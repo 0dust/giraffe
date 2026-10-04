@@ -24,7 +24,7 @@ CHECK_NAMES = {
 
 
 class Model(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class Target(Model):
@@ -48,6 +48,12 @@ class Target(Model):
             raise ValueError("target url must be an http(s) endpoint")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("use an endpoint URL without credentials, query or fragment")
+        if self.metrics_url:
+            metrics = urlsplit(self.metrics_url)
+            if metrics.scheme not in {"http", "https"} or not metrics.hostname:
+                raise ValueError("metrics_url must be an http(s) endpoint")
+            if metrics.username or metrics.password or metrics.query or metrics.fragment:
+                raise ValueError("metrics_url must not contain credentials, query or fragment")
         if self.route == "replica" and not self.parent:
             raise ValueError("replica targets require parent service name")
         return self
@@ -107,6 +113,12 @@ class RunConfig(Model):
         reserved = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
         if reserved.intersection(self.request_options):
             raise ValueError("request_options cannot override model/messages/stream/token budget/n")
+        if self.proxy:
+            from urllib.parse import urlsplit
+
+            proxy = urlsplit(self.proxy)
+            if proxy.username or proxy.password:
+                raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
         return self
 
 
@@ -140,6 +152,7 @@ class RequestRecord(Model):
     first_output_ms: float | None = None
     first_reasoning_ms: float | None = None
     max_stream_gap_ms: float | None = None
+    completion_tokens: int | None = None
     output_tokens: int | None = None
     input_tokens: int | None = None
     output_chars: int = 0
