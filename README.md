@@ -4,7 +4,7 @@ Run a built-in test suite against an existing OpenAI-compatible LLM endpoint.
 See which requests failed, where output stalled, whether known answers changed,
 and what regressed against a saved run. Results stay in local HTML and JSON files.
 
-## Run
+## Install
 
 Python 3.11+ on macOS or Linux:
 
@@ -12,22 +12,69 @@ Python 3.11+ on macOS or Linux:
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
-
-giraffe ui --config examples/local.yaml
-# Open http://127.0.0.1:8765
-
-# Or use the CLI directly:
-giraffe run --url http://127.0.0.1:11434/v1 --model qwen2.5:7b-instruct \
-  --output runs/first
 ```
 
 Use a model already installed on your server. No test authoring, model download,
 cloud account, database, or hosted judge is needed. API origins, `/v1` bases, and
 complete `/chat/completions` URLs are accepted.
 
-The web interface uses the same runner and scores as the CLI. It lets you configure
-a run, follow live activity, stop and keep partial results, inspect failed checks
-and individual responses, save a named baseline, and compare a later run. Existing
+## Ollama
+
+Connect to a running Ollama server using a model you already have installed.
+Copy [examples/local.yaml](examples/local.yaml) and edit these settings:
+
+| Setting | What to enter |
+| --- | --- |
+| `targets[0].url` | `http://127.0.0.1:11434/v1` for a local server; use its reachable address if remote. |
+| `targets[0].model` | A model name from `ollama list`, including its tag, such as `llama3.2:3b`. |
+| `context_limit` | The context length configured in Ollama for this model. |
+
+```sh
+cp examples/local.yaml my-ollama.yaml
+# Edit my-ollama.yaml, then open the prefilled form:
+giraffe ui --config my-ollama.yaml
+
+# Or run the same configuration from the CLI:
+giraffe run --config my-ollama.yaml --output runs/ollama-first
+```
+
+Review the traffic budgets, acceptance limits and enabled checks before running.
+
+## vLLM
+
+Start your vLLM server separately, then connect Giraffe to its
+[Chat Completions API](https://docs.vllm.ai/en/latest/serving/online_serving/).
+Use a text-generation model with a working chat template.
+
+Copy [examples/vllm.yaml](examples/vllm.yaml) and edit these settings:
+
+| Setting | What to enter |
+| --- | --- |
+| `targets[0].url` | `http://127.0.0.1:8000/v1` for a local server; use the reachable host/port for a remote server. |
+| `targets[0].model` | An exact model ID from the server's `/v1/models` response, including any `--served-model-name` alias. |
+| `context_limit` | The context length configured on the server with `--max-model-len`. |
+| `targets[0].api_key_env` | If authentication is enabled, the name of an environment variable containing the API key. |
+| Traffic and `limits` | Review the request/time budgets and set acceptance limits for your service. The example values are not hardware recommendations. |
+
+```sh
+cp examples/vllm.yaml my-vllm.yaml
+# Edit my-vllm.yaml, then open the prefilled form:
+giraffe ui --config my-vllm.yaml
+
+# Or run the same configuration from the CLI:
+giraffe run --config my-vllm.yaml --output runs/vllm-first
+```
+
+The example enables the ten standard checks; JSON and GPU checks remain optional.
+A wrong answer can fail a load check even when requests complete successfully.
+Inspect the failed responses before treating the result as a vLLM server fault.
+
+## Run and compare
+
+Open **http://127.0.0.1:8765**, select **New run**, review the settings, and select
+**Run suite**. The web interface uses the same runner and scores as the CLI. It lets
+you follow live activity, stop and keep partial results, inspect failed checks and
+individual responses, save a named baseline, and compare a later run. Existing
 CLI reports in `runs/` appear in the history. A finished run can still fail its
 acceptance checks; those are displayed separately.
 
@@ -42,17 +89,19 @@ The CLI prints its limits before sending traffic: maximum requests, concurrency,
 total duration, per-request deadline, and output tokens. Ctrl-C stops new requests
 and saves partial results. Normal runs never restart the service.
 
-Open `runs/first/report.html`. `report.json` contains the same measurements and
-reproduction settings. A failed or interrupted run still produces a report.
+Open `report.html` in your run's output directory. `report.json` contains the same
+measurements and reproduction settings. A failed or interrupted run still produces
+a report.
 
-To set your service's acceptance limits, use [examples/local.yaml](examples/local.yaml):
+To compare runs, substitute your edited Ollama or vLLM configuration for
+`my-config.yaml` below:
 
 ```sh
-giraffe run --config examples/local.yaml --output runs/before
+giraffe run --config my-config.yaml --output runs/before
 giraffe baseline save runs/before/report.json baselines/local.json
 
 # After changing your deployment:
-giraffe run --config examples/local.yaml --baseline baselines/local.json \
+giraffe run --config my-config.yaml --baseline baselines/local.json \
   --output runs/after
 ```
 
@@ -235,9 +284,17 @@ Verified locally on October 4, 2026 with Python 3.12 on macOS:
 | Endpoint | Model | Verified behavior |
 | --- | --- | --- |
 | Ollama 0.31.1, OpenAI-compatible `/v1` | `qwen2.5:7b-instruct` | Streaming/nonstreaming, JSON, concurrency, mixed traffic, context, caps, disconnect/deadline and recovery |
+| Ollama, OpenAI-compatible `/v1` | `llama3.2:3b` | All ten standard checks passed: 141 requests, concurrency 2, 4,096-token context. JSON/GPU checks were not selected. |
+| vLLM 0.30.0 + vLLM-Metal 0.30.0 on Apple M1 | `mlx-community/Llama-3.2-1B-Instruct-4bit` | All ten standard checks exercised: 4 passed, 4 failed on answer checks, 2 timing checks inconclusive. 159 requests, concurrency 2, 1,024-token context. |
 | Deterministic loopback HTTP fixture | Synthetic responses | Empty/truncated HTTP 200 rejection, wrong-answer and latency regression detection, budgets, report persistence and baseline preservation |
 
-The full Ollama run observed a known-answer failure in one near-limit context
+The vLLM-Metal run's copy refusal and incorrect stop-test answer also reproduced
+with the same checkpoint directly through MLX, without Giraffe or vLLM. The two
+timing checks were inconclusive because Giraffe recorded a scheduling pause.
+These results do not isolate an engine difference from Ollama: the models differ.
+Linux/CUDA vLLM has not been tested live here.
+
+The earlier Qwen/Ollama run observed a known-answer failure in one near-limit context
 fixture and correctly reported `fail`; compatibility does not mean the deployment
 passed every check. Real CLI interruption produced an inconclusive partial report.
 The web UI was checked at desktop, narrow-window and mobile widths. A UI-started

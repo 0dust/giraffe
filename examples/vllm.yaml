@@ -1,0 +1,35 @@
+# Connect to an existing vLLM Chat Completions server.
+# Replace the URL/model and match context_limit to the server's --max-model-len.
+targets:
+  - name: vllm
+    url: http://127.0.0.1:8000/v1
+    model: your-served-model
+    # api_key_env: VLLM_API_KEY
+    identity: {runtime: vllm}
+
+# Example traffic budgets; adjust for your model and machine.
+concurrency: 2
+max_requests: 400
+max_duration_seconds: 900
+request_timeout_seconds: 120
+max_output_tokens: 128
+context_limit: 4096
+samples: 6
+sustained_seconds: 30
+request_options: {temperature: 0}
+structured_json: false
+metrics: false
+retention: failures
+
+# Example acceptance limits, not performance recommendations.
+# Replace these with your service's requirements before interpreting a pass.
+limits:
+  first_output_ms: 60000
+  latency_ms: 90000
+  stream_gap_ms: 10000
+  min_output_tokens_per_second: 1
+  fairness_max_ratio: 3
+  max_error_rate: 0
+  min_correctness: 1
+  regression_percent: 20
+  min_samples: 5
