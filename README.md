@@ -13,6 +13,10 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
 
+giraffe ui --config examples/local.yaml
+# Open http://127.0.0.1:8765
+
+# Or use the CLI directly:
 giraffe run --url http://127.0.0.1:11434/v1 --model qwen2.5:7b-instruct \
   --output runs/first
 ```
@@ -20,6 +24,19 @@ giraffe run --url http://127.0.0.1:11434/v1 --model qwen2.5:7b-instruct \
 Use a model already installed on your server. No test authoring, model download,
 cloud account, database, or hosted judge is needed. API origins, `/v1` bases, and
 complete `/chat/completions` URLs are accepted.
+
+The web interface uses the same runner and scores as the CLI. It lets you configure
+a run, follow live activity, stop and keep partial results, inspect failed checks
+and individual responses, save a named baseline, and compare a later run. Existing
+CLI reports in `runs/` appear in the history. A finished run can still fail its
+acceptance checks; those are displayed separately.
+
+`giraffe ui` starts on loopback only and never starts inference automatically.
+Use `--port 8766` to select another port or `--runs-dir /path/to/runs` for another
+report directory. The optional `--config` prefills the form. Advanced configuration
+supports the same multi-model/replica settings as the CLI. All UI assets are bundled
+locally, with no CDN or frontend build step. Closing the browser does not stop a run;
+use **Stop run**. One run is active at a time to avoid competing benchmark traffic.
 
 The CLI prints its limits before sending traffic: maximum requests, concurrency,
 total duration, per-request deadline, and output tokens. Ctrl-C stops new requests
@@ -187,8 +204,9 @@ ruff check src tests
 
 Integration tests use a real local HTTP server to inject empty/truncated successful
 responses, wrong answers, timeouts, and timing regressions. They require loopback
-network access. This MVP is a CLI and local report; it has no accounts, control
-plane, inline gateway, provisioning, automatic tuning, promotion, or rollback.
+network access. This MVP is a CLI, local web interface and local reports; it has no
+accounts, control plane, inline gateway, provisioning, automatic tuning, promotion,
+or rollback.
 
 ## Tested compatibility
 
@@ -202,7 +220,13 @@ Verified locally on October 4, 2026 with Python 3.12 on macOS:
 The full Ollama run observed a known-answer failure in one near-limit context
 fixture and correctly reported `fail`; compatibility does not mean the deployment
 passed every check. Real CLI interruption produced an inconclusive partial report.
+The web UI was checked at desktop, narrow-window and mobile widths. A UI-started
+Ollama run saved all 119 requests with the same context failure and a separate,
+inconclusive baseline comparison. Stopping another run saved 15 requests as a
+partial report. Refresh continuity, form preservation, baseline saving and
+comparison filtering were verified in the browser.
+
 A wheel was built and installed offline from cached dependencies. Other runtimes,
 real multi-replica deployments, GPU exporters, Linux, and the Docker image still
 need live qualification; their supported paths have local automated coverage where
-applicable. Browser rendering was not visually verified.
+applicable. Exported HTML report rendering was not separately visually verified.

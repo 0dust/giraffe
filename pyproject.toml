@@ -7,7 +7,7 @@ name = "giraffe-check"
 version = "0.1.0"
 description = "A built-in acceptance test suite for self-hosted LLM services"
 requires-python = ">=3.11"
-dependencies = ["httpx>=0.28,<0.29", "pydantic>=2.11,<3", "PyYAML>=6,<7", "jsonschema>=4.23,<5"]
+dependencies = ["httpx>=0.28,<0.29", "pydantic>=2.11,<3", "PyYAML>=6,<7", "jsonschema>=4.23,<5", "fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11"]

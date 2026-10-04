@@ -23,6 +23,10 @@ def parser() -> argparse.ArgumentParser:
     )
     app.add_argument("--version", action="version", version=__version__)
     commands = app.add_subparsers(dest="command", required=True)
+    web = commands.add_parser("ui", help="Open the local web interface")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--runs-dir", type=Path, default=Path("runs"))
+    web.add_argument("--config", type=Path, help="Prefill the run form from a YAML/JSON config")
     for name in ("run", "cold-start"):
         run = commands.add_parser(name, help="Run the suite" if name == "run" else
                                   "Explicitly restart one configured target and test readiness")
@@ -144,6 +148,25 @@ async def _run(config: RunConfig) -> RunReport:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "ui":
+            if not 1 <= args.port <= 65535:
+                raise ValueError("Port must be between 1 and 65535")
+            defaults = None
+            if args.config:
+                defaults = RunConfig.model_validate(yaml.safe_load(args.config.read_text())).model_dump(
+                    mode="json"
+                )
+                defaults["restart_target"] = None
+            import uvicorn
+            from giraffe.web import create_app
+
+            print(f"Giraffe UI: http://127.0.0.1:{args.port}\n"
+                  f"Local runs: {args.runs_dir.resolve()}\n"
+                  "Open the address in your browser. No tests start until you choose Run suite.",
+                  flush=True)
+            uvicorn.run(create_app(runs_dir=args.runs_dir, defaults=defaults),
+                        host="127.0.0.1", port=args.port, log_level="warning")
+            return 0
         if args.command == "baseline":
             report = load_report(args.report)
             args.destination.parent.mkdir(parents=True, exist_ok=True)

@@ -60,3 +60,30 @@ def test_run_duration_must_be_finite(capsys):
     assert main(["run", "--url", "http://localhost", "--model", "tiny",
                  "--max-duration", "inf"]) == 2
     assert "finite" in capsys.readouterr().err
+
+
+def test_ui_rejects_invalid_port_before_starting_server(capsys):
+    assert main(["ui", "--port", "0"]) == 2
+    assert "Port must be" in capsys.readouterr().err
+
+
+def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch):
+    import uvicorn
+    import giraffe.web
+
+    config = tmp_path / "ui.yaml"
+    config.write_text(json.dumps({"targets": [{"name": "local", "url": "http://localhost",
+                                             "model": "tiny", "restart_command": ["false"]}],
+                                  "restart_target": "local"}))
+    captured = {}
+
+    def create_app(**kwargs):
+        captured.update(kwargs)
+        return "app"
+
+    monkeypatch.setattr(giraffe.web, "create_app", create_app)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: captured.update(app=app, **kwargs))
+    assert main(["ui", "--config", str(config), "--runs-dir", str(tmp_path)]) == 0
+    assert captured["host"] == "127.0.0.1" and captured["port"] == 8765
+    assert captured["defaults"]["restart_target"] is None
+    assert captured["defaults"]["targets"][0]["restart_command"] == ["false"]
