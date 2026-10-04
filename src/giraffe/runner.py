@@ -359,8 +359,9 @@ async def _fairness(run, target, client, fixtures):
 
 async def _context_fixtures(run, target, client, fixtures):
     """Use observed token usage to size deterministic filler, never claim estimated coverage."""
+    long_fixture_ids = {spec.fixture_id for spec in fixtures["long"]}
     candidates = [r for r in run.records if r.target == target.name and r.valid and
-                  r.fixture_id == "long.prefill.v1" and r.input_tokens and r.input_chars]
+                  r.fixture_id in long_fixture_ids and r.input_tokens and r.input_chars]
     if not candidates:
         candidates = await run.group(target, client, [fixtures["context"][-2]],
                                      "context_calibration", count=1, checks=["context"])

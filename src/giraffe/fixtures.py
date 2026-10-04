@@ -20,7 +20,7 @@ from referencing.exceptions import Unresolvable
 
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig
 
-FIXTURE_VERSION = "0.1.0"
+FIXTURE_VERSION = "0.1.1"
 SUITE_VERSION = FIXTURE_VERSION
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
@@ -34,10 +34,11 @@ def _request(
     scorer: str = "exact",
     expected: Any = None,
     max_tokens: int = 24,
+    version: int = 1,
     **kwargs: Any,
 ) -> RequestSpec:
     return RequestSpec(
-        fixture_id=f"{fixture_id}.v1",
+        fixture_id=f"{fixture_id}.v{version}",
         scenario=scenario,
         check_ids=check_ids,
         messages=[{"role": "user", "content": prompt}],
@@ -57,9 +58,10 @@ def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec
     """
     output_budget = min(24, config.max_output_tokens)
     character_budget = config.context_limit - output_budget - 32
-    code = hashlib.sha256(f"context-v1-{size}-{position}".encode()).hexdigest()[:6].upper()
-    prefix, suffix = "Notes:\n", "\nReply with the code only."
-    fact = f"Code: {code}."
+    # Keep the expected labels stable across prompt wording revisions.
+    label = hashlib.sha256(f"context-v1-{size}-{position}".encode()).hexdigest()[:6].upper()
+    prefix, suffix = "Notes:\n", "\nReply with the box label only."
+    fact = f"The box label is {label}."
     minimum = len(prefix + fact + suffix)
     desired = character_budget if size == "long" else max(minimum, character_budget // 3)
     filler_chars = max(0, desired - minimum)
@@ -77,8 +79,9 @@ def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec
         "context",
         ["context", "serving"],
         prefix + body + suffix,
-        expected=code,
+        expected=label,
         max_tokens=output_budget,
+        version=2,
         context_position=position,
     )
 
@@ -91,18 +94,20 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     JSON is opt-in. Output-cap and cancellation requests intentionally have no
     semantic scorer; their observed protocol and timing behavior is evaluated
     by the runner. Exact scorers intentionally reject explanatory extra text.
+    Identifiers are box labels so prompts do not imply access credentials.
     """
     short = [
         _request(
             "short.code", "short", ["serving", "first_output", "generation", "capacity"],
-            "Code: K7P4. Reply with the code only.", expected="K7P4",
+            "The box label is K7P4. Reply with the box label only.", expected="K7P4",
+            version=2,
         ),
         _request(
             "short.copy", "short", ["serving", "first_output", "generation", "capacity"],
             "Copy exactly, with no extra text:\n"
-            "The blue box holds seven red cards. The code on each card is K7P4.",
-            expected="The blue box holds seven red cards. The code on each card is K7P4.",
-            max_tokens=64,
+            "The blue box holds seven red cards. The label on each card is K7P4.",
+            expected="The blue box holds seven red cards. The label on each card is K7P4.",
+            max_tokens=64, version=2,
         ),
     ]
     context = [
@@ -112,7 +117,7 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     ]
     long = [
         context[-2].model_copy(update={
-            "fixture_id": "long.prefill.v1",
+            "fixture_id": "long.prefill.v2",
             "scenario": "long",
             "check_ids": ["serving", "fairness", "capacity"],
         })
@@ -120,7 +125,8 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     correctness = [
         _request(
             "correctness.extraction", "correctness", ["correctness", "serving"],
-            "Name: Mira. Code: T8R2. Color: blue. Return the code only.", expected="T8R2",
+            "Name: Mira. Box label: T8R2. Color: blue. Return the box label only.",
+            expected="T8R2", version=2,
         ),
         _request(
             "correctness.arithmetic", "correctness", ["correctness", "serving"],
@@ -134,22 +140,22 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     ]
     json_fixtures: list[RequestSpec] = []
     if config.structured_json:
-        expected = {"code": "J6Q2", "count": 3, "ready": True}
+        expected = {"label": "J6Q2", "count": 3, "ready": True}
         schema = {
             "type": "object",
             "properties": {
-                "code": {"type": "string", "enum": ["J6Q2"]},
+                "label": {"type": "string", "enum": ["J6Q2"]},
                 "count": {"type": "integer", "enum": [3]},
                 "ready": {"type": "boolean"},
             },
-            "required": ["code", "count", "ready"],
+            "required": ["label", "count", "ready"],
             "additionalProperties": False,
         }
         json_fixtures.append(_request(
             "json.record", "json", ["json", "serving"],
-            "Return only a JSON object with code equal to the string J6Q2, "
-            "count equal to the integer 3, and ready equal to the boolean true. No other fields.",
-            scorer="json", expected=expected, schema=schema, max_tokens=64,
+            "Convert this box record to JSON.\nlabel: J6Q2\ncount: 3\nready: true\n"
+            "Output only the JSON object, with no explanation or markdown.",
+            scorer="json", expected=expected, schema=schema, max_tokens=64, version=2,
         ))
     cap = min(8, config.max_output_tokens)
     limits = [
@@ -173,7 +179,8 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     sustained = [
         _request(
             "sustained.code", "sustained", ["recovery", "serving"],
-            "Code: V5N3. Reply with the code only.", expected="V5N3",
+            "The box label is V5N3. Reply with the box label only.", expected="V5N3",
+            version=2,
         ),
     ]
     fixtures = {

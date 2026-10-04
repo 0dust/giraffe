@@ -164,7 +164,7 @@ class FakeEndpoint:
     @staticmethod
     def _answer(prompt: str) -> str:
         if "JSON object" in prompt:
-            return '{"code":"J6Q2","count":3,"ready":true}'
+            return '{"label":"J6Q2","count":3,"ready":true}'
         if "17 cards" in prompt and "8 cards" in prompt:
             return "25"
         if "Label mip" in prompt:
@@ -173,6 +173,6 @@ class FakeEndpoint:
             return prompt.split("\n", 1)[1] if "\n" in prompt else prompt.split(":", 1)[1].strip()
         if "numbers from 1 to 100" in prompt:
             return " ".join(str(number) for number in range(1, 101))
-        if match := re.search(r"Code:\s*([A-Z0-9]+)", prompt):
+        if match := re.search(r"(?:The box label is|Box label:)\s*([A-Z0-9]+)", prompt):
             return match.group(1)
         return "42"

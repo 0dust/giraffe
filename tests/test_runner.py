@@ -233,8 +233,9 @@ async def test_deliberate_deadline_and_cancellation_not_serving_failures():
     assert deadline.id in result.evidence_ids
 
 
-async def test_context_sizing_uses_actual_usage_and_records_reproduction():
-    report = await runner.run_suite(config(checks=["context"]))
+@pytest.mark.parametrize("checks", [["context"], ["capacity", "context"]])
+async def test_context_sizing_uses_actual_usage_and_records_reproduction(checks):
+    report = await runner.run_suite(config(checks=checks))
     result = check(report, "context")
     assert result.status == "pass"
     assert result.metrics["near_limit_coverage"]
@@ -242,6 +243,10 @@ async def test_context_sizing_uses_actual_usage_and_records_reproduction():
     calibration = result.metrics["calibration"]
     assert calibration["fixture_context_limit"] > 512
     assert len({r.fixture_id for r in report.requests if r.scenario == "context"}) == 6
+    if "capacity" in checks:
+        assert not any(r.scenario == "context_calibration" for r in report.requests)
+        source = next(r for r in report.requests if r.id == calibration["source_request_id"])
+        assert source.scenario.startswith("capacity_")
 
 
 async def test_context_without_token_usage_never_claims_declared_limit(client):
