@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "giraffe-check"
+version = "0.1.0"
+description = "A built-in acceptance test suite for self-hosted LLM services"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.28,<0.29", "pydantic>=2.11,<3", "PyYAML>=6,<7", "jsonschema>=4.23,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11"]
+
+[project.scripts]
+giraffe = "giraffe.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/giraffe"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
