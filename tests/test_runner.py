@@ -73,7 +73,9 @@ class FakeClient:
             output_chars=len(output), output_tokens=2,
             input_tokens=max(1, spec.input_chars//4) if cls.input_usage else None,
             input_chars=spec.input_chars, elapsed_ms=elapsed,
-            first_output_ms=first_output, chunks=2, stream=spec.stream, stream_terminated=True,
+            first_output_ms=first_output, last_output_ms=first_output + 2,
+            answer_chunks=2 if spec.stream else 0,
+            chunks=2, stream=spec.stream, stream_terminated=True,
             finish_reason="stop", requested_max_tokens=spec.max_tokens or 128,
             max_stream_gap_ms=500 if cls.bad_mixed_gap and spec.scenario == "fairness_short" else 2,
         )
@@ -256,6 +258,23 @@ async def test_context_without_token_usage_never_claims_declared_limit(client):
     assert result.status == "inconclusive" and not result.metrics["near_limit_coverage"]
 
 
+async def test_generation_uses_dedicated_longer_output_samples():
+    report = await runner.run_suite(config(checks=["generation"],
+                                          limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
+    result = check(report, "generation")
+    assert result.status == "pass"
+    assert result.metrics["generation_rate_samples"] == 2
+    assert {r.scenario for r in report.requests if r.id in result.evidence_ids} == {"generation"}
+
+
+async def test_unstreamed_generation_cannot_pass_a_generation_rate_limit():
+    report = await runner.run_suite(config(checks=["generation"], stream=False,
+                                          limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
+    result = check(report, "generation")
+    assert result.status == "inconclusive"
+    assert result.metrics["generation_rate_samples"] == 0
+
+
 async def test_sustained_timing_failure_visible_even_when_recovery_is_fast(client):
     client.bad_sustained = True
     report = await runner.run_suite(config(checks=["recovery"],
@@ -280,7 +299,7 @@ async def test_capacity_missing_configured_token_rate_is_inconclusive(client, mo
     result = check(report, "capacity")
     assert result.status == "inconclusive"
     assert result.metrics["highest_tested_acceptable_concurrency"] is None
-    assert result.metrics["levels"]["2"]["missing_timing_metrics"] == ["output_tokens_per_second"]
+    assert result.metrics["levels"]["2"]["missing_timing_metrics"] == ["generation_tokens_per_second"]
 
 
 async def test_nonstreaming_cannot_pass_a_stream_gap_limit():
@@ -462,7 +481,7 @@ async def test_recovery_missing_configured_output_rate_is_inconclusive(client, m
                                           limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
     result = check(report, "recovery")
     assert result.status == report.overall == "inconclusive"
-    assert result.metrics["missing_timing_metrics"] == ["output_tokens_per_second"]
+    assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["completed"] == 2
 

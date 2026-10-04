@@ -67,7 +67,7 @@ reports change, while absolute checks still evaluate the current run.
 | Access | Real inference request through the selected DNS/TLS/auth/network path |
 | Serving | HTTP status, completion envelope, nonempty answer, stream finish |
 | First output | First useful answer separately from reasoning and initial requests |
-| Generation | End-to-end latency, visible stream gaps, actual output length/rate |
+| Generation | Longer-output samples, generation pace after first output, response time and stream gaps |
 | Capacity | Bounded concurrency levels with valid completions and configured limits |
 | Fairness | Long prompts added while a short response is streaming |
 | Context | Injected known facts at different lengths and positions |
@@ -88,6 +88,26 @@ the report distinguishes measured token usage from character counts. A service U
 does not establish which replicas or GPUs were reached. Client disconnect does not
 prove backend work was reclaimed. Buffered responses can prevent a valid fairness
 measurement. The report preserves these limits.
+
+Generation pace is a client-observed estimate: `(output tokens - 1) / seconds from
+first useful answer chunk to last answer chunk`. Prompt waiting and trailing
+usage/finish messages are excluded. This follows the first-token exclusion used
+by [vLLM's per-request TPOT](https://docs.vllm.ai/en/latest/design/metrics/), using
+the last observed answer instead of protocol cleanup as the endpoint. A chunk may
+contain multiple tokens, and network buffering can distort arrival times; this
+is not an exact server decoding measurement. Longer-output fixtures reduce the
+influence of small answers. Their purpose is timing, not semantic scoring.
+
+`limits.min_output_tokens_per_second` sets the minimum **generation** rate for
+measurable requests. Single-token answers have no remaining generation interval;
+they do not establish a rate. Non-streamed, single-answer-chunk, incomplete or
+missing-usage responses also cannot establish it. A rate requirement without
+sufficient measurable evidence stays inconclusive. First-output and total-time
+limits still apply independently.
+
+End-to-end output rate (`output tokens / total request seconds`) is retained as a
+separate measurement. Schema 2 reports store the additional answer timing;
+schema 1 reports remain readable and are not compared against the new definition.
 
 ## Configure targets and traffic
 

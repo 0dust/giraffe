@@ -48,6 +48,7 @@ def _stats(records: list[RequestRecord]) -> dict:
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
+    generation_rates = [rate for r in good if (rate := r.generation_tokens_per_second) is not None]
     return {
         "attempted": len(records), "completed": len(good),
         "failed": sum(r.status == "failed" or (r.status == "completed" and not r.valid)
@@ -62,6 +63,9 @@ def _stats(records: list[RequestRecord]) -> dict:
                                    if r.max_stream_gap_ms is not None), default=None),
         "output_tokens_per_second_p50": _percentile(rates, .5),
         "output_tokens_per_second_min": min(rates, default=None),
+        "generation_tokens_per_second_p50": _percentile(generation_rates, .5),
+        "generation_tokens_per_second_min": min(generation_rates, default=None),
+        "generation_rate_samples": len(generation_rates),
         "output_tokens": sum(r.output_tokens or 0 for r in good),
         "output_chars": sum(r.output_chars for r in good),
         "scored": sum(r.score is not None for r in records),
@@ -402,6 +406,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     restart["reason"] = "No successful inference within readiness budget"
                     return
             await run.group(target, client, fixtures["short"], "warm")
+            if "generation" in enabled:
+                await run.group(target, client, fixtures["generation"], "generation",
+                                checks=["generation"])
             if "capacity" in enabled:
                 for level in _levels(config.concurrency):
                     records = []
@@ -484,7 +491,9 @@ def _timing_violations(records, limits):
             failures.append(record.id)
         elif limits.stream_gap_ms and record.max_stream_gap_ms is not None and record.max_stream_gap_ms > limits.stream_gap_ms:
             failures.append(record.id)
-        elif limits.min_output_tokens_per_second and record.output_tokens is not None and record.elapsed_ms > 0 and record.output_tokens / (record.elapsed_ms/1000) < limits.min_output_tokens_per_second:
+        elif (limits.min_output_tokens_per_second
+              and (rate := record.generation_tokens_per_second) is not None
+              and rate < limits.min_output_tokens_per_second):
             failures.append(record.id)
     return failures
 
@@ -498,10 +507,14 @@ def _missing_timing(records, limits):
             missing.add("first_output_ms")
         if limits.stream_gap_ms is not None and (not record.stream or record.max_stream_gap_ms is None):
             missing.add("stream_gap_ms")
-        if limits.min_output_tokens_per_second is not None and (record.output_tokens is None or record.elapsed_ms <= 0):
-            missing.add("output_tokens_per_second")
+        if (limits.min_output_tokens_per_second is not None
+                and record.output_tokens != 1 and record.generation_tokens_per_second is None):
+            missing.add("generation_tokens_per_second")
         if limits.latency_ms is not None and record.elapsed_ms <= 0:
             missing.add("latency_ms")
+    if (limits.min_output_tokens_per_second is not None
+            and not any(r.generation_tokens_per_second is not None for r in records)):
+        missing.add("generation_tokens_per_second")
     return sorted(missing)
 
 
@@ -524,6 +537,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             records = [r for r in all_records if check_id in r.check_ids]
         if check_id in {"first_output", "generation"}:
             records = [r for r in records if r.scenario not in {"initial", "readiness"}]
+        if check_id == "generation":
+            records = [r for r in records if r.scenario == "generation"]
         metrics, status, summary = _stats(records), "pass", "Observed requests met configured checks."
         if check_id not in config.checks or (check_id == "json" and not config.structured_json) or (check_id == "gpu" and not config.metrics):
             status, summary = "skipped", "Not selected for this run."
@@ -580,6 +595,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits.model_copy(update={"first_output_ms": None}))
                 status, summary = "inconclusive", "Configured generation limits cannot be checked with available stream or token measurements."
+            elif (check_id == "generation" and limits.min_output_tokens_per_second is not None
+                  and metrics["generation_rate_samples"] < limits.min_samples):
+                status, summary = "inconclusive", "Too few measurable streamed answers to assess generation pace."
         elif check_id == "capacity":
             levels = observations["capacity"]
             accepted = []

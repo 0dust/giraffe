@@ -13,6 +13,7 @@ def make_report(run_id: str = "current", *, latency: float = 100, count: int = 8
         id=f"{run_id}-{index}", target="local", fixture_id="arithmetic-v1", scenario="warm",
         check_ids=["serving", "correctness"], started_at="2026-10-04T10:00:00Z",
         status="completed", http_status=200, elapsed_ms=latency, first_output_ms=latency / 2,
+        last_output_ms=latency, answer_chunks=2,
         max_stream_gap_ms=latency / 10, output_tokens=10, output_chars=2, output="42",
         reasoning="computed", stream_terminated=True, finish_reason="stop", valid=True,
         score=True, score_message="Exact answer matched", input_chars=30, requested_max_tokens=128,
@@ -40,6 +41,27 @@ def test_same_evidence_passes_and_input_reports_are_unchanged():
     assert current.baseline is None
     assert previous.baseline is None
     assert len(current.checks) == 1
+
+
+def test_legacy_rate_reports_are_incomparable_with_new_generation_metrics():
+    current, previous = make_report(), make_report("baseline")
+    previous.schema_version = "1"
+    result = compare_baseline(current, previous)
+    assert baseline_check(result).status == "inconclusive"
+    assert "Report schema versions differ." in result.baseline["targets"][0]["reasons"]
+
+
+def test_generation_rate_comparison_does_not_confuse_longer_prefill_with_slower_decoding():
+    current, previous = make_report(), make_report("baseline")
+    for record in current.requests:
+        record.first_output_ms += 5000
+        record.last_output_ms += 5000
+        record.elapsed_ms += 5000
+    result = compare_baseline(current, previous)
+    rows = {row["metric"]: row for row in result.baseline["targets"][0]["comparisons"]}
+    assert rows["generation_tokens_per_second"]["status"] == "pass"
+    assert rows["output_tokens_per_second"]["status"] == "fail"
+    assert rows["first_output_ms"]["status"] == "fail"
 
 
 @pytest.mark.parametrize("change", ["route", "model", "url", "load", "fixture", "unknown", "aborted"])
@@ -202,7 +224,8 @@ def test_generator_saturation_cannot_create_timing_regressions(saturated_run):
     assert baseline_check(result).status == "inconclusive"
     assert result.overall == "inconclusive"
     rows = result.baseline["targets"][0]["comparisons"]
-    timing = {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second"}
+    timing = {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second",
+              "generation_tokens_per_second"}
     assert all(row["status"] == "inconclusive" for row in rows if row["metric"] in timing)
     assert all(row["status"] == "pass" for row in rows if row["metric"] not in timing)
 

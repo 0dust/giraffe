@@ -35,13 +35,13 @@ def custom_entry(**overrides):
 def test_builtins_repeatable_versioned_and_json_opt_in():
     first, second = builtin_fixtures(config()), builtin_fixtures(config())
     assert first == second
-    assert set(first) == {"short", "long", "context", "correctness", "json", "limits", "sustained"}
+    assert set(first) == {"short", "long", "context", "correctness", "json", "limits", "sustained", "generation"}
     assert first["json"] == []
     specs = [spec for group in first.values() for spec in group]
     assert len({spec.fixture_id for spec in specs}) == len(specs)
     assert all(spec.fixture_id.endswith((".v1", ".v2")) and spec.check_ids for spec in specs)
     assert all(spec.expected is not None for spec in specs)
-    assert FIXTURE_VERSION == "0.1.1"
+    assert FIXTURE_VERSION == "0.1.2"
     assert builtin_fixtures(config(structured_json=True))["json"]
 
 

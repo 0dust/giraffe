@@ -20,7 +20,7 @@ from referencing.exceptions import Unresolvable
 
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig
 
-FIXTURE_VERSION = "0.1.1"
+FIXTURE_VERSION = "0.1.2"
 SUITE_VERSION = FIXTURE_VERSION
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
@@ -183,9 +183,22 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
             version=2,
         ),
     ]
+    generation = [
+        _request(
+            "generation.copy", "generation", ["generation", "serving"],
+            "Copy exactly, with no extra text:\n"
+            "The small boat crossed the lake early in the morning. The water was calm, "
+            "and the trees along the shore were reflected on its surface. A family watched "
+            "from the wooden pier as the boat approached. They carried a basket of bread, "
+            "apples, and fresh water for their picnic. After tying the boat to the pier, "
+            "the captain helped everyone aboard and checked that each person had a life jacket.",
+            scorer="none", expected={"purpose": "observe sustained answer generation"},
+            max_tokens=config.max_output_tokens,
+        ),
+    ]
     fixtures = {
         "short": short, "long": long, "context": context, "correctness": correctness,
-        "json": json_fixtures, "limits": limits, "sustained": sustained,
+        "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
     for group in fixtures.values():
         for spec in group:
