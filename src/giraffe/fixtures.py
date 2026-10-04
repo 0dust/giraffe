@@ -21,7 +21,7 @@ from referencing.exceptions import Unresolvable
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig
 
 FIXTURE_VERSION = "0.1.2"
-SUITE_VERSION = FIXTURE_VERSION
+SUITE_VERSION = "0.1.3"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
 
