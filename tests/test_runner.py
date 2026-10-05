@@ -73,7 +73,9 @@ class FakeClient:
             output_chars=len(output), output_tokens=2,
             input_tokens=max(1, spec.input_chars//4) if cls.input_usage else None,
             input_chars=spec.input_chars, elapsed_ms=elapsed,
-            first_output_ms=first_output, chunks=2, stream=spec.stream, stream_terminated=True,
+            first_output_ms=first_output, last_output_ms=first_output + 2,
+            answer_chunks=2 if spec.stream else 0,
+            chunks=2, stream=spec.stream, stream_terminated=True,
             finish_reason="stop", requested_max_tokens=spec.max_tokens or 128,
             max_stream_gap_ms=500 if cls.bad_mixed_gap and spec.scenario == "fairness_short" else 2,
         )
@@ -233,8 +235,9 @@ async def test_deliberate_deadline_and_cancellation_not_serving_failures():
     assert deadline.id in result.evidence_ids
 
 
-async def test_context_sizing_uses_actual_usage_and_records_reproduction():
-    report = await runner.run_suite(config(checks=["context"]))
+@pytest.mark.parametrize("checks", [["context"], ["capacity", "context"]])
+async def test_context_sizing_uses_actual_usage_and_records_reproduction(checks):
+    report = await runner.run_suite(config(checks=checks))
     result = check(report, "context")
     assert result.status == "pass"
     assert result.metrics["near_limit_coverage"]
@@ -242,6 +245,10 @@ async def test_context_sizing_uses_actual_usage_and_records_reproduction():
     calibration = result.metrics["calibration"]
     assert calibration["fixture_context_limit"] > 512
     assert len({r.fixture_id for r in report.requests if r.scenario == "context"}) == 6
+    if "capacity" in checks:
+        assert not any(r.scenario == "context_calibration" for r in report.requests)
+        source = next(r for r in report.requests if r.id == calibration["source_request_id"])
+        assert source.scenario.startswith("capacity_")
 
 
 async def test_context_without_token_usage_never_claims_declared_limit(client):
@@ -249,6 +256,165 @@ async def test_context_without_token_usage_never_claims_declared_limit(client):
     report = await runner.run_suite(config(checks=["context"]))
     result = check(report, "context")
     assert result.status == "inconclusive" and not result.metrics["near_limit_coverage"]
+
+
+async def test_context_corrects_undershoot_from_fixed_chat_template_tokens(client, monkeypatch):
+    original = client.execute
+
+    async def with_template_overhead(self, spec, **kwargs):
+        result = await original(self, spec, **kwargs)
+        # Token counts have a fixed chat-template cost, not just chars / token.
+        result.input_tokens = int(spec.input_chars / 3.4) + 35
+        return result
+
+    monkeypatch.setattr(client, "execute", with_template_overhead)
+    report = await runner.run_suite(config(checks=["capacity", "context"], context_limit=1024))
+    result = check(report, "context")
+    context = [r for r in report.requests if r.scenario == "context"]
+    assert max(r.input_tokens for r in context[:6]) < 1024 * .8
+    assert result.status == "pass"
+    assert result.metrics["observed_max_input_tokens"] >= 1024 * .8
+    assert len(context) == 12
+    adjustments = result.metrics["calibration"]["adjustments"]
+    assert len(adjustments) == 1
+    source = next(r for r in context if r.id == adjustments[0]["source_request_id"])
+    assert source.input_tokens == adjustments[0]["source_input_tokens"]
+    assert {r.fixture_id for r in context[6:]} == {r.fixture_id for r in context[:6]}
+
+
+@pytest.mark.parametrize("max_requests", [10, 100])
+async def test_context_corrections_are_bounded_and_respect_request_budget(
+    client, monkeypatch, max_requests,
+):
+    original = client.execute
+
+    async def fixed_usage(self, spec, **kwargs):
+        result = await original(self, spec, **kwargs)
+        result.input_tokens = 100
+        return result
+
+    monkeypatch.setattr(client, "execute", fixed_usage)
+    report = await runner.run_suite(config(checks=["context"], context_limit=1024,
+                                          max_requests=max_requests))
+    result = check(report, "context")
+    assert result.status == "inconclusive"
+    assert len(report.requests) <= max_requests
+    context = [r for r in report.requests if r.scenario == "context"]
+    assert len(context) == (6 if max_requests == 10 else 18)
+    assert len(result.metrics["calibration"].get("adjustments", [])) <= 2
+
+
+async def test_context_correction_does_not_erase_an_earlier_wrong_answer(client, monkeypatch):
+    original = client.execute
+    calls = 0
+
+    async def wrong_first_context(self, spec, **kwargs):
+        nonlocal calls
+        result = await original(self, spec, **kwargs)
+        result.input_tokens = int(spec.input_chars / 3.4) + 35
+        if spec.scenario == "context":
+            calls += 1
+            if calls == 1:
+                result.output = "wrong label"
+        return result
+
+    monkeypatch.setattr(client, "execute", wrong_first_context)
+    report = await runner.run_suite(config(checks=["context"], context_limit=1024))
+    result = check(report, "context")
+    assert result.metrics["near_limit_coverage"]
+    assert result.status == "fail"
+    assert result.metrics["correct"] < result.metrics["scored"]
+
+
+@pytest.mark.parametrize("check_id", ["capacity", "fairness", "cancellation", "recovery"])
+async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
+    client, monkeypatch, check_id,
+):
+    original = client.execute
+
+    async def refused_copy(self, spec, **kwargs):
+        result = await original(self, spec, **kwargs)
+        if spec.fixture_id == "short.copy.v2":
+            result.output = "I cannot copy that sentence."
+        return result
+
+    monkeypatch.setattr(client, "execute", refused_copy)
+    report = await runner.run_suite(config(checks=[check_id], limits=Limits(
+        latency_ms=100, fairness_max_ratio=10, min_samples=2,
+    )))
+    result = check(report, check_id)
+    assert result.status == "fail"
+    assert "Answer checks failed" in result.summary
+    assert "short.copy.v2" in result.summary
+    assert "warm-up" in result.summary
+    failure = next(f for f in result.metrics["answer_failures"]
+                   if f["fixture_id"] == "short.copy.v2")
+    assert failure["warmup_failed"] == 1
+    assert failure["failed"] > 0
+
+
+async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeypatch):
+    original = client.execute
+    client.bad_sustained = True
+
+    async def refused_copy(self, spec, **kwargs):
+        result = await original(self, spec, **kwargs)
+        if spec.fixture_id == "short.copy.v2":
+            result.output = "I cannot copy that sentence."
+        return result
+
+    monkeypatch.setattr(client, "execute", refused_copy)
+    report = await runner.run_suite(config(checks=["recovery"],
+                                          limits=Limits(latency_ms=100, min_samples=2)))
+    result = check(report, "recovery")
+    assert result.status == "fail"
+    assert "timing limits exceeded" in result.summary
+    assert "short.copy.v2" in result.summary
+
+
+@pytest.mark.parametrize("fault,message", [
+    ("request", "Request or protocol failures"),
+    ("cap", "Output token caps were also exceeded"),
+])
+async def test_answer_failure_details_preserve_other_cancellation_failures(
+    client, monkeypatch, fault, message,
+):
+    original = client.execute
+
+    async def failed_limit_and_wrong_answer(self, spec, **kwargs):
+        result = await original(self, spec, **kwargs)
+        if spec.fixture_id == "short.copy.v2":
+            result.output = "Wrong answer"
+        if spec.fixture_id == "limits.output_cap.v1":
+            if fault == "request":
+                result.status, result.valid = "failed", False
+            else:
+                result.output_tokens = spec.max_tokens + 1
+        return result
+
+    monkeypatch.setattr(client, "execute", failed_limit_and_wrong_answer)
+    report = await runner.run_suite(config(checks=["cancellation"]))
+    result = check(report, "cancellation")
+    assert result.status == "fail"
+    assert message in result.summary
+    assert "short.copy.v2" in result.summary
+
+
+async def test_generation_uses_dedicated_longer_output_samples():
+    report = await runner.run_suite(config(checks=["generation"],
+                                          limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
+    result = check(report, "generation")
+    assert result.status == "pass"
+    assert result.metrics["generation_rate_samples"] == 2
+    assert {r.scenario for r in report.requests if r.id in result.evidence_ids} == {"generation"}
+
+
+async def test_unstreamed_generation_cannot_pass_a_generation_rate_limit():
+    report = await runner.run_suite(config(checks=["generation"], stream=False,
+                                          limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
+    result = check(report, "generation")
+    assert result.status == "inconclusive"
+    assert result.metrics["generation_rate_samples"] == 0
 
 
 async def test_sustained_timing_failure_visible_even_when_recovery_is_fast(client):
@@ -275,7 +441,7 @@ async def test_capacity_missing_configured_token_rate_is_inconclusive(client, mo
     result = check(report, "capacity")
     assert result.status == "inconclusive"
     assert result.metrics["highest_tested_acceptable_concurrency"] is None
-    assert result.metrics["levels"]["2"]["missing_timing_metrics"] == ["output_tokens_per_second"]
+    assert result.metrics["levels"]["2"]["missing_timing_metrics"] == ["generation_tokens_per_second"]
 
 
 async def test_nonstreaming_cannot_pass_a_stream_gap_limit():
@@ -457,7 +623,7 @@ async def test_recovery_missing_configured_output_rate_is_inconclusive(client, m
                                           limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
     result = check(report, "recovery")
     assert result.status == report.overall == "inconclusive"
-    assert result.metrics["missing_timing_metrics"] == ["output_tokens_per_second"]
+    assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["completed"] == 2
 

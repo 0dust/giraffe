@@ -35,13 +35,13 @@ def custom_entry(**overrides):
 def test_builtins_repeatable_versioned_and_json_opt_in():
     first, second = builtin_fixtures(config()), builtin_fixtures(config())
     assert first == second
-    assert set(first) == {"short", "long", "context", "correctness", "json", "limits", "sustained"}
+    assert set(first) == {"short", "long", "context", "correctness", "json", "limits", "sustained", "generation"}
     assert first["json"] == []
     specs = [spec for group in first.values() for spec in group]
     assert len({spec.fixture_id for spec in specs}) == len(specs)
-    assert all(spec.fixture_id.endswith(".v1") and spec.check_ids for spec in specs)
+    assert all(spec.fixture_id.endswith((".v1", ".v2")) and spec.check_ids for spec in specs)
     assert all(spec.expected is not None for spec in specs)
-    assert FIXTURE_VERSION == "0.1.0"
+    assert FIXTURE_VERSION == "0.1.2"
     assert builtin_fixtures(config(structured_json=True))["json"]
 
 
@@ -57,9 +57,9 @@ def test_context_lengths_are_bounded_and_fact_positions_vary(context_limit):
         text = spec.messages[0]["content"]
         assert spec.input_chars == len(text)
         assert len(text) + spec.max_tokens + 32 <= context_limit
-        assert text.count(f"Code: {spec.expected}.") == 1
-        body = text.removeprefix("Notes:\n").removesuffix("\nReply with the code only.")
-        fact = f"Code: {spec.expected}."
+        assert text.count(f"The box label is {spec.expected}.") == 1
+        body = text.removeprefix("Notes:\n").removesuffix("\nReply with the box label only.")
+        fact = f"The box label is {spec.expected}."
         if spec.context_position == "beginning":
             assert body.startswith(fact)
         elif spec.context_position == "end":
@@ -93,6 +93,17 @@ def test_extraction_and_classification_do_not_accept_reasoning_or_wrong_values()
     assert score_response(classification, record(classification, "B")).score is True
 
 
+def test_reworded_fixtures_still_reject_refusals_and_extra_text():
+    fixtures = builtin_fixtures(config())
+    specs = (fixtures["short"] + fixtures["long"] + fixtures["context"]
+             + [fixtures["correctness"][0]] + fixtures["sustained"])
+    for spec in specs:
+        assert spec.fixture_id.endswith(".v2")
+        assert score_response(spec, record(spec, spec.expected)).score is True
+        for output in ("I can't fulfill this request.", f"The answer is {spec.expected}"):
+            assert score_response(spec, record(spec, output)).score is False
+
+
 def test_scoring_preserves_original_record_and_does_not_pass_incomplete_requests():
     spec = builtin_fixtures(config())["short"][0]
     original = record(spec, spec.expected)
@@ -105,18 +116,18 @@ def test_scoring_preserves_original_record_and_does_not_pass_incomplete_requests
 
 
 @pytest.mark.parametrize("output,expected", [
-    ('{"code":"J6Q2","count":3,"ready":true}', True),
-    ('```json\n{"code":"J6Q2","count":3,"ready":true}\n```', True),
-    ('{"code":"J6Q2","count":"3","ready":true}', False),
-    ('{"code":"J6Q2","count":3}', False),
-    ('{"code":"other","count":3,"ready":true}', False),
-    ('{"code":"J6Q2","count":3,"ready":false}', False),
-    ('{"code":"J6Q2","count":3,"ready":true,"extra":1}', False),
-    ('Result: {"code":"J6Q2","count":3,"ready":true}', False),
-    ('{"code":"J6Q2","count":3,"ready":true} trailing', False),
-    ('{"code":"bad","code":"J6Q2","count":3,"ready":true}', False),
-    ('{"code":"J6Q2","count":NaN,"ready":true}', False),
-    ('{"code":"J6Q2","count":true,"ready":true}', False),
+    ('{"label":"J6Q2","count":3,"ready":true}', True),
+    ('```json\n{"label":"J6Q2","count":3,"ready":true}\n```', True),
+    ('{"label":"J6Q2","count":"3","ready":true}', False),
+    ('{"label":"J6Q2","count":3}', False),
+    ('{"label":"other","count":3,"ready":true}', False),
+    ('{"label":"J6Q2","count":3,"ready":false}', False),
+    ('{"label":"J6Q2","count":3,"ready":true,"extra":1}', False),
+    ('Result: {"label":"J6Q2","count":3,"ready":true}', False),
+    ('{"label":"J6Q2","count":3,"ready":true} trailing', False),
+    ('{"label":"bad","label":"J6Q2","count":3,"ready":true}', False),
+    ('{"label":"J6Q2","count":NaN,"ready":true}', False),
+    ('{"label":"J6Q2","count":true,"ready":true}', False),
 ])
 def test_json_parsing_schema_and_expected_values(output, expected):
     spec = builtin_fixtures(config(structured_json=True))["json"][0]
