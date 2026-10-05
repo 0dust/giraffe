@@ -20,7 +20,7 @@ from typing import Callable
 import httpx
 
 from .client import LLMClient, _headers
-from .fixtures import FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures, score_response
+from .fixtures import FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures, score_response
 from .models import (
     CHECK_NAMES, CheckResult, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
     overall_status,
@@ -48,6 +48,7 @@ def _stats(records: list[RequestRecord]) -> dict:
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
+    generation_rates = [rate for r in good if (rate := r.generation_tokens_per_second) is not None]
     return {
         "attempted": len(records), "completed": len(good),
         "failed": sum(r.status == "failed" or (r.status == "completed" and not r.valid)
@@ -62,6 +63,9 @@ def _stats(records: list[RequestRecord]) -> dict:
                                    if r.max_stream_gap_ms is not None), default=None),
         "output_tokens_per_second_p50": _percentile(rates, .5),
         "output_tokens_per_second_min": min(rates, default=None),
+        "generation_tokens_per_second_p50": _percentile(generation_rates, .5),
+        "generation_tokens_per_second_min": min(generation_rates, default=None),
+        "generation_rate_samples": len(generation_rates),
         "output_tokens": sum(r.output_tokens or 0 for r in good),
         "output_chars": sum(r.output_chars for r in good),
         "scored": sum(r.score is not None for r in records),
@@ -357,14 +361,16 @@ async def _fairness(run, target, client, fixtures):
             await asyncio.gather(waiter, task, return_exceptions=True)
 
 
-async def _context_fixtures(run, target, client, fixtures):
+async def _context_fixtures(run, target, client, fixtures, source=None):
     """Use observed token usage to size deterministic filler, never claim estimated coverage."""
-    candidates = [r for r in run.records if r.target == target.name and r.valid and
-                  r.fixture_id == "long.prefill.v1" and r.input_tokens and r.input_chars]
-    if not candidates:
-        candidates = await run.group(target, client, [fixtures["context"][-2]],
-                                     "context_calibration", count=1, checks=["context"])
-    source = next((r for r in candidates if r.valid and r.input_tokens and r.input_chars), None)
+    if source is None:
+        long_fixture_ids = {spec.fixture_id for spec in fixtures["long"]}
+        candidates = [r for r in run.records if r.target == target.name and r.valid and
+                      r.fixture_id in long_fixture_ids and r.input_tokens and r.input_chars]
+        if not candidates:
+            candidates = await run.group(target, client, [fixtures["context"][-2]],
+                                         "context_calibration", count=1, checks=["context"])
+        source = next((r for r in candidates if r.valid and r.input_tokens and r.input_chars), None)
     if source is None:
         run.observations[target.name]["context_calibration"] = {"status": "unavailable", "reason": "Server input token usage unavailable"}
         return fixtures["context"]
@@ -372,12 +378,17 @@ async def _context_fixtures(run, target, client, fixtures):
     character_budget = int(source.input_chars * desired_tokens / source.input_tokens)
     fixture_context_limit = max(128, min(run.config.context_limit * 16,
                                         character_budget + min(24, run.config.max_output_tokens) + 32))
-    run.observations[target.name]["context_calibration"] = {
+    calibration = {
         "status": "sized_from_observed_usage", "source_request_id": source.id,
         "source_input_tokens": source.input_tokens, "source_input_chars": source.input_chars,
         "desired_input_tokens": desired_tokens, "fixture_context_limit": fixture_context_limit,
         "method": "builtin_fixtures(config with this fixture_context_limit); actual coverage uses returned usage",
     }
+    previous = run.observations[target.name].get("context_calibration")
+    if previous and previous["status"] == "sized_from_observed_usage":
+        previous.setdefault("adjustments", []).append(calibration)
+    else:
+        run.observations[target.name]["context_calibration"] = calibration
     return builtin_fixtures(run.config.model_copy(update={"context_limit": fixture_context_limit}))["context"]
 
 
@@ -401,6 +412,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     restart["reason"] = "No successful inference within readiness budget"
                     return
             await run.group(target, client, fixtures["short"], "warm")
+            if "generation" in enabled:
+                await run.group(target, client, fixtures["generation"], "generation",
+                                checks=["generation"])
             if "capacity" in enabled:
                 for level in _levels(config.concurrency):
                     records = []
@@ -413,8 +427,23 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await _fairness(run, target, client, fixtures)
             if "context" in enabled:
                 context_fixtures = await _context_fixtures(run, target, client, fixtures)
-                await run.group(target, client, context_fixtures, "context",
-                                count=max(config.samples, len(fixtures["context"])), checks=["context"])
+                count = max(config.samples, len(fixtures["context"]))
+                for attempt in range(3):
+                    records = await run.group(target, client, context_fixtures, "context",
+                                              count=count, checks=["context"])
+                    source = max((r for r in records if r.valid and r.input_tokens
+                                  and r.input_chars), key=lambda r: r.input_tokens, default=None)
+                    if source is None or source.input_tokens >= config.context_limit * .8:
+                        break
+                    remaining = min(config.max_requests - run.attempted,
+                                    run.quotas[target.name] - run.counts[target.name])
+                    if attempt == 2 or len(records) < count or remaining < count:
+                        break
+                    # Fixed chat-template tokens make one proportional estimate undershoot.
+                    # Correct from measured usage, retaining every earlier answer and score.
+                    context_fixtures = await _context_fixtures(
+                        run, target, client, fixtures, source=source,
+                    )
             if "correctness" in enabled:
                 await run.group(target, client, fixtures["correctness"],
                                 f"correctness_c{config.concurrency}",
@@ -483,7 +512,9 @@ def _timing_violations(records, limits):
             failures.append(record.id)
         elif limits.stream_gap_ms and record.max_stream_gap_ms is not None and record.max_stream_gap_ms > limits.stream_gap_ms:
             failures.append(record.id)
-        elif limits.min_output_tokens_per_second and record.output_tokens is not None and record.elapsed_ms > 0 and record.output_tokens / (record.elapsed_ms/1000) < limits.min_output_tokens_per_second:
+        elif (limits.min_output_tokens_per_second
+              and (rate := record.generation_tokens_per_second) is not None
+              and rate < limits.min_output_tokens_per_second):
             failures.append(record.id)
     return failures
 
@@ -497,11 +528,25 @@ def _missing_timing(records, limits):
             missing.add("first_output_ms")
         if limits.stream_gap_ms is not None and (not record.stream or record.max_stream_gap_ms is None):
             missing.add("stream_gap_ms")
-        if limits.min_output_tokens_per_second is not None and (record.output_tokens is None or record.elapsed_ms <= 0):
-            missing.add("output_tokens_per_second")
+        if (limits.min_output_tokens_per_second is not None
+                and record.output_tokens != 1 and record.generation_tokens_per_second is None):
+            missing.add("generation_tokens_per_second")
         if limits.latency_ms is not None and record.elapsed_ms <= 0:
             missing.add("latency_ms")
+    if (limits.min_output_tokens_per_second is not None
+            and not any(r.generation_tokens_per_second is not None for r in records)):
+        missing.add("generation_tokens_per_second")
     return sorted(missing)
+
+
+def _answer_failures(records: list[RequestRecord], warm: list[RequestRecord]) -> list[dict]:
+    failed = Counter(r.fixture_id for r in records if r.score is False)
+    scored = Counter(r.fixture_id for r in records if r.score is not None)
+    warmup_failed = Counter(r.fixture_id for r in warm if r.score is False)
+    warmup_scored = Counter(r.fixture_id for r in warm if r.score is not None)
+    return [{"fixture_id": fixture, "failed": failed[fixture], "scored": scored[fixture],
+             "warmup_failed": warmup_failed[fixture], "warmup_scored": warmup_scored[fixture]}
+            for fixture in sorted(failed)]
 
 
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
@@ -523,6 +568,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             records = [r for r in all_records if check_id in r.check_ids]
         if check_id in {"first_output", "generation"}:
             records = [r for r in records if r.scenario not in {"initial", "readiness"}]
+        if check_id == "generation":
+            records = [r for r in records if r.scenario == "generation"]
         metrics, status, summary = _stats(records), "pass", "Observed requests met configured checks."
         if check_id not in config.checks or (check_id == "json" and not config.structured_json) or (check_id == "gpu" and not config.metrics):
             status, summary = "skipped", "Not selected for this run."
@@ -579,6 +626,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits.model_copy(update={"first_output_ms": None}))
                 status, summary = "inconclusive", "Configured generation limits cannot be checked with available stream or token measurements."
+            elif (check_id == "generation" and limits.min_output_tokens_per_second is not None
+                  and metrics["generation_rate_samples"] < limits.min_samples):
+                status, summary = "inconclusive", "Too few measurable streamed answers to assess generation pace."
         elif check_id == "capacity":
             levels = observations["capacity"]
             accepted = []
@@ -691,6 +741,36 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."
             else:
                 summary = "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified."
+        if status == "fail" and check_id in {"capacity", "fairness", "cancellation", "recovery"}:
+            answer_failures = _answer_failures(records, warm)
+            if answer_failures:
+                metrics["answer_failures"] = answer_failures
+                details = "; ".join(f"{row['fixture_id']} ({row['failed']}/{row['scored']})"
+                                    for row in answer_failures)
+                summary = f"Answer checks failed: {details}."
+                if any(row["warmup_failed"] for row in answer_failures):
+                    summary += " Some of these fixtures also failed during warm-up."
+                ordinary_records = [r for r in records if r.scenario not in {
+                    "client_cancel", "client_deadline",
+                }]
+                if any(not r.valid or r.status != "completed" for r in ordinary_records):
+                    summary += " Request or protocol failures were also observed."
+                timing_failed = False
+                if check_id in {"capacity", "recovery"}:
+                    timing_failed = bool(_timing_violations(ordinary_records, limits))
+                elif check_id == "fairness":
+                    mixed = metrics["mixed_short"]
+                    ratio = metrics["latency_ratio"]
+                    timing_failed = bool(
+                        (limits.fairness_max_ratio and ratio is not None
+                         and ratio > limits.fairness_max_ratio)
+                        or (limits.stream_gap_ms and mixed["max_stream_gap_ms"] is not None
+                            and mixed["max_stream_gap_ms"] > limits.stream_gap_ms)
+                    )
+                if timing_failed and not saturated:
+                    summary += " Configured timing limits exceeded."
+                if check_id == "cancellation" and metrics.get("output_cap_violations"):
+                    summary += " Output token caps were also exceeded."
         if status == "pass" and check_id in run.unfinished[target.name]:
             status, summary = "inconclusive", "This check was unfinished when a run budget or stop condition was reached."
         if metrics.get("completed", 0) < limits.min_samples and status not in {"skipped", "blocked"}:
@@ -761,7 +841,8 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                                "target_request_quotas": run.quotas},
                 "scenario_counts": dict(counts)}
     run.emit("run_finished", abort_reason=run.reason)
-    return RunReport(run_id=run_id, started_at=started_at, finished_at=_now(),
+    return RunReport(run_id=run_id, suite_version=SUITE_VERSION,
+                     started_at=started_at, finished_at=_now(),
                      overall=overall_status(checks, run.reason), manifest=manifest, checks=checks,
                      requests=run.records, warnings=warnings, observations=observations,
                      abort_reason=run.reason)

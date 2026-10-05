@@ -108,6 +108,8 @@ def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
             r.max_stream_gap_ms for r in completed if r.max_stream_gap_ms is not None
         ],
         "output_tokens_per_second": [value for r in completed if (value := _rate(r)) is not None],
+        "generation_tokens_per_second": [value for r in completed
+                                         if (value := r.generation_tokens_per_second) is not None],
     }
 
 
@@ -144,7 +146,8 @@ def _compare_metric(
     is_rate = name.endswith("_rate")
     aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
     current_value, old_value = aggregate(current), aggregate(old)
-    higher_is_better = name in {"correctness_rate", "valid_completion_rate", "output_tokens_per_second"}
+    higher_is_better = name in {"correctness_rate", "valid_completion_rate", "output_tokens_per_second",
+                               "generation_tokens_per_second"}
     direction = -1 if higher_is_better else 1
     # Rates use percentage points, avoiding undefined percentages for a zero baseline error rate.
     scale = 100 if is_rate else (100 / old_value if old_value > 0 else None)
@@ -236,10 +239,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if not values and not old_metrics[metric]:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
-                    if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second"}:
+                    if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         row.update(status="inconclusive", reason="Actual generated output lengths differ "
                                    "materially; these performance samples are not like-for-like.")
-                    if saturated_runs and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second"}:
+                    if saturated_runs and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         row.update(status="inconclusive", reason=" / ".join(saturated_runs) +
                                    " generator scheduling lag prevents a reliable timing/rate comparison.")
                     row.update(check=check, scenario=scenario,
@@ -389,7 +392,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                  'are counted alongside them. Small samples do not establish tail latency.</p>'
                  '<div class="table"><table><tr><th>Target / scenario</th><th>Requests</th>'
                  '<th>Valid</th><th>Errors / timeouts</th><th>Cancelled</th><th>Latency p50 / p95 ms</th>'
-                 '<th>First output p50 ms</th><th>Scored correct</th></tr>')
+                 '<th>First output p50 ms</th><th>Generation pace p50 tok/s (estimate)</th>'
+                 '<th>End-to-end output p50 tok/s</th><th>Scored correct</th></tr>')
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in report.requests:
         groups[(record.target, record.scenario)].append(record)
@@ -397,6 +401,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
         valid = [r for r in records if r.valid and r.status == "completed"]
         times = [r.elapsed_ms for r in valid]
         first = [r.first_output_ms for r in valid if r.first_output_ms is not None]
+        generation = [rate for r in valid if (rate := r.generation_tokens_per_second) is not None]
+        end_to_end = [rate for r in valid if (rate := _rate(r)) is not None]
         scored = [r for r in records if r.score is not None]
         parts.append(f'<tr><td>{_e(target)} / {_e(scenario)}</td><td>{len(records)}</td><td>{len(valid)}</td>'
                      f'<td>{sum(r.status == "failed" for r in records)} / '
@@ -404,6 +410,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'<td>{sum(r.status == "cancelled" for r in records)}</td>'
                      f'<td>{_number(_percentile(times, .5))} / {_number(_percentile(times, .95))}</td>'
                      f'<td>{_number(_percentile(first, .5))}</td>'
+                     f'<td>{_number(_percentile(generation, .5))} (n={len(generation)})</td>'
+                     f'<td>{_number(_percentile(end_to_end, .5))}</td>'
                      f'<td>{sum(r.score is True for r in scored)} / {len(scored)}</td></tr>')
     parts.append('</table></div></section><section id="baseline"><h2>Baseline comparison</h2>')
     if report.baseline:

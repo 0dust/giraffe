@@ -18,8 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field, ValidationError
 
-from giraffe import __version__
-from giraffe.fixtures import load_custom_fixtures
+from giraffe.fixtures import SUITE_VERSION, load_custom_fixtures
 from giraffe.models import CHECK_NAMES, Model, RunConfig, RunReport
 from giraffe.reporting import compare_baseline, write_report
 from giraffe.runner import run_suite
@@ -264,7 +263,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         return {"config": _bootstrap_config(defaults), "checks": [
             {"id": key, "title": title, "description": _DESCRIPTIONS[key],
              "optional": key in {"json", "gpu"}} for key, title in CHECK_NAMES.items()],
-            "active_run_id": active.get("id"), "suite_version": __version__}
+            "active_run_id": active.get("id"), "suite_version": SUITE_VERSION}
 
     @app.get("/api/runs")
     async def list_runs():

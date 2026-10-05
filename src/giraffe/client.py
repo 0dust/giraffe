@@ -219,6 +219,10 @@ class LLMClient:
                             record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
                         )
                     last_answer = now
+                    if streaming:
+                        record.answer_chunks += 1
+                if record.first_output_ms is not None:
+                    record.last_output_ms = (now - start) * 1000
             if reasoning:
                 record.reasoning += reasoning
                 if record.first_reasoning_ms is None:

@@ -150,6 +150,8 @@ class RequestRecord(Model):
     error: str | None = None
     elapsed_ms: float = 0
     first_output_ms: float | None = None
+    last_output_ms: float | None = None
+    answer_chunks: int = 0
     first_reasoning_ms: float | None = None
     max_stream_gap_ms: float | None = None
     completion_tokens: int | None = None
@@ -170,6 +172,21 @@ class RequestRecord(Model):
     requested_max_tokens: int = 0
     stream: bool = True
 
+    @property
+    def generation_tokens_per_second(self) -> float | None:
+        """Client-observed estimate; streamed chunks are not individual tokens.
+
+        Exclude the first token and time before the first useful answer. Waiting
+        for usage, finish markers or stream cleanup must not slow generation.
+        Legacy records and single-chunk/non-streamed answers lack this evidence.
+        """
+        if (not self.valid or self.status != "completed" or not self.stream
+                or self.output_tokens is None or self.output_tokens <= 1
+                or self.answer_chunks < 2 or self.first_output_ms is None
+                or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms):
+            return None
+        return (self.output_tokens - 1) * 1000 / (self.last_output_ms - self.first_output_ms)
+
 
 class CheckResult(Model):
     id: str
@@ -183,7 +200,7 @@ class CheckResult(Model):
 
 
 class RunReport(Model):
-    schema_version: str = "1"
+    schema_version: str = "2"
     suite_version: str = "0.1.0"
     run_id: str
     started_at: str

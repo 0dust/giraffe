@@ -127,6 +127,43 @@ async def test_first_answer_waits_for_reasoning_and_counts_trailing_stall(monkey
     assert result.output == "42" and result.reasoning == "thinking"
 
 
+async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch):
+    from types import SimpleNamespace
+
+    client, _, _ = setup_client(monkeypatch, [
+        event("33"), event("692F"),
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        b'"usage":{"completion_tokens":4}}\n\n',
+        b'data: [DONE]\n\n',
+    ])
+    timestamps = iter([0, 39, 39.25, 44, 45])
+    monkeypatch.setattr("giraffe.client.time", SimpleNamespace(perf_counter=lambda: next(timestamps)))
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.output == "33692F"
+    assert result.first_output_ms == 39000
+    assert result.last_output_ms == 39250
+    assert result.elapsed_ms == 45000
+    assert result.answer_chunks == 2
+    assert result.generation_tokens_per_second == 12
+
+
+@pytest.mark.parametrize("trailer", [[], [event("   ")]])
+async def test_single_answer_chunk_is_not_a_generation_speed_measurement(monkeypatch, trailer):
+    client, _, _ = setup_client(monkeypatch, [
+        event("a complete answer"), *trailer,
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        b'"usage":{"completion_tokens":4}}\n\n',
+        b'data: [DONE]\n\n',
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.answer_chunks == 1
+    if not trailer:
+        assert result.last_output_ms == result.first_output_ms
+    assert result.generation_tokens_per_second is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("chunks", "error"), [
     ([event("42"), event(finish="stop")], "without [DONE]"),
