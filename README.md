@@ -4,6 +4,9 @@ Run a built-in test suite against an existing OpenAI-compatible LLM endpoint.
 See which requests failed, where output stalled, whether known answers changed,
 and what regressed against a saved run. Results stay in local HTML and JSON files.
 
+Licensed under [Apache-2.0](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the branch and approval policy.
+
 ## Install
 
 Python 3.11+ on macOS or Linux:
