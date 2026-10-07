@@ -28,7 +28,7 @@ server, executes imported commands or recreates inaccessible server state.
 | Setting | Behavior | Evidence and limitations |
 | --- | --- | --- |
 | `arrivals` | Steady RPS or bursts, independent of the concurrency cap | Scheduled arrival, dispatch, completion, waiting and unissued counts; a bounded pending queue drops excess arrivals visibly. Seed is recorded; current schedule is deterministic and has no jitter. |
-| `prefix` | Shared prefix plus independent-prefix controls, then increasing fixed history | Order, character shape, observed input tokens, first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
+| `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
 | `buckets` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
 | `buckets.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the exact completed answer from that session; fixed history uses saved answers. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
@@ -37,7 +37,9 @@ server, executes imported commands or recreates inaccessible server state.
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
 Conversation fixtures, modes, generation options, schedules and seeds contribute
-to the workload fixture hash in the manifest. Live histories may change input
+to the workload fixture hash in the manifest, together with a hash of the loaded
+workload generator source. Source changes conservatively prevent like-for-like
+baseline comparison even when settings stay the same. Live histories may change input
 work across runs: comparison checks observed input lengths and request hashes and
 marks affected timing/rates inconclusive rather than claiming identical inputs.
 Log-probability requests can be supplied through request options, but Giraffe does
@@ -50,6 +52,12 @@ scenario, including error time in the window. Missing output usage leaves aggreg
 token throughput unknown. Per-request generation pace remains a client-observed
 estimate between first/last answer chunks, separate from end-to-end throughput and
 server TTFT statistics.
+
+Timing acceptance uses the same generator scheduling-lag qualification for core
+and additional workloads. If the generator cannot keep up, configured timing
+limits remain inconclusive; observed task/protocol failures remain failures.
+Mixed-load latency ratios require enough successful control/load samples and
+actual overlap before they can fail the interference check.
 
 ## Deployment metadata
 
@@ -69,7 +77,8 @@ Arguments are never executed by discovery. Preserve precedence-sensitive orderin
 Arbitrary environment dumps and unknown top-level configuration fields are excluded.
 
 Discovery is optional and read-only: `discovery: ollama` reads `/api/version` and
-`/api/show`; `discovery: vllm` reads `/version`. Served model identifiers also come
+`/api/show`, with optional `/api/tags` and `/api/ps` for matching model digests and
+active context length; `discovery: vllm` reads `/version`. Served model identifiers also come
 from inference responses. A separately configured `collector_url` can return an
 allowlisted JSON export with `scope` and `collected_at`. A collector never inherits
 inference credentials. Use an accessible read-only export, not a privileged agent

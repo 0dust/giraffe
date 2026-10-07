@@ -187,7 +187,8 @@ def main(argv: list[str] | None = None) -> int:
             from giraffe.reporting import reproduction_export, _retained
             report = _retained(load_report(args.report))
             value = reproduction_export(report) if args.command == "export" else {
-                "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline}
+                "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline,
+                "workload_selection": report.manifest.get("workload_selection", {})}
             print(json.dumps(value, indent=2, allow_nan=False))
             return 0
         if args.command == "baseline":

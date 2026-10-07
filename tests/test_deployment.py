@@ -65,6 +65,21 @@ async def test_imported_snapshot_keeps_source_scope_and_original_collection_time
     assert fields["runtime.engine"]["configured"]["provenance"] == "user-supplied"
 
 
+@pytest.mark.parametrize("intended", ["fake-model", "different-model"])
+async def test_observed_served_model_preserves_configured_identity_and_updates_unknowns(intended):
+    with FakeEndpoint() as endpoint:
+        report = await run_suite(config(
+            endpoint,
+            targets=[target(endpoint, deployment={"model": {"served": intended}})],
+        ))
+    snapshot = report.observations["targets"]["local"]["deployment"]
+    row = snapshot["fields"]["model.served"]
+    assert row["configured"]["value"] == intended
+    assert row["reported"]["value"] == ["fake-model"]
+    assert "model.served" not in snapshot["unknown_fields"]
+    assert (row.get("status") == "conflicting") == (intended != "fake-model")
+
+
 @pytest.mark.parametrize("timestamp", [[], "password=hidden-time-secret"])
 async def test_invalid_collector_timestamp_does_not_block_inference_or_leak_secrets(timestamp):
     with FakeEndpoint() as endpoint:
@@ -132,6 +147,8 @@ async def test_ollama_discovery_uses_actual_runtime_response():
     fields = report.observations["targets"]["local"]["deployment"]["fields"]
     assert fields["model.quantization"]["reported"]["value"] == "Q4_K_M"
     assert fields["runtime.engine"]["reported"]["value"] == "ollama"
+    assert fields["model.digest"]["reported"]["value"] == "model-digest"
+    assert fields["serving.context_limit"]["reported"]["value"] == 2048
 
 
 async def test_periodic_serving_scrapes_cover_phases_bounded_cardinality_and_samples():

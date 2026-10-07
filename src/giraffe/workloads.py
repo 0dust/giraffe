@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import time
 from collections import Counter
+from pathlib import Path
 
 from giraffe.models import CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec
+
+# Capture the loaded generator's identity, including deterministic fixture construction.
+FIXTURE_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def spec(prompt, scenario, check, *, expected=None, max_tokens=24, options=None, **workload):
@@ -132,12 +137,16 @@ async def arrivals(run, target, client, fixtures):
 
 async def prefixes(run, target, client):
     settings = run.config.prefix
-    prefix = (" The box is gray." * (settings.prefix_chars // 17 + 1))[: settings.prefix_chars]
+    prefix = (" The rock is gray." * (settings.prefix_chars // 18 + 1))[: settings.prefix_chars]
     for index in range(settings.repeats):
         for kind in ("shared", "independent"):
             # Deterministic controls of equal character length; observed token counts stay separate.
-            control = hashlib.sha256(f"control-{index}".encode()).hexdigest()
-            matched = (control * (len(prefix) // len(control) + 1))[: len(prefix)]
+            rng = random.Random(index)
+            matched = "".join(
+                f" The {rng.choice(('tree', 'bird', 'boat', 'rock'))} is "
+                f"{rng.choice(('blue', 'gray', 'pink', 'gold'))}."
+                for _ in range(len(prefix) // 18 + 1)
+            )[: len(prefix)]
             prompt = label_prompt(len(prefix) + 80, prefix if kind == "shared" else matched)
             prompt += f"\nTrial {index:04d}."
             request = spec(
@@ -466,7 +475,7 @@ async def execute(run, target, client, fixtures):
             run.emit("scenario_finished", target.name, field)
 
 
-def results(run, target, stats, violations, missing_timing):
+def results(run, target, stats, violations, missing_timing, *, saturated=False):
     result = []
     selected = set(run.config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
@@ -509,7 +518,10 @@ def results(run, target, stats, violations, missing_timing):
                     or entry["achieved_overlap"] < items[0].workload["level"]
                 ):
                     if status != "fail":
-                        status = "inconclusive"
+                        status, summary = (
+                            "inconclusive",
+                            "Repetition/load coverage lacks sufficient samples or observed overlap.",
+                        )
             if check == "buckets":
                 level = items[0].workload["level"]
                 expected = items[0].workload["requested_output_tokens"]
@@ -517,18 +529,23 @@ def results(run, target, stats, violations, missing_timing):
                     r.output_tokens is not None and r.output_tokens >= expected * 0.5 for r in items
                 )
                 entry["input_length_verified"] = sum(r.input_tokens is not None for r in items)
-                if (
-                    len(items) < run.config.buckets.samples_per_bucket
-                    or entry["completed"] < minimum
-                    or entry["achieved_overlap"] < level
-                    or (
-                        items[0].workload["output_bucket"] != "short"
-                        and entry["output_length_exercised"] < minimum
-                    )
-                    or not entry["input_length_verified"]
-                ):
+                gaps = []
+                if len(items) < run.config.buckets.samples_per_bucket or entry["completed"] < minimum:
+                    gaps.append("Insufficient requested or successful samples.")
+                if entry["achieved_overlap"] < level:
+                    gaps.append("Requested concurrency was not observed.")
+                if (items[0].workload["output_bucket"] != "short"
+                        and entry["output_length_exercised"] < minimum):
+                    gaps.append("Requested output length was not sufficiently exercised; a cap alone is not coverage.")
+                if not entry["input_length_verified"]:
+                    gaps.append("Actual input token lengths are unknown.")
+                entry["coverage_gaps"] = gaps
+                if gaps:
                     if status != "fail":
-                        status = "inconclusive"
+                        status, summary = (
+                            "inconclusive",
+                            "Some length/load cells lack sufficient samples, achieved overlap or observed lengths; see per-cell coverage gaps.",
+                        )
             if check == "prefix":
                 entry["cache_observations"] = [
                     {
@@ -542,6 +559,21 @@ def results(run, target, stats, violations, missing_timing):
                 ]
             groups[scenario] = entry
         metrics["buckets"] = groups
+        if check == "prefix":
+            shared = [r for r in records if r.scenario == "prefix_shared"]
+            independent = [r for r in records if r.scenario == "prefix_independent"]
+            first, repeat = stats(shared[:1]), stats(shared[1:])
+            metrics["first_repeat"] = {
+                "shared_first": first,
+                "shared_repeats": repeat,
+                "independent_controls": stats(independent),
+                "repeat_to_first_first_output_ratio": (
+                    repeat["first_output_p50_ms"] / first["first_output_p50_ms"]
+                    if repeat["first_output_p50_ms"] is not None
+                    and first["first_output_p50_ms"] else None
+                ),
+                "interpretation": "First observed use is not proof of an empty cache; timing alone does not establish reuse.",
+            }
         if check == "arrivals":
             metrics["schedule"] = run.observations[target.name].get("arrivals", {})
             if metrics["schedule"].get("unissued") or metrics["schedule"].get("delayed"):
@@ -571,6 +603,11 @@ def results(run, target, stats, violations, missing_timing):
                     else None
                 )
                 observed = row["achieved_overlap"] >= 2
+                qualified = (
+                    observed
+                    and control["completed"] >= minimum
+                    and row["completed"] >= max(minimum, run.config.buckets.mixed_pairs)
+                )
                 comparisons.append(
                     {
                         "scenario": name,
@@ -578,17 +615,20 @@ def results(run, target, stats, violations, missing_timing):
                         "mixed_short": row,
                         "latency_ratio": ratio,
                         "overlap_observed": observed,
+                        "samples_and_overlap_qualified": qualified,
                     }
                 )
+                if not qualified and status != "fail":
+                    status, summary = (
+                        "inconclusive",
+                        "Mixed-load comparison lacks sufficient control/load samples or observed overlap.",
+                    )
                 if (
-                    not observed or row["completed"] < run.config.buckets.mixed_pairs
-                ) and status != "fail":
-                    status = "inconclusive"
-                if (
-                    ratio is not None
+                    qualified
+                    and ratio is not None
                     and run.config.limits.fairness_max_ratio
                     and ratio > run.config.limits.fairness_max_ratio
-                    and run.max_lag_ms <= 100
+                    and not saturated
                 ):
                     status, summary = (
                         "fail",
@@ -660,13 +700,25 @@ def results(run, target, stats, violations, missing_timing):
                 )
         if timing:
             metrics["timing_violations"] = timing
-            if run.max_lag_ms > 100 and status != "fail":
+            if saturated and status != "fail":
                 status, summary = (
                     "inconclusive",
                     "Generator saturation prevents attributing timing violations to the endpoint.",
                 )
-            elif run.max_lag_ms <= 100:
+            elif not saturated:
                 status, summary = "fail", "Workload exceeded configured timing limits."
+        if (
+            saturated
+            and check != "tools"
+            and status != "fail"
+            and any((run.config.limits.first_output_ms, run.config.limits.latency_ms,
+                     run.config.limits.stream_gap_ms,
+                     run.config.limits.min_output_tokens_per_second))
+        ):
+            status, summary = (
+                "inconclusive",
+                "Generator saturation prevents qualifying configured workload timing limits.",
+            )
         if not records or (check in run.unfinished[target.name] and status != "fail"):
             status, summary = (
                 "inconclusive",

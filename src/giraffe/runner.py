@@ -523,7 +523,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 current["continuity"] = "unstable"
                 current["observed_model_identity_changes"] = True
             if served:
-                current["fields"]["model.served"] = {"reported": deployment._fact(served, "runtime-reported", current["scope"], _now())}
+                row = current["fields"].setdefault("model.served", {})
+                row["reported"] = deployment._fact(served, "runtime-reported", current["scope"], _now())
+                if "configured" in row and row["configured"]["value"] not in (served, served[0] if len(served) == 1 else served):
+                    row["status"] = "conflicting"
+                current["unknown_fields"] = [key for key in current["unknown_fields"] if key != "model.served"]
 
 
 def _levels(concurrency):
@@ -814,7 +818,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                   summary=summary, metrics=metrics,
                                   evidence_ids=[r.id for r in records]))
     from giraffe.workloads import results
-    return result + results(run, target, _stats, _timing_violations, _missing_timing)
+    return result + results(run, target, _stats, _timing_violations, _missing_timing,
+                            saturated=saturated)
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
@@ -867,12 +872,21 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
-    manifest = {"config": config.model_dump(mode="json"),
+    from giraffe.workloads import FIXTURE_SOURCE_SHA256
+    config_values = config.model_dump(mode="json")
+    workload_settings = {key: config_values[key] for key in (
+        "arrivals", "prefix", "buckets", "sessions", "consistency", "tool_calling",
+        "forced_tool_diagnostic",
+    )}
+    manifest = {"config": config_values,
+                "workload_selection": {key: "selected" if key in config.checks else "not selected"
+                                       for key in CHECK_NAMES if key not in CORE_CHECKS},
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": fixture_hash({k: [s.model_dump() for s in v] for k,v in fixtures.items()}),
                                  "workload_fixture_sha256": fixture_hash({
-                                     k: config.model_dump(mode="json")[k] for k in ("arrivals", "prefix", "buckets", "sessions", "consistency", "tool_calling", "forced_tool_diagnostic")})},
+                                     "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
+                                     "settings": workload_settings})},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),
                                  "machine": platform.machine(), "python": platform.python_version()},
                 "load_shape": {"levels": _levels(config.concurrency), "overlap_models": config.overlap_models,

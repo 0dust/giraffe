@@ -298,6 +298,10 @@ or rollback.
 
 ## Tested compatibility
 
+The expanded workloads and deployment/telemetry capture have a separate
+[October 8 validation record](docs/validation/2026-10-08.md), with runnable
+configurations, real Ollama and vLLM-Metal results, endpoint failures and coverage gaps.
+
 Verified locally on October 4, 2026 with Python 3.12 on macOS:
 
 | Endpoint | Model | Verified behavior |
