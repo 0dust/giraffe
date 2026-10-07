@@ -112,6 +112,22 @@ Saving a baseline is explicit. Subsequent runs never replace it; replacement
 requires `baseline save ... --replace`. A baseline may contain failures: comparison
 reports change, while absolute checks still evaluate the current run.
 
+## Additional workloads and deployment evidence
+
+Opt-in arrivals, shared prefixes, input/output buckets, mixed traffic, fixed/live
+conversations, repeated-request consistency and parsed tool-calling checks use the
+same global budgets. Deployment snapshots and bounded serving-metrics collection
+keep configuration changes, provenance, missing data and performance evidence
+alongside an explicit baseline. The CLI, local UI, HTML and JSON expose the same
+configuration and evidence.
+
+Read [the workload and telemetry guide](docs/workloads.md) and use
+[the expanded example](examples/workloads.yaml). Export a sanitized reproduction
+snapshot with `giraffe export runs/after/report.json`, or inspect deployment,
+telemetry and comparison evidence with `giraffe inspect runs/after/report.json`.
+New workloads stay disabled unless configured; missing internal telemetry stays
+unverified.
+
 ## What runs
 
 | Check | Built-in workload / measurement |

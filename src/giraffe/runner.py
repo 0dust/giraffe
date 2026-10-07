@@ -4,25 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from giraffe.deployment import fixture_hash
 import math
 import platform
 import re
 import socket
-import ssl
 import time
 import uuid
-from urllib.parse import urlsplit
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-import httpx
 
-from .client import LLMClient, _headers
+from .client import LLMClient
 from .fixtures import FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures, score_response
 from .models import (
-    CHECK_NAMES, CheckResult, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
+    CHECK_NAMES, CORE_CHECKS, CheckResult, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
     overall_status,
 )
 
@@ -49,7 +47,7 @@ def _stats(records: list[RequestRecord]) -> dict:
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
     generation_rates = [rate for r in good if (rate := r.generation_tokens_per_second) is not None]
-    return {
+    result = {
         "attempted": len(records), "completed": len(good),
         "failed": sum(r.status == "failed" or (r.status == "completed" and not r.valid)
                       for r in records),
@@ -70,7 +68,18 @@ def _stats(records: list[RequestRecord]) -> dict:
         "output_chars": sum(r.output_chars for r in good),
         "scored": sum(r.score is not None for r in records),
         "correct": sum(r.score is True for r in records),
+        "actual_input_tokens": [r.input_tokens for r in records if r.input_tokens is not None],
+        "unknown_input_length": sum(r.input_tokens is None for r in records),
+        "actual_output_tokens": [r.output_tokens for r in records if r.output_tokens is not None],
+        "unknown_output_length": sum(r.output_tokens is None for r in records),
+        "finish_reasons": dict(Counter(r.finish_reason or "unknown" for r in records)),
+        "measurement_window_ms": max((r.completed_ms or 0 for r in records), default=0)-min((r.dispatch_ms or 0 for r in records), default=0),
     }
+
+    window = result["measurement_window_ms"]/1000
+    result["completed_requests_per_second"] = result["completed"]/window if window>0 else None
+    result["aggregate_output_tokens_per_second"] = result["output_tokens"]/window if window>0 and not result["unknown_output_length"] else None
+    return result
 
 
 def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSpec:
@@ -103,8 +112,21 @@ class _Run:
         self.active = Counter()
         self.peak = Counter()
         self.max_lag_ms = 0.0
+        self.inflight = []
+        for observation in self.observations.values():
+            observation.update(deployment=None, deployment_history=[], phase_boundaries=[],
+                serving_telemetry={"snapshots": [], "sample_limit_reached": False,
+                    "sampling_interval_seconds": config.metrics_interval_seconds,
+                    "timeout_seconds": config.metrics_timeout_seconds,
+                    "max_samples": config.metrics_max_samples,
+                    "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
 
     def emit(self, event: str, target: str = "", scenario: str = "", **extra):
+        if target and event in {"scenario_started", "scenario_finished"}:
+            boundaries = self.observations[target]["phase_boundaries"]
+            if len(boundaries)<512:
+                boundaries.append({"event": event, "phase": scenario,
+                                   "elapsed_seconds": time.monotonic()-self.start})
         if self.progress:
             self.progress({"event": event, "target": target, "scenario": scenario,
                            "completed": len(self.records), "attempted": self.attempted,
@@ -134,6 +156,12 @@ class _Run:
             self.active[key] += 1
             self.peak[key] = max(self.peak[key], self.active[key])
             started, started_at = time.monotonic(), _now()
+            slot = {"target": target.name, "peak": 1}
+            self.inflight.append(slot)
+            concurrent = sum(item["target"]==target.name for item in self.inflight)
+            for item in self.inflight:
+                if item["target"]==target.name:
+                    item["peak"] = max(item["peak"], concurrent)
             if on_start:
                 on_start()
             self.emit("request_started", target.name, spec.scenario)
@@ -171,9 +199,17 @@ class _Run:
                 )
             finally:
                 self.active[key] -= 1
+                self.inflight.remove(slot)
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
+            record.completed_at = _now()
+            record.dispatch_ms = (started-self.start)*1000
+            record.completed_ms = (time.monotonic()-self.start)*1000
+            record.workload = dict(spec.workload)
+            record.scheduled_ms = spec.workload.get("scheduled_ms")
+            record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
+            record.overlap = slot["peak"]
             record = score_response(spec, record)
             self.records.append(record)
             intentional = (spec.cancel_after_ms is not None and record.status == "cancelled") or (
@@ -272,58 +308,16 @@ _METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*?\})?\s+'
                           r'(?:\s+(\d+(?:\.\d+)?))?\s*$')
 
 
-async def _metrics(run: _Run, target: Target, phase: str):
-    snapshot = {"phase": phase, "collected_at": _now(), "samples": [], "unavailable": []}
-    if run.stop.is_set() or time.monotonic() >= run.deadline:
-        snapshot["unavailable"] = list(_GPU_FAMILIES)
-        snapshot["reason"] = "Metrics not collected because the run stopped or reached its deadline"
-        run.observations[target.name]["metrics"].append(snapshot)
-        return
-    if not target.metrics_url:
-        snapshot["unavailable"] = list(_GPU_FAMILIES)
-        snapshot["reason"] = "No metrics_url configured"
-        run.observations[target.name]["metrics"].append(snapshot)
-        return
-    try:
-        async with asyncio.timeout(min(5, max(.001, run.deadline-time.monotonic()))):
-            verify = ssl.create_default_context(cafile=run.config.ca_bundle) if run.config.ca_bundle else True
-            api_origin, metrics_origin = urlsplit(target.url), urlsplit(target.metrics_url)
-            same_origin = (api_origin.scheme, api_origin.hostname, api_origin.port) == (
-                metrics_origin.scheme, metrics_origin.hostname, metrics_origin.port)
-            headers = _headers(target) if same_origin else {}
-            async with httpx.AsyncClient(verify=verify, proxy=run.config.proxy, headers=headers, trust_env=True,
-                                         timeout=min(5, max(.001, run.deadline-time.monotonic()))) as client:
-                async with client.stream("GET", target.metrics_url) as response:
-                    response.raise_for_status()
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        if len(body) + len(chunk) > 4 * 1024 * 1024:
-                            raise ValueError("Metrics response exceeds 4 MiB limit")
-                        body.extend(chunk)
-        families = set()
-        for line in body.decode("utf-8").splitlines():
-            match = _METRIC_LINE.match(line)
-            if not match:
-                continue
-            name, labels, value, stamp = match.groups()
-            family = next((family for family, fragments in _GPU_FAMILIES.items()
-                           if any(fragment in name.lower() for fragment in fragments)), None)
-            if family is None or not math.isfinite(float(value)):
-                continue
-            # Prometheus exposition timestamps are milliseconds since epoch.
-            age = max(0, time.time()-float(stamp)/1000) if stamp else None
-            stale = age is not None and age > run.config.metrics_max_age_seconds
-            if not stale:
-                families.add(family)
-            snapshot["samples"].append({"name": name, "labels": labels or "", "value": float(value),
-                                        "family": family, "sample_timestamp_ms": float(stamp) if stamp else None,
-                                        "age_seconds": age, "stale": stale,
-                                        "freshness": "sample timestamp" if stamp else "scrape only"})
-        snapshot["unavailable"] = sorted(set(_GPU_FAMILIES)-families)
-    except (httpx.HTTPError, OSError, ValueError, TimeoutError) as exc:
-        snapshot["reason"] = f"Metrics unavailable ({type(exc).__name__})"
-        snapshot["unavailable"] = list(_GPU_FAMILIES)
-    run.observations[target.name]["metrics"].append(snapshot)
+def _gpu_snapshot(snapshot):
+    samples = [s for s in snapshot.get("samples", []) if s["family"] in _GPU_FAMILIES]
+    families = {s["family"] for s in samples if not s["stale"]}
+    return {**snapshot, "samples": samples, "unavailable": sorted(set(_GPU_FAMILIES)-families)}
+
+
+async def _metrics(run, target, phase):
+    from giraffe.telemetry import scrape
+    snapshot = await scrape(run, target, phase, force=True)
+    run.observations[target.name]["metrics"].append(_gpu_snapshot(snapshot))
 
 
 async def _fairness(run, target, client, fixtures):
@@ -394,12 +388,19 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
 
 async def _target(run: _Run, target: Target, fixtures: dict):
     config, enabled = run.config, set(run.config.checks)
+    telemetry_task = None
+    from giraffe import deployment, telemetry, workloads
     try:
+        run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop)
         if not await _restart(run, target):
             return
         async with LLMClient(target, config) as client:
-            if config.metrics and "gpu" in enabled:
-                await _metrics(run, target, "before")
+            if config.metrics:
+                data = run.observations[target.name]["serving_telemetry"]
+                data["snapshots"].append(await telemetry.scrape(run, target, "start"))
+                telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
+            elif target.deployment.collector_url:
+                telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
             initial = await run.group(target, client, fixtures["short"], "initial", count=1)
             restart = run.observations[target.name]["restart"]
             if restart and restart["status"] == "hook_completed":
@@ -482,8 +483,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 run.observations[target.name]["sustained_batches"] = batches
                 run.observations[target.name]["sustained_complete"] = time.monotonic() >= end and batches > 0
                 await run.group(target, client, fixtures["short"], "recovery", checks=["recovery"])
-            if config.metrics and "gpu" in enabled:
-                await _metrics(run, target, "after")
+            await workloads.execute(run, target, client, fixtures)
     except asyncio.CancelledError:
         run.unfinished[target.name].update(enabled)
     except Exception as exc:
@@ -491,6 +491,39 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             "Missing API key environment variable:", "Missing header environment variable:")) else type(exc).__name__
         run.observations[target.name]["client_error"] = f"Client setup failed ({detail})"
         run.unfinished[target.name].update(enabled)
+
+    finally:
+        if telemetry_task:
+            telemetry_task.cancel()
+            await asyncio.gather(telemetry_task, return_exceptions=True)
+        data = run.observations[target.name]["serving_telemetry"]
+        if config.metrics:
+            data["snapshots"].append(await telemetry.scrape(run, target, "end"))
+        else:
+            data["snapshots"].append(await telemetry.scrape(run, target, "not collected"))
+        telemetry.summarize(data, config.cache_pressure_threshold)
+        if config.metrics:
+            run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
+        current = run.observations[target.name]["deployment"]
+        if current and (target.deployment.discovery != "none" or target.deployment.collector_url):
+            end = await deployment.snapshot(target, config, run.deadline, run.stop)
+            run.observations[target.name]["deployment_history"].append(end)
+            observations = [current, *run.observations[target.name]["deployment_history"]]
+            initial_signature = deployment.observed_signature(current)
+            changes = []
+            for item in observations[1:]:
+                signature = deployment.observed_signature(item)
+                if any(signature[key] != initial_signature[key] for key in signature.keys() & initial_signature.keys()):
+                    changes.append(item)
+            current["continuity"] = "unstable" if changes else "no_observed_change; between samples unverified"
+            current["observed_changes"] = changes
+        if current:
+            served = sorted({r.observed_model for r in run.records if r.target==target.name and r.observed_model})
+            if len(served) > 1:
+                current["continuity"] = "unstable"
+                current["observed_model_identity_changes"] = True
+            if served:
+                current["fields"]["model.served"] = {"reported": deployment._fact(served, "runtime-reported", current["scope"], _now())}
 
 
 def _levels(concurrency):
@@ -557,7 +590,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]
     saturated = run.max_lag_ms > max(100, (_stats(warm)["first_output_p50_ms"] or 0)*.1)
-    for check_id, title in CHECK_NAMES.items():
+    for check_id in CORE_CHECKS:
+        title = CHECK_NAMES[check_id]
         optional = check_id in {"json", "gpu"}
         records = [r for r in ordinary if check_id in r.check_ids]
         if check_id == "capacity":
@@ -779,7 +813,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                   required=not optional and check_id in config.checks,
                                   summary=summary, metrics=metrics,
                                   evidence_ids=[r.id for r in records]))
-    return result
+    from giraffe.workloads import results
+    return result + results(run, target, _stats, _timing_violations, _missing_timing)
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
@@ -834,12 +869,22 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "other_replicas": "unverified"} for t in config.targets]}
     manifest = {"config": config.model_dump(mode="json"),
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
-                                 "custom_sha256": custom_hash},
+                                 "custom_sha256": custom_hash,
+                                 "builtin_sha256": fixture_hash({k: [s.model_dump() for s in v] for k,v in fixtures.items()}),
+                                 "workload_fixture_sha256": fixture_hash({
+                                     k: config.model_dump(mode="json")[k] for k in ("arrivals", "prefix", "buckets", "sessions", "consistency", "tool_calling", "forced_tool_diagnostic")})},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),
                                  "machine": platform.machine(), "python": platform.python_version()},
                 "load_shape": {"levels": _levels(config.concurrency), "overlap_models": config.overlap_models,
                                "target_request_quotas": run.quotas},
-                "scenario_counts": dict(counts)}
+                "scenario_counts": dict(counts),
+                "measurement_definitions": {
+                    "first_output_ms": "client-observed first non-whitespace answer or parsed tool delta; not server TTFT",
+                    "generation_tokens_per_second": "(answer tokens - 1) / seconds between first and last answer chunk; estimate",
+                    "aggregate": "valid completions or known output tokens / seconds from first dispatch to last completion within each scenario; includes errors in window",
+                    "latency_ms": "client dispatch through protocol completion",
+                    "workload_sizes": "character sizing is requested shape; server token usage is observed length",
+                    "warmup": "one initial request, then config.samples short requests"}}
     run.emit("run_finished", abort_reason=run.reason)
     return RunReport(run_id=run_id, suite_version=SUITE_VERSION,
                      started_at=started_at, finished_at=_now(),

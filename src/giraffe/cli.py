@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import argparse
 import asyncio
 import signal
@@ -47,6 +48,11 @@ def parser() -> argparse.ArgumentParser:
         run.add_argument("--stop-after-errors", type=int)
         run.add_argument("--checks", help="Comma-separated: " + ",".join(CHECK_NAMES))
         run.add_argument("--json", action="store_true", default=None, dest="structured_json")
+        run.add_argument("--deployment-file", type=Path, help="Bounded deployment JSON for the first target")
+        run.add_argument("--metrics-url", help="Separate statistics endpoint for the first target")
+        run.add_argument("--metrics-api-key-env", help="Separate metrics secret reference")
+        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy"])
+        run.add_argument("--tool-calling", action="store_true", default=None)
         run.add_argument("--metrics", action="store_true", default=None)
         run.add_argument("--nonstream", action="store_false", default=None, dest="stream")
         run.add_argument("--overlap-models", action="store_true", default=None)
@@ -62,6 +68,10 @@ def parser() -> argparse.ArgumentParser:
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
         if name == "cold-start":
             run.add_argument("--restart", required=True, help="Name of target with restart_command")
+    export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
+    export.add_argument("report", type=Path)
+    inspect = commands.add_parser("inspect", help="Print recorded deployment/telemetry and comparison JSON")
+    inspect.add_argument("report", type=Path)
     baseline = commands.add_parser("baseline", help="Explicitly save a run for future comparisons")
     actions = baseline.add_subparsers(dest="action", required=True)
     save = actions.add_parser("save", help="Save a chosen report; never changes it during runs")
@@ -110,6 +120,12 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     values["limits"] = limits
     if args.command == "cold-start":
         values["restart_target"] = args.restart
+    if getattr(args, "deployment_file", None):
+        from giraffe.deployment import load_metadata
+        values["targets"][0].setdefault("deployment", {}).update(load_metadata(args.deployment_file))
+    for key in ("metrics_url", "metrics_api_key_env", "metrics_profile"):
+        if getattr(args, key, None) is not None:
+            values["targets"][0][key] = getattr(args, key)
     return RunConfig.model_validate(values)
 
 
@@ -167,8 +183,16 @@ def main(argv: list[str] | None = None) -> int:
             uvicorn.run(create_app(runs_dir=args.runs_dir, defaults=defaults),
                         host="127.0.0.1", port=args.port, log_level="warning")
             return 0
+        if args.command in {"export", "inspect"}:
+            from giraffe.reporting import reproduction_export, _retained
+            report = _retained(load_report(args.report))
+            value = reproduction_export(report) if args.command == "export" else {
+                "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline}
+            print(json.dumps(value, indent=2, allow_nan=False))
+            return 0
         if args.command == "baseline":
-            report = load_report(args.report)
+            from giraffe.reporting import _retained
+            report = _retained(load_report(args.report))
             args.destination.parent.mkdir(parents=True, exist_ok=True)
             with args.destination.open("w" if args.replace else "x") as file:
                 file.write(report.model_dump_json(indent=2) + "\n")
@@ -198,6 +222,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Stopped: {report.abort_reason}")
         for check in report.checks:
             print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
+        for name, observation in report.observations.get("targets", {}).items():
+            telemetry = observation.get("serving_telemetry", {})
+            states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
+            print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
+        if report.baseline:
+            for target in report.baseline["targets"]:
+                diff = target["configuration_diff"]
+                changes = [row["field"] for row in diff["fields"] if row["change"]!="no_observed_change"]
+                print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
         print(f"JSON: {json_path.resolve()}\nHTML: {html_path.resolve()}")
         return 0 if report.overall == "pass" else 1 if report.overall == "fail" else 2
     except ValidationError as error:
