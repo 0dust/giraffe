@@ -461,6 +461,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     for name, observation in report.observations.get("targets", {}).items():
         parts.append(f'<h3>{_e(name)}</h3><details><summary>Deployment snapshot and unknowns</summary>'
                      f'<pre>{_json(observation.get("deployment"))}</pre></details>'
+                     f'<details><summary>Deployment observations during the run</summary>'
+                     f'<pre>{_json(observation.get("deployment_history", []))}</pre></details>'
                      f'<details><summary>Serving telemetry, phases and collection coverage</summary>'
                      f'<pre>{_json(observation.get("serving_telemetry"))}</pre></details>')
     parts.append('</section>')
@@ -528,6 +530,7 @@ def reproduction_export(report: RunReport) -> dict:
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
             "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},
+            "deployment_history": {name: obs.get("deployment_history", []) for name, obs in retained.observations.get("targets", {}).items()},
             "instructions": ["Supply secret environment-variable references locally.",
                 "Match suite and fixture hashes; supply any local fixture/metadata files.",
                 "Verify unknown server settings manually. This export cannot recreate inaccessible server state.",

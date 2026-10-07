@@ -86,6 +86,10 @@ class FakeEndpoint:
                 if self.path in {"/version", "/api/version"}:
                     self._json(200, {"version": "0.30.0"})
                     return
+                if self.path in {"/api/tags", "/api/ps"}:
+                    self._json(200, {"models": [{"model": "fake-model", "digest": "model-digest",
+                                                "context_length": 2048}]})
+                    return
                 if self.path == "/v1/models":
                     self._json(200, {"object": "list", "data": [{"id": "fake-model"}]})
                 else:

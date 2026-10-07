@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from giraffe.models import RequestRecord, RunConfig, Target
 from giraffe.reporting import write_report
-from giraffe.runner import _missing_timing, _stats, _timing_violations, run_suite
+from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
 from giraffe.fixtures import score_response
 from tests.fake_endpoint import FakeEndpoint
@@ -137,6 +137,8 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
         )
         for name, elapsed, overlap in [
             ("mixed_control", 10, 1),
+            ("mixed_control", 10, 1),
+            ("mixed_short_failure", 100, 2),
             ("mixed_short_failure", 100, 2),
             ("mixed_short_unobserved", 10, 1),
         ]
@@ -150,6 +152,107 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
     )
     outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
     assert next(c for c in outcome if c.id == "mixed").status == "fail"
+
+
+@pytest.mark.parametrize("overlap,control_samples,mixed_samples", [(1, 2, 2), (2, 1, 2), (2, 2, 1)])
+def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
+    overlap, control_samples, mixed_samples
+):
+    settings = RunConfig(
+        targets=[Target(name="local", url="http://localhost:1", model="m")],
+        buckets={"mixed_pairs": 2},
+        limits={"min_samples": 2, "fairness_max_ratio": 2},
+    )
+    records = [
+        RequestRecord(
+            id=f"{scenario}-{index}", target="local", fixture_id=scenario,
+            scenario=scenario, check_ids=["mixed"], started_at="2026-10-08T00:00:00Z",
+            status="completed", valid=True, elapsed_ms=elapsed, overlap=achieved,
+        )
+        for scenario, count, elapsed, achieved in [
+            ("mixed_control", control_samples, 10, 1),
+            ("mixed_short_unqualified", mixed_samples, 100, overlap),
+        ]
+        for index in range(count)
+    ]
+    run = SimpleNamespace(config=settings, records=records, max_lag_ms=0,
+                          observations={"local": {}}, unfinished={"local": set()})
+    outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
+    mixed = next(c for c in outcome if c.id == "mixed")
+    assert mixed.status == "inconclusive"
+    comparison = mixed.metrics["comparisons"][0]
+    assert comparison["latency_ratio"] == 10
+    assert comparison["samples_and_overlap_qualified"] is False
+
+
+@pytest.mark.parametrize(
+    "lag,warm_first,correct,expected",
+    [(150, 2000, True, "pass"), (150, 100, True, "inconclusive"),
+     (500, 100, False, "fail")],
+)
+def test_workload_timing_uses_core_generator_qualification(lag, warm_first, correct, expected):
+    settings = RunConfig(
+        targets=[Target(name="local", url="http://localhost:1", model="m")],
+        checks=["serving"], prefix={"repeats": 2},
+        limits={"min_samples": 2, "latency_ms": 1000},
+    )
+    records = [
+        RequestRecord(
+            id="warm", target="local", fixture_id="warm", scenario="warm", check_ids=[],
+            started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
+            first_output_ms=warm_first, elapsed_ms=warm_first + 100,
+        ),
+        *[
+            RequestRecord(
+                id=f"prefix-{index}", target="local", fixture_id="prefix",
+                scenario="prefix_shared", check_ids=["prefix"],
+                started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
+                elapsed_ms=100, first_output_ms=20, score=correct,
+            )
+            for index in range(2)
+        ],
+    ]
+    run = SimpleNamespace(config=settings, records=records, max_lag_ms=lag,
+                          observations={"local": {"restart": None}},
+                          unfinished={"local": set()})
+    outcome = _checks(run, settings.targets[0])
+    assert next(c for c in outcome if c.id == "prefix").status == expected
+
+
+async def test_independent_prefix_controls_use_reproducible_matched_prose():
+    with FakeEndpoint() as endpoint:
+        settings = config(endpoint, prefix={"prefix_chars": 256, "repeats": 3, "history_turns": 2})
+        report = await run_suite(settings)
+        first = [p["messages"][0]["content"] for p in endpoint.requests if "Trial" in p["messages"][0]["content"]]
+        endpoint.requests.clear()
+        await run_suite(settings)
+        second = [p["messages"][0]["content"] for p in endpoint.requests if "Trial" in p["messages"][0]["content"]]
+    assert first == second and len(first) == 6
+    comparison = check(report, "prefix").metrics["first_repeat"]
+    assert comparison["shared_first"]["attempted"] == 1
+    assert comparison["shared_repeats"]["attempted"] == 2
+    assert comparison["independent_controls"]["attempted"] == 3
+    assert "not proof" in comparison["interpretation"]
+    assert len({prompt[:256] for prompt in first[1::2]}) == 3
+    for shared, independent in zip(first[::2], first[1::2]):
+        assert len(shared) == len(independent)
+        assert "The rock is gray." in shared and " The " in independent
+        assert "Reply with the box label only." in independent
+        assert shared[:256] != independent[:256]
+
+
+async def test_loaded_workload_source_identity_is_part_of_baseline_fixture_hash(monkeypatch):
+    from giraffe import workloads
+    from giraffe.reporting import compare_baseline
+    with FakeEndpoint() as endpoint:
+        settings = config(endpoint, prefix={"repeats": 2, "history_turns": 2})
+        baseline = await run_suite(settings)
+        monkeypatch.setattr(workloads, "FIXTURE_SOURCE_SHA256", "different-generator-content")
+        current = await run_suite(settings)
+    assert (baseline.manifest["fixture_pack"]["workload_fixture_sha256"]
+            != current.manifest["fixture_pack"]["workload_fixture_sha256"])
+    compared = compare_baseline(current, baseline)
+    assert "Fixture pack identity differs." in compared.baseline["targets"][0]["reasons"]
 
 
 @pytest.mark.parametrize(
@@ -365,6 +468,8 @@ async def test_tools_disabled_and_forced_diagnostic_remain_separate():
         assert not any(p.get("tools") for p in endpoint.requests)
         forced = await run_suite(config(endpoint, tool_calling=True, forced_tool_diagnostic=True))
     assert "tools" not in {c.id for c in disabled.checks}
+    assert disabled.manifest["workload_selection"]["tools"] == "not selected"
+    assert forced.manifest["workload_selection"]["tools"] == "selected"
     assert (
         len([r for r in forced.requests if r.workload.get("selection") == "forced diagnostic"]) == 2
     )

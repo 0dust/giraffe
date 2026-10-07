@@ -350,6 +350,31 @@ async def snapshot(target, config, deadline, stop):
                             reported["model"]["chat_template"] = (
                                 "sha256:" + hashlib.sha256(model["template"].encode()).hexdigest()
                             )
+                        for route in ("/api/tags", "/api/ps"):
+                            try:
+                                inventory = await _read(client, origin + route)
+                                for entry in inventory.get("models", []):
+                                    if entry.get("model", entry.get("name")) != target.model:
+                                        continue
+                                    if isinstance(entry.get("digest"), str):
+                                        reported["model"]["digest"] = entry["digest"]
+                                    context = entry.get("context_length")
+                                    if (
+                                        route == "/api/ps"
+                                        and isinstance(context, int)
+                                        and not isinstance(context, bool)
+                                        and context > 0
+                                    ):
+                                        reported.setdefault("serving", {})["context_limit"] = (
+                                            context
+                                        )
+                                result["discovery"].append(
+                                    {"status": "available", "source": "ollama " + route}
+                                )
+                            except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+                                result["discovery"].append(
+                                    {"status": "unavailable", "source": "ollama " + route}
+                                )
                         result["discovery"].append(
                             {"status": "available", "source": "ollama /api/version and /api/show"}
                         )
