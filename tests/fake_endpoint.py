@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -27,6 +28,12 @@ class FakeEndpoint:
         self.chunk_delay = chunk_delay
         self.fault_contains = fault_contains
         self.requests: list[dict[str, Any]] = []
+        self.metrics_text = 'vllm:kv_cache_usage_perc{model_name="fake-model",engine="0"} 0.95\nvllm:num_requests_running{engine="0"} 2\nvllm:num_requests_waiting{engine="0"} 1\nvllm:num_preemptions_total{engine="0"} 5\n'
+        self.metrics_status = 200
+        self.metrics_reads = 0
+        self.collector_reads = 0
+        self.discovery_export = {"serving": {"scheduler": "fcfs", "max_num_seqs": 2}}
+        self.collector_changes = False
         self.active = 0
         self.peak_active = 0
         self._lock = threading.Lock()
@@ -60,12 +67,35 @@ class FakeEndpoint:
                 self.close_connection = True
 
             def do_GET(self) -> None:
+                if self.path == "/metrics":
+                    endpoint.metrics_reads += 1
+                    content = endpoint.metrics_text.encode()
+                    self.send_response(endpoint.metrics_status)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+                if self.path == "/configuration":
+                    endpoint.collector_reads += 1
+                    doc = endpoint.discovery_export
+                    if endpoint.collector_changes and endpoint.collector_reads>1:
+                        doc = {"serving": {"scheduler": "priority", "max_num_seqs": 4}}
+                    self._json(200, doc)
+                    return
+                if self.path in {"/version", "/api/version"}:
+                    self._json(200, {"version": "0.30.0"})
+                    return
                 if self.path == "/v1/models":
                     self._json(200, {"object": "list", "data": [{"id": "fake-model"}]})
                 else:
                     self._json(404, {"error": {"message": "unknown fixture path"}})
 
             def do_POST(self) -> None:
+                if self.path == "/api/show":
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                    self._json(200, {"details": {"quantization_level": "Q4_K_M"}})
+                    return
                 if self.path != "/v1/chat/completions":
                     self._json(404, {"error": {"message": "unknown fixture path"}})
                     return
@@ -83,6 +113,33 @@ class FakeEndpoint:
                     with endpoint._lock:
                         endpoint.active -= 1
 
+            def _tools(self, payload, mode):
+                function = "wrong" if mode=="tool_wrong" else "get_weather"
+                arguments = "{broken" if mode=="tool_malformed" else '{"city":42}' if mode=="tool_schema" else '{"city":"Delhi"}'
+                calls = [{"id": "call-1", "type": "function", "function": {"name": function, "arguments": arguments}}]
+                if mode=="tool_multiple":
+                    calls += [{"id": "call-2", "type": "function", "function": {"name": function, "arguments": arguments}}]
+                if mode=="tool_missing":
+                    self._json(200, {"choices": [{"message": {"content": arguments}, "finish_reason": "stop"}]})
+                    return
+                if not payload.get("stream"):
+                    self._json(200, {"model": payload["model"], "choices": [{"message": {"content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                def event(delta, finish=None):
+                    data = {"model": payload["model"], "choices": [{"delta": delta, "finish_reason": finish}]}
+                    self.wfile.write(("data: "+json.dumps(data)+"\n\n").encode())
+                    self.wfile.flush()
+                event({"tool_calls": [dict(index=i, id=c["id"], type="function", function={"name": c["function"]["name"][:4], "arguments": c["function"]["arguments"][:4]}) for i,c in enumerate(calls)]})
+                event({"tool_calls": [{"index": i, "function": {"name": c["function"]["name"][4:], "arguments": c["function"]["arguments"][4:]}} for i,c in enumerate(calls)]})
+                event({}, "tool_calls")
+                if mode!="tool_truncated":
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+
             def _completion(self, payload: dict[str, Any]) -> None:
                 prompt = "\n".join(message["content"] for message in payload["messages"])
                 applies = endpoint.fault_contains is None or endpoint.fault_contains in prompt
@@ -91,6 +148,20 @@ class FakeEndpoint:
                     self._json(503, {"error": {"message": "seeded unavailable response"}})
                     return
                 output = endpoint._answer(prompt)
+                if payload["messages"][-1]["content"].startswith("Suggest a name for a bakery"):
+                    output = "Bakery_" + uuid.uuid4().hex
+                if payload["messages"][-1]["content"].startswith("Repeat exactly the bakery name"):
+                    output = next(m["content"] for m in reversed(payload["messages"]) if m["role"]=="assistant")
+                if mode == "overlap_variation" and endpoint.active>1:
+                    output += " "  # Whitespace changes byte equality but keeps the exact task correct.
+                if mode == "variable_correct":
+                    output += " " * (len(endpoint.requests)%3)
+                if mode == "tool_rejection" and payload.get("tools"):
+                    self._json(400, {"error": {"message": "unsupported tools"}})
+                    return
+                if payload.get("tools"):
+                    self._tools(payload, mode)
+                    return
                 if mode == "wrong":
                     output = "INCORRECT"
                 elif mode == "empty":

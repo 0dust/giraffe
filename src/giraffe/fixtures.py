@@ -21,7 +21,7 @@ from referencing.exceptions import Unresolvable
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig
 
 FIXTURE_VERSION = "0.1.2"
-SUITE_VERSION = "0.1.3"
+SUITE_VERSION = "0.2.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
 
@@ -228,10 +228,10 @@ def _check_schema(schema: dict[str, Any]) -> None:
     validator_for(schema).check_schema(schema)
 
 
-def _json_answer(output: str) -> Any:
+def _json_answer(output: str, *, allow_fence: bool = True) -> Any:
     answer = output.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n\s*```", answer, re.DOTALL | re.IGNORECASE)
-    if fenced:
+    if fenced and allow_fence:
         answer = fenced[1]
 
     def reject_constant(value: str) -> None:
@@ -262,6 +262,30 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         return record.model_copy(update={
             "score": None, "score_message": "Answer not scored: request did not complete validly.",
         })
+    if spec.scorer == "tool":
+        calls = record.tool_calls
+        message = "Parsed tool call matches the fixture."
+        score = False
+        if record.finish_reason == "length":
+            message = "Truncated tool-call completion cannot establish complete capability."
+        elif not calls:
+            message = "Missing parsed tool call; JSON answer text is not a tool call."
+        elif len(calls) != 1:
+            message = "Wrong tool-call count: expected exactly one."
+        elif calls[0].get("function", {}).get("name") != "get_weather":
+            message = "Wrong tool function: expected get_weather."
+        else:
+            try:
+                value = _json_answer(calls[0]["function"]["arguments"], allow_fence=False)
+                if not isinstance(value, dict) or set(value) != {"city"} or not isinstance(value["city"], str):
+                    message = "Tool argument schema mismatch: exactly one string city required."
+                elif value != {"city": "Delhi"}:
+                    message = "Tool arguments differ from expected city Delhi (case sensitive)."
+                else:
+                    score = True
+            except (ValueError, TypeError, KeyError):
+                message = "Malformed tool argument JSON."
+        return record.model_copy(update={"score": score, "score_message": message})
     if spec.scorer in {"exact", "contains"}:
         expected = _normalized(str(spec.expected))
         actual = _normalized(record.output)
