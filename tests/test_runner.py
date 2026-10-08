@@ -508,7 +508,7 @@ async def test_sustained_semantic_corruption_fails_recovery(client, monkeypatch)
 
 
 @pytest.mark.parametrize("same_origin", [True, False])
-async def test_metrics_reuses_credentials_only_on_same_origin(monkeypatch, same_origin):
+async def test_metrics_never_inherits_inference_credentials(monkeypatch, same_origin):
     import httpx
 
     seen = []
@@ -522,13 +522,13 @@ async def test_metrics_reuses_credentials_only_on_same_origin(monkeypatch, same_
     def mock_client(**kwargs):
         return actual_client(**kwargs, transport=httpx.MockTransport(respond))
 
-    monkeypatch.setattr(runner.httpx, "AsyncClient", mock_client)
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics" if same_origin else "http://localhost:5555/metrics",
                     api_key_env="GIRAFFE_TEST_KEY")
     report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True))
-    assert len(seen) == 2
-    assert (seen[0].headers.get("Authorization") == "Bearer local-test-key") is same_origin
+    assert 2 <= len(seen) <= 256
+    assert all("Authorization" not in request.headers for request in seen)
     assert "local-test-key" not in report.model_dump_json()
     assert check(report, "gpu").status == "inconclusive"  # Four missing observation families.
 
@@ -545,7 +545,7 @@ async def test_stale_gpu_samples_are_unavailable(monkeypatch):
     def mock_client(**kwargs):
         return actual_client(**kwargs, transport=httpx.MockTransport(lambda req: httpx.Response(200, text=text)))
 
-    monkeypatch.setattr(runner.httpx, "AsyncClient", mock_client)
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
     report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True))
@@ -600,14 +600,14 @@ async def test_oversized_metrics_response_is_unavailable_and_bounded(monkeypatch
         return actual_client(**kwargs, transport=httpx.MockTransport(
             lambda req: httpx.Response(200, stream=LargeBody())))
 
-    monkeypatch.setattr(runner.httpx, "AsyncClient", mock_client)
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
     report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True))
     result = check(report, "gpu")
     assert result.status == "inconclusive"
-    assert len(consumed) == 10  # Exactly five 1 MiB chunks per attempted snapshot, not ten.
-    assert all("unavailable" in snapshot["reason"].lower() for snapshot in result.metrics["snapshots"])
+    assert len(consumed) == 2 * len(result.metrics["snapshots"])  # 1 MiB retained + rejecting chunk per scrape.
+    assert all(snapshot["status"] == "response_limit" for snapshot in result.metrics["snapshots"])
 
 
 async def test_recovery_missing_configured_output_rate_is_inconclusive(client, monkeypatch):
@@ -766,7 +766,7 @@ async def test_metrics_trickle_has_a_total_deadline(monkeypatch):
         return actual_client(**kwargs, transport=httpx.MockTransport(
             lambda req: httpx.Response(200, stream=Trickle())))
 
-    monkeypatch.setattr(runner.httpx, "AsyncClient", mock_client)
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
     state = runner._Run(config(targets=[target], max_duration_seconds=.03), None, None)
@@ -775,15 +775,17 @@ async def test_metrics_trickle_has_a_total_deadline(monkeypatch):
     snapshot = state.observations["service"]["metrics"][0]
     assert time.monotonic()-started < .1
     assert 0 < len(chunks) < 20
-    assert snapshot["reason"] == "Metrics unavailable (TimeoutError)"
+    assert snapshot["status"] == "connection_failure"
+    assert "TimeoutError" in snapshot["reason"]
     assert len(snapshot["unavailable"]) == 5
 
 
 async def test_metrics_skips_when_stop_already_requested(monkeypatch):
+    import httpx
     def unexpected_request(**kwargs):
         pytest.fail("A stopped run must not open a metrics client")
 
-    monkeypatch.setattr(runner.httpx, "AsyncClient", unexpected_request)
+    monkeypatch.setattr(httpx, "AsyncClient", unexpected_request)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
     stop = asyncio.Event()

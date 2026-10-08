@@ -20,7 +20,8 @@ from pydantic import Field, ValidationError
 
 from giraffe.fixtures import SUITE_VERSION, load_custom_fixtures
 from giraffe.models import CHECK_NAMES, Model, RunConfig, RunReport
-from giraffe.reporting import compare_baseline, write_report
+from giraffe.reporting import compare_baseline, write_report, reproduction_export
+from giraffe.deployment import safe_config
 from giraffe.runner import run_suite
 
 _DESCRIPTIONS = {
@@ -261,7 +262,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.get("/api/bootstrap")
     async def bootstrap():
         return {"config": _bootstrap_config(defaults), "checks": [
-            {"id": key, "title": title, "description": _DESCRIPTIONS[key],
+            {"id": key, "title": title, "description": _DESCRIPTIONS.get(key, "Opt-in bounded workload; configure through Advanced configuration."),
              "optional": key in {"json", "gpu"}} for key, title in CHECK_NAMES.items()],
             "active_run_id": active.get("id"), "suite_version": SUITE_VERSION}
 
@@ -304,7 +305,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         directory = _directory(root, identifier)
         directory.mkdir()
         meta = {"id": identifier, "state": "running", "started_at": _now(),
-                "config": config.model_dump(mode="json"), "baseline_id": body.baseline_id}
+                "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
         _write(directory / ".web.json", meta)
         active.update(id=identifier, state="running", directory=directory, meta=meta,
                       progress={}, events=[], stop=asyncio.Event())
@@ -339,6 +340,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             raise HTTPException(404, "Report is not available yet")
         return FileResponse(path, filename=f"giraffe-{identifier}.{extension}",
                             media_type="application/json" if extension == "json" else "text/html")
+
+    @app.get("/api/runs/{identifier}/reproduction.json")
+    async def export_reproduction(identifier: str):
+        return reproduction_export(_report(_directory(root, identifier) / "report.json"))
 
     @app.get("/api/baselines")
     async def list_baselines():

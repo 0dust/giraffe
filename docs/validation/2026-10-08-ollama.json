@@ -1,0 +1,135 @@
+{
+  "targets": [
+    {
+      "name": "ollama",
+      "url": "http://127.0.0.1:11434/v1",
+      "model": "llama3.2:3b",
+      "api_key_env": null,
+      "headers_env": {},
+      "route": "direct",
+      "parent": null,
+      "identity": {},
+      "metrics_url": null,
+      "restart_command": null,
+      "metrics_profile": "ollama",
+      "metrics_runtime_version": null,
+      "deployment": {
+        "discovery": "ollama",
+        "runtime": {
+          "engine": "ollama"
+        },
+        "scope": "local single runtime; other replicas unverified",
+        "serving": {
+          "context_limit": 4096
+        },
+        "model": {
+          "digest": "a80c4f17acd55265feec403c7aef86be0c25983ab279d83f3bcd3abbcb5b8b72"
+        },
+        "metadata_file": "docs/validation/2026-10-08-ollama-deployment.json"
+      }
+    }
+  ],
+  "concurrency": 2,
+  "max_requests": 700,
+  "max_duration_seconds": 1800,
+  "request_timeout_seconds": 120.0,
+  "max_output_tokens": 128,
+  "context_limit": 4096,
+  "samples": 6,
+  "sustained_seconds": 30.0,
+  "stop_after_errors": 20,
+  "checks": [
+    "access",
+    "serving",
+    "first_output",
+    "generation",
+    "capacity",
+    "fairness",
+    "context",
+    "correctness",
+    "cancellation",
+    "recovery"
+  ],
+  "structured_json": false,
+  "metrics": true,
+  "metrics_max_age_seconds": 60.0,
+  "overlap_models": false,
+  "stream": true,
+  "request_options": {
+    "temperature": 0
+  },
+  "custom_fixtures": null,
+  "retention": "failures",
+  "ca_bundle": null,
+  "proxy": null,
+  "restart_target": null,
+  "limits": {
+    "first_output_ms": 60000.0,
+    "latency_ms": 90000.0,
+    "stream_gap_ms": 10000.0,
+    "min_output_tokens_per_second": 1.0,
+    "max_error_rate": 0.0,
+    "min_correctness": 1.0,
+    "fairness_max_ratio": 3.0,
+    "regression_percent": 20.0,
+    "min_samples": 5
+  },
+  "metrics_interval_seconds": 2,
+  "metrics_timeout_seconds": 2,
+  "metrics_max_samples": 1024,
+  "arrivals": {
+    "requests": 12,
+    "requests_per_second": 0.5,
+    "max_pending": 4,
+    "mode": "burst"
+  },
+  "prefix": {
+    "prefix_chars": 256,
+    "repeats": 6,
+    "history_turns": 3
+  },
+  "buckets": {
+    "input_chars": {
+      "short": 64,
+      "medium": 256,
+      "long": 512
+    },
+    "output_tokens": {
+      "short": 24,
+      "medium": 64,
+      "long": 128
+    },
+    "levels": [
+      1,
+      2
+    ],
+    "samples_per_bucket": 6,
+    "window_seconds": 120,
+    "mixed_pairs": 6
+  },
+  "sessions": {
+    "sessions": 2,
+    "concurrency": 2,
+    "modes": [
+      "fixed",
+      "live"
+    ],
+    "delay_seconds": 0.05,
+    "max_tokens": 64
+  },
+  "consistency": {
+    "repetitions": 6,
+    "levels": [
+      1,
+      2
+    ],
+    "shapes": [
+      "short",
+      "long"
+    ],
+    "temperature": 0,
+    "seed": 17
+  },
+  "tool_calling": true,
+  "forced_tool_diagnostic": true
+}

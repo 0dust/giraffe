@@ -1,0 +1,571 @@
+{
+  "source_report_sha256": "259e7d75b15669cb70cd89382eea231dad13c9ba283a196e84ff385d26075f3b",
+  "generator_source_sha256": "baf9fcb8ba505e5b67358e403971d947f2fd14bd6546e9418630196d233f7251",
+  "run_id": "758179b0dfda40028d8ae1e3c3dd82b7",
+  "suite_version": "0.2.0",
+  "schema_version": "2",
+  "started_at": "2026-10-07T19:19:05.970182+00:00",
+  "finished_at": "2026-10-07T19:27:24.481200+00:00",
+  "duration_seconds": 498.511018,
+  "request_count": 416,
+  "overall": "inconclusive",
+  "generator_max_lag_ms": 45.018,
+  "abort_reason": null,
+  "critical_memory_pressure_observed": false,
+  "maximum_memory_pressure_level": 2,
+  "fixture_pack": {
+    "version": "0.1.2",
+    "custom": null,
+    "custom_sha256": null,
+    "builtin_sha256": "990ab89d0b8e3ffd1a43d4e25bbd2cec0ab82a8c2e44f5b799cd3c35548fcd9e",
+    "workload_fixture_sha256": "a036dbe5014b672298ccd59f86438e974f6ef70a9e7744fbe0d9e83b07af9f31"
+  },
+  "checks": [
+    {
+      "id": "access",
+      "status": "pass",
+      "summary": "Configured route accepted requests; TLS trust is enforced for HTTPS.",
+      "samples": {
+        "attempted": 219,
+        "completed": 219,
+        "scored": 210,
+        "correct": 210
+      }
+    },
+    {
+      "id": "serving",
+      "status": "pass",
+      "summary": "Valid non-empty responses and required stream termination observed.",
+      "samples": {
+        "attempted": 219,
+        "completed": 219,
+        "scored": 210,
+        "correct": 210
+      }
+    },
+    {
+      "id": "first_output",
+      "status": "pass",
+      "summary": "Observed requests met configured checks.",
+      "samples": {
+        "attempted": 218,
+        "completed": 218,
+        "scored": 209,
+        "correct": 209
+      }
+    },
+    {
+      "id": "generation",
+      "status": "pass",
+      "summary": "Observed requests met configured checks.",
+      "samples": {
+        "attempted": 6,
+        "completed": 6,
+        "scored": 0,
+        "correct": 0
+      }
+    },
+    {
+      "id": "capacity",
+      "status": "pass",
+      "summary": "Reported highest tested acceptable concurrency; maximum capacity is unknown.",
+      "samples": {
+        "attempted": 24,
+        "completed": 24,
+        "scored": 24,
+        "correct": 24
+      }
+    },
+    {
+      "id": "fairness",
+      "status": "pass",
+      "summary": "Observed mixed-traffic effect met the limit; this does not identify a scheduler cause.",
+      "samples": {
+        "attempted": 12,
+        "completed": 12,
+        "scored": 12,
+        "correct": 12
+      }
+    },
+    {
+      "id": "context",
+      "status": "pass",
+      "summary": "Built-in deterministic checks passed for the recorded fixtures and load.",
+      "samples": {
+        "attempted": 6,
+        "completed": 6,
+        "scored": 6,
+        "correct": 6
+      }
+    },
+    {
+      "id": "correctness",
+      "status": "pass",
+      "summary": "Built-in deterministic checks passed for the recorded fixtures and load.",
+      "samples": {
+        "attempted": 6,
+        "completed": 6,
+        "scored": 6,
+        "correct": 6
+      }
+    },
+    {
+      "id": "json",
+      "status": "skipped",
+      "summary": "Not selected for this run.",
+      "samples": {
+        "attempted": 0,
+        "completed": 0,
+        "scored": 0,
+        "correct": 0
+      }
+    },
+    {
+      "id": "cancellation",
+      "status": "pass",
+      "summary": "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified.",
+      "samples": {
+        "attempted": 14,
+        "completed": 12,
+        "scored": 9,
+        "correct": 9
+      }
+    },
+    {
+      "id": "recovery",
+      "status": "pass",
+      "summary": "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified.",
+      "samples": {
+        "attempted": 116,
+        "completed": 116,
+        "scored": 116,
+        "correct": 116
+      }
+    },
+    {
+      "id": "gpu",
+      "status": "skipped",
+      "summary": "Not selected for this run.",
+      "samples": {
+        "attempted": 0,
+        "completed": 0,
+        "scored": 0,
+        "correct": 0
+      }
+    },
+    {
+      "id": "arrivals",
+      "status": "pass",
+      "summary": "Bounded workload observed; untested combinations remain unverified.",
+      "samples": {
+        "attempted": 12,
+        "completed": 12,
+        "scored": 12,
+        "correct": 12
+      }
+    },
+    {
+      "id": "prefix",
+      "status": "pass",
+      "summary": "Bounded workload observed; untested combinations remain unverified.",
+      "samples": {
+        "attempted": 15,
+        "completed": 15,
+        "scored": 15,
+        "correct": 15
+      }
+    },
+    {
+      "id": "buckets",
+      "status": "inconclusive",
+      "summary": "Some length/load cells lack sufficient samples, achieved overlap or observed lengths; see per-cell coverage gaps.",
+      "samples": {
+        "attempted": 108,
+        "completed": 108,
+        "scored": 36,
+        "correct": 36
+      }
+    },
+    {
+      "id": "mixed",
+      "status": "pass",
+      "summary": "Bounded workload observed; untested combinations remain unverified.",
+      "samples": {
+        "attempted": 54,
+        "completed": 54,
+        "scored": 42,
+        "correct": 42
+      }
+    },
+    {
+      "id": "sessions",
+      "status": "pass",
+      "summary": "Bounded workload observed; untested combinations remain unverified.",
+      "samples": {
+        "attempted": 8,
+        "completed": 8,
+        "scored": 4,
+        "correct": 4
+      }
+    },
+    {
+      "id": "consistency",
+      "status": "pass",
+      "summary": "Bounded workload observed; untested combinations remain unverified.",
+      "samples": {
+        "attempted": 24,
+        "completed": 24,
+        "scored": 24,
+        "correct": 24
+      }
+    },
+    {
+      "id": "tools",
+      "status": "pass",
+      "summary": "Bounded workload observed; untested combinations remain unverified.",
+      "samples": {
+        "attempted": 4,
+        "completed": 4,
+        "scored": 4,
+        "correct": 4
+      }
+    },
+    {
+      "id": "baseline",
+      "status": "inconclusive",
+      "summary": "Baseline comparison is inconclusive: Fixture pack identity differs.",
+      "samples": {}
+    }
+  ],
+  "failed_answers": [],
+  "bucket_coverage_gaps": {
+    "bucket_c1_short_medium": [
+      "Requested output length was not sufficiently exercised; a cap alone is not coverage."
+    ],
+    "bucket_c1_short_long": [
+      "Requested output length was not sufficiently exercised; a cap alone is not coverage."
+    ],
+    "bucket_c2_short_medium": [
+      "Requested output length was not sufficiently exercised; a cap alone is not coverage."
+    ],
+    "bucket_c2_short_long": [
+      "Requested output length was not sufficiently exercised; a cap alone is not coverage."
+    ]
+  },
+  "mixed_comparisons": [
+    {
+      "scenario": "mixed_short_long_input_before_output",
+      "latency_ratio": 1.5249724323232952,
+      "overlap_observed": true,
+      "samples_and_overlap_qualified": true
+    },
+    {
+      "scenario": "mixed_short_long_input_active_stream",
+      "latency_ratio": 1.4526162113470111,
+      "overlap_observed": true,
+      "samples_and_overlap_qualified": true
+    },
+    {
+      "scenario": "mixed_short_long_output_before_output",
+      "latency_ratio": 2.285178685138304,
+      "overlap_observed": true,
+      "samples_and_overlap_qualified": true
+    },
+    {
+      "scenario": "mixed_short_long_output_active_stream",
+      "latency_ratio": 1.6726078245608587,
+      "overlap_observed": true,
+      "samples_and_overlap_qualified": true
+    }
+  ],
+  "serving_telemetry": {
+    "snapshot_count": 251,
+    "states": {
+      "no_endpoint": 251
+    },
+    "cache_pressure": {
+      "threshold": 0.9,
+      "status": "unverified"
+    },
+    "series": [],
+    "interpretation": "Concurrent observations provide context, not causality. Sampling can miss peaks. Missing counters are unknown. Label changes create separate series; counters are never joined across replicas."
+  },
+  "baseline": {
+    "status": "inconclusive",
+    "reasons": [
+      "Fixture pack identity differs."
+    ],
+    "configuration_diff": {
+      "fields": [
+        {
+          "field": "model.chat_template",
+          "change": "no_observed_change",
+          "baseline": {
+            "reported": {
+              "value": "sha256:966de95ca8a62200913e3f8bfbf84c8494536f1b94b49166851e76644e966396",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:03:11.891466+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "reported": {
+              "value": "sha256:966de95ca8a62200913e3f8bfbf84c8494536f1b94b49166851e76644e966396",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:19:06.093173+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "model.digest",
+          "change": "no_observed_change",
+          "baseline": {
+            "configured": {
+              "value": "a80c4f17acd55265feec403c7aef86be0c25983ab279d83f3bcd3abbcb5b8b72",
+              "provenance": "user-supplied metadata file",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T18:49:25.036140+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            },
+            "reported": {
+              "value": "a80c4f17acd55265feec403c7aef86be0c25983ab279d83f3bcd3abbcb5b8b72",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:03:11.891486+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "configured": {
+              "value": "a80c4f17acd55265feec403c7aef86be0c25983ab279d83f3bcd3abbcb5b8b72",
+              "provenance": "user-supplied metadata file",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T18:49:25.036140+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            },
+            "reported": {
+              "value": "a80c4f17acd55265feec403c7aef86be0c25983ab279d83f3bcd3abbcb5b8b72",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:19:06.093188+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "model.quantization",
+          "change": "no_observed_change",
+          "baseline": {
+            "reported": {
+              "value": "Q4_K_M",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:03:11.891451+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "reported": {
+              "value": "Q4_K_M",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:19:06.093161+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "model.requested",
+          "change": "no_observed_change",
+          "baseline": {
+            "configured": {
+              "value": "llama3.2:3b",
+              "provenance": "user-supplied",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:03:11.736520+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "configured": {
+              "value": "llama3.2:3b",
+              "provenance": "user-supplied",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:19:05.972112+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "model.served",
+          "change": "no_observed_change",
+          "baseline": {
+            "reported": {
+              "value": [
+                "llama3.2:3b"
+              ],
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:10:56.948593+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "reported": {
+              "value": [
+                "llama3.2:3b"
+              ],
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:27:24.465742+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "runtime.engine",
+          "change": "no_observed_change",
+          "baseline": {
+            "configured": {
+              "value": "ollama",
+              "provenance": "user-supplied metadata file",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T18:49:25.036140+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            },
+            "reported": {
+              "value": "ollama",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:03:11.891398+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "configured": {
+              "value": "ollama",
+              "provenance": "user-supplied metadata file",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T18:49:25.036140+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            },
+            "reported": {
+              "value": "ollama",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:19:06.093117+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "runtime.version",
+          "change": "no_observed_change",
+          "baseline": {
+            "reported": {
+              "value": "0.12.10",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:03:11.891434+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "reported": {
+              "value": "0.12.10",
+              "provenance": "runtime-reported",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T19:19:06.093147+00:00",
+              "status": "runtime_reported",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        },
+        {
+          "field": "serving.context_limit",
+          "change": "no_observed_change",
+          "baseline": {
+            "configured": {
+              "value": 4096,
+              "provenance": "user-supplied metadata file",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T18:49:25.036140+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          },
+          "current": {
+            "configured": {
+              "value": 4096,
+              "provenance": "user-supplied metadata file",
+              "scope": "local single runtime; other replicas unverified",
+              "collected_at": "2026-10-07T18:49:25.036140+00:00",
+              "status": "unverified",
+              "freshness": "collection time; underlying update time unknown"
+            }
+          }
+        }
+      ],
+      "unknown_baseline": false,
+      "unknown_fields": [
+        "backend.attention",
+        "backend.compilation",
+        "backend.graphs",
+        "backend.kernel",
+        "hardware.gpu_count",
+        "hardware.gpu_type",
+        "hardware.interconnect",
+        "hardware.layout",
+        "hardware.pipeline_parallel",
+        "hardware.tensor_parallel",
+        "model.revision",
+        "model.served",
+        "model.tokenizer",
+        "runtime.commit",
+        "runtime.image",
+        "runtime.image_digest",
+        "serving.configuration",
+        "serving.gpu_memory_utilization",
+        "serving.instrumentation",
+        "serving.kv_cache",
+        "serving.launch_arguments",
+        "serving.max_num_batched_tokens",
+        "serving.max_num_seqs",
+        "serving.prefix_caching",
+        "serving.resolved_settings",
+        "serving.scheduler",
+        "software.cuda",
+        "software.driver",
+        "software.libraries",
+        "software.rocm"
+      ],
+      "continuity": {
+        "baseline": "no_observed_change; between samples unverified",
+        "current": "no_observed_change; between samples unverified"
+      },
+      "intended_change": null,
+      "confounded": false,
+      "interpretation": "Changes are investigation context, not evidence of causality. Missing/stale/unobserved fields cannot establish unchanged configuration."
+    }
+  }
+}
