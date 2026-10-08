@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import json
+import hashlib
 import os
 import re
 import ssl
@@ -170,6 +171,12 @@ class LLMClient:
                        max_tokens=budget, n=1)
         if stream:
             payload.setdefault("stream_options", {"include_usage": True})
+        record.workload = dict(spec.workload)
+        record.request_hash = hashlib.sha256(json.dumps({
+            "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
+        }, sort_keys=True).encode()).hexdigest()
+        record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
+        tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
 
         def receive(data: dict[str, Any], *, streaming: bool) -> None:
@@ -185,6 +192,11 @@ class LLMClient:
                 record.input_tokens = _token_count(usage.get("prompt_tokens"))
                 record.completion_tokens = _token_count(usage.get("completion_tokens"))
                 record.output_tokens = record.completion_tokens
+                cached = usage.get("prompt_tokens_details")
+                if isinstance(cached, dict):
+                    record.cached_prompt_tokens = _token_count(cached.get("cached_tokens"))
+                    if record.cached_prompt_tokens is not None:
+                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
                 details = usage.get("completion_tokens_details")
                 reasoning_tokens = _token_count(details.get("reasoning_tokens")) if isinstance(
                     details, dict,
@@ -205,6 +217,34 @@ class LLMClient:
             answer = _text(content.get("content"))
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = time.perf_counter()
+            calls = content.get("tool_calls")
+            if calls is not None:
+                if not isinstance(calls, list) or len(calls) > 16:
+                    raise _ProtocolError("invalid tool-call structure or count")
+                for ordinal, call in enumerate(calls):
+                    if not isinstance(call, dict):
+                        raise _ProtocolError("invalid tool-call structure")
+                    index = call.get("index", ordinal) if streaming else ordinal
+                    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 16:
+                        raise _ProtocolError("invalid tool-call index")
+                    part = tool_parts.setdefault(index, {"id": "", "type": "", "function": {"name": "", "arguments": ""}})
+                    if record.finish_reason is not None:
+                        raise _ProtocolError("tool-call content arrived after finish reason")
+                    for key in ("id", "type"):
+                        if call.get(key) is not None:
+                            value = _text(call[key])
+                            if part[key] and part[key] != value:
+                                raise _ProtocolError("conflicting tool-call ID/type")
+                            part[key] = value
+                    function = call.get("function", {})
+                    if not isinstance(function, dict):
+                        raise _ProtocolError("invalid tool-call function")
+                    for key in ("name", "arguments"):
+                        part["function"][key] += _text(function.get(key))
+                    if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
+                        record.first_output_ms = (now-start)*1000
+                        if first_output_event is not None:
+                            first_output_event.set()
             if answer:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
@@ -270,7 +310,12 @@ class LLMClient:
                         raise _ProtocolError("response ended without a completion finish reason")
                     if record.finish_reason in {"error", "content_filter"}:
                         raise _ProtocolError("endpoint did not finish a usable answer")
-                    if record.first_output_ms is None:
+                    record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
+                    if spec.scorer == "tool" and record.tool_calls:
+                        ids = [call["id"] for call in record.tool_calls]
+                        if any(not call["id"] or call["type"] != "function" or not call["function"]["name"] for call in record.tool_calls) or len(set(ids)) != len(ids):
+                            raise _ProtocolError("incomplete tool-call ID/type/function structure")
+                    if record.first_output_ms is None or (not record.output.strip() and spec.scorer != "tool"):
                         raise _ProtocolError("response contained no useful answer output")
                     record.status, record.valid = "completed", True
         except TimeoutError:
@@ -288,6 +333,12 @@ class LLMClient:
             now = time.perf_counter()
             record.elapsed_ms = (now - start) * 1000
             record.output_chars = len(record.output)
+            record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
+            if record.valid and record.status == "completed":
+                answer = record.output
+                if record.workload.get("equality") == "whitespace":
+                    answer = " ".join(answer.split())
+                record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
             if stream and last_answer is not None:
                 record.max_stream_gap_ms = max(
                     record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
