@@ -367,3 +367,13 @@ def test_intentional_client_deadline_does_not_create_baseline_error_regression()
     assert baseline_check(result).status == "pass"
     assert not any(row["scenario"] == "client_deadline"
                    for row in result.baseline["targets"][0]["comparisons"])
+
+
+def test_unselected_traffic_configuration_does_not_invalidate_other_checks():
+    current, previous = make_report(), make_report("baseline")
+    for report in (current, previous):
+        report.manifest["config"]["checks"] = ["correctness"]
+        report.manifest["effective_traffic"] = report.manifest["config"]["traffic"].copy()
+    current.manifest["config"]["traffic"]["rates"] = [1, 20]
+    current.manifest["effective_traffic"]["rates"] = [1, 20]
+    assert baseline_check(compare_baseline(current, previous)).status == "pass"

@@ -35,7 +35,7 @@ def run_config(endpoint, **overrides):
 @pytest.mark.parametrize("stream", [True, False])
 async def test_real_http_and_builtin_scoring(stream):
     with FakeEndpoint() as endpoint:
-        config = run_config(endpoint, stream=stream, structured_json=True)
+        config = run_config(endpoint, stream=stream, checks=["correctness", "json", "context"])
         fixtures = builtin_fixtures(config)
         selected = fixtures["correctness"] + fixtures["json"] + fixtures["context"]
         async with LLMClient(config.targets[0], config) as client:
