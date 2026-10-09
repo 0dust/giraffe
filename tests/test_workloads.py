@@ -17,6 +17,20 @@ from tests.fake_endpoint import FakeEndpoint
 
 
 def config(endpoint, **extra):
+    if "checks" not in extra:
+        selected = ["serving"]
+        if extra.get("metrics"):
+            selected.append("gpu")
+        if extra.get("structured_json"):
+            selected.append("json")
+        for field, check_id in (("arrivals", "arrivals"), ("prefix", "prefix"),
+                                ("buckets", "buckets"), ("sessions", "sessions"),
+                                ("consistency", "consistency"), ("tool_calling", "tools")):
+            if extra.get(field) is not None and extra.get(field) is not False:
+                selected.append(check_id)
+        if extra.get("buckets") is not None:
+            selected.append("mixed")
+        extra["checks"] = selected
     return RunConfig.model_validate(
         {
             "targets": [{"name": "local", "url": endpoint.url, "model": "fake-model"}],
@@ -118,7 +132,7 @@ async def test_failed_semantic_turn_stops_session_before_next_user_turn():
 def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
     settings = RunConfig(
         targets=[Target(name="local", url="http://localhost:1", model="m")],
-        checks=["serving"],
+        checks=["serving", "mixed"],
         buckets={"mixed_pairs": 1},
         limits={"min_samples": 2, "fairness_max_ratio": 2},
     )
@@ -193,7 +207,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
 def test_workload_timing_uses_core_generator_qualification(lag, warm_first, correct, expected):
     settings = RunConfig(
         targets=[Target(name="local", url="http://localhost:1", model="m")],
-        checks=["serving"], prefix={"repeats": 2},
+        checks=["serving", "prefix"], prefix={"repeats": 2},
         limits={"min_samples": 2, "latency_ms": 1000},
     )
     records = [
@@ -494,3 +508,26 @@ def test_invalid_workloads_rejected_before_network(extra):
                 **extra,
             }
         )
+
+
+async def test_retained_unselected_workloads_send_no_workload_requests():
+    with FakeEndpoint() as endpoint:
+        report = await run_suite(config(
+            endpoint, checks=["serving"], arrivals={}, prefix={}, buckets={},
+            sessions={}, consistency={}, tool_calling=True,
+        ))
+    assert {check.id for check in report.checks if check.status != "skipped"} == {"serving"}
+    assert not any(record.workload for record in report.requests)
+    assert not any(payload.get("tools") for payload in endpoint.requests)
+
+
+@pytest.mark.parametrize("selected", ["buckets", "mixed"])
+async def test_bucket_and_mixed_workloads_can_be_selected_independently(selected):
+    with FakeEndpoint() as endpoint:
+        report = await run_suite(config(endpoint, checks=[selected], buckets={
+            "levels": [1], "samples_per_bucket": 2, "mixed_pairs": 1,
+        }))
+    assert {check.id for check in report.checks if check.status != "skipped"} == {selected}
+    workload_records = [record for record in report.requests if record.workload]
+    assert workload_records
+    assert all(record.check_ids == [selected] for record in workload_records)

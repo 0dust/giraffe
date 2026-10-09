@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -12,7 +13,7 @@ CHECK_NAMES = {
     "serving": "Serving success",
     "first_output": "First useful output",
     "generation": "Generation pace",
-    "capacity": "Concurrency and capacity",
+    "capacity": "Arrival traffic capacity",
     "fairness": "Mixed long/short fairness",
     "context": "Long-context behavior",
     "correctness": "Known-answer correctness",
@@ -21,7 +22,8 @@ CHECK_NAMES = {
     "recovery": "Sustained load and recovery",
     "gpu": "GPU observations",
 }
-CORE_CHECKS = list(CHECK_NAMES)
+CORE_CHECKS = tuple(CHECK_NAMES)
+DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu"})
 CHECK_NAMES.update({
     "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
     "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
@@ -206,6 +208,101 @@ class Limits(Model):
     min_samples: int = Field(default=5, ge=2)
 
 
+MAX_PLANNED_ARRIVALS = 100_000
+
+
+class TrafficMix(Model):
+    short: float = Field(default=.6, ge=0)
+    long_input: float = Field(default=.2, ge=0)
+    long_output: float = Field(default=.2, ge=0)
+
+    @model_validator(mode="after")
+    def normalize(self) -> TrafficMix:
+        weights = (self.short, self.long_input, self.long_output)
+        scale = max(weights)
+        if scale <= 0:
+            raise ValueError("traffic mix must contain a positive weight")
+        if math.isclose(sum(weights), 1, rel_tol=0, abs_tol=1e-12):
+            return self
+        scaled = tuple(weight / scale for weight in weights)
+        total = sum(scaled)
+        self.short, self.long_input, self.long_output = (
+            weight / total for weight in scaled
+        )
+        return self
+
+
+class TrafficConfig(Model):
+    rates: list[float] = Field(default_factory=lambda: [1, 2, 4], min_length=1, max_length=16)
+    duration_seconds: float = Field(default=5, gt=0, le=3600)
+    arrival: Literal["steady", "poisson"] = "steady"
+    max_in_flight: int | None = Field(default=None, ge=1, le=256)
+    seed: int = Field(default=42, ge=0)
+    mix: TrafficMix = Field(default_factory=TrafficMix)
+    scheduler_lag_tolerance_ms: float = Field(default=100, gt=0)
+    drain_timeout_seconds: float = Field(default=30, gt=0)
+    long_input_chars: int = Field(default=4096, ge=128, le=1_000_000)
+    long_output_words: int = Field(default=32, ge=2, le=4096)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> TrafficConfig:
+        if any(rate <= 0 or rate > 10_000 for rate in self.rates):
+            raise ValueError("traffic rates must be positive and at most 10000 requests/second")
+        if any(left >= right for left, right in zip(self.rates, self.rates[1:])):
+            raise ValueError("traffic rates must be unique and strictly increasing")
+        if sum(self.rates) * self.duration_seconds > MAX_PLANNED_ARRIVALS:
+            raise ValueError("traffic plan exceeds 100000 expected arrivals per target")
+        return self
+
+
+class CheckOptions(Model):
+    samples: int | None = Field(default=None, ge=1)
+    concurrency: int | None = Field(default=None, ge=1, le=256)
+    context_limit: int | None = Field(default=None, ge=128)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    request_timeout_seconds: float | None = Field(default=None, gt=0)
+    sustained_seconds: float | None = Field(default=None, ge=0)
+    metrics_max_age_seconds: float | None = Field(default=None, gt=0)
+    cancel_after_ms: float | None = Field(default=None, gt=0)
+    deadline_probe_ms: float | None = Field(default=None, gt=0)
+    limits: Limits | None = None
+
+
+# These maps are shared by validation, execution and the local UI. A check only
+# exposes settings that affect its workload or verdict.
+CHECK_OPTION_FIELDS = {
+    "access": {"request_timeout_seconds"},
+    "serving": set(),
+    "first_output": set(),
+    "generation": {"samples", "max_output_tokens"},
+    "capacity": set(),
+    "fairness": {"samples", "context_limit"},
+    "context": {"samples", "context_limit"},
+    "correctness": {"samples", "concurrency"},
+    "json": {"samples", "concurrency"},
+    "cancellation": {"samples", "cancel_after_ms", "deadline_probe_ms"},
+    "recovery": {"samples", "concurrency", "sustained_seconds"},
+    "gpu": {"metrics_max_age_seconds"},
+}
+_TRAFFIC_LIMITS = {"first_output_ms", "latency_ms", "stream_gap_ms",
+                   "min_output_tokens_per_second", "max_error_rate", "min_correctness", "min_samples"}
+CHECK_LIMIT_FIELDS = {
+    "access": set(), "serving": {"max_error_rate"},
+    "first_output": {"first_output_ms", "min_samples"},
+    "generation": {"latency_ms", "stream_gap_ms", "min_output_tokens_per_second", "min_samples"},
+    "capacity": _TRAFFIC_LIMITS,
+    "fairness": {"fairness_max_ratio", "stream_gap_ms", "min_correctness"},
+    "context": {"min_correctness"}, "correctness": {"min_correctness"},
+    "json": {"min_correctness"}, "cancellation": set(),
+    "recovery": _TRAFFIC_LIMITS - {"min_samples"}, "gpu": set(),
+}
+
+# Extended workloads have dedicated top-level configuration blocks.
+for _check in CHECK_NAMES.keys() - CHECK_OPTION_FIELDS.keys():
+    CHECK_OPTION_FIELDS[_check] = set()
+    CHECK_LIMIT_FIELDS[_check] = set()
+
+
 class RunConfig(Model):
     targets: list[Target] = Field(min_length=1)
     concurrency: int = Field(default=4, ge=1, le=256)
@@ -217,7 +314,7 @@ class RunConfig(Model):
     samples: int = Field(default=6, ge=1)
     sustained_seconds: float = Field(default=5, ge=0)
     stop_after_errors: int = Field(default=20, ge=1)
-    checks: list[str] = Field(default_factory=lambda: list(CORE_CHECKS))
+    checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS), min_length=1)
     structured_json: bool = False
     metrics: bool = False
     metrics_interval_seconds: float = Field(default=1, ge=.1, le=60)
@@ -242,14 +339,65 @@ class RunConfig(Model):
     proxy: str | None = None
     restart_target: str | None = None
     limits: Limits = Field(default_factory=Limits)
+    traffic: TrafficConfig = Field(default_factory=TrafficConfig)
+    test_options: dict[str, CheckOptions] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
+        if "checks" not in self.model_fields_set:
+            self.checks = [*self.checks, *(["json"] if self.structured_json else []),
+                           *(["gpu"] if self.metrics else [])]
+            for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
+                                 ("buckets", "buckets"), ("sessions", "sessions"),
+                                 ("consistency", "consistency"), ("tool_calling", "tools")):
+                if getattr(self, field):
+                    self.checks.append(check)
+            if self.buckets:
+                self.checks.append("mixed")
+        self.checks = list(dict.fromkeys(self.checks))
+        self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
+        self.tool_calling = "tools" in self.checks
+        # Selecting a workload in the UI runs its defaults. Retain unselected
+        # settings for later edits without silently selecting their checks.
+        if "arrivals" in self.checks and self.arrivals is None:
+            self.arrivals = Arrival()
+        if "prefix" in self.checks and self.prefix is None:
+            self.prefix = Prefix()
+        if {"buckets", "mixed"}.intersection(self.checks) and self.buckets is None:
+            self.buckets = Buckets(
+                levels=[level for level in (1, 2) if level <= self.concurrency],
+                output_tokens={name: min(value, self.max_output_tokens)
+                               for name, value in Buckets().output_tokens.items()},
+            )
+        if "sessions" in self.checks and self.sessions is None:
+            self.sessions = Sessions(concurrency=min(2, self.concurrency),
+                                     max_tokens=min(32, self.max_output_tokens))
+        if "consistency" in self.checks and self.consistency is None:
+            self.consistency = Consistency(
+                levels=[level for level in (1, 2) if level <= self.concurrency])
         names = [t.name for t in self.targets]
         if len(names) != len(set(names)):
             raise ValueError("target names must be unique")
-        if not self.checks or set(self.checks) - set(CHECK_NAMES):
+        if set(self.checks) - set(CHECK_NAMES):
             raise ValueError("checks must contain supported check names")
+        if ("capacity" in self.checks and self.traffic.max_in_flight is not None
+                and self.traffic.max_in_flight > self.concurrency):
+            raise ValueError(f"traffic.max_in_flight must not exceed global concurrency ({self.concurrency})")
+        for check_id, options in self.test_options.items():
+            if check_id not in CHECK_NAMES:
+                raise ValueError(f"unsupported test_options check: {check_id}")
+            fields = options.model_fields_set - {"limits"}
+            unsupported = fields - CHECK_OPTION_FIELDS[check_id]
+            limit_fields = options.limits.model_fields_set if options.limits else set()
+            unsupported |= {f"limits.{field}" for field in limit_fields - CHECK_LIMIT_FIELDS[check_id]}
+            if unsupported:
+                raise ValueError(f"unsupported options for {check_id}: {', '.join(sorted(unsupported))}")
+            if check_id in self.checks:
+                for field in {"concurrency", "max_output_tokens", "request_timeout_seconds"}:
+                    value = getattr(options, field)
+                    if value is not None and value > getattr(self, field):
+                        raise ValueError(f"test_options.{check_id}.{field} must not exceed global "
+                                         f"{field} ({getattr(self, field)})")
         for target in self.targets:
             if target.parent and target.parent not in names:
                 raise ValueError(f"replica parent {target.parent!r} is not a configured service")
@@ -266,25 +414,63 @@ class RunConfig(Model):
             proxy = urlsplit(self.proxy)
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
-        for settings in (self.buckets, self.consistency):
-            if settings and max(settings.levels) > self.concurrency:
+        bucket_selected = bool({"buckets", "mixed"}.intersection(self.checks))
+        for selected, settings in ((bucket_selected, self.buckets),
+                                   ("consistency" in self.checks, self.consistency)):
+            if selected and settings and max(settings.levels) > self.concurrency:
                 raise ValueError("workload levels must not exceed the global concurrency ceiling")
-        if self.sessions and self.sessions.concurrency > self.concurrency:
-            raise ValueError("session concurrency must not exceed the global ceiling")
-        if self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
+        if "sessions" in self.checks and self.sessions:
+            if self.sessions.concurrency > self.concurrency:
+                raise ValueError("session concurrency must not exceed the global ceiling")
+            if self.sessions.max_tokens > self.max_output_tokens:
+                raise ValueError("session output budget must stay within max_output_tokens")
+        if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
             raise ValueError("bucket output budgets must stay within max_output_tokens")
-        if self.sessions and self.sessions.max_tokens > self.max_output_tokens:
-            raise ValueError("session output budget must stay within max_output_tokens")
-        for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                             ("buckets", "buckets"), ("sessions", "sessions"),
-                             ("consistency", "consistency"), ("tool_calling", "tools")):
-            if getattr(self, field) and check not in self.checks:
-                self.checks.append(check)
-        if self.buckets and "mixed" not in self.checks:
-            self.checks.append("mixed")
         from giraffe.deployment import sanitize
         self.request_options = sanitize(self.request_options)
         return self
+
+    def effective_check(self, check_id: str) -> dict[str, Any]:
+        """Resolve sparse overrides once, retaining global safety ceilings."""
+        if check_id not in CHECK_NAMES:
+            raise ValueError(f"unsupported check: {check_id}")
+        options = self.test_options.get(check_id, CheckOptions())
+        special_defaults = {"cancel_after_ms": 100, "deadline_probe_ms": 50}
+        resolved = {}
+        for field in sorted(CHECK_OPTION_FIELDS[check_id]):
+            default = special_defaults.get(field, getattr(self, field, None))
+            override = getattr(options, field)
+            value = default if override is None else override
+            if field in {"concurrency", "max_output_tokens", "request_timeout_seconds"}:
+                value = min(value, getattr(self, field))
+            resolved[field] = value
+        limits = self.limits.model_dump()
+        if options.limits:
+            limits.update(options.limits.model_dump(exclude_unset=True))
+        resolved["limits"] = limits
+        return resolved
+
+    def effective_traffic(self) -> TrafficConfig:
+        return self.traffic.model_copy(update={
+            "max_in_flight": min(self.traffic.max_in_flight or self.concurrency, self.concurrency),
+        })
+
+    @field_serializer("test_options")
+    def serialize_test_options(self, options: dict[str, CheckOptions]) -> dict[str, Any]:
+        return {name: value.model_dump(exclude_unset=True) for name, value in options.items()}
+
+
+class DraftTarget(Target):
+    """An endpoint being configured may not have a model selected yet."""
+
+    model: str
+
+
+class ConfigDraft(RunConfig):
+    """Editable configuration; validate as RunConfig before any execution."""
+
+    targets: list[DraftTarget] = Field(min_length=1)
+    checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS))
 
 
 class RequestSpec(Model):
@@ -301,6 +487,7 @@ class RequestSpec(Model):
     cancel_after_ms: float | None = Field(default=None, gt=0)
     context_position: str | None = None
     input_chars: int = 0
+    request_timeout_seconds: float | None = Field(default=None, gt=0)
     workload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -337,6 +524,13 @@ class RequestRecord(Model):
     input_chars: int = 0
     requested_max_tokens: int = 0
     stream: bool = True
+    traffic_stage: int | None = None
+    traffic_rate_rps: float | None = None
+    traffic_class: str | None = None
+    scheduled_offset_ms: float | None = None
+    dispatch_lag_ms: float | None = None
+    arrival_first_output_ms: float | None = None
+    arrival_elapsed_ms: float | None = None
 
     completed_at: str | None = None
     dispatch_ms: float | None = None

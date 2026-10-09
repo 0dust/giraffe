@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -18,12 +18,25 @@ from giraffe import __version__
 from giraffe.models import CHECK_NAMES, RunConfig, RunReport
 
 
+class UsageError(ValueError):
+    """An argument error that can use the caller's requested output format."""
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise UsageError(message)
+
+
 def parser() -> argparse.ArgumentParser:
-    app = argparse.ArgumentParser(
+    app = ArgumentParser(
         prog="giraffe", description="Run a bounded, built-in health suite against your LLM endpoint."
     )
     app.add_argument("--version", action="version", version=__version__)
     commands = app.add_subparsers(dest="command", required=True)
+    commands.add_parser("describe", help="Print checks, defaults and the full configuration schema as JSON")
+    validate = commands.add_parser("validate", help="Validate and normalize a configuration without traffic")
+    validate.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
+    validate.add_argument("--output-format", choices=["text", "json"], default="text")
     web = commands.add_parser("ui", help="Open the local web interface")
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--runs-dir", type=Path, default=Path("runs"))
@@ -32,7 +45,7 @@ def parser() -> argparse.ArgumentParser:
         run = commands.add_parser(name, help="Run the suite" if name == "run" else
                                   "Explicitly restart one configured target and test readiness")
         source = run.add_mutually_exclusive_group()
-        source.add_argument("--config", type=Path, help="YAML or JSON run configuration")
+        source.add_argument("--config", type=Path, help="YAML or JSON run configuration; - reads stdin")
         source.add_argument("--manifest", type=Path, help="Rerun the configuration in a saved report")
         run.add_argument("--url", help="OpenAI-compatible origin, API base, or chat-completions URL")
         run.add_argument("--model")
@@ -66,6 +79,7 @@ def parser() -> argparse.ArgumentParser:
             run.add_argument("--" + option, type=float)
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
+        run.add_argument("--output-format", choices=["text", "json"], default="text")
         if name == "cold-start":
             run.add_argument("--restart", required=True, help="Name of target with restart_command")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
@@ -78,6 +92,7 @@ def parser() -> argparse.ArgumentParser:
     save.add_argument("report", type=Path)
     save.add_argument("destination", type=Path)
     save.add_argument("--replace", action="store_true", help="Explicitly replace an existing baseline")
+    save.add_argument("--output-format", choices=["text", "json"], default="text")
     return app
 
 
@@ -85,12 +100,17 @@ def load_report(path: Path) -> RunReport:
     return RunReport.model_validate_json(path.read_text())
 
 
+def load_configuration(path: Path) -> dict:
+    values = yaml.safe_load(sys.stdin.read() if path == Path("-") else path.read_text())
+    if not isinstance(values, dict):
+        raise ValueError("Configuration must be a YAML/JSON object")
+    return values
+
+
 def configuration(args: argparse.Namespace) -> RunConfig:
     values = {}
     if args.config:
-        values = yaml.safe_load(args.config.read_text())
-        if not isinstance(values, dict):
-            raise ValueError("Configuration must be a YAML/JSON object")
+        values = load_configuration(args.config)
     elif args.manifest:
         values = dict(load_report(args.manifest).manifest["config"])
     if values.get("restart_target"):
@@ -112,6 +132,13 @@ def configuration(args: argparse.Namespace) -> RunConfig:
             values[name] = value
     if args.checks is not None:
         values["checks"] = [part.strip() for part in args.checks.split(",") if part.strip()]
+    elif "checks" in values:
+        # Explicit CLI opt-ins can extend a saved selection. An explicit --checks
+        # list remains authoritative, including when it deselects optional tests.
+        values["checks"] = list(values["checks"])
+        for flag, check in (("structured_json", "json"), ("metrics", "gpu"), ("tool_calling", "tools")):
+            if getattr(args, flag, None) and check not in values["checks"]:
+                values["checks"].append(check)
     limits = dict(values.get("limits") or {})
     for name in RunConfig.model_fields["limits"].annotation.model_fields:
         value = getattr(args, name, None)
@@ -162,8 +189,41 @@ async def _run(config: RunConfig) -> RunReport:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    json_output = any(value == "--output-format=json" or (
+        value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "json"
+    ) for index, value in enumerate(arguments))
+    kind = arguments[0] if arguments else "usage"
+
+    def emit(outcome: str, exit_code: int, **details) -> None:
+        print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
+                         allow_nan=False))
+
+    def failure(errors: list[dict]) -> int:
+        if json_output:
+            emit("error", 2, errors=errors)
+        else:
+            for error in errors:
+                location = ".".join(map(str, error["loc"]))
+                print(f"giraffe: {location + ': ' if location else ''}{error['message']}", file=sys.stderr)
+        return 2
+
     try:
+        args = parser().parse_args(arguments)
+        kind = "baseline.save" if args.command == "baseline" else args.command
+        if args.command == "describe":
+            from giraffe.capabilities import capabilities
+
+            print(json.dumps(capabilities(), allow_nan=False))
+            return 0
+        if args.command == "validate":
+            config = RunConfig.model_validate(load_configuration(args.config))
+            if json_output:
+                emit("success", 0, config=config.model_dump(mode="json"))
+            else:
+                print("Configuration is valid. No traffic was sent.")
+                print(config.model_dump_json(indent=2))
+            return 0
         if args.command == "ui":
             if not 1 <= args.port <= 65535:
                 raise ValueError("Port must be between 1 and 65535")
@@ -197,7 +257,10 @@ def main(argv: list[str] | None = None) -> int:
             args.destination.parent.mkdir(parents=True, exist_ok=True)
             with args.destination.open("w" if args.replace else "x") as file:
                 file.write(report.model_dump_json(indent=2) + "\n")
-            print(f"Saved baseline {report.run_id} ({report.overall}): {args.destination.resolve()}")
+            if json_output:
+                emit("success", 0, run_id=report.run_id, destination=str(args.destination.resolve()))
+            else:
+                print(f"Saved baseline {report.run_id} ({report.overall}): {args.destination.resolve()}")
             return 0
         config = configuration(args)
         baseline = load_report(args.baseline) if args.baseline else None
@@ -218,30 +281,38 @@ def main(argv: list[str] | None = None) -> int:
         if baseline:
             report = compare_baseline(report, baseline)
         json_path, html_path = write_report(report, directory)
-        print(f"{report.overall.upper()}: {len(report.requests)} requests")
-        if report.abort_reason:
-            print(f"Stopped: {report.abort_reason}")
-        for check in report.checks:
-            print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
-        for name, observation in report.observations.get("targets", {}).items():
-            telemetry = observation.get("serving_telemetry", {})
-            states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
-            print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
-        if report.baseline:
-            for target in report.baseline["targets"]:
-                diff = target["configuration_diff"]
-                changes = [row["field"] for row in diff["fields"] if row["change"]!="no_observed_change"]
-                print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
-        print(f"JSON: {json_path.resolve()}\nHTML: {html_path.resolve()}")
-        return 0 if report.overall == "pass" else 1 if report.overall == "fail" else 2
+        exit_code = 0 if report.overall == "pass" else 1 if report.overall == "fail" else 2
+        if json_output:
+            emit(report.overall, exit_code, run_id=report.run_id, request_count=len(report.requests),
+                 abort_reason=report.abort_reason,
+                 report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve())})
+        else:
+            print(f"{report.overall.upper()}: {len(report.requests)} requests")
+            if report.abort_reason:
+                print(f"Stopped: {report.abort_reason}")
+            for check in report.checks:
+                print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
+            for name, observation in report.observations.get("targets", {}).items():
+                telemetry = observation.get("serving_telemetry", {})
+                states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
+                print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
+            if report.baseline:
+                for target in report.baseline["targets"]:
+                    diff = target["configuration_diff"]
+                    changes = [row["field"] for row in diff["fields"] if row["change"]!="no_observed_change"]
+                    print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
+            print(f"JSON: {json_path.resolve()}\nHTML: {html_path.resolve()}")
+        return exit_code
     except ValidationError as error:
         # Pydantic's full repr contains raw input; only print locations/messages.
-        for item in error.errors(include_input=False, include_url=False, include_context=False):
-            print(f"giraffe: {'.'.join(map(str, item['loc']))}: {item['msg']}", file=sys.stderr)
-        return 2
-    except (OSError, ValueError, KeyError, yaml.YAMLError) as error:
-        print(f"giraffe: {error}", file=sys.stderr)
-        return 2
+        return failure([{"loc": list(item["loc"]), "message": item["msg"], "type": item["type"]}
+                        for item in error.errors(include_input=False, include_url=False, include_context=False)])
+    except yaml.YAMLError as error:
+        mark = getattr(error, "problem_mark", None)
+        location = ["config", mark.line + 1, mark.column + 1] if mark else []
+        return failure([{"loc": location, "message": "Invalid YAML/JSON configuration", "type": "parse_error"}])
+    except (OSError, ValueError, KeyError) as error:
+        return failure([{"loc": [], "message": str(error), "type": type(error).__name__}])
 
 
 if __name__ == "__main__":

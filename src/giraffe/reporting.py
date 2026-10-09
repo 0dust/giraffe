@@ -15,6 +15,7 @@ from typing import Any
 
 from .deployment import deployment_diff, safe_config, sanitize
 from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status
+from .workloads import WORKLOAD_CHECKS
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
@@ -22,7 +23,7 @@ _MATCH_CONFIG = (
     "concurrency", "max_requests", "max_duration_seconds", "request_timeout_seconds",
     "max_output_tokens", "context_limit", "samples", "sustained_seconds", "checks",
     "structured_json", "overlap_models", "stream", "request_options", "stop_after_errors",
-    "arrivals", "prefix", "buckets", "sessions", "consistency", "tool_calling", "forced_tool_diagnostic",
+    "limits",
 )
 
 
@@ -45,7 +46,8 @@ def _rate(record: RequestRecord) -> float | None:
 def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], list[RequestRecord]]:
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in records:
-        if record.target == target and record.scenario not in {"client_cancel", "client_deadline"}:
+        if (record.target == target and getattr(record, "traffic_stage", None) is None
+                and record.scenario not in {"client_cancel", "client_deadline"}):
             for check in record.check_ids:
                 groups[(check, record.scenario)].append(record)
     return groups
@@ -63,11 +65,30 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
     current_config = report.manifest.get("config", {})
     old_config = baseline.manifest.get("config", {})
-    for key in _MATCH_CONFIG:
+    selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    workload_fields = [key for key, checks in WORKLOAD_CHECKS.items() if checks & selected]
+    for key in (*_MATCH_CONFIG, *workload_fields):
         if key not in old_config or key not in current_config:
             reasons.append(f"Recorded {key} is missing; comparability is unknown.")
         elif old_config[key] != current_config[key]:
             reasons.append(f"Run setting {key} differs.")
+    traffic_selected = any("capacity" in config.get("checks", []) for config in (current_config, old_config))
+    for key, effective in (("traffic", "effective_traffic"), ("test_options", "effective_checks")):
+        if key == "traffic" and not traffic_selected:
+            continue
+        if effective in report.manifest and effective in baseline.manifest:
+            continue  # Saved drafts and explicit defaults do not change executed work.
+        if key in current_config or key in old_config:
+            if key not in current_config or key not in old_config:
+                reasons.append(f"Recorded {key} is missing; comparability is unknown.")
+            elif current_config[key] != old_config[key]:
+                reasons.append(f"Run setting {key} differs.")
+    for key in ("effective_checks", "effective_traffic"):
+        if key == "effective_traffic" and not traffic_selected:
+            continue
+        if key in report.manifest or key in baseline.manifest:
+            if report.manifest.get(key) != baseline.manifest.get(key):
+                reasons.append(f"Recorded {key} differs or is missing.")
     # The suite version identifies bundled fixtures; custom packs also need a content identity.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
@@ -76,8 +97,9 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     elif ({key: value for key, value in current_pack.items() if key != "custom"}
           != {key: value for key, value in old_pack.items() if key != "custom"}):
         reasons.append("Fixture pack identity differs.")
-    if current_config.get("custom_fixtures") or old_config.get("custom_fixtures"):
-        for label, pack in (("Current", current_pack), ("Baseline", old_pack)):
+    for label, config, pack in (("Current", current_config, current_pack),
+                                ("Baseline", old_config, old_pack)):
+        if config.get("custom_fixtures") and "correctness" in config.get("checks", []):
             if not isinstance(pack, dict) or not any(
                 pack.get(key) for key in ("sha256", "custom_sha256", "hash", "content_hash")
             ):
@@ -181,6 +203,94 @@ def _compare_metric(
     return result
 
 
+def _traffic_metrics(report: RunReport, target: str) -> dict[str, Any] | None:
+    return next((check.metrics for check in report.checks
+                 if check.id == "capacity" and check.target == target
+                 and "traffic_stages" in check.metrics), None)
+
+
+def _compare_traffic(
+    report: RunReport, baseline: RunReport, target: str, reasons: list[str], threshold: float,
+) -> dict[str, Any] | None:
+    current, old = _traffic_metrics(report, target), _traffic_metrics(baseline, target)
+    if current is None and old is None:
+        return None
+    result: dict[str, Any] = {
+        "status": "inconclusive", "reason": "", "stages": [],
+        "current_highest_acceptable_rate_rps": (current or {}).get("highest_acceptable_rate_rps"),
+        "baseline_highest_acceptable_rate_rps": (old or {}).get("highest_acceptable_rate_rps"),
+        "delta_rps": None, "change_percent": None,
+        "method": "Matched planned arrival cohorts and acceptance criteria. Stage acceptance "
+                  "changes are observed qualification results, not statistical capacity estimates.",
+    }
+    if reasons:
+        result["reason"] = "Traffic comparison is unavailable: " + " ".join(reasons)
+        return result
+    if current is None or old is None:
+        result["reason"] = "One run lacks arrival-stage evidence; legacy concurrency is not arrival capacity."
+        return result
+    current_stages, old_stages = current["traffic_stages"], old["traffic_stages"]
+    planned_rates = report.manifest.get("effective_traffic", {}).get("rates")
+    if planned_rates is None:
+        planned_rates = report.manifest.get("config", {}).get("traffic", {}).get("rates")
+    if (not current_stages or not old_stages
+            or [stage.get("rate_rps") for stage in current_stages]
+            != [stage.get("rate_rps") for stage in old_stages]
+            or [stage.get("rate_rps") for stage in current_stages] != planned_rates):
+        result["reason"] = "The runs lack the same complete set of planned rate stages."
+        return result
+    for index, (stage, previous) in enumerate(zip(current_stages, old_stages)):
+        row: dict[str, Any] = {
+            "rate_rps": stage["rate_rps"], "current": stage, "baseline": previous,
+            "status": "inconclusive", "reason": "Stage evidence is incomplete or generator-limited.",
+            "goodput_delta_rps": None, "timing_comparable": False,
+            "evidence_ids": [record.id for record in report.requests
+                             if record.target == target and record.traffic_stage == index],
+        }
+        comparable = all(
+            item.get("fully_offered") and not item.get("generator_limited")
+            and item.get("status") in {"pass", "fail"} for item in (stage, previous)
+        )
+        if comparable:
+            row["goodput_delta_rps"] = stage["goodput_rps"] - previous["goodput_rps"]
+            if previous.get("accepted") and not stage.get("accepted"):
+                row.update(status="fail", reason="This previously acceptable rate now fails its configured criteria.")
+            else:
+                row.update(status="pass", reason="No loss of previously acceptable traffic at this tested rate.")
+            current_work, old_work = (
+                _output_work([record for record in run.requests
+                              if record.target == target and record.traffic_stage == index])
+                for run in (report, baseline)
+            )
+            row["output_work"] = {"current": current_work, "baseline": old_work}
+            row["timing_comparable"] = bool(
+                current_work["valid_completions"] and old_work["valid_completions"]
+                and not _different_output_work(current_work, old_work, threshold)
+            )
+            if not row["timing_comparable"]:
+                row["timing_comparison_reason"] = (
+                    "Generated output work differs or is unmeasured; displayed timings do not establish "
+                    "a like-for-like performance change. Qualification and goodput outcomes still apply."
+                )
+        result["stages"].append(row)
+    failures = [row for row in result["stages"] if row["status"] == "fail"]
+    incomplete = any(row["status"] == "inconclusive" for row in result["stages"])
+    highest = result["current_highest_acceptable_rate_rps"]
+    old_highest = result["baseline_highest_acceptable_rate_rps"]
+    if not incomplete and highest is not None and old_highest is not None:
+        result["delta_rps"] = highest - old_highest
+        result["change_percent"] = (highest - old_highest) * 100 / old_highest
+    if failures:
+        result.update(status="fail", reason=f"{len(failures)} previously acceptable tested rate(s) now fail.")
+    elif incomplete:
+        result["reason"] = "Incomplete or generator-limited stages prevent a capacity comparison."
+    elif old_highest is None:
+        result["reason"] = "The baseline established no acceptable arrival rate."
+    else:
+        result.update(status="pass", reason="Previously acceptable tested arrival rates remain acceptable.")
+    return result
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
@@ -236,8 +346,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
-        if not current_groups or not old_groups:
+        if (not current_groups or not old_groups) and traffic is None:
             target_reasons.append("Measured request samples are absent from one or both runs.")
         if not target_reasons:
             for check, scenario in sorted(set(current_groups) | set(old_groups)):
@@ -279,15 +390,20 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         uncertain = [row for row in assessed if row["status"] == "inconclusive"]
         missing_measurements = [row for row in rows if "worsening" not in row and
                                 max(row["current_samples"], row["baseline_samples"]) >= minimum]
-        if failures:
+        traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
+        if failures or traffic_failures:
             status = "fail"
-            summary = f"{len(failures)} material metric regression(s) against {baseline.run_id}."
+            summary = (f"{len(failures)} material metric regression(s) and "
+                       f"{len(traffic_failures)} lost acceptable traffic rate(s) against {baseline.run_id}.")
             if target_reasons:
                 summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
         elif target_reasons:
             status = "inconclusive"
             summary = "Baseline comparison is inconclusive: " + " ".join(target_reasons)
-        elif not assessed or uncertain or missing_measurements:
+        elif traffic is not None and traffic["status"] == "inconclusive":
+            status = "inconclusive"
+            summary = traffic["reason"]
+        elif (not assessed and traffic is None) or uncertain or missing_measurements:
             status = "inconclusive"
             if not assessed:
                 summary = "No metric has enough comparable samples."
@@ -300,6 +416,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         else:
             status = "pass"
             summary = f"No material regression detected in {len(assessed)} comparable metric(s)."
+            if traffic is not None:
+                summary += " " + traffic["reason"]
         excluded = len(rows) - len(assessed)
         if excluded:
             summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
@@ -310,13 +428,17 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                  "telemetry": {"current": report.observations.get("targets", {}).get(name, {}).get("serving_telemetry"),
                                "baseline": baseline.observations.get("targets", {}).get(name, {}).get("serving_telemetry")},
                  "comparisons": rows}
+        if traffic is not None:
+            entry["traffic_capacity"] = traffic
         comparison["targets"].append(entry)
         result.checks.append(CheckResult(
             id="baseline", target=name, title="Baseline comparison", required=True,
             status=status, summary=summary,
             metrics={"compared_metrics": len(assessed), "excluded_metrics": excluded,
-                     "regressions": len(failures), "baseline_run_id": baseline.run_id},
-            evidence_ids=list(dict.fromkeys(rid for row in failures for rid in row["evidence_ids"])),
+                     "regressions": len(failures) + len(traffic_failures),
+                     "baseline_run_id": baseline.run_id},
+            evidence_ids=list(dict.fromkeys(rid for row in failures + traffic_failures
+                                            for rid in row["evidence_ids"])),
         ))
     baseline_checks = [check for check in result.checks if check.id == "baseline"]
     comparison["status"] = overall_status(baseline_checks)
@@ -362,6 +484,70 @@ def _badge(status: str) -> str:
     return f'<span class="badge {_e(status)}">{_e(status)}</span>'
 
 
+def _rps(value: float | None) -> str:
+    return "not established" if value is None else f"{value:,.4g} requests/s"
+
+
+def _traffic_table(check: CheckResult) -> str:
+    parts = [f'<h3>{_e(check.target)} — arrival traffic</h3>',
+             '<p class="muted">Cohort goodput counts valid, correct answers meeting every configured '
+             'SLO, including bounded drain completions, divided by the arrival window. '
+             'Arrival latency includes local dispatch delay; service latency starts at dispatch. '
+             'Neither measures internal server queue time.</p>',
+             '<div class="table"><table><tr><th>Offered rate / outcome</th><th>Scheduled / sent</th>'
+             '<th>Sent rate</th><th>Completed / failed / timed out</th>'
+             '<th>Local / late / not offered</th><th>Cohort goodput / good fraction</th>'
+             '<th>Dispatch delay p95 ms</th><th>Service latency p95 ms</th>'
+             '<th>Arrival first output / latency p95 ms</th></tr>']
+    for stage in check.metrics["traffic_stages"]:
+        def count(name: str) -> str:
+            return _e(stage.get(name, "—"))
+        parts.append(
+            f'<tr><td>{_e(_rps(stage.get("rate_rps")))}<br>{_badge(stage.get("status", "inconclusive"))}'
+            f'<br>{_e(" ".join(stage.get("reasons", [])))}</td>'
+            f'<td>{count("scheduled")} / {count("started")}</td>'
+            f'<td>{_e(_rps(stage.get("achieved_rps")))}</td>'
+            f'<td>{count("completed")} / {count("failed")} / {count("timed_out")}</td>'
+            f'<td>{count("dropped_local")} / {count("dropped_late")} / {count("not_offered")}</td>'
+            f'<td>{_e(_rps(stage.get("goodput_rps")))} / '
+            f'{_number(stage["good_fraction"] * 100) if stage.get("good_fraction") is not None else "—"}%</td>'
+            f'<td>{_number(stage.get("dispatch_lag_p95_ms"))}</td>'
+            f'<td>{_number(stage.get("latency_p95_ms"))}</td>'
+            f'<td>{_number(stage.get("arrival_first_output_p95_ms"))} / '
+            f'{_number(stage.get("arrival_latency_p95_ms"))}</td></tr>'
+        )
+    parts.append('</table></div><details><summary>Arrival cohort windows and stage accounting</summary>'
+                 f'<pre>{_json(check.metrics["traffic_stages"])}</pre></details>')
+    return "".join(parts)
+
+
+def _traffic_baseline_html(target: dict[str, Any]) -> str:
+    traffic = target["traffic_capacity"]
+    delta = traffic.get("delta_rps")
+    delta_text = (f' Change: {delta:+.4g} requests/s ({traffic["change_percent"]:+.1f}%).'
+                  if delta is not None else " No comparable capacity delta established.")
+    parts = [f'<h3>{_e(target["target"])} — tested arrival capacity</h3>',
+             f'<p>{_badge(traffic["status"])} {_e(traffic["reason"])}<br>'
+             f'Highest acceptable tested rate: '
+             f'{_e(_rps(traffic.get("baseline_highest_acceptable_rate_rps")))} → '
+             f'{_e(_rps(traffic.get("current_highest_acceptable_rate_rps")))}.'
+             f'{_e(delta_text)}</p>']
+    if traffic["stages"]:
+        parts.append('<div class="table"><table><tr><th>Offered rate</th><th>Baseline / current</th>'
+                     '<th>Cohort goodput, baseline / current</th><th>Finding</th></tr>')
+        for stage in traffic["stages"]:
+            before, after = stage["baseline"], stage["current"]
+            parts.append(
+                f'<tr><td>{_e(_rps(stage["rate_rps"]))}</td>'
+                f'<td>{_badge(before["status"])} / {_badge(after["status"])}</td>'
+                f'<td>{_e(_rps(before.get("goodput_rps")))} / {_e(_rps(after.get("goodput_rps")))}</td>'
+                f'<td>{_badge(stage["status"])} {_e(stage["reason"])} '
+                f'{_e(stage.get("timing_comparison_reason", ""))}</td></tr>'
+            )
+        parts.append('</table></div>')
+    return "".join(parts)
+
+
 def _render(report: RunReport) -> str:
     anchors = {record.id: f"request-{index}" for index, record in enumerate(report.requests)}
     config = report.manifest.get("config", {})
@@ -391,11 +577,16 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></div>')
     for check in report.checks:
         if check.id == "capacity":
-            highest = check.metrics.get("highest_tested_acceptable_concurrency")
-            value = str(highest) if highest is not None else "not established"
-            parts.append(f'<p><strong>{_e(check.target)} — highest tested acceptable concurrency: '
+            arrival = "traffic_stages" in check.metrics
+            highest = check.metrics.get("highest_acceptable_rate_rps" if arrival
+                                        else "highest_tested_acceptable_concurrency")
+            value = _rps(highest) if arrival else str(highest) if highest is not None else "not established"
+            measure = "arrival rate" if arrival else "concurrency"
+            parts.append(f'<p><strong>{_e(check.target)} — highest tested acceptable {measure}: '
                          f'{_e(value)}</strong> {_badge(check.status)}<br>'
                          f'{_e(check.summary)} Maximum capacity is not established by this run.</p>')
+            if arrival:
+                parts.append(_traffic_table(check))
     missing = [f"{c.target} / {c.title}: {c.summary}" for c in report.checks
                if c.status in {"skipped", "inconclusive", "blocked"}]
     missing.extend(report.warnings)
@@ -451,6 +642,9 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
         parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
                      f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
                      'Absolute check outcomes appear separately above.</p>')
+        for target in report.baseline.get("targets", []):
+            if "traffic_capacity" in target:
+                parts.append(_traffic_baseline_html(target))
         parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
                      f'<pre>{_json(report.baseline)}</pre></details>')
     else:

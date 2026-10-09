@@ -469,3 +469,12 @@ def test_flat_configuration_imports_preserve_intent_and_safe_launch(tmp_path):
     assert imported["serving"]["context_limit"] == 1024
     assert imported["backend"]["attention"] == "FLASH_ATTN"
     assert "do-not-save" not in json.dumps(imported) and "secret" not in json.dumps(imported)
+
+
+async def test_explicitly_deselected_telemetry_does_not_poll_metrics():
+    with FakeEndpoint() as endpoint:
+        report = await run_suite(config(endpoint, checks=["serving"],
+                                        targets=[target(endpoint)], metrics=True))
+        assert endpoint.metrics_reads == 0
+    assert not report.manifest["config"]["metrics"]
+    assert next(check for check in report.checks if check.id == "gpu").status == "skipped"
