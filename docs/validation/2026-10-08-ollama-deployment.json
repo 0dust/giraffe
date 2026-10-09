@@ -1,0 +1,14 @@
+{
+  "model": {
+    "digest": "a80c4f17acd55265feec403c7aef86be0c25983ab279d83f3bcd3abbcb5b8b72"
+  },
+  "runtime": {
+    "engine": "ollama"
+  },
+  "serving": {
+    "context_limit": 4096
+  },
+  "backend": {},
+  "scope": "local single runtime; other replicas unverified",
+  "collected_at": "2026-10-07T18:49:25.036140+00:00"
+}

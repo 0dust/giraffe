@@ -80,8 +80,10 @@ async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monk
         result = (await client.get("/api/bootstrap")).json()
         assert result["config"]["targets"][0]["model"] == ""
         assert result["config"]["restart_target"] is None
-        assert len(result["checks"]) == 12
-        assert {c["id"] for c in result["checks"] if c["optional"]} == {"json", "gpu"}
+        assert len(result["checks"]) == 19
+        assert {c["id"] for c in result["checks"] if c["optional"]} == {
+            "json", "gpu", "arrivals", "prefix", "buckets", "mixed", "sessions", "consistency", "tools",
+        }
         assert result["active_run_id"] is None
         assert (await client.get("/api/runs")).json()["runs"] == []
 
@@ -96,7 +98,10 @@ async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
             assert set(check["limit_fields"]) <= result["limits_schema"]["properties"].keys()
         assert result["traffic_schema"]["properties"]["arrival"]["enum"] == ["steady", "poisson"]
         assert result["config"]["traffic"]["rates"] == [1, 2, 4]
-        assert set(result["config"]["checks"]) == set(CHECK_OPTION_FIELDS) - {"json", "gpu"}
+        assert set(result["config"]["checks"]) == {
+            "access", "serving", "first_output", "generation", "capacity", "fairness", "context",
+            "correctness", "cancellation", "recovery",
+        }
 
 
 async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_path, monkeypatch):
@@ -234,6 +239,43 @@ async def test_blank_model_draft_sync_and_export_keep_execution_strict(tmp_path,
         assert (await client.post("/api/config/validate", json=saved)).status_code == 200
         assert (await client.post("/api/config/cli", json={"config": saved})).status_code == 200
         assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_workload_and_deployment_drafts_survive_sync_and_remain_opt_in(tmp_path, monkeypatch):
+    seen = []
+
+    async def capture(configuration, **kwargs):
+        seen.append(configuration)
+        return report(configuration)
+
+    monkeypatch.setattr("giraffe.web.run_suite", capture)
+    async with browser(tmp_path) as client:
+        values = (await client.get("/api/bootstrap")).json()["config"]
+        values.update(checks=["prefix"], prefix={"repeats": 7},
+                      arrivals={"requests_per_second": 3}, consistency={"repetitions": 8})
+        values["targets"][0].update(
+            deployment={"runtime": {"version": "custom-runtime"}, "discovery": "vllm"},
+            metrics_profile="vllm-v1", metrics_api_key_env="METRICS_TOKEN")
+        draft = await client.post("/api/config/draft", json=values)
+        assert draft.status_code == 200, draft.text
+        saved = draft.json()["config"]
+        assert saved["checks"] == ["prefix"]
+        assert saved["targets"][0]["model"] == ""
+        assert saved["prefix"]["repeats"] == 7
+        assert saved["arrivals"]["requests_per_second"] == 3
+        assert saved["targets"][0]["deployment"]["runtime"] == {"version": "custom-runtime"}
+        assert saved["targets"][0]["metrics_api_key_env"] == "METRICS_TOKEN"
+        assert (await client.post("/api/config/draft", json=saved)).json()["config"] == saved
+        saved["checks"] = ["correctness"]
+        saved["targets"][0]["model"] = "test-model"
+        command = await client.post("/api/config/cli", json={"config": saved})
+        assert command.status_code == 200, command.text
+        assert '"repeats": 7' in command.json()["command"]
+        identifier = await start(client, saved)
+        await finished(client, identifier)
+        assert seen[0].checks == ["correctness"]
+        assert seen[0].prefix.repeats == 7
+        assert seen[0].targets[0].deployment.runtime == {"version": "custom-runtime"}
 
 
 async def test_selected_checks_and_custom_settings_reach_runner_exactly(tmp_path, monkeypatch):

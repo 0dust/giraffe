@@ -38,6 +38,7 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
   if (!config.checks.length && !allowEmpty) throw new Error('Select at least one test before running.');
   config.structured_json = config.checks.includes('json');
   config.metrics = config.checks.includes('gpu');
+  config.tool_calling = config.checks.includes('tools');
   config.test_options ||= {};
   for (const check of checks) {
     if (values.get(`test_mode_${check.id}`) !== 'custom') {

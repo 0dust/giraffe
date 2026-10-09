@@ -1,0 +1,63 @@
+# Opt-in coverage example. Match endpoint, model and context to your server.
+targets:
+  - name: local
+    url: http://127.0.0.1:11434/v1
+    model: llama3.2:3b
+    deployment:
+      discovery: ollama
+      scope: local configured endpoint; other replicas unverified
+      serving: {context_limit: 4096}
+    metrics_profile: ollama
+    # metrics_url: http://127.0.0.1:8000/metrics
+    # metrics_profile: vllm-v1
+    # metrics_runtime_version: 0.30.0
+    # metrics_api_key_env: GIRAFFE_METRICS_KEY
+concurrency: 2
+max_requests: 700
+max_duration_seconds: 1800
+request_timeout_seconds: 120
+max_output_tokens: 128
+context_limit: 4096
+samples: 6
+sustained_seconds: 30
+retention: failures
+request_options: {temperature: 0}
+metrics: true
+metrics_interval_seconds: 2
+metrics_max_samples: 1024
+arrivals: {mode: steady, requests: 12, requests_per_second: 0.5, max_pending: 4}
+prefix: {prefix_chars: 256, repeats: 6, history_turns: 3}
+buckets:
+  input_chars: {short: 64, medium: 256, long: 512}
+  output_tokens: {short: 24, medium: 64, long: 128}
+  levels: [1, 2]
+  samples_per_bucket: 6
+  window_seconds: 120
+  mixed_pairs: 6
+  heavy_weights: {long_input: 1, long_output: 1}
+sessions:
+  modes: [fixed, live]
+  sessions: 2
+  concurrency: 2
+  max_tokens: 64
+  delay_seconds: 0.05
+consistency:
+  repetitions: 6
+  shapes: [short, long]
+  levels: [1, 2]
+  temperature: 0
+  seed: 17
+  equality: bytes
+  strict: false
+# Enable only on deployments expected to support parsed tool calls.
+tool_calling: false
+forced_tool_diagnostic: false
+limits:
+  min_samples: 5
+  first_output_ms: 60000
+  latency_ms: 90000
+  stream_gap_ms: 10000
+  min_output_tokens_per_second: 1
+  fairness_max_ratio: 3
+  max_error_rate: 0
+  min_correctness: 1

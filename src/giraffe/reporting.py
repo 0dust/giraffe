@@ -13,7 +13,9 @@ from statistics import median
 import tempfile
 from typing import Any
 
+from .deployment import deployment_diff, safe_config, sanitize
 from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status
+from .workloads import WORKLOAD_CHECKS
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
@@ -63,7 +65,9 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
     current_config = report.manifest.get("config", {})
     old_config = baseline.manifest.get("config", {})
-    for key in _MATCH_CONFIG:
+    selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    workload_fields = [key for key, checks in WORKLOAD_CHECKS.items() if checks & selected]
+    for key in (*_MATCH_CONFIG, *workload_fields):
         if key not in old_config or key not in current_config:
             reasons.append(f"Recorded {key} is missing; comparability is unknown.")
         elif old_config[key] != current_config[key]:
@@ -301,6 +305,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     comparison: dict[str, Any] = {
         "run_id": baseline.run_id, "status": "inconclusive", "targets": [],
         "min_samples": minimum, "regression_threshold": threshold,
+        "deployment_changes_establish_causality": False,
+        "source_outcome": baseline.overall,
+        "source_started_at": baseline.started_at, "source_finished_at": baseline.finished_at,
         "method": "Per check/scenario; medians for timing and means for rates; "
                   "400 deterministic bootstrap resamples, 95% sample intervals. "
                   "Rates use percentage points; timing and output rate use relative percent. "
@@ -324,6 +331,20 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 previous, current = old_target.get("identity", {}).get(key), target.get("identity", {}).get(key)
                 if previous != current:
                     identity_changes[key] = {"baseline": previous, "current": current}
+        current_deployment = report.observations.get("targets", {}).get(name, {}).get("deployment")
+        old_deployment = baseline.observations.get("targets", {}).get(name, {}).get("deployment")
+        configuration_diff = deployment_diff(current_deployment, old_deployment)
+        consistency_changes = []
+        for check in report.checks:
+            if check.target == name and check.id == "consistency":
+                previous = next((c for c in baseline.checks if c.target == name and c.id == "consistency"), None)
+                for scenario, bucket in check.metrics.get("buckets", {}).items():
+                    old_bucket = previous.metrics.get("buckets", {}).get(scenario, {}) if previous else {}
+                    consistency_changes.append({"scenario": scenario,
+                        "current_agreement": bucket.get("agreement_rate"),
+                        "baseline_agreement": old_bucket.get("agreement_rate"),
+                        "comparable": not target_reasons,
+                        "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
         traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
@@ -344,10 +365,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
                 different_work = _different_output_work(current_work, old_work, threshold)
+                current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
+                old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
+                input_work_changed = bool(current_inputs and old_inputs and median(old_inputs)>0 and abs(median(current_inputs)-median(old_inputs))*100/median(old_inputs)>threshold)
+                live_inputs_differ = any(r.workload.get("mode")=="live" for r in current_records) and Counter(r.request_hash for r in current_records) != Counter(r.request_hash for r in old_records)
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
+                    if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
+                        row.update(status="inconclusive", reason="Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         row.update(status="inconclusive", reason="Actual generated output lengths differ "
                                    "materially; these performance samples are not like-for-like.")
@@ -396,7 +423,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
         entry = {"target": name, "status": status, "reasons": target_reasons,
                  "generator_saturated_runs": saturated_runs,
-                 "identity_changes": identity_changes, "comparisons": rows}
+                 "identity_changes": identity_changes, "configuration_diff": configuration_diff,
+                 "consistency_changes": consistency_changes,
+                 "telemetry": {"current": report.observations.get("targets", {}).get(name, {}).get("serving_telemetry"),
+                               "baseline": baseline.observations.get("targets", {}).get(name, {}).get("serving_telemetry")},
+                 "comparisons": rows}
         if traffic is not None:
             entry["traffic_capacity"] = traffic
         comparison["targets"].append(entry)
@@ -418,6 +449,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
 
 def _retained(report: RunReport) -> RunReport:
     result = report.model_copy(deep=True)
+    result.manifest["config"] = safe_config(result.manifest.get("config", {}))
+    if result.baseline:
+        result.baseline = sanitize(result.baseline, bounded=False)
     policy = result.manifest.get("config", {}).get("retention", "failures")
     failed_evidence = {rid for check in result.checks if check.status in {"fail", "blocked"}
                        for rid in check.evidence_ids}
@@ -430,6 +464,7 @@ def _retained(report: RunReport) -> RunReport:
         if not keep:
             record.output = ""
             record.reasoning = ""
+            record.tool_calls = []
     return result
 
 
@@ -614,6 +649,17 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'<pre>{_json(report.baseline)}</pre></details>')
     else:
         parts.append('<p>No baseline supplied. This run reports absolute checks only.</p>')
+    parts.append('<section id="deployment"><h2>Deployment and serving telemetry</h2>'
+                 '<p>Deployment changes provide investigation context and do not establish causality. '
+                 'Unknown fields and telemetry remain unknown. Client first output is separate from server TTFT.</p>')
+    for name, observation in report.observations.get("targets", {}).items():
+        parts.append(f'<h3>{_e(name)}</h3><details><summary>Deployment snapshot and unknowns</summary>'
+                     f'<pre>{_json(observation.get("deployment"))}</pre></details>'
+                     f'<details><summary>Deployment observations during the run</summary>'
+                     f'<pre>{_json(observation.get("deployment_history", []))}</pre></details>'
+                     f'<details><summary>Serving telemetry, phases and collection coverage</summary>'
+                     f'<pre>{_json(observation.get("serving_telemetry"))}</pre></details>')
+    parts.append('</section>')
     parts.append('</section><section id="requests"><h2>Request evidence</h2>'
                  f'<p class="muted">Response retention: {_e(config.get("retention", "failures"))}. '
                  'Retention changes stored bodies only; scores, character counts and measurements remain.</p>')
@@ -669,3 +715,18 @@ def write_report(report: RunReport, directory: Path) -> tuple[Path, Path]:
     _atomic_write(json_path, retained.model_dump_json(indent=2))
     _atomic_write(html_path, _render(retained))
     return json_path, html_path
+
+
+def reproduction_export(report: RunReport) -> dict:
+    retained = _retained(report)
+    return {"schema_version": "1", "source_run_id": report.run_id,
+            "source_outcome": report.overall,
+            "config": retained.manifest.get("config", {}),
+            "fixture_pack": retained.manifest.get("fixture_pack", {}),
+            "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},
+            "deployment_history": {name: obs.get("deployment_history", []) for name, obs in retained.observations.get("targets", {}).items()},
+            "instructions": ["Supply secret environment-variable references locally.",
+                "Match suite and fixture hashes; supply any local fixture/metadata files.",
+                "Verify unknown server settings manually. This export cannot recreate inaccessible server state.",
+                "Imported launch arguments describe intent and are never executed by this export.",
+                "A saved failed run is a reference, not an approved deployment."]}
