@@ -12,6 +12,7 @@ from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS,
 
 @pytest.mark.parametrize("scenario", [
     "selection", "defaults", "nullable_limits", "traffic", "empty_selection", "round_trip",
+    "optional_workloads",
 ])
 def test_browser_configuration_behavior(scenario):
     node = shutil.which("node")
@@ -20,6 +21,9 @@ def test_browser_configuration_behavior(scenario):
     config = RunConfig(targets=[{"name": "a", "url": "http://localhost:8000/v1", "model": "a"},
                                 {"name": "b", "url": "http://localhost:8001/v1", "model": "b"}],
                        checks=["correctness", "capacity"], limits={"latency_ms": 1000},
+                       arrivals={"requests_per_second": 3}, prefix={"repeats": 7},
+                       buckets={"levels": [1]}, sessions={"sessions": 3},
+                       consistency={"repetitions": 8},
                        test_options={"correctness": {"samples": 9},
                                      "recovery": {"sustained_seconds": 2}})
     inherited = config.model_copy(update={"test_options": {}})
@@ -102,6 +106,21 @@ switch ({json.dumps(scenario)}) {{
     assert.deepEqual(preview.test_options,source.test_options);
     break;
   }}
+  case 'optional_workloads': {{
+    source.targets[0].deployment={{runtime:{{version:'custom-runtime'}},discovery:'vllm'}};
+    source.targets[0].metrics_profile='vllm-v1';
+    source.targets[0].metrics_api_key_env='METRICS_TOKEN';
+    values.delete('check');values.append('check','prefix');values.append('check','tools');
+    let result=build();
+    assert.deepEqual(result.checks,['prefix','tools']);assert.equal(result.tool_calling,true);
+    for(const key of ['arrivals','prefix','buckets','sessions','consistency'])assert.deepEqual(result[key],source[key]);
+    assert.deepEqual(result.targets,source.targets);
+    const next=valuesFor(result);next.delete('check');next.append('check','correctness');
+    result=configureTests(result,next,checks,defaults);
+    assert.deepEqual(result.checks,['correctness']);assert.equal(result.tool_calling,false);
+    assert.deepEqual(result.prefix,source.prefix);assert.deepEqual(result.targets,source.targets);
+    break;
+  }}
   case 'round_trip': {{
     const first=build(),second=configureTests(first,valuesFor(first),checks,defaults);
     assert.deepEqual(first,second);
@@ -171,6 +190,16 @@ markup=renderComparison(report);
 assert.match(markup,/comparison-filters/);
 assert.match(markup,/1 recorded metric comparisons/);
 assert(markup.includes('1 / 1 metrics shown'));
+target.configuration_diff={{confounded:true,changed_fields:['runtime.version']}};
+target.telemetry={{coverage:'partial'}};
+markup=renderComparison(report);
+assert.match(markup,/runtime.version|confounded experiment/);
+assert.match(markup,/Serving telemetry and repeatability comparison/);
+assert.match(markup,/Tested arrival capacity/);
+state.detail={{id:'run-one'}};
+const configMarkup=renderConfig({{manifest:{{config:{{}}}},observations:{{targets:{{local:{{deployment:{{runtime:'vllm'}},serving_telemetry:{{coverage:'partial'}}}}}}}}}});
+assert.match(configMarkup,/Deployment and serving observations/);
+assert.match(configMarkup,/reproduction.json/);assert.match(configMarkup,/config.json/);
 `,context);
 """
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
@@ -241,6 +270,11 @@ assert.doesNotMatch(markup,/<select name="test_mode_/);
 markup=renderTestCard(checks[1],state.config);
 assert(markup.indexOf('Traffic profile')<markup.indexOf('Acceptance settings'));
 assert.doesNotMatch(markup,/<select name="traffic_mode"/);
+const workload={{id:'prefix',title:'Shared prefix',description:'Cache evidence',option_fields:[],limit_fields:[],defaults:{{}}}};
+markup=renderTestCard(workload,{{...state.config,prefix:{{repeats:7}}}});
+assert.match(markup,/data-config-tab="json"/);
+assert.match(markup,/JSON settings saved/);
+assert.doesNotMatch(markup,/<textarea|data-reset-test=/);
 syncTestControls();
 assert.equal(cards.correctness.editor.hidden,true);
 const before=JSON.stringify(state.config);

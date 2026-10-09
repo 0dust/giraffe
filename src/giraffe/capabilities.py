@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from giraffe.fixtures import SUITE_VERSION
 from giraffe.models import (
-    CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, CheckOptions, Limits,
+    CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, Limits,
     RunConfig, TrafficConfig,
 )
 
@@ -21,6 +21,13 @@ CHECK_DESCRIPTIONS = {
     "cancellation": "Output caps, stop sequences, deadlines, cancellation, and follow-up probes.",
     "recovery": "Sustained traffic followed by light-load recovery probes.",
     "gpu": "Existing GPU telemetry; missing observations never imply healthy hardware.",
+    "arrivals": "Bounded steady or burst schedules with actual dispatch and waiting measurements.",
+    "prefix": "Shared prompt prefixes, repeated history, and observed cache reuse evidence.",
+    "buckets": "Input and output sizes across concurrency levels with coverage measurements.",
+    "mixed": "Whether long input and output requests interfere with short requests.",
+    "sessions": "Concurrent multi-turn conversations using fixed or live response history.",
+    "consistency": "Repeated answers across request shapes and concurrency levels.",
+    "tools": "Parsed tool-call format and expected arguments; tools are never executed.",
 }
 
 
@@ -38,7 +45,7 @@ def capabilities(config: RunConfig | None = None) -> dict:
         "defaults": defaults, "config_schema": RunConfig.model_json_schema(),
         "checks": [
             {"id": key, "title": title, "description": CHECK_DESCRIPTIONS[key],
-             "optional": key in {"json", "gpu"},
+             "optional": key not in DEFAULT_CHECKS,
              "option_fields": sorted(CHECK_OPTION_FIELDS[key]),
              "limit_fields": sorted(CHECK_LIMIT_FIELDS[key]),
              "defaults": inherited.effective_check(key)} for key, title in CHECK_NAMES.items()

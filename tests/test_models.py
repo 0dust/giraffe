@@ -103,3 +103,47 @@ def test_mix_normalization_is_finite_and_stable_across_reload():
     mix = TrafficMix(short=1e308, long_input=1e308, long_output=1e308)
     assert mix.short == pytest.approx(1 / 3)
     assert TrafficMix.model_validate(mix.model_dump()).model_dump() == mix.model_dump()
+
+
+def test_workload_defaults_and_explicit_selection_preserve_disabled_configuration():
+    from giraffe.models import CHECK_NAMES, CORE_CHECKS, ConfigDraft
+
+    target = Target(name="local", url="http://localhost", model="example")
+    default = RunConfig(targets=[target])
+    assert not (set(default.checks) - set(CORE_CHECKS))
+    implicit = RunConfig(targets=[target], sessions={}, buckets={}, tool_calling=True)
+    assert {"sessions", "buckets", "mixed", "tools"} <= set(implicit.checks)
+    explicit = RunConfig(targets=[target], checks=["serving"], sessions={}, buckets={},
+                         tool_calling=True)
+    assert explicit.checks == ["serving"]
+    assert explicit.sessions is not None and explicit.buckets is not None
+    assert not explicit.tool_calling
+    assert RunConfig.model_validate(explicit.model_dump()) == explicit
+    draft = ConfigDraft.model_validate({**implicit.model_dump(), "checks": []})
+    assert draft.checks == []
+    assert not draft.tool_calling
+    assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
+        "arrivals", "prefix", "buckets", "mixed", "sessions", "consistency", "tools"}
+
+
+@pytest.mark.parametrize("check_id,field", [
+    ("arrivals", "arrivals"), ("prefix", "prefix"), ("buckets", "buckets"),
+    ("mixed", "buckets"), ("sessions", "sessions"), ("consistency", "consistency"),
+    ("tools", "tool_calling"),
+])
+def test_selected_extended_workloads_get_safe_defaults(check_id, field):
+    config = RunConfig(targets=[Target(name="local", url="http://localhost", model="test")],
+                       checks=[check_id], concurrency=1, max_output_tokens=16)
+    assert getattr(config, field)
+    assert config.checks == [check_id]
+    assert RunConfig.model_validate(config.model_dump()) == config
+
+
+def test_all_selectable_checks_have_discoverable_configuration():
+    from giraffe.capabilities import capabilities
+    from giraffe.models import CHECK_NAMES, DEFAULT_CHECKS
+
+    discovered = capabilities()
+    assert {check["id"] for check in discovered["checks"]} == set(CHECK_NAMES)
+    assert {check["id"] for check in discovered["checks"] if not check["optional"]} == set(DEFAULT_CHECKS)
+    assert all(check["description"] for check in discovered["checks"])

@@ -211,3 +211,33 @@ def test_portable_report_explains_traffic_accounting_and_capacity_change(tmp_pat
     assert "Change: -3 requests/s (-75.0%)" in content
     assert "Arrival cohort windows" in content
     assert result == original
+
+
+@pytest.mark.parametrize("field,value", [
+    ("arrivals", {"requests": 3}), ("prefix", {"repeats": 3}),
+    ("buckets", {"mixed_pairs": 3}), ("sessions", {"sessions": 3}),
+    ("consistency", {"repetitions": 3}), ("forced_tool_diagnostic", True),
+])
+def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, value):
+    current, old = traffic_report(), traffic_report("baseline")
+    current.manifest["config"][field] = value
+    current.manifest["config"] = RunConfig.model_validate(current.manifest["config"]).model_dump()
+    assert compare_baseline(current, old).baseline["status"] == "pass"
+
+
+@pytest.mark.parametrize("field,check,value", [
+    ("sessions", "sessions", {"sessions": 3}),
+    ("buckets", "mixed", {"mixed_pairs": 3}),
+    ("buckets", "buckets", {"samples_per_bucket": 3}),
+    ("forced_tool_diagnostic", "tools", True),
+])
+def test_selected_workload_settings_still_block_comparison(field, check, value):
+    current, old = traffic_report(), traffic_report("baseline")
+    for report in (current, old):
+        report.manifest["config"]["checks"].append(check)
+        report.manifest["config"] = RunConfig.model_validate(report.manifest["config"]).model_dump()
+    current.manifest["config"][field] = value
+    current.manifest["config"] = RunConfig.model_validate(current.manifest["config"]).model_dump()
+    result = compare_baseline(current, old)
+    assert result.baseline["status"] == "inconclusive"
+    assert f"Run setting {field} differs." in result.baseline["targets"][0]["reasons"]

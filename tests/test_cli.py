@@ -26,12 +26,12 @@ def test_cli_optional_flags_extend_saved_selection_but_explicit_checks_win(tmp_p
         "targets": [{"name": "test", "url": "http://localhost", "model": "tiny"}],
         "checks": ["correctness"],
     }))
-    args = ["run", "--config", str(path), "--json", "--metrics"]
+    args = ["run", "--config", str(path), "--json", "--metrics", "--tool-calling"]
     selected = configuration(parser().parse_args(args))
-    assert selected.checks == ["correctness", "json", "gpu"]
+    assert selected.checks == ["correctness", "json", "gpu", "tools"]
     explicit = configuration(parser().parse_args(args + ["--checks", "correctness"]))
     assert explicit.checks == ["correctness"]
-    assert not explicit.structured_json and not explicit.metrics
+    assert not explicit.structured_json and not explicit.metrics and not explicit.tool_calling
 
 
 def test_config_cannot_restart_without_explicit_command(tmp_path, capsys):
@@ -120,7 +120,7 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     assert result == capabilities()
     assert result["config_schema"]["required"] == ["targets"]
     assert result["defaults"]["traffic"]["rates"] == [1, 2, 4]
-    assert len(result["checks"]) == 12
+    assert len(result["checks"]) == 19
     assert "runtime availability" in result["validation_note"]
 
 

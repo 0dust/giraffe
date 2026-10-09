@@ -22,11 +22,125 @@ CHECK_NAMES = {
     "recovery": "Sustained load and recovery",
     "gpu": "GPU observations",
 }
-DEFAULT_CHECKS = tuple(name for name in CHECK_NAMES if name not in {"json", "gpu"})
+CORE_CHECKS = tuple(CHECK_NAMES)
+DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu"})
+CHECK_NAMES.update({
+    "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
+    "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
+    "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
+    "tools": "Tool-calling capability",
+})
 
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class Deployment(Model):
+    # Explicit categories; arbitrary imports are filtered by deployment.py.
+    model: dict[str, Any] = Field(default_factory=dict)
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    serving: dict[str, Any] = Field(default_factory=dict)
+    backend: dict[str, Any] = Field(default_factory=dict)
+    hardware: dict[str, Any] = Field(default_factory=dict)
+    software: dict[str, Any] = Field(default_factory=dict)
+    extension: dict[str, Any] = Field(default_factory=dict)
+    scope: str = Field(default="configured endpoint; other replicas unverified", max_length=512)
+    collected_at: str | None = None
+    metadata_file: str | None = None
+    launch_command: str | list[str] | None = None
+    discovery: Literal["none", "ollama", "vllm"] = "none"
+    collector_url: str | None = None
+    intended_change: str | None = None
+
+
+class Arrival(Model):
+    mode: Literal["steady", "burst"] = "steady"
+    requests: int = Field(default=8, ge=2, le=10000)
+    requests_per_second: float = Field(default=1, gt=0, le=1000)
+    burst_size: int = Field(default=2, ge=1, le=256)
+    interval_seconds: float = Field(default=1, gt=0)
+    max_pending: int = Field(default=4, ge=1, le=256)
+    seed: int = 0
+
+
+class Prefix(Model):
+    prefix_chars: int = Field(default=256, ge=32, le=65536)
+    repeats: int = Field(default=4, ge=2, le=100)
+    history_turns: int = Field(default=3, ge=2, le=32)
+
+
+class Buckets(Model):
+    input_chars: dict[str, int] = Field(default_factory=lambda: {
+        "short": 64, "medium": 256, "long": 512})
+    output_tokens: dict[str, int] = Field(default_factory=lambda: {
+        "short": 16, "medium": 48, "long": 96})
+    levels: list[int] = Field(default_factory=lambda: [1, 2])
+    samples_per_bucket: int = Field(default=4, ge=2, le=100)
+    window_seconds: float = Field(default=30, gt=0)
+    mixed_pairs: int = Field(default=2, ge=1, le=100)
+    heavy_weights: dict[str, int] = Field(default_factory=lambda: {
+        "long_input": 1, "long_output": 1})
+
+    @model_validator(mode="after")
+    def valid_buckets(self):
+        for values in (self.input_chars, self.output_tokens):
+            if set(values) != {"short", "medium", "long"} or any(
+                not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 65536
+                for v in values.values()
+            ):
+                raise ValueError("buckets need short/medium/long integer sizes in 1..65536")
+        if not self.levels or len(self.levels) > 16 or len(set(self.levels)) != len(self.levels) or any(
+            level < 1 or level > 256 for level in self.levels
+        ):
+            raise ValueError("bucket levels must be distinct concurrency values in 1..256")
+        if set(self.heavy_weights) != {"long_input", "long_output"} or any(
+            not 1 <= weight <= 16 for weight in self.heavy_weights.values()
+        ):
+            raise ValueError("mixed heavy_weights need long_input/long_output weights in 1..16")
+        return self
+
+
+class Sessions(Model):
+    modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
+    sessions: int = Field(default=2, ge=1, le=32)
+    concurrency: int = Field(default=2, ge=1, le=32)
+    turns: list[str] = Field(default_factory=lambda: [
+        "Suggest a name for a bakery. Reply with just the name.",
+        "Repeat exactly the bakery name you just suggested, with no extra text."])
+    saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"])
+    delay_seconds: float = Field(default=0, ge=0, le=60)
+    max_tokens: int = Field(default=32, ge=1)
+    # Stop rather than inventing an answer or silently cropping required history.
+    failure_policy: Literal["stop"] = "stop"
+
+    @model_validator(mode="after")
+    def valid_session(self):
+        if not self.modes or len(set(self.modes)) != len(self.modes):
+            raise ValueError("select distinct fixed/live session modes")
+        if not 2 <= len(self.turns) <= 32 or any(not t.strip() or len(t) > 8192 for t in self.turns):
+            raise ValueError("sessions need 2..32 non-empty bounded user turns")
+        if "fixed" in self.modes and len(self.saved_answers) < len(self.turns) - 1:
+            raise ValueError("fixed history needs a saved assistant answer for each prior turn")
+        return self
+
+
+class Consistency(Model):
+    repetitions: int = Field(default=4, ge=2, le=100)
+    levels: list[int] = Field(default_factory=lambda: [1, 2])
+    shapes: list[Literal["short", "long"]] = Field(default_factory=lambda: ["short", "long"])
+    temperature: float = Field(default=0, ge=0, le=2)
+    seed: int | None = None
+    equality: Literal["bytes", "whitespace"] = "bytes"
+    strict: bool = False
+
+    @model_validator(mode="after")
+    def valid_consistency(self):
+        if not self.levels or len(self.levels) > 16 or len(set(self.levels)) != len(self.levels) or any(
+            level < 1 or level > 256 for level in self.levels
+        ) or not self.shapes or len(set(self.shapes)) != len(self.shapes):
+            raise ValueError("consistency needs distinct bounded levels and shapes")
+        return self
 
 
 class Target(Model):
@@ -39,6 +153,12 @@ class Target(Model):
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
     metrics_url: str | None = None
+    metrics_api_key_env: str | None = None
+    metrics_headers_env: dict[str, str] = Field(default_factory=dict)
+    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama"] = "unknown"
+    metrics_runtime_version: str | None = None
+    instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
+    deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
 
     @model_validator(mode="after")
@@ -58,6 +178,21 @@ class Target(Model):
                 raise ValueError("metrics_url must not contain credentials, query or fragment")
         if self.route == "replica" and not self.parent:
             raise ValueError("replica targets require parent service name")
+        if self.deployment.collector_url:
+            collector = urlsplit(self.deployment.collector_url)
+            if collector.scheme not in {"http", "https"} or not collector.hostname or any(
+                (collector.username, collector.password, collector.query, collector.fragment)
+            ):
+                raise ValueError("collector_url must be an http(s) URL without credentials/query/fragment")
+        from giraffe.deployment import sanitize
+        self.identity = sanitize(self.identity)
+        for category in ("model", "runtime", "serving", "backend", "hardware", "software", "extension"):
+            setattr(self.deployment, category, sanitize(getattr(self.deployment, category)))
+        self.deployment.scope = sanitize(self.deployment.scope)
+        self.deployment.intended_change = sanitize(self.deployment.intended_change)
+        if self.deployment.launch_command:
+            from giraffe.deployment import safe_launch
+            self.deployment.launch_command = safe_launch(self.deployment.launch_command)
         return self
 
 
@@ -162,6 +297,11 @@ CHECK_LIMIT_FIELDS = {
     "recovery": _TRAFFIC_LIMITS - {"min_samples"}, "gpu": set(),
 }
 
+# Extended workloads have dedicated top-level configuration blocks.
+for _check in CHECK_NAMES.keys() - CHECK_OPTION_FIELDS.keys():
+    CHECK_OPTION_FIELDS[_check] = set()
+    CHECK_LIMIT_FIELDS[_check] = set()
+
 
 class RunConfig(Model):
     targets: list[Target] = Field(min_length=1)
@@ -177,6 +317,18 @@ class RunConfig(Model):
     checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS), min_length=1)
     structured_json: bool = False
     metrics: bool = False
+    metrics_interval_seconds: float = Field(default=1, ge=.1, le=60)
+    metrics_timeout_seconds: float = Field(default=2, gt=0, le=10)
+    metrics_max_samples: int = Field(default=256, ge=2, le=4096)
+    metrics_max_series: int = Field(default=128, ge=1, le=1024)
+    cache_pressure_threshold: float = Field(default=.9, gt=0, le=1)
+    arrivals: Arrival | None = None
+    prefix: Prefix | None = None
+    buckets: Buckets | None = None
+    sessions: Sessions | None = None
+    consistency: Consistency | None = None
+    tool_calling: bool = False
+    forced_tool_diagnostic: bool = False
     metrics_max_age_seconds: float = Field(default=60, gt=0)
     overlap_models: bool = False
     stream: bool = True
@@ -195,8 +347,34 @@ class RunConfig(Model):
         if "checks" not in self.model_fields_set:
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
+            for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
+                                 ("buckets", "buckets"), ("sessions", "sessions"),
+                                 ("consistency", "consistency"), ("tool_calling", "tools")):
+                if getattr(self, field):
+                    self.checks.append(check)
+            if self.buckets:
+                self.checks.append("mixed")
         self.checks = list(dict.fromkeys(self.checks))
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
+        self.tool_calling = "tools" in self.checks
+        # Selecting a workload in the UI runs its defaults. Retain unselected
+        # settings for later edits without silently selecting their checks.
+        if "arrivals" in self.checks and self.arrivals is None:
+            self.arrivals = Arrival()
+        if "prefix" in self.checks and self.prefix is None:
+            self.prefix = Prefix()
+        if {"buckets", "mixed"}.intersection(self.checks) and self.buckets is None:
+            self.buckets = Buckets(
+                levels=[level for level in (1, 2) if level <= self.concurrency],
+                output_tokens={name: min(value, self.max_output_tokens)
+                               for name, value in Buckets().output_tokens.items()},
+            )
+        if "sessions" in self.checks and self.sessions is None:
+            self.sessions = Sessions(concurrency=min(2, self.concurrency),
+                                     max_tokens=min(32, self.max_output_tokens))
+        if "consistency" in self.checks and self.consistency is None:
+            self.consistency = Consistency(
+                levels=[level for level in (1, 2) if level <= self.concurrency])
         names = [t.name for t in self.targets]
         if len(names) != len(set(names)):
             raise ValueError("target names must be unique")
@@ -236,6 +414,20 @@ class RunConfig(Model):
             proxy = urlsplit(self.proxy)
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
+        bucket_selected = bool({"buckets", "mixed"}.intersection(self.checks))
+        for selected, settings in ((bucket_selected, self.buckets),
+                                   ("consistency" in self.checks, self.consistency)):
+            if selected and settings and max(settings.levels) > self.concurrency:
+                raise ValueError("workload levels must not exceed the global concurrency ceiling")
+        if "sessions" in self.checks and self.sessions:
+            if self.sessions.concurrency > self.concurrency:
+                raise ValueError("session concurrency must not exceed the global ceiling")
+            if self.sessions.max_tokens > self.max_output_tokens:
+                raise ValueError("session output budget must stay within max_output_tokens")
+        if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
+            raise ValueError("bucket output budgets must stay within max_output_tokens")
+        from giraffe.deployment import sanitize
+        self.request_options = sanitize(self.request_options)
         return self
 
     def effective_check(self, check_id: str) -> dict[str, Any]:
@@ -286,7 +478,7 @@ class RequestSpec(Model):
     scenario: str
     check_ids: list[str]
     messages: list[dict[str, Any]]
-    scorer: Literal["none", "exact", "contains", "json"] = "none"
+    scorer: Literal["none", "exact", "contains", "json", "tool"] = "none"
     expected: Any = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
     max_tokens: int | None = Field(default=None, ge=1)
@@ -296,6 +488,7 @@ class RequestSpec(Model):
     context_position: str | None = None
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
+    workload: dict[str, Any] = Field(default_factory=dict)
 
 
 class RequestRecord(Model):
@@ -338,6 +531,20 @@ class RequestRecord(Model):
     dispatch_lag_ms: float | None = None
     arrival_first_output_ms: float | None = None
     arrival_elapsed_ms: float | None = None
+
+    completed_at: str | None = None
+    dispatch_ms: float | None = None
+    completed_ms: float | None = None
+    scheduled_ms: float | None = None
+    client_wait_ms: float | None = None
+    overlap: int = 1
+    workload: dict[str, Any] = Field(default_factory=dict)
+    answer_hash: str | None = None
+    request_hash: str | None = None
+    history_hash: str | None = None
+    cached_prompt_tokens: int | None = None
+    cache_source: str | None = None
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def generation_tokens_per_second(self) -> float | None:
