@@ -11,6 +11,15 @@ from pathlib import Path
 
 from giraffe.models import CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec
 
+# One settings block can drive multiple selectable workloads.
+WORKLOAD_CHECKS = {
+    "arrivals": {"arrivals"}, "prefix": {"prefix"},
+    "buckets": {"buckets", "mixed"}, "sessions": {"sessions"},
+    "consistency": {"consistency"}, "tool_calling": {"tools"},
+    "forced_tool_diagnostic": {"tools"},
+}
+
+
 # Capture the loaded generator's identity, including deterministic fixture construction.
 FIXTURE_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -206,35 +215,38 @@ def bucket_spec(settings, input_shape, output_shape, scenario, check, level):
 
 async def buckets(run, target, client):
     settings = run.config.buckets
-    for level in settings.levels:
-        for input_shape in ("short", "medium", "long"):
-            for output_shape in ("short", "medium", "long"):
-                scenario = f"bucket_c{level}_{input_shape}_{output_shape}"
-                request = bucket_spec(
-                    settings, input_shape, output_shape, scenario, "buckets", level
-                )
-                end = min(run.deadline, time.monotonic() + settings.window_seconds)
-                count = 0
-                while (
-                    count < settings.samples_per_bucket
-                    and time.monotonic() < end
-                    and run.allowed(target.name)
-                ):
-                    batch = min(level, settings.samples_per_bucket - count)
-                    results = await asyncio.gather(
-                        *(
-                            run.request(
-                                target,
-                                client,
-                                request,
-                                timeout_override=max(0.001, end - time.monotonic()),
-                            )
-                            for _ in range(batch)
-                        )
+    if "buckets" in run.config.checks:
+        for level in settings.levels:
+            for input_shape in ("short", "medium", "long"):
+                for output_shape in ("short", "medium", "long"):
+                    scenario = f"bucket_c{level}_{input_shape}_{output_shape}"
+                    request = bucket_spec(
+                        settings, input_shape, output_shape, scenario, "buckets", level
                     )
-                    count += sum(r is not None for r in results)
-                if count < settings.samples_per_bucket:
-                    run.unfinished[target.name].add("buckets")
+                    end = min(run.deadline, time.monotonic() + settings.window_seconds)
+                    count = 0
+                    while (
+                        count < settings.samples_per_bucket
+                        and time.monotonic() < end
+                        and run.allowed(target.name)
+                    ):
+                        batch = min(level, settings.samples_per_bucket - count)
+                        results = await asyncio.gather(
+                            *(
+                                run.request(
+                                    target,
+                                    client,
+                                    request,
+                                    timeout_override=max(0.001, end - time.monotonic()),
+                                )
+                                for _ in range(batch)
+                            )
+                        )
+                        count += sum(r is not None for r in results)
+                    if count < settings.samples_per_bucket:
+                        run.unfinished[target.name].add("buckets")
+    if "mixed" not in run.config.checks:
+        return
     # Controls use precisely the same short request as every mixed pair.
     short = bucket_spec(settings, "short", "short", "mixed_control", "mixed", 1)
     await run.group(target, client, [short], "mixed_control", count=settings.mixed_pairs)
@@ -463,10 +475,11 @@ async def execute(run, target, client, fixtures):
         ("consistency", consistency),
         ("tool_calling", tools),
     ):
-        if getattr(run.config, field):
+        selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
+        if selected and getattr(run.config, field):
             run.emit("scenario_started", target.name, field)
             if not run.allowed(target.name):
-                run.unfinished[target.name].update({"tools" if field == "tool_calling" else field})
+                run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:
                 await callback(run, target, client, fixtures)

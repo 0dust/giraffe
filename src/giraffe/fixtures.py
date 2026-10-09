@@ -20,7 +20,7 @@ from referencing.exceptions import Unresolvable
 
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig
 
-FIXTURE_VERSION = "0.1.2"
+FIXTURE_VERSION = "0.2.0"
 SUITE_VERSION = "0.2.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
@@ -205,6 +205,36 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
             spec.max_tokens = min(spec.max_tokens or config.max_output_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return fixtures
+
+
+def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
+    """Three reproducible request shapes with complete local answer scoring.
+
+    Lengths describe characters and words, not tokenizer-dependent token counts.
+    Repeated fixtures intentionally exercise a reproducible canary workload;
+    production cache locality and workload coverage must be assessed separately.
+    """
+    traffic = config.traffic
+    prefix = "Notes:\nThe box label is L8N2.\n"
+    suffix = "\nReply with the box label only."
+    filler_size = max(0, traffic.long_input_chars - len(prefix + suffix))
+    filler = ("The box is gray. " * (filler_size // 17 + 1))[:filler_size]
+    word_bank = "blue red green yellow orange silver violet brown white black".split()
+    answer = " ".join(word_bank[index % len(word_bank)]
+                      for index in range(traffic.long_output_words))
+    groups = {
+        "short": builtin_fixtures(config)["short"],
+        "long_input": [_request("traffic.long_input", "capacity", ["capacity"],
+                                prefix + filler + suffix, expected="L8N2")],
+        "long_output": [_request("traffic.long_output", "capacity", ["capacity"],
+                                 "Copy exactly, with no extra text:\n" + answer,
+                                 expected=answer, max_tokens=config.max_output_tokens)],
+    }
+    for specs in groups.values():
+        for spec in specs:
+            spec.max_tokens = min(spec.max_tokens, config.max_output_tokens)
+            spec.stream = config.stream
+    return groups
 
 
 def _normalized(text: str) -> str:

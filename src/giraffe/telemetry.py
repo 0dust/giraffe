@@ -99,7 +99,10 @@ def parse(body, target, config):
         family, kind, unit = mapping[name]
         timestamp = float(raw_time) if raw_time else None
         age = time.time() - timestamp / 1000 if timestamp is not None else None
-        stale = age is not None and (age > config.metrics_max_age_seconds or age < -5)
+        max_age = (config.effective_check("gpu")["metrics_max_age_seconds"]
+                   if family in {entry[0] for entry in GPU.values()} and "gpu" in config.checks
+                   else config.metrics_max_age_seconds)
+        stale = age is not None and (age > max_age or age < -5)
         samples.append(
             {
                 "name": name,
