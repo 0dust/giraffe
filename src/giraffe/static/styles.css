@@ -21,5 +21,42 @@
 @layer components{.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.check-item:focus-visible{outline-offset:-3px}.notice,.check-detail-head>p,.page-heading p,.empty-state p{font-size:14px}.form-section>.hint,.details-content>.hint,.run-preview>p,.context-panel p{font-size:13px}label,.sidebar nav a{font-size:13px}.hint{font-size:12px}.check-item .check-name{font-size:13px}.history-table table{font-size:13px}.status{font-size:12px}}
 
 @layer layout{.panel,.history-layout>*,.form-layout>*,.live-layout>*,.result-grid>*{min-width:0}.workspace{min-width:0}.history-table,.comparison-table,.metric-table{max-width:100%}}
+@layer components{
+  .test-suite-heading,.test-card-heading,.test-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .test-suite-heading{margin-bottom:10px}.test-suite-heading h2{font-size:16px;margin-bottom:6px}
+  .test-suite-heading .actions{gap:12px;font-size:12px}.test-cards{margin-top:18px}
+  .test-card{border-top:1px solid var(--line);padding:15px 0;min-width:0}
+  .test-card:last-child{padding-bottom:0}.test-row-copy{min-width:0;flex:1}
+  .test-selection{display:flex;align-items:center;gap:10px;font-weight:500}
+  .test-selection input{flex:0 0 auto;margin:0}.test-description,.traffic-profile-summary{margin:4px 0 0 26px}
+  .test-row-actions{display:flex;align-items:center;justify-content:flex-end;gap:14px;flex-shrink:0}
+  .test-setting-state{color:var(--dim);font-size:11px;white-space:nowrap}.configure-test{font-size:12px;min-height:32px}
+  .test-disabled .test-selection{color:var(--muted)}
+  .test-editor{padding:20px 0 4px 26px}.test-editor-heading{margin-bottom:16px}
+  .test-editor-heading h3{font-size:13px}.reset-test{font-size:11px}
+  .test-editor fieldset{border:0;padding:0;margin:0;min-width:0}
+  .test-editor-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:22px}
+  .draft-notice{margin-bottom:18px;color:var(--warn)}
+  .traffic-editor{margin-bottom:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}
+  .traffic-editor>.hint{margin-bottom:20px}.traffic-mix-heading{margin-top:6px}
+  .traffic-mix-heading h4{font-size:12px;margin-bottom:6px}
+  .traffic-profile-summary{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+  .traffic-stage-table table{min-width:780px}.traffic-stage-table small{max-width:290px;white-space:normal}
+  .traffic-summary{padding:20px 24px;border-bottom:1px solid var(--line)}.traffic-summary p{margin-top:8px}
+}
+@layer responsive{
+@media(max-width:1100px){.test-card-heading{align-items:flex-start}.test-row-actions{flex-direction:column;align-items:flex-end;gap:0}}
+@media(max-width:580px){.test-card-heading{gap:12px}.test-row-actions{max-width:110px}.test-setting-state{white-space:normal;text-align:right}.test-suite-heading{align-items:flex-start}.test-editor{padding-left:0}.test-editor-heading{align-items:flex-start}.test-settings .fields,.traffic-editor .fields{grid-template-columns:1fr}.test-editor-footer{align-items:flex-start}.test-description{font-size:11px}}
+}
 
 @layer components{.comparison-filters{display:flex;align-items:end;gap:16px;margin-bottom:20px;flex-wrap:wrap}.comparison-filters>div{min-width:190px}.comparison-filters label{font-size:11px;margin-bottom:6px}.comparison-filters select{font-size:12px;min-height:36px}.comparison-filters>.hint{padding-bottom:8px;margin-left:auto}}
+
+@layer components{
+.config-toolbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px;border-bottom:1px solid var(--line)}
+.config-tabs{border:0;margin:0;gap:24px}.config-toolbar>.actions{font-size:12px;gap:20px;padding:8px 0 14px}
+.config-draft-notice{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:20px}.config-draft-notice .actions{flex-shrink:0}
+.config-locked{opacity:.55}.config-action-error{margin:0 0 20px;white-space:pre-wrap}
+#config-panel-json .config-editor{min-height:480px;tab-size:2}
+.cli-fallback{padding:20px;margin-bottom:20px}.cli-fallback textarea{margin-top:12px;min-height:170px}
+}
+@layer responsive{@media(max-width:580px){.config-toolbar{flex-wrap:wrap;gap:0}.config-toolbar>.actions{width:100%;gap:18px;justify-content:space-between}.config-draft-notice{align-items:flex-start;flex-direction:column;gap:12px}#config-panel-json .config-editor{min-height:360px}}}

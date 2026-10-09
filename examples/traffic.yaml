@@ -1,0 +1,38 @@
+# Existing endpoint only. Set rates and SLOs for your deployment before running:
+# giraffe ui --config examples/traffic.yaml
+targets:
+  - name: local
+    url: http://127.0.0.1:11434/v1
+    model: qwen2.5:7b-instruct
+
+checks: [capacity, correctness]
+concurrency: 32
+max_requests: 600
+max_duration_seconds: 300
+request_timeout_seconds: 30
+max_output_tokens: 128
+request_options: {temperature: 0}
+retention: failures
+
+traffic:
+  rates: [1, 2, 4]
+  duration_seconds: 20
+  arrival: poisson
+  seed: 42
+  mix: {short: 0.6, long_input: 0.2, long_output: 0.2}
+  long_input_chars: 4096
+  long_output_words: 32
+  drain_timeout_seconds: 30
+
+# Example limits, not hardware/model recommendations.
+test_options:
+  capacity:
+    limits:
+      first_output_ms: 1500
+      latency_ms: 10000
+      min_correctness: 1
+      max_error_rate: 0
+      min_samples: 5
+  correctness:
+    samples: 12
+    concurrency: 4

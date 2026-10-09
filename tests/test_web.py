@@ -8,7 +8,9 @@ import httpx
 import pytest
 
 from tests.fake_endpoint import FakeEndpoint
-from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport
+from giraffe.models import (
+    CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, CheckResult, RequestRecord, RunConfig, RunReport,
+)
 from giraffe.reporting import write_report
 from giraffe.web import create_app
 
@@ -82,6 +84,179 @@ async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monk
         assert {c["id"] for c in result["checks"] if c["optional"]} == {"json", "gpu"}
         assert result["active_run_id"] is None
         assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
+    async with browser(tmp_path) as client:
+        result = (await client.get("/api/bootstrap")).json()
+        for check in result["checks"]:
+            assert set(check["option_fields"]) == CHECK_OPTION_FIELDS[check["id"]]
+            assert set(check["limit_fields"]) == CHECK_LIMIT_FIELDS[check["id"]]
+            assert set(check["option_fields"]) <= result["option_schema"]["properties"].keys()
+            assert set(check["limit_fields"]) <= result["limits_schema"]["properties"].keys()
+        assert result["traffic_schema"]["properties"]["arrival"]["enum"] == ["steady", "poisson"]
+        assert result["config"]["traffic"]["rates"] == [1, 2, 4]
+        assert set(result["config"]["checks"]) == set(CHECK_OPTION_FIELDS) - {"json", "gpu"}
+
+
+async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_path, monkeypatch):
+    from giraffe.capabilities import capabilities
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Capability discovery must not send traffic")
+
+    monkeypatch.setattr("giraffe.web.run_suite", forbidden)
+    async with browser(tmp_path) as client:
+        discovery = (await client.get("/api/capabilities")).json()
+        bootstrap = (await client.get("/api/bootstrap")).json()
+        assert discovery == capabilities()
+        assert discovery["checks"] == bootstrap["checks"]
+        assert discovery["config_schema"] == bootstrap["config_schema"]
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_copy_cli_preserves_intent_without_starting_a_run(tmp_path, monkeypatch):
+    from giraffe.handoff import cli_command
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Copy CLI must not start traffic")
+
+    monkeypatch.setattr("giraffe.web.run_suite", forbidden)
+    values = config(checks=["correctness"], test_options={"correctness": {"samples": 9}})
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/cli", json={"config": values})
+        assert response.status_code == 200
+        assert response.json() == {"command": cli_command(RunConfig.model_validate(values))}
+        assert (await client.get("/api/runs")).json()["runs"] == []
+        assert not any(path.is_dir() and not path.name.startswith(".") for path in tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("mode,restart_target,config_restart,hook", [
+    ("normal", "local", None, ["true"]),
+    ("normal", None, "local", ["true"]),
+    ("cold-start", None, None, ["true"]),
+    ("cold-start", "unknown", None, ["true"]),
+    ("cold-start", "local\x00", None, ["true"]),
+    ("cold-start", "local", None, None),
+])
+async def test_copy_cli_and_start_reject_the_same_invalid_restart_intent(
+    tmp_path, mode, restart_target, config_restart, hook,
+):
+    values = config(checks=["access"])
+    values["targets"][0]["restart_command"] = hook
+    values["restart_target"] = config_restart
+    body = {"config": values, "mode": mode, "restart_target": restart_target}
+    async with browser(tmp_path) as client:
+        copy = await client.post("/api/config/cli", json=body)
+        start = await client.post("/api/runs", json=body)
+        assert copy.status_code == start.status_code == 422
+        assert copy.json() == start.json()
+
+
+async def test_copy_cli_checks_selected_fixture_and_baseline_availability(tmp_path):
+    async with browser(tmp_path) as client:
+        values = config(checks=["correctness"], custom_fixtures="/missing-fixtures.json")
+        assert (await client.post("/api/config/cli", json={"config": values})).status_code == 422
+        values["checks"] = ["capacity"]
+        assert (await client.post("/api/config/cli", json={"config": values})).status_code == 200
+        for endpoint in ("/api/config/cli", "/api/runs"):
+            assert (await client.post(endpoint, json={"config": values,
+                                                      "baseline_id": "missing"})).status_code == 404
+
+
+async def test_download_config_returns_exact_saved_manifest_and_no_resolved_credentials(tmp_path, fake_runner):
+    values = config(checks=["correctness"], test_options={"correctness": {"samples": 11}})
+    values["targets"][0]["api_key_env"] = "LOCAL_MODEL_KEY"
+    async with browser(tmp_path) as client:
+        identifier = await start(client, values)
+        detail = await finished(client, identifier)
+        response = await client.get(f"/api/runs/{identifier}/config.json")
+        assert response.status_code == 200
+        assert response.json() == detail["report"]["manifest"]["config"]
+        assert response.json()["targets"][0]["api_key_env"] == "LOCAL_MODEL_KEY"
+        assert "attachment" in response.headers["content-disposition"]
+        assert (await client.get("/api/runs/missing/config.json")).status_code == 404
+
+
+async def test_config_validation_never_starts_traffic_and_preserves_sparse_overrides(
+    tmp_path, monkeypatch,
+):
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Validating configuration must not start a runner")
+    monkeypatch.setattr("giraffe.web.run_suite", forbidden)
+    values = config(checks=["capacity"], limits={"latency_ms": 800}, test_options={
+        "capacity": {"limits": {"latency_ms": None, "first_output_ms": 400}},
+        "correctness": {"samples": 12},
+    }, traffic={"rates": [1, 3], "arrival": "poisson"})
+    values["targets"].append({"name": "other", "url": "http://localhost:8000/v1", "model": "b"})
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/validate", json=values)
+        assert response.status_code == 200, response.text
+        saved = response.json()["config"]
+        assert saved["checks"] == ["capacity"]
+        assert saved["test_options"] == values["test_options"]
+        assert saved["targets"][1]["name"] == "other"
+        assert saved["traffic"]["arrival"] == "poisson"
+        assert (await client.get("/api/runs")).json()["runs"] == []
+        for changes in ({"checks": []}, {"traffic": {"rates": [3, 1]}},
+                        {"test_options": {"correctness": {"sustained_seconds": 5}}}):
+            rejected = await client.post("/api/config/validate", json=values | changes)
+            assert rejected.status_code == 422
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+@pytest.mark.parametrize("checks", [[], ["capacity"]])
+async def test_blank_model_draft_sync_and_export_keep_execution_strict(tmp_path, checks):
+    async with browser(tmp_path) as client:
+        values = (await client.get("/api/bootstrap")).json()["config"]
+        values["traffic"]["rates"] = [1, 3]
+        values["checks"] = checks
+        values["test_options"] = {"capacity": {"limits": {"latency_ms": None}}}
+        values["targets"].append({"name": "second", "url": "http://localhost:8000/v1", "model": ""})
+        response = await client.post("/api/config/draft", json=values)
+        assert response.status_code == 200, response.text
+        saved = response.json()["config"]
+        assert [t["model"] for t in saved["targets"]] == ["", ""]
+        assert saved["traffic"]["rates"] == [1, 3]
+        assert saved["checks"] == checks
+        assert saved["test_options"] == values["test_options"]
+        assert (await client.post("/api/config/draft", json=saved)).json()["config"] == saved
+        for endpoint, body in (("/api/config/validate", saved), ("/api/config/cli", {"config": saved}),
+                               ("/api/runs", {"config": saved})):
+            assert (await client.post(endpoint, json=body)).status_code == 422
+        for changes in ({"traffic": {"rates": [3, 1]}}, {"checks": ["unknown"]},
+                        {"test_options": {"correctness": {"sustained_seconds": 5}}}):
+            assert (await client.post("/api/config/draft", json=saved | changes)).status_code == 422
+        for target in saved["targets"]:
+            target["model"] = "test-model"
+        assert (await client.post("/api/config/validate", json=saved)).status_code == (200 if checks else 422)
+        saved["checks"] = ["capacity"]
+        assert (await client.post("/api/config/validate", json=saved)).status_code == 200
+        assert (await client.post("/api/config/cli", json={"config": saved})).status_code == 200
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_selected_checks_and_custom_settings_reach_runner_exactly(tmp_path, monkeypatch):
+    seen = []
+
+    async def capture(configuration, **kwargs):
+        seen.append(configuration)
+        return report(configuration)
+
+    monkeypatch.setattr("giraffe.web.run_suite", capture)
+    values = config(checks=["correctness"], test_options={"correctness": {"samples": 9},
+                                                        "recovery": {"sustained_seconds": 2}})
+    # Old flags must not silently re-enable explicitly deselected checks.
+    values.update(structured_json=True, metrics=True)
+    async with browser(tmp_path) as client:
+        identifier = await start(client, values)
+        detail = await finished(client, identifier)
+        assert seen[0].checks == ["correctness"]
+        assert seen[0].effective_check("correctness")["samples"] == 9
+        assert seen[0].test_options["recovery"].sustained_seconds == 2
+        assert detail["config"]["checks"] == ["correctness"]
+        assert not detail["config"]["structured_json"]
+        assert not detail["config"]["metrics"]
 
 
 async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
@@ -275,6 +450,14 @@ async def test_invalid_configuration_and_custom_fixtures_preflight(tmp_path, fak
         missing = await client.post("/api/runs", json={"config": config(custom_fixtures="/missing")})
         assert missing.status_code == 422
         assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_disabled_correctness_does_not_load_custom_fixture_file(tmp_path, fake_runner):
+    async with browser(tmp_path) as client:
+        identifier = await start(client, config(checks=["capacity"], custom_fixtures="/missing"))
+        detail = await finished(client, identifier)
+        assert detail["state"] == "completed"
+        assert detail["config"]["custom_fixtures"] == "/missing"
 
 
 async def test_normal_run_never_runs_restart_config(tmp_path, fake_runner):

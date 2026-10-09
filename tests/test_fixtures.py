@@ -41,8 +41,22 @@ def test_builtins_repeatable_versioned_and_json_opt_in():
     assert len({spec.fixture_id for spec in specs}) == len(specs)
     assert all(spec.fixture_id.endswith((".v1", ".v2")) and spec.check_ids for spec in specs)
     assert all(spec.expected is not None for spec in specs)
-    assert FIXTURE_VERSION == "0.1.2"
+    assert FIXTURE_VERSION == "0.2.0"
     assert builtin_fixtures(config(structured_json=True))["json"]
+
+
+def test_traffic_mix_has_scored_and_bounded_short_input_long_input_and_long_output():
+    from giraffe.fixtures import traffic_fixtures
+
+    configured = config(max_output_tokens=40,
+                        traffic={"long_input_chars": 2000, "long_output_words": 24})
+    fixtures = traffic_fixtures(configured)
+    assert set(fixtures) == {"short", "long_input", "long_output"}
+    assert fixtures["long_input"][0].input_chars == 2000
+    assert len(fixtures["long_output"][0].expected.split()) == 24
+    assert all(spec.scorer == "exact" and spec.expected and spec.max_tokens <= 40
+               for group in fixtures.values() for spec in group)
+    assert traffic_fixtures(configured) == fixtures
 
 
 @pytest.mark.parametrize("context_limit", [128, 512, 4096, 32768])

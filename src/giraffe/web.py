@@ -18,25 +18,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field, ValidationError
 
-from giraffe.fixtures import SUITE_VERSION, load_custom_fixtures
-from giraffe.models import CHECK_NAMES, Model, RunConfig, RunReport
+from giraffe.capabilities import capabilities
+from giraffe.fixtures import load_custom_fixtures
+from giraffe.models import ConfigDraft, Model, RunConfig, RunReport
 from giraffe.reporting import compare_baseline, write_report
 from giraffe.runner import run_suite
 
-_DESCRIPTIONS = {
-    "access": "Real inference through your network, TLS, credentials, and endpoint route.",
-    "serving": "Errors, empty answers, malformed responses, incomplete streams, and timeouts.",
-    "first_output": "Time until useful answer text, separating initial and warmed requests.",
-    "generation": "Response time, stream pauses, output length, and reported token rate.",
-    "capacity": "Increasing bounded concurrency with short and long requests.",
-    "fairness": "Whether long prompts disrupt an already streaming short response.",
-    "context": "Recall of known facts at different positions and input lengths.",
-    "correctness": "Known-answer extraction, arithmetic, and classification under load.",
-    "json": "JSON parsing, fields, types, and expected content under concurrency.",
-    "cancellation": "Output caps, stop sequences, deadlines, cancellation, and follow-up probes.",
-    "recovery": "Sustained traffic followed by light-load recovery probes.",
-    "gpu": "Existing GPU telemetry; missing observations never imply healthy hardware.",
-}
+
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
 _SHUTDOWN_SECONDS = 5
 
@@ -260,10 +248,25 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
 
     @app.get("/api/bootstrap")
     async def bootstrap():
-        return {"config": _bootstrap_config(defaults), "checks": [
-            {"id": key, "title": title, "description": _DESCRIPTIONS[key],
-             "optional": key in {"json", "gpu"}} for key, title in CHECK_NAMES.items()],
-            "active_run_id": active.get("id"), "suite_version": SUITE_VERSION}
+        configuration = _bootstrap_config(defaults)
+        resolved = ConfigDraft.model_validate(configuration)
+        return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
+                "active_run_id": active.get("id")}
+
+    @app.get("/api/capabilities")
+    async def describe_capabilities():
+        return capabilities()
+
+
+    @app.post("/api/config/draft")
+    async def validate_draft(config: ConfigDraft):
+        """Normalize a draft for editing or export without requiring run readiness."""
+        return {"config": config.model_dump(mode="json")}
+
+    @app.post("/api/config/validate")
+    async def validate_config(config: RunConfig):
+        """Normalize edits using the same contract as a run without sending traffic."""
+        return {"config": config.model_dump(mode="json")}
 
     @app.get("/api/runs")
     async def list_runs():
@@ -278,15 +281,15 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         return {"runs": sorted(rows, key=lambda item: item.get("started_at") or "", reverse=True),
                 "active_run_id": active.get("id")}
 
-    @app.post("/api/runs", status_code=202)
-    async def start_run(body: StartRun):
-        if active:
-            raise HTTPException(409, "A run is already active; stop it or wait for its report")
+    def prepare_run(body: StartRun) -> tuple[RunConfig, RunReport | None]:
+        """Resolve the same execution intent for Start and Copy CLI."""
         config = body.config
         if body.mode == "normal":
             if config.restart_target or body.restart_target:
                 raise HTTPException(422, "Restart requires explicit cold-start mode and target")
         else:
+            if body.restart_target and "\x00" in body.restart_target:
+                raise HTTPException(422, "Restart target must not contain a NUL character")
             target = next((target for target in config.targets
                            if target.name == body.restart_target), None)
             if target is None or not target.restart_command:
@@ -294,12 +297,27 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             if config.restart_target and config.restart_target != body.restart_target:
                 raise HTTPException(422, "Restart targets must match")
             config = config.model_copy(update={"restart_target": body.restart_target})
-        if config.custom_fixtures:
+        if config.custom_fixtures and "correctness" in config.checks:
             try:
                 load_custom_fixtures(config.custom_fixtures)
             except (OSError, ValueError, ValidationError) as exc:
                 raise HTTPException(422, "Custom fixtures are missing or invalid; check the local file") from exc
         baseline = _report(_directory(baseline_root, body.baseline_id) / "report.json") if body.baseline_id else None
+        return config, baseline
+
+    @app.post("/api/config/cli")
+    async def copy_cli(body: StartRun):
+        from giraffe.handoff import cli_command
+
+        config, baseline = prepare_run(body)
+        return {"command": cli_command(config, mode=body.mode, restart_target=body.restart_target,
+                                       baseline=baseline)}
+
+    @app.post("/api/runs", status_code=202)
+    async def start_run(body: StartRun):
+        if active:
+            raise HTTPException(409, "A run is already active; stop it or wait for its report")
+        config, baseline = prepare_run(body)
         identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         directory = _directory(root, identifier)
         directory.mkdir()
@@ -314,6 +332,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
         return run_detail(identifier)
+
+    @app.get("/api/runs/{identifier}/config.json")
+    async def download_config(identifier: str):
+        saved = _report(_directory(root, identifier) / "report.json")
+        config = saved.manifest.get("config")
+        if not isinstance(config, dict):
+            raise HTTPException(404, "Saved configuration is unavailable")
+        return JSONResponse(config, headers={
+            "Content-Disposition": f'attachment; filename="giraffe-{identifier}-config.json"',
+        })
 
     @app.post("/api/runs/{identifier}/cancel")
     async def cancel_run(identifier: str):

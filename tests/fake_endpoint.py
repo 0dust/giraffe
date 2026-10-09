@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -21,16 +23,22 @@ class FakeEndpoint:
         first_token_delay: float = 0.005,
         chunk_delay: float = 0.002,
         fault_contains: str | None = None,
+        service_slots: int | None = None,
     ):
         self.mode = mode
         self.first_token_delay = first_token_delay
         self.chunk_delay = chunk_delay
         self.fault_contains = fault_contains
         self.requests: list[dict[str, Any]] = []
+        self.request_started_at: list[float] = []
+        self.request_finished_at: list[float] = []
         self.active = 0
         self.peak_active = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        if service_slots is not None and service_slots < 1:
+            raise ValueError("service_slots must be positive")
+        self._service_slots = threading.Semaphore(service_slots) if service_slots else None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -72,16 +80,21 @@ class FakeEndpoint:
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 with endpoint._lock:
                     endpoint.requests.append(payload)
+                    endpoint.request_started_at.append(time.monotonic())
                     endpoint.active += 1
                     endpoint.peak_active = max(endpoint.peak_active, endpoint.active)
                 try:
-                    self._completion(payload)
+                    # Optional finite service capacity creates genuine HTTP queue
+                    # delay, allowing tests to observe overload without a model.
+                    with endpoint._service_slots or nullcontext():
+                        self._completion(payload)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass  # Intentional client disconnect is an exercised behavior.
                 finally:
                     self.close_connection = True
                     with endpoint._lock:
                         endpoint.active -= 1
+                        endpoint.request_finished_at.append(time.monotonic())
 
             def _completion(self, payload: dict[str, Any]) -> None:
                 prompt = "\n".join(message["content"] for message in payload["messages"])
