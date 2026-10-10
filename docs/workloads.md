@@ -115,6 +115,13 @@ Explicit profiles map exact metric names and units:
   requests, preemption count, prefix hits/queries and server TTFT sum/count.
 - `vllm-legacy`: an explicit older-name contract adding GPU/CPU cache fractions;
   qualify the recorded runtime/version before interpreting it as supported.
+- `sglang`: running/queued requests, KV pool usage fraction, retraction counter,
+  current retraction gauge, prefix-hit ratio, cached/prompt token counters and
+  server TTFT sum/count. The old retraction gauge is never treated as a counter.
+  The mapping follows [SGLang's collector at the tested commit](https://github.com/sgl-project/sglang/blob/44bc478863052efdc455b0282b49830f68fdefb3/python/sglang/srt/observability/metrics_collector.py).
+  `deployment.discovery: sglang` reads `/get_server_info` for version, context,
+  scheduler, cache/instrumentation settings and reported parallel sizes. Unknown
+  settings and credentials are excluded; an MPS device does not establish MLX use.
 - `ollama` / `unknown`: no serving counter mapping is assumed. Ollama native APIs
   supply deployment information, but an inference URL alone does not provide
   scheduler or KV-cache counters.

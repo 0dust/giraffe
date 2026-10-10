@@ -51,7 +51,7 @@ class Deployment(Model):
     collected_at: str | None = None
     metadata_file: str | None = None
     launch_command: str | list[str] | None = None
-    discovery: Literal["none", "ollama", "vllm"] = "none"
+    discovery: Literal["none", "ollama", "vllm", "sglang"] = "none"
     collector_url: str | None = None
     intended_change: str | None = None
 
@@ -157,7 +157,7 @@ class Target(Model):
     metrics_url: str | None = None
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
-    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama"] = "unknown"
+    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang"] = "unknown"
     metrics_runtime_version: str | None = None
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)

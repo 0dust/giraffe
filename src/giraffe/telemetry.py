@@ -30,6 +30,20 @@ LEGACY = V1 | {
     "vllm:gpu_cache_usage_perc": ("cache_occupancy", "gauge", "fraction"),
     "vllm:cpu_cache_usage_perc": ("cpu_cache_occupancy", "gauge", "fraction"),
 }
+SGLANG = {
+    "sglang:token_usage": ("cache_occupancy", "gauge", "fraction"),
+    "sglang:num_running_reqs": ("running", "gauge", "requests"),
+    "sglang:num_queue_reqs": ("waiting", "gauge", "requests"),
+    "sglang:num_retracted_requests_total": ("retractions", "counter", "requests"),
+    "sglang:num_retracted_reqs": ("retractions_current", "gauge", "requests"),
+    "sglang:cache_hit_rate": ("prefix_hit_rate", "gauge", "fraction"),
+    "sglang:cached_tokens_total": ("cached_tokens", "counter", "tokens"),
+    "sglang:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
+    "sglang:time_to_first_token_seconds_sum": ("server_ttft_sum", "counter", "seconds"),
+    "sglang:time_to_first_token_seconds_count": ("server_ttft_count", "counter", "requests"),
+}
+# Exact metric contracts from the source used for the live Apple Silicon run.
+SGLANG_REFERENCE = "SGLang 44bc47886 srt/observability/metrics_collector.py"
 GPU = {
     "DCGM_FI_DEV_FB_USED": ("memory", "gauge", "MiB"),
     "DCGM_FI_DEV_GPU_UTIL": ("utilization", "gauge", "percent"),
@@ -73,6 +87,8 @@ def parse(body, target, config):
         if target.metrics_profile == "vllm-v1"
         else LEGACY
         if target.metrics_profile == "vllm-legacy"
+        else SGLANG
+        if target.metrics_profile == "sglang"
         else {}
     )
     mapping = profile | GPU
@@ -132,15 +148,23 @@ def parse(body, target, config):
     )
     if not body.strip() or body.strip() in {"[]", "{}"}:
         state = "empty_response"
+    required = (
+        (SERVING_FAMILIES - {"preemptions"}) | {"retractions"}
+        if target.metrics_profile == "sglang" else SERVING_FAMILIES
+    )
     return {
         "status": state,
         "samples": samples,
-        "missing_families": sorted(SERVING_FAMILIES - families),
+        "missing_families": sorted(required - families),
         "series_limit_reached": truncated,
         "mapping": target.metrics_profile,
         "mapping_reference": "vLLM 0.30.0 v1/metrics/loggers.py"
         if target.metrics_profile == "vllm-v1"
-        else "explicit legacy metric-name contract; runtime/version qualification required",
+        else SGLANG_REFERENCE
+        if target.metrics_profile == "sglang"
+        else "explicit legacy metric-name contract; runtime/version qualification required"
+        if target.metrics_profile == "vllm-legacy"
+        else "No serving metric-name contract selected.",
         "runtime_version": target.metrics_runtime_version,
         "version_verification": "user-supplied profile/version; verify with recorded deployment discovery",
         "instrumentation": target.instrumentation,

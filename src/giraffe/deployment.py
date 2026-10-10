@@ -246,6 +246,50 @@ async def _read(client, url, *, body=None):
     return json.loads(data)
 
 
+def _sglang_metadata(info):
+    """Select known fields; /get_server_info also contains credentials and paths."""
+    if not isinstance(info, dict):
+        raise ValueError("SGLang server info must be an object")
+    args = info.get("server_args", info)
+    if not isinstance(args, dict):
+        raise ValueError("SGLang server args must be an object")
+    reported = {
+        "runtime": {"engine": "sglang", "version": info.get("version")},
+        "model": {
+            key: args[source] for source, key in (
+                ("revision", "revision"), ("quantization", "quantization"),
+                ("tokenizer_path", "tokenizer"),
+            ) if isinstance(args.get(source), str)
+        },
+        "serving": {
+            "resolved_settings": {
+                key: args[key] for key in (
+                    "context_length", "max_running_requests", "max_total_tokens",
+                    "chunked_prefill_size", "mem_fraction_static", "schedule_policy",
+                    "disable_radix_cache", "disable_overlap_schedule", "mlx_enable_sampling",
+                    "grammar_backend", "tool_call_parser",
+                ) if key in args and isinstance(args[key], (str, int, float, bool))
+            },
+        },
+        "backend": {},
+        "hardware": {},
+    }
+    for source, category, key in (
+        ("context_length", "serving", "context_limit"),
+        ("schedule_policy", "serving", "scheduler"),
+        ("attention_backend", "backend", "attention"),
+        ("tp_size", "hardware", "tensor_parallel"),
+        ("pp_size", "hardware", "pipeline_parallel"),
+    ):
+        if isinstance(args.get(source), (str, int, float)) and not isinstance(args[source], bool):
+            reported[category][key] = args[source]
+    if isinstance(args.get("disable_radix_cache"), bool):
+        reported["serving"]["prefix_caching"] = not args["disable_radix_cache"]
+    if isinstance(args.get("enable_metrics"), bool):
+        reported["serving"]["instrumentation"] = "enabled" if args["enable_metrics"] else "disabled"
+    return reported
+
+
 async def snapshot(target, config, deadline, stop):
     import time
     from giraffe.client import _headers
@@ -377,6 +421,12 @@ async def snapshot(target, config, deadline, stop):
                                 )
                         result["discovery"].append(
                             {"status": "available", "source": "ollama /api/version and /api/show"}
+                        )
+                    elif deployment.discovery == "sglang":
+                        info = await _read(client, origin + "/get_server_info")
+                        reported = _sglang_metadata(info)
+                        result["discovery"].append(
+                            {"status": "available", "source": "sglang /get_server_info"}
                         )
                     else:
                         version = await _read(client, origin + "/version")

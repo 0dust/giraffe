@@ -77,7 +77,7 @@ def parser() -> argparse.ArgumentParser:
         run.add_argument("--deployment-file", type=Path, help="Bounded deployment JSON for the first target")
         run.add_argument("--metrics-url", help="Separate statistics endpoint for the first target")
         run.add_argument("--metrics-api-key-env", help="Separate metrics secret reference")
-        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy"])
+        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang"])
         run.add_argument("--tool-calling", action="store_true", default=None)
         run.add_argument("--metrics", action="store_true", default=None)
         run.add_argument("--nonstream", action="store_false", default=None, dest="stream")
