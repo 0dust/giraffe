@@ -36,6 +36,14 @@ server, executes imported commands or recreates inaccessible server state.
 | `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
+The default conversation asks: "Suggest a name for a bakery. Reply with only the
+name, without quotation marks or a trailing full stop." Its next turn is "Repeat
+exactly the above answer." The repeat answer is scored against the assistant
+message supplied in that session's history: a saved answer in fixed mode, or the
+actual preceding output in live mode. Exact scoring normalizes whitespace only;
+it does not remove punctuation or quotation marks. Saved configurations using the
+older bakery-specific repeat prompt remain scored.
+
 Conversation fixtures, modes, generation options, schedules and seeds contribute
 to the workload fixture hash in the manifest, together with a hash of the loaded
 workload generator source. Source changes conservatively prevent like-for-like

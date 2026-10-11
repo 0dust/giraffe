@@ -167,7 +167,7 @@ class FakeEndpoint:
                 output = endpoint._answer(prompt)
                 if payload["messages"][-1]["content"].startswith("Suggest a name for a bakery"):
                     output = "Bakery_" + uuid.uuid4().hex
-                if payload["messages"][-1]["content"].startswith("Repeat exactly the bakery name"):
+                if payload["messages"][-1]["content"].startswith(("Repeat exactly the bakery name", "Repeat exactly the above answer.")):
                     output = next(m["content"] for m in reversed(payload["messages"]) if m["role"]=="assistant")
                 if mode == "overlap_variation" and endpoint.active>1:
                     output += " "  # Whitespace changes byte equality but keeps the exact task correct.
