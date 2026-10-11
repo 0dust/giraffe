@@ -21,7 +21,6 @@ CHECK_DESCRIPTIONS = {
     "correctness": "Known-answer extraction, arithmetic, and classification under load.",
     "json": "JSON parsing, fields, types, and expected content under concurrency.",
     "cancellation": "Output caps, stop sequences, deadlines, cancellation, and follow-up probes.",
-    "sglang_cancellation": "Opt-in same-host SGLang cancellation: exact request terminal abort trace and follow-up inference.",
     "recovery": "Sustained traffic followed by light-load recovery probes.",
     "gpu": "Existing GPU telemetry; missing observations never imply healthy hardware.",
     "arrivals": "Bounded steady or burst schedules with actual dispatch and waiting measurements.",

@@ -120,7 +120,7 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     assert result == capabilities()
     assert result["config_schema"]["required"] == ["targets"]
     assert result["defaults"]["traffic"]["rates"] == [1, 2, 4]
-    assert len(result["checks"]) == 20
+    assert len(result["checks"]) == 19
     assert "runtime availability" in result["validation_note"]
 
 

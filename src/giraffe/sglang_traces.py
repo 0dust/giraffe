@@ -132,5 +132,8 @@ class TraceTail:
         self.pending = lines.pop()
         if any(len(line) > MAX_LINE_BYTES for line in lines + [self.pending]):
             raise ValueError("trace record exceeded the 16 KiB limit")
+        return self.decode(lines)
+
+    def decode(self, lines: list[bytes]) -> list[dict]:
         rows = [json.loads(line) for line in lines if line.strip()]
         return [row for row in rows if isinstance(row, dict)]

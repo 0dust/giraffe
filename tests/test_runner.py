@@ -102,7 +102,7 @@ def config(**kwargs):
     return RunConfig(**(values | kwargs))
 
 
-async def test_unused_sglang_option_preserves_legacy_builtin_fingerprint(client):
+async def test_disabled_backend_verification_preserves_legacy_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
         "ab9fb04ee49e79b9e10690fdcf03fc840164dd7962f4cee9b47d53214860598b")
@@ -256,7 +256,7 @@ async def test_shared_request_concurrency_budget_and_replica_separation(client):
     assert report.overall == "inconclusive" and "request budget" in report.abort_reason
     assert all(check(report, "serving", name).status == "inconclusive" for name in ("service", "replica"))
     assert max(e["attempted"] for e in events) == 5
-    assert len(report.checks) == 26
+    assert len(report.checks) == 24
     assert all(row["other_replicas"] == "unverified" for row in report.observations["replica_coverage"])
 
 
@@ -368,7 +368,7 @@ async def test_deliberate_deadline_and_cancellation_not_serving_failures():
     assert deadline.status == "timeout"
     result = check(report, "cancellation")
     assert result.status == "pass"
-    assert result.metrics["backend_cancellation"] == "unverified"
+    assert result.metrics["backend_cancellation"]["status"] == "unverified"
     assert deadline.id in result.evidence_ids
 
 

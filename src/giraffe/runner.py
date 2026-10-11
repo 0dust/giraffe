@@ -580,9 +580,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.request(target, client, deadline_spec, timeout_override=probe_timeout)
                 await run.group(target, client, fixtures["short"], "cancellation_probe",
                                 count=effective.samples, checks=["cancellation"])
-            if "sglang_cancellation" in enabled:
-                from giraffe.sglang_cancellation import exercise
-                await exercise(run, target, client, fixtures)
+                if options["backend_verification"] == "required":
+                    from giraffe.backend_cancellation import exercise
+                    await exercise(run, target, client, fixtures)
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 end = time.monotonic() + effective.sustained_seconds
@@ -729,7 +729,7 @@ def _pack_results(run: _Run, target: Target) -> dict:
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
-    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline"}]
+    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}]
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]
@@ -760,10 +760,6 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             status, summary = "blocked", observations["restart"].get("reason", "Restart readiness unavailable")
         elif observations.get("client_error"):
             status, summary = "blocked", observations["client_error"]
-        elif check_id == "sglang_cancellation":
-            metrics = observations.get("sglang_cancellation", {})
-            status = metrics.get("status", "inconclusive")
-            summary = metrics.get("summary", "Backend cancellation was not exercised.")
         elif check_id == "gpu":
             snapshots = observations["metrics"]
             missing = sorted({family for snap in snapshots for family in snap["unavailable"]})
@@ -901,7 +897,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             probes = [r for r in records if r.scenario == "cancellation_probe"]
             metrics.update({"intentional_cancellations": len(cancelled),
                             "client_disconnect_observed": sum(r.status == "cancelled" for r in cancelled),
-                            "backend_cancellation": "unverified", "probes": _stats(probes),
+                            "backend_cancellation": observations.get("backend_cancellation", {"status": "unverified", "summary": "Backend verification was not enabled."}), "probes": _stats(probes),
                             "deadline_probe_ms": observations.get("deadline_probe_ms"),
                             "deadline_probes": _stats(deadlines)})
             cap_usage = {r.id: r.completion_tokens if r.completion_tokens is not None else r.output_tokens for r in records}
@@ -917,6 +913,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Output token usage missing; exact output cap compliance is unverified."
             else:
                 summary = "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified."
+            backend = metrics["backend_cancellation"]
+            if backend["status"] == "fail":
+                status, summary = "fail", "Backend cancellation or follow-up inference failed."
+            elif status == "pass" and backend["status"] in {"inconclusive", "blocked"}:
+                status, summary = backend["status"], backend["summary"]
+            elif status == "pass" and backend["status"] == "pass":
+                summary = "Output/stop limits, client interruption, backend capacity release and follow-ups passed."
         elif check_id == "recovery":
             sustained = [r for r in records if r.scenario == "sustained"]
             probes = [r for r in records if r.scenario == "recovery"]
@@ -967,7 +970,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 if any(row["warmup_failed"] for row in answer_failures):
                     summary += " Some of these fixtures also failed during warm-up."
                 ordinary_records = [r for r in records if r.scenario not in {
-                    "client_cancel", "client_deadline",
+                    "client_cancel", "client_deadline", "backend_cancel",
                 }]
                 if any(not r.valid or r.status != "completed" for r in ordinary_records):
                     summary += " Request or protocol failures were also observed."

@@ -578,7 +578,7 @@ function renderDetail() {
   <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a></div>`;
   syncComparisonFilters();
 }
-function keyMetric(check){if(check.status==='skipped')return 'Not selected';const m=check.metrics || {};if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.status==='skipped')return 'Not selected';if(check.id==='sglang_cancellation')return `${number(m.attempted)} cancellation probes · ${check.target}`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
+function keyMetric(check){if(check.status==='skipped')return 'Not selected';const m=check.metrics || {};if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.status==='skipped')return 'Not selected';return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
 function renderChecks(report) {
   const checks=report.checks.filter(c=>c.id!=='baseline').sort((a,b)=>(order[a.status]??5)-(order[b.status]??5));
   if(!checks.length)return notice('This report contains no check results.');
@@ -601,10 +601,6 @@ function renderCheck(check,report) {
     metrics.push(metric('Completed responses',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Completion and correctness are distinct'));
     if(check.id==='context')metrics.push(metric('Longest measured input',m.observed_max_input_tokens==null?'Not reported':`${number(m.observed_max_input_tokens)} tokens`,`Declared context: ${number(m.declared_context_limit)} tokens`));
     else metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));
-  }else if(check.id==='sglang_cancellation'){
-    metrics.push(metric('Backend terminal traces',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Matched by server request ID and model'));
-    metrics.push(metric('Cleanup deadline',elapsed(m.cleanup_seconds),'Measured from client disconnect to native terminal event'));
-    metrics.push(metric('Verified aborts',number((m.probes || []).filter(p=>p.status==='pass').length),'Terminal abort within deadline and successful follow-up'));
   }else{
     metrics.push(metric('Requests completed',`${m.completed ?? 0} / ${m.attempted ?? 0}`,`${m.failed ?? 0} failed · ${m.timed_out ?? 0} timed out`));
     if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),limits.first_output_ms?`Limit: ${ms(limits.first_output_ms)}`:'No acceptance limit set'));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}
@@ -612,6 +608,11 @@ function renderCheck(check,report) {
     else if(check.id==='capacity'){metrics.push(metric('Highest accepted load',m.highest_tested_acceptable_concurrency==null?'Unconfirmed':number(m.highest_tested_acceptable_concurrency),'Highest tested; maximum capacity unknown'));metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));}
     else if(check.id==='fairness'){metrics.push(metric('Mixed / short-only latency',m.latency_ratio==null?'Unmeasured':`${number(m.latency_ratio,2)}×`,limits.fairness_max_ratio?`Limit: ${limits.fairness_max_ratio}×`:'No slowdown limit set'));metrics.push(metric('Observed overlap',`${m.overlaps ?? 0} / ${m.pairs ?? 0}`,'Pairs with concurrent prefill'));}
     else {metrics.push(metric('Response time · p95',ms(m.p95_ms),limits.latency_ms?`Limit: ${ms(limits.latency_ms)}`:'No response-time limit set'));metrics.push(metric('Longest stream pause',ms(m.max_stream_gap_ms),limits.stream_gap_ms?`Limit: ${ms(limits.stream_gap_ms)}`:'No stream-pause limit set'));}
+  }
+  if(check.id==='cancellation' && typeof m.backend_cancellation==='object'){
+    const backend=m.backend_cancellation;
+    metrics.push(metric('Backend cancellation',human(backend.status),`${backend.runtime || 'Unknown runtime'} · ${(backend.probes || []).filter(p=>p.status==='pass').length} / ${backend.attempted || 0} probes verified`));
+    metrics.push(metric('Cleanup deadline',elapsed(backend.cleanup_seconds),backend.summary));
   }
   if(check.id==='generation'){
     const current=Object.hasOwn(m,'generation_rate_samples');
@@ -622,7 +623,7 @@ function renderCheck(check,report) {
   const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k)));
   return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
   ${check.status==='skipped'?'<div class="empty-state" style="padding:35px 24px"><p>This optional check was not selected for the run. No result is inferred.</p></div>':`<dl class="metrics-grid">${metrics.join('')}</dl>`}
-  ${check.id==='cancellation'?'<div class="notice" style="margin:20px 24px 0">Cancellation and deadline probes deliberately interrupt requests. Backend resource reclamation remains unverified.</div>':''}
+  ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}

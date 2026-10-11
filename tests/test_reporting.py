@@ -353,7 +353,7 @@ def test_intentional_cancellation_is_not_a_retention_failure(tmp_path: Path):
     assert saved.requests[0].output == ""
 
 
-@pytest.mark.parametrize("scenario", ["client_deadline", "sglang_cancel"])
+@pytest.mark.parametrize("scenario", ["client_deadline", "backend_cancel"])
 def test_intentional_client_deadline_does_not_create_baseline_error_regression(scenario):
     current, previous = make_report(), make_report("baseline")
     for report in (current, previous):

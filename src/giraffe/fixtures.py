@@ -199,16 +199,16 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         "short": short, "long": long, "context": context, "correctness": correctness,
         "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
-    if "sglang_cancellation" in config.checks:
-        chunks = config.effective_check("sglang_cancellation")["cancel_after_chunks"]
-        fixtures["sglang_cancellation"] = [
+    if "cancellation" in config.checks and config.effective_check("cancellation")["backend_verification"] == "required":
+        chunks = config.effective_check("cancellation")["cancel_after_chunks"]
+        fixtures["backend_cancellation"] = [
             _request(
-                "sglang.backend_cancel", "sglang_cancel", ["sglang_cancellation"],
+                "limits.backend_cancel", "backend_cancel", ["cancellation"],
                 "Write the numbers from 1 to 100, one per line.", scorer="none",
                 max_tokens=128, options={"temperature": 0}, cancel_after_chunks=chunks,
             ),
             _request(
-                "sglang.backend_cancel.followup", "sglang_cancel_followup", ["sglang_cancellation"],
+                "limits.backend_cancel.followup", "backend_cancel_followup", ["cancellation"],
                 "Reply with just OK.", scorer="none", max_tokens=8, options={"temperature": 0},
             ),
         ]

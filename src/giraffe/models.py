@@ -21,12 +21,11 @@ CHECK_NAMES = {
     "correctness": "Known-answer correctness",
     "json": "Structured JSON",
     "cancellation": "Limits and cancellation",
-    "sglang_cancellation": "SGLang backend cancellation",
     "recovery": "Sustained load and recovery",
     "gpu": "GPU observations",
 }
 CORE_CHECKS = tuple(CHECK_NAMES)
-DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu", "sglang_cancellation"})
+DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu"})
 CHECK_NAMES.update({
     "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
     "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
@@ -268,6 +267,8 @@ class CheckOptions(Model):
     metrics_max_age_seconds: float | None = Field(default=None, gt=0)
     cancel_after_ms: float | None = Field(default=None, gt=0)
     deadline_probe_ms: float | None = Field(default=None, gt=0)
+    backend_verification: Literal["off", "required"] | None = None
+    server_log: str | None = Field(default=None, max_length=4096)
     trace_file: str | None = Field(default=None, max_length=4096)
     cancel_after_chunks: int | None = Field(default=None, ge=1, le=128)
     cleanup_seconds: float | None = Field(default=None, gt=0, le=60)
@@ -287,8 +288,8 @@ CHECK_OPTION_FIELDS = {
     "context": {"samples", "context_limit"},
     "correctness": {"samples", "concurrency"},
     "json": {"samples", "concurrency"},
-    "cancellation": {"samples", "cancel_after_ms", "deadline_probe_ms"},
-    "sglang_cancellation": {"samples", "trace_file", "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"},
+    "cancellation": {"samples", "cancel_after_ms", "deadline_probe_ms", "backend_verification",
+                     "trace_file", "server_log", "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"},
     "recovery": {"samples", "concurrency", "sustained_seconds"},
     "gpu": {"metrics_max_age_seconds"},
 }
@@ -301,7 +302,7 @@ CHECK_LIMIT_FIELDS = {
     "capacity": _TRAFFIC_LIMITS,
     "fairness": {"fairness_max_ratio", "stream_gap_ms", "min_correctness"},
     "context": {"min_correctness"}, "correctness": {"min_correctness"},
-    "json": {"min_correctness"}, "cancellation": set(), "sglang_cancellation": set(),
+    "json": {"min_correctness"}, "cancellation": set(),
     "recovery": _TRAFFIC_LIMITS - {"min_samples"}, "gpu": set(),
 }
 
@@ -682,7 +683,7 @@ class RunConfig(Model):
         if check_id not in CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
         options = self.test_options.get(check_id, CheckOptions())
-        special_defaults = {"cancel_after_ms": 100, "deadline_probe_ms": 50,
+        special_defaults = {"backend_verification": "off", "cancel_after_ms": 100, "deadline_probe_ms": 50,
                             "cancel_after_chunks": 5, "cleanup_seconds": 5,
                             "trace_wait_seconds": 10}
         resolved = {}

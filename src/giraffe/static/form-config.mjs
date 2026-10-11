@@ -52,7 +52,7 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
         continue;
       }
       const raw = values.get(`test_${check.id}_${name}`);
-      const value = name === 'trace_file' ? (String(raw || '').trim() || null) : numeric(raw, name, allowInvalid);
+      const value = ['trace_file','server_log','backend_verification'].includes(name) ? (String(raw || '').trim() || null) : numeric(raw, name, allowInvalid);
       if (value !== null && value !== optionDefault(config, check, name)) options[name] = value;
     }
     const limits = {};
