@@ -5,6 +5,19 @@ cap, stop sequence, client disconnect, deadline and follow-up probes. Enable
 backend verification in that check's custom settings; there is no separate
 SGLang, vLLM or Ollama test in the catalog.
 
+The category reports two independently scored results in JSON, HTML and the UI:
+
+- **Cancellation — verify server stopped** uses matching native terminal evidence.
+  An answer mismatch or failed follow-up cannot overwrite an observed abort.
+- **Cancellation — verify answer** scores completed stop/follow-up answers.
+  Intentionally cancelled partial outputs are not graded.
+
+They are stored in `metrics.cancellation_results.server_stopped` and
+`metrics.cancellation_results.answer`. The category's overall result still includes
+output caps, client interruption and follow-up health. A category failure does not
+mean both cancellation results failed. Backend verification disabled is explicitly
+`unverified` for server termination.
+
 ```yaml
 checks: [cancellation]
 test_options:
@@ -37,11 +50,11 @@ global output limit. Giraffe closes its streaming connection after five useful
 answer chunks, then requests a short follow-up. Budgets and stop conditions apply
 to every request, including references and follow-ups.
 
-| Runtime | Evidence | What a passing backend subcheck establishes |
+| Runtime | Evidence | What the evidence establishes |
 | --- | --- | --- |
 | SGLang | Native `sglang::request` terminal OTLP span | The exact response request ID and model terminated with `abort` before the cleanup deadline. |
 | vLLM V1 | Optional scheduler observer after native request removal/cache release | The exact response request ID terminated with `FINISHED_ABORTED` before the deadline. |
-| Ollama | Native debug cache-slot admissions, single slot, uncancelled reference | The same exclusive runner slot was reused before the deadline with less generated cache than the capped reference. This verifies capacity release, not a native abort reason or an exact termination timestamp. |
+| Ollama | Native debug cache-slot admissions, single slot, uncancelled reference | The same exclusive runner slot was reused before the deadline with less generated cache than the capped reference. Capacity release can pass, but **verify server stopped stays inconclusive** because the native abort reason and exact termination time are unavailable. |
 
 SGLang/vLLM terminal events must have a fresh start, end after the recorded client
 cancellation, and match the response ID/model. A terminal event after the cleanup

@@ -914,12 +914,32 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             else:
                 summary = "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified."
             backend = metrics["backend_cancellation"]
+            from giraffe.backend_cancellation import server_stop_result
+            server_stop = server_stop_result(backend)
+            answers = [r for r in records
+                       if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
+                       and (r.scenario == "cancellation_probe"
+                            or r.fixture_id.startswith("limits.stop.") or r.score is not None)]
+            scored = [r for r in answers if r.score is not None]
+            answer_status = "fail" if any(r.score is False for r in scored) else (
+                "pass" if scored and len(scored) == len(answers) else "inconclusive")
+            metrics["cancellation_results"] = {
+                "server_stopped": server_stop,
+                "answer": {"title": "Cancellation — verify answer", "status": answer_status,
+                    "summary": "Completed stop/follow-up answers are scored separately; interrupted partial outputs are not graded.",
+                    "correct": sum(r.score is True for r in scored), "scored": len(scored),
+                    "attempted": len(answers), "evidence_ids": [r.id for r in answers]},
+            }
             if backend["status"] == "fail":
                 status, summary = "fail", "Backend cancellation or follow-up inference failed."
             elif status == "pass" and backend["status"] in {"inconclusive", "blocked"}:
                 status, summary = backend["status"], backend["summary"]
             elif status == "pass" and backend["status"] == "pass":
                 summary = "Output/stop limits, client interruption, backend capacity release and follow-ups passed."
+                if server_stop["status"] != "pass":
+                    status, summary = server_stop["status"], server_stop["summary"]
+            if status == "pass" and answer_status == "inconclusive":
+                status, summary = "inconclusive", "Some completed answer fixtures could not be scored."
         elif check_id == "recovery":
             sustained = [r for r in records if r.scenario == "sustained"]
             probes = [r for r in records if r.scenario == "recovery"]
@@ -990,6 +1010,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     summary += " Configured timing limits exceeded."
                 if check_id == "cancellation" and metrics.get("output_cap_violations"):
                     summary += " Output token caps were also exceeded."
+        if check_id == "cancellation" and "cancellation_results" in metrics:
+            outcomes = metrics["cancellation_results"]
+            summary = (f"Server stopped: {outcomes['server_stopped']['status']}; "
+                       f"answer check: {outcomes['answer']['status']}. {summary}")
         if status == "pass" and check_id in run.unfinished[target.name]:
             status, summary = "inconclusive", "This check was unfinished when a run budget or stop condition was reached."
         if metrics.get("completed", 0) < limits.min_samples and status not in {"skipped", "blocked"}:

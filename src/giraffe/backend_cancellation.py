@@ -12,6 +12,26 @@ from giraffe.sglang_traces import TraceTail
 CHECK = "cancellation"
 
 
+def server_stop_result(backend: dict) -> dict:
+    """Keep termination evidence independent of answers and follow-up health."""
+    status = backend.get("status", "unverified")
+    result = {"title": "Cancellation — verify server stopped", "status": "inconclusive",
+              "summary": "No sufficient per-request termination evidence was recorded.",
+              "verified": 0, "attempted": backend.get("attempted", 0)}
+    if status in {"unverified", "blocked"}:
+        return result | {"status": status, "summary": backend["summary"]}
+    probes = backend.get("probes", [])
+    verdicts = [probe.get("server_stop", {}) for probe in probes]
+    result["verified"] = sum(item.get("status") == "pass" for item in verdicts)
+    if any(item.get("status") == "fail" for item in verdicts):
+        result.update(status="fail", summary="A matching backend request outlived the cleanup deadline.")
+    elif verdicts and len(verdicts) == backend.get("planned") and result["verified"] == len(verdicts):
+        result.update(status="pass", summary="Every cancelled request has a matching native terminal abort within the cleanup deadline.")
+    elif backend.get("runtime") == "ollama":
+        result["summary"] = "Ollama slot reuse is capacity-release evidence; a native abort reason is unavailable, so server cancellation is unconfirmed."
+    return result
+
+
 def evaluate(record: RequestRecord, trace: dict, started_at_ns: int, cleanup_seconds: float, runtime: str = "sglang") -> dict | None:
     """Only an exact, fresh server request match can affect the verdict."""
     if runtime not in {"sglang", "vllm"}:
@@ -43,7 +63,7 @@ def evaluate(record: RequestRecord, trace: dict, started_at_ns: int, cleanup_sec
 
 async def exercise(run, target, client, fixtures) -> None:
     options = run.config.effective_check(CHECK)
-    evidence = {"status": "inconclusive", "attempted": 0, "completed": 0,
+    evidence = {"status": "inconclusive", "attempted": 0, "completed": 0, "planned": options["samples"],
                 "cleanup_seconds": options["cleanup_seconds"], "probes": [],
                 "summary": "Runtime evidence is required; client close alone is insufficient."}
     run.observations[target.name]["backend_cancellation"] = evidence
@@ -143,6 +163,11 @@ async def exercise(run, target, client, fixtures) -> None:
                             break
                 if match:
                     probe.update(match)
+                    # Follow-up failure must not overwrite a proven termination.
+                    probe["server_stop"] = {"status": match["status"], "summary": match["reason"]}
+                    if runtime == "ollama":
+                        probe["server_stop"] = {"status": "inconclusive",
+                            "summary": "Runner capacity was released; native abort reason is unavailable."}
                     evidence["completed"] += 1
                     break
                 await asyncio.sleep(min(.1, max(0, deadline - time.monotonic())))

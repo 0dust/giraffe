@@ -51,6 +51,20 @@ def test_legacy_rate_reports_are_incomparable_with_new_generation_metrics():
     assert "Report schema versions differ." in result.baseline["targets"][0]["reasons"]
 
 
+@pytest.mark.parametrize("verification,expected", [("required", "inconclusive"), ("off", "pass")])
+def test_legacy_cancellation_grading_cannot_claim_a_server_stop_regression(verification, expected):
+    current, previous = make_report(), make_report("baseline")
+    for report in (current, previous):
+        report.manifest["config"]["test_options"] = {"cancellation": {"backend_verification": verification}}
+        report.checks.append(CheckResult(id="cancellation", target="local",
+            title="Limits and cancellation", status="pass", summary="Recorded evidence"))
+    current.checks[-1].metrics["cancellation_results"] = {"server_stopped": {"status": "inconclusive"}}
+    result = compare_baseline(current, previous)
+    assert baseline_check(result).status == expected
+    reasons = result.baseline["targets"][0]["reasons"]
+    assert any("Cancellation verdict definitions differ" in reason for reason in reasons) == (verification == "required")
+
+
 def test_generation_rate_comparison_does_not_confuse_longer_prefill_with_slower_decoding():
     current, previous = make_report(), make_report("baseline")
     for record in current.requests:

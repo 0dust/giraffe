@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from giraffe.backend_cancellation import evaluate
+from giraffe.backend_cancellation import evaluate, server_stop_result
 from giraffe.models import CHECK_NAMES, RequestRecord, Target
 from giraffe.ollama_cancellation import OllamaLogTail, evaluate_slot_reuse
 
@@ -27,6 +27,27 @@ def admissions(**changes):
 def test_cancellation_catalog_has_one_runtime_independent_check():
     assert CHECK_NAMES["cancellation"] == "Limits and cancellation"
     assert not any("sglang" in key or "ollama" in key or "vllm" in key for key in CHECK_NAMES)
+
+
+@pytest.mark.parametrize("runtime,backend_status,verdicts,expected", [
+    ("sglang", "pass", ["pass", "pass", "pass"], "pass"),
+    ("vllm", "fail", ["pass", "pass", "pass"], "pass"),
+    ("sglang", "fail", ["pass", "fail", "pass"], "fail"),
+    ("sglang", "inconclusive", ["pass"], "inconclusive"),
+    ("sglang", "inconclusive", ["pass", "inconclusive", "pass"], "inconclusive"),
+    ("ollama", "pass", ["inconclusive"] * 3, "inconclusive"),
+    ("sglang", "unverified", [], "unverified"),
+    (None, "blocked", [], "blocked"),
+])
+def test_server_stop_verdict_requires_all_native_terminations_not_combined_backend_status(
+    runtime, backend_status, verdicts, expected,
+):
+    evidence = {"runtime": runtime, "status": backend_status, "planned": 3,
+                "attempted": len(verdicts), "summary": "Evidence unavailable",
+                "probes": [{"server_stop": {"status": status}} for status in verdicts]}
+    result = server_stop_result(evidence)
+    assert result["status"] == expected
+    assert result["verified"] == verdicts.count("pass")
 
 
 @pytest.mark.parametrize("rows,reference,expected", [

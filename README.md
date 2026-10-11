@@ -116,7 +116,9 @@ the Apple backend does not provide.
 Enable backend verification inside [Limits and cancellation](docs/backend-cancellation.md)
 for SGLang, vLLM V1 or an isolated single-slot Ollama server. The adapter uses
 explicit runtime metadata; target names remain labels. Reports distinguish native
-abort termination from Ollama's controlled capacity-release evidence.
+abort termination from Ollama's controlled capacity-release evidence. Server-stop
+and answer verdicts are independent; a wrong answer cannot fail a proven abort.
+Ollama's server-stop verdict remains inconclusive without native abort evidence.
 
 ## Run and compare
 
@@ -595,10 +597,12 @@ or rollback.
 ## Tested compatibility
 
 Shared backend cancellation has an [October 11 validation record](docs/validation/2026-10-11-backend-cancellation.md):
-541 automated tests passed, and all 19 live checks ran sequentially on SGLang,
-vLLM-Metal and Ollama. Backend evidence passed three probes per runtime; Ollama
-verifies controlled slot reuse rather than a native abort reason. The record
-includes the failing negative control, answer/performance failures and coverage gaps.
+554 automated tests passed. All 19 live checks previously ran sequentially on
+SGLang, vLLM-Metal and Ollama; focused live runs then validated the separate
+server-stop and answer verdicts on all three. SGLang/vLLM verified three native
+aborts each. Ollama verified controlled slot reuse, leaving server termination
+inconclusive. The record includes the failing negative control, answer/performance
+failures and coverage gaps.
 
 The expanded workloads and deployment/telemetry capture have a separate
 [October 8 validation record](docs/validation/2026-10-08.md), with runnable

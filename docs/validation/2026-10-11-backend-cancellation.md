@@ -143,3 +143,54 @@ Configs, bounded runtime launchers, native evidence, memory samples and automate
 check logs are retained in `../artifacts/backend-cancellation-trial/` relative to
 Giraffe. Final runtime folders are `sglang-final`, `vllm-final`, `ollama-final`
 and `ollama-all-final`. These local artifacts are not added to public Git history.
+
+## Follow-up: independent server-stop and answer verdicts
+
+The same Limits and cancellation category now records independent verdicts in
+JSON, HTML and the UI. A wrong completed answer or failed follow-up cannot overwrite
+native proof that the cancelled request terminated. Interrupted partial output is
+not answer-scored. Overall category status still includes output limits, client
+interruption, follow-up health and required server verification.
+
+Focused live cancellation runs validated the new grading sequentially, with only
+one loaded engine at a time:
+
+| Runtime | Verify server stopped | Verify answer | Overall category |
+| --- | --- | --- | --- |
+| SGLang | pass: 3/3 native aborts | fail: 3/4 correct | fail |
+| vLLM-Metal | pass: 3/3 native aborts | fail: 3/4 correct | fail |
+| Ollama | inconclusive: native abort reason unavailable | pass: 4/4 correct | inconclusive |
+
+SGLang and vLLM still returned `Blue` instead of exact lowercase `blue` in the
+stop fixture; scoring was not relaxed. Ollama's supporting capacity-release
+evidence passed all three probes, but no longer makes server termination pass.
+All targets were named `local-llama`; explicit runtime metadata selected each
+adapter independently of the target label.
+
+The repeated vLLM negative control continued reading the upstream response after
+downstream disconnect. **Verify server stopped failed**, detecting the request
+outliving the cleanup deadline.
+
+The fresh reports are:
+
+- [`runs/sglang-cancellation-split/report.json`](../../runs/sglang-cancellation-split/report.json)
+- [`runs/vllm-cancellation-split/report.json`](../../runs/vllm-cancellation-split/report.json)
+- [`runs/ollama-cancellation-split/report.json`](../../runs/ollama-cancellation-split/report.json)
+- [`runs/vllm-cancellation-split-negative/report.json`](../../runs/vllm-cancellation-split-negative/report.json)
+
+Independent JSON results are at
+`checks[id=cancellation].metrics.cancellation_results.server_stopped` and
+`checks[id=cancellation].metrics.cancellation_results.answer`. Older reports
+require a rerun to record these verdicts. Baseline comparison rejects mixed legacy
+and split grading when backend verification is required.
+
+Final automated verification: **554 passed in 39.00 seconds**; Ruff, JavaScript
+syntax and diff checks passed. The real UI displayed both independent verdicts
+with no console errors. These follow-up live runs selected cancellation only;
+the earlier all-19-check results above retain their original grading.
+
+Task-owned servers, the gateway and trace receiver were stopped. The original
+Ollama daemon was preserved with no model loaded. No critical memory-pressure
+sample occurred. Fresh launchers, native evidence and pressure samples are in
+`../artifacts/cancellation-split-trial/`; automated and orchestration logs are in
+`../artifacts/backend-cancellation-trial/`. No push or PR was made.

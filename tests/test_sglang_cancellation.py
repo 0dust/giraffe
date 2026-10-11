@@ -258,7 +258,20 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
     assert check.evidence_ids
     if mode == "answer_mismatch":
         assert backend["status"] == "pass"
+        assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "pass"
+        assert check.metrics["cancellation_results"]["answer"]["status"] == "fail"
         assert "protocol failures" not in check.summary
+        from giraffe.reporting import write_report
+        _, html_path = write_report(report, tmp_path / "rendered")
+        html = html_path.read_text()
+        assert 'Cancellation — verify server stopped</td><td><span class="badge pass"' in html
+        assert 'Cancellation — verify answer</td><td><span class="badge fail"' in html
+    if mode == "followup_error":
+        assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "pass"
+        assert check.metrics["cancellation_results"]["answer"]["status"] == "pass"
+    if mode == "late":
+        assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "fail"
+        assert check.metrics["cancellation_results"]["answer"]["status"] == "pass"
     if expected == "pass":
         assert backend["probes"][0]["trace"]["finish_reasons"] == ["abort"]
         assert backend["probes"][0]["followup_valid"]
