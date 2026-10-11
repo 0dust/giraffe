@@ -34,6 +34,9 @@ def parser() -> argparse.ArgumentParser:
     app.add_argument("--version", action="version", version=__version__)
     commands = app.add_subparsers(dest="command", required=True)
     commands.add_parser("describe", help="Print checks, defaults and the full configuration schema as JSON")
+    traces = commands.add_parser("sglang-traces", help="Collect local SGLang terminal traces (optional tracing extra)")
+    traces.add_argument("--output", required=True, type=Path)
+    traces.add_argument("--port", type=int, default=4318)
     validate = commands.add_parser("validate", help="Validate and normalize a configuration without traffic")
     validate.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
     validate.add_argument("--output-format", choices=["text", "json"], default="text")
@@ -237,6 +240,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(arguments)
         kind = "baseline.save" if args.command == "baseline" else args.command
+        if args.command == "sglang-traces":
+            from giraffe.sglang_traces import serve
+            serve(args.output, args.port)
+            return 0
         if args.command == "describe":
             from giraffe.capabilities import capabilities
 

@@ -353,19 +353,20 @@ def test_intentional_cancellation_is_not_a_retention_failure(tmp_path: Path):
     assert saved.requests[0].output == ""
 
 
-def test_intentional_client_deadline_does_not_create_baseline_error_regression():
+@pytest.mark.parametrize("scenario", ["client_deadline", "sglang_cancel"])
+def test_intentional_client_deadline_does_not_create_baseline_error_regression(scenario):
     current, previous = make_report(), make_report("baseline")
     for report in (current, previous):
         intentional = report.requests[0].model_copy(deep=True)
         intentional.id += "-deadline"
-        intentional.scenario = "client_deadline"
-        intentional.status = "timeout"
+        intentional.scenario = scenario
+        intentional.status = "timeout" if scenario == "client_deadline" else "cancelled"
         intentional.valid = False
         intentional.score = None
         report.requests.append(intentional)
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "pass"
-    assert not any(row["scenario"] == "client_deadline"
+    assert not any(row["scenario"] == scenario
                    for row in result.baseline["targets"][0]["comparisons"])
 
 

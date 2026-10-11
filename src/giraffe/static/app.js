@@ -115,6 +115,7 @@ function schemaField(name,value,schema,{label,hint='',placeholder='Inherit run s
   label ||= schema.title || human(name);
   if(valueSchema.enum)return `<label>${escape(label)}<select name="${escape(name)}">${valueSchema.enum.map(item=>`<option value="${escape(item)}" ${item===value?'selected':''}>${escape(item==='poisson'?'Poisson · uneven arrivals':item==='steady'?'Steady · evenly spaced':human(item))}</option>`).join('')}</select>${hint?`<span class="hint">${escape(hint)}</span>`:''}</label>`;
   if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,required:true});
+  if(valueSchema.type==='string')return field(name,label,value,{hint,required:!nullable,placeholder});
   return field(name,label,value,{type:'number',hint,min:valueSchema.minimum,max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
 }
 function testSettingsLabel(check,config) {
@@ -577,7 +578,7 @@ function renderDetail() {
   <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a></div>`;
   syncComparisonFilters();
 }
-function keyMetric(check){if(check.status==='skipped')return 'Not selected';const m=check.metrics || {};if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.status==='skipped')return 'Not selected';return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
+function keyMetric(check){if(check.status==='skipped')return 'Not selected';const m=check.metrics || {};if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.status==='skipped')return 'Not selected';if(check.id==='sglang_cancellation')return `${number(m.attempted)} cancellation probes · ${check.target}`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
 function renderChecks(report) {
   const checks=report.checks.filter(c=>c.id!=='baseline').sort((a,b)=>(order[a.status]??5)-(order[b.status]??5));
   if(!checks.length)return notice('This report contains no check results.');
@@ -600,6 +601,10 @@ function renderCheck(check,report) {
     metrics.push(metric('Completed responses',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Completion and correctness are distinct'));
     if(check.id==='context')metrics.push(metric('Longest measured input',m.observed_max_input_tokens==null?'Not reported':`${number(m.observed_max_input_tokens)} tokens`,`Declared context: ${number(m.declared_context_limit)} tokens`));
     else metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));
+  }else if(check.id==='sglang_cancellation'){
+    metrics.push(metric('Backend terminal traces',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Matched by server request ID and model'));
+    metrics.push(metric('Cleanup deadline',elapsed(m.cleanup_seconds),'Measured from client disconnect to native terminal event'));
+    metrics.push(metric('Verified aborts',number((m.probes || []).filter(p=>p.status==='pass').length),'Terminal abort within deadline and successful follow-up'));
   }else{
     metrics.push(metric('Requests completed',`${m.completed ?? 0} / ${m.attempted ?? 0}`,`${m.failed ?? 0} failed · ${m.timed_out ?? 0} timed out`));
     if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),limits.first_output_ms?`Limit: ${ms(limits.first_output_ms)}`:'No acceptance limit set'));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}

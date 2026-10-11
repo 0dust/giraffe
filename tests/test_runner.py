@@ -102,6 +102,12 @@ def config(**kwargs):
     return RunConfig(**(values | kwargs))
 
 
+async def test_unused_sglang_option_preserves_legacy_builtin_fingerprint(client):
+    report = await runner.run_suite(config())
+    assert report.manifest["fixture_pack"]["builtin_sha256"] == (
+        "ab9fb04ee49e79b9e10690fdcf03fc840164dd7962f4cee9b47d53214860598b")
+
+
 def check(report, id, target="service"):
     return next(c for c in report.checks if c.id == id and c.target == target)
 
@@ -250,7 +256,7 @@ async def test_shared_request_concurrency_budget_and_replica_separation(client):
     assert report.overall == "inconclusive" and "request budget" in report.abort_reason
     assert all(check(report, "serving", name).status == "inconclusive" for name in ("service", "replica"))
     assert max(e["attempted"] for e in events) == 5
-    assert len(report.checks) == 24
+    assert len(report.checks) == 26
     assert all(row["other_replicas"] == "unverified" for row in report.observations["replica_coverage"])
 
 

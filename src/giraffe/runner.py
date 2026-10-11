@@ -580,6 +580,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.request(target, client, deadline_spec, timeout_override=probe_timeout)
                 await run.group(target, client, fixtures["short"], "cancellation_probe",
                                 count=effective.samples, checks=["cancellation"])
+            if "sglang_cancellation" in enabled:
+                from giraffe.sglang_cancellation import exercise
+                await exercise(run, target, client, fixtures)
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 end = time.monotonic() + effective.sustained_seconds
@@ -757,6 +760,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             status, summary = "blocked", observations["restart"].get("reason", "Restart readiness unavailable")
         elif observations.get("client_error"):
             status, summary = "blocked", observations["client_error"]
+        elif check_id == "sglang_cancellation":
+            metrics = observations.get("sglang_cancellation", {})
+            status = metrics.get("status", "inconclusive")
+            summary = metrics.get("summary", "Backend cancellation was not exercised.")
         elif check_id == "gpu":
             snapshots = observations["metrics"]
             missing = sorted({family for snap in snapshots for family in snap["unavailable"]})
@@ -1080,6 +1087,12 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     config_values = config.model_dump(mode="json")
     workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
+    fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
+    # An unused optional field must not invalidate existing baseline fingerprints.
+    for specs in fixture_values.values():
+        for spec in specs:
+            if spec["cancel_after_chunks"] is None:
+                del spec["cancel_after_chunks"]
     manifest = {"config": config_values,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in config.checks else "not selected"
@@ -1090,7 +1103,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"capacity", "correctness"}
-                                                    else fixture_hash({k: [s.model_dump() for s in v] for k,v in fixtures.items()})),
+                                                    else fixture_hash(fixture_values)),
                                  "workload_fixture_sha256": fixture_hash({
                                      "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
                                      "settings": workload_settings})},

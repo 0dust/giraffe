@@ -47,7 +47,7 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in records:
         if (record.target == target and getattr(record, "traffic_stage", None) is None
-                and record.scenario not in {"client_cancel", "client_deadline"}):
+                and record.scenario not in {"client_cancel", "client_deadline", "sglang_cancel"}):
             for check in record.check_ids:
                 groups[(check, record.scenario)].append(record)
     return groups

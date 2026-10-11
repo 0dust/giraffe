@@ -113,6 +113,11 @@ An Ollama GGUF checkpoint cannot be reused directly through that backend; a loca
 MLX checkpoint can. GPU health checks still require published DCGM metrics, which
 the Apple backend does not provide.
 
+For request-correlated backend cancellation evidence, use the opt-in
+[SGLang backend cancellation check](docs/sglang-cancellation.md). It requires
+native SGLang tracing and a local receiver; the default cancellation check keeps
+its existing client-side scope.
+
 ## Run and compare
 
 Open **http://127.0.0.1:8765**, select **New run**, review the settings, and select

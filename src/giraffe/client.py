@@ -27,6 +27,10 @@ class _ProtocolError(Exception):
     pass
 
 
+class _IntentionalCancellation(Exception):
+    pass
+
+
 def completion_url(url: str) -> str:
     """Accept a server origin, API base, or complete chat-completions endpoint."""
     url = url.rstrip("/")
@@ -181,6 +185,15 @@ class LLMClient:
 
         def receive(data: dict[str, Any], *, streaming: bool) -> None:
             nonlocal last_answer
+            server_id = data.get("id")
+            if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
+                    and len(server_id) > 4096):
+                raise _ProtocolError("completion request ID exceeded the safety limit")
+            if isinstance(server_id, str) and 0 < len(server_id) <= 4096:
+                if (spec.cancel_after_chunks is not None and record.server_request_id is not None
+                        and server_id != record.server_request_id):
+                    raise _ProtocolError("completion request ID changed during the response")
+                record.server_request_id = server_id
             model = data.get("model")
             if isinstance(model, str) and model:
                 record.observed_model = model
@@ -301,6 +314,11 @@ class LLMClient:
                                 record.stream_terminated = True
                                 break
                             receive(_object(event), streaming=True)
+                            if (spec.cancel_after_chunks is not None
+                                    and record.answer_chunks >= spec.cancel_after_chunks
+                                    and record.finish_reason is None):
+                                record.client_cancelled_at_ns = time.time_ns()
+                                raise _IntentionalCancellation
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
@@ -318,6 +336,8 @@ class LLMClient:
                     if record.first_output_ms is None or (not record.output.strip() and spec.scorer != "tool"):
                         raise _ProtocolError("response contained no useful answer output")
                     record.status, record.valid = "completed", True
+        except _IntentionalCancellation:
+            record.status, record.error = "cancelled", "intentional cancellation after answer chunks"
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"

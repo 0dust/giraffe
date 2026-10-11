@@ -12,7 +12,7 @@ from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS,
 
 @pytest.mark.parametrize("scenario", [
     "selection", "defaults", "nullable_limits", "traffic", "empty_selection", "round_trip",
-    "optional_workloads", "request_pack",
+    "optional_workloads", "request_pack", "sglang_cancellation",
 ])
 def test_browser_configuration_behavior(scenario):
     node = shutil.which("node")
@@ -75,6 +75,18 @@ switch ({json.dumps(scenario)}) {{
     result.request_source='builtin';
     const roundtrip=configureTests(result,valuesFor(result),checks,defaults,{{allowEmpty:true}});
     assert.equal(roundtrip.request_source,'builtin');assert.deepEqual(roundtrip.request_pack,source.request_pack);
+    break;
+  }}
+  case 'sglang_cancellation': {{
+    values.delete('check');values.append('check','sglang_cancellation');
+    values.set('test_mode_sglang_cancellation','custom');
+    values.set('test_sglang_cancellation_trace_file','/tmp/sglang traces.jsonl');
+    values.set('test_sglang_cancellation_cleanup_seconds','1');
+    const result=build();
+    assert.equal(result.test_options.sglang_cancellation.trace_file,'/tmp/sglang traces.jsonl');
+    assert.equal(result.test_options.sglang_cancellation.cleanup_seconds,1);
+    const again=configureTests(result,valuesFor(result),checks,defaults);
+    assert.deepEqual(again.test_options.sglang_cancellation,result.test_options.sglang_cancellation);
     break;
   }}
   case 'selection': {{

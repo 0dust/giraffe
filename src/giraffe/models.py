@@ -21,11 +21,12 @@ CHECK_NAMES = {
     "correctness": "Known-answer correctness",
     "json": "Structured JSON",
     "cancellation": "Limits and cancellation",
+    "sglang_cancellation": "SGLang backend cancellation",
     "recovery": "Sustained load and recovery",
     "gpu": "GPU observations",
 }
 CORE_CHECKS = tuple(CHECK_NAMES)
-DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu"})
+DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu", "sglang_cancellation"})
 CHECK_NAMES.update({
     "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
     "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
@@ -267,6 +268,10 @@ class CheckOptions(Model):
     metrics_max_age_seconds: float | None = Field(default=None, gt=0)
     cancel_after_ms: float | None = Field(default=None, gt=0)
     deadline_probe_ms: float | None = Field(default=None, gt=0)
+    trace_file: str | None = Field(default=None, max_length=4096)
+    cancel_after_chunks: int | None = Field(default=None, ge=1, le=128)
+    cleanup_seconds: float | None = Field(default=None, gt=0, le=60)
+    trace_wait_seconds: float | None = Field(default=None, gt=0, le=60)
     limits: Limits | None = None
 
 
@@ -283,6 +288,7 @@ CHECK_OPTION_FIELDS = {
     "correctness": {"samples", "concurrency"},
     "json": {"samples", "concurrency"},
     "cancellation": {"samples", "cancel_after_ms", "deadline_probe_ms"},
+    "sglang_cancellation": {"samples", "trace_file", "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"},
     "recovery": {"samples", "concurrency", "sustained_seconds"},
     "gpu": {"metrics_max_age_seconds"},
 }
@@ -295,7 +301,7 @@ CHECK_LIMIT_FIELDS = {
     "capacity": _TRAFFIC_LIMITS,
     "fairness": {"fairness_max_ratio", "stream_gap_ms", "min_correctness"},
     "context": {"min_correctness"}, "correctness": {"min_correctness"},
-    "json": {"min_correctness"}, "cancellation": set(),
+    "json": {"min_correctness"}, "cancellation": set(), "sglang_cancellation": set(),
     "recovery": _TRAFFIC_LIMITS - {"min_samples"}, "gpu": set(),
 }
 
@@ -676,7 +682,9 @@ class RunConfig(Model):
         if check_id not in CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
         options = self.test_options.get(check_id, CheckOptions())
-        special_defaults = {"cancel_after_ms": 100, "deadline_probe_ms": 50}
+        special_defaults = {"cancel_after_ms": 100, "deadline_probe_ms": 50,
+                            "cancel_after_chunks": 5, "cleanup_seconds": 5,
+                            "trace_wait_seconds": 10}
         resolved = {}
         for field in sorted(CHECK_OPTION_FIELDS[check_id]):
             default = special_defaults.get(field, getattr(self, field, None))
@@ -737,6 +745,7 @@ class RequestSpec(Model):
     stream: bool = True
     options: dict[str, Any] = Field(default_factory=dict)
     cancel_after_ms: float | None = Field(default=None, gt=0)
+    cancel_after_chunks: int | None = Field(default=None, ge=1, le=128)
     context_position: str | None = None
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
@@ -764,6 +773,8 @@ class RequestRecord(Model):
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
     error: str | None = None
+    server_request_id: str | None = None
+    client_cancelled_at_ns: int | None = None
     elapsed_ms: float = 0
     first_output_ms: float | None = None
     last_output_ms: float | None = None
