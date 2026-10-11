@@ -594,6 +594,12 @@ or rollback.
 
 ## Tested compatibility
 
+Shared backend cancellation has an [October 11 validation record](docs/validation/2026-10-11-backend-cancellation.md):
+541 automated tests passed, and all 19 live checks ran sequentially on SGLang,
+vLLM-Metal and Ollama. Backend evidence passed three probes per runtime; Ollama
+verifies controlled slot reuse rather than a native abort reason. The record
+includes the failing negative control, answer/performance failures and coverage gaps.
+
 The expanded workloads and deployment/telemetry capture have a separate
 [October 8 validation record](docs/validation/2026-10-08.md), with runnable
 configurations, real Ollama and vLLM-Metal results, endpoint failures and coverage gaps.
