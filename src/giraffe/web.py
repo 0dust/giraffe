@@ -23,6 +23,7 @@ from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.models import ConfigDraft, Model, RunConfig, RunReport
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
+from giraffe.request_pack import pack_preview
 from giraffe.runner import run_suite
 
 
@@ -35,6 +36,20 @@ class StartRun(Model):
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
     restart_target: str | None = None
+
+
+class DatasetPreview(Model):
+    text: str
+    format: Literal["csv", "json"]
+    input_field: str | None = None
+    expected_field: str | None = None
+    scorer: Literal["judge", "exact"] = "judge"
+
+
+class TryExample(Model):
+    config: ConfigDraft
+    fixture_id: str
+    target_name: str
 
 
 class SaveBaseline(Model):
@@ -268,6 +283,29 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     async def validate_config(config: RunConfig):
         """Normalize edits using the same contract as a run without sending traffic."""
         return {"config": config.model_dump(mode="json")}
+
+    @app.post("/api/config/preview")
+    async def preview_config(config: ConfigDraft):
+        """Describe effective requests and coverage without target calls or file imports."""
+        return {"config": config.model_dump(mode="json"), "request_pack_preview": pack_preview(config)}
+
+    @app.post("/api/datasets/preview")
+    async def preview_dataset_import(body: DatasetPreview):
+        from giraffe.dataset_import import preview_dataset
+
+        return preview_dataset(**body.model_dump())
+
+    @app.post("/api/runs/try-example", status_code=202)
+    async def try_example(body: TryExample):
+        from giraffe.dataset_import import try_example_config
+
+        try:
+            config = try_example_config(body.config, body.fixture_id, body.target_name)
+        except (ValidationError, ValueError) as exc:
+            message = str(exc) if not isinstance(exc, ValidationError) else "; ".join(
+                ".".join(map(str, item["loc"])) + ": " + item["msg"] for item in exc.errors())
+            raise HTTPException(422, message) from exc
+        return await start_run(StartRun(config=config))
 
     @app.get("/api/runs")
     async def list_runs():

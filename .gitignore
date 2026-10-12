@@ -10,3 +10,7 @@ runs/
 .DS_Store
 # Private research stays local; it is not part of the distributable product.
 research/
+# Local planning and review artifacts stay out of version control.
+docs/plans/
+docs/reviews/
+.brooks-lint-history.json

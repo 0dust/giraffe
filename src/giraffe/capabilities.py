@@ -5,8 +5,10 @@ from __future__ import annotations
 from giraffe.fixtures import SUITE_VERSION
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, Limits,
-    RunConfig, TrafficConfig,
+    RunConfig, TrafficConfig, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES, RequestPack,
 )
+from giraffe.request_pack import INPUT_RETENTION_NOTICE
 
 CHECK_DESCRIPTIONS = {
     "access": "Real inference through your network, TLS, credentials, and endpoint route.",
@@ -53,4 +55,29 @@ def capabilities(config: RunConfig | None = None) -> dict:
         "option_schema": CheckOptions.model_json_schema(),
         "limits_schema": Limits.model_json_schema(),
         "traffic_schema": TrafficConfig.model_json_schema(),
+        "judging": {"schema": JudgingConfig.model_json_schema(),
+                    "defaults": JudgingConfig().model_dump(mode="json"),
+                    "prompt_version": JUDGE_PROMPT_VERSION, "voting_rule": JUDGE_VOTING_RULE},
+        "datasets": {
+            "preview_api": "POST /api/datasets/preview",
+            "preview_fields": ["text", "format", "input_field", "expected_field", "scorer"],
+            "import_cli": "giraffe import-dataset --file FILE [--input-field FIELD --expected-field FIELD --scorer judge|exact]",
+            "formats": ["csv", "json"], "flat_rows_require_explicit_mapping": True,
+            "try_example_api": "POST /api/runs/try-example",
+            "try_example_fields": ["config", "fixture_id", "target_name"],
+            "try_example_cli": "giraffe try-example --config FILE --case ID --target NAME --output DIRECTORY",
+            "try_example_behavior": "One selected dataset case and target; correctness only, no restart or traffic stages; configured judges run afterward.",
+        },
+        "request_pack": {
+            "version": 1, "schema": RequestPack.model_json_schema(),
+            "max_bytes": MAX_REQUEST_PACK_BYTES, "max_cases": MAX_REQUEST_PACK_CASES,
+            "scorers": {
+                "exact": "Case-sensitive text equality after normalizing whitespace.",
+                "contains": "Case-sensitive substring after normalizing whitespace; does not validate the full answer.",
+                "json": "JSON schema validation and, when supplied, equality to the complete expected JSON value.",
+                "judge": "Reference-answer AI correctness after traffic; complete panel strict majority, ties/errors unscored.",
+                "none": "Traffic only; never counts as correct or qualifies full-pack correct capacity.",
+            },
+            "input_retention_notice": INPUT_RETENTION_NOTICE,
+        },
     }

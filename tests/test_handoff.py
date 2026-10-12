@@ -71,6 +71,28 @@ def test_normal_command_has_exact_config_and_needs_no_tempfile(tmp_path, config)
     assert "--baseline" not in command
 
 
+def test_pack_command_preserves_hostile_input_and_secret_references(tmp_path, config, monkeypatch):
+    from giraffe.models import RequestPack
+
+    marker = tmp_path / "injected"
+    attack = f"$(touch {shlex.quote(str(marker))}); `touch {shlex.quote(str(marker))}`\n$HOME"
+    config.request_source = "request_pack"
+    config.request_pack = RequestPack.model_validate({"version": 1, "cases": [{
+        "fixture_id": "operator", "messages": [{"role": "user", "content": attack}],
+        "scorer": "exact", "expected": attack}]})
+    config.targets[0].api_key_env = "PACK_TEST_KEY"
+    monkeypatch.setenv("PACK_TEST_KEY", "RESOLVED_SECRET")
+    command = cli_command(config)
+    result, captured, _ = run_command(tmp_path, command)
+    assert result.returncode == 0, result.stderr
+    restored = RunConfig.model_validate_json(captured["stdin"])
+    assert restored == config
+    assert restored.request_pack.cases[0].messages[0].content == attack
+    assert restored.targets[0].api_key_env == "PACK_TEST_KEY"
+    assert "RESOLVED_SECRET" not in command
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("exit_code", [0, 3, 127])
 def test_baseline_is_exact_private_and_removed_without_changing_exit_status(
     tmp_path, config, baseline, exit_code,

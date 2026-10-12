@@ -256,6 +256,127 @@ fixtures are used only when correctness is selected.
 target's optional `metrics_url`; missing or stale samples cannot produce a healthy
 GPU verdict. No node agents are installed.
 
+### Use your own requests under traffic
+
+In **New run → Dataset**, choose **My dataset**. Add examples in the editor,
+try the sample, or import CSV/JSON. For tabular files, select the input and expected
+answer columns, preview the mapping, then choose **Use dataset**. Invalid rows are
+shown with their row numbers; the current dataset stays unchanged until you apply
+a valid import. Canonical request-pack JSON preserves conversations and mixed checks.
+
+Edit any example's messages, expected answer and answer check. Select rows to change
+their checks together in **Answer checks**. Select correctness, capacity, or both;
+preview shows effective request settings, case allocation at each rate and budget
+gaps. **Try one** sends one selected example to one target using its effective request
+settings and configured judges, without traffic stages or restart commands. Its
+optional answer-retention checkbox affects only that trial's saved report.
+
+The same operations are available to agents:
+
+```sh
+# Inspect columns without sending traffic; add mappings to produce request_pack.
+giraffe import-dataset --file examples.csv
+giraffe import-dataset --file examples.csv --input-field question \
+  --expected-field answer --scorer judge
+# Run one case from a complete exported configuration.
+giraffe try-example --config my-config.json --case example-1 --target local \
+  --output runs/one-example --output-format json
+```
+
+`import-dataset` returns JSON with `request_pack`, preview rows, mapping suggestions
+and structured errors. Put the returned pack in your configuration's `request_pack`
+field and set `request_source` to `request_pack`. The API equivalents are
+`POST /api/datasets/preview` and `POST /api/runs/try-example`; `giraffe describe`
+lists their fields. A successful single-example trial checks setup and that example,
+not deployment capacity.
+
+Start with [examples/request-pack.json](examples/request-pack.json):
+
+```sh
+giraffe run --config my-config.yaml --request-pack examples/request-pack.json \
+  --checks correctness,capacity --latency-ms 1000 --output runs/pack-before
+giraffe baseline save runs/pack-before/report.json baselines/pack.json
+# Saved configuration embeds the pack; the original file is no longer needed.
+giraffe preview --config exported-config.json
+giraffe run --manifest runs/pack-before/report.json --baseline baselines/pack.json \
+  --output runs/pack-after
+```
+
+Each case has a unique `fixture_id`, text `messages`, a positive `weight` (default 1),
+and an explicit `scorer`: `exact`, `contains`, `json`, `judge`, or `none`. Exact and contains
+need an `expected` string; JSON needs a local `schema` and can include expected JSON.
+Exact normalizes whitespace; contains only checks for the specified text; schema
+validation alone checks structure. None of these establishes general chatbot quality.
+
+Giraffe sends each case once quietly, then uses the same weighted pack for continuous
+arrivals. It allocates each finite stage before dispatch; dropped requests are not
+replaced. Every scored case needs quiet and loaded coverage for a full-pack rate
+claim. An unscored case prevents that claim, though throughput and latency remain
+available. A quiet failure never removes a case from load. Requests repeat and may
+benefit caches, so this measures a warmed workload.
+
+**Requests and expected answers are saved with the run.** Response retention only
+controls generated outputs. Imports are limited to 1 MiB and 1,000 cases. Export,
+Copy CLI, stdin configuration, and `POST /api/config/preview` use the same inline
+`request_source: "request_pack"` / `request_pack` contract. Legacy `--fixtures`
+continues to add correctness cases only and cannot be combined with a selected pack.
+
+### Evaluate golden answers with AI judges
+
+Use `scorer: "judge"` with an `expected` reference answer when correct answers may
+use different words. An optional `rubric` adds case-specific requirements. The
+default policy accepts paraphrases but rejects wrong facts, contradictions and
+missing essential details. See [examples/request-pack-judged.json](examples/request-pack-judged.json).
+
+In **New run → Dataset**, add or import examples with expected answers. Choose
+**AI judge** in an example's editor or apply it to selected rows under **Answer checks**,
+then open **Configure AI judges** to enter the judge endpoint and model.
+For CLI/API runs, add the same settings to your run configuration:
+
+```json
+{
+  "judging": {
+    "judges": [
+      {
+        "name": "reviewer",
+        "url": "http://localhost:9000/v1",
+        "model": "your-judge-model",
+        "api_key_env": "JUDGE_API_KEY"
+      }
+    ],
+    "concurrency": 2,
+    "request_timeout_seconds": 30,
+    "max_duration_seconds": 300,
+    "max_output_tokens": 256
+  }
+}
+```
+
+Set the actual served model ID and omit `api_key_env` for an endpoint without
+authentication. Add further named endpoints to `judges` for a panel, up to eight.
+One judge decides directly; a complete panel uses strict majority. Two disagreeing
+judges tie. A tie, timeout, malformed verdict or unavailable judge leaves the answer
+unscored and prevents accepted capacity; missing votes never reduce the panel size.
+Each judge's vote and short explanation appear in request evidence.
+
+Giraffe judges every valid completed answer from a judged case, including repeated
+quiet and loaded answers, **after all measured traffic and telemetry finish**.
+Judge calls use separate limits and never enter deployment latency or traffic counts.
+Preview shows a call upper bound; no model is contacted during preview. There are no
+retries, sampling or cached verdicts. Stopping the run stops evaluation as well.
+The configured judges receive the original messages, reference answer and generated
+answer. Judge explanations follow the same response-retention policy as outputs.
+
+Run with `giraffe run --config my-config.json --request-pack examples/request-pack-judged.json`.
+Export, Copy CLI and stdin carry the complete configuration. Changing active references,
+rubrics or judge settings makes an upgrade comparison inconclusive. Pin judge model
+versions where possible: a mutable model alias can change without a configuration change.
+
+Reference-based judging is an established [evaluation method](https://docs.langchain.com/langsmith/evaluation-types),
+but judges can be wrong. Check your chosen judge against a small human-reviewed set of
+correct paraphrases and deliberately wrong answers before relying on it. Panel agreement
+does not prove correctness or general model quality.
+
 ### Arrival traffic and per-test settings
 
 The capacity test sends arrivals continuously during each rate stage, independently
@@ -344,8 +465,8 @@ measuring restarts or load.
 
 ## Offline and container use
 
-After installing dependencies, the suite needs only your configured inference and
-optional metrics endpoints. It never downloads fixtures or calls an external judge.
+After installing dependencies, the suite needs only your configured inference,
+optional metrics, and optional AI judge endpoints. It never downloads fixtures or models.
 For an offline machine, prepare wheels on a compatible online machine:
 
 ```sh

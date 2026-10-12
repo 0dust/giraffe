@@ -211,3 +211,93 @@ def test_baseline_save_json_preserves_explicit_replace_boundary(tmp_path, capsys
     assert result["kind"] == "baseline.save" and result["destination"] == str(destination.resolve())
     assert main(arguments) == 2
     assert json.loads(capsys.readouterr().out)["outcome"] == "error"
+
+
+def operator_pack():
+    return {"version": 1, "cases": [{"fixture_id": "hello", "messages": [
+        {"role": "user", "content": "Reply hello"}], "scorer": "exact", "expected": "hello"}]}
+
+
+@pytest.mark.parametrize("command", ["run", "cold-start"])
+def test_request_pack_file_embeds_portable_configuration(tmp_path, command):
+    path = tmp_path / "pack.json"
+    path.write_text(json.dumps(operator_pack()))
+    args = [command, "--url", "http://localhost", "--model", "tiny", "--request-pack", str(path)]
+    if command == "cold-start":
+        args += ["--restart", "local"]
+    result = configuration(parser().parse_args(args))
+    path.unlink()
+    exported = tmp_path / "exported.json"
+    exported.write_text(result.model_dump_json())
+    rerun_args = [command, "--config", str(exported)]
+    if command == "cold-start":
+        rerun_args += ["--restart", "local"]
+    assert configuration(parser().parse_args(rerun_args)) == result
+    assert result.request_source == "request_pack"
+    assert result.request_pack.cases[0].expected == "hello"
+
+
+@pytest.mark.parametrize("conflict", ["inline", "fixtures", "url"])
+def test_request_pack_flag_conflicts_fail_before_reading_pack(conflict, monkeypatch, capsys, tmp_path):
+    values = {"targets": [{"name": "local", "url": "http://localhost", "model": "tiny"}]}
+    if conflict == "inline":
+        values["request_pack"] = operator_pack()
+    if conflict == "fixtures":
+        values["custom_fixtures"] = "missing-legacy.json"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
+    monkeypatch.setattr("giraffe.request_pack.load_request_pack", lambda *a: pytest.fail("read pack"))
+    output = tmp_path / "run"
+    path = "https://example.com/pack.json" if conflict == "url" else "missing-pack.json"
+    assert main(["run", "--config", "-", "--request-pack", path, "--output", str(output),
+                 "--output-format", "json"]) == 2
+    assert not output.exists()
+    message = json.loads(capsys.readouterr().out)["errors"][0]["message"]
+    assert ("inline" if conflict == "inline" else "custom_fixtures" if conflict == "fixtures" else "local") in message
+
+
+def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, capsys, tmp_path):
+    from giraffe.models import ConfigDraft
+    from giraffe.request_pack import pack_preview
+
+    values = {"targets": [{"name": "local", "url": "http://localhost", "model": ""}],
+              "checks": ["capacity"], "request_source": "request_pack", "request_pack": operator_pack()}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
+    monkeypatch.setattr("giraffe.cli._run", lambda *a: pytest.fail("Preview sent traffic"))
+    assert main(["preview", "--config", "-"]) == 0
+    draft = ConfigDraft.model_validate(values)
+    assert json.loads(capsys.readouterr().out) == {
+        "config": draft.model_dump(mode="json"), "request_pack_preview": pack_preview(draft)}
+    assert not list(tmp_path.iterdir())
+
+
+def test_describe_exposes_pack_contract(capsys):
+    assert main(["describe"]) == 0
+    pack = json.loads(capsys.readouterr().out)["request_pack"]
+    assert pack["version"] == 1
+    assert pack["max_bytes"] == 1048576 and pack["max_cases"] == 1000
+    assert set(pack["scorers"]) == {"exact", "contains", "json", "none", "judge"}
+    assert pack["schema"]["properties"]["version"] == {"const": 1, "title": "Version", "type": "integer"}
+
+
+@pytest.mark.parametrize("source", ["inline", "file"])
+def test_invalid_pack_errors_have_case_locations_and_create_no_run(source, tmp_path, monkeypatch, capsys):
+    pack = operator_pack()
+    pack["cases"][0]["weight"] = "PRIVATE_SECRET"
+    values = {"targets": [{"name": "local", "url": "http://localhost", "model": "tiny"}],
+              "request_source": "request_pack"}
+    args = ["run", "--config", "-", "--output", str(tmp_path / "output"), "--output-format", "json"]
+    if source == "inline":
+        values["request_pack"] = pack
+    else:
+        path = tmp_path / "pack.json"
+        path.write_text(json.dumps(pack))
+        args += ["--request-pack", str(path)]
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
+    monkeypatch.setattr("giraffe.cli._run", lambda *a: pytest.fail("Invalid pack sent traffic"))
+    assert main(args) == 2
+    output = capsys.readouterr()
+    assert "PRIVATE_SECRET" not in output.out + output.err
+    error = json.loads(output.out)["errors"][0]
+    assert error["loc"][-3:] == ["cases", 0, "weight"]
+    assert not (tmp_path / "output").exists()

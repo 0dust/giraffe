@@ -147,3 +147,32 @@ def test_all_selectable_checks_have_discoverable_configuration():
     assert {check["id"] for check in discovered["checks"]} == set(CHECK_NAMES)
     assert {check["id"] for check in discovered["checks"] if not check["optional"]} == set(DEFAULT_CHECKS)
     assert all(check["description"] for check in discovered["checks"])
+
+
+@pytest.mark.parametrize("judging", [
+    {"judges": [{"name": "same"}, {"name": "same"}]},
+    {"judges": [{"url": "https://user:pass@localhost/v1"}]},
+    {"judges": [{"url": "https://localhost/v1?key=secret"}]},
+    {"judges": [{"url": "file:///tmp/judge"}]},
+    {"judges": [{}] * 9}, {"concurrency": 0}, {"request_timeout_seconds": float("inf")},
+    {"max_duration_seconds": 0}, {"max_output_tokens": 0},
+    {"proxy": "http://user:pass@localhost"},
+])
+def test_judging_rejects_invalid_or_credential_bearing_configuration(judging):
+    from giraffe.models import ConfigDraft
+
+    with pytest.raises(ValueError):
+        ConfigDraft(targets=[{"name": "local", "url": "http://localhost", "model": ""}], judging=judging)
+
+
+def test_judge_vote_bool_is_strict_and_capabilities_are_discoverable():
+    from giraffe.capabilities import capabilities
+    from giraffe.models import JudgeVote
+
+    for verdict in ("true", 1):
+        with pytest.raises(ValueError):
+            JudgeVote(judge="reviewer", url="http://localhost", model="judge", status="completed", verdict=verdict)
+    discovered = capabilities()
+    assert "judge" in discovered["request_pack"]["scorers"]
+    assert discovered["judging"]["defaults"]["concurrency"] == 2
+    assert discovered["judging"]["schema"]["properties"]["judges"]["maxItems"] == 8

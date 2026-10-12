@@ -12,7 +12,7 @@ from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS,
 
 @pytest.mark.parametrize("scenario", [
     "selection", "defaults", "nullable_limits", "traffic", "empty_selection", "round_trip",
-    "optional_workloads",
+    "optional_workloads", "request_pack",
 ])
 def test_browser_configuration_behavior(scenario):
     node = shutil.which("node")
@@ -56,6 +56,27 @@ const values=valuesFor(source);
 const build=()=>configureTests(source,values,checks,defaults);
 const before=JSON.stringify(source);
 switch ({json.dumps(scenario)}) {{
+  case 'request_pack': {{
+    source.request_source='request_pack';
+    source.request_pack={{version:1,cases:[{{fixture_id:'one',messages:[{{role:'user',content:'secret literal <tag>'}}],weight:1,scorer:'exact',expected:'answer'}}]}};
+    source.test_options.correctness.concurrency=4;
+    values.set('test_correctness_samples','100');values.set('test_correctness_concurrency','100');
+    values.set('traffic_mode','custom');values.set('traffic_mix_short','9');
+    values.set('traffic_long_input_chars','999');values.set('traffic_rates','3, 6');
+    let result=build();
+    assert.deepEqual(result.request_pack,source.request_pack);
+    assert.deepEqual(result.test_options.correctness,source.test_options.correctness);
+    assert.deepEqual(result.traffic.mix,source.traffic.mix);
+    assert.equal(result.traffic.long_input_chars,source.traffic.long_input_chars);
+    assert.deepEqual(result.traffic.rates,[3,6]);
+    values.delete('check');
+    result=configureTests(result,values,checks,defaults,{{allowEmpty:true}});
+    assert.deepEqual(result.checks,[]);assert.deepEqual(result.request_pack,source.request_pack);
+    result.request_source='builtin';
+    const roundtrip=configureTests(result,valuesFor(result),checks,defaults,{{allowEmpty:true}});
+    assert.equal(roundtrip.request_source,'builtin');assert.deepEqual(roundtrip.request_pack,source.request_pack);
+    break;
+  }}
   case 'selection': {{
     values.delete('check');values.append('check','correctness');
     const result=build();
@@ -276,6 +297,13 @@ assert.match(markup,/data-config-tab="json"/);
 assert.match(markup,/JSON settings saved/);
 assert.doesNotMatch(markup,/<textarea|data-reset-test=/);
 syncTestControls();
+assert.equal(cards.correctness.hidden,true);
+assert.equal(cards.capacity.hidden,false);
+state.showAvailableTests=true;syncTestControls();
+assert.equal(cards.correctness.hidden,false);
+assert.equal(cards.correctness.selection.checked,false);
+state.showAvailableTests=false;syncTestControls();
+assert.equal(cards.correctness.hidden,true);
 assert.equal(cards.correctness.editor.hidden,true);
 const before=JSON.stringify(state.config);
 toggleTestEditor('correctness');
@@ -443,6 +471,262 @@ assert.equal(state.configView,'form');assert.equal(state.tab,'baseline');
 }})()
 `,context);
 """
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+def test_request_pack_import_preview_revision_guards_and_run_snapshot():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute browser request pack behavior")
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = r"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const nodes={},listeners={};
+for(const id of ['request-pack-preview','config-error','start-run','form-error','request-pack-file'])nodes['#'+id]={hidden:true,innerHTML:'',textContent:'',click(){this.clicked=true;}};
+const form={elements:{request_source:{value:'builtin'}}};nodes['#new-run-form']=form;
+const context={assert,structuredClone,nodes,form,fetch:async()=>({ok:false,status:404,json:async()=>({detail:'Not Found'})}),document:{querySelector:q=>nodes[q],addEventListener:(kind,fn)=>listeners[kind]=fn},window:{addEventListener(){}},location:{hash:'#new'}};
+const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+await vm.runInNewContext(source+`
+(async()=>{
+const initial={request_source:'builtin',request_pack:null,targets:[{name:'local',model:''}],checks:[],traffic:{rates:[1]}};
+let current=structuredClone(initial),renders=0,calls=0;
+state.config=structuredClone(initial);state.jsonDraft=state.jsonBase='synced';
+readForm=()=>({config:structuredClone(current),mode:'normal'});
+captureFormDraft=()=>{state.config=structuredClone(current);};
+renderNew=()=>{renders++;current=structuredClone(state.config);state.jsonDraft=state.jsonBase='synced';renderRequestPreview();};
+toast=()=>{};
+const pack={version:1,cases:[{fixture_id:'<case>',messages:[{role:'user',content:'private input'}],weight:1,scorer:'exact',expected:'<answer>'}]};
+const preview={active:false,source:'request_pack',consumers:[],cases:[],stages:[],warnings:['<warning>'],quiet_requests:0};
+// Stale backend configuration errors remain actionable; missing runs stay ordinary 404s.
+await assert.rejects(api('/api/config/preview'),/server.*configuration.*Restart.*giraffe ui.*refresh/i);
+await assert.rejects(api('/api/runs/missing'),error=>error.message==='Not Found'&&error.status===404);
+// My dataset is a persistent empty choice, without launching a file picker.
+changeRequestSource('request_pack');assert.equal(nodes['#request-pack-file'].clicked,undefined);
+assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);
+assert.equal(calls,0);
+current={...current,request_pack:pack};state.config=current;
+let resolve;api=()=>new Promise(done=>resolve=done);
+// Request previews may resolve out of order: only current revision is accepted.
+const first=refreshRequestPreview();const oldResolve=resolve;
+current.traffic.rates=[9];configChanged();
+assert.match(nodes['#request-pack-preview'].innerHTML,/Preview stale/);
+const second=refreshRequestPreview();const newResolve=resolve;
+newResolve({config:current,request_pack_preview:{...preview,quiet_requests:9}});await second;
+oldResolve({config:initial,request_pack_preview:{...preview,quiet_requests:1}});await assert.rejects(first,/changed during preview/);
+assert.equal(state.requestPreview.data.quiet_requests,9);assert.equal(state.requestPreview.status,'current');
+api=async()=>{throw Error('preview unavailable');};await assert.rejects(refreshRequestPreview(),/preview unavailable/);
+assert.equal(state.requestPreview.status,'error');assert.match(nodes['#request-pack-preview'].innerHTML,/current plan is unconfirmed/);
+assert(!nodes['#request-pack-preview'].innerHTML.includes('Preview current'));
+// Switching sources preserves cases; explicit remove clears them without selecting tests.
+changeRequestSource('builtin');assert.equal(state.config.request_source,'builtin');assert.equal(state.config.request_pack.cases.length,1);
+changeRequestSource('request_pack');assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.checks.length,0);
+changeRequestSource('builtin',{remove:true});assert.equal(state.config.request_pack,null);assert.equal(state.config.checks.length,0);
+// Run uses the strict validated snapshot, then previews that same snapshot before sending.
+current={...initial,targets:[{name:'local',model:'model'}],checks:['capacity'],request_source:'request_pack',request_pack:pack};state.config=current;
+validateRunForm=()=>true;setActive=()=>{};const sent=[];
+api=async(path,options)=>{const config=JSON.parse(options.body);sent.push({path,config});if(path==='/api/runs')return {id:'done'};return {config,request_pack_preview:preview};};
+await startRun({preventDefault(){},target:form});
+assert.equal(sent.map(x=>x.path).join(','),'/api/config/validate,/api/config/preview,/api/runs');
+assert.equal(JSON.stringify(sent[1].config),JSON.stringify(sent[2].config.config));
+// Edits while the pre-run preview is pending prevent all inference calls.
+state.active=null;sent.length=0;api=async(path,options)=>{sent.push(path);if(path==='/api/config/preview')return new Promise(done=>resolve=done);return {config:JSON.parse(options.body)};};
+const running=startRun({preventDefault(){},target:form});await Promise.resolve();await Promise.resolve();
+configChanged();resolve({config:current,request_pack_preview:preview});await running;
+assert(!sent.includes('/api/runs'));assert.match(nodes['#form-error'].textContent,/changed during preview/);
+// Case evidence and assertions are escaped, including long operator-provided identifiers.
+const rendered=renderPackResults({control_status:'fail',cases:[{case_id:'<unsafe>',quiet:{status:'fail',correct:0,scored:1,valid:1},stages:[{rate_rps:2,correct:0,scored:0,valid:0}]}]});
+assert.match(rendered,/&lt;unsafe&gt;/);assert.match(rendered,/insufficient evidence/);assert.match(rendered,/Quiet control/);
+
+// Service throughput and scored-subset goodput remain separate human-facing claims.
+const stage={rate_rps:2,status:'inconclusive',valid_throughput_rps:1.8,scored_subset_correct_goodput_rps:.7,goodput_rps:.7,all_cases_scored:false};
+const mixedPack={control_status:'inconclusive',all_cases_scored:false,cases:[]};
+let stageMarkup=renderTrafficStages([stage],mixedPack);
+assert.match(stageMarkup,/Valid throughput/);assert.match(stageMarkup,/Scored-subset correct goodput/);
+assert(stageMarkup.includes('1.8 req/s'));assert(stageMarkup.includes('0.7 req/s'));
+assert.doesNotMatch(stageMarkup,/Cohort goodput/);
+const failedQuiet={control_status:'fail',all_cases_scored:true,cases:[]};
+const capacity={id:'capacity',title:'Capacity',target:'local',status:'fail',required:true,metrics:{highest_acceptable_rate_rps:2,request_pack:failedQuiet,traffic_stages:[{...stage,status:'pass',all_cases_scored:true}]}};
+assert(keyMetric(capacity).includes('2 requests/s loaded · quiet failed'));
+const detail=renderCheck(capacity,{requests:[],manifest:{config:{}}});
+assert.match(detail,/Highest acceptable tested loaded rate · quiet failed/);
+assert.match(detail,/Loaded result · quiet failed/);
+assert(!detail.includes('Highest accepted arrival rate'));assert(!detail.includes('requests/s accepted'));
+assert(detail.includes('<th>Correct goodput</th>'));
+assert.doesNotMatch(detail,/class="status pass"/);
+const builtin=renderTrafficStages([{...stage,status:'pass'}]);
+assert.match(builtin,/Cohort goodput/);assert.doesNotMatch(builtin,/Scored-subset correct goodput/);
+// Preview has one warming explanation and names only the pack subtotal.
+state.config=current;state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config:current,data:{...preview,active:true,consumers:['capacity'],planned_requests_per_target:12,warnings:['Repeated, warmed workload: quiet controls and traffic repeat the same requests and may benefit caches.','Other selected checks consume additional shared request and time budget.']}};
+renderRequestPreview();const previewMarkup=nodes['#request-pack-preview'].innerHTML;
+assert.match(previewMarkup,/Pack requests per target: 12/);
+assert.doesNotMatch(previewMarkup,/Known selected-check subtotal/);
+assert.equal((previewMarkup.match(/warmed workload/g)||[]).length,1);
+assert.match(previewMarkup,/Other selected checks/);
+
+})()
+`,context);
+""".replace("APP_PATH", json.dumps(str(static / "app.js")))
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+def test_ai_judge_configuration_evidence_and_evaluation_phase():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute browser judge behavior")
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = r"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {configureJudging} from FORM_PATH;
+const config={request_source:'request_pack',request_pack:{version:1,cases:[{fixture_id:'refund',scorer:'judge',expected:'30 days',rubric:'Preserve eligibility',messages:[{role:'user',content:'Refund?'}]}]},judging:{judges:[{name:'reviewer',url:'http://localhost:9000/v1',model:'judge-model',api_key_env:null,headers_env:{'X-Auth':'JUDGE_HEADER'}}],concurrency:2,request_timeout_seconds:30,max_duration_seconds:300,max_output_tokens:256,proxy:'http://localhost:3128',ca_bundle:'/cert.pem'}};
+const values=new FormData();
+values.set('judge_count','1');values.set('judge_0_name',' reviewer ');values.set('judge_0_url','http://localhost:9000/v1');values.set('judge_0_model','');values.set('judge_0_api_key_env','JUDGE_API_KEY');
+for(const [key,value] of Object.entries(config.judging))if(typeof value==='number')values.set('judging_'+key,String(value));
+values.set('judging_concurrency','3');
+const draft=configureJudging(config,values,{allowInvalid:true});
+assert.equal(draft.judging.judges[0].model,'');assert.equal(draft.judging.judges[0].name,'reviewer');
+assert.equal(draft.judging.judges[0].api_key_env,'JUDGE_API_KEY');assert.equal(draft.judging.concurrency,3);
+assert.deepEqual(draft.judging.judges[0].headers_env,config.judging.judges[0].headers_env);
+assert.equal(draft.judging.ca_bundle,'/cert.pem');assert.equal(draft.judging.proxy,config.judging.proxy);
+assert.deepEqual(draft.request_pack,config.request_pack);assert.equal(config.judging.judges[0].model,'judge-model');
+assert.deepEqual(configureJudging({...draft,request_source:'builtin'},new FormData()),{...draft,request_source:'builtin'});
+values.set('judging_concurrency','bad');assert.throws(()=>configureJudging(config,values),/finite number/);
+assert.equal(configureJudging(config,values,{allowInvalid:true}).judging.concurrency,'bad');
+const nodes={'#main':{innerHTML:''},'#request-pack-preview':{innerHTML:''},'#config-error':{hidden:true},'#request-dialog':{innerHTML:'',showModal(){this.shown=true;}}};
+const context={assert,structuredClone,nodes,config,draft,document:{querySelector:q=>nodes[q],addEventListener(){}},window:{addEventListener(){}},location:{hash:'#new'}};
+const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+vm.runInNewContext(source+`
+state.config=draft;state.jsonDraft=state.jsonBase='synced';
+let captured=0,rendered=0;
+captureFormDraft=()=>{captured++;};renderNew=()=>{rendered++;};
+let markup=renderJudging(draft);assert.match(markup,/AI judges/);assert.match(markup,/judge_0_model/);assert.match(markup,/Evaluation limits/);assert.match(markup,/configured judges/);
+assert.equal(renderJudging({...draft,request_source:'builtin'}),'');
+assert.equal(renderJudging({...draft,request_pack:{cases:[{scorer:'exact'}]}}),'');
+changeJudge('add');assert.equal(state.config.judging.judges.length,2);assert.equal(captured,1);assert.equal(rendered,1);
+assert.equal(state.config.judging.judges[1].model,'');assert.equal(state.requestPreview,null);
+changeJudge('remove',0);assert.equal(state.config.judging.judges.length,1);assert.equal(state.config.judging.judges[0].name,'judge-1');
+state.jsonDraft='unapplied';changeJudge('add');assert.equal(state.config.judging.judges.length,1);assert.match(nodes['#config-error'].textContent,/Apply or discard/);
+state.jsonDraft=state.jsonBase;
+state.config=structuredClone(config);
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config:state.config,data:{active:true,consumers:['correctness'],cases:[],stages:[],warnings:['AI judging runs after target traffic. Messages, golden answers and generated answers are sent to every configured judge.','Other warning'],judging:{active:true,ready:false,readiness_errors:['Missing <model>'],planned_call_upper_bound:12,judge_count:1}}};
+renderRequestPreview();markup=nodes['#request-pack-preview'].innerHTML;assert.match(markup,/12 judge calls/);assert.match(markup,/upper bound/);assert.match(markup,/Missing &lt;model&gt;/);assert.doesNotMatch(markup,/AI judging runs after target traffic/);assert.match(markup,/Other warning/);assert.equal(state.requestPreview.data.warnings.length,2);
+const votes=[{judge:'<judge>',model:'<model>',url:'http://judge',status:'completed',verdict:true,reason:'<script>alert(1)</script>'},{judge:'second',status:'completed',verdict:false,reason:'Wrong quantity'}];
+markup=renderJudgement({status:'inconclusive',votes});assert.match(markup,/Tie/);assert.match(markup,/Disagreement/);assert.match(markup,/&lt;script&gt;/);assert(!markup.includes('<script>'));assert.match(markup,/&lt;judge&gt;/);
+markup=renderJudgement({status:'pass',votes:[...votes,{judge:'third',status:'completed',verdict:true}]});assert.match(markup,/Disagreement/);assert.match(markup,/Passed/);
+markup=renderJudgement({status:'inconclusive',votes:[votes[0],{judge:'second',status:'error',verdict:null,error_category:'timeout'}]});assert.match(markup,/Incomplete panel/);assert.match(markup,/timeout/);assert.match(markup,/Reason not retained/);
+state.detail={report:{requests:[{id:'r',fixture_id:'refund',judgement:{status:'inconclusive',votes},score:null}],manifest:{config:{retention:'all'}}}};
+openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI evaluation/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
+state.detail={id:'run',state:'running',config:{targets:[{name:'target',model:'m'}],judging:config.judging,max_requests:50},progress:{event:'judging_progress',attempted:20,completed:20,judge_calls_total:40,judge_calls_completed:7,elapsed_seconds:10},events:[]};
+renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating golden answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
+state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert.match(nodes['#main'].innerHTML,/Measuring the configured endpoint/);
+`,context);
+""".replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
+        "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+def test_dataset_editor_preserves_canonical_cases_and_stages_imports():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute dataset editing behavior")
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = r"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {datasetCaseFromValues,changeDatasetScorer} from FORM_PATH;
+const original={fixture_id:'conversation',messages:[{role:'system',content:'Return JSON'},{role:'user',content:'Nothing'}],scorer:'json',schema:{type:'null'},expected:null,weight:2,max_tokens:null,options:{temperature:0,response_format:{type:'json_object'}}};
+const values=new FormData();
+values.set('example_id','conversation');values.set('message_count','2');
+original.messages.forEach((message,index)=>{values.set(`message_${index}_role`,message.role);values.set(`message_${index}_content`,message.content);});
+values.set('example_scorer','json');values.set('example_expected','null');values.set('example_schema','{"type":"null"}');values.set('example_weight','2');values.set('example_max_tokens','');values.set('example_options',JSON.stringify(original.options));
+assert.deepEqual(datasetCaseFromValues(original,values),original);
+values.set('example_expected','');assert(!Object.hasOwn(datasetCaseFromValues(original,values),'expected'));
+assert.throws(()=>changeDatasetScorer(original,'judge'),/Edit the expected answer.*as text first/);
+assert.throws(()=>changeDatasetScorer({...original,expected:{a:1}},'exact'),/as text first/);
+assert.deepEqual(changeDatasetScorer(original,'json'),original);
+const judged={...original,scorer:'judge',expected:'Nothing',rubric:'No invented values'};delete judged.schema;
+const exact=changeDatasetScorer(judged,'exact');assert.equal(exact.expected,'Nothing');assert(!Object.hasOwn(exact,'rubric'));assert.deepEqual(exact.messages,original.messages);assert.deepEqual(exact.options,original.options);
+const unscored=changeDatasetScorer(judged,'none');assert(!Object.hasOwn(unscored,'expected'));assert(!Object.hasOwn(unscored,'rubric'));
+values.set('example_scorer','judge');values.set('example_expected','No value');values.set('example_rubric',' Require absence ');
+const edited=datasetCaseFromValues(original,values);assert.equal(edited.expected,'No value');assert.equal(edited.rubric,'Require absence');assert(!Object.hasOwn(edited,'schema'));assert.deepEqual(edited.messages,original.messages);assert.equal(original.expected,null);
+const nodes={},listeners={};
+for(const id of ['main','config-error','dataset-error','request-pack-preview','request-pack-file'])nodes['#'+id]={innerHTML:'',textContent:'',hidden:true,click(){this.clicked=true;}};
+nodes['#dataset-dialog']={innerHTML:'',open:false,showModal(){this.open=true;},close(){this.open=false;}};
+nodes['#new-run-form']={elements:{request_source:{value:'builtin'}}};
+nodes['#dataset-import-form']={elements:{input_field:{value:'question'},expected_field:{value:'answer'},import_scorer:{value:'judge'}}};
+nodes['#dataset-try-form']={elements:{try_target:{value:'secondary'},save_try_output:{checked:true}}};
+const context={assert,structuredClone,nodes,listeners,datasetCaseFromValues,changeDatasetScorer,document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},window:{addEventListener(){}},location:{hash:'#new'}};
+const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+await vm.runInNewContext(source+`
+(async()=>{
+const initial={request_source:'builtin',request_pack:null,targets:[{name:'local',model:''},{name:'secondary',model:'m'}],checks:[],retention:'failures',max_requests:99,traffic:{rates:[1]}};
+state.config=structuredClone(initial);state.jsonDraft=state.jsonBase='synced';
+readForm=()=>({config:structuredClone(state.config),mode:'normal'});captureFormDraft=()=>{};
+renderNew=()=>{state.jsonDraft=state.jsonBase='synced';};toast=()=>{};setActive=id=>{state.active=id;};
+const pack={version:1,cases:[{fixture_id:'one',messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<answer>',weight:1}]};
+changeRequestSource('request_pack');assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);assert(!nodes['#request-pack-file'].clicked);
+let markup=renderRequestSource(state.config);assert.match(markup,/My dataset/);assert.match(markup,/Add your first example/);assert.match(markup,/Answer checks/);
+const calls=[];api=async(path,options)=>{calls.push({path,body:JSON.parse(options.body)});if(path==='/api/datasets/preview')return {columns:[],preview_rows:pack.cases,request_pack:pack,errors:[],needs_mapping:false};if(path==='/api/config/draft')return {config:JSON.parse(options.body)};throw Error('Unexpected endpoint');};
+await importRequestPack({name:'examples.json',size:20,text:async()=>JSON.stringify(pack)});
+assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert(nodes['#dataset-dialog'].open);
+markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Use dataset/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
+await useImportedDataset({preventDefault(){}});assert.equal(state.config.request_pack.cases[0].fixture_id,'one');assert.equal(state.config.targets[0].model,'');assert.equal(calls[1].path,'/api/config/draft');assert(!nodes['#dataset-dialog'].open);
+const accepted=JSON.stringify(state.config);
+const invalidPreview=renderDatasetImportTable({columns:['question','answer'],preview_rows:[{question:'q',answer:'a'},null,42]});
+assert.match(invalidPreview,/Invalid row: null/);assert.match(invalidPreview,/Invalid row: 42/);
+// A slower old file read cannot replace a newer staged import.
+let finishRead;const slowRead=importRequestPack({name:'old.json',size:20,text:()=>new Promise(done=>finishRead=done)});
+await importRequestPack({name:'new.json',size:20,text:async()=>JSON.stringify(pack)});
+finishRead(JSON.stringify(pack));await slowRead;assert.equal(state.datasetImport.name,'new.json');assert.equal(JSON.stringify(state.config),accepted);closeDatasetDialog();
+// Flat import requires a confirmed mapping preview and explicit commit.
+api=async(path,options)=>{const body=JSON.parse(options.body);calls.push({path,body});if(path==='/api/config/draft')return {config:body};return body.input_field?{columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],request_pack:pack,errors:[],needs_mapping:false}:{columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],suggested_mapping:{input_field:'question',expected_field:'answer'},request_pack:null,errors:[],needs_mapping:true};};
+await importRequestPack({name:'examples.csv',size:20,text:async()=>'question,answer'});
+assert.equal(JSON.stringify(state.config),accepted);assert.equal(state.datasetImport.preview.request_pack,null);
+const before=calls.length;await useImportedDataset({preventDefault(){}});assert.equal(calls.length,before);
+await previewDatasetMapping();assert.equal(calls.at(-1).body.input_field,'question');assert.equal(JSON.stringify(state.config),accepted);assert(state.datasetImport.preview.request_pack);
+// Changing a mapping invalidates the preview; late earlier responses cannot restore it.
+let resolve;api=()=>new Promise(done=>resolve=done);const older=previewDatasetMapping();const oldResolve=resolve;
+listeners.change({target:{matches:()=>false,closest:selector=>selector==='#dataset-import-form',name:'input_field'}});
+assert(state.datasetImport.mappingDirty);assert.match(nodes['#dataset-dialog'].innerHTML,/Mapping changed/);
+const newer=previewDatasetMapping();resolve({columns:['question','answer'],preview_rows:[],request_pack:pack,errors:[]});await newer;
+oldResolve({columns:[],preview_rows:[],request_pack:null,errors:[{field:'old',message:'stale'}]});await older;
+assert.equal(state.datasetImport.preview.request_pack.cases[0].fixture_id,'one');assert(!state.datasetImport.mappingDirty);assert.equal(JSON.stringify(state.config),accepted);
+// Cancelling while the explicit commit validates cannot apply it afterward.
+const applying=useImportedDataset({preventDefault(){}});const commitResolve=resolve;
+assert(state.configBusy);closeDatasetDialog();commitResolve({config:{...state.config,request_pack:{version:1,cases:[]}}});await applying;
+assert.equal(JSON.stringify(state.config),accepted);assert.equal(state.configBusy,false);
+state.datasetImport={name:'again.json',text:'{}',format:'json',revision:state.configRevision,route:state.routeVersion,sequence:0,mapping:{},preview:null};
+// Leaving/cancelling an import while parsing keeps the active dataset unchanged.
+const pending=previewDatasetMapping();const pendingResolve=resolve;closeDatasetDialog();pendingResolve({request_pack:pack});await pending;assert.equal(state.datasetImport,null);assert.equal(JSON.stringify(state.config),accepted);
+// Edits to main configuration while import validation is in flight win.
+const importing=importRequestPack({name:'late.json',size:20,text:async()=>JSON.stringify(pack)});await Promise.resolve();const staleResolve=resolve;configChanged();staleResolve({request_pack:pack,preview_rows:pack.cases});await importing;assert.equal(state.datasetImport.preview,null);assert.equal(JSON.stringify(state.config),accepted);closeDatasetDialog();
+// Dirty JSON and oversized files are rejected before reading.
+state.jsonDraft='unapplied';await importRequestPack({size:20,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/Apply or discard/);state.jsonDraft=state.jsonBase;
+await importRequestPack({size:1048577,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/1 MiB/);
+// Trial only submits one named example/target to its own bounded endpoint.
+openTryExample(0);markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/one inference request/);assert.match(markup,/No traffic stages or restart/);assert.match(markup,/Save this trial/);assert.match(markup,/retention setting stays unchanged/);
+const trial=[];api=async(path,options)=>{trial.push({path,body:JSON.parse(options.body)});return {id:'trial',state:'queued'};};
+await tryDatasetExample({preventDefault(){}});assert.equal(trial[0].path,'/api/runs/try-example');assert.equal(trial[0].body.fixture_id,'one');assert.equal(trial[0].body.target_name,'secondary');assert.equal(trial[0].body.config.retention,'all');assert.equal(state.config.retention,'failures');assert.equal(state.config.max_requests,99);assert.equal(trial[0].body.config.checks.length,0);assert.equal(location.hash,'#runs/trial');
+// Unchecking trial retention overrides even an all-retention main config, without changing it.
+state.active=null;state.config.retention='all';nodes['#dataset-try-form'].elements.save_try_output.checked=false;
+openTryExample(0);await tryDatasetExample({preventDefault(){}});
+assert.equal(trial[1].body.config.retention,'none');assert.equal(state.config.retention,'all');
+// Removing the last row preserves My dataset as an empty draft.
+state.active=null;api=async(path,options)=>({config:JSON.parse(options.body)});await removeExample(0);assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);assert.equal(state.config.targets[0].model,'');
+})()
+`,context);
+""".replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
+        "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr

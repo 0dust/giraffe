@@ -47,6 +47,10 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
     }
     const options = {};
     for (const name of check.option_fields) {
+      if (config.request_source === 'request_pack' && check.id === 'correctness' && ['samples','concurrency'].includes(name)) {
+        if (Object.hasOwn(source.test_options?.correctness || {}, name)) options[name] = source.test_options.correctness[name];
+        continue;
+      }
       const value = numeric(values.get(`test_${check.id}_${name}`), name, allowInvalid);
       if (value !== null && value !== optionDefault(config, check, name)) options[name] = value;
     }
@@ -77,5 +81,69 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
       else config.traffic[name] = numeric(values.get(`traffic_${name}`), name, allowInvalid);
     }
   }
+  if (config.request_source === 'request_pack' && source.traffic) {
+    for (const name of ['mix','long_input_chars','long_output_words']) {
+      if (Object.hasOwn(source.traffic, name)) config.traffic[name] = structuredClone(source.traffic[name]);
+    }
+  }
   return config;
+}
+
+// Only rendered judge fields participate; inactive drafts and JSON-only transport
+// settings survive ordinary edits and source changes.
+export function configureJudging(source, values, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  if (!values.has('judge_count')) return config;
+  const judging = config.judging ||= {};
+  const previous = judging.judges || [];
+  judging.judges = Array.from({length:Number(values.get('judge_count'))}, (_, index) => {
+    const judge = {...previous[index]};
+    for (const key of ['name','url','model','api_key_env']) {
+      const value = String(values.get(`judge_${index}_${key}`) || '').trim();
+      judge[key] = key === 'api_key_env' ? value || null : value;
+    }
+    judge.headers_env ||= {};
+    return judge;
+  });
+  for (const key of ['concurrency','request_timeout_seconds','max_duration_seconds','max_output_tokens']) {
+    judging[key] = numeric(values.get(`judging_${key}`), `Judge ${key}`, allowInvalid);
+  }
+  return config;
+}
+
+export function datasetCaseFromValues(previous, values) {
+  const item = structuredClone(previous || {});
+  item.fixture_id = String(values.get('example_id') || '').trim();
+  item.messages = Array.from({length:Number(values.get('message_count'))}, (_, index) => ({
+    role: values.get(`message_${index}_role`),
+    content: String(values.get(`message_${index}_content`) || ''),
+  }));
+  item.scorer = values.get('example_scorer');
+  const expected = String(values.get('example_expected') || '');
+  delete item.expected;delete item.rubric;delete item.schema;
+  if (item.scorer === 'json') {
+    item.schema = JSON.parse(values.get('example_schema') || '{}');
+    if (expected.trim()) item.expected = JSON.parse(expected);
+  } else if (item.scorer !== 'none') item.expected = expected;
+  const rubric = String(values.get('example_rubric') || '').trim();
+  if (item.scorer === 'judge' && rubric) item.rubric = rubric;
+  item.weight = numeric(values.get('example_weight'), 'Example weight');
+  item.max_tokens = numeric(values.get('example_max_tokens'), 'Example output cap');
+  item.options = JSON.parse(values.get('example_options') || '{}');
+  return item;
+}
+
+export function changeDatasetScorer(item, scorer) {
+  const result = structuredClone(item);
+  if (scorer === item.scorer) return result;
+  result.scorer = scorer;
+  delete result.schema;
+  if (scorer !== 'judge') delete result.rubric;
+  if (scorer === 'none') delete result.expected;
+  else {
+    if (!Object.hasOwn(result, 'expected')) throw new Error(`Add an expected answer to ${item.fixture_id} first.`);
+    if (typeof result.expected !== 'string') throw new Error(`Edit the expected answer for ${item.fixture_id} as text first.`);
+    if (!result.expected.trim()) throw new Error(`Add an expected answer to ${item.fixture_id} first.`);
+  }
+  return result;
 }

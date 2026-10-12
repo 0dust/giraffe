@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "fixture_id": "refund-policy",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Policy: unused items may be returned within 30 days of delivery. A receipt is required. Explain the return conditions to a customer in one sentence."
+        }
+      ],
+      "scorer": "judge",
+      "expected": "You can return unused items within 30 days of delivery if you have a receipt.",
+      "rubric": "The answer must include all three conditions: unused item, 30 days from delivery, and a receipt. Different wording is acceptable.",
+      "max_tokens": 96,
+      "options": {"temperature": 0}
+    },
+    {
+      "fixture_id": "order-id",
+      "messages": [
+        {"role": "user", "content": "Order A-104 has shipped. Return only the order ID."}
+      ],
+      "scorer": "exact",
+      "expected": "A-104",
+      "max_tokens": 16,
+      "options": {"temperature": 0}
+    }
+  ]
+}

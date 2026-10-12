@@ -219,3 +219,41 @@ def test_unresolvable_local_schema_reference_is_a_failed_score():
     )
     result = score_response(spec, record(spec, "{}"))
     assert result.score is False and "schema" in result.score_message
+
+
+@pytest.mark.parametrize("schema", [
+    {"const": {"$ref": "this-is-data"}},
+    {"enum": [{"$ref": "this-is-data"}]},
+])
+def test_pack_literal_reference_data_scores_consistently_with_import(schema):
+    from giraffe.request_pack import pack_specs
+
+    configured = config(request_source="request_pack", checks=["correctness"], request_pack={
+        "version": 1, "cases": [{"fixture_id": "literal", "messages": [{"role": "user", "content": "Return JSON"}],
+                                  "scorer": "json", "schema": schema, "expected": {"$ref": "this-is-data"}}]})
+    spec = pack_specs(configured)[0]
+    assert score_response(spec, record(spec, '{"$ref":"this-is-data"}')).score is True
+    assert score_response(spec, record(spec, '{"$ref":"wrong"}')).score is False
+
+
+def test_legacy_json_none_remains_schema_only():
+    spec = RequestSpec(fixture_id="legacy", scenario="custom", check_ids=["correctness"],
+                       messages=[{"role": "user", "content": "Return JSON"}], scorer="json",
+                       schema={"type": "string"}, expected=None)
+    assert score_response(spec, record(spec, '"valid"')).score is True
+
+
+def test_judge_scorer_waits_for_post_run_evaluation():
+    spec = RequestSpec(fixture_id="reference", scenario="request_pack", check_ids=["correctness"],
+                       messages=[{"role": "user", "content": "Refund window?"}],
+                       scorer="judge", expected="30 days")
+    pending = score_response(spec, record(spec, "Within thirty days."))
+    assert pending.valid and pending.score is None
+    assert "pending" in pending.score_message.lower()
+    failed = score_response(spec, record(spec, "", status="failed", valid=False))
+    assert failed.score is None and "did not complete" in failed.score_message
+
+
+def test_legacy_custom_fixtures_reject_judge_with_pack_guidance(tmp_path):
+    with pytest.raises(ValueError, match="request pack"):
+        load_custom_fixtures(custom_file(tmp_path, [custom_entry(scorer="judge")]))

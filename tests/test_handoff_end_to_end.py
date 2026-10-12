@@ -15,7 +15,8 @@ from tests.test_web import browser, finished, start
 
 
 @pytest.mark.parametrize("compare", [False, True])
-async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, compare):
+@pytest.mark.parametrize("request_source", ["builtin", "request_pack"])
+async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, compare, request_source):
     with FakeEndpoint(first_token_delay=.001, chunk_delay=0) as endpoint:
         config = RunConfig(
             targets=[{"name": "local", "url": endpoint.url, "model": "fake-model"}],
@@ -23,6 +24,21 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
             limits={"regression_percent": 1_000_000},
             test_options={"capacity": {"limits": {"latency_ms": None}}},
         ).model_dump(mode="json")
+        if request_source == "request_pack":
+            from giraffe.cli import configuration, parser
+
+            pack_path = tmp_path / "operator-pack.json"
+            pack_path.write_text(json.dumps({"version": 1, "cases": [{
+                "fixture_id": f"operator-question-{index}",
+                "messages": [{"role": "user", "content": f"Return 42 for question {index}"}],
+                "scorer": "exact", "expected": "42"} for index in range(6)]}))
+            config_path = tmp_path / "run-config.json"
+            config_path.write_text(json.dumps(config))
+            config = configuration(parser().parse_args([
+                "run", "--config", str(config_path), "--request-pack", str(pack_path),
+            ])).model_dump(mode="json")
+            pack_path.unlink()
+            config_path.unlink()
         async with browser(tmp_path / "ui-runs") as client:
             original = await finished(client, await start(client, config))
             assert original["report"]["overall"] == "pass"
@@ -60,6 +76,10 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
             assert {r["fixture_id"] for r in replay["requests"]} == {
                 r["fixture_id"] for r in original["report"]["requests"]
             }
+            if request_source == "request_pack":
+                assert len(replay["requests"]) == 6
+                assert replay["requests"][0]["fixture_id"] == "pack:operator-question-0"
+                assert endpoint.requests[before:][0]["messages"] == config["request_pack"]["cases"][0]["messages"]
             if compare:
                 assert replay["baseline"]["run_id"] == original["report"]["run_id"]
                 assert replay["baseline"]["status"] == "pass"

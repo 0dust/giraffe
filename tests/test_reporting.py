@@ -377,3 +377,45 @@ def test_unselected_traffic_configuration_does_not_invalidate_other_checks():
     current.manifest["config"]["traffic"]["rates"] = [1, 20]
     current.manifest["effective_traffic"]["rates"] = [1, 20]
     assert baseline_check(compare_baseline(current, previous)).status == "pass"
+
+
+def test_pack_html_separates_rates_and_qualifies_quiet_failure():
+    from giraffe.models import CheckResult
+    from giraffe.reporting import _traffic_table
+
+    check = CheckResult(id="capacity", target="local", title="Capacity", status="fail",
+                        summary="Quiet failed", metrics={
+        "request_pack": {"control_status": "fail", "all_cases_scored": False},
+        "traffic_stages": [{"rate_rps": 10, "status": "pass", "goodput_rps": 3,
+                            "valid_throughput_rps": 8}],
+    })
+    content = _traffic_table(check)
+    assert "Valid throughput" in content and "8 requests/s" in content
+    assert "Scored-subset correct goodput" in content and "3 requests/s" in content
+    assert "Loaded result: pass; quiet failed" in content
+    assert 'class="badge pass"' not in content
+
+
+@pytest.mark.parametrize("policy,score,retained", [
+    ("all", True, True), ("failures", False, True),
+    ("failures", True, False), ("none", False, False),
+])
+def test_judge_rationale_follows_answer_retention_without_losing_votes(tmp_path, policy, score, retained):
+    report = make_report(count=1)
+    report.manifest["config"]["retention"] = policy
+    vote = {"judge": "reviewer", "url": "http://localhost:9000/v1", "model": "judge-model",
+            "verdict": score, "status": "completed", "reason": "<script>private rationale</script>"}
+    report.requests[0] = RequestRecord.model_validate({
+        **report.requests[0].model_dump(), "score": score,
+        "judgement": {"status": "pass" if score else "fail", "votes": [vote]},
+    })
+    original = report.model_copy(deep=True)
+    json_path, html_path = write_report(report, tmp_path)
+    saved = json.loads(json_path.read_text())["requests"][0]
+    assert saved["judgement"]["votes"][0]["verdict"] == score
+    assert bool(saved["judgement"]["votes"][0]["reason"]) == retained
+    content = html_path.read_text()
+    assert "AI judge verdicts" in content
+    assert "<script>private rationale</script>" not in content
+    assert ("&lt;script&gt;private rationale&lt;/script&gt;" in content) == retained
+    assert report == original

@@ -10,8 +10,9 @@ import asyncio
 import math
 import random
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, TrafficConfig
 
@@ -99,6 +100,31 @@ def _record_stats(records: list[RequestRecord], limits: Limits) -> dict:
     return result
 
 
+@dataclass(frozen=True)
+class StageEvidence:
+    """Inference-only stage facts, retained privately while scores are pending.
+
+    Records are deliberately shared so post-run evaluation can update scores.
+    All scheduler inputs and timings are captured before evaluation starts.
+    """
+
+    stage_index: int
+    rate_rps: float
+    duration_seconds: float
+    observation_seconds: float
+    schedule: tuple[tuple[float, str], ...]
+    outcomes: tuple[str, ...]
+    records: tuple[tuple[int, RequestRecord], ...]
+    lifetimes: tuple[tuple[float, float], ...]
+    reasons: tuple[str, ...]
+    peak: int
+    execution_errors: int
+    overflow: bool
+    interrupted: bool
+    drain_expired: bool
+    case_scorers: tuple[tuple[str, str], ...] | None
+
+
 async def run_stage(
     *,
     traffic: TrafficConfig,
@@ -112,6 +138,9 @@ async def run_stage(
     stop_reason: Callable[[], str | None],
     deadline: float,
     limits: Limits,
+    case_specs: list[RequestSpec] | None = None,
+    active_case_specs: list[RequestSpec] | None = None,
+    capture_evidence: Callable[[StageEvidence], None] | None = None,
 ) -> dict:
     """Run one stage; callbacks own shared run budgets and global admission slots.
 
@@ -122,8 +151,16 @@ async def run_stage(
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
     schedule, overflow = arrival_schedule(traffic, rate_rps, stage_index)
-    if any(not fixtures.get(kind) for _, kind in schedule):
+    if case_specs is not None and len(case_specs) != len(schedule):
+        raise ValueError("case sequence must match the finite arrival schedule")
+    if case_specs is None and any(not fixtures.get(kind) for _, kind in schedule):
         raise ValueError("every scheduled traffic class needs a scored fixture")
+    selected_specs = (case_specs if case_specs is not None else [
+        fixtures[kind][index % len(fixtures[kind])] for index, (_, kind) in enumerate(schedule)
+    ])
+    if case_specs is not None:
+        schedule = [(offset, spec.workload["case_id"])
+                    for (offset, _), spec in zip(schedule, selected_specs, strict=True)]
     started_at = time.monotonic()
     stage_end = started_at + traffic.duration_seconds
     outcomes = ["not_offered"] * len(schedule)
@@ -168,7 +205,7 @@ async def run_stage(
             return
         outcomes[index] = "started"
         try:
-            spec = fixtures[kind][index % len(fixtures[kind])].model_copy(update={
+            spec = selected_specs[index].model_copy(update={
                 "scenario": f"traffic_stage_{stage_index}", "check_ids": ["capacity"],
             })
             record = await execute(spec)
@@ -264,18 +301,49 @@ async def run_stage(
                     reasons.append("Traffic stage cancelled.")
                     interrupted = True
 
+    case_scorers = None
+    if case_specs is not None:
+        active_cases = {spec.workload["case_id"]: spec.scorer for spec in active_case_specs or []}
+        for spec in selected_specs:
+            active_cases.setdefault(spec.workload["case_id"], spec.scorer)
+        case_scorers = tuple(active_cases.items())
+    evidence = StageEvidence(
+        stage_index=stage_index, rate_rps=rate_rps,
+        duration_seconds=traffic.duration_seconds,
+        observation_seconds=time.monotonic() - started_at,
+        schedule=tuple(schedule), outcomes=tuple(outcomes), records=tuple(records),
+        lifetimes=tuple(lifetimes.values()), reasons=tuple(reasons), peak=peak,
+        execution_errors=execution_errors, overflow=overflow, interrupted=interrupted,
+        drain_expired=drain_expired, case_scorers=case_scorers,
+    )
+    result = finalize_stage(evidence, limits)
+    if capture_evidence is not None:
+        capture_evidence(evidence)
+    return result
+
+
+def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
+    """Aggregate original stage facts with the records' current correctness scores."""
+    schedule, outcomes, records = evidence.schedule, evidence.outcomes, evidence.records
+    reasons = list(evidence.reasons)
     counts = Counter(outcomes)
     started = counts["started"] + counts["cancelled"]
     not_offered = counts["not_offered"] + counts["dispatching"]
-    evidence = [record for _, record in records]
-    stats = _record_stats(evidence, limits)
-    stats["failed"] += execution_errors
+    stats = _record_stats([record for _, record in records], limits)
+    stats["failed"] += evidence.execution_errors
     stats["cancelled"] += counts["cancelled"]
     error_rate = (stats["failed"] + stats["timed_out"]) / started if started else None
-    generator_limited = bool(counts["dropped_local"] or counts["dropped_late"] or overflow)
-    fully_offered = not (not_offered or generator_limited or interrupted)
+    generator_limited = bool(counts["dropped_local"] or counts["dropped_late"] or evidence.overflow)
+    fully_offered = not (not_offered or generator_limited or evidence.interrupted)
     service_failure = error_rate is not None and error_rate > limits.max_error_rate
-    answer_failure = stats["correctness"] is not None and stats["correctness"] < limits.min_correctness
+    # Missing judgments are uncertainty, not wrong answers. Only fail when even
+    # every remaining judgment passing could not satisfy the required fraction.
+    best_possible_correctness = (
+        (stats["correct"] + stats["unscored_completions"]) / stats["completed"]
+        if stats["completed"] else None
+    )
+    answer_failure = (best_possible_correctness is not None
+                      and best_possible_correctness < limits.min_correctness)
     timing_failure = bool(stats["timing_violations"] and not counts["dropped_late"])
     if service_failure:
         reasons.append("Service failures exceeded the error limit.")
@@ -298,14 +366,46 @@ async def run_stage(
         reasons.append("Some completed answers lack required timing or correctness evidence.")
     if stats["cancelled"]:
         reasons.append("Some admitted requests were cancelled before completion.")
+    case_counts = {}
+    coverage_complete = all_cases_scored = True
+    if evidence.case_scorers is not None:
+        active_cases = dict(evidence.case_scorers)
+        all_cases_scored = bool(active_cases) and all(scorer != "none" for scorer in active_cases.values())
+        indices_by_case = defaultdict(list)
+        records_by_case = defaultdict(list)
+        for index, (_, case_id) in enumerate(schedule):
+            indices_by_case[case_id].append(index)
+        for index, record in records:
+            records_by_case[schedule[index][1]].append(record)
+        for case_id in active_cases:
+            indices = indices_by_case[case_id]
+            case_outcomes = Counter(outcomes[index] for index in indices)
+            case_records = records_by_case[case_id]
+            case_stats = _record_stats(case_records, limits)
+            missing = case_outcomes["not_offered"] + case_outcomes["dispatching"]
+            case_counts[case_id] = {
+                "planned": len(indices), "offered": len(indices) - missing,
+                "started": case_outcomes["started"] + case_outcomes["cancelled"],
+                "valid": case_stats["completed"], "scored": case_stats["scored"],
+                "correct": case_stats["correct"],
+                "dropped_local": case_outcomes["dropped_local"],
+                "dropped_late": case_outcomes["dropped_late"], "not_offered": missing,
+                "drops": case_outcomes["dropped_local"] + case_outcomes["dropped_late"],
+            }
+        coverage_complete = bool(case_counts) and all(row["scored"] >= 1 for row in case_counts.values())
+        if not coverage_complete:
+            reasons.append("Every active case needs a valid scored completion at this rate.")
+        if not all_cases_scored:
+            reasons.append("An active unscored case prevents a full-pack correct-capacity claim.")
     failed = service_failure or answer_failure or timing_failure
     accepted = bool(not failed and fully_offered and enough_samples and latency_configured
-                    and not drain_expired and not stats["missing_timing"]
-                    and not stats["unscored_completions"] and not stats["cancelled"])
+                    and not evidence.drain_expired and not stats["missing_timing"]
+                    and not stats["unscored_completions"] and not stats["cancelled"]
+                    and coverage_complete and all_cases_scored)
     windows = []
     for number in range(5):
-        lower, upper = (traffic.duration_seconds * number / 5,
-                        traffic.duration_seconds * (number + 1) / 5)
+        lower, upper = (evidence.duration_seconds * number / 5,
+                        evidence.duration_seconds * (number + 1) / 5)
         indices = {i for i, (offset, _) in enumerate(schedule) if lower <= offset < upper}
         window_records = [record for index, record in records if index in indices]
         window_counts = Counter(outcomes[index] for index in indices)
@@ -316,25 +416,29 @@ async def run_stage(
             "started": window_started, "dropped_local": window_counts["dropped_local"],
             "dropped_late": window_counts["dropped_late"],
             "not_offered": window_counts["not_offered"] + window_counts["dispatching"],
-            "pending_at_end": sum(begin <= upper < end for begin, end in lifetimes.values()),
+            "pending_at_end": sum(begin <= upper < end for begin, end in evidence.lifetimes),
             "error_rate": ((window_stats["failed"] + window_stats["timed_out"]) / window_started
                            if window_started else None),
             **window_stats,
         })
     return {
-        "stage_index": stage_index, "rate_rps": rate_rps,
-        "duration_seconds": traffic.duration_seconds,
-        "observation_seconds": time.monotonic() - started_at,
+        "stage_index": evidence.stage_index, "rate_rps": evidence.rate_rps,
+        "duration_seconds": evidence.duration_seconds,
+        "observation_seconds": evidence.observation_seconds,
         "scheduled": len(schedule), "started": started,
         "dropped_local": counts["dropped_local"], "dropped_late": counts["dropped_late"],
-        "not_offered": not_offered, "schedule_truncated": overflow,
-        "scheduled_rps": len(schedule) / traffic.duration_seconds,
-        "achieved_rps": started / traffic.duration_seconds,
-        "goodput_rps": stats["good"] / traffic.duration_seconds,
+        "not_offered": not_offered, "schedule_truncated": evidence.overflow,
+        "scheduled_rps": len(schedule) / evidence.duration_seconds,
+        "achieved_rps": started / evidence.duration_seconds,
+        "goodput_rps": stats["good"] / evidence.duration_seconds,
+        "valid_throughput_rps": stats["completed"] / evidence.duration_seconds,
+        "scored_subset_correct_goodput_rps": stats["good"] / evidence.duration_seconds,
+        **({"case_counts": case_counts, "coverage_complete": coverage_complete,
+            "all_cases_scored": all_cases_scored} if evidence.case_scorers is not None else {}),
         "good_fraction": stats["good"] / len(schedule) if schedule else None,
-        "error_rate": error_rate, "peak_in_flight": peak,
+        "error_rate": error_rate, "peak_in_flight": evidence.peak,
         "fully_offered": fully_offered, "generator_limited": generator_limited,
-        "drain_expired": drain_expired, "accepted": accepted,
+        "drain_expired": evidence.drain_expired, "accepted": accepted,
         "status": "fail" if failed else "pass" if accepted else "inconclusive",
         "reasons": list(dict.fromkeys(reasons)), "windows": windows,
         "planned_mix": dict(Counter(kind for _, kind in schedule)),
