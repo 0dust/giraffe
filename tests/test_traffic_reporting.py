@@ -94,6 +94,70 @@ def test_no_acceptable_rate_does_not_invent_zero_capacity():
     assert comparison(result)["change_percent"] is None
 
 
+def packed_report(run_id="current"):
+    report = traffic_report(run_id)
+    report.manifest["config"]["request_source"] = "request_pack"
+    report.manifest["request_pack"] = {"sha256": "same-pack", "selector_version": 1}
+    report.checks[0].metrics["request_pack"] = {
+        "control_status": "pass", "coverage_complete": True, "all_cases_scored": True,
+    }
+    for stage in report.checks[0].metrics["traffic_stages"]:
+        stage.update(coverage_complete=True, all_cases_scored=True)
+    return report
+
+
+def test_pack_comparison_requires_recorded_identity():
+    current, old = packed_report(), packed_report("baseline")
+    old.manifest.pop("request_pack")
+    result = compare_baseline(current, old)
+    assert result.baseline["status"] == "inconclusive"
+    assert "pack identity" in comparison(result)["reason"].lower()
+
+
+def test_changed_pack_assertion_identity_blocks_comparison():
+    current, old = packed_report(), packed_report("baseline")
+    current.manifest["request_pack"]["sha256"] = "changed-assertion"
+    assert compare_baseline(current, old).baseline["status"] == "inconclusive"
+
+
+def test_pack_comparison_ignores_inactive_builtin_traffic_shape():
+    current, old = packed_report(), packed_report("baseline")
+    current.manifest["effective_traffic"].update(
+        mix={"short": 1, "long_input": 0, "long_output": 0},
+        long_input_chars=9999, long_output_words=999,
+    )
+    assert compare_baseline(current, old).baseline["status"] == "pass"
+
+
+def test_pack_comparison_does_not_treat_incomplete_coverage_as_qualified():
+    current, old = packed_report(), packed_report("baseline")
+    for report in (current, old):
+        report.checks[0].metrics["request_pack"] = {
+            "coverage_complete": True, "all_cases_scored": True,
+        }
+        for stage in report.checks[0].metrics["traffic_stages"]:
+            stage.update(coverage_complete=True, all_cases_scored=True)
+    current.checks[0].metrics["request_pack"]["coverage_complete"] = False
+    result = compare_baseline(current, old)
+    assert comparison(result)["status"] == "inconclusive"
+    assert comparison(result)["delta_rps"] is None
+
+
+def test_report_shows_quiet_and_loaded_case_evidence(tmp_path):
+    report = packed_report()
+    report.checks[0].metrics["request_pack"] = {
+        "control_status": "pass", "coverage_complete": True, "all_cases_scored": True,
+        "cases": [{"case_id": "<script>private</script>", "quiet": {"status": "pass"},
+                   "stages": [{"rate_rps": 1, "planned": 5, "offered": 5,
+                               "started": 5, "valid": 5, "scored": 5, "correct": 4}]}],
+    }
+    _, html = write_report(report, tmp_path)
+    content = html.read_text()
+    assert "Quiet result" in content and "Planned / offered / started" in content
+    assert "&lt;script&gt;private&lt;/script&gt;" in content
+    assert "<script>private</script>" not in content
+
+
 @pytest.mark.parametrize("change", ["mix", "seed", "rates", "duration", "limits", "test_options", "effective"])
 def test_changed_planned_work_or_criteria_are_not_capacity_regressions(change):
     current, old = traffic_report(high_failure="latency"), traffic_report("baseline")
@@ -241,3 +305,93 @@ def test_selected_workload_settings_still_block_comparison(field, check, value):
     result = compare_baseline(current, old)
     assert result.baseline["status"] == "inconclusive"
     assert f"Run setting {field} differs." in result.baseline["targets"][0]["reasons"]
+
+
+@pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])
+async def test_executed_pack_ignores_inactive_correctness_sample_and_concurrency_settings(monkeypatch, checks):
+    from giraffe import runner
+    from giraffe.reporting import _settings_reasons
+    from tests.test_runner import FakeClient, pack_config
+
+    monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    old = await runner.run_suite(pack_config(checks=checks))
+    current = await runner.run_suite(pack_config(checks=checks,
+        test_options={"correctness": {"samples": 9, "concurrency": 1}}))
+    assert current.manifest["request_pack"] == old.manifest["request_pack"]
+    assert [(record.fixture_id, record.scenario) for record in current.requests] == [
+        (record.fixture_id, record.scenario) for record in old.requests]
+    assert _settings_reasons(current, old) == []
+
+
+@pytest.mark.parametrize("field,value", [("samples", 9), ("context_limit", 1024), ("sustained_seconds", .1)])
+async def test_executed_pack_ignores_unused_global_fixture_settings(monkeypatch, field, value):
+    from giraffe import runner
+    from giraffe.reporting import _settings_reasons
+    from tests.test_runner import FakeClient, pack_config
+
+    monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    old = await runner.run_suite(pack_config())
+    current = await runner.run_suite(pack_config(**{field: value}))
+    assert current.manifest["request_pack"] == old.manifest["request_pack"]
+    assert _settings_reasons(current, old) == []
+
+
+@pytest.mark.parametrize("field,value", [("max_output_tokens", 8), ("request_options", {"temperature": .4}),
+                                         ("limits", {"latency_ms": 300, "min_samples": 2})])
+async def test_executed_pack_keeps_payload_and_criteria_changes_incomparable(monkeypatch, field, value):
+    from giraffe import runner
+    from giraffe.reporting import _settings_reasons
+    from tests.test_runner import FakeClient, pack_config
+
+    monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    old = await runner.run_suite(pack_config())
+    current = await runner.run_suite(pack_config(**{field: value}))
+    assert _settings_reasons(current, old)
+
+
+@pytest.mark.parametrize("field,check,value", [("samples", "serving", 9),
+    ("context_limit", "context", 1024), ("sustained_seconds", "recovery", .1)])
+def test_mixed_pack_diagnostics_still_compare_their_global_settings(field, check, value):
+    from giraffe.reporting import _settings_reasons
+
+    current, old = packed_report(), packed_report("baseline")
+    for report in (current, old):
+        report.manifest["config"]["checks"].append(check)
+    current.manifest["config"][field] = value
+    assert f"Run setting {field} differs." in _settings_reasons(current, old)
+
+
+def test_shared_capacity_pack_ignores_only_inactive_correctness_payload_settings():
+    from giraffe.reporting import _settings_reasons
+
+    current, old = packed_report(), packed_report("baseline")
+    for report in (current, old):
+        report.manifest["config"]["checks"].append("correctness")
+        report.manifest["effective_checks"]["correctness"] = {
+            "samples": 5, "concurrency": 1, "max_output_tokens": 12,
+            "request_timeout_seconds": 2, "limits": {"min_correctness": 1},
+        }
+    current.manifest["effective_checks"]["correctness"].update(max_output_tokens=8, request_timeout_seconds=1)
+    assert _settings_reasons(current, old) == []
+    current.manifest["effective_checks"]["correctness"]["limits"]["min_correctness"] = .5
+    assert "Recorded effective_checks differs or is missing." in _settings_reasons(current, old)
+
+
+@pytest.mark.parametrize("failed_run", ["current", "baseline"])
+def test_quiet_failure_cannot_claim_accepted_baseline_capacity(failed_run, tmp_path):
+    current, old = packed_report(), packed_report("baseline")
+    failed = current if failed_run == "current" else old
+    failed.checks[0].metrics["request_pack"]["control_status"] = "fail"
+    failed.checks[0].status = "fail"
+    original_rate = failed.checks[0].metrics["highest_acceptable_rate_rps"]
+    result = compare_baseline(current, old)
+    capacity = comparison(result)
+    assert capacity["status"] == "inconclusive"
+    assert "passing quiet controls" in capacity["reason"]
+    assert capacity[f"{failed_run}_highest_acceptable_rate_rps"] is None
+    assert capacity["delta_rps"] is None
+    assert failed.checks[0].metrics["highest_acceptable_rate_rps"] == original_rate
+    from giraffe.reporting import _traffic_baseline_html
+    html = _traffic_baseline_html({"target": "local", "traffic_capacity": capacity})
+    assert "Previously acceptable tested arrival rates remain acceptable" not in html
+    assert "not established" in html

@@ -20,6 +20,7 @@ from .client import LLMClient
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures)
+from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
 from .models import (
     CHECK_NAMES, CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
     overall_status,
@@ -102,6 +103,8 @@ def _check_config(config: RunConfig, check_id: str) -> RunConfig:
 class _Run:
     def __init__(self, config: RunConfig, progress, stop_event):
         self.config = config
+        self.pack_specs = pack_specs(config)
+        self.stage_evidence = defaultdict(list)
         self.progress = progress
         self.stop = stop_event or asyncio.Event()
         self.start = time.monotonic()
@@ -483,11 +486,15 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await run.group(target, client, builtin_fixtures(effective)["generation"], "generation",
                                 count=effective.samples, checks=["generation"])
             if "capacity" in enabled:
-                from .traffic import run_stage
+                from .traffic import arrival_schedule, run_stage
+
+                if run.pack_specs:
+                    await run.group(target, client, run.pack_specs, "pack_control",
+                                    count=len(run.pack_specs), checks=["correctness"] if "correctness" in enabled else [])
 
                 traffic = config.effective_traffic()
                 effective = _check_config(config, "capacity")
-                mixed_fixtures = traffic_fixtures(config)
+                mixed_fixtures = {} if run.pack_specs else traffic_fixtures(config)
 
                 async def execute(spec):
                     spec = _spec(spec, spec.scenario, ["capacity"])
@@ -499,12 +506,24 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     return None if reason == "maximum request budget reached" else reason
 
                 for index, rate in enumerate(traffic.rates):
+                    pack_arguments = {}
+                    if run.pack_specs:
+                        frozen = {spec.fixture_id: spec for spec in run.pack_specs}
+                        schedule, _ = arrival_schedule(traffic, rate, index)
+                        pack_arguments = {
+                            "case_specs": [frozen[spec.fixture_id] for spec in
+                                           case_sequence(config, len(schedule), index)],
+                            "active_case_specs": run.pack_specs,
+                        }
                     stage = await run_stage(
                         traffic=traffic, rate_rps=rate, stage_index=index,
                         fixtures=mixed_fixtures, execute=execute,
                         reserve_offer=lambda: run.reserve_offer(target.name),
                         try_acquire=run.try_acquire_slot, release=run.release_slot,
                         stop_reason=traffic_stop_reason, deadline=run.deadline, limits=effective.limits,
+                        capture_evidence=(run.stage_evidence[target.name].append
+                                          if any(spec.scorer == "judge" for spec in run.pack_specs) else None),
+                        **pack_arguments,
                     )
                     run.observations[target.name]["capacity"].append(stage)
                     if run.reason or run.stop.is_set() or time.monotonic() >= run.deadline:
@@ -533,6 +552,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     )
             for check_id in ("correctness", "json"):
                 if check_id in enabled:
+                    if check_id == "correctness" and run.pack_specs:
+                        if "capacity" not in enabled:
+                            await run.group(target, client, run.pack_specs, "pack_control",
+                                            count=len(run.pack_specs), checks=["correctness"])
+                        continue
                     effective = _check_config(config, check_id)
                     specs = fixtures[check_id]
                     await run.group(target, client, specs, f"{check_id}_c{effective.concurrency}",
@@ -668,6 +692,37 @@ def _answer_failures(records: list[RequestRecord], warm: list[RequestRecord]) ->
             for fixture in sorted(failed)]
 
 
+def _pack_results(run: _Run, target: Target) -> dict:
+    quiet = [record for record in run.records
+             if record.target == target.name and record.scenario == "pack_control"]
+    stages = run.observations[target.name]["capacity"]
+    cases = []
+    for spec in run.pack_specs:
+        case_id = spec.workload["case_id"]
+        records = [record for record in quiet if record.fixture_id == spec.fixture_id]
+        valid = [record for record in records if record.status == "completed" and record.valid]
+        scored = [record for record in valid if record.score is not None]
+        failed = any(record.score is False or record.status in {"failed", "timeout"}
+                     or (record.status == "completed" and not record.valid) for record in records)
+        status = "fail" if failed else "pass" if scored else "inconclusive"
+        cases.append({"case_id": case_id, "quiet": {
+            "planned": 1, "offered": len(records), "started": len(records),
+            "valid": len(valid), "scored": len(scored),
+            "correct": sum(record.score is True for record in scored), "status": status,
+        }, "stages": [{"stage_index": stage["stage_index"], "rate_rps": stage["rate_rps"],
+                        **stage["case_counts"][case_id]} for stage in stages]})
+    coverage = bool(cases) and all(case["quiet"]["scored"] >= 1 for case in cases)
+    all_scored = all(spec.scorer != "none" for spec in run.pack_specs)
+    control_status = ("fail" if any(case["quiet"]["status"] == "fail" for case in cases)
+                      else "pass" if coverage and all_scored else "inconclusive")
+    preview = pack_preview(run.config)
+    return {"control_status": control_status, "coverage_complete": coverage,
+            "all_cases_scored": all_scored, "cases": cases,
+            "workload_note": "Repeated, warmed workload; quiet controls and traffic repeat requests and may benefit caches.",
+            "unique_effective_requests": preview["unique_effective_requests"],
+            "repeated_requests_per_target": preview["repeated_requests_per_target"]}
+
+
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
@@ -682,6 +737,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         limits = config.limits
         optional = check_id == "gpu"
         records = [r for r in ordinary if check_id in r.check_ids]
+        if check_id == "correctness" and run.pack_specs:
+            records = [r for r in records if r.scenario == "pack_control"]
+            limits = limits.model_copy(update={"min_samples": 1})
         if check_id == "capacity":
             records = [r for r in records if r.traffic_stage is not None]
         if check_id == "fairness":
@@ -757,9 +815,16 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 for stage in stages:
                     stage["accepted"] = False
                     stage["generator_limited"] = True
+                    # Missing judgments may still pass; preserve a correctness
+                    # failure only when the full completion set cannot recover.
+                    best_possible_correctness = (
+                        (stage["correct"] + stage["unscored_completions"]) / stage["completed"]
+                        if stage["completed"] else None
+                    )
                     independent_failure = (
                         stage["error_rate"] is not None and stage["error_rate"] > limits.max_error_rate
-                    ) or (stage["correctness"] is not None and stage["correctness"] < limits.min_correctness)
+                    ) or (best_possible_correctness is not None
+                          and best_possible_correctness < limits.min_correctness)
                     if not independent_failure:
                         stage["status"] = "inconclusive"
                     stage["reasons"].append("Run-wide generator scheduling lag prevents timing attribution.")
@@ -817,8 +882,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                 "calibration": observations.get("context_calibration")})
             if accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
-            elif metrics["completed"] != metrics["attempted"] or not metrics["scored"]:
-                status, summary = "inconclusive", "Some fixtures could not be scored because inference did not complete."
+            elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
+                status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
             elif check_id == "context" and not metrics["near_limit_coverage"]:
                 status, summary = "inconclusive", "Recall fixtures passed at observed lengths; near-limit token context was not verified."
             else:
@@ -870,6 +935,19 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."
             else:
                 summary = "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified."
+        if run.pack_specs and check_id in {"capacity", "correctness"} and check_id in run.config.checks:
+            pack = _pack_results(run, target)
+            metrics["request_pack"] = pack
+            if check_id == "capacity":
+                metrics["scope"] = "Highest tested incoming rate for this request pack; repeated requests may benefit caches."
+                if not pack["coverage_complete"] or not pack["all_cases_scored"]:
+                    metrics["highest_acceptable_rate_rps"] = None
+            if pack["control_status"] == "fail" and status != "blocked":
+                status, summary = "fail", "Quiet request-pack checks failed; loaded-stage outcomes are reported separately."
+            elif pack["control_status"] != "pass" and status == "pass":
+                status, summary = "inconclusive", "Quiet request-pack coverage is incomplete or includes unscored cases."
+            elif check_id == "correctness" and status == "pass":
+                summary = "Every request-pack case completed its quiet scored check."
         if status == "fail" and check_id in {"capacity", "fairness", "cancellation", "recovery"}:
             answer_failures = _answer_failures(records, warm)
             if check_id == "recovery" and metrics["accuracy"] is not None and metrics["accuracy"] >= limits.min_correctness:
@@ -918,6 +996,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
+    config = config.model_copy(deep=True)
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     fixtures = builtin_fixtures(config)
@@ -940,12 +1019,39 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         run.reason = "cancelled by user"
+        run.stop.set()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         monitor.cancel()
         await asyncio.gather(monitor, return_exceptions=True)
+    inference_duration = time.monotonic() - run.start
+    judging_summary = None
+    if any(spec.scorer == "judge" for spec in run.pack_specs) and not run.stop.is_set():
+        from .judging import judge_records
+        from .traffic import finalize_stage
+
+        # Evaluation is outside every target's lifetime, telemetry task and
+        # generator monitor. Inference budgets do not shorten this phase.
+        evaluation = asyncio.create_task(judge_records(
+            config, run.records, run.pack_specs, stop_event=run.stop,
+            progress=lambda event: run.emit(**event, phase="judging"),
+        ))
+        try:
+            judging_summary = await asyncio.shield(evaluation)
+        except asyncio.CancelledError:
+            # Let the evaluator close its own workers and preserve partial votes.
+            run.stop.set()
+            judging_summary = await evaluation
+        if run.stop.is_set():
+            run.reason = "cancelled by user"
+        limits = _check_config(config, "capacity").limits
+        for target in config.targets:
+            if run.stage_evidence[target.name]:
+                run.observations[target.name]["capacity"] = [
+                    finalize_stage(evidence, limits) for evidence in run.stage_evidence[target.name]
+                ]
     checks = [check for target in config.targets for check in _checks(run, target)]
     counts = defaultdict(dict)
     for target in config.targets:
@@ -959,8 +1065,12 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         warnings.append("Generator scheduling lag was observed; affected timing checks are inconclusive.")
     if run.budget_used >= config.max_requests:
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
+    if run.pack_specs:
+        warnings.append("Repeated, warmed workload: quiet controls and traffic repeat the same requests and may benefit caches.")
     observations = {"targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
                     "request_budget_used": run.budget_used,
+                    "inference_duration_seconds": inference_duration,
+                    **({"judging": judging_summary} if judging_summary is not None else {}),
                     "replica_coverage": [{"target": t.name, "route": t.route, "parent": t.parent,
                         "configured_url_tested": any(r.target == t.name for r in run.records),
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
@@ -971,6 +1081,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
     manifest = {"config": config_values,
+                **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in config.checks else "not selected"
                                        for key in CHECK_NAMES if key not in CORE_CHECKS},
                 "effective_checks": {name: config.effective_check(name) for name in config.checks},
@@ -978,7 +1089,8 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                                       if "capacity" in config.checks else None),
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
                                  "custom_sha256": custom_hash,
-                                 "builtin_sha256": fixture_hash({k: [s.model_dump() for s in v] for k,v in fixtures.items()}),
+                                 "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"capacity", "correctness"}
+                                                    else fixture_hash({k: [s.model_dump() for s in v] for k,v in fixtures.items()})),
                                  "workload_fixture_sha256": fixture_hash({
                                      "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
                                      "settings": workload_settings})},

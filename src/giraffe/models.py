@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, model_serializer, model_validator
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -303,7 +305,222 @@ for _check in CHECK_NAMES.keys() - CHECK_OPTION_FIELDS.keys():
     CHECK_LIMIT_FIELDS[_check] = set()
 
 
+JUDGE_PROMPT_VERSION = "reference-correctness-v1"
+JUDGE_VOTING_RULE = "complete-panel-strict-majority-v1"
+
+MAX_REQUEST_PACK_BYTES = 1024 * 1024
+MAX_REQUEST_PACK_CASES = 1000
+_RESERVED_PACK_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
+_CREDENTIAL_OPTION = re.compile(
+    r"(?i)(api[ _-]?key|authorization|password|passwd|credential|secret|access[ _-]?token|bearer|cookie)"
+)
+
+
+def validate_pack_options(options: dict[str, Any]) -> None:
+    """Reject credential fields; leave request text and response schemas untouched."""
+    if _RESERVED_PACK_OPTIONS.intersection(options):
+        raise ValueError("options cannot override model/messages/stream/token budget/n")
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if _CREDENTIAL_OPTION.search(key) or key.lower() in {
+                    "token", "tokens", "headers", "env", "environment"
+                }:
+                    raise ValueError("credential-bearing request options are not allowed")
+                # Field names inside output schemas describe answers, not credentials.
+                if key != "schema":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(options)
+
+
+def validated_json_schema(schema: dict[str, Any], expected: Any = None, *,
+                          expected_provided: bool = False):
+    """Build the shared local-only validator, optionally checking an explicit assertion."""
+    from jsonschema import SchemaError, ValidationError
+    from jsonschema.validators import validator_for
+    from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
+    from referencing.exceptions import CannotDetermineSpecification, Unresolvable
+
+    try:
+        validator = validator_for(schema)
+        validator.check_schema(schema)
+        resource = Resource.from_contents(schema, default_specification=DRAFT202012)
+        registry = Registry().with_resource("urn:giraffe:request-pack", resource)
+
+        def check(resource, resolver):
+            if isinstance(resource.contents, dict):
+                for key in ("$ref", "$dynamicRef", "$recursiveRef"):
+                    if key in resource.contents:
+                        reference = resource.contents[key]
+                        if not isinstance(reference, str) or not reference.startswith("#"):
+                            raise ValueError("references must be local")
+                        resolver.lookup(reference)
+            for child in resource.subresources():
+                check(child, resolver.in_subresource(child))
+
+        check(resource, registry.resolver("urn:giraffe:request-pack"))
+        checked = validator(schema, registry=registry)
+        if expected_provided:
+            checked.validate(expected)
+        return checked
+    except (SchemaError, ValidationError, Unresolvable, CannotDetermineSpecification,
+            ValueError, TypeError, RecursionError) as error:
+        # jsonschema and referencing errors can embed an entire private schema/answer.
+        raise ValueError("invalid JSON schema, expected value, or local reference; no downloads") from error
+
+
+class RequestPackMessage(Model):
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def nonempty_text(self):
+        if not self.content.strip():
+            raise ValueError("message content must contain text")
+        return self
+
+
+class RequestPackCase(Model):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True,
+                              serialize_by_alias=True)
+    fixture_id: str = Field(min_length=1)
+    messages: list[RequestPackMessage] = Field(min_length=1)
+    weight: float = Field(default=1, gt=0)
+    scorer: Literal["none", "exact", "contains", "json", "judge"]
+    expected: Any = None
+    rubric: str | None = None
+    schema_: dict[str, Any] | None = Field(default=None, alias="schema")
+    max_tokens: int | None = Field(default=None, ge=1)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize_case(self, handler):
+        value = handler(self)
+        if "expected" not in self.model_fields_set:
+            value.pop("expected", None)
+        elif self.expected is None:
+            # Null is an assertion; ordinary default exclusion must not erase it.
+            value["expected"] = None
+        return value
+
+    @model_validator(mode="after")
+    def validate_case(self):
+        if not self.fixture_id.strip():
+            raise ValueError("fixture_id must contain text")
+        if self.scorer in {"exact", "contains", "judge"} and (
+            not isinstance(self.expected, str) or not self.expected.strip()
+        ):
+            raise ValueError("exact/contains/judge requires a non-empty expected answer")
+        if self.scorer == "json":
+            if self.schema_ is None:
+                raise ValueError("json scorer requires a schema")
+            validated_json_schema(self.schema_, self.expected,
+                                  expected_provided="expected" in self.model_fields_set)
+        elif self.schema_ is not None:
+            raise ValueError("schema is only supported for the json scorer")
+        if self.scorer == "none" and self.expected is not None:
+            raise ValueError("unscored cases cannot have an expected answer")
+        if self.rubric is not None:
+            if self.scorer != "judge" or not self.rubric.strip():
+                raise ValueError("rubric requires a judge scorer and non-empty text")
+        validate_pack_options(self.options)
+        return self
+
+
+class RequestPack(Model):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+    version: Literal[1]
+    cases: list[RequestPackCase] = Field(min_length=1, max_length=MAX_REQUEST_PACK_CASES)
+
+    @model_validator(mode="after")
+    def validate_pack(self):
+        ids = [case.fixture_id for case in self.cases]
+        if len(ids) != len(set(ids)):
+            raise ValueError("request pack case fixture_id values must be unique")
+        try:
+            encoded = json.dumps(self.model_dump(by_alias=True, exclude_defaults=True),
+                                 ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, UnicodeError) as error:
+            raise ValueError("request pack must contain finite JSON values") from error
+        if len(encoded) > MAX_REQUEST_PACK_BYTES:
+            raise ValueError("request pack exceeds 1 MiB")
+        return self
+
+
+class JudgeEndpoint(Model):
+    """Shared endpoint draft; execution additionally requires all identity fields."""
+
+    name: str = ""
+    url: str = ""
+    model: str = ""
+    api_key_env: str | None = None
+    headers_env: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_endpoint(self):
+        from urllib.parse import urlsplit
+
+        if self.url:
+            parsed = urlsplit(self.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(
+                (parsed.username, parsed.password, parsed.query, parsed.fragment)
+            ):
+                raise ValueError("judge url must be an http(s) endpoint without credentials/query/fragment")
+        references = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) for value in references):
+            raise ValueError("judge credentials must name environment variables")
+        return self
+
+
+class JudgingConfig(Model):
+    judges: list[JudgeEndpoint] = Field(default_factory=list, max_length=8)
+    concurrency: int = Field(default=2, ge=1, le=256)
+    request_timeout_seconds: float = Field(default=30, gt=0)
+    max_duration_seconds: float = Field(default=300, gt=0)
+    max_output_tokens: int = Field(default=256, ge=1)
+    ca_bundle: str | None = None
+    proxy: str | None = None
+
+    @model_validator(mode="after")
+    def validate_judging(self):
+        from urllib.parse import urlsplit
+
+        names = [judge.name for judge in self.judges if judge.name]
+        if len(names) != len(set(names)):
+            raise ValueError("judge names must be unique")
+        if self.proxy:
+            parsed = urlsplit(self.proxy)
+            if parsed.scheme not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname or any(
+                (parsed.username, parsed.password, parsed.query, parsed.fragment)
+            ):
+                raise ValueError("judge proxy must be a proxy URL without credentials/query/fragment")
+        return self
+
+
+class JudgeVote(Model):
+    judge: str
+    url: str
+    model: str
+    verdict: StrictBool | None = None
+    status: Literal["completed", "error"]
+    error_category: str | None = None
+    reason: str | None = None
+    observed_model: str | None = None
+
+
+class RequestJudgement(Model):
+    status: Literal["pass", "fail", "inconclusive"]
+    votes: list[JudgeVote] = Field(default_factory=list)
+
+
 class RunConfig(Model):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
     targets: list[Target] = Field(min_length=1)
     concurrency: int = Field(default=4, ge=1, le=256)
     max_requests: int = Field(default=160, ge=1)
@@ -334,6 +551,9 @@ class RunConfig(Model):
     stream: bool = True
     request_options: dict[str, Any] = Field(default_factory=dict)
     custom_fixtures: str | None = None
+    request_source: Literal["builtin", "request_pack"] = "builtin"
+    request_pack: RequestPack | None = None
+    judging: JudgingConfig = Field(default_factory=JudgingConfig)
     retention: Literal["all", "failures", "none"] = "failures"
     ca_bundle: str | None = None
     proxy: str | None = None
@@ -344,6 +564,11 @@ class RunConfig(Model):
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
+        if self.request_source == "request_pack":
+            self.validate_request_pack_presence()
+            if self.custom_fixtures:
+                raise ValueError("request_pack cannot be combined with custom_fixtures")
+            validate_pack_options(self.request_options)
         if "checks" not in self.model_fields_set:
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
@@ -354,6 +579,7 @@ class RunConfig(Model):
                     self.checks.append(check)
             if self.buckets:
                 self.checks.append("mixed")
+        self.validate_active_judges()
         self.checks = list(dict.fromkeys(self.checks))
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
         self.tool_calling = "tools" in self.checks
@@ -427,8 +653,23 @@ class RunConfig(Model):
         if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
             raise ValueError("bucket output budgets must stay within max_output_tokens")
         from giraffe.deployment import sanitize
-        self.request_options = sanitize(self.request_options)
+        if self.request_source != "request_pack":
+            self.request_options = sanitize(self.request_options)
         return self
+
+    def validate_request_pack_presence(self) -> None:
+        if self.request_pack is None:
+            raise ValueError("request_pack is required for the selected request source")
+
+    def validate_active_judges(self) -> None:
+        if (self.request_source == "request_pack" and self.request_pack
+                and {"capacity", "correctness"}.intersection(self.checks)
+                and any(case.scorer == "judge" for case in self.request_pack.cases)):
+            if not self.judging.judges or any(
+                not all(value.strip() for value in (judge.name, judge.url, judge.model))
+                for judge in self.judging.judges
+            ):
+                raise ValueError("judge scoring requires at least one judge with a name, URL and model")
 
     def effective_check(self, check_id: str) -> dict[str, Any]:
         """Resolve sparse overrides once, retaining global safety ceilings."""
@@ -473,13 +714,24 @@ class ConfigDraft(RunConfig):
     checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS))
 
 
+    def validate_request_pack_presence(self) -> None:
+        # Selecting an empty dataset is a valid editing state, never a runnable one.
+        pass
+
+    def validate_active_judges(self) -> None:
+        # Preview/export retain incomplete judge endpoint drafts without inference.
+        pass
+
+
 class RequestSpec(Model):
     fixture_id: str
     scenario: str
     check_ids: list[str]
     messages: list[dict[str, Any]]
-    scorer: Literal["none", "exact", "contains", "json", "tool"] = "none"
+    scorer: Literal["none", "exact", "contains", "json", "tool", "judge"] = "none"
     expected: Any = None
+    expected_provided: bool = False
+    rubric: str | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
     max_tokens: int | None = Field(default=None, ge=1)
     stream: bool = True
@@ -489,6 +741,17 @@ class RequestSpec(Model):
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
     workload: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationEvidence(Model):
+    """The actual input and answer check used for one request; never credentials."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, populate_by_name=True, serialize_by_alias=True)
+    messages: list[dict[str, Any]]
+    scorer: str
+    expected: Any = None
+    expected_provided: bool = False
+    rubric: str | None = None
+    schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
 
 class RequestRecord(Model):
@@ -519,6 +782,9 @@ class RequestRecord(Model):
     valid: bool = False
     score: bool | None = None
     score_message: str | None = None
+    evaluation: EvaluationEvidence | None = None
+    evaluation_error: str | None = None
+    judgement: RequestJudgement | None = None
     observed_model: str | None = None
     backend_id: str | None = None
     input_chars: int = 0

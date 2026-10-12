@@ -226,7 +226,7 @@ def test_workload_timing_uses_core_generator_qualification(lag, warm_first, corr
             for index in range(2)
         ],
     ]
-    run = SimpleNamespace(config=settings, records=records, max_lag_ms=lag,
+    run = SimpleNamespace(config=settings, records=records, max_lag_ms=lag, pack_specs=[],
                           observations={"local": {"restart": None}},
                           unfinished={"local": set()})
     outcome = _checks(run, settings.targets[0])

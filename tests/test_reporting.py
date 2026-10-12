@@ -377,3 +377,81 @@ def test_unselected_traffic_configuration_does_not_invalidate_other_checks():
     current.manifest["config"]["traffic"]["rates"] = [1, 20]
     current.manifest["effective_traffic"]["rates"] = [1, 20]
     assert baseline_check(compare_baseline(current, previous)).status == "pass"
+
+
+def test_pack_html_separates_rates_and_qualifies_quiet_failure():
+    from giraffe.models import CheckResult
+    from giraffe.reporting import _traffic_table
+
+    check = CheckResult(id="capacity", target="local", title="Capacity", status="fail",
+                        summary="Quiet failed", metrics={
+        "request_pack": {"control_status": "fail", "all_cases_scored": False},
+        "traffic_stages": [{"rate_rps": 10, "status": "pass", "goodput_rps": 3,
+                            "valid_throughput_rps": 8}],
+    })
+    content = _traffic_table(check)
+    assert "Valid throughput" in content and "8 requests/s" in content
+    assert "Scored-subset correct goodput" in content and "3 requests/s" in content
+    assert "Loaded result: pass; quiet failed" in content
+    assert 'class="badge pass"' not in content
+
+
+@pytest.mark.parametrize("policy,score,retained", [
+    ("all", True, True), ("failures", False, True),
+    ("failures", True, False), ("none", False, False),
+])
+def test_judge_rationale_follows_answer_retention_without_losing_votes(tmp_path, policy, score, retained):
+    report = make_report(count=1)
+    report.manifest["config"]["retention"] = policy
+    vote = {"judge": "reviewer", "url": "http://localhost:9000/v1", "model": "judge-model",
+            "verdict": score, "status": "completed", "reason": "<script>private rationale</script>"}
+    report.requests[0] = RequestRecord.model_validate({
+        **report.requests[0].model_dump(), "score": score,
+        "judgement": {"status": "pass" if score else "fail", "votes": [vote]},
+    })
+    original = report.model_copy(deep=True)
+    json_path, html_path = write_report(report, tmp_path)
+    saved = json.loads(json_path.read_text())["requests"][0]
+    assert saved["judgement"]["votes"][0]["verdict"] == score
+    assert bool(saved["judgement"]["votes"][0]["reason"]) == retained
+    content = html_path.read_text()
+    assert "AI judge verdicts" in content
+    assert "<script>private rationale</script>" not in content
+    assert ("&lt;script&gt;private rationale&lt;/script&gt;" in content) == retained
+    assert report == original
+
+
+@pytest.mark.parametrize("policy", ["all", "failures", "none"])
+def test_evaluation_context_and_schema_error_survive_report_retention(policy, tmp_path):
+    from giraffe.models import EvaluationEvidence
+
+    report = make_report()
+    report.manifest["config"]["retention"] = policy
+    record = report.requests[0]
+    record.score = None
+    record.evaluation_error = "schema_recursion"
+    record.evaluation = EvaluationEvidence(messages=[{"role": "user", "content": "<question>"}],
+                                            scorer="json", expected=None, expected_provided=True,
+                                            schema={"$ref": "#"}, rubric="No <invention>")
+    json_path, html_path = write_report(report, tmp_path)
+    saved = RunReport.model_validate_json(json_path.read_text()).requests[0]
+    assert saved.evaluation.messages == record.evaluation.messages
+    assert saved.evaluation.schema_ == {"$ref": "#"}
+    assert saved.evaluation.expected_provided and saved.evaluation.expected is None
+    assert saved.evaluation_error == "schema_recursion"
+    assert bool(saved.output) is (policy != "none")
+    html = html_path.read_text()
+    for text in ("Input messages", "Expected answer", "Answer check", "JSON schema", "&lt;question&gt;", "No &lt;invention&gt;"):
+        assert text in html
+    assert "<question>" not in html
+
+
+@pytest.mark.parametrize("side", ["current", "baseline"])
+def test_schema_evaluation_error_cannot_produce_passing_comparison(side):
+    current, baseline = make_report(), make_report("baseline")
+    affected = current if side == "current" else baseline
+    affected.requests[0].score = None
+    affected.requests[0].evaluation_error = "schema_recursion"
+    result = compare_baseline(current, baseline)
+    assert result.baseline["status"] == "inconclusive"
+    assert "answer evaluation failed" in str(result.baseline)

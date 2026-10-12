@@ -15,7 +15,7 @@ import yaml
 from pydantic import ValidationError
 
 from giraffe import __version__
-from giraffe.models import CHECK_NAMES, RunConfig, RunReport
+from giraffe.models import CHECK_NAMES, ConfigDraft, RunConfig, RunReport
 
 
 class UsageError(ValueError):
@@ -37,6 +37,19 @@ def parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate", help="Validate and normalize a configuration without traffic")
     validate.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
     validate.add_argument("--output-format", choices=["text", "json"], default="text")
+    preview = commands.add_parser("preview", help="Preview a draft configuration as JSON without traffic")
+    preview.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
+    importer = commands.add_parser("import-dataset", help="Preview CSV or JSON dataset import as JSON without traffic")
+    importer.add_argument("--file", required=True, type=Path)
+    importer.add_argument("--input-field")
+    importer.add_argument("--expected-field")
+    importer.add_argument("--scorer", choices=["judge", "exact"], default="judge")
+    trial = commands.add_parser("try-example", help="Run one dataset example against one target")
+    trial.add_argument("--config", required=True, type=Path)
+    trial.add_argument("--case", required=True, dest="fixture_id")
+    trial.add_argument("--target", required=True, dest="target_name")
+    trial.add_argument("--output", type=Path)
+    trial.add_argument("--output-format", choices=["text", "json"], default="text")
     web = commands.add_parser("ui", help="Open the local web interface")
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--runs-dir", type=Path, default=Path("runs"))
@@ -70,6 +83,8 @@ def parser() -> argparse.ArgumentParser:
         run.add_argument("--nonstream", action="store_false", default=None, dest="stream")
         run.add_argument("--overlap-models", action="store_true", default=None)
         run.add_argument("--fixtures", dest="custom_fixtures", help="Optional custom fixture JSON")
+        run.add_argument("--request-pack", dest="request_pack_file", metavar="PATH",
+                         help="Import local request-pack JSON into the portable configuration")
         run.add_argument("--retention", choices=["all", "failures", "none"])
         run.add_argument("--ca-bundle")
         run.add_argument("--proxy")
@@ -145,6 +160,17 @@ def configuration(args: argparse.Namespace) -> RunConfig:
         if value is not None:
             limits[name] = value
     values["limits"] = limits
+    if args.request_pack_file is not None:
+        if values.get("request_pack") is not None:
+            raise ValueError("Do not combine an inline request_pack with --request-pack")
+        if values.get("custom_fixtures"):
+            raise ValueError("request_pack cannot be combined with custom_fixtures")
+        if "://" in args.request_pack_file:
+            raise ValueError("--request-pack requires a local JSON file path")
+        from giraffe.request_pack import load_request_pack
+
+        values["request_pack"] = load_request_pack(args.request_pack_file).model_dump(mode="json")
+        values["request_source"] = "request_pack"
     if args.command == "cold-start":
         values["restart_target"] = args.restart
     if getattr(args, "deployment_file", None):
@@ -190,7 +216,7 @@ async def _run(config: RunConfig) -> RunReport:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    json_output = any(value == "--output-format=json" or (
+    json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or any(value == "--output-format=json" or (
         value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "json"
     ) for index, value in enumerate(arguments))
     kind = arguments[0] if arguments else "usage"
@@ -224,6 +250,21 @@ def main(argv: list[str] | None = None) -> int:
                 print("Configuration is valid. No traffic was sent.")
                 print(config.model_dump_json(indent=2))
             return 0
+        if args.command == "preview":
+            from giraffe.request_pack import pack_preview
+
+            config = ConfigDraft.model_validate(load_configuration(args.config))
+            print(json.dumps({"config": config.model_dump(mode="json"),
+                              "request_pack_preview": pack_preview(config)}, allow_nan=False))
+            return 0
+        if args.command == "import-dataset":
+            from giraffe.dataset_import import preview_dataset, read_dataset
+
+            result = preview_dataset(read_dataset(args.file), args.file.suffix.lower().lstrip("."),
+                                     input_field=args.input_field, expected_field=args.expected_field,
+                                     scorer=args.scorer)
+            print(json.dumps(result, allow_nan=False))
+            return 2 if result["errors"] else 0
         if args.command == "ui":
             if not 1 <= args.port <= 65535:
                 raise ValueError("Port must be between 1 and 65535")
@@ -262,8 +303,15 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"Saved baseline {report.run_id} ({report.overall}): {args.destination.resolve()}")
             return 0
-        config = configuration(args)
-        baseline = load_report(args.baseline) if args.baseline else None
+        if args.command == "try-example":
+            from giraffe.dataset_import import try_example_config
+
+            config = try_example_config(ConfigDraft.model_validate(load_configuration(args.config)),
+                                        args.fixture_id, args.target_name)
+            baseline = None
+        else:
+            config = configuration(args)
+            baseline = load_report(args.baseline) if args.baseline else None
         directory = args.output or Path("runs") / datetime.now(timezone.utc).strftime(
             "%Y%m%dT%H%M%S.%fZ"
         )

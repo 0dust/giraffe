@@ -14,11 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import SchemaError, ValidationError
-from jsonschema.validators import validator_for
 from pydantic import ValidationError as ModelValidationError
 from referencing.exceptions import Unresolvable
 
-from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig
+from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig, EvaluationEvidence, validated_json_schema
 
 FIXTURE_VERSION = "0.2.0"
 SUITE_VERSION = "0.2.0"
@@ -241,23 +240,6 @@ def _normalized(text: str) -> str:
     return " ".join(text.split())
 
 
-def _check_schema(schema: dict[str, Any]) -> None:
-    def check_references(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"$ref", "$dynamicRef"} and (
-                    not isinstance(child, str) or not child.startswith("#")
-                ):
-                    raise ValueError("JSON schema references must be local fragments; no downloads")
-                check_references(child)
-        elif isinstance(value, list):
-            for child in value:
-                check_references(child)
-
-    check_references(schema)
-    validator_for(schema).check_schema(schema)
-
-
 def _json_answer(output: str, *, allow_fence: bool = True) -> Any:
     answer = output.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n\s*```", answer, re.DOTALL | re.IGNORECASE)
@@ -286,12 +268,19 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     used by built-ins. JSON permits one complete markdown fence, but not prose
     surrounding an object. Reasoning content never substitutes for the answer.
     """
+    record = record.model_copy(update={"evaluation": EvaluationEvidence(
+        messages=spec.messages, scorer=spec.scorer, expected=spec.expected,
+        expected_provided=spec.expected_provided or spec.expected is not None,
+        rubric=spec.rubric, schema=spec.schema_,
+    ).model_copy(deep=True)})
     if spec.scorer == "none":
         return record.model_copy(update={"score": None, "score_message": "No semantic scorer."})
     if record.status != "completed" or not record.valid:
         return record.model_copy(update={
             "score": None, "score_message": "Answer not scored: request did not complete validly.",
         })
+    if spec.scorer == "judge":
+        return record.model_copy(update={"score": None, "score_message": "AI judgment pending."})
     if spec.scorer == "tool":
         calls = record.tool_calls
         message = "Parsed tool call matches the fixture."
@@ -327,15 +316,20 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         try:
             if spec.schema_ is None:
                 raise ValueError("JSON scorer requires a schema")
-            _check_schema(spec.schema_)
+            validator = validated_json_schema(spec.schema_)
             value = _json_answer(record.output)
-            validator_for(spec.schema_)(spec.schema_).validate(value)
-            if spec.expected is not None and json.dumps(value, sort_keys=True) != json.dumps(
+            validator.validate(value)
+            if (spec.expected_provided or spec.expected is not None) and json.dumps(value, sort_keys=True) != json.dumps(
                 spec.expected, sort_keys=True
             ):
                 score, message = False, "JSON is valid but differs from the expected answer."
             else:
                 score, message = True, "JSON matches the required schema and expected values."
+        except RecursionError:
+            return record.model_copy(update={
+                "score": None, "evaluation_error": "schema_recursion",
+                "score_message": "Answer not scored: JSON schema evaluation exceeded the recursion limit. Review the schema; this is not an incorrect-answer verdict.",
+            })
         except (ValueError, TypeError, SchemaError, ValidationError, Unresolvable) as error:
             score = False
             # Do not include raw answers in scoring messages; retention is handled elsewhere.
@@ -372,6 +366,8 @@ def load_custom_fixtures(path: str) -> list[RequestSpec]:
                 raise ValueError("each fixture must be an object")
             if "scorer" not in entry:
                 raise ValueError("scorer is required (exact, contains, json or none)")
+            if entry["scorer"] == "judge":
+                raise ValueError("judge scoring requires a request pack and configured AI judges")
             values = {"scenario": "custom", "check_ids": ["correctness"], **entry}
             spec = RequestSpec.model_validate(values)
             if not spec.fixture_id.strip() or spec.fixture_id in ids:
@@ -396,7 +392,7 @@ def load_custom_fixtures(path: str) -> list[RequestSpec]:
             if spec.scorer == "json" and spec.schema_ is None:
                 raise ValueError("json scorer requires a schema")
             if spec.schema_ is not None:
-                _check_schema(spec.schema_)
+                validated_json_schema(spec.schema_)
             spec.input_chars = sum(len(message["content"]) for message in spec.messages)
             ids.add(spec.fixture_id)
             fixtures.append(spec)

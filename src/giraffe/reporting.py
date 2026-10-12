@@ -63,11 +63,62 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
     if baseline.abort_reason:
         reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
+    for label, run in (("Current", report), ("Baseline", baseline)):
+        if any(record.evaluation_error for record in run.requests):
+            reasons.append(f"{label} answer evaluation failed; correctness and capacity cannot be compared.")
     current_config = report.manifest.get("config", {})
     old_config = baseline.manifest.get("config", {})
+    pack_modes = [config.get("request_source") == "request_pack"
+                  and bool({"capacity", "correctness"}.intersection(config.get("checks", [])))
+                  for config in (current_config, old_config)]
+    if any(pack_modes):
+        identities = [run.manifest.get("request_pack") for run in (report, baseline)]
+        if not all(pack_modes):
+            reasons.append("The effective request source differs.")
+        elif not all(isinstance(value, dict) and value.get("sha256") for value in identities):
+            reasons.append("Request pack identity is missing; comparability is unknown.")
+        elif identities[0] != identities[1]:
+            reasons.append("Request pack identity differs.")
+        for label, run, config, active in zip(
+            ("Current", "Baseline"), (report, baseline), (current_config, old_config), pack_modes
+        ):
+            if not active:
+                continue
+            judged_ids = {f"pack:{case['fixture_id']}"
+                          for case in (config.get("request_pack") or {}).get("cases", [])
+                          if case.get("scorer") == "judge"}
+            if any(record.fixture_id in judged_ids and record.status == "completed"
+                   and record.valid and record.score is None for record in run.requests):
+                reasons.append(f"{label} AI judge results are incomplete; "
+                               "correctness and capacity cannot be compared.")
+
+    def effective_value(manifest, key):
+        value = manifest.get(key)
+        if key == "effective_traffic" and all(pack_modes) and isinstance(value, dict):
+            return {name: setting for name, setting in value.items()
+                    if name not in {"mix", "long_input_chars", "long_output_words"}}
+        if key == "effective_checks" and all(pack_modes) and isinstance(value, dict):
+            correctness = value.get("correctness")
+            if isinstance(correctness, dict):
+                # A pack always uses one serial quiet pass. Capacity, when
+                # selected, also owns the payload used by that shared pass.
+                shared = "capacity" in manifest.get("config", {}).get("checks", [])
+                inactive = {"samples", "concurrency"}
+                if shared:
+                    inactive.update({"max_output_tokens", "request_timeout_seconds",
+                                     "stream", "request_options"})
+                correctness = {name: setting for name, setting in correctness.items()
+                               if name not in inactive}
+                return {**value, "correctness": correctness}
+        return value
+
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    inactive_pack_globals = ({"context_limit", "samples", "sustained_seconds"}
+                             if all(pack_modes) and selected <= {"capacity", "correctness"} else set())
     workload_fields = [key for key, checks in WORKLOAD_CHECKS.items() if checks & selected]
     for key in (*_MATCH_CONFIG, *workload_fields):
+        if key in inactive_pack_globals:
+            continue
         if key not in old_config or key not in current_config:
             reasons.append(f"Recorded {key} is missing; comparability is unknown.")
         elif old_config[key] != current_config[key]:
@@ -87,7 +138,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         if key == "effective_traffic" and not traffic_selected:
             continue
         if key in report.manifest or key in baseline.manifest:
-            if report.manifest.get(key) != baseline.manifest.get(key):
+            if effective_value(report.manifest, key) != effective_value(baseline.manifest, key):
                 reasons.append(f"Recorded {key} differs or is missing.")
     # The suite version identifies bundled fixtures; custom packs also need a content identity.
     current_pack = report.manifest.get("fixture_pack")
@@ -223,12 +274,28 @@ def _compare_traffic(
         "method": "Matched planned arrival cohorts and acceptance criteria. Stage acceptance "
                   "changes are observed qualification results, not statistical capacity estimates.",
     }
+    for label, metrics in (("current", current), ("baseline", old)):
+        pack = (metrics or {}).get("request_pack")
+        if pack and pack.get("control_status") != "pass":
+            # The source check retains its independently measured loaded rate.
+            result[f"{label}_highest_acceptable_rate_rps"] = None
     if reasons:
         result["reason"] = "Traffic comparison is unavailable: " + " ".join(reasons)
         return result
     if current is None or old is None:
         result["reason"] = "One run lacks arrival-stage evidence; legacy concurrency is not arrival capacity."
         return result
+    if report.manifest.get("request_pack") or baseline.manifest.get("request_pack"):
+        if any(not metrics.get("request_pack", {}).get("coverage_complete")
+               or not metrics.get("request_pack", {}).get("all_cases_scored")
+               for metrics in (current, old)):
+            result["reason"] = "Request pack comparison needs scored quiet coverage of every case in both runs."
+            return result
+        if any(metrics.get("request_pack", {}).get("control_status") != "pass"
+               for metrics in (current, old)):
+            result["reason"] = ("Request pack capacity comparison needs passing quiet controls in both runs; "
+                                "loaded results remain available in each run's capacity check.")
+            return result
     current_stages, old_stages = current["traffic_stages"], old["traffic_stages"]
     planned_rates = report.manifest.get("effective_traffic", {}).get("rates")
     if planned_rates is None:
@@ -251,6 +318,10 @@ def _compare_traffic(
             item.get("fully_offered") and not item.get("generator_limited")
             and item.get("status") in {"pass", "fail"} for item in (stage, previous)
         )
+        if report.manifest.get("request_pack"):
+            comparable = comparable and all(item.get("coverage_complete")
+                                            and item.get("all_cases_scored")
+                                            for item in (stage, previous))
         if comparable:
             row["goodput_delta_rps"] = stage["goodput_rps"] - previous["goodput_rps"]
             if previous.get("accepted") and not stage.get("accepted"):
@@ -459,12 +530,15 @@ def _retained(report: RunReport) -> RunReport:
         keep = policy == "all" or (policy == "failures" and (
             (record.status in {"failed", "timeout"} and record.scenario not in {"client_cancel", "client_deadline"})
             or (record.status == "completed" and not record.valid) or record.score is False
-            or record.id in failed_evidence
+            or record.evaluation_error is not None or record.id in failed_evidence
         ))
         if not keep:
             record.output = ""
             record.reasoning = ""
             record.tool_calls = []
+            if record.judgement:
+                for vote in record.judgement.votes:
+                    vote.reason = None
     return result
 
 
@@ -488,7 +562,53 @@ def _rps(value: float | None) -> str:
     return "not established" if value is None else f"{value:,.4g} requests/s"
 
 
+def _judgement_table(record: RequestRecord) -> str:
+    judgement = record.judgement
+    if not judgement:
+        return ""
+    votes = judgement.votes
+    yes = sum(vote.verdict is True for vote in votes)
+    no = sum(vote.verdict is False for vote in votes)
+    parts = [f'<h3>AI judge verdicts {_badge(judgement.status)}</h3>',
+             f'<p>{yes} accept · {no} reject · {len(votes) - yes - no} unavailable. '
+             'A complete panel needs a strict majority; ties and errors are inconclusive.</p>',
+             '<div class="table"><table><tr><th>Judge / model</th><th>Verdict</th><th>Reason</th></tr>']
+    for vote in votes:
+        verdict = "Accept" if vote.verdict is True else "Reject" if vote.verdict is False else "Unavailable"
+        reason = vote.reason or vote.error_category or "Reason omitted by response retention."
+        parts.append(f'<tr><td>{_e(vote.judge)}<br>{_e(vote.model)}</td>'
+                     f'<td>{verdict}</td><td>{_e(reason)}</td></tr>')
+    parts.append('</table></div>')
+    return "".join(parts)
+
+
+def _pack_table(check: CheckResult) -> str:
+    pack = check.metrics.get("request_pack")
+    if not pack:
+        return ""
+    parts = ['<h3>Request pack cases</h3><p class="muted">Repeated, warmed workload. '
+             'Quiet failures remain failures even when loaded requests pass. '
+             'Unscored cases cannot establish full-pack correct capacity.</p>',
+             '<div class="table"><table><tr><th>Case</th><th>Quiet result</th>'
+             '<th>Loaded rate</th><th>Planned / offered / started</th>'
+             '<th>Valid / scored / correct</th></tr>']
+    for case in pack.get("cases", []):
+        for stage in case.get("stages") or [{}]:
+            planned = " / ".join(_e(stage.get(key, "—")) for key in ("planned", "offered", "started"))
+            scored = " / ".join(_e(stage.get(key, "—")) for key in ("valid", "scored", "correct"))
+            parts.append(f'<tr><td>{_e(case["case_id"])}</td>'
+                         f'<td>{_badge(case.get("quiet", {}).get("status", "inconclusive"))}</td>'
+                         f'<td>{_e(_rps(stage.get("rate_rps"))) if stage else "—"}</td>'
+                         f'<td>{planned}</td><td>{scored}</td></tr>')
+    parts.append('</table></div>')
+    return "".join(parts)
+
+
 def _traffic_table(check: CheckResult) -> str:
+    pack = check.metrics.get("request_pack")
+    quiet_failed = pack and pack.get("control_status") == "fail"
+    goodput_label = ("Scored-subset correct goodput" if pack and not pack.get("all_cases_scored")
+                     else "Correct goodput" if pack else "Cohort goodput")
     parts = [f'<h3>{_e(check.target)} — arrival traffic</h3>',
              '<p class="muted">Cohort goodput counts valid, correct answers meeting every configured '
              'SLO, including bounded drain completions, divided by the arrival window. '
@@ -496,20 +616,25 @@ def _traffic_table(check: CheckResult) -> str:
              'Neither measures internal server queue time.</p>',
              '<div class="table"><table><tr><th>Offered rate / outcome</th><th>Scheduled / sent</th>'
              '<th>Sent rate</th><th>Completed / failed / timed out</th>'
-             '<th>Local / late / not offered</th><th>Cohort goodput / good fraction</th>'
+             '<th>Local / late / not offered</th>'
+             + ('<th>Valid throughput</th>' if pack else '')
+             + f'<th>{goodput_label} / good fraction</th>'
              '<th>Dispatch delay p95 ms</th><th>Service latency p95 ms</th>'
              '<th>Arrival first output / latency p95 ms</th></tr>']
     for stage in check.metrics["traffic_stages"]:
         def count(name: str) -> str:
             return _e(stage.get(name, "—"))
+        outcome = (f'Loaded result: {_e(stage.get("status", "inconclusive"))}; quiet failed'
+                   if quiet_failed else _badge(stage.get("status", "inconclusive")))
         parts.append(
-            f'<tr><td>{_e(_rps(stage.get("rate_rps")))}<br>{_badge(stage.get("status", "inconclusive"))}'
+            f'<tr><td>{_e(_rps(stage.get("rate_rps")))}<br>{outcome}'
             f'<br>{_e(" ".join(stage.get("reasons", [])))}</td>'
             f'<td>{count("scheduled")} / {count("started")}</td>'
             f'<td>{_e(_rps(stage.get("achieved_rps")))}</td>'
             f'<td>{count("completed")} / {count("failed")} / {count("timed_out")}</td>'
             f'<td>{count("dropped_local")} / {count("dropped_late")} / {count("not_offered")}</td>'
-            f'<td>{_e(_rps(stage.get("goodput_rps")))} / '
+            + (f'<td>{_e(_rps(stage.get("valid_throughput_rps")))}</td>' if pack else '')
+            + f'<td>{_e(_rps(stage.get("goodput_rps")))} / '
             f'{_number(stage["good_fraction"] * 100) if stage.get("good_fraction") is not None else "—"}%</td>'
             f'<td>{_number(stage.get("dispatch_lag_p95_ms"))}</td>'
             f'<td>{_number(stage.get("latency_p95_ms"))}</td>'
@@ -582,11 +707,17 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                                         else "highest_tested_acceptable_concurrency")
             value = _rps(highest) if arrival else str(highest) if highest is not None else "not established"
             measure = "arrival rate" if arrival else "concurrency"
-            parts.append(f'<p><strong>{_e(check.target)} — highest tested acceptable {measure}: '
+            label = f'highest tested acceptable {measure}'
+            if check.metrics.get("request_pack", {}).get("control_status") == "fail":
+                label = "highest passing loaded rate (quiet failed)"
+            parts.append(f'<p><strong>{_e(check.target)} — {label}: '
                          f'{_e(value)}</strong> {_badge(check.status)}<br>'
                          f'{_e(check.summary)} Maximum capacity is not established by this run.</p>')
             if arrival:
                 parts.append(_traffic_table(check))
+            parts.append(_pack_table(check))
+        elif check.id == "correctness" and "capacity" not in config.get("checks", []):
+            parts.append(_pack_table(check))
     missing = [f"{c.target} / {c.title}: {c.summary}" for c in report.checks
                if c.status in {"skipped", "inconclusive", "blocked"}]
     missing.extend(report.warnings)
@@ -671,6 +802,20 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'valid completion: {_e(record.valid)} · output characters: {record.output_chars}</p>')
         if record.error or record.score_message:
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
+        if record.evaluation:
+            evidence = record.evaluation
+            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages)}</pre>'
+                         f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
+            if evidence.expected_provided:
+                expected = _json(evidence.expected) if evidence.scorer == "json" else _e(evidence.expected)
+                parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
+            else:
+                parts.append('<p>No expected answer configured.</p>')
+            if evidence.rubric:
+                parts.append(f'<h3>Judge rubric</h3><pre>{_e(evidence.rubric)}</pre>')
+            if evidence.schema_ is not None:
+                parts.append(f'<h3>JSON schema</h3><pre>{_json(evidence.schema_)}</pre>')
+        parts.append(_judgement_table(record))
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_e(record.output)}</pre>')
         else:

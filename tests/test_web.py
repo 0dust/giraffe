@@ -43,6 +43,81 @@ async def successful_runner(configuration, *, progress, stop_event):
     return report(configuration)
 
 
+@pytest.mark.parametrize("checks", [[], ["capacity"], ["correctness"]])
+async def test_pack_preview_matches_cli_and_preserves_blank_model_draft(tmp_path, monkeypatch, capsys, checks):
+    import io
+    from giraffe.cli import main
+    from tests.test_cli import operator_pack
+
+    values = config(checks=["capacity"], request_source="request_pack", request_pack=operator_pack())
+    values["targets"][0]["model"] = ""
+    values["checks"] = checks
+    monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Preview sent traffic"))
+    monkeypatch.setattr("giraffe.web.load_custom_fixtures", lambda *a: pytest.fail("Preview read fixtures"))
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+        assert response.status_code == 200, response.text
+        normalized = response.json()["config"]
+        assert normalized["request_pack"] == values["request_pack"]
+        assert normalized["targets"][0]["model"] == ""
+        assert (await client.post("/api/config/draft", json=normalized)).json()["config"] == normalized
+        for endpoint in ("/api/config/cli", "/api/runs"):
+            assert (await client.post(endpoint, json={"config": normalized})).status_code == 422
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
+        assert main(["preview", "--config", "-"]) == 0
+        assert json.loads(capsys.readouterr().out) == response.json()
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+@pytest.mark.parametrize("pack", ["/private/pack.json", "https://example.com/pack.json", {
+    "version": 1, "cases": [{"fixture_id": "secret", "messages": [{"role": "user", "content": "PRIVATE_SECRET"}],
+                            "scorer": "PRIVATE_SECRET"}]}])
+async def test_pack_api_rejects_paths_and_bad_cases_without_input_echo(tmp_path, monkeypatch, pack):
+    monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Invalid pack sent traffic"))
+    monkeypatch.setattr("giraffe.web.load_custom_fixtures", lambda *a: pytest.fail("Invalid pack read fixtures"))
+    values = config() | {"request_source": "request_pack", "request_pack": pack}
+    async with browser(tmp_path) as client:
+        for endpoint in ("/api/config/preview", "/api/config/draft", "/api/config/validate", "/api/config/cli", "/api/runs"):
+            body = {"config": values} if endpoint in {"/api/config/cli", "/api/runs"} else values
+            response = await client.post(endpoint, json=body)
+            assert response.status_code == 422, response.text
+            assert "PRIVATE_SECRET" not in response.text
+            assert "request_pack" in str(response.json()["detail"][0]["loc"])
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_pack_conflicts_with_legacy_before_files_or_run_creation(tmp_path, monkeypatch):
+    from tests.test_cli import operator_pack
+
+    monkeypatch.setattr("giraffe.web.load_custom_fixtures", lambda *a: pytest.fail("Read conflicting fixtures"))
+    values = config() | {"request_source": "request_pack", "request_pack": operator_pack(),
+                         "custom_fixtures": "/missing/fixtures.json"}
+    async with browser(tmp_path) as client:
+        for endpoint in ("/api/config/preview", "/api/config/cli", "/api/runs"):
+            response = await client.post(endpoint, json=values if endpoint.endswith("preview") else {"config": values})
+            assert response.status_code == 422
+            assert "cannot be combined" in response.text
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
+async def test_pack_saved_config_download_preserves_inputs_under_response_retention(tmp_path, fake_runner):
+    from tests.test_cli import operator_pack
+
+    pack = operator_pack()
+    pack["cases"][0]["messages"][0]["content"] = "api_key=literal-case-content " * 1000
+    values = config(checks=["correctness"], request_source="request_pack", request_pack=pack,
+                    retention="none")
+    async with browser(tmp_path) as client:
+        identifier = await start(client, values)
+        result = await finished(client, identifier)
+        saved = (await client.get(f"/api/runs/{identifier}/config.json")).json()
+        assert saved["request_pack"] == values["request_pack"]
+        assert result["report"]["requests"][0]["output"] == ""
+        command = await client.post("/api/config/cli", json={"config": saved})
+        assert command.status_code == 200
+        assert "api_key=literal-case-content" in command.json()["command"]
+
+
 @asynccontextmanager
 async def browser(tmp_path, **kwargs):
     app = create_app(tmp_path, **kwargs)

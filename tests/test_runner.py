@@ -984,3 +984,338 @@ async def test_selected_workload_changes_executed_fixture_identity():
         arrivals={"requests": 3, "requests_per_second": 100}))
     assert (baseline.manifest["fixture_pack"]["workload_fixture_sha256"]
             != changed.manifest["fixture_pack"]["workload_fixture_sha256"])
+
+
+def pack_config(**overrides):
+    return config(**({
+        "checks": ["capacity", "correctness"], "request_source": "request_pack",
+        "request_pack": {"version": 1, "cases": [
+            {"fixture_id": key, "messages": [{"role": "user", "content": key}],
+             "scorer": "exact", "expected": key} for key in ("alpha", "beta")
+        ]},
+        "traffic": {"rates": [40], "duration_seconds": .1},
+        "limits": Limits(latency_ms=1000, min_samples=2),
+    } | overrides))
+
+
+async def test_pack_control_is_serial_and_reused_for_correctness(client, monkeypatch):
+    observed = []
+    execute = client.execute
+
+    async def capture(self, spec, **kwargs):
+        observed.append(spec.model_dump())
+        return await execute(self, spec, **kwargs)
+
+    monkeypatch.setattr(client, "execute", capture)
+    report = await runner.run_suite(pack_config(max_output_tokens=7))
+    quiet = [r for r in report.requests if r.scenario == "pack_control"]
+    loaded = [r for r in report.requests if r.traffic_stage is not None]
+    assert len(quiet) == 2 and len(loaded) == 4
+    assert all(r.overlap == 1 for r in quiet)
+    assert all(r.requested_max_tokens == 7 for r in quiet + loaded)
+    assert check(report, "correctness").metrics["attempted"] == 2
+    assert check(report, "capacity").metrics["request_pack"]["control_status"] == "pass"
+    assert report.manifest["request_pack"]
+    assert {r.fixture_id for r in report.requests} == {"pack:alpha", "pack:beta"}
+
+
+async def test_quiet_wrong_answer_does_not_filter_pack_or_stop_load(client, monkeypatch):
+    execute = client.execute
+
+    async def quiet_wrong(self, spec, **kwargs):
+        record = await execute(self, spec, **kwargs)
+        if spec.scenario == "pack_control" and spec.fixture_id == "pack:alpha":
+            record.output = "wrong"
+        return record
+
+    monkeypatch.setattr(client, "execute", quiet_wrong)
+    report = await runner.run_suite(pack_config(stop_after_errors=1))
+    result = check(report, "capacity")
+    assert result.status == "fail"
+    assert result.metrics["traffic_stages"][0]["accepted"]
+    assert result.metrics["highest_acceptable_rate_rps"] == 40
+    assert result.metrics["request_pack"]["control_status"] == "fail"
+    assert result.metrics["traffic_stages"][0]["case_counts"]["alpha"]["correct"] == 2
+    assert report.abort_reason is None
+
+
+async def test_correctness_only_pack_uses_one_pass_and_case_coverage_floor():
+    report = await runner.run_suite(pack_config(checks=["correctness"], samples=20,
+                                               limits=Limits(min_samples=5)))
+    result = check(report, "correctness")
+    assert len(report.requests) == 2 and result.status == "pass"
+    assert not result.metrics.get("low_confidence", False)
+    assert result.metrics["request_pack"]["coverage_complete"]
+
+
+async def test_pack_quiet_budget_shortfall_prevents_capacity_claim():
+    report = await runner.run_suite(pack_config(max_requests=1))
+    result = check(report, "capacity")
+    assert result.status == "inconclusive"
+    assert result.metrics["highest_acceptable_rate_rps"] is None
+    assert not result.metrics["request_pack"]["coverage_complete"]
+
+
+@pytest.mark.parametrize("scorer", ["exact", "none"])
+async def test_rare_case_missing_loaded_evidence_blocks_full_pack_claim(scorer):
+    configured = pack_config()
+    cases = configured.request_pack.model_dump(mode="json")["cases"]
+    cases[0]["weight"], cases[1]["weight"] = 99, 1
+    cases[1]["scorer"] = scorer
+    if scorer == "none":
+        cases[1]["expected"] = None
+    configured = pack_config(request_pack={"version": 1, "cases": cases},
+                             traffic={"rates": [20], "duration_seconds": .1})
+    result = check(await runner.run_suite(configured), "capacity")
+    stage = result.metrics["traffic_stages"][0]
+    assert result.status == "inconclusive" and result.metrics["highest_acceptable_rate_rps"] is None
+    assert stage["case_counts"]["beta"]["planned"] == 0
+    assert not stage["coverage_complete"]
+    assert stage["all_cases_scored"] is (scorer != "none")
+
+
+async def test_pack_capacity_missing_stream_gap_timing_stays_inconclusive():
+    report = await runner.run_suite(pack_config(stream=False,
+        limits=Limits(latency_ms=1000, stream_gap_ms=100, min_samples=2)))
+    result = check(report, "capacity")
+    assert result.status == "inconclusive"
+    assert result.metrics["traffic_stages"][0]["missing_timing"] == 4
+
+
+async def test_pack_config_is_frozen_before_progress_can_mutate_caller():
+    configured = pack_config()
+
+    def mutate(event):
+        if event["event"] == "run_started":
+            configured.request_pack.cases[0].expected = "mutated"
+            configured.request_pack.cases[0].messages[0].content = "mutated"
+
+    report = await runner.run_suite(configured, progress=mutate)
+    assert report.manifest["config"]["request_pack"]["cases"][0]["expected"] == "alpha"
+    assert all(record.score for record in report.requests)
+
+
+async def test_pack_target_quotas_include_quiet_and_loaded_requests():
+    targets = [Target(name=name, model="local", url="http://localhost:1234") for name in ("one", "two")]
+    report = await runner.run_suite(pack_config(targets=targets, max_requests=8))
+    for target in ("one", "two"):
+        records = [record for record in report.requests if record.target == target]
+        assert len(records) == 4
+        assert sum(record.scenario == "pack_control" for record in records) == 2
+        stage = check(report, "capacity", target).metrics["traffic_stages"][0]
+        assert stage["started"] == stage["not_offered"] == 2
+
+
+def judged_pack_config(**overrides):
+    return pack_config(**({
+        "request_pack": {"version": 1, "cases": [
+            {"fixture_id": "reference", "messages": [{"role": "user", "content": "Refund window?"}],
+             "scorer": "judge", "expected": "Within 30 days."},
+        ]},
+        "judging": {"judges": [{"name": "reviewer", "url": "http://localhost:9999/v1", "model": "judge"}]},
+    } | overrides))
+
+
+def judge_summary(records, *, duration=0, stopped=None):
+    scored = sum(record.score is not None for record in records)
+    return {"eligible_requests": len(records), "scored_requests": scored,
+            "passed_requests": sum(record.score is True for record in records),
+            "failed_requests": sum(record.score is False for record in records),
+            "inconclusive_requests": len(records) - scored,
+            "judge_calls_total": len(records), "judge_calls_completed": scored,
+            "judge_calls_errors": 0, "ties": 0, "duration_seconds": duration, "stop_reason": stopped}
+
+
+async def test_judging_waits_for_every_target_telemetry_and_monitor(client, monkeypatch):
+    from giraffe import judging, telemetry
+
+    closed_telemetry, monitor_done = set(), asyncio.Event()
+    original_scrape, original_monitor = telemetry.scrape, runner._Run.monitor
+
+    async def scrape(run, target, phase, **kwargs):
+        result = await original_scrape(run, target, phase, **kwargs)
+        if phase == "not collected":
+            closed_telemetry.add(target.name)
+        return result
+
+    async def monitor(self, tasks):
+        try:
+            await original_monitor(self, tasks)
+        finally:
+            monitor_done.set()
+
+    snapshots = []
+
+    async def evaluate(config, records, specs, *, stop_event=None, progress=None):
+        assert set(client.closed) == closed_telemetry == {"one", "two"}
+        assert monitor_done.is_set() and client.active == 0
+        snapshots.extend((r.id, r.dispatch_ms, r.completed_ms, r.elapsed_ms) for r in records)
+        progress({"event": "judging_started", "judge_calls_total": len(records), "judge_calls_completed": 0})
+        await asyncio.sleep(.12)
+        for record in records:
+            record.score = record.scenario == "pack_control"
+        progress({"event": "judging_finished", "judge_calls_total": len(records),
+                  "judge_calls_completed": len(records)})
+        return judge_summary(records, duration=.12)
+
+    monkeypatch.setattr(telemetry, "scrape", scrape)
+    monkeypatch.setattr(runner._Run, "monitor", monitor)
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    events = []
+    targets = [Target(name=name, model="local", url="http://localhost:1234") for name in ("one", "two")]
+    report = await runner.run_suite(judged_pack_config(targets=targets, concurrency=8, overlap_models=True),
+                                    progress=events.append)
+    assert snapshots == [(r.id, r.dispatch_ms, r.completed_ms, r.elapsed_ms) for r in report.requests]
+    assert len(report.requests) == report.observations["request_budget_used"] == 10
+    assert report.observations["judging"]["duration_seconds"] == .12
+    assert report.observations["generator_max_lag_ms"] < 100
+    for target in ("one", "two"):
+        result = check(report, "capacity", target)
+        stage = result.metrics["traffic_stages"][0]
+        assert result.status == "fail" and stage["status"] == "fail"
+        assert stage["case_counts"]["reference"]["scored"] == 4
+        assert stage["case_counts"]["reference"]["correct"] == 0
+        assert stage["scored_subset_correct_goodput_rps"] == 0 < stage["valid_throughput_rps"]
+        assert check(report, "correctness", target).status == "pass"
+    kinds = [event["event"] for event in events]
+    assert max(i for i, kind in enumerate(kinds) if kind == "request_completed") < kinds.index("judging_started")
+    assert kinds[-1] == "run_finished"
+
+
+async def test_missing_judgments_do_not_become_serving_errors(monkeypatch):
+    from giraffe import judging
+
+    async def evaluate(config, records, specs, **kwargs):
+        return judge_summary(records, stopped="phase_deadline")
+
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    report = await runner.run_suite(judged_pack_config(checks=["capacity", "correctness", "serving"]))
+    assert check(report, "serving").status == "pass"
+    assert check(report, "correctness").status == "inconclusive"
+    result = check(report, "capacity")
+    assert result.status == "inconclusive" and result.metrics["highest_acceptable_rate_rps"] is None
+    assert result.metrics["traffic_stages"][0]["error_rate"] == 0
+    assert not result.metrics["traffic_stages"][0]["accepted"]
+    assert report.abort_reason is None and all(record.valid for record in report.requests)
+
+
+async def test_inference_deadline_does_not_skip_completed_answer_judging(monkeypatch):
+    from giraffe import judging
+
+    evaluated = []
+
+    async def evaluate(config, records, specs, **kwargs):
+        evaluated.extend(record for record in records if record.valid)
+        for record in evaluated:
+            record.score = True
+        return judge_summary(evaluated)
+
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    report = await runner.run_suite(judged_pack_config(max_duration_seconds=.035))
+    assert report.abort_reason == "maximum run duration reached"
+    assert evaluated and all(record.score for record in evaluated)
+    assert report.observations["judging"]["scored_requests"] == len(evaluated)
+
+
+async def test_user_stop_during_inference_skips_judging(monkeypatch):
+    from giraffe import judging
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Explicitly stopped inference must not start evaluation")
+
+    monkeypatch.setattr(judging, "judge_records", forbidden)
+    stop = asyncio.Event()
+
+    def progress(event):
+        if event["event"] == "request_completed":
+            stop.set()
+
+    report = await runner.run_suite(judged_pack_config(), stop_event=stop, progress=progress)
+    assert report.abort_reason == "cancelled by user"
+    assert "judging" not in report.observations
+    assert all(record.score is None for record in report.requests)
+
+
+@pytest.mark.parametrize("external_cancel", [False, True])
+async def test_cancelling_evaluation_preserves_partial_report(monkeypatch, external_cancel):
+    from giraffe import judging
+
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    async def evaluate(config, records, specs, *, stop_event=None, progress=None):
+        records[0].score = True
+        started.set()
+        await stop_event.wait()
+        stopped.set()
+        return judge_summary(records, stopped="cancelled")
+
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    stop = asyncio.Event()
+    task = asyncio.create_task(runner.run_suite(judged_pack_config(), stop_event=stop))
+    await asyncio.wait_for(started.wait(), 1)
+    if external_cancel:
+        task.cancel()
+    else:
+        stop.set()
+    report = await asyncio.wait_for(task, 1)
+    assert stopped.is_set() and report.abort_reason == "cancelled by user"
+    assert report.observations["judging"]["scored_requests"] == 1
+    assert report.observations["judging"]["inconclusive_requests"] == 4
+    assert check(report, "correctness").status == "pass"
+    assert not check(report, "capacity").metrics["traffic_stages"][0]["accepted"]
+
+
+@pytest.mark.parametrize("wrong_answers,expected_status", [(1, "inconclusive"), (3, "fail")])
+async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure(
+    monkeypatch, wrong_answers, expected_status,
+):
+    from giraffe import judging
+
+    original = runner._Run.monitor
+
+    async def saturated(self, tasks):
+        self.max_lag_ms = 500
+        await original(self, tasks)
+
+    async def evaluate(config, records, specs, **kwargs):
+        loaded = [record for record in records if record.traffic_stage is not None]
+        for record in records:
+            if record.scenario == "pack_control":
+                record.score = True
+        loaded[0].score = True
+        for record in loaded[1:1 + wrong_answers]:
+            record.score = False
+        return judge_summary(records)
+
+    monkeypatch.setattr(runner._Run, "monitor", saturated)
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    report = await runner.run_suite(judged_pack_config(
+        traffic={"rates": [100], "duration_seconds": .1},
+        limits=Limits(latency_ms=1, min_correctness=.8, min_samples=2),
+    ))
+    result = check(report, "capacity")
+    stage = result.metrics["traffic_stages"][0]
+    assert stage["completed"] == 10 and stage["scored"] == 1 + wrong_answers
+    assert stage["timing_violations"] and stage["generator_limited"]
+    assert stage["status"] == result.status == expected_status
+    assert result.metrics["highest_acceptable_rate_rps"] is None
+
+
+async def test_recursive_schema_does_not_abort_remaining_examples(client):
+    configured = config(checks=["correctness"], concurrency=1, limits=Limits(min_samples=2),
+                        request_source="request_pack", request_pack={"version": 1, "cases": [
+                            {"fixture_id": "a-recursive", "messages": [{"role": "user", "content": "Return JSON"}],
+                             "scorer": "json", "schema": {"$ref": "#"}},
+                            {"fixture_id": "b-valid", "messages": [{"role": "user", "content": "Say Paris"}],
+                             "scorer": "exact", "expected": "Paris"},
+                        ]})
+    report = await runner.run_suite(configured)
+    assert len(report.requests) == 2
+    first, second = sorted(report.requests, key=lambda record: record.fixture_id)
+    assert first.valid and first.output == "null" and first.score is None
+    assert first.evaluation_error == "schema_recursion"
+    assert second.score is True
+    assert first.evaluation.messages == [{"role": "user", "content": "Return JSON"}]
+    assert second.evaluation.expected == "Paris"
+    assert check(report, "correctness").status == "inconclusive"
+    assert report.abort_reason is None

@@ -486,7 +486,13 @@ def fixture_hash(value):
 def safe_config(config):
     """Persist secret reference names, never their values or arbitrary launch inputs."""
     result = dict(config)
-    result["request_options"] = sanitize(config.get("request_options", {}))
+    options = config.get("request_options", {})
+    if config.get("request_source") == "request_pack":
+        from .models import validate_pack_options
+        validate_pack_options(options)
+        result["request_options"] = options
+    else:
+        result["request_options"] = sanitize(options)
     result["targets"] = []
     for original in config.get("targets", []):
         target = dict(original)
