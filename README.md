@@ -258,16 +258,16 @@ GPU verdict. No node agents are installed.
 
 ### Use your own requests under traffic
 
-In **New run → Dataset**, choose **My dataset**. Add examples in the editor,
+In **New run → Add questions & expected answers**, choose **My questions**. Add examples in the editor,
 try the sample, or import CSV/JSON. For tabular files, select the input and expected
 answer columns, preview the mapping, then choose **Use dataset**. Invalid rows are
 shown with their row numbers; the current dataset stays unchanged until you apply
 a valid import. Canonical request-pack JSON preserves conversations and mixed checks.
 
 Edit any example's messages, expected answer and answer check. Select rows to change
-their checks together in **Answer checks**. Select correctness, capacity, or both;
-preview shows effective request settings, case allocation at each rate and budget
-gaps. **Try one** sends one selected example to one target using its effective request
+their checks together using the controls below the table. Select correctness, capacity,
+or both in **Tests & traffic**. **Advanced dataset settings → Request planning details**
+shows effective requests, case allocation at each rate and budget gaps. **Try one** sends one selected example to one target using its effective request
 settings and configured judges, without traffic stages or restart commands. Its
 optional answer-retention checkbox affects only that trial's saved report.
 
@@ -328,9 +328,9 @@ use different words. An optional `rubric` adds case-specific requirements. The
 default policy accepts paraphrases but rejects wrong facts, contradictions and
 missing essential details. See [examples/request-pack-judged.json](examples/request-pack-judged.json).
 
-In **New run → Dataset**, add or import examples with expected answers. Choose
-**AI judge** in an example's editor or apply it to selected rows under **Answer checks**,
-then open **Configure AI judges** to enter the judge endpoint and model.
+In **New run → Add questions & expected answers**, add or import examples with expected answers. Choose
+**AI evaluator** in an example's editor or apply it to selected rows,
+then choose **Configure evaluator** to enter the evaluator endpoint and model.
 For CLI/API runs, add the same settings to your run configuration:
 
 ```json

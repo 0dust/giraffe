@@ -606,7 +606,7 @@ vm.runInNewContext(source+`
 state.config=draft;state.jsonDraft=state.jsonBase='synced';
 let captured=0,rendered=0;
 captureFormDraft=()=>{captured++;};renderNew=()=>{rendered++;};
-let markup=renderJudging(draft);assert.match(markup,/AI judges/);assert.match(markup,/judge_0_model/);assert.match(markup,/Evaluation limits/);assert.match(markup,/configured judges/);
+let markup=renderJudging(draft);assert.match(markup,/AI evaluator/);assert.match(markup,/judge_0_model/);assert.match(markup,/Evaluation limits/);assert.match(markup,/configured evaluators/);
 assert.equal(renderJudging({...draft,request_source:'builtin'}),'');
 assert.equal(renderJudging({...draft,request_pack:{cases:[{scorer:'exact'}]}}),'');
 changeJudge('add');assert.equal(state.config.judging.judges.length,2);assert.equal(captured,1);assert.equal(rendered,1);
@@ -616,7 +616,7 @@ state.jsonDraft='unapplied';changeJudge('add');assert.equal(state.config.judging
 state.jsonDraft=state.jsonBase;
 state.config=structuredClone(config);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config:state.config,data:{active:true,consumers:['correctness'],cases:[],stages:[],warnings:['AI judging runs after target traffic. Messages, golden answers and generated answers are sent to every configured judge.','Other warning'],judging:{active:true,ready:false,readiness_errors:['Missing <model>'],planned_call_upper_bound:12,judge_count:1}}};
-renderRequestPreview();markup=nodes['#request-pack-preview'].innerHTML;assert.match(markup,/12 judge calls/);assert.match(markup,/upper bound/);assert.match(markup,/Missing &lt;model&gt;/);assert.doesNotMatch(markup,/AI judging runs after target traffic/);assert.match(markup,/Other warning/);assert.equal(state.requestPreview.data.warnings.length,2);
+renderRequestPreview();markup=nodes['#request-pack-preview'].innerHTML;assert.match(markup,/Missing &lt;model&gt;/);assert(!markup.includes("Missing <model>"));assert.doesNotMatch(markup,/judge calls/);assert.doesNotMatch(markup,/AI judging runs after target traffic/);assert.match(markup,/Other warning/);assert.equal(state.requestPreview.data.warnings.length,2);
 const votes=[{judge:'<judge>',model:'<model>',url:'http://judge',status:'completed',verdict:true,reason:'<script>alert(1)</script>'},{judge:'second',status:'completed',verdict:false,reason:'Wrong quantity'}];
 markup=renderJudgement({status:'inconclusive',votes});assert.match(markup,/Tie/);assert.match(markup,/Disagreement/);assert.match(markup,/&lt;script&gt;/);assert(!markup.includes('<script>'));assert.match(markup,/&lt;judge&gt;/);
 markup=renderJudgement({status:'pass',votes:[...votes,{judge:'third',status:'completed',verdict:true}]});assert.match(markup,/Disagreement/);assert.match(markup,/Passed/);
@@ -675,13 +675,22 @@ readForm=()=>({config:structuredClone(state.config),mode:'normal'});captureFormD
 renderNew=()=>{state.jsonDraft=state.jsonBase='synced';};toast=()=>{};setActive=id=>{state.active=id;};
 const pack={version:1,cases:[{fixture_id:'one',messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<answer>',weight:1}]};
 changeRequestSource('request_pack');assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);assert(!nodes['#request-pack-file'].clicked);
-let markup=renderRequestSource(state.config);assert.match(markup,/My dataset/);assert.match(markup,/Add your first example/);assert.match(markup,/Answer checks/);
+let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/Add your first question/);assert(!markup.includes('dataset-bulk-scorer'));
 const calls=[];api=async(path,options)=>{calls.push({path,body:JSON.parse(options.body)});if(path==='/api/datasets/preview')return {columns:[],preview_rows:pack.cases,request_pack:pack,errors:[],needs_mapping:false};if(path==='/api/config/draft')return {config:JSON.parse(options.body)};throw Error('Unexpected endpoint');};
 await importRequestPack({name:'examples.json',size:20,text:async()=>JSON.stringify(pack)});
 assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert(nodes['#dataset-dialog'].open);
 markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Use dataset/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
 await useImportedDataset({preventDefault(){}});assert.equal(state.config.request_pack.cases[0].fixture_id,'one');assert.equal(state.config.targets[0].model,'');assert.equal(calls[1].path,'/api/config/draft');assert(!nodes['#dataset-dialog'].open);
 const accepted=JSON.stringify(state.config);
+// Sample loading uses the same staged preview: cancelling preserves custom questions.
+const importApi=api;const sampleCalls=[];
+api=async(path,options)=>{sampleCalls.push(path);const body=JSON.parse(options.body);if(path==='/api/config/draft')return {config:body};const sample=JSON.parse(body.text);return {columns:[],preview_rows:sample.cases,request_pack:sample,errors:[],needs_mapping:false};};
+await sampleDataset();assert.equal(JSON.stringify(state.config),accepted);assert(nodes['#dataset-dialog'].open);
+assert.deepEqual(sampleCalls,['/api/datasets/preview']);assert.equal(state.datasetImport.preview.request_pack.cases[0].fixture_id,'refund-window');
+closeDatasetDialog();assert.equal(JSON.stringify(state.config),accepted);
+await sampleDataset();await useImportedDataset({preventDefault(){}});
+assert.equal(sampleCalls.at(-1),'/api/config/draft');assert.equal(state.config.request_pack.cases[0].fixture_id,'refund-window');assert(!nodes['#dataset-dialog'].open);
+state.config=JSON.parse(accepted);api=importApi;
 const invalidPreview=renderDatasetImportTable({columns:['question','answer'],preview_rows:[{question:'q',answer:'a'},null,42]});
 assert.match(invalidPreview,/Invalid row: null/);assert.match(invalidPreview,/Invalid row: 42/);
 // A slower old file read cannot replace a newer staged import.
@@ -769,10 +778,10 @@ form.elements.example_scorer.value='none';syncExampleScorer();assert(nodes['#exa
 form.elements.example_scorer.value='exact';syncExampleScorer();assert.equal(form.elements.example_expected.value,'Paris');
 form.elements.example_scorer.value='json';syncExampleScorer();form.elements.example_expected.value='null';
 form.elements.example_scorer.value='exact';syncExampleScorer();assert.equal(form.elements.example_scorer.value,'json');assert.equal(form.elements.example_expected.value,'null');assert.match(nodes['#dataset-error'].textContent,/JSON string reference/);
-let sample;importRequestPack=async(file)=>{sample=JSON.parse(await file.text());};await sampleDataset();
+let sample;importRequestPack=async(file)=>{sample=JSON.parse(await file.text());assert.equal(file.name,'sample-dataset.json');};applyDataset=()=>{throw Error('sample must wait for explicit application');};await sampleDataset();
 const exact=sample.cases.find(item=>item.scorer==='exact');assert.equal(exact.expected,'7');assert.match(exact.messages[0].content,/only the digit/);
 const record={evaluation:{messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<Paris>',expected_provided:true,rubric:'No <invention>'}};
-let html=renderEvaluationEvidence(record,{});assert.match(html,/&lt;question&gt;/);assert.match(html,/&lt;Paris&gt;/);assert.match(html,/No &lt;invention&gt;/);assert.match(html,/AI judge/);assert(!html.includes('<question>'));
+let html=renderEvaluationEvidence(record,{});assert.match(html,/&lt;question&gt;/);assert.match(html,/&lt;Paris&gt;/);assert.match(html,/No &lt;invention&gt;/);assert.match(html,/AI evaluator/);assert(!html.includes('<question>'));
 record.evaluation={messages:[],scorer:'json',expected:null,expected_provided:true,schema:{type:'null'}};
 html=renderEvaluationEvidence(record,{});assert(html.includes("<pre>null</pre>"));assert.match(html,/JSON schema/);
 const old={manifest:{config:{request_source:'request_pack',request_pack:{cases:[{fixture_id:'city',messages:[{role:'user',content:'Capital?'}],scorer:'exact',expected:'Paris'}]}}}};
@@ -782,6 +791,60 @@ assert.match(renderEvaluationEvidence({fixture_id:'missing'},old),/not saved/);
 `,context);
 '''.replace("FORM_PATH", json.dumps((static / "form-config.mjs").as_uri())).replace(
         "APP_PATH", json.dumps(str(static / "app.js")))
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+def test_dataset_readiness_and_contextual_controls():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to exercise browser setup behavior")
+    app = Path(__file__).parents[1] / "src/giraffe/static/app.js"
+    script = r"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const nodes={
+  '#form-error':{hidden:true},'#start-run':{},
+  '[data-action="add-example"]':{focus(){this.focused=true;}},
+  '.judge-configuration':{open:false},
+};
+const context={assert,nodes,structuredClone,
+  document:{querySelector:q=>nodes[q],addEventListener(){}},
+  window:{addEventListener(){}},location:{hash:'#new'}};
+const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+await vm.runInNewContext(source+`
+(async()=>{
+state.config={request_source:'request_pack',checks:['correctness','recovery'],request_pack:null};
+state.jsonDraft=state.jsonBase='synced';
+syncTestControls=()=>{};updateBounds=()=>{};renderRequestPreview=()=>{};
+// Missing questions and evaluator setup are caught before any HTTP request.
+let calls=0;api=async()=>{calls++;throw Error('should not send');};
+validateRunForm=()=>true;readForm=()=>({config:structuredClone(state.config)});
+await startRun({preventDefault(){},target:{}});
+assert.equal(calls,0);assert(nodes['[data-action="add-example"]'].focused);
+assert.match(nodes['#form-error'].textContent,/Add a question/);
+state.config.request_pack={cases:[{fixture_id:'one',scorer:'judge'}]};
+let additions=0;changeJudge=action=>{assert.equal(action,'add');additions++;};
+await startRun({preventDefault(){},target:{}});
+assert.equal(calls,0);assert.equal(additions,1);assert(nodes['.judge-configuration'].open);
+assert.match(nodes['#form-error'].textContent,/Set up the AI evaluator/);
+assert(!judgesReady(state.config));
+state.config.judging={judges:[{name:'evaluator',url:'http://localhost/v1',model:'m'}]};
+assert(judgesReady(state.config));state.config.judging.judges[0].model=' ';assert(!judgesReady(state.config));
+// Bulk controls are contextual; exact matches never require an AI evaluator.
+state.judgeEditorOpen=false;state.datasetSelection=[];
+let markup=renderAnswerChecks(state.config);
+assert(!markup.includes('dataset-bulk-scorer'));assert(markup.includes('Configure evaluator'));
+assert(!markup.includes('class="judge-configuration" open'));
+state.datasetSelection=['one'];markup=renderAnswerChecks(state.config);
+assert(markup.includes('dataset-bulk-scorer'));
+state.config.request_pack.cases[0].scorer='exact';markup=renderAnswerChecks(state.config);
+assert(!markup.includes('judge_count'));assert(!markup.includes('Configure evaluator'));
+})()
+`,context);
+""".replace("APP_PATH", json.dumps(str(app)))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
