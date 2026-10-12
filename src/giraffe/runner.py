@@ -1118,8 +1118,10 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
         for spec in specs:
-            if spec["cancel_after_chunks"] is None:
-                del spec["cancel_after_chunks"]
+            for field, default in (("cancel_after_chunks", None),
+                                   ("expected_provided", False), ("rubric", None)):
+                if spec[field] == default:
+                    del spec[field]
     manifest = {"config": config_values,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in config.checks else "not selected"
