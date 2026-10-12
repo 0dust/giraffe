@@ -147,3 +147,13 @@ export function changeDatasetScorer(item, scorer) {
   }
   return result;
 }
+
+export function convertExpectedAnswer(value, from, to) {
+  if (from === to || !value.trim()) return value;
+  if (to === 'json') return JSON.stringify(value);
+  let parsed;
+  try { parsed = JSON.parse(value); }
+  catch { throw new Error('Fix the JSON reference before changing the answer check.'); }
+  if (typeof parsed !== 'string') throw new Error('Use a JSON string reference before switching to a text answer check.');
+  return parsed;
+}

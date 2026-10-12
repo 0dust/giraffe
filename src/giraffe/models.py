@@ -743,6 +743,17 @@ class RequestSpec(Model):
     workload: dict[str, Any] = Field(default_factory=dict)
 
 
+class EvaluationEvidence(Model):
+    """The actual input and answer check used for one request; never credentials."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, populate_by_name=True, serialize_by_alias=True)
+    messages: list[dict[str, Any]]
+    scorer: str
+    expected: Any = None
+    expected_provided: bool = False
+    rubric: str | None = None
+    schema_: dict[str, Any] | None = Field(default=None, alias="schema")
+
+
 class RequestRecord(Model):
     id: str
     target: str
@@ -771,6 +782,8 @@ class RequestRecord(Model):
     valid: bool = False
     score: bool | None = None
     score_message: str | None = None
+    evaluation: EvaluationEvidence | None = None
+    evaluation_error: str | None = None
     judgement: RequestJudgement | None = None
     observed_model: str | None = None
     backend_id: str | None = None

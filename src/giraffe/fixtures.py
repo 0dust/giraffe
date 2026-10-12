@@ -17,7 +17,7 @@ from jsonschema import SchemaError, ValidationError
 from pydantic import ValidationError as ModelValidationError
 from referencing.exceptions import Unresolvable
 
-from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig, validated_json_schema
+from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig, EvaluationEvidence, validated_json_schema
 
 FIXTURE_VERSION = "0.2.0"
 SUITE_VERSION = "0.2.0"
@@ -268,6 +268,11 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     used by built-ins. JSON permits one complete markdown fence, but not prose
     surrounding an object. Reasoning content never substitutes for the answer.
     """
+    record = record.model_copy(update={"evaluation": EvaluationEvidence(
+        messages=spec.messages, scorer=spec.scorer, expected=spec.expected,
+        expected_provided=spec.expected_provided or spec.expected is not None,
+        rubric=spec.rubric, schema=spec.schema_,
+    ).model_copy(deep=True)})
     if spec.scorer == "none":
         return record.model_copy(update={"score": None, "score_message": "No semantic scorer."})
     if record.status != "completed" or not record.valid:
@@ -320,6 +325,11 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
                 score, message = False, "JSON is valid but differs from the expected answer."
             else:
                 score, message = True, "JSON matches the required schema and expected values."
+        except RecursionError:
+            return record.model_copy(update={
+                "score": None, "evaluation_error": "schema_recursion",
+                "score_message": "Answer not scored: JSON schema evaluation exceeded the recursion limit. Review the schema; this is not an incorrect-answer verdict.",
+            })
         except (ValueError, TypeError, SchemaError, ValidationError, Unresolvable) as error:
             score = False
             # Do not include raw answers in scoring messages; retention is handled elsewhere.

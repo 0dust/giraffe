@@ -63,6 +63,9 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
     if baseline.abort_reason:
         reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
+    for label, run in (("Current", report), ("Baseline", baseline)):
+        if any(record.evaluation_error for record in run.requests):
+            reasons.append(f"{label} answer evaluation failed; correctness and capacity cannot be compared.")
     current_config = report.manifest.get("config", {})
     old_config = baseline.manifest.get("config", {})
     pack_modes = [config.get("request_source") == "request_pack"
@@ -527,7 +530,7 @@ def _retained(report: RunReport) -> RunReport:
         keep = policy == "all" or (policy == "failures" and (
             (record.status in {"failed", "timeout"} and record.scenario not in {"client_cancel", "client_deadline"})
             or (record.status == "completed" and not record.valid) or record.score is False
-            or record.id in failed_evidence
+            or record.evaluation_error is not None or record.id in failed_evidence
         ))
         if not keep:
             record.output = ""
@@ -799,6 +802,19 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'valid completion: {_e(record.valid)} · output characters: {record.output_chars}</p>')
         if record.error or record.score_message:
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
+        if record.evaluation:
+            evidence = record.evaluation
+            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages)}</pre>'
+                         f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
+            if evidence.expected_provided:
+                expected = _json(evidence.expected) if evidence.scorer == "json" else _e(evidence.expected)
+                parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
+            else:
+                parts.append('<p>No expected answer configured.</p>')
+            if evidence.rubric:
+                parts.append(f'<h3>Judge rubric</h3><pre>{_e(evidence.rubric)}</pre>')
+            if evidence.schema_ is not None:
+                parts.append(f'<h3>JSON schema</h3><pre>{_json(evidence.schema_)}</pre>')
         parts.append(_judgement_table(record))
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_e(record.output)}</pre>')

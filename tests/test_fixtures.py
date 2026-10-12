@@ -257,3 +257,24 @@ def test_judge_scorer_waits_for_post_run_evaluation():
 def test_legacy_custom_fixtures_reject_judge_with_pack_guidance(tmp_path):
     with pytest.raises(ValueError, match="request pack"):
         load_custom_fixtures(custom_file(tmp_path, [custom_entry(scorer="judge")]))
+
+
+def test_recursive_schema_preserves_answer_as_unscored():
+    spec = RequestSpec(fixture_id="recursive", scenario="custom", check_ids=["correctness"],
+                       messages=[{"role": "user", "content": "Return JSON"}],
+                       scorer="json", schema={"$ref": "#"})
+    original = record(spec, '"Paris"')
+    result = score_response(spec, original)
+    assert result.score is None
+    assert result.evaluation_error == "schema_recursion"
+    assert result.output == '"Paris"' and result.valid
+    assert "not scored" in result.score_message
+    assert original.score_message is None
+
+
+def test_productive_recursive_schema_still_scores():
+    schema = {"type": "object", "properties": {"child": {"$ref": "#"}}}
+    spec = RequestSpec(fixture_id="tree", scenario="custom", check_ids=["correctness"],
+                       messages=[{"role": "user", "content": "Return a tree"}],
+                       scorer="json", schema=schema)
+    assert score_response(spec, record(spec, '{"child": {"child": {}}}')).score is True

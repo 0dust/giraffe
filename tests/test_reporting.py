@@ -419,3 +419,39 @@ def test_judge_rationale_follows_answer_retention_without_losing_votes(tmp_path,
     assert "<script>private rationale</script>" not in content
     assert ("&lt;script&gt;private rationale&lt;/script&gt;" in content) == retained
     assert report == original
+
+
+@pytest.mark.parametrize("policy", ["all", "failures", "none"])
+def test_evaluation_context_and_schema_error_survive_report_retention(policy, tmp_path):
+    from giraffe.models import EvaluationEvidence
+
+    report = make_report()
+    report.manifest["config"]["retention"] = policy
+    record = report.requests[0]
+    record.score = None
+    record.evaluation_error = "schema_recursion"
+    record.evaluation = EvaluationEvidence(messages=[{"role": "user", "content": "<question>"}],
+                                            scorer="json", expected=None, expected_provided=True,
+                                            schema={"$ref": "#"}, rubric="No <invention>")
+    json_path, html_path = write_report(report, tmp_path)
+    saved = RunReport.model_validate_json(json_path.read_text()).requests[0]
+    assert saved.evaluation.messages == record.evaluation.messages
+    assert saved.evaluation.schema_ == {"$ref": "#"}
+    assert saved.evaluation.expected_provided and saved.evaluation.expected is None
+    assert saved.evaluation_error == "schema_recursion"
+    assert bool(saved.output) is (policy != "none")
+    html = html_path.read_text()
+    for text in ("Input messages", "Expected answer", "Answer check", "JSON schema", "&lt;question&gt;", "No &lt;invention&gt;"):
+        assert text in html
+    assert "<question>" not in html
+
+
+@pytest.mark.parametrize("side", ["current", "baseline"])
+def test_schema_evaluation_error_cannot_produce_passing_comparison(side):
+    current, baseline = make_report(), make_report("baseline")
+    affected = current if side == "current" else baseline
+    affected.requests[0].score = None
+    affected.requests[0].evaluation_error = "schema_recursion"
+    result = compare_baseline(current, baseline)
+    assert result.baseline["status"] == "inconclusive"
+    assert "answer evaluation failed" in str(result.baseline)

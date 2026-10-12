@@ -882,8 +882,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                 "calibration": observations.get("context_calibration")})
             if accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
-            elif metrics["completed"] != metrics["attempted"] or not metrics["scored"]:
-                status, summary = "inconclusive", "Some fixtures could not be scored because inference did not complete."
+            elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
+                status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
             elif check_id == "context" and not metrics["near_limit_coverage"]:
                 status, summary = "inconclusive", "Recall fixtures passed at observed lengths; near-limit token context was not verified."
             else:

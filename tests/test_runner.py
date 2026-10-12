@@ -1299,3 +1299,23 @@ async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure
     assert stage["timing_violations"] and stage["generator_limited"]
     assert stage["status"] == result.status == expected_status
     assert result.metrics["highest_acceptable_rate_rps"] is None
+
+
+async def test_recursive_schema_does_not_abort_remaining_examples(client):
+    configured = config(checks=["correctness"], concurrency=1, limits=Limits(min_samples=2),
+                        request_source="request_pack", request_pack={"version": 1, "cases": [
+                            {"fixture_id": "a-recursive", "messages": [{"role": "user", "content": "Return JSON"}],
+                             "scorer": "json", "schema": {"$ref": "#"}},
+                            {"fixture_id": "b-valid", "messages": [{"role": "user", "content": "Say Paris"}],
+                             "scorer": "exact", "expected": "Paris"},
+                        ]})
+    report = await runner.run_suite(configured)
+    assert len(report.requests) == 2
+    first, second = sorted(report.requests, key=lambda record: record.fixture_id)
+    assert first.valid and first.output == "null" and first.score is None
+    assert first.evaluation_error == "schema_recursion"
+    assert second.score is True
+    assert first.evaluation.messages == [{"role": "user", "content": "Return JSON"}]
+    assert second.evaluation.expected == "Paris"
+    assert check(report, "correctness").status == "inconclusive"
+    assert report.abort_reason is None

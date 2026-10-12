@@ -137,3 +137,6 @@
 .run-action-bar{bottom:8px;padding:12px;gap:12px}.run-action-bar>div:first-child{min-width:0;flex-basis:100%}.run-action-bar>.button{width:100%;min-height:40px}.run-action-bar .hint{display:none}.run-action-bar strong{font-size:12px}.review-bounds{gap:18px 14px}
 }
 }
+
+@layer components{.request-comparison{display:grid;grid-template-columns:1fr 1fr;gap:24px}.request-comparison>section{min-width:0}.request-comparison h4{margin:14px 0 8px}.request-comparison details{margin-top:18px}.request-comparison details pre{margin-top:10px}.request-comparison .body-output{max-height:260px}}
+@layer responsive{@media(max-width:700px){.request-comparison{grid-template-columns:1fr;gap:0}}}

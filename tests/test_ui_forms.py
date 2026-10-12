@@ -714,7 +714,7 @@ const importing=importRequestPack({name:'late.json',size:20,text:async()=>JSON.s
 state.jsonDraft='unapplied';await importRequestPack({size:20,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/Apply or discard/);state.jsonDraft=state.jsonBase;
 await importRequestPack({size:1048577,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/1 MiB/);
 // Trial only submits one named example/target to its own bounded endpoint.
-openTryExample(0);markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/one inference request/);assert.match(markup,/No traffic stages or restart/);assert.match(markup,/Save this trial/);assert.match(markup,/retention setting stays unchanged/);
+openTryExample(0);markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/one inference request/);assert.match(markup,/No traffic stages or restart/);assert.match(markup,/Save this trial/);assert.match(markup,/name="save_try_output" type="checkbox" checked/);assert.match(markup,/retention setting stays unchanged/);
 const trial=[];api=async(path,options)=>{trial.push({path,body:JSON.parse(options.body)});return {id:'trial',state:'queued'};};
 await tryDatasetExample({preventDefault(){}});assert.equal(trial[0].path,'/api/runs/try-example');assert.equal(trial[0].body.fixture_id,'one');assert.equal(trial[0].body.target_name,'secondary');assert.equal(trial[0].body.config.retention,'all');assert.equal(state.config.retention,'failures');assert.equal(state.config.max_requests,99);assert.equal(trial[0].body.config.checks.length,0);assert.equal(location.hash,'#runs/trial');
 // Unchecking trial retention overrides even an all-retention main config, without changing it.
@@ -727,6 +727,61 @@ state.active=null;api=async(path,options)=>({config:JSON.parse(options.body)});a
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+def test_scorer_conversion_sample_and_request_evidence():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute UI behavior")
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = r'''
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {convertExpectedAnswer,datasetCaseFromValues} from FORM_PATH;
+assert.equal(convertExpectedAnswer('"Paris"','json','text'),'Paris');
+assert.equal(convertExpectedAnswer('Paris','text','json'),'"Paris"');
+assert.equal(convertExpectedAnswer('"Paris"','text','text'),'"Paris"');
+for(const text of ['"Paris"','line\nbreak','C:\\path','null','123']) {
+  assert.equal(convertExpectedAnswer(convertExpectedAnswer(text,'text','json'),'json','text'),text);
+}
+for(const value of ['null','{}','[]','42','true'])assert.throws(()=>convertExpectedAnswer(value,'json','text'),/JSON string reference/);
+assert.throws(()=>convertExpectedAnswer('{broken','json','text'),/Fix the JSON reference/);
+const nodes={};
+for(const id of ['example-expected-label','example-rubric-label','example-schema-label','example-expected-hint','dataset-error'])nodes['#'+id]={hidden:false,textContent:''};
+nodes['#dataset-example-form']={elements:{example_scorer:{value:'json'},example_expected:{value:'"Paris"'}}};
+const context={assert,nodes,structuredClone,convertExpectedAnswer,datasetCaseFromValues,FormData,document:{querySelector:q=>nodes[q],addEventListener(){}},window:{addEventListener(){}}};
+const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+await vm.runInNewContext(source+`
+(async()=>{
+const form=nodes['#dataset-example-form'];
+state.datasetEditor={expectedFormat:'json',scorer:'json'};
+for(const scorer of ['exact','contains','judge']){
+ form.elements.example_scorer.value=scorer;syncExampleScorer();assert.equal(form.elements.example_expected.value,'Paris');
+ const values=new FormData();for(const [key,value] of Object.entries({example_id:'city',message_count:'1',message_0_role:'user',message_0_content:'Capital?',example_scorer:scorer,example_expected:form.elements.example_expected.value,example_weight:'1',example_options:'{}'}))values.set(key,value);
+ assert.equal(datasetCaseFromValues(null,values).expected,'Paris');
+ form.elements.example_scorer.value='json';syncExampleScorer();assert.equal(form.elements.example_expected.value,'"Paris"');
+}
+form.elements.example_scorer.value='none';syncExampleScorer();assert(nodes['#example-expected-label'].hidden);
+form.elements.example_scorer.value='exact';syncExampleScorer();assert.equal(form.elements.example_expected.value,'Paris');
+form.elements.example_scorer.value='json';syncExampleScorer();form.elements.example_expected.value='null';
+form.elements.example_scorer.value='exact';syncExampleScorer();assert.equal(form.elements.example_scorer.value,'json');assert.equal(form.elements.example_expected.value,'null');assert.match(nodes['#dataset-error'].textContent,/JSON string reference/);
+let sample;importRequestPack=async(file)=>{sample=JSON.parse(await file.text());};await sampleDataset();
+const exact=sample.cases.find(item=>item.scorer==='exact');assert.equal(exact.expected,'7');assert.match(exact.messages[0].content,/only the digit/);
+const record={evaluation:{messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<Paris>',expected_provided:true,rubric:'No <invention>'}};
+let html=renderEvaluationEvidence(record,{});assert.match(html,/&lt;question&gt;/);assert.match(html,/&lt;Paris&gt;/);assert.match(html,/No &lt;invention&gt;/);assert.match(html,/AI judge/);assert(!html.includes('<question>'));
+record.evaluation={messages:[],scorer:'json',expected:null,expected_provided:true,schema:{type:'null'}};
+html=renderEvaluationEvidence(record,{});assert(html.includes("<pre>null</pre>"));assert.match(html,/JSON schema/);
+const old={manifest:{config:{request_source:'request_pack',request_pack:{cases:[{fixture_id:'city',messages:[{role:'user',content:'Capital?'}],scorer:'exact',expected:'Paris'}]}}}};
+assert.match(renderEvaluationEvidence({fixture_id:'pack:city'},old),/Paris/);
+assert.match(renderEvaluationEvidence({fixture_id:'missing'},old),/not saved/);
+})()
+`,context);
+'''.replace("FORM_PATH", json.dumps((static / "form-config.mjs").as_uri())).replace(
+        "APP_PATH", json.dumps(str(static / "app.js")))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
