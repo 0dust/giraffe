@@ -178,6 +178,15 @@ def parse(body, target, config):
     }
 
 
+def _metrics_client(config, target, timeout):
+    # Loading CA certificates can block even for an HTTP statistics endpoint.
+    verify = ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True
+    return httpx.AsyncClient(
+        verify=verify, proxy=config.proxy, headers=_metrics_headers(target),
+        timeout=timeout, follow_redirects=False,
+    )
+
+
 async def scrape(run, target, phase, *, force=False):
     result = {
         "phase": phase,
@@ -196,19 +205,9 @@ async def scrape(run, target, phase, *, force=False):
     if run.stop.is_set() or remaining <= 0:
         return result | {"status": "run_stopped", "reason": "Run stopped or deadline reached."}
     try:
-        verify = (
-            ssl.create_default_context(cafile=run.config.ca_bundle)
-            if run.config.ca_bundle
-            else True
-        )
         async with asyncio.timeout(remaining):
-            async with httpx.AsyncClient(
-                verify=verify,
-                proxy=run.config.proxy,
-                headers=_metrics_headers(target),
-                timeout=remaining,
-                follow_redirects=False,
-            ) as client:
+            client = await asyncio.to_thread(_metrics_client, run.config, target, remaining)
+            async with client:
                 async with client.stream("GET", target.metrics_url) as response:
                     result["http_status"] = response.status_code
                     if response.status_code in {401, 403}:
