@@ -72,54 +72,6 @@ The example enables the ten standard checks; JSON and GPU checks remain optional
 A wrong answer can fail a load check even when requests complete successfully.
 Inspect the failed responses before treating the result as a vLLM server fault.
 
-## SGLang
-
-Start SGLang separately, then point Giraffe at its OpenAI-compatible
-`/v1` endpoint and the exact model ID returned by `/v1/models`:
-
-```sh
-giraffe run --url http://127.0.0.1:30000/v1 --model your-served-model \
-  --checks access,serving,correctness --context-limit 1024 --output runs/sglang-first
-```
-
-Match `context_limit` to the server's `--context-length` and review traffic budgets
-and acceptance limits as for the other runtimes. The shared Chat Completions client
-handles SGLang streaming, nonstreaming, usage and tool calls without an adapter.
-Tool calling requires the server's model-appropriate `--tool-call-parser`.
-For arrival-rate capacity testing, also size `traffic.long_input_chars` to fit
-the model's context and choose arrival rates for the deployment being tested.
-
-For serving telemetry, start SGLang with `--enable-metrics` and configure the target:
-
-```yaml
-metrics: true
-targets:
-  - name: sglang
-    url: http://127.0.0.1:30000/v1
-    model: your-served-model
-    metrics_url: http://127.0.0.1:30000/metrics
-    metrics_profile: sglang
-    deployment: {discovery: sglang}
-```
-
-Discovery reads `/get_server_info`, retaining selected settings and runtime version
-with their provenance. Metrics keep running/queued requests, KV occupancy, retraction
-counts, cache observations and server TTFT separate from client measurements.
-Metrics authentication uses independent secret references; inference credentials
-are never forwarded to the metrics URL. See [the telemetry guide](docs/workloads.md).
-
-Apple Silicon requires SGLang's [MLX backend setup](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/apple_metal.mdx).
-An Ollama GGUF checkpoint cannot be reused directly through that backend; a local
-MLX checkpoint can. GPU health checks still require published DCGM metrics, which
-the Apple backend does not provide.
-
-Enable backend verification inside [Limits and cancellation](docs/backend-cancellation.md)
-for SGLang, vLLM V1 or an isolated single-slot Ollama server. The adapter uses
-explicit runtime metadata; target names remain labels. Reports distinguish native
-abort termination from Ollama's controlled capacity-release evidence. Server-stop
-and answer verdicts are independent; a wrong answer cannot fail a proven abort.
-Ollama's server-stop verdict remains inconclusive without native abort evidence.
-
 ## Run and compare
 
 Open **http://127.0.0.1:8765**, select **New run**, review the settings, and select
@@ -153,7 +105,7 @@ Open `report.html` in your run's output directory. `report.json` contains the sa
 measurements and reproduction settings. A failed or interrupted run still produces
 a report.
 
-To compare runs, substitute your edited Ollama, vLLM or SGLang configuration for
+To compare runs, substitute your edited Ollama or vLLM configuration for
 `my-config.yaml` below:
 
 ```sh
@@ -596,23 +548,9 @@ or rollback.
 
 ## Tested compatibility
 
-Shared backend cancellation has an [October 11 validation record](docs/validation/2026-10-11-backend-cancellation.md):
-554 automated tests passed. All 19 live checks previously ran sequentially on
-SGLang, vLLM-Metal and Ollama; focused live runs then validated the separate
-server-stop and answer verdicts on all three. SGLang/vLLM verified three native
-aborts each. Ollama verified controlled slot reuse, leaving server termination
-inconclusive. The record includes the failing negative control, answer/performance
-failures and coverage gaps.
-
 The expanded workloads and deployment/telemetry capture have a separate
 [October 8 validation record](docs/validation/2026-10-08.md), with runnable
 configurations, real Ollama and vLLM-Metal results, endpoint failures and coverage gaps.
-
-SGLang's Apple/MLX integration has an [October 10 validation record](docs/validation/2026-10-10-sglang.md):
-486 automated tests pass after updating to latest main; streaming and nonstreaming inference, automatic tool calls,
-runtime discovery and serving metrics were verified with the existing 1B Llama.
-The complete live acceptance run retains failed answers and inconclusive timing/GPU
-checks rather than claiming an all-passing deployment.
 
 Verified locally on October 4, 2026 with Python 3.12 on macOS:
 
