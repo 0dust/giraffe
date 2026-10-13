@@ -36,14 +36,6 @@ server, executes imported commands or recreates inaccessible server state.
 | `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
-The default conversation asks: "Suggest a name for a bakery. Reply with only the
-name, without quotation marks or a trailing full stop." Its next turn is "Repeat
-exactly the above answer." The repeat answer is scored against the assistant
-message supplied in that session's history: a saved answer in fixed mode, or the
-actual preceding output in live mode. Exact scoring normalizes whitespace only;
-it does not remove punctuation or quotation marks. Saved configurations using the
-older bakery-specific repeat prompt remain scored.
-
 Conversation fixtures, modes, generation options, schedules and seeds contribute
 to the workload fixture hash in the manifest, together with a hash of the loaded
 workload generator source. Source changes conservatively prevent like-for-like
@@ -123,13 +115,6 @@ Explicit profiles map exact metric names and units:
   requests, preemption count, prefix hits/queries and server TTFT sum/count.
 - `vllm-legacy`: an explicit older-name contract adding GPU/CPU cache fractions;
   qualify the recorded runtime/version before interpreting it as supported.
-- `sglang`: running/queued requests, KV pool usage fraction, retraction counter,
-  current retraction gauge, prefix-hit ratio, cached/prompt token counters and
-  server TTFT sum/count. The old retraction gauge is never treated as a counter.
-  The mapping follows [SGLang's collector at the tested commit](https://github.com/sgl-project/sglang/blob/44bc478863052efdc455b0282b49830f68fdefb3/python/sglang/srt/observability/metrics_collector.py).
-  `deployment.discovery: sglang` reads `/get_server_info` for version, context,
-  scheduler, cache/instrumentation settings and reported parallel sizes. Unknown
-  settings and credentials are excluded; an MPS device does not establish MLX use.
 - `ollama` / `unknown`: no serving counter mapping is assumed. Ollama native APIs
   supply deployment information, but an inference URL alone does not provide
   scheduler or KV-cache counters.
