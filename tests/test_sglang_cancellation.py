@@ -196,6 +196,7 @@ async def test_real_client_closes_after_answer_chunks_and_keeps_exact_server_id(
     ("natural", "inconclusive"), ("followup_error", "fail"),
     ("wrong_id", "inconclusive"), ("budget", "inconclusive"), ("late_budget", "fail"),
     ("answer_mismatch", "fail"),
+    ("generation_error", "fail"), ("generation_timeout", "fail"),
 ])
 async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, tmp_path, mode, expected):
     path = tmp_path / "traces.jsonl"
@@ -220,6 +221,15 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
                             else str(spec.expected or "answer") if spec.scorer != "none" else "1 2"), output_tokens=1)
             now = time.time_ns()
             if spec.cancel_after_chunks:
+                if mode in {"generation_error", "generation_timeout"}:
+                    return RequestRecord(
+                        id=spec.fixture_id, fixture_id=spec.fixture_id, scenario=spec.scenario,
+                        check_ids=spec.check_ids, target="local",
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        status="failed" if mode == "generation_error" else "timeout",
+                        http_status=500 if mode == "generation_error" else None,
+                        error="HTTP 500" if mode == "generation_error" else "request deadline exceeded",
+                    )
                 # Keep timestamps in their true order; receipt can lag termination.
                 start = now
                 await asyncio.sleep(.001)
@@ -254,8 +264,15 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
     check = next(c for c in report.checks if c.id == "cancellation")
     assert check.status == expected and check.required
     backend = check.metrics["backend_cancellation"]
-    assert backend["probes"][0]["server_request_id"] == "rid"
+    assert backend["probes"][0]["server_request_id"] == (
+        None if mode in {"generation_error", "generation_timeout"} else "rid")
     assert check.evidence_ids
+    if mode in {"generation_error", "generation_timeout"}:
+        assert backend["status"] == "fail"
+        assert backend["probes"][0]["status"] == "fail"
+        assert backend["probes"][0]["followup_valid"]
+        assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "inconclusive"
+        assert check.metrics["cancellation_results"]["answer"]["status"] == "pass"
     if mode == "answer_mismatch":
         assert backend["status"] == "pass"
         assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "pass"
