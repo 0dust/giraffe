@@ -599,6 +599,11 @@ function renderCheck(check,report) {
   const evidenceSet=new Set(check.evidence_ids || []),records=report.requests.filter(r=>evidenceSet.has(r.id));
   const sorted=[...records].sort((a,b)=>(a.score===false?-2:a.status==='failed'?-1:0)-(b.score===false?-2:b.status==='failed'?-1:0));
   const metrics=[];
+  if(m.timing_quality){
+    const quality=m.timing_quality;
+    metrics.push(metric('Client timing quality',`${quality.affected_requests} / ${quality.total_requests} requests affected`,
+      quality.status==='client_delayed'?'Scheduling delay overlaps these measurements. Raw timings are retained; endpoint attribution is uncertain.':'No material client scheduling delay overlaps the assessed timing intervals.'));
+  }
   if(check.id==='gpu'){
     const snapshots=m.snapshots || [],samples=snapshots.flatMap(s=>s.samples || []);
     metrics.push(metric('Telemetry snapshots',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Snapshots containing reported samples'));

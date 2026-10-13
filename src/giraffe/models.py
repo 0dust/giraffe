@@ -7,7 +7,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StrictBool, field_serializer, model_serializer, model_validator
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -766,6 +766,7 @@ class EvaluationEvidence(Model):
 
 
 class RequestRecord(Model):
+    _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -814,6 +815,8 @@ class RequestRecord(Model):
     completed_at: str | None = None
     dispatch_ms: float | None = None
     completed_ms: float | None = None
+    timing_start_ms: float | None = None
+    client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
     overlap: int = 1

@@ -61,9 +61,44 @@ token throughput unknown. Per-request generation pace remains a client-observed
 estimate between first/last answer chunks, separate from end-to-end throughput and
 server TTFT statistics.
 
-Timing acceptance uses the same generator scheduling-lag qualification for core
-and additional workloads. If the generator cannot keep up, configured timing
-limits remain inconclusive; observed task/protocol failures remain failures.
+Timing acceptance uses the same client scheduling-delay qualification for core
+and additional workloads. A 50 ms heartbeat observes event-loop responsiveness;
+it cannot distinguish CPU overload from OS wake-up delays or other causes.
+Delays above the existing threshold (the greater of 100 ms and 10% of warmed
+median first-output time) qualify only overlapping request/metric intervals.
+First-output qualification intervals end at the first useful output. Generation
+pace is calculated between the first and last answer, but its qualification
+interval starts at dispatch: a pause before the first read may buffer tokens and
+artificially compress observed gaps. Completion and stream-gap qualification
+intervals likewise start at dispatch and include the protocol trailer. Arrival
+latency also includes scheduled-to-dispatch time.
+Capacity stages include offered arrival windows and drain, including intervals
+with no request in flight. Fairness ratios include their short-only controls.
+
+Reports retain every raw timing sample and percentile. They record delay windows,
+heartbeat sample/delay counts in `observations.client_timing_health`, and affected
+request IDs/counts and metrics under each check's `timing_quality`. The UI shows
+affected request counts. Overlap qualifies endpoint attribution; it does not
+erase the client-observed elapsed time, prove a server defect or subtract a delay
+from latency. An independently violated timing limit or task/protocol failure
+still fails even when another sample was delayed.
+
+The start of a stall between heartbeats is unknown, so its conservative window
+starts at the last responsive tick. Up to 4,096 windows are retained; later
+windows are represented by an enclosing overflow window, which can qualify extra
+measurements conservatively. Legacy reports containing only a run-wide maximum
+retain the old conservative qualification because overlap cannot be reconstructed.
+
+Payload/history hashing occurs before the inference timer. Streaming timestamps
+are captured when the client reads the chunk completing an SSE event, before JSON
+parsing; non-streaming first output is observed with the full response body. These
+are client observation times, not network-interface arrival or server TTFT.
+Reports record `timing_measurement_version: 2`; timing/traffic comparisons against
+older boundaries require a new baseline. Timing-version differences alone do not
+invalidate correctness comparisons.
+
+Configured timing limits remain inconclusive where relevant client delay prevents
+qualification; observed task/protocol failures remain failures.
 Mixed-load latency ratios require enough successful control/load samples and
 actual overlap before they can fail the interference check.
 

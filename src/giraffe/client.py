@@ -11,6 +11,7 @@ import re
 import ssl
 import time
 import uuid
+from time import monotonic
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -65,7 +66,7 @@ async def _limited_body(response: httpx.Response) -> bytes:
     return bytes(body)
 
 
-async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str, float]]:
     """Decode SSE independently of TCP boundaries, including CRLF and multiline data."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     buffer = ""
@@ -79,6 +80,7 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]
         yield b"", True
 
     async for chunk, final in chunks_with_eof():
+        observed_at = time.perf_counter()
         consumed += len(chunk)
         if consumed > _MAX_RESPONSE_BYTES:
             raise _ProtocolError("response exceeded the 4 MiB safety limit")
@@ -92,7 +94,7 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]
             line, buffer = buffer[:end], buffer[end + width:]
             if not line:
                 if data:
-                    yield event_type, "\n".join(data)
+                    yield event_type, "\n".join(data), observed_at
                 data, event_type = [], "message"
             elif not line.startswith(":"):
                 field, _, value = line.partition(":")
@@ -158,7 +160,7 @@ class LLMClient:
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
-        start = time.perf_counter()
+        preparation_start = time.perf_counter()
         stream = self.config.stream and spec.stream
         budget = min(spec.max_tokens or self.config.max_output_tokens, self.config.max_output_tokens)
         record = RequestRecord(
@@ -180,10 +182,13 @@ class LLMClient:
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
         }, sort_keys=True).encode()).hexdigest()
         record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
+        start = time.perf_counter()
+        record._timing_started_monotonic = monotonic()
+        record.client_preparation_ms = (start - preparation_start) * 1000
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
 
-        def receive(data: dict[str, Any], *, streaming: bool) -> None:
+        def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
             nonlocal last_answer
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
@@ -229,7 +234,7 @@ class LLMClient:
                 raise _ProtocolError("response is missing assistant content")
             answer = _text(content.get("content"))
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
-            now = time.perf_counter()
+            now = observed_at
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > 16:
@@ -307,13 +312,13 @@ class LLMClient:
                         if "application/json" in response.headers.get("content-type", ""):
                             _object(await _limited_body(response))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        async for event_type, event in _sse_events(response):
+                        async for event_type, event, observed_at in _sse_events(response):
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
                                 record.stream_terminated = True
                                 break
-                            receive(_object(event), streaming=True)
+                            receive(_object(event), streaming=True, observed_at=observed_at)
                             if (spec.cancel_after_chunks is not None
                                     and record.answer_chunks >= spec.cancel_after_chunks
                                     and record.finish_reason is None):
@@ -322,7 +327,9 @@ class LLMClient:
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
-                        receive(_object(await _limited_body(response)), streaming=False)
+                        body = await _limited_body(response)
+                        observed_at = time.perf_counter()
+                        receive(_object(body), streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")

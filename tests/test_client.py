@@ -136,7 +136,7 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
         b'"usage":{"completion_tokens":4}}\n\n',
         b'data: [DONE]\n\n',
     ])
-    timestamps = iter([0, 39, 39.25, 44, 45])
+    timestamps = iter([0, 0, 39, 39.25, 44, 44.5, 45])
     monkeypatch.setattr("giraffe.client.time", SimpleNamespace(perf_counter=lambda: next(timestamps)))
     async with client:
         result = await client.execute(spec())
@@ -146,6 +146,47 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
     assert result.elapsed_ms == 45000
     assert result.answer_chunks == 2
     assert result.generation_tokens_per_second == 12
+
+
+async def test_first_output_timestamp_precedes_json_processing(monkeypatch):
+    from types import SimpleNamespace
+    from giraffe import client as module
+
+    clock = [0.0]
+    client, _, _ = setup_client(monkeypatch, [event("42"), event(finish="stop"),
+                                           b"data: [DONE]\n\n"])
+    original = module._object
+
+    def slow_parse(payload):
+        clock[0] += .2
+        return original(payload)
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(module, "_object", slow_parse)
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.first_output_ms == 0
+    assert result.elapsed_ms == 400  # Processing remains in client completion time.
+
+
+async def test_payload_hash_preparation_is_outside_inference_timer(monkeypatch):
+    from types import SimpleNamespace
+    from giraffe import client as module
+
+    clock = [0.0]
+    client, _, _ = setup_client(monkeypatch, [event("42", finish="stop"), b"data: [DONE]\n\n"])
+    original = module.hashlib.sha256
+
+    def slow_hash(*args, **kwargs):
+        clock[0] += .25
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(module.hashlib, "sha256", slow_hash)
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.client_preparation_ms == 500
+    assert result.first_output_ms == result.elapsed_ms == 0
 
 
 @pytest.mark.parametrize("trailer", [[], [event("   ")]])

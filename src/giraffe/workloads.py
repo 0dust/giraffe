@@ -491,6 +491,8 @@ async def execute(run, target, client, fixtures):
 
 
 def results(run, target, stats, violations, missing_timing, *, saturated=False):
+    from .timing import configured_metrics, qualified_violations, run_quality
+
     result = []
     selected = set(run.config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
@@ -498,6 +500,9 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             continue
         records = [r for r in run.records if r.target == target.name and check in r.check_ids]
         metrics = stats(records)
+        quality = run_quality(run, records, target.name, configured_metrics(run.config.limits, check))
+        saturated = quality["status"] == "client_delayed"
+        metrics["timing_quality"] = quality
         status = "pass"
         summary = "Bounded workload observed; untested combinations remain unverified."
         minimum = run.config.limits.min_samples
@@ -623,6 +628,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     and control["completed"] >= minimum
                     and row["completed"] >= max(minimum, run.config.buckets.mixed_pairs)
                 )
+                comparison_quality = run_quality(run, controls + [
+                    r for r in records if r.scenario == name], target.name, ("latency_ms",))
                 comparisons.append(
                     {
                         "scenario": name,
@@ -631,6 +638,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "latency_ratio": ratio,
                         "overlap_observed": observed,
                         "samples_and_overlap_qualified": qualified,
+                        "timing_quality": comparison_quality,
                     }
                 )
                 if not qualified and status != "fail":
@@ -643,7 +651,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     and ratio is not None
                     and run.config.limits.fairness_max_ratio
                     and ratio > run.config.limits.fairness_max_ratio
-                    and not saturated
+                    and comparison_quality["status"] != "client_delayed"
                 ):
                     status, summary = (
                         "fail",
@@ -715,10 +723,14 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 )
         if timing:
             metrics["timing_violations"] = timing
-            if saturated and status != "fail":
+            qualified = qualified_violations(assessed, run.config.limits, quality)
+            if qualified:
+                metrics["qualified_timing_violations"] = qualified
+                status, summary = "fail", "Workload exceeded configured timing limits without overlapping client scheduling delay."
+            elif saturated and status != "fail":
                 status, summary = (
                     "inconclusive",
-                    "Generator saturation prevents attributing timing violations to the endpoint.",
+                    "Client scheduling delay prevents attributing timing violations to the endpoint.",
                 )
             elif not saturated:
                 status, summary = "fail", "Workload exceeded configured timing limits."
@@ -732,7 +744,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         ):
             status, summary = (
                 "inconclusive",
-                "Generator saturation prevents qualifying configured workload timing limits.",
+                "Client scheduling delay prevents qualifying configured workload timing limits.",
             )
         if not records or (check in run.unfinished[target.name] and status != "fail"):
             status, summary = (

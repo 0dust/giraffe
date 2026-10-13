@@ -266,6 +266,36 @@ def test_generator_saturation_threshold_matches_warm_first_output_scale():
     assert result.baseline["targets"][0]["generator_saturated_runs"] == []
 
 
+def test_scoped_delay_does_not_taint_other_baseline_scenarios_or_first_output():
+    current, previous = make_report(latency=200, count=12), make_report("baseline", count=12)
+    for report in (current, previous):
+        for index, record in enumerate(report.requests):
+            record.scenario = "affected" if index < 6 else "unaffected"
+            record.dispatch_ms = 1000 if index < 6 else 4000
+            record.completed_ms = record.dispatch_ms + record.elapsed_ms
+        report.observations["client_timing_health"] = {"schema_version": 1, "windows": [],
+                                                       "overflow_window": None}
+    current.observations["generator_max_lag_ms"] = 500
+    current.observations["client_timing_health"]["windows"] = [
+        {"start_ms": 1120, "end_ms": 1180, "lag_ms": 500}]
+    result = compare_baseline(current, previous)
+    rows = result.baseline["targets"][0]["comparisons"]
+    assert all(row["status"] == "fail" for row in rows
+               if row["scenario"] == "unaffected" and row["metric"] == "latency_ms")
+    affected = {row["metric"]: row for row in rows if row["scenario"] == "affected"}
+    assert affected["latency_ms"]["status"] == "inconclusive"
+    assert affected["first_output_ms"]["status"] == "fail"
+    assert affected["latency_ms"]["current_samples"] == 6
+
+
+def test_changed_receive_boundaries_require_new_timing_baseline_only():
+    current, previous = make_report(), make_report("baseline")
+    current.manifest["timing_measurement_version"] = 2
+    rows = compare_baseline(current, previous).baseline["targets"][0]["comparisons"]
+    assert all(row["status"] == "inconclusive" for row in rows if row["metric"] == "latency_ms")
+    assert all(row["status"] == "pass" for row in rows if row["metric"] == "correctness_rate")
+
+
 def test_custom_fixture_path_without_content_hash_is_not_comparable():
     current, previous = make_report(), make_report("baseline")
     for report in (current, previous):

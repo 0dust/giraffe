@@ -863,6 +863,7 @@ async def test_generator_saturation_makes_timing_violation_inconclusive(monkeypa
 
     async def saturated(self, tasks):
         self.max_lag_ms = 500
+        self.timing_health.windows.append({"start_ms": 0, "end_ms": 10000, "lag_ms": 500})
         await original(self, tasks)
 
     monkeypatch.setattr(runner._Run, "monitor", saturated)
@@ -874,6 +875,104 @@ async def test_generator_saturation_makes_timing_violation_inconclusive(monkeypa
         assert result.metrics["highest_acceptable_rate_rps"] is None
 
 
+async def test_delay_outside_requests_does_not_disqualify_timing(monkeypatch):
+    original = runner._checks
+
+    def delayed(self, target):
+        self.max_lag_ms = 500
+        self.timing_health.windows[:] = [{"start_ms": 10000, "end_ms": 10550, "lag_ms": 500}]
+        return original(self, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed)
+    report = await runner.run_suite(config(checks=["first_output", "generation"],
+        limits=Limits(first_output_ms=100, latency_ms=100, min_samples=2)))
+    assert check(report, "first_output").status == "pass"
+    assert check(report, "generation").status == "pass"
+    assert report.observations["generator_max_lag_ms"] == 500
+    assert not check(report, "generation").metrics["timing_quality"]["affected_request_ids"]
+
+
+async def test_delay_in_generation_does_not_disqualify_earlier_first_output(monkeypatch):
+    original = runner._checks
+
+    def delayed(self, target):
+        request = next(r for r in self.records if r.scenario == "generation")
+        self.max_lag_ms = 500
+        self.timing_health.windows[:] = [{
+            "start_ms": request.dispatch_ms + request.first_output_ms + .1,
+            "end_ms": request.completed_ms, "lag_ms": 500,
+        }]
+        return original(self, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed)
+    report = await runner.run_suite(config(checks=["first_output", "generation"],
+        limits=Limits(first_output_ms=100, latency_ms=100, min_samples=2)))
+    assert check(report, "first_output").status == "pass"
+    result = check(report, "generation")
+    assert result.status == "inconclusive"
+    assert result.metrics["timing_quality"]["affected_request_ids"]
+    assert result.metrics["completed"] == 2  # Delayed samples are retained.
+
+
+async def test_blocking_final_callback_is_captured_before_monitor_cancellation(client, monkeypatch):
+    original = client.execute
+    completed = 0
+
+    async def execute(self, spec, **kwargs):
+        nonlocal completed
+        record = await original(self, spec, **kwargs)
+        completed += 1
+        if completed == 2:
+            time.sleep(.18)
+            record.elapsed_ms += 180
+        return record
+
+    monkeypatch.setattr(client, "execute", execute)
+    report = await runner.run_suite(config(checks=["generation"], concurrency=1,
+        limits=Limits(latency_ms=1000, min_samples=2)))
+    health = report.observations["client_timing_health"]
+    assert health["delayed_sample_count"] >= 1
+    assert health["max_lag_ms"] > 100
+    assert check(report, "generation").status == "inconclusive"
+    assert len(report.requests) == 2 and report.requests[-1].elapsed_ms >= 180
+
+
+async def test_delay_on_another_target_does_not_change_completed_target(monkeypatch):
+    original = runner._checks
+
+    def delayed(self, target):
+        request = next(r for r in self.records if r.target == "second")
+        self.max_lag_ms = 500
+        self.timing_health.windows[:] = [{"start_ms": request.dispatch_ms,
+            "end_ms": request.completed_ms, "lag_ms": 500}]
+        return original(self, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed)
+    report = await runner.run_suite(config(checks=["generation"], targets=[
+        Target(name=name, model="local", url="http://localhost:1234") for name in ["service", "second"]],
+        limits=Limits(latency_ms=1000, min_samples=2)))
+    assert check(report, "generation", "service").status == "pass"
+    assert check(report, "generation", "second").status == "inconclusive"
+
+
+async def test_client_dispatch_anchor_excludes_slow_progress_callback(monkeypatch):
+    from giraffe.client import LLMClient
+    from tests.fake_endpoint import FakeEndpoint
+
+    monkeypatch.setattr(runner, "LLMClient", LLMClient)
+
+    def progress(event):
+        if event["event"] == "request_started":
+            time.sleep(.02)
+
+    with FakeEndpoint(first_token_delay=.001, chunk_delay=0) as endpoint:
+        report = await runner.run_suite(config(checks=["generation"], targets=[
+            Target(name="service", model="fake-model", url=endpoint.url)]), progress=progress)
+    assert len(report.requests) == 2
+    assert all(r.timing_start_ms - r.dispatch_ms >= 20 for r in report.requests)
+    assert all("_timing_started_monotonic" not in r.model_dump() for r in report.requests)
+
+
 @pytest.mark.parametrize("check_id", ["capacity", "fairness", "recovery"])
 async def test_generator_saturation_does_not_hide_known_answer_failure(client, monkeypatch, check_id):
     client.bad_target = "service"
@@ -881,6 +980,7 @@ async def test_generator_saturation_does_not_hide_known_answer_failure(client, m
 
     async def saturated(self, tasks):
         self.max_lag_ms = 500
+        self.timing_health.windows.append({"start_ms": 0, "end_ms": 10000, "lag_ms": 500})
         await original(self, tasks)
 
     monkeypatch.setattr(runner._Run, "monitor", saturated)
@@ -1281,6 +1381,7 @@ async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure
 
     async def saturated(self, tasks):
         self.max_lag_ms = 500
+        self.timing_health.windows.append({"start_ms": 0, "end_ms": 10000, "lag_ms": 500})
         await original(self, tasks)
 
     async def evaluate(config, records, specs, **kwargs):
