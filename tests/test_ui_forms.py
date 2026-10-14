@@ -10,6 +10,58 @@ import pytest
 from giraffe.models import Buckets, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
 
 
+def test_field_help_preserves_labels_and_escapes_details():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute browser configuration behavior")
+    from giraffe.capabilities import capabilities
+
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = f"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {{optionValue,limitValue,sameConfig}} from {json.dumps((static / 'form-config.mjs').as_uri())};
+const context={{structuredClone,optionValue,limitValue,sameConfig,
+  document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
+const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
+  .replace(/^import .*?;\\n/,'').replace(/\\ninit\\(\\);\\s*$/,'');
+vm.runInNewContext(source,context);
+const html=vm.runInNewContext(`field('concurrency','Maximum in-flight requests',8)`,context);
+assert.match(html,/<label for="field-concurrency">Maximum in-flight requests<\\/label>/);
+assert.match(html,/<input id="field-concurrency" name="concurrency"/);
+assert.match(html,/aria-describedby="field-concurrency-hint"/);
+assert.match(html,/<button type="button"[^>]*popovertarget="field-concurrency-help"/);
+assert.match(html,/aria-label="About Maximum in-flight requests"/);
+assert.match(html,/id="field-concurrency-help"[^>]*popover="auto"/);
+assert.doesNotMatch(html,/<label[^>]*>[^<]*<button/);
+const unsafe=vm.runInNewContext(`field('custom','<img src=x>',1,{{help:'<script>bad</script>'}})`,context);
+assert.doesNotMatch(unsafe,/<img|<script>/);
+const text=vm.runInNewContext(`textField('example_expected','Expected answer','answer',{{hint:'Use a JSON value.',hintId:'answer-hint'}})`,context);
+assert.match(text,/aria-describedby="answer-hint"/);
+assert.match(text,/id="answer-hint"/);
+assert.doesNotMatch(vm.runInNewContext(`textField('example_schema','JSON schema','{{}}')`,context),/aria-describedby="field-example_schema-hint"/);
+context.bootstrap={json.dumps(capabilities())};
+context.config={json.dumps(RunConfig(targets=[{'name':'local','url':'http://localhost','model':'test'}]).model_dump(mode='json'))};
+vm.runInNewContext('state.bootstrap=bootstrap;state.bootstrap.config=config;',context);
+for(const check of context.bootstrap.checks) {{
+  context.check=check;
+  const markup=vm.runInNewContext('renderTestCard(check,config)',context);
+  assert.match(markup,/class="field-info"/);
+  for(const name of check.option_fields) {{
+    assert(markup.includes(`name="test_${{check.id}}_${{name}}"`));
+    assert(markup.includes(`popovertarget="field-test_${{check.id}}_${{name}}-help"`));
+  }}
+  for(const name of check.limit_fields) {{
+    assert(markup.includes(`popovertarget="field-test_${{check.id}}_limit_${{name}}-help"`));
+  }}
+}}
+"""
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
 def test_bucket_controls_and_request_budget_guidance():
     node = shutil.which("node")
     if not node:
@@ -823,7 +875,7 @@ await previewDatasetMapping();assert.equal(calls.at(-1).body.input_field,'questi
 // Changing a mapping invalidates the preview; late earlier responses cannot restore it.
 let resolve;api=()=>new Promise(done=>resolve=done);const older=previewDatasetMapping();const oldResolve=resolve;
 listeners.change({target:{matches:()=>false,closest:selector=>selector==='#dataset-import-form',name:'input_field'}});
-assert(state.datasetImport.mappingDirty);assert.match(nodes['#dataset-dialog'].innerHTML,/Mapping changed/);
+assert(state.datasetImport.mappingDirty);assert.match(nodes['#dataset-dialog'].innerHTML,/Columns changed/);
 const newer=previewDatasetMapping();resolve({columns:['question','answer'],preview_rows:[],request_pack:pack,errors:[]});await newer;
 oldResolve({columns:[],preview_rows:[],request_pack:null,errors:[{field:'old',message:'stale'}]});await older;
 assert.equal(state.datasetImport.preview.request_pack.cases[0].fixture_id,'one');assert(!state.datasetImport.mappingDirty);assert.equal(JSON.stringify(state.config),accepted);
@@ -840,7 +892,7 @@ const importing=importRequestPack({name:'late.json',size:20,text:async()=>JSON.s
 state.jsonDraft='unapplied';await importRequestPack({size:20,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/Apply or discard/);state.jsonDraft=state.jsonBase;
 await importRequestPack({size:1048577,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/1 MiB/);
 // Trial only submits one named example/target to its own bounded endpoint.
-openTryExample(0);markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/one inference request/);assert.match(markup,/No traffic stages or restart/);assert.match(markup,/Save this trial/);assert.match(markup,/name="save_try_output" type="checkbox" checked/);assert.match(markup,/retention setting stays unchanged/);
+openTryExample(0);markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Sends this question once/);assert.match(markup,/No traffic stages or restart/);assert.match(markup,/Save this trial/);assert.match(markup,/name="save_try_output" type="checkbox" checked/);assert.match(markup,/does not change what your main run saves/);
 const trial=[];api=async(path,options)=>{trial.push({path,body:JSON.parse(options.body)});return {id:'trial',state:'queued'};};
 await tryDatasetExample({preventDefault(){}});assert.equal(trial[0].path,'/api/runs/try-example');assert.equal(trial[0].body.fixture_id,'one');assert.equal(trial[0].body.target_name,'secondary');assert.equal(trial[0].body.config.retention,'all');assert.equal(state.config.retention,'failures');assert.equal(state.config.max_requests,99);assert.equal(trial[0].body.config.checks.length,0);assert.equal(location.hash,'#runs/trial');
 // Unchecking trial retention overrides even an all-retention main config, without changing it.

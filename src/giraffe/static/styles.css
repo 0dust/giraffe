@@ -156,3 +156,15 @@
 .question-table tr{display:grid;grid-template-columns:28px minmax(0,1fr);padding:14px 12px;border-bottom:1px solid var(--line)}.question-table tr:last-child{border-bottom:0}.question-table td{display:block;border:0;padding:0;min-width:0}.question-table td:nth-child(2){max-width:none;min-width:0}.question-table td:nth-child(n+3){grid-column:2;margin-top:12px}.question-table td:nth-child(3){font-size:12px;color:var(--muted)}.question-table td:nth-child(3)::before{content:'Answer check: ';}.question-table .dataset-row-actions{max-width:none;gap:20px}.question-table .dataset-row-actions .text-button{min-height:32px}.question-table .dataset-excerpt{max-width:none}
 }
 }
+
+@layer components {
+.form-field{min-width:0}.field-label,.test-title{display:flex;align-items:center;gap:4px;min-height:28px}.field-label label{min-width:0}
+.form-field>input,.form-field>select,.form-field>textarea{margin-top:5px}.form-field>.hint{display:block;margin-top:6px;font-weight:400}
+.field-info{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:28px;height:28px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--muted)}
+.field-info span{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid currentColor;border-radius:50%;font:500 11px/1 var(--mono)}
+.field-info:hover,.field-info:focus-visible{color:var(--accent-light);background:var(--panel-hover)}
+.field-help{display:none;position:fixed;inset:auto;margin:0;padding:16px;width:360px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;border:1px solid var(--line-strong);border-radius:6px;background:var(--panel);color:var(--text);font-size:13px;line-height:1.6;box-shadow:0 8px 24px #0004;overflow-wrap:anywhere}
+.field-help:popover-open{display:block}.field-help strong{display:block;margin-bottom:6px;font-size:13px;font-weight:500}.field-help p{color:var(--muted);font-weight:400;margin:0}
+.setup-body .test-description{display:block}.test-title .test-selection{min-width:0}.test-title .field-info{align-self:flex-start}
+.dataset-bulk .form-field{flex:1}.message-controls .form-field{width:140px}.message-controls .field-info{margin-bottom:0}
+}
