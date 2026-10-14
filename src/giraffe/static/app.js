@@ -1,4 +1,4 @@
-import {convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261012-evaluation-feedback';
+import {bucketCoveragePlan, configureBuckets, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261014-concurrency';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -103,7 +103,7 @@ function renderRuns() {
   <aside class="context-panel"><div class="eyebrow">One suite. Real evidence.</div><h2>What gets checked</h2><p>Built-in fixtures test serving behavior and known answers. No test authoring required.</p>${suiteList()}<p>Results apply to the targets, traffic and limits recorded in each run.</p></aside></div>`;
   $('#run-filter').value=state.filter;
 }
-const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Concurrency ceiling','requests',1,1],['max_requests','Request budget','requests',1,1],['max_duration_seconds','Maximum duration','seconds',.1,'any'],['request_timeout_seconds','Request deadline','seconds',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
+const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Maximum in-flight requests','Simultaneous requests across all targets. Choose the load to allow; this is not detected hardware capacity.',1,1],['max_requests','Total request limit','Total target requests across all tests and targets. AI evaluator calls have separate limits.',1,1],['max_duration_seconds','Maximum duration','seconds',.1,'any'],['request_timeout_seconds','Request deadline','seconds',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output (estimate)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
 function field(name,label,value,{type='text',hint='',min,max,step,placeholder='',required=false,full=false}={}) {
   return `<label class="${full?'full':''}">${escape(label)}<input name="${name}" type="${type}" value="${escape(value ?? '')}" ${required?'required':''} ${min!==undefined?`min="${min}"`:''} ${max!==undefined?`max="${max}"`:''} ${step!==undefined?`step="${step}"`:''} placeholder="${escape(placeholder)}" autocomplete="off">${hint?`<span class="hint">${escape(hint)}</span>`:''}</label>`;
@@ -119,6 +119,7 @@ function schemaField(name,value,schema,{label,hint='',placeholder='Inherit run s
   return field(name,label,value,{type:'number',hint,min:valueSchema.minimum,max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
 }
 function testSettingsLabel(check,config) {
+  if(check.id==='buckets')return `${config.checks.includes('buckets')?'Levels':'Saved levels'}: ${(config.buckets || bucketFormDefaults(config)).levels.join(', ')}`;
   if(!check.option_fields.length&&!check.limit_fields.length){
     const key={mixed:'buckets',tools:'forced_tool_diagnostic'}[check.id] || check.id;
     if(config[key])return config.checks.includes(check.id)?'JSON settings':'JSON settings saved';
@@ -132,7 +133,32 @@ function renderTestCard(check,config) {
   const profileKey={mixed:'buckets',tools:'tool_calling'}[check.id] || check.id;
   const advanced=!check.option_fields.length&&!check.limit_fields.length;
   const limits=check.limit_fields.map(name=>schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:human(name),placeholder:'No limit',hint:state.bootstrap.limits_schema.properties[name].anyOf?'Blank removes this limit for this test.':''}));
-  return `<section class="test-card" data-test-card="${check.id}"><div class="test-card-heading"><div class="test-row-copy"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(check.title)}</span></label><p class="hint test-description">${escape(check.description)}</p>${check.id==='capacity'?'<p class="hint traffic-profile-summary"></p>':''}</div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${testSettingsLabel(check,config)}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Configure ${escape(check.title)}" aria-expanded="false" aria-controls="settings-${check.id}">Configure</button></div></div><input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}"><div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden><p class="hint draft-notice" ${selected?'hidden':''}>Not selected. These settings will be used if you select this test.</p>${check.id==='capacity'?renderTrafficEditor(config):''}<div class="test-settings" data-test-settings="${check.id}"><div class="test-editor-heading"><h3>${check.id==='capacity'?'Acceptance settings':'Test settings'}</h3>${advanced?'':`<button type="button" class="text-button reset-test" data-reset-test="${check.id}">${check.id==='capacity'?'Reset acceptance settings':'Reset to defaults'}</button>`}</div><fieldset class="fields">${fields.join('')}${limits.join('')}</fieldset>${advanced?`<p class="hint">Uses the shared run bounds. Customize <code>${escape(profileKey)}</code>${check.id==='tools'?' and forced_tool_diagnostic':''} in the JSON configuration.</p><button type="button" class="text-button" data-config-tab="json">Edit in JSON</button>`:''}</div>${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first target',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}<div class="test-editor-footer"><span class="hint">Changes are kept as you edit.</span><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
+  return `<section class="test-card" data-test-card="${check.id}"><div class="test-card-heading"><div class="test-row-copy"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(check.title)}</span></label><p class="hint test-description">${escape(check.description)}</p>${check.id==='capacity'?'<p class="hint traffic-profile-summary"></p>':''}</div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${escape(testSettingsLabel(check,config))}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Configure ${escape(check.title)}" aria-expanded="false" aria-controls="settings-${check.id}">Configure</button></div></div><input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}"><div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden><p class="hint draft-notice" ${selected?'hidden':''}>Not selected. These settings will be used if you select this test.</p>${check.id==='capacity'?renderTrafficEditor(config):''}<div class="test-settings" data-test-settings="${check.id}"><div class="test-editor-heading"><h3>${check.id==='capacity'?'Acceptance settings':'Test settings'}</h3>${advanced?'':`<button type="button" class="text-button reset-test" data-reset-test="${check.id}">${check.id==='capacity'?'Reset acceptance settings':'Reset to defaults'}</button>`}</div><fieldset class="fields">${fields.join('')}${limits.join('')}</fieldset>${check.id==='buckets'?renderBucketEditor(config):advanced?`<p class="hint">Uses the shared run bounds. Customize <code>${escape(profileKey)}</code>${check.id==='tools'?' and forced_tool_diagnostic':''} in the JSON configuration.</p><button type="button" class="text-button" data-config-tab="json">Edit in JSON</button>`:''}</div>${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first target',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}<div class="test-editor-footer"><span class="hint">Changes are kept as you edit.</span><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
+}
+function bucketFormDefaults(config) {
+  const defaults=clone(state.bootstrap.buckets.defaults);
+  defaults.levels=defaults.levels.filter(level=>level<=config.concurrency);
+  defaults.output_tokens=Object.fromEntries(Object.entries(defaults.output_tokens).map(([name,value])=>[name,Math.min(value,config.max_output_tokens)]));
+  return defaults;
+}
+function renderBucketEditor(config) {
+  const settings=config.buckets || bucketFormDefaults(config),schema=state.bootstrap.buckets.schema;
+  return `<fieldset class="fields" data-bucket-settings>${field('buckets_levels','Concurrency levels',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 2, 4, 8',hint:'Simultaneous requests to test at each input/output size pair. Separate levels with commas. Every level must fit within Maximum in-flight requests.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Minimum requests per size pair',hint:'At each level, sends at least this many requests or one full concurrent batch, whichever is larger.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Time limit per size pair (seconds)'})}</fieldset><p class="hint bucket-profile-summary"></p><p class="hint">Input/output sizes and mixed-workload settings are available in JSON under <code>buckets</code>.</p><button type="button" class="text-button" data-config-tab="json">Edit sizes in JSON</button>`;
+}
+function renderLoadGuidance(config) {
+  const plan=bucketCoveragePlan(config),messages=[];
+  const batchBudget=config.concurrency*config.targets.length;
+  let budgetNeeded=batchBudget;
+  if(plan){
+    messages.push(`<p class="hint">Bucket coverage: levels ${escape(plan.levels.join(' → '))}, ${number(plan.perTarget)} requests per target, ${number(plan.total)} total. This covers 9 input/output size pairs at each level. Time limits can stop coverage early.</p>`);
+    budgetNeeded=Math.max(budgetNeeded,plan.total);
+    if(plan.peak>config.concurrency)messages.push(notice(`The highest tested level (${plan.peak}) exceeds Maximum in-flight requests (${config.concurrency}). Raise the maximum or lower the tested levels.`,'warning'));
+    if(config.max_requests<plan.total)messages.push(notice(`The total request limit (${number(config.max_requests)}) is below bucket coverage alone (${number(plan.total)}). The selected levels cannot all be covered.`,'warning'));
+    else if(config.checks.length>1)messages.push('<p class="hint">Other selected tests share the total request limit and may leave fewer requests for bucket coverage.</p>');
+  }
+  if(config.max_requests<batchBudget)messages.push(notice(`The total request limit gives at least one target fewer than ${number(config.concurrency)} requests. That target cannot reach the maximum in-flight setting.`,'warning'));
+  if(config.max_requests<budgetNeeded)messages.push(`<button type="button" class="button small" data-action="use-request-budget" data-budget="${budgetNeeded}">Use ${number(budgetNeeded)} total requests</button><p class="hint">${plan?'Covers bucket traffic only; allow more for other selected tests.':'Allows one full batch per target at the maximum in-flight setting; individual tests may use lower levels.'} This changes your total traffic limit.</p>`);
+  return messages.join('');
 }
 function renderTrafficEditor(config) {
   const traffic=config.traffic || state.bootstrap.config.traffic,custom=!sameConfig(traffic,state.bootstrap.config.traffic),schema=state.bootstrap.traffic_schema;
@@ -182,7 +208,7 @@ function validateRunForm(form) {
     if(card){
       const id=card.dataset.testCard;
       if(!$('input[name="check"]',card).checked)continue;
-      if(input.closest('[data-test-settings]')&&form.elements[`test_mode_${id}`].value!=='custom')continue;
+      if(input.closest('[data-test-settings]')&&!input.closest('[data-bucket-settings]')&&form.elements[`test_mode_${id}`].value!=='custom')continue;
       if(input.closest('[data-traffic-settings]')&&form.elements.traffic_mode.value!=='custom')continue;
     }
     const fieldset=input.closest('fieldset'),disabled=input.disabled,fieldsetDisabled=fieldset?.disabled;
@@ -446,14 +472,14 @@ function renderNew() {
   <div class="test-suite-heading"><div><h3>Selected tests</h3><p class="hint" id="selection-summary"></p></div><div class="actions"><button class="button small" id="add-tests" type="button" data-action="toggle-available-tests" aria-expanded="false" aria-controls="test-cards">Add tests</button><button class="button small ghost" type="button" data-action="select-tests">Select all</button><button class="button small ghost" type="button" data-action="clear-tests">Clear</button></div></div>
   <p class="hint" id="no-tests-selected" hidden>No tests selected. Use Add tests to choose what to run.</p>
   <div class="test-cards" id="test-cards">${[...(state.bootstrap.checks || [])].sort((a,b)=>Number(c.checks.includes(b.id))-Number(c.checks.includes(a.id))).map(check=>renderTestCard(check,c)).join('')}</div>
-  <details class="setup-disclosure"><summary>Run ceilings <span class="dim" id="run-ceilings-summary"></span></summary><div class="details-content"><p class="hint">Hard ceilings shared across all selected tests and targets.</p><div class="fields three">${numericFields.map(([key,label,unit,min,step])=>field(key,label,c[key],{type:'number',hint:unit,min,step,required:true})).join('')}</div></div></details>
+  <details class="setup-disclosure" open><summary>Shared run limits <span class="dim" id="run-ceilings-summary"></span></summary><div class="details-content"><p class="hint">The in-flight limit controls simultaneous load. The total request limit controls how much traffic the whole run can send. Changing one does not automatically change the other.</p><div class="fields three">${numericFields.map(([key,label,unit,min,step])=>field(key,label,c[key],{type:'number',hint:unit,min,max:key==='concurrency'?256:undefined,step,required:true})).join('')}</div></div></details>
   <details class="setup-disclosure"><summary>Acceptance targets <span class="dim" id="acceptance-summary"></span></summary><div class="details-content"><p class="hint">A missing performance limit means an observation, or an inconclusive acceptance check. It does not certify a response-time requirement.</p><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Not set'})).join('')}${field('limit_max_error_rate','Maximum error rate',limits.max_error_rate,{type:'number',hint:'Fraction: 0 to 1',min:0,step:'any'})}${field('limit_min_correctness','Minimum correctness',limits.min_correctness,{type:'number',hint:'Fraction: 0 to 1',min:0,step:'any'})}${field('limit_regression_percent','Material regression threshold',limits.regression_percent,{type:'number',hint:'Percent; percentage points for rates',min:0,step:'any'})}</div></div></details>
 </div></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit the same configuration as the form, including additional workload profiles, deployment metadata, serving telemetry, multiple targets, credentials via environment-variable names, and request options. Apply changes to validate them.</p><p class="hint">${inputRetentionNotice}</p><label for="config-editor">Configuration · JSON</label><textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea><div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section>
 
   <section class="setup-section" id="setup-review">${setupSectionHeader(4,'Review & run','Check the scope and any missing settings before sending traffic.')}<div class="setup-body">
   <div class="review-baseline"><label>Compare against<select name="baseline_id">${baselineOptions(state.prefillBaseline || '')}</select></label><p class="hint">Compare with a saved baseline to check for an upgrade regression.</p></div>
-  <dl class="bound-list review-bounds" id="run-bounds"></dl></div></section>
+  <dl class="bound-list review-bounds" id="run-bounds"></dl><div id="load-guidance" role="status" aria-live="polite"></div></div></section>
   <div class="run-action-bar"><div><strong id="run-bar-summary"></strong><p class="hint">Sends requests to your configured deployment. You can stop at any time.</p></div><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''}>Run suite ${icon('arrow')}</button><div id="form-error" class="error-message" role="alert" hidden></div></div>
   </div></form>`;
   for(const check of state.bootstrap.checks){
@@ -477,6 +503,7 @@ function readForm(allowEmpty=false) {
   config.limits ||= {};
   for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','regression_percent']){const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v);}
   config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty});
+  config=configureBuckets(config,data,bucketFormDefaults(config),{allowInvalid:allowEmpty});
   config=configureJudging(config,data,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
@@ -486,12 +513,15 @@ function updateBounds() {
   $('#selection-summary').textContent=`${selected} of ${state.bootstrap.checks.length} tests selected`;
   let payload;try{payload=readForm(true);}catch{return;}
   const c=payload.config;
+  $('#load-guidance').innerHTML=renderLoadGuidance(c);
+  const bucketSummary=$('.bucket-profile-summary');
+  if(bucketSummary){const plan=bucketCoveragePlan({...c,checks:['buckets']});bucketSummary.textContent=plan?`${number(plan.perTarget)} requests per target for all 9 size pairs at each level. The total request limit is shared with other tests.`:'Enter valid concurrency levels and a sample minimum to calculate coverage.';}
   updateDatasetReadiness(c);
   for(const check of state.bootstrap.checks){
     const card=$(`[data-test-card="${check.id}"]`);
     $('[data-setting-state]',card).textContent=testSettingsLabel(check,c);
   }
-  $('#run-bounds').innerHTML=[['Targets',number(c.targets.length)],['Concurrency',`≤ ${number(c.concurrency)}`],['Request budget',`≤ ${number(c.max_requests)}`],['Run duration',`≤ ${elapsed(c.max_duration_seconds)}`],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${number(c.max_output_tokens)} tokens`],['Mode',payload.mode==='normal'?'Existing service':'Explicit restart']].map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('');
+  $('#run-bounds').innerHTML=[['Targets',number(c.targets.length)],['Maximum in flight',`≤ ${number(c.concurrency)}`],['Total request limit',`≤ ${number(c.max_requests)}`],['Run duration',`≤ ${elapsed(c.max_duration_seconds)}`],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${number(c.max_output_tokens)} tokens`],['Mode',payload.mode==='normal'?'Existing service':'Explicit restart']].map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('');
   $('#selection-summary').textContent=`${c.checks.length} of ${state.bootstrap.checks.length} tests selected`;
   $('#run-bounds').insertAdjacentHTML('afterbegin',`<div><dt>Selected tests</dt><dd>${c.checks.length}</dd></div>`);
   const missing=[];
@@ -680,7 +710,7 @@ function renderLive() {
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const title=judging?'Evaluating golden answers':'Suite in progress';
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Measuring the configured endpoint. Results are assessed when the suite finishes.';
-  const bounds=judging?[['Concurrent judge calls',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Concurrency',c.concurrency],['Request budget',c.max_requests],['Maximum duration',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
+  const bounds=judging?[['Concurrent judge calls',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Maximum in flight',c.concurrency],['Total request limit',c.max_requests],['Maximum duration',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
   $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping the suite':title}</h1><p>${stopping?'Stopping further work and saving partial evidence.':description}</p></div><button class="button danger" data-action="stop" ${stopping?'disabled':''}>${icon('stop')}${stopping?'Stopping…':'Stop run'}</button></div><div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(human(progress.scenario || progress.event || 'Preparing fixtures'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p><dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl><div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/(c.max_requests || 1)*100)}%"></span></div><div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`Request budget used · ${number(started)} of ${number(c.max_requests)}`}</span><span>${judging?'Inference timing is unchanged':'Budget ceiling, not completion'}</span></div></section><section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Recent activity</h2><span class="hint">Refreshes automatically</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.scenario || e.event || 'Progress'))}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Waiting for the first runner event…</p>'}</div></section></div><aside class="panel run-preview"><h3>${judging?'Evaluation bounds':'Run bounds'}</h3><p>${judging?'Separate limits apply to the configured judges.':'The current suite shares these ceilings across all targets.'}</p><dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Some interruptions are deliberate suite probes.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
 }
 function renderJudgement(judgement) {
@@ -729,6 +759,7 @@ function syncConfigView() {
     tab.setAttribute('aria-selected',String(active));tab.tabIndex=active?0:-1;tab.classList.toggle('selected',active);panel.hidden=!active;
   }
   $('#config-panel-form').inert=dirty;$('#execution-settings').inert=dirty;
+  const budgetButton=$('[data-action="use-request-budget"]');if(budgetButton)budgetButton.disabled=dirty;
   $('#config-panel-form').classList.toggle('config-locked',dirty);
   $('#config-draft-notice').hidden=!dirty;
   $('#json-status').textContent=dirty?'Unapplied changes':'In sync with the form';
@@ -815,6 +846,20 @@ document.addEventListener('click',async(event)=>{
   if(done){toggleTestEditor(done,true);return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
   if(reset){configChanged();const form=$('#new-run-form');form.elements[`test_mode_${reset}`].value='default';refreshInheritedFields(reset);syncTestControls();updateBounds();return;}
+  if(action==='use-request-budget'){
+    try{
+      assertAppliedConfig();
+      const budget=Number(event.target.closest('[data-budget]').dataset.budget),input=$('#new-run-form').elements.max_requests;
+      if(Number.isInteger(budget)&&budget>Number(input.value)){
+        input.value=budget;configChanged();updateBounds();
+        if(state.configView==='json'){
+          state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;
+          $('#config-editor').value=state.jsonDraft;
+        }
+      }
+    }catch(error){configError(error);}
+    return;
+  }
   if(action==='toggle-available-tests'){state.showAvailableTests=!state.showAvailableTests;syncTestControls();return;}
   if(action==='select-tests'||action==='clear-tests'){configChanged();for(const input of $$('#new-run-form input[name="check"]'))input.checked=action==='select-tests';syncTestControls();updateBounds();return;}
   if(action==='reset-traffic'){configChanged();const form=$('#new-run-form');form.elements.traffic_mode.value='default';const defaults=state.bootstrap.config.traffic;for(const [key,value] of Object.entries(defaults)){if(key==='mix'){for(const [kind,weight] of Object.entries(value))form.elements[`traffic_mix_${kind}`].value=weight;}else form.elements[`traffic_${key}`].value=Array.isArray(value)?value.join(', '):value ?? '';}syncTestControls();updateBounds();return;}

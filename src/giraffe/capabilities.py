@@ -5,7 +5,7 @@ from __future__ import annotations
 from giraffe.fixtures import SUITE_VERSION
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, Limits,
-    RunConfig, TrafficConfig, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    RunConfig, TrafficConfig, Buckets, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
     MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES, RequestPack,
 )
 from giraffe.request_pack import INPUT_RETENTION_NOTICE
@@ -55,6 +55,7 @@ def capabilities(config: RunConfig | None = None) -> dict:
         "option_schema": CheckOptions.model_json_schema(),
         "limits_schema": Limits.model_json_schema(),
         "traffic_schema": TrafficConfig.model_json_schema(),
+        "buckets": {"schema": Buckets.model_json_schema(), "defaults": Buckets().model_dump(mode="json")},
         "judging": {"schema": JudgingConfig.model_json_schema(),
                     "defaults": JudgingConfig().model_dump(mode="json"),
                     "prompt_version": JUDGE_PROMPT_VERSION, "voting_rule": JUDGE_VOTING_RULE},

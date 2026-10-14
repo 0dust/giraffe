@@ -32,6 +32,36 @@ function numeric(value, label, allowInvalid=false) {
   return result;
 }
 
+export function configureBuckets(source, values, defaults, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  if (!values.has('buckets_levels')) return config;
+  const settings = structuredClone(source.buckets || defaults);
+  settings.levels = String(values.get('buckets_levels') || '').trim().split(/[\s,]+/)
+    .filter(Boolean).map(value => numeric(value, 'Concurrency levels', allowInvalid));
+  if (!allowInvalid && (!settings.levels.length || settings.levels.length > 16 ||
+      new Set(settings.levels).size !== settings.levels.length ||
+      settings.levels.some(level => !Number.isInteger(level) || level < 1 || level > 256))) {
+    throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+  }
+  for (const name of ['samples_per_bucket','window_seconds']) {
+    settings[name] = numeric(values.get(`buckets_${name}`), name, allowInvalid);
+  }
+  if (source.buckets || config.checks.some(id => ['buckets','mixed'].includes(id)) ||
+      !sameConfig(settings, defaults)) config.buckets = settings;
+  return config;
+}
+
+// A level needs at least one full concurrent batch for each of the nine size pairs.
+// This is bucket traffic only; other selected checks share the same request budget.
+export function bucketCoveragePlan(config) {
+  if (!config.checks.includes('buckets') || !config.buckets) return null;
+  const {levels, samples_per_bucket: samples} = config.buckets;
+  if (!levels.length || levels.some(level => !Number.isInteger(level) || level < 1 || level > 256) ||
+      !Number.isInteger(samples) || samples < 2) return null;
+  const perTarget = 9 * levels.reduce((total, level) => total + Math.max(samples, level), 0);
+  return {levels, peak:Math.max(...levels), perTarget, total:perTarget * config.targets.length};
+}
+
 export function configureTests(source, values, checks, trafficDefaults, {allowEmpty=false, allowInvalid=false}={}) {
   const config = structuredClone(source);
   config.checks = values.getAll('check');

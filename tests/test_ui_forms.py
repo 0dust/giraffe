@@ -7,7 +7,83 @@ from pathlib import Path
 
 import pytest
 
-from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
+from giraffe.models import Buckets, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
+
+
+def test_bucket_controls_and_request_budget_guidance():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute browser configuration behavior")
+    from giraffe.capabilities import capabilities
+
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = f"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {{configureBuckets, bucketCoveragePlan, sameConfig}} from {json.dumps((static / 'form-config.mjs').as_uri())};
+const defaults={json.dumps(Buckets().model_dump())};
+const source={{checks:['buckets'],concurrency:8,max_requests:20,targets:[{{name:'a'}},{{name:'b'}}],buckets:null}};
+const values=new FormData();
+values.set('buckets_levels','1, 4 8');
+values.set('buckets_samples_per_bucket','4');
+values.set('buckets_window_seconds','30');
+const build=()=>configureBuckets(source,values,defaults);
+let result=build();
+assert.deepEqual(result.buckets.levels,[1,4,8]);
+assert.equal(source.buckets,null);
+assert.deepEqual(bucketCoveragePlan(result),{{levels:[1,4,8],peak:8,perTarget:144,total:288}});
+assert.equal(result.max_requests,20); // Never silently raise a total traffic limit.
+result.concurrency=16;
+assert.deepEqual(bucketCoveragePlan(result),{{levels:[1,4,8],peak:8,perTarget:144,total:288}});
+result.buckets.levels=[1,16];
+assert.equal(bucketCoveragePlan(result).total,360);
+result.checks=['mixed'];assert.equal(bucketCoveragePlan(result),null);
+result.checks=['serving'];assert.equal(bucketCoveragePlan(result),null);
+source.checks=['serving'];
+values.set('buckets_levels',defaults.levels.join(', '));
+assert.equal(build().buckets,null); // Ordinary edits do not activate an optional workload.
+values.set('buckets_levels','8');assert.deepEqual(build().buckets.levels,[8]);
+source.buckets={{...defaults,input_chars:{{short:20,medium:40,long:80}},mixed_pairs:7}};
+assert.deepEqual(build().buckets.input_chars,source.buckets.input_chars);
+assert.equal(build().buckets.mixed_pairs,7);
+assert.deepEqual(configureBuckets(result,new FormData(),defaults),result);
+for(const invalid of ['', '0', '2, 2', '1.5', '257', 'Infinity', 'oops']) {{
+  values.set('buckets_levels',invalid);assert.throws(build,/Concurrency levels/);
+}}
+values.set('buckets_levels','1, oops');
+assert.doesNotThrow(()=>configureBuckets(source,values,defaults,{{allowInvalid:true}}));
+const bootstrap={json.dumps(capabilities())};
+bootstrap.config={{traffic:bootstrap.defaults.traffic}};
+const app=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
+  .replace(/^import .*?;\\n/,'').replace(/\\ninit\\(\\);\\s*$/,'');
+const context={{structuredClone,sameConfig,bucketCoveragePlan,
+  document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
+vm.runInNewContext(app+`\nstate.bootstrap=${{JSON.stringify(bootstrap)}};`,context);
+const html=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='buckets'),
+  {{checks:['buckets'],concurrency:8,max_output_tokens:128,buckets:null,test_options:{{}}}})`,context);
+assert.match(html,/name="buckets_levels"/);
+assert.match(html,/name="buckets_samples_per_bucket"/);
+assert.match(html,/Concurrency levels/);
+assert.doesNotMatch(html,/Customize <code>buckets<\\/code> in the JSON/);
+context.draft={{checks:['buckets'],concurrency:8,max_output_tokens:128,
+  buckets:{{...defaults,levels:['<img src=x>']}}}};
+const draftHtml=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='buckets'),draft)`,context);
+assert.doesNotMatch(draftHtml,/<img src=x>/);
+context.config={{...source,checks:['buckets'],buckets:{{...defaults,levels:[1,4,8]}}}};
+let guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
+assert.match(guidance,/288 total/);assert.match(guidance,/Use 288 total requests/);
+context.config.max_requests=288;
+guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
+assert.doesNotMatch(guidance,/data-action="use-request-budget"/);
+context.config.concurrency=4;
+assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/highest tested level \\(8\\) exceeds/);
+context.config={{...source,checks:['correctness'],buckets:null,max_requests:1}};
+assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/Use 16 total requests/);
+"""
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("scenario", [
@@ -254,9 +330,10 @@ import vm from 'node:vm';
 import {{optionDefault, optionValue, limitValue, sameConfig}} from {json.dumps((static / 'form-config.mjs').as_uri())};
 const listeners={{}}, elements={{}}, cards={{}};
 const checks=[{{id:'correctness',title:'Known answers',description:'Check answers',option_fields:['samples'],limit_fields:[],defaults:{{samples:6}}}},
-  {{id:'capacity',title:'Capacity',description:'Test traffic',option_fields:[],limit_fields:['latency_ms'],defaults:{{limits:{{latency_ms:null}}}}}}];
+  {{id:'capacity',title:'Capacity',description:'Test traffic',option_fields:[],limit_fields:['latency_ms'],defaults:{{limits:{{latency_ms:null}}}}}},
+  {{id:'buckets',title:'Bucket coverage',description:'Test levels',option_fields:[],limit_fields:[],defaults:{{}}}}];
 const traffic={{rates:[1,2,4],arrival:'steady',duration_seconds:5,mix:{{short:.6,long_input:.2,long_output:.2}}}};
-for(const id of ['correctness','capacity']){{
+for(const id of ['correctness','capacity','buckets']){{
   const fieldset={{disabled:true}}, selection={{checked:id==='capacity'}}, status={{textContent:''}}, draft={{hidden:true}};
   const trigger={{attributes:{{}},setAttribute(k,v){{this.attributes[k]=v;}},focus(){{this.focused=true;}}}};
   const editor={{hidden:true,querySelectorAll:()=>[fieldset]}};
@@ -272,7 +349,8 @@ for(const [name,value] of Object.entries({{context_limit:4096,concurrency:8,max_
 function input(name,id,section,value){{
   const item={{name,value,dataset:{{inherited:'true'}},disabled:false,valid:true,
     closest(q){{if(q==='[data-test-card]')return cards[id];if(q==='fieldset')return cards[id].fieldset;
-      if(q==='[data-test-settings]'&&section==='test')return {{dataset:{{testSettings:id}}}};
+      if(q==='[data-test-settings]'&&['test','bucket'].includes(section))return {{dataset:{{testSettings:id}}}};
+      if(q==='[data-bucket-settings]'&&section==='bucket')return {{}};
       if(q==='[data-traffic-settings]'&&section==='traffic')return {{}};
       return null;}},checkValidity(){{return this.valid;}},reportValidity(){{this.reported=true;}}}};
   elements[name]=item;return item;
@@ -280,7 +358,8 @@ function input(name,id,section,value){{
 const samples=input('test_correctness_samples','correctness','test','6');
 const latency=input('test_capacity_limit_latency_ms','capacity','test','');
 const rates=input('traffic_rates','capacity','traffic','1, 2, 4');
-const form={{elements,querySelectorAll:()=>[samples,latency,rates]}};
+const levels=input('buckets_levels','buckets','bucket','1, 8');
+const form={{elements,querySelectorAll:()=>[samples,latency,rates,levels]}};
 const document={{addEventListener:(kind,fn)=>listeners[kind]=fn,querySelector(q){{
   if(q==='#new-run-form')return form;
   const card=q.match(/^\[data-test-card="(.*?)"\]$/);if(card)return cards[card[1]];
@@ -289,12 +368,12 @@ const document={{addEventListener:(kind,fn)=>listeners[kind]=fn,querySelector(q)
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,
-  document,window:{{addEventListener(){{}}}},assert,checks,traffic,cards,elements,form,samples,latency,rates,listeners}};
+  document,window:{{addEventListener(){{}}}},assert,checks,traffic,cards,elements,form,samples,latency,rates,levels,listeners}};
 vm.runInNewContext(source+`
-state.bootstrap={{checks,config:{{traffic}},option_schema:{{properties:{{samples:{{type:'integer',minimum:1}}}}}},
+state.bootstrap={{checks,config:{{traffic}},buckets:{{defaults:{json.dumps(Buckets().model_dump())}}},option_schema:{{properties:{{samples:{{type:'integer',minimum:1}}}}}},
  limits_schema:{{properties:{{latency_ms:{{anyOf:[{{type:'number'}},{{type:'null'}}]}}}}}},
  traffic_schema:{{properties:{{rates:{{type:'array'}},arrival:{{enum:['steady','poisson']}}}},$defs:{{TrafficMix:{{properties:{{short:{{type:'number'}},long_input:{{type:'number'}},long_output:{{type:'number'}}}}}}}}}}}};
-state.config={{checks:['capacity'],targets:[{{}}],samples:6,traffic,limits:{{latency_ms:null}},test_options:{{correctness:{{samples:9}}}}}};
+state.config={{checks:['capacity'],targets:[{{}}],samples:6,concurrency:8,max_output_tokens:128,traffic,limits:{{latency_ms:null}},test_options:{{correctness:{{samples:9}}}}}};
 syncConfigView=()=>{{}};
 updateBounds=()=>{{}}; // The DOM mock exercises disclosure and input behavior, not report markup.
 let markup=renderTestCard(checks[0],state.config);
@@ -368,6 +447,15 @@ assert.equal(validateRunForm(form),false);
 assert.equal(state.openTest,'correctness');
 assert.equal(cards.correctness.fieldset.disabled,false);
 assert.equal(samples.reported,true);
+samples.valid=true;cards.correctness.selection.checked=false;
+levels.valid=false;
+assert.equal(elements.test_mode_buckets.value,'default');
+assert.equal(validateRunForm(form),true);
+cards.buckets.selection.checked=true;
+assert.equal(validateRunForm(form),false);
+assert.equal(state.openTest,'buckets');
+assert.equal(cards.buckets.fieldset.disabled,false);
+assert.equal(levels.reported,true);
 `,context);
 """
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
@@ -391,6 +479,7 @@ for(const id of ['config-tab-form','config-tab-json','config-panel-form','config
 }}
 const form={{elements:{{baseline_id:{{value:'before'}},mode:{{value:'normal'}},restart_target:{{value:'local'}},model:{{focus(){{this.focused=true;}}}}}}}};
 nodes['#new-run-form']=form;
+nodes['[data-action="use-request-budget"]']={{disabled:false}};
 const document={{querySelector:q=>nodes[q],addEventListener:(kind,fn)=>listeners[kind]=fn,
   createElement:()=>({{click(){{this.clicked=true;}}}})}};
 const context={{structuredClone,document,window:{{addEventListener(){{}}}},assert,nodes,form,listeners,
@@ -413,6 +502,7 @@ const base=state.jsonBase;
 state.jsonDraft='{{ invalid';state.configRevision++;
 switchConfigView('form');assert.equal(nodes['#config-panel-form'].inert,true);
 assert.equal(nodes['#execution-settings'].inert,true);
+assert.equal(nodes['[data-action="use-request-budget"]'].disabled,true);
 switchConfigView('json');assert.equal(state.jsonDraft,'{{ invalid');
 assert.throws(assertAppliedConfig,/Apply or discard/);
 let calls=0;api=async()=>{{calls++;return {{config:{{}}}};}};
@@ -422,6 +512,7 @@ assert.equal(state.jsonDraft,'{{ invalid');assert.equal(nodes['#config-error'].h
 await exportConfig();await copyCli();
 assert.equal(calls,0);assert.equal(downloads.length,0);
 discardConfig();assert.equal(state.jsonDraft,base);assert.equal(nodes['#config-panel-form'].inert,false);
+assert.equal(nodes['[data-action="use-request-budget"]'].disabled,false);
 // Invalid imports never replace the form, the applied snapshot, or a retained draft.
 await importConfig({{text:async()=>'bad json'}});
 assert.equal(JSON.stringify(state.config),before);assert.equal(state.jsonDraft,base);
@@ -482,6 +573,18 @@ resolve({{config:current.config}});await assert.rejects(snapshot,/changed during
 state.tab='baseline';state.configView='json';state.jsonDraft=state.jsonBase;
 listeners.keydown({{key:'Home',preventDefault(){{}},target:{{closest(q){{return q==='[data-config-tab]'?{{}}:null;}}}}}});
 assert.equal(state.configView,'form');assert.equal(state.tab,'baseline');
+// The shared review action updates whichever configuration view is visible.
+state.configView='json';state.jsonDraft=state.jsonBase;
+form.elements.max_requests={{value:'1'}};
+readForm=()=>({{config:{{...current.config,max_requests:Number(form.elements.max_requests.value)}},mode:'normal'}});
+updateBounds=()=>{{}};
+await listeners.click({{target:{{closest(q){{
+  if(q==='[data-action]')return {{dataset:{{action:'use-request-budget'}}}};
+  if(q==='[data-budget]')return {{dataset:{{budget:'16'}}}};
+  return null;
+}}}}}});
+assert.equal(JSON.parse(nodes['#config-editor'].value).max_requests,16);
+assert.equal(state.jsonDraft,state.jsonBase);
 }})()
 `,context);
 """

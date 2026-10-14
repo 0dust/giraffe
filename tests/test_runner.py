@@ -112,6 +112,52 @@ def check(report, id, target="service"):
     return next(c for c in report.checks if c.id == id and c.target == target)
 
 
+async def test_bucket_window_expires_while_waiting_for_shared_concurrency(client):
+    from giraffe.workloads import buckets
+
+    configuration = config(checks=["buckets"], concurrency=8,
+                           buckets={"levels": [8], "samples_per_bucket": 2,
+                                    "window_seconds": .01})
+    run = runner._Run(configuration, None, None)
+    target = configuration.targets[0]
+    for _ in range(configuration.concurrency):
+        run.slots.get_nowait()
+
+    async def release_competing_requests():
+        await asyncio.sleep(.04)
+        for _ in range(configuration.concurrency):
+            run.release_slot()
+
+    await asyncio.gather(buckets(run, target, client(target, configuration)),
+                         release_competing_requests())
+    assert not any(record.scenario == "bucket_c8_short_short" for record in run.records)
+    assert run.records  # Later cells can still use the released slots.
+    assert "buckets" in run.unfinished[target.name]
+    assert run.slots.qsize() == configuration.concurrency
+
+
+async def test_bucket_request_uses_remaining_window_after_queue_admission(client, monkeypatch):
+    from giraffe.workloads import bucket_spec
+
+    configuration = config(checks=["buckets"])
+    run = runner._Run(configuration, None, None)
+    target = configuration.targets[0]
+    request = bucket_spec(configuration.buckets, "short", "short", "bucket", "buckets", 1)
+    monkeypatch.setattr(client, "delay", 1)
+    for _ in range(configuration.concurrency):
+        run.slots.get_nowait()
+    deadline = time.monotonic() + .2
+    pending = asyncio.create_task(run.request(target, client(target, configuration), request,
+                                             timeout_override=.2, deadline_override=deadline))
+    await asyncio.sleep(.1)
+    for _ in range(configuration.concurrency):
+        run.release_slot()
+    record = await pending
+    assert record.status == "timeout"
+    assert record.elapsed_ms < 150
+    assert run.slots.qsize() == configuration.concurrency
+
+
 @pytest.mark.parametrize("selected,allowed", [
     ("correctness", {"correctness_c2"}), ("generation", {"generation"}),
     ("json", {"json_c2"}), ("capacity", {"traffic_stage_0", "traffic_stage_1"}),
