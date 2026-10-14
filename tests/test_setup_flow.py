@@ -140,7 +140,7 @@ values.set('buckets_samples_per_bucket','5');
 values.set('buckets_window_seconds','30');
 const buckets = setup.configureBuckets(preset,values,defaults);
 const before = structuredClone(buckets);
-const configured = setup.configureSetupLoad(buckets,values,'concurrent');
+const configured = setup.configureSetupLoad(buckets,'concurrent');
 assert.deepEqual(buckets,before);
 assert.deepEqual(configured.buckets.levels,[1,4,8]);
 assert.equal(configured.concurrency,8);
@@ -148,7 +148,7 @@ assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
 for (const mode of ['answers','arrival','custom']) {
   const imported = {...configured,concurrency:16};
-  assert.deepEqual(setup.configureSetupLoad(imported,values,mode),imported);
+  assert.deepEqual(setup.configureSetupLoad(imported,mode),imported);
 }
 console.log(JSON.stringify(configured));
 """)
@@ -167,10 +167,10 @@ for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']
   values.set('buckets_window_seconds','30');
   const draft = setup.configureBuckets(preset,values,defaults,{allowInvalid:true});
   const before = structuredClone(draft);
-  assert.deepEqual(setup.configureSetupLoad(draft,values,'concurrent',{allowInvalid:true}),before);
+  assert.deepEqual(setup.configureSetupLoad(draft,'concurrent',{allowInvalid:true}),before);
   assert.deepEqual(draft,before);
-  assert.throws(()=>setup.configureSetupLoad(draft,values,'concurrent'),/Concurrency levels/);
-  assert.deepEqual(setup.configureSetupLoad(draft,values,'custom'),before);
+  assert.throws(()=>setup.configureSetupLoad(draft,'concurrent'),/Concurrency levels/);
+  assert.deepEqual(setup.configureSetupLoad(draft,'custom'),before);
 }
 """)
 
@@ -198,7 +198,7 @@ assert.deepEqual(configured.buckets.heavy_weights,source.buckets.heavy_weights);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
 values.set('buckets_output_long','256');
-assert.throws(()=>setup.configureBuckets(source,values,defaults),/answer cap.*max_output_tokens.*128/i);
+assert.throws(()=>setup.configureBuckets(source,values,defaults),/answer cap must be 128 tokens or less/i);
 const draft = setup.configureBuckets(source,values,defaults,{allowInvalid:true});
 assert.equal(draft.buckets.output_tokens.long,256);
 assert.equal(draft.max_output_tokens,128);
@@ -293,7 +293,7 @@ for (const key of ['concurrency','request_timeout_seconds','max_duration_seconds
 let configured = setup.configureTests(preset,values,checks,preset.traffic);
 configured = setup.configureBuckets(configured,values,defaults);
 configured = setup.configureJudging(configured,values);
-configured = setup.configureSetupLoad(configured,values,'concurrent');
+configured = setup.configureSetupLoad(configured,'concurrent');
 assert.deepEqual(preset,before);
 assert.deepEqual(configured,preset);
 assert.equal(configured.request_source,'request_pack');
@@ -312,3 +312,83 @@ console.log(JSON.stringify(configured));
     assert configured.test_options["correctness"].concurrency == 4
     assert configured.request_pack.cases[0].fixture_id == "one"
     assert configured.judging.judges[0].headers_env == {"X-Project": "PROJECT"}
+
+
+def test_setup_transitions_preserve_owned_overrides_when_inheritance_matches():
+    result = run_setup_script("""
+function valuesFor(config) {
+  const values = new FormData();
+  for (const id of config.checks) values.append('check',id);
+  for (const check of checks) {
+    values.set(`test_mode_${check.id}`,config.test_options[check.id] ? 'custom' : 'default');
+    for (const name of check.option_fields) values.set(`test_${check.id}_${name}`,setup.optionValue(config,check,name) ?? '');
+    for (const name of check.limit_fields) values.set(`test_${check.id}_limit_${name}`,setup.limitValue(config,check,name) ?? '');
+  }
+  values.set('traffic_mode','default');
+  return values;
+}
+source.samples = 6;
+source.concurrency = 16;
+source.limits.min_correctness = 0.95;
+source.limits.latency_ms = 1200;
+source.limits.first_output_ms = null;
+source.test_options = {
+  correctness:{samples:6,concurrency:8,limits:{min_correctness:0.95}},
+  capacity:{limits:{latency_ms:1200,first_output_ms:null}},
+  recovery:{sustained_seconds:2},
+};
+source.buckets = {...defaults,levels:[1,4,8],samples_per_bucket:5};
+const before = structuredClone(source);
+const concurrent = setup.applySetupPreset(source,'concurrent',defaults);
+assert.equal(concurrent.concurrency,8);
+const captured = setup.configureTests(concurrent,valuesFor(concurrent),checks,source.traffic);
+assert.deepEqual(captured.test_options,source.test_options);
+assert.deepEqual(source,before);
+const answers = setup.applySetupPreset(captured,'answers',defaults);
+answers.concurrency = 16;
+answers.samples = 9;
+answers.limits.min_correctness = 0.9;
+answers.limits.latency_ms = 2000;
+answers.limits.first_output_ms = 500;
+const configured = setup.configureTests(answers,valuesFor(answers),checks,source.traffic);
+assert.deepEqual(configured.test_options,source.test_options);
+assert.equal(setup.optionValue(configured,checks.find(check => check.id === 'correctness'),'concurrency'),8);
+assert.equal(setup.limitValue(configured,checks.find(check => check.id === 'capacity'),'first_output_ms'),null);
+console.log(JSON.stringify(configured));
+""")
+    configured = RunConfig.model_validate(result)
+    assert configured.effective_check("correctness")["concurrency"] == 8
+    assert configured.effective_check("correctness")["samples"] == 6
+    assert configured.effective_check("correctness")["limits"]["min_correctness"] == 0.95
+    assert configured.effective_check("capacity")["limits"]["latency_ms"] == 1200
+    assert configured.effective_check("capacity")["limits"]["first_output_ms"] is None
+
+
+def test_owned_override_preservation_keeps_reset_blank_and_sparse_semantics():
+    run_setup_script("""
+const values = new FormData();
+for (const id of source.checks) values.append('check',id);
+source.concurrency = 8;
+source.limits.latency_ms = 1200;
+source.test_options = {
+  correctness:{samples:source.samples,concurrency:8},
+  capacity:{limits:{latency_ms:1200,first_output_ms:null}},
+  recovery:{sustained_seconds:2},
+};
+for (const check of checks) {
+  values.set(`test_mode_${check.id}`,source.test_options[check.id] ? 'custom' : 'default');
+  for (const name of check.option_fields) values.set(`test_${check.id}_${name}`,setup.optionValue(source,check,name) ?? '');
+  for (const name of check.limit_fields) values.set(`test_${check.id}_limit_${name}`,setup.limitValue(source,check,name) ?? '');
+}
+values.set('traffic_mode','default');
+values.set('test_correctness_samples','');
+values.set('test_mode_capacity','default');
+values.set('test_mode_json','custom');
+const configured = setup.configureTests(source,values,checks,source.traffic);
+assert.deepEqual(configured.test_options.correctness,{concurrency:8});
+assert.equal(configured.test_options.capacity,undefined);
+assert.equal(configured.test_options.json,undefined);
+assert.deepEqual(configured.test_options.recovery,{sustained_seconds:2});
+values.set('test_mode_correctness','default');
+assert.equal(setup.configureTests(configured,values,checks,source.traffic).test_options.correctness,undefined);
+""")

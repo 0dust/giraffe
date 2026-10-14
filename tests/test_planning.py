@@ -52,6 +52,28 @@ def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, upda
     assert result["planned_per_target"] == result["known_per_target"] == expected
 
 
+@pytest.mark.parametrize("stream,concurrency,kind,known", [
+    (False, 2, "exact", 6),
+    (True, 1, "exact", 6),
+    (True, 2, "bounded", 12),
+])
+def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, concurrency, kind, known):
+    result = plan(config(checks=["fairness"], stream=stream, concurrency=concurrency))
+    assert result["count_kind"] == kind
+    assert result["known_per_target"] == known
+    assert result["required_request_limit"] == (known if kind == "exact" else None)
+    assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
+
+
+@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 2), (2, "bounded", 14)])
+def test_mixed_plan_only_includes_interference_work_when_concurrency_allows_it(concurrency, kind, known):
+    result = plan(config(checks=["mixed"], concurrency=concurrency))
+    assert result["count_kind"] == kind
+    assert result["known_per_target"] == known
+    assert result["required_request_limit"] == (known if kind == "exact" else None)
+    assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
+
+
 def test_bucket_plan_covers_nine_real_prompts_and_full_batches():
     configuration = config(checks=["access", "buckets"], concurrency=8,
                            buckets={"levels": [1, 4, 8], "samples_per_bucket": 4})
@@ -116,7 +138,8 @@ def test_saved_dataset_does_not_replace_generated_buckets_or_activate_judges():
     assert next(row for row in result["rows"] if row["id"] == "buckets")["source"] == "generated examples"
     assert result["evaluator"] == {"active": False, "call_upper_bound": 0, "judge_count": 0,
                                    "ready": True, "readiness_errors": []}
-    assert any("dataset" in warning and "generated" in warning for warning in result["warnings"])
+    assert any("saved questions" in warning and "generated questions" in warning for warning in result["warnings"])
+    assert not any("dataset is inactive" in warning for warning in result["warnings"])
 
 
 @pytest.mark.parametrize("rate,duration", [(1, 2.5), (3, .7), (.3, 10), (7, 1)])
@@ -153,11 +176,14 @@ def test_poisson_rates_are_labeled_expected_estimates_without_building_schedules
 
 def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
     configuration = config(checks=["capacity"])
-    assert any("capacity verdict" in warning and "inconclusive" in warning
+    assert any("Without a time target" in warning and "measurements only" in warning
                for warning in plan(configuration)["warnings"])
     with_goal = config(checks=["capacity"], test_options={
         "capacity": {"limits": {"latency_ms": 1000}}})
-    assert not any("capacity verdict" in warning for warning in plan(with_goal)["warnings"])
+    assert not any("Without a time target" in warning for warning in plan(with_goal)["warnings"])
+    with_first_text_goal = config(checks=["capacity"], test_options={
+        "capacity": {"limits": {"first_output_ms": 1000}}})
+    assert not any("Without a time target" in warning for warning in plan(with_first_text_goal)["warnings"])
 
 
 @pytest.mark.parametrize("updates,known", [
@@ -208,3 +234,45 @@ def test_empty_dataset_and_blank_model_remain_editable_with_unknown_active_count
     empty = plan(ConfigDraft.model_validate(draft.model_dump() | {"checks": []}))
     assert empty["count_kind"] == "exact"
     assert empty["planned_total"] == 0
+
+
+@pytest.mark.parametrize("arrival", ["steady", "poisson"])
+async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview(tmp_path, monkeypatch, arrival):
+    import httpx
+    from giraffe import request_pack, traffic, web
+    from giraffe.planning import request_plan
+
+    configuration = ConfigDraft.model_validate(config().model_dump() | {
+        "checks": ["access", "correctness", "capacity"], "request_source": "request_pack",
+        "request_pack": {"version": 1, "cases": [
+            {"fixture_id": "judged", "messages": [{"role": "user", "content": "A?"}],
+             "scorer": "judge", "expected": "A", "weight": 3},
+            {"fixture_id": "exact", "messages": [{"role": "user", "content": "B?"}],
+             "scorer": "exact", "expected": "B", "weight": 1},
+        ]},
+        "traffic": {"rates": [1.5, 3], "duration_seconds": 2, "arrival": arrival},
+        "targets": [{"name": name, "url": "http://localhost/v1", "model": ""} for name in ("a", "b")],
+        "judging": {"judges": [{"name": "judge"}]}, "max_requests": 3,
+    })
+    expected = request_plan(configuration, pack_details=request_pack.pack_preview(configuration))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Draft plan constructed full request-pack preview details or identities")
+
+    for name in ("pack_preview", "pack_specs", "pack_identity", "judging_identity", "_digest"):
+        monkeypatch.setattr(request_pack, name, forbidden)
+    monkeypatch.setattr(web, "pack_preview", forbidden)
+    schedule_calls = []
+    schedule = traffic.arrival_schedule
+
+    def counted_schedule(settings, rate, stage_index=0):
+        schedule_calls.append(stage_index)
+        return schedule(settings, rate, stage_index)
+
+    monkeypatch.setattr(traffic, "arrival_schedule", counted_schedule)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=web.create_app(tmp_path)),
+                                 base_url="http://test") as client:
+        response = await client.post("/api/config/draft", json=configuration.model_dump(mode="json"))
+    assert response.status_code == 200, response.text
+    assert response.json()["request_plan"] == expected
+    assert schedule_calls == [0, 1]

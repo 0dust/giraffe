@@ -77,7 +77,7 @@ export function applySetupPreset(source, preset, defaults) {
 
 // Basic concurrent testing has one load control: the tested levels. Advanced
 // configurations retain their independently chosen run ceiling.
-export function configureSetupLoad(source, values, preset, {allowInvalid=false}={}) {
+export function configureSetupLoad(source, preset, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   if (preset !== 'concurrent') return config;
   if (!validBucketLevels(config.buckets?.levels)) {
@@ -119,7 +119,7 @@ export function configureBuckets(source, values, defaults, {allowInvalid=false}=
   }
   if (!allowInvalid && config.checks.some(id => ['buckets','mixed'].includes(id)) &&
       Object.values(settings.output_tokens).some(cap => cap > config.max_output_tokens)) {
-    throw new Error(`Each answer cap must stay within max_output_tokens (${config.max_output_tokens}).`);
+    throw new Error(`Each answer cap must be ${config.max_output_tokens} tokens or less. Lower the answer cap or edit the run output cap under Context, output & request deadlines.`);
   }
   if (source.buckets || config.checks.some(id => ['buckets','mixed'].includes(id)) ||
       !sameConfig(settings, defaults)) config.buckets = settings;
@@ -150,22 +150,26 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
       delete config.test_options[check.id];
       continue;
     }
+    const previous = source.test_options?.[check.id] || {};
     const options = {};
     for (const name of check.option_fields) {
       if (config.request_source === 'request_pack' && check.id === 'correctness' && ['samples','concurrency'].includes(name)) {
-        if (Object.hasOwn(source.test_options?.correctness || {}, name)) options[name] = source.test_options.correctness[name];
+        if (Object.hasOwn(previous, name)) options[name] = previous[name];
         continue;
       }
       const raw = values.get(`test_${check.id}_${name}`);
       const value = ['trace_file','server_log','backend_verification'].includes(name) ? (String(raw || '').trim() || null) : numeric(raw, name, allowInvalid);
-      if (value !== null && value !== optionDefault(config, check, name)) options[name] = value;
+      // A saved override still owns its value when the global setting happens
+      // to match it. Blank options and Reset remain explicit ways to inherit.
+      if (value !== null && (value !== optionDefault(config, check, name) ||
+          (Object.hasOwn(previous, name) && previous[name] != null))) options[name] = value;
     }
     const limits = {};
     for (const name of check.limit_fields) {
       const value = numeric(values.get(`test_${check.id}_limit_${name}`), name, allowInvalid);
       const inherited = Object.hasOwn(config.limits || {}, name) ?
         config.limits[name] : check.defaults.limits[name];
-      if (value !== inherited) limits[name] = value;
+      if (value !== inherited || Object.hasOwn(previous.limits || {}, name)) limits[name] = value;
     }
     if (Object.keys(limits).length) options.limits = limits;
     if (Object.keys(options).length) config.test_options[check.id] = options;

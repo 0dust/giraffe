@@ -16,10 +16,13 @@ giraffe inspect runs/after/report.json
 giraffe export runs/after/report.json > reproduction.json
 ```
 
-The local UI exposes bucket concurrency levels, sample minimums and measurement
-windows under **Input/output and concurrency coverage → Configure**. Other
-workload settings, deployment metadata, metrics profiles and separate metrics
-credentials remain available in JSON. Advanced configuration accepts the same
+In the local UI, choose **Test under load → Requests at once** to edit the
+request counts to test, question lengths in characters and answer caps in tokens.
+The form shows the resulting size combinations directly. Sample minimums and
+per-case time limits are available in advanced settings. **Choose individual
+tests** keeps the full suite and its per-test controls available. Deployment
+metadata, metrics profiles and separate metrics credentials remain available in
+JSON. Advanced configuration accepts the same
 `RunConfig` used by the CLI. Run results, standalone HTML and JSON include the
 same request evidence, workload outcomes, configuration differences and telemetry.
 The Configuration tab offers a reproduction export. Exporting never launches a
@@ -32,14 +35,24 @@ limit**) caps total target requests across all selected tests and targets. It st
 independent of concurrency; increasing simultaneous load does not authorize more
 total traffic. AI evaluator calls use separate limits.
 
-`buckets.levels` selects the simultaneous request counts to test. Each of the nine
-input/output size pairs sends `max(samples_per_bucket, level)` requests at every
+`buckets.levels` selects the simultaneous request counts to test. In the simple
+concurrent-load form, these counts also determine the run's concurrency ceiling;
+custom configurations retain their independently configured ceiling. Each of the
+nine input/output size pairs sends `max(samples_per_bucket, level)` requests at every
 level, enough for at least one full concurrent batch. For levels `[1, 4, 8]` and
 a sample minimum of 4, bucket coverage needs `9 × (4 + 4 + 8) = 144` requests per
-target. The UI updates this count and flags insufficient budgets as you edit,
-with an explicit action to raise the total request limit. Other selected tests
-share that limit; time limits, errors and cancellation can also leave coverage
-incomplete. Changing the global in-flight limit does not change the tested levels.
+target. The review includes other selected tests in its plan and flags
+insufficient request limits as you edit, with an explicit action to raise the
+limit when a complete count is known. Adaptive work remains labeled as bounded
+and built-in random arrival counts as estimates. Time limits, errors and cancellation can
+leave coverage incomplete. In custom configurations, changing the global in-flight
+limit does not change the tested levels.
+
+The built-in question length targets are 64, 256 and 512 characters; answer caps
+are 16, 48 and 96 tokens. These are editable presets, not categories of question
+difficulty. The generator pairs every question target with every answer cap,
+giving three times three cases. Answer instructions can add characters to the
+question, and a token cap does not guarantee an answer reaches that length.
 
 ## Workload settings and evidence
 

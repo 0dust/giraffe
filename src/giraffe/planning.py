@@ -7,7 +7,7 @@ from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
-from giraffe.request_pack import active_pack, pack_preview
+from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, label_prompt
 
 
@@ -27,7 +27,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     """Count complete fixed work before hard caps; leave adaptive totals unknown.
 
     Rows account for shared controls only once. ``known`` includes only exact
-    fixed portions, and evaluator calls use the existing pack preview contract.
+    fixed portions, and evaluator calls share the dataset preview's count rules.
     The optional preview avoids rebuilding request-pack schedules in the API.
     """
     selected = set(config.checks)
@@ -70,7 +70,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     pack_selected = config.request_source == "request_pack" and bool(selected & {"capacity", "correctness"})
     pack = active_pack(config)
-    details = pack_details if pack_details is not None else pack_preview(config) if pack else None
+    details = pack_details if pack_details is not None else pack_summary(config) if pack else None
     if pack_selected:
         count = len(config.request_pack.cases) if pack else None
         add("pack_control", count, "Sends each of your questions once. The answer and arrival checks reuse these results."
@@ -84,7 +84,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append("Scheduled requests use the run limit even when Giraffe cannot send them because all request slots are busy.")
         limits = config.effective_check("capacity")["limits"]
         if limits["first_output_ms"] is None and limits["latency_ms"] is None:
-            warnings.append("Arrival performance will be measured, but the capacity verdict remains inconclusive without a first-output or full-answer timing goal.")
+            warnings.append("Set a maximum answer time or time to first text for a pass/fail result under load. Without a time target, Giraffe reports measurements only.")
         if pack_selected and not pack:
             add("capacity", None, "Add your questions to calculate the arrival request count.",
                 source="your dataset", kind="bounded")
@@ -185,7 +185,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                               "requests_per_target": 9 * max(settings.samples_per_bucket, level)}
                              for level in settings.levels]
             add("buckets", sum(level["requests_per_target"] for level in bucket_levels),
-                "Tests all nine input-size and answer-limit combinations at every selected load. Each combination includes at least one full batch.")
+                "Tries every question length with every answer cap at each selected load. Each combination sends enough requests to reach that load.",
+                title="Question and answer size tests")
         if "mixed" in selected:
             add("mixed_control", settings.mixed_pairs, "Quiet short controls for mixed-load comparisons.",
                 title="Mixed-load controls")
@@ -199,7 +200,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 add("mixed", None, f"Up to {pairs} heavy requests start only while a short response is streaming.",
                     kind="bounded")
         if config.request_pack is not None:
-            warnings.append("Bucket and mixed workloads use generated examples; your saved dataset does not replace those requests.")
+            warnings.append("Size and mixed-load tests use generated questions. Your saved questions are kept for answer and rate tests.")
     if "sessions" in selected:
         settings = config.sessions
         maximum = len(settings.modes) * settings.sessions * len(settings.turns)
@@ -224,7 +225,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if evaluator["active"]:
         warnings.append("AI judge calls run separately from the target request budget and send cases and generated answers to each judge.")
         warnings.extend(evaluator["readiness_errors"])
-    if config.request_source == "request_pack" and not pack_selected:
+    if config.request_source == "request_pack" and not pack_selected and not selected & {"buckets", "mixed"}:
         warnings.append("Your dataset is inactive: select answer correctness or arrival capacity to use it.")
     if config.overlap_models and target_count > 1:
         warnings.append("Models run at the same time and share the maximum requests at a time. Their actual overlap depends on when request slots become free.")
@@ -238,8 +239,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             warnings.append(f"{target} needs at least {known} requests, but its share of the run limit is {quota}. Some tests may be incomplete.")
         elif planned is not None and planned > quota:
             warnings.append(f"About {planned} requests are planned for {target}, but its share of the run limit is {quota}. Some tests may be incomplete.")
-    if rows:
-        warnings.append("Counts show the complete plan. The run may stop earlier when its request, time or error limit is reached.")
     return {"count_kind": kind, "planned_per_target": planned,
             "planned_total": planned * target_count if planned is not None else None,
             "known_per_target": known, "known_total": known * target_count,

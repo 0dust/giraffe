@@ -10,6 +10,304 @@ import pytest
 from giraffe.models import Buckets, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
 
 
+def test_first_run_goals_sizes_and_confirmed_live_plan():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to exercise browser setup behavior")
+    from giraffe.capabilities import capabilities
+
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    script = rf"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import * as formConfig from {json.dumps((static / 'form-config.mjs').as_uri())};
+const nodes={{'#request-plan':{{innerHTML:''}},'#request-pack-preview':{{innerHTML:''}}}},listeners={{}},timers=[];
+const context={{assert,structuredClone,...formConfig,nodes,listeners,timers,
+  setTimeout(fn){{timers.push(fn);return timers.length;}},clearTimeout(){{}},
+  document:{{querySelector:q=>nodes[q],addEventListener:(kind,fn)=>listeners[kind]=fn}},window:{{addEventListener(){{}}}}}};
+const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
+  .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+context.bootstrap={json.dumps(capabilities())};
+context.config={json.dumps(RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['access','buckets'],concurrency=8,buckets={'levels':[1,4,8],'samples_per_bucket':5}).model_dump(mode='json'))};
+await vm.runInNewContext(source+`
+(async()=>{{
+state.bootstrap=bootstrap;state.bootstrap.config=config;state.config=config;state.setupPreset='concurrent';state.jsonDraft=state.jsonBase='synced';
+const before=JSON.stringify(config);
+const goals=renderSetupGoal('concurrent');
+for(const label of ['Check answers','Test under load','Choose individual tests','Requests at once','Requests per second'])assert(goals.includes(label));
+let markup=renderSetupLoad(config,'concurrent');
+assert.match(markup,/Requests at a time/);assert.match(markup,/Giraffe-generated requests/);
+for(const size of ['short','medium','long']){{
+  assert(markup.includes('name="buckets_input_'+size+'"'));
+  assert(markup.includes('name="buckets_output_'+size+'"'));
+}}
+assert.doesNotMatch(markup,/Edit sizes in JSON/);assert.equal(JSON.stringify(config),before);
+const bucket=state.bootstrap.checks.find(check=>check.id==='buckets');
+const concurrent=markup+renderTestCard(bucket,config);
+for(const name of ['buckets_levels','buckets_input_short','buckets_output_long'])assert.equal((concurrent.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
+state.setupPreset='arrival';
+const rate=renderSetupLoad(config,'arrival')+renderTestCard(state.bootstrap.checks.find(check=>check.id==='capacity'),config);
+for(const name of ['traffic_rates','traffic_duration_seconds'])assert.equal((rate.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
+assert(rate.includes('Requests per second'));
+state.setupPreset='concurrent';
+config.buckets.output_tokens.long=config.max_output_tokens+1;
+assert.match(renderLoadGuidance(config),/answer cap.*run.*cap/i);
+assert.match(renderLoadGuidance(config),/data-action="edit-output-cap"/);
+config.buckets.output_tokens.long=config.max_output_tokens;
+const plan={{count_kind:'exact',planned_per_target:164,planned_total:164,known_per_target:164,known_total:164,request_limit:20,required_request_limit:164,target_quotas:{{local:20}},rows:[{{id:'initial',title:'Connection check',requests_per_target:1,kind:'exact',source:'generated examples',summary:'One generated request checks the connection.'}},{{id:'access',title:'Shared accounting',requests_per_target:0,kind:'exact',source:'generated examples',summary:'Adds no requests.'}}],bucket_cases:[{{input_chars:64,actual_input_chars:96,output_tokens:16}}],bucket_levels:[],evaluator:{{active:true,ready:true,call_upper_bound:12,judge_count:1,readiness_errors:[]}},warnings:[]}};
+config.max_requests=20;
+state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan,config}};
+renderRequestPlan();
+assert.match(nodes['#request-plan'].innerHTML,/164 target requests/);
+assert.match(nodes['#request-plan'].innerHTML,/12 evaluator calls/);
+assert.match(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"/);
+assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning" open>/);
+assert.match(nodes['#request-plan'].innerHTML,/96 characters sent/);assert.match(nodes['#request-plan'].innerHTML,/64 configured, plus instructions/);
+assert.match(nodes['#request-plan'].innerHTML,/Connection check/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
+configChanged();assert.match(nodes['#request-plan'].innerHTML,/stale/i);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"|164 target requests/);
+let current=structuredClone(config),resolve;
+readForm=()=>({{config:structuredClone(current)}});
+api=()=>new Promise(done=>resolve=done);
+const older=refreshRequestPreview(undefined,{{draft:true}}),oldResolve=resolve;
+current.max_requests=200;configChanged();const newer=refreshRequestPreview(undefined,{{draft:true}});
+resolve({{config:current,request_plan:{{...plan,request_limit:200}}}});await newer;
+oldResolve({{config,request_plan:plan}});await assert.rejects(older,/changed during preview/);
+assert.equal(state.requestPreview.plan.request_limit,200);
+// A failed current plan can be retried, and the retry replaces the failure state.
+api=async()=>{{throw Error('temporary planning failure');}};
+await assert.rejects(refreshRequestPreview(undefined,{{draft:true}}),/temporary planning failure/);
+assert.match(nodes['#request-plan'].innerHTML,/Retry request plan/);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/200 target requests planned/);
+api=async(path,options)=>({{config:JSON.parse(options.body),request_plan:{{...plan,request_limit:200}}}});
+await listeners.click({{target:{{closest(q){{return q==='[data-action]'?{{dataset:{{action:'preview-pack'}}}}:null;}}}}}});
+assert.equal(state.requestPreview.status,'current');
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Retry request plan|temporary planning failure/);
+nodes['#cli-fallback']={{hidden:false}};
+const syncView=syncConfigView;syncConfigView=()=>{{}};
+listeners.input({{target:{{id:'config-editor',value:'dirty',matches(){{return false;}},closest(){{return {{}};}}}}}});
+syncConfigView=syncView;
+assert.match(nodes['#request-plan'].innerHTML,/Apply or discard JSON changes/);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 target requests|data-action="use-request-budget"/);
+// Debounced live planning never sends inference, and a replaced timer cannot plan an old form.
+state.jsonDraft=state.jsonBase;nodes['#new-run-form']={{}};
+const paths=[];api=async(path,options)=>{{paths.push(path);return {{config:JSON.parse(options.body),request_plan:plan}};}};
+scheduleRequestPlan();const replaced=timers.at(-1);configChanged();scheduleRequestPlan();
+await replaced();assert.equal(paths.length,0);
+await timers.at(-1)();assert.equal(paths.join(','),'/api/config/draft');
+// The native change event on blur replaces the input timer rather than leaving planning stale.
+const beforeBlur=timers.length;
+listeners.change({{target:{{name:'max_requests',id:'',tagName:'INPUT',matches(){{return false;}},closest(q){{return q==='#new-run-form'?{{}}:null;}}}}}});
+assert.equal(timers.length,beforeBlur+1);await timers.at(-1)();assert.equal(paths.join(','),'/api/config/draft,/api/config/draft');
+// A full dataset preview survives live count refreshes, but remains clearly labeled previous.
+current.request_source='request_pack';current.request_pack={{version:1,cases:[{{fixture_id:'saved',messages:[{{role:'user',content:'question'}}],weight:1,scorer:'exact',expected:'answer'}}]}};
+state.config=structuredClone(current);
+const packDetails={{active:true,consumers:['correctness'],cases:[],stages:[],warnings:[],quiet_requests:1}};
+api=async(path,options)=>({{config:JSON.parse(options.body),request_plan:plan,...(path==='/api/config/preview'?{{request_pack_preview:packDetails}}:{{}})}});
+await refreshRequestPreview();const packRevision=state.requestPreview.packRevision;
+configChanged();await refreshRequestPreview(undefined,{{draft:true}});
+assert.equal(state.requestPreview.data,packDetails);assert.equal(state.requestPreview.packRevision,packRevision);
+assert.equal(state.requestPreview.status,'current');assert.match(nodes['#request-pack-preview'].innerHTML,/Preview stale/);
+// Restart readiness is counted in the cloned planning input without changing execution state.
+readForm=()=>({{config:structuredClone(current),mode:'cold-start',restart_target:'local'}});
+let planningInput;api=async(path,options)=>{{planningInput=JSON.parse(options.body);return {{config:planningInput,request_plan:plan}};}};
+await refreshRequestPreview(current,{{draft:true}});
+assert.equal(planningInput.restart_target,'local');assert.equal(current.restart_target,null);assert.equal(state.config.restart_target,null);
+// Leaving this route invalidates the displayed plan and its in-flight replacement.
+api=()=>new Promise(done=>resolve=done);
+const navigationPreview=refreshRequestPreview(undefined,{{draft:true}});
+state.routeVersion++;state.requestPreview=null;renderRequestPlan();
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 target requests|data-action="use-request-budget"/);
+resolve({{config:current,request_plan:plan}});
+await assert.rejects(navigationPreview,/changed during preview/);
+assert.equal(state.requestPreview,null);
+}})()
+`,context);
+"""
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("capacity_limit", [700, None])
+def test_setup_presets_render_one_control_per_value_and_keep_real_form_state(capacity_limit):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to exercise browser setup behavior")
+    from giraffe.capabilities import capabilities
+
+    static = Path(__file__).parents[1] / "src/giraffe/static"
+    config = RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test"}],
+                       checks=["access", "correctness"], prefix={"repeats": 7},
+                       request_pack={"version": 1, "cases": [{"fixture_id": "saved",
+                                      "messages": [{"role": "user", "content": "Private <question>"}],
+                                      "scorer": "exact", "expected": "Answer"}]},
+                       limits={"latency_ms": 2000, "first_output_ms": 1000},
+                       test_options={"recovery": {"sustained_seconds": 2},
+                                     "capacity": {"limits": {"latency_ms": capacity_limit,
+                                                              "first_output_ms": 300}}})
+    script = rf"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import * as formConfig from {json.dumps((static / 'form-config.mjs').as_uri())};
+const nodes={{}},controls=[],listeners={{}},snapshots=[];
+const decode=value=>(value || '').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+const attr=(tag,key)=>decode(tag.match(new RegExp('(?:^|\\s)'+key+'="([^"]*)"'))?.[1]);
+const form={{elements:{{}},querySelectorAll:()=>controls.filter(input=>/^(test_|traffic_|buckets_)/.test(input.name))}};
+let html='';
+nodes['#main']={{get innerHTML(){{return html;}},set innerHTML(value){{
+  html=value;controls.length=0;form.elements={{}};
+  for(const match of value.matchAll(/<input\b[^>]*>|<select\b[^>]*>[\s\S]*?<\/select>/g)){{
+    const tag=match[0],name=attr(tag,'name');if(!name)continue;
+    const type=attr(tag,'type'),options=[...tag.matchAll(/<option\b([^>]*)>([^<]*)<\/option>/g)];
+    const option=options.find(item=>/\bselected\b/.test(item[1])) || options[0];
+    const input={{name,type,value:tag.startsWith('<select')?attr(option?.[1] || '', 'value'):attr(tag,'value'),checked:/\bchecked\b/.test(tag),dataset:{{}}}};
+    controls.push(input);form.elements[name] ||= input;
+  }}
+}}}};
+nodes['#new-run-form']=form;nodes['#config-editor']={{value:''}};
+nodes['#cli-fallback']={{hidden:false}};
+class FormValues {{
+  constructor(){{this.values=new Map();for(const input of controls){{if(['radio','checkbox'].includes(input.type)&&!input.checked)continue;this.append(input.name,input.value);}}}}
+  append(name,value){{this.values.set(name,[...(this.values.get(name)||[]),value]);}}
+  set(name,value){{this.values.set(name,[value]);}}
+  get(name){{return this.values.get(name)?.[0] ?? null;}}
+  getAll(name){{return this.values.get(name)||[];}}
+  has(name){{return this.values.has(name);}}
+}}
+const context={{assert,structuredClone,...formConfig,nodes,form,controls,listeners,snapshots,FormData:FormValues,location:{{hash:'#new'}},
+ document:{{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn}},window:{{addEventListener(){{}}}},
+ setTimeout(){{}},console}};
+const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+context.bootstrap={json.dumps(capabilities())};context.config={json.dumps(config.model_dump(mode='json'))};
+await vm.runInNewContext(source+`
+(async()=>{{
+state.bootstrap=bootstrap;state.bootstrap.config=structuredClone(config);state.config=structuredClone(config);
+state.jsonDraft=state.jsonBase='synced';
+const renderBounds=updateBounds;
+syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=()=>{{}};
+const savedPack=JSON.stringify(config.request_pack),savedProfile=JSON.stringify(config.prefix),savedOptions=JSON.stringify(config.test_options);
+for(const preset of ['answers','concurrent','arrival','custom']){{
+  state.config=applySetupPreset(config,preset,state.bootstrap.buckets.defaults);state.jsonDraft=state.jsonBase='synced';
+  const before=JSON.stringify(state.config);renderNew(preset);
+  assert.equal(JSON.stringify(state.config),before); // Merely opening never changes selection.
+  const markup=nodes['#main'].innerHTML;
+  assert(markup.indexOf('id="setup-goal"')<markup.indexOf('id="setup-deployment"'));
+  for(const name of new Set(controls.map(input=>input.name))){{
+    if(['check','setup_goal','setup_load','request_source'].includes(name))continue;
+    assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
+  }}
+  assert.equal(controls.filter(input=>input.name==='check').length,19);
+  for(const name of ['max_requests','max_duration_seconds'])assert(controls.some(input=>input.name===name));
+  if(preset==='concurrent'){{
+    assert(!markup.includes('name="request_source"'));assert(markup.includes('Giraffe-generated requests'));
+    assert.equal(form.elements.concurrency.type,'hidden');
+    for(const size of ['short','medium','long'])assert(form.elements['buckets_input_'+size]&&form.elements['buckets_output_'+size]);
+    form.elements.buckets_levels.value='1, 4, 8';
+    for(const [index,size] of ['short','medium','long'].entries()){{form.elements['buckets_input_'+size].value=String(80+index*80);form.elements['buckets_output_'+size].value=String(8+index*8);}}
+  }}
+  if(preset==='arrival'){{
+    const primary=markup.slice(markup.indexOf('id="primary-load"'),markup.indexOf('id="test-catalogue"'));
+    assert(primary.includes('name="traffic_rates"'));assert(primary.includes('name="test_capacity_limit_latency_ms"'));
+    assert(!primary.includes('name="limit_latency_ms"'));
+    assert.equal(form.elements.test_capacity_limit_latency_ms.value,String(config.test_options.capacity.limits.latency_ms ?? ''));
+    assert.equal(form.elements.limit_latency_ms.value,'2000');
+    assert(primary.includes('without setting a limit'));
+  }}
+  const result=readForm(true).config;
+  assert.equal(JSON.stringify(result.request_pack),savedPack);
+  assert.equal(JSON.stringify(result.prefix),savedProfile);
+  assert.equal(JSON.stringify(result.test_options),savedOptions);
+  assert.equal(result.max_requests,config.max_requests);
+  if(preset==='concurrent'){{
+    assert.equal(result.concurrency,8);
+    for(const [index,size] of ['short','medium','long'].entries()){{assert.equal(result.buckets.input_chars[size],80+index*80);assert.equal(result.buckets.output_tokens[size],8+index*8);}}
+    assert.equal(result.max_output_tokens,config.max_output_tokens);
+  }}
+}}
+// Explicit goal changes use the form's latest draft rather than a stale applied config.
+form.elements.model.value='latest-model';changeSetupPreset('answers');
+assert.equal(state.config.targets[0].model,'latest-model');
+assert.equal(state.config.checks.join(','),'access,correctness');
+assert.equal(JSON.stringify(state.config.request_pack),savedPack);
+assert.equal(state.config.max_requests,config.max_requests);
+// Reruns and imported advanced selections infer Custom without rewriting them.
+const custom={{...structuredClone(config),checks:['access','correctness','recovery'],concurrency:16}};
+state.detail={{report:{{manifest:{{config:custom}}}},baseline_id:'saved-baseline'}};rerun();
+const rerunBefore=JSON.stringify(state.config);renderNew();
+assert.equal(state.setupPreset,'custom');assert.equal(JSON.stringify(state.config),rerunBefore);
+assert.equal(state.config.concurrency,16);assert.equal(state.prefillBaseline,'saved-baseline');
+// The primary answer-time field edits the effective capacity target, preserving shared limits.
+state.config=applySetupPreset(config,'arrival',state.bootstrap.buckets.defaults);renderNew('arrival');
+for(const id of ['selection-summary','load-guidance','run-bounds'])nodes['#'+id]={{innerHTML:'',insertAdjacentHTML(position,html){{this.innerHTML+=html;}}}};
+for(const check of state.bootstrap.checks)nodes['[data-test-card="'+check.id+'"]']={{querySelector:()=>({{}})}};
+renderBounds();
+assert.match(nodes['#run-bounds'].innerHTML,/Time targets under load/);
+assert(nodes['#run-bounds'].innerHTML.includes('First output within 300 ms'));
+assert(!nodes['#run-bounds'].innerHTML.includes('Complete answer within 2,000 ms'));
+assert.equal(nodes['#run-bounds'].innerHTML.includes('Complete answer within 700 ms'),config.test_options.capacity.limits.latency_ms===700);
+const primary=form.elements.test_capacity_limit_latency_ms;
+primary.matches=()=>false;
+primary.closest=q=>q==='#new-run-form'?form:q==='[data-test-settings]'?{{dataset:{{testSettings:'capacity'}}}}:null;
+primary.value='900';listeners.input({{target:primary}});
+assert.equal(primary.dataset.inherited,'false');assert.equal(form.elements.test_mode_capacity.value,'custom');
+let current=readForm(true).config;
+assert.equal(current.test_options.capacity.limits.latency_ms,900);
+assert.equal(current.test_options.capacity.limits.first_output_ms,300);
+assert.equal(current.limits.latency_ms,2000);
+assert.equal(JSON.stringify(current.test_options.recovery),JSON.stringify(config.test_options.recovery));
+// Explicit Reset clears ownership before another setting becomes custom.
+await listeners.click({{target:{{closest:q=>q==='[data-reset-test]'?{{dataset:{{resetTest:'capacity'}}}}:null}}}});
+assert.equal(state.config.test_options.capacity,undefined);
+assert.equal(primary.value,2000);assert.equal(primary.dataset.inherited,'true');
+const firstOutput=form.elements.test_capacity_limit_first_output_ms;
+firstOutput.closest=q=>q==='[data-test-settings]'?{{dataset:{{testSettings:'capacity'}}}}:null;
+firstOutput.value='400';editTestField(firstOutput);
+form.elements.limit_latency_ms.value='2500';refreshInheritedFields('capacity',true);
+current=readForm(true).config;
+assert.equal(current.limits.latency_ms,2500);assert.equal(primary.value,2500);
+assert.equal(current.test_options.capacity.limits.first_output_ms,400);
+assert(!Object.hasOwn(current.test_options.capacity.limits,'latency_ms'));
+// My questions can remain an empty saved draft while generated-only work executes.
+state.config=applySetupPreset(config,'concurrent',state.bootstrap.buckets.defaults);
+state.config.request_source='request_pack';state.config.request_pack=null;renderNew('concurrent');
+toast=()=>{{}};api=async(path,options)=>{{const body=JSON.parse(options.body);snapshots.push({{path,config:body}});return {{config:body}};}};
+const editable=readForm(true).config;
+const strict=await validatedSnapshot();
+assert.equal(strict.config.request_source,'builtin');assert.equal(strict.config.request_pack,null);
+assert.equal(editable.request_source,'request_pack');assert.equal(state.config.request_source,'request_pack');
+const draft=await validatedSnapshot({{draft:true}});assert.equal(draft.config.request_source,'request_pack');
+// Strict source normalization does not hide a missing dataset from its consumers.
+for(const check of ['correctness','capacity']){{
+  state.config={{...structuredClone(config),checks:[check],request_source:'request_pack',request_pack:null}};renderNew('custom');
+  const consumer=await validatedSnapshot();assert.equal(consumer.config.request_source,'request_pack');
+}}
+// A successful generated-only run sends builtin, but retains the editable empty choice.
+state.config=applySetupPreset(editable,'concurrent',state.bootstrap.buckets.defaults);renderNew('concurrent');
+nodes['#form-error']={{hidden:true}};nodes['#start-run']={{}};nodes['#new-active-notice']={{hidden:true}};
+validateRunForm=()=>true;setActive=()=>{{}};refreshRequestPreview=async()=>{{}};
+let runPayload;api=async(path,options)=>{{const body=JSON.parse(options.body);if(path==='/api/runs'){{runPayload=body;return {{id:'synthetic-run'}};}}return {{config:body}};}};
+await startRun({{preventDefault(){{}},target:form}});
+assert.equal(runPayload.config.request_source,'builtin');
+assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);
+console.log(JSON.stringify(snapshots));
+}})()
+`,context);
+"""
+    result = subprocess.run([node, "--input-type=module", "-"], input=script,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    snapshots = json.loads(result.stdout)
+    RunConfig.model_validate(snapshots[0]["config"])
+    from giraffe.models import ConfigDraft
+    ConfigDraft.model_validate(snapshots[1]["config"])
+    for snapshot in snapshots[1:]:
+        with pytest.raises(ValueError, match="request_pack is required"):
+            RunConfig.model_validate(snapshot["config"])
+
+
 def test_field_help_preserves_labels_and_escapes_details():
     node = shutil.which("node")
     if not node:
@@ -116,7 +414,7 @@ const html=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.i
   {{checks:['buckets'],concurrency:8,max_output_tokens:128,buckets:null,test_options:{{}}}})`,context);
 assert.match(html,/name="buckets_levels"/);
 assert.match(html,/name="buckets_samples_per_bucket"/);
-assert.match(html,/Concurrency levels/);
+assert.match(html,/Requests at a time/);
 assert.doesNotMatch(html,/Customize <code>buckets<\\/code> in the JSON/);
 context.draft={{checks:['buckets'],concurrency:8,max_output_tokens:128,
   buckets:{{...defaults,levels:['<img src=x>']}}}};
@@ -124,14 +422,14 @@ const draftHtml=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c
 assert.doesNotMatch(draftHtml,/<img src=x>/);
 context.config={{...source,checks:['buckets'],buckets:{{...defaults,levels:[1,4,8]}}}};
 let guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
-assert.match(guidance,/288 total/);assert.match(guidance,/Use 288 total requests/);
+assert.doesNotMatch(guidance,/data-action="use-request-budget"/); // Only a confirmed full server plan may offer a budget raise.
 context.config.max_requests=288;
 guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
 assert.doesNotMatch(guidance,/data-action="use-request-budget"/);
 context.config.concurrency=4;
 assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/highest tested level \\(8\\) exceeds/);
 context.config={{...source,checks:['correctness'],buckets:null,max_requests:1}};
-assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/Use 16 total requests/);
+assert.doesNotMatch(vm.runInNewContext('renderLoadGuidance(config)',context),/data-action="use-request-budget"/);
 """
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
@@ -564,7 +862,7 @@ assert.equal(state.jsonDraft,'{{ invalid');assert.equal(nodes['#config-error'].h
 await exportConfig();await copyCli();
 assert.equal(calls,0);assert.equal(downloads.length,0);
 discardConfig();assert.equal(state.jsonDraft,base);assert.equal(nodes['#config-panel-form'].inert,false);
-assert.equal(nodes['[data-action="use-request-budget"]'].disabled,false);
+assert.equal(nodes['[data-action="use-request-budget"]'].disabled,true); // Discarding JSON still requires a refreshed plan.
 // Invalid imports never replace the form, the applied snapshot, or a retained draft.
 await importConfig({{text:async()=>'bad json'}});
 assert.equal(JSON.stringify(state.config),before);assert.equal(state.jsonDraft,base);
@@ -630,11 +928,17 @@ state.configView='json';state.jsonDraft=state.jsonBase;
 form.elements.max_requests={{value:'1'}};
 readForm=()=>({{config:{{...current.config,max_requests:Number(form.elements.max_requests.value)}},mode:'normal'}});
 updateBounds=()=>{{}};
-await listeners.click({{target:{{closest(q){{
+const budgetEvent={{target:{{closest(q){{
   if(q==='[data-action]')return {{dataset:{{action:'use-request-budget'}}}};
   if(q==='[data-budget]')return {{dataset:{{budget:'16'}}}};
   return null;
-}}}}}});
+}}}}}};
+state.requestPreview=null;await listeners.click(budgetEvent);
+assert.equal(form.elements.max_requests.value,'1');assert.match(nodes['#config-error'].textContent,/current request plan/);
+state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan:{{request_limit:2,required_request_limit:16}}}};
+await listeners.click(budgetEvent);assert.equal(form.elements.max_requests.value,'1');assert.match(nodes['#config-error'].textContent,/plan changed/);
+state.requestPreview.plan.request_limit=1;
+await listeners.click(budgetEvent);
 assert.equal(JSON.parse(nodes['#config-editor'].value).max_requests,16);
 assert.equal(state.jsonDraft,state.jsonBase);
 }})()

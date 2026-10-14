@@ -83,7 +83,18 @@ acceptance checks; those are displayed separately.
 
 `giraffe ui` starts on loopback only and never starts inference automatically.
 Use `--port 8766` to select another port or `--runs-dir /path/to/runs` for another
-report directory. The optional `--config` prefills the form. **Form** and **JSON** at
+report directory. A fresh **New run** starts with **Check answers**. Choose
+**Test under load** to test concurrent requests or requests arriving at a chosen
+rate, or **Choose individual tests** to configure the full suite. Concurrent size
+tests use generated examples; answer checks and rate-based tests can use your own
+questions. The review shows the request source, tested loads, planned requests,
+stopping limits and separate evaluator calls before you start. Plans update as
+you edit; adaptive tests are labeled as bounded and built-in random arrival counts
+as estimates. Increasing the total request limit always requires an explicit
+action.
+
+The optional `--config` prefills the form and preserves the supplied test selection.
+**Form** and **JSON** at
 the top of **New run** are two views of the same configuration. The JSON view
 supports the same multi-model/replica settings as the CLI. **Apply changes** validates
 JSON before updating the form; unapplied edits are retained and must be applied or
@@ -237,8 +248,9 @@ environment-variable names. HTTPX honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PR
 `ca_bundle` supplies a private CA file. Nothing disables TLS verification.
 
 `--nonstream` exercises nonstreaming Chat Completions. `--checks serving,correctness`
-runs a selected subset. The UI exposes every check with a selection checkbox and
-**Configure** action. Settings start collapsed, including saved custom settings.
+runs a selected subset. **Choose individual tests** in the UI exposes every check
+with a selection checkbox and **Configure** action. Specialist settings stay in
+advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one
 editor is open at a time. Defaults inherit the run configuration;
 custom settings change only the selected test. Deselecting a test does not run its
@@ -514,6 +526,7 @@ The local HTTP API provides the same configuration and runner contracts:
 | `GET /api/capabilities` | Supported tests, defaults and full configuration schema |
 | `POST /api/config/validate` | Validate and normalize a run configuration without traffic |
 | `POST /api/config/draft` | Normalize an editable draft, allowing blank models and no selected tests; never starts traffic |
+| `POST /api/config/preview` | Preview the selected tests, request counts, sources and evaluator calls without sending traffic |
 | `POST /api/runs` | Start a run with `config`, optional `baseline_id`, and explicit execution mode |
 | `GET /api/runs/{id}` | Inspect state, progress and the completed report |
 | `POST /api/runs/{id}/cancel` | Stop traffic and retain partial results |
