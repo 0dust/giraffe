@@ -47,7 +47,7 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in records:
         if (record.target == target and getattr(record, "traffic_stage", None) is None
-                and record.scenario not in {"client_cancel", "client_deadline"}):
+                and record.scenario not in {"client_cancel", "client_deadline", "sglang_cancel", "backend_cancel"}):
             for check in record.check_ids:
                 groups[(check, record.scenario)].append(record)
     return groups
@@ -94,6 +94,16 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
     def effective_value(manifest, key):
         value = manifest.get(key)
+        if key == "effective_checks" and isinstance(value, dict):
+            cancellation = value.get("cancellation")
+            if isinstance(cancellation, dict) and cancellation.get("backend_verification", "off") == "off":
+                # Legacy reports omit these fields; none affect traffic while
+                # backend verification is off. Keep executed settings strict.
+                inactive = {"backend_verification", "trace_file", "server_log",
+                            "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"}
+                value = {**value, "cancellation": {
+                    name: setting for name, setting in cancellation.items() if name not in inactive
+                }}
         if key == "effective_traffic" and all(pack_modes) and isinstance(value, dict):
             return {name: setting for name, setting in value.items()
                     if name not in {"mix", "long_input_chars", "long_output_words"}}
@@ -123,6 +133,13 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
             reasons.append(f"Recorded {key} is missing; comparability is unknown.")
         elif old_config[key] != current_config[key]:
             reasons.append(f"Run setting {key} differs.")
+    if any(config.get("test_options", {}).get("cancellation", {}).get("backend_verification") == "required"
+           for config in (current_config, old_config)):
+        cancellation_grading = [{check.target: "cancellation_results" in check.metrics
+                                 for check in item.checks if check.id == "cancellation"}
+                                for item in (report, baseline)]
+        if cancellation_grading[0] != cancellation_grading[1]:
+            reasons.append("Cancellation verdict definitions differ; rerun the baseline with separate server-stop and answer grading.")
     traffic_selected = any("capacity" in config.get("checks", []) for config in (current_config, old_config))
     for key, effective in (("traffic", "effective_traffic"), ("test_options", "effective_checks")):
         if key == "traffic" and not traffic_selected:
@@ -735,6 +752,10 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'<br>{"Required" if check.required else "Optional"}</td>'
                      f'<td>{_badge(check.status)}</td><td>{_e(check.summary)}'
                      f'{metrics}<div>{evidence}</div></td></tr>')
+        for outcome in check.metrics.get("cancellation_results", {}).values():
+            parts.append(f'<tr><td>{_e(check.target)}<br>{_e(outcome["title"])}</td>'
+                         f'<td>{_badge(outcome["status"])}</td>'
+                         f'<td>{_e(outcome["summary"])}</td></tr>')
     # A partially selected suite must not look like complete coverage.
     seen = {check.id for check in report.checks}
     absent = [title for check_id, title in CHECK_NAMES.items() if check_id not in seen]

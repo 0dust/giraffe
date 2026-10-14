@@ -580,6 +580,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.request(target, client, deadline_spec, timeout_override=probe_timeout)
                 await run.group(target, client, fixtures["short"], "cancellation_probe",
                                 count=effective.samples, checks=["cancellation"])
+                if options["backend_verification"] == "required":
+                    from giraffe.backend_cancellation import exercise
+                    await exercise(run, target, client, fixtures)
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 end = time.monotonic() + effective.sustained_seconds
@@ -726,7 +729,7 @@ def _pack_results(run: _Run, target: Target) -> dict:
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
-    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline"}]
+    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}]
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]
@@ -894,7 +897,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             probes = [r for r in records if r.scenario == "cancellation_probe"]
             metrics.update({"intentional_cancellations": len(cancelled),
                             "client_disconnect_observed": sum(r.status == "cancelled" for r in cancelled),
-                            "backend_cancellation": "unverified", "probes": _stats(probes),
+                            "backend_cancellation": observations.get("backend_cancellation", {"status": "unverified", "summary": "Backend verification was not enabled."}), "probes": _stats(probes),
                             "deadline_probe_ms": observations.get("deadline_probe_ms"),
                             "deadline_probes": _stats(deadlines)})
             cap_usage = {r.id: r.completion_tokens if r.completion_tokens is not None else r.output_tokens for r in records}
@@ -910,6 +913,33 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Output token usage missing; exact output cap compliance is unverified."
             else:
                 summary = "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified."
+            backend = metrics["backend_cancellation"]
+            from giraffe.backend_cancellation import server_stop_result
+            server_stop = server_stop_result(backend)
+            answers = [r for r in records
+                       if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
+                       and (r.scenario == "cancellation_probe"
+                            or r.fixture_id.startswith("limits.stop.") or r.score is not None)]
+            scored = [r for r in answers if r.score is not None]
+            answer_status = "fail" if any(r.score is False for r in scored) else (
+                "pass" if scored and len(scored) == len(answers) else "inconclusive")
+            metrics["cancellation_results"] = {
+                "server_stopped": server_stop,
+                "answer": {"title": "Cancellation — verify answer", "status": answer_status,
+                    "summary": "Completed stop/follow-up answers are scored separately; interrupted partial outputs are not graded.",
+                    "correct": sum(r.score is True for r in scored), "scored": len(scored),
+                    "attempted": len(answers), "evidence_ids": [r.id for r in answers]},
+            }
+            if backend["status"] == "fail":
+                status, summary = "fail", "Backend cancellation or follow-up inference failed."
+            elif status == "pass" and backend["status"] in {"inconclusive", "blocked"}:
+                status, summary = backend["status"], backend["summary"]
+            elif status == "pass" and backend["status"] == "pass":
+                summary = "Output/stop limits, client interruption, backend capacity release and follow-ups passed."
+                if server_stop["status"] != "pass":
+                    status, summary = server_stop["status"], server_stop["summary"]
+            if status == "pass" and answer_status == "inconclusive":
+                status, summary = "inconclusive", "Some completed answer fixtures could not be scored."
         elif check_id == "recovery":
             sustained = [r for r in records if r.scenario == "sustained"]
             probes = [r for r in records if r.scenario == "recovery"]
@@ -960,7 +990,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 if any(row["warmup_failed"] for row in answer_failures):
                     summary += " Some of these fixtures also failed during warm-up."
                 ordinary_records = [r for r in records if r.scenario not in {
-                    "client_cancel", "client_deadline",
+                    "client_cancel", "client_deadline", "backend_cancel",
                 }]
                 if any(not r.valid or r.status != "completed" for r in ordinary_records):
                     summary += " Request or protocol failures were also observed."
@@ -980,6 +1010,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     summary += " Configured timing limits exceeded."
                 if check_id == "cancellation" and metrics.get("output_cap_violations"):
                     summary += " Output token caps were also exceeded."
+        if check_id == "cancellation" and "cancellation_results" in metrics:
+            outcomes = metrics["cancellation_results"]
+            summary = (f"Server stopped: {outcomes['server_stopped']['status']}; "
+                       f"answer check: {outcomes['answer']['status']}. {summary}")
         if status == "pass" and check_id in run.unfinished[target.name]:
             status, summary = "inconclusive", "This check was unfinished when a run budget or stop condition was reached."
         if metrics.get("completed", 0) < limits.min_samples and status not in {"skipped", "blocked"}:
@@ -1080,6 +1114,14 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     config_values = config.model_dump(mode="json")
     workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
+    fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
+    # An unused optional field must not invalidate existing baseline fingerprints.
+    for specs in fixture_values.values():
+        for spec in specs:
+            for field, default in (("cancel_after_chunks", None),
+                                   ("expected_provided", False), ("rubric", None)):
+                if spec[field] == default:
+                    del spec[field]
     manifest = {"config": config_values,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in config.checks else "not selected"
@@ -1090,7 +1132,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"capacity", "correctness"}
-                                                    else fixture_hash({k: [s.model_dump() for s in v] for k,v in fixtures.items()})),
+                                                    else fixture_hash(fixture_values)),
                                  "workload_fixture_sha256": fixture_hash({
                                      "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
                                      "settings": workload_settings})},

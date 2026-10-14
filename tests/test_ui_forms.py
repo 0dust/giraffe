@@ -12,7 +12,7 @@ from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS,
 
 @pytest.mark.parametrize("scenario", [
     "selection", "defaults", "nullable_limits", "traffic", "empty_selection", "round_trip",
-    "optional_workloads", "request_pack",
+    "optional_workloads", "request_pack", "cancellation",
 ])
 def test_browser_configuration_behavior(scenario):
     node = shutil.which("node")
@@ -75,6 +75,20 @@ switch ({json.dumps(scenario)}) {{
     result.request_source='builtin';
     const roundtrip=configureTests(result,valuesFor(result),checks,defaults,{{allowEmpty:true}});
     assert.equal(roundtrip.request_source,'builtin');assert.deepEqual(roundtrip.request_pack,source.request_pack);
+    break;
+  }}
+  case 'cancellation': {{
+    values.delete('check');values.append('check','cancellation');
+    values.set('test_mode_cancellation','custom');
+    values.set('test_cancellation_backend_verification','required');
+    values.set('test_cancellation_trace_file','/tmp/sglang traces.jsonl');
+    values.set('test_cancellation_cleanup_seconds','1');
+    const result=build();
+    assert.equal(result.test_options.cancellation.trace_file,'/tmp/sglang traces.jsonl');
+    assert.equal(result.test_options.cancellation.cleanup_seconds,1);
+    assert.equal(result.test_options.cancellation.backend_verification,'required');
+    const again=configureTests(result,valuesFor(result),checks,defaults);
+    assert.deepEqual(again.test_options.cancellation,result.test_options.cancellation);
     break;
   }}
   case 'selection': {{
@@ -847,4 +861,45 @@ assert(!markup.includes('judge_count'));assert(!markup.includes('Configure evalu
 """.replace("APP_PATH", json.dumps(str(app)))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("server_status,answer_status", [
+    ("pass", "fail"), ("fail", "pass"), ("inconclusive", "pass"),
+])
+def test_cancellation_ui_renders_independent_verdicts(server_status, answer_status):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is needed to execute browser rendering")
+    app = Path(__file__).parents[1] / "src/giraffe/static/app.js"
+    outcomes = {
+        "server_stopped": {"title": "Cancellation — verify server stopped", "status": server_status,
+                           "summary": "Native evidence only", "verified": 3, "attempted": 3},
+        "answer": {"title": "Cancellation — verify answer", "status": answer_status,
+                   "summary": "Completed answers only", "correct": 2, "scored": 3},
+    }
+    script = rf"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const source=fs.readFileSync({json.dumps(str(app))},'utf8')
+  .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+vm.runInNewContext(source+`
+const outcomes={json.dumps(outcomes)};
+const check={{id:'cancellation',title:'Limits and cancellation',status:'fail',required:true,
+  target:'local',metrics:{{cancellation_results:outcomes}},evidence_ids:[]}};
+const report={{manifest:{{config:{{}}}},requests:[]}};
+const markup=renderCheck(check,report);
+const sections=[...markup.matchAll(/<section class="check-detail-head"[\\s\\S]*?<\\/section>/g)].map(x=>x[0]);
+assert.equal(sections.length,2);
+assert.ok(sections[0].includes(outcomes.server_stopped.title));
+assert.ok(sections[0].includes('class="status '+outcomes.server_stopped.status+'"'));
+assert.ok(sections[1].includes(outcomes.answer.title));
+assert.ok(sections[1].includes('class="status '+outcomes.answer.status+'"'));
+assert.ok(keyMetric(check).includes('Server stopped:'));
+assert.ok(keyMetric(check).includes('Answer:'));
+assert.match(renderCancellationResults({{}}),/older report/);
+`,{{assert,structuredClone,document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}});
+"""
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

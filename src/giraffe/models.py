@@ -32,6 +32,7 @@ CHECK_NAMES.update({
     "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
     "tools": "Tool-calling capability",
 })
+SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
 
 class Model(BaseModel):
@@ -51,7 +52,7 @@ class Deployment(Model):
     collected_at: str | None = None
     metadata_file: str | None = None
     launch_command: str | list[str] | None = None
-    discovery: Literal["none", "ollama", "vllm"] = "none"
+    discovery: Literal["none", "ollama", "vllm", "sglang"] = "none"
     collector_url: str | None = None
     intended_change: str | None = None
 
@@ -108,8 +109,8 @@ class Sessions(Model):
     sessions: int = Field(default=2, ge=1, le=32)
     concurrency: int = Field(default=2, ge=1, le=32)
     turns: list[str] = Field(default_factory=lambda: [
-        "Suggest a name for a bakery. Reply with just the name.",
-        "Repeat exactly the bakery name you just suggested, with no extra text."])
+        "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop.",
+        SESSION_REPEAT_PROMPT])
     saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"])
     delay_seconds: float = Field(default=0, ge=0, le=60)
     max_tokens: int = Field(default=32, ge=1)
@@ -157,7 +158,7 @@ class Target(Model):
     metrics_url: str | None = None
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
-    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama"] = "unknown"
+    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang"] = "unknown"
     metrics_runtime_version: str | None = None
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)
@@ -267,6 +268,12 @@ class CheckOptions(Model):
     metrics_max_age_seconds: float | None = Field(default=None, gt=0)
     cancel_after_ms: float | None = Field(default=None, gt=0)
     deadline_probe_ms: float | None = Field(default=None, gt=0)
+    backend_verification: Literal["off", "required"] | None = None
+    server_log: str | None = Field(default=None, max_length=4096)
+    trace_file: str | None = Field(default=None, max_length=4096)
+    cancel_after_chunks: int | None = Field(default=None, ge=1, le=128)
+    cleanup_seconds: float | None = Field(default=None, gt=0, le=60)
+    trace_wait_seconds: float | None = Field(default=None, gt=0, le=60)
     limits: Limits | None = None
 
 
@@ -282,7 +289,8 @@ CHECK_OPTION_FIELDS = {
     "context": {"samples", "context_limit"},
     "correctness": {"samples", "concurrency"},
     "json": {"samples", "concurrency"},
-    "cancellation": {"samples", "cancel_after_ms", "deadline_probe_ms"},
+    "cancellation": {"samples", "cancel_after_ms", "deadline_probe_ms", "backend_verification",
+                     "trace_file", "server_log", "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"},
     "recovery": {"samples", "concurrency", "sustained_seconds"},
     "gpu": {"metrics_max_age_seconds"},
 }
@@ -676,7 +684,9 @@ class RunConfig(Model):
         if check_id not in CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
         options = self.test_options.get(check_id, CheckOptions())
-        special_defaults = {"cancel_after_ms": 100, "deadline_probe_ms": 50}
+        special_defaults = {"backend_verification": "off", "cancel_after_ms": 100, "deadline_probe_ms": 50,
+                            "cancel_after_chunks": 5, "cleanup_seconds": 5,
+                            "trace_wait_seconds": 10}
         resolved = {}
         for field in sorted(CHECK_OPTION_FIELDS[check_id]):
             default = special_defaults.get(field, getattr(self, field, None))
@@ -737,6 +747,7 @@ class RequestSpec(Model):
     stream: bool = True
     options: dict[str, Any] = Field(default_factory=dict)
     cancel_after_ms: float | None = Field(default=None, gt=0)
+    cancel_after_chunks: int | None = Field(default=None, ge=1, le=128)
     context_position: str | None = None
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
@@ -764,6 +775,8 @@ class RequestRecord(Model):
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
     error: str | None = None
+    server_request_id: str | None = None
+    client_cancelled_at_ns: int | None = None
     elapsed_ms: float = 0
     first_output_ms: float | None = None
     last_output_ms: float | None = None

@@ -13,6 +13,7 @@ dependencies = ["httpx>=0.28,<0.29", "pydantic>=2.11,<3", "PyYAML>=6,<7", "jsons
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11"]
+sglang-tracing = ["opentelemetry-proto>=1.40,<2"]
 
 [project.scripts]
 giraffe = "giraffe.cli:main"

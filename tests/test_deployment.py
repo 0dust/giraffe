@@ -1,6 +1,8 @@
 """Deployment and telemetry provenance, missing-data handling and secret exclusion."""
 
+import asyncio
 import json
+import threading
 import time
 
 import httpx
@@ -239,6 +241,33 @@ async def test_statistics_and_collector_never_inherit_inference_secrets(monkeypa
     assert seen[0].headers["Authorization"] == "Bearer test-metrics-secret"
     assert "test-inference-secret" not in str(sample) + settings.model_dump_json()
     assert "test-metrics-secret" not in str(sample) + settings.model_dump_json()
+
+
+async def test_statistics_client_setup_does_not_block_inference_scheduling(monkeypatch):
+    actual = httpx.AsyncClient
+    setup_started = threading.Event()
+    release_setup = threading.Event()
+
+    def slow_client(**kwargs):
+        setup_started.set()
+        if not release_setup.wait(timeout=1):
+            raise AssertionError("Metrics client setup blocked the event loop")
+        return actual(**kwargs, transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text="vllm:num_requests_running 1\n")))
+
+    monkeypatch.setattr(httpx, "AsyncClient", slow_client)
+    target = Target(name="local", model="m", url="http://localhost:8000/v1",
+                    metrics_url="http://localhost:9000/metrics", metrics_profile="vllm-v1")
+    settings = RunConfig(targets=[target], metrics=True)
+
+    async def inference_progress():
+        while not setup_started.is_set():
+            await asyncio.sleep(0)
+        release_setup.set()
+
+    sample, _ = await asyncio.gather(
+        telemetry.scrape(_Run(settings, None, None), target, "load"), inference_progress())
+    assert sample["status"] == "available"
 
 
 def test_counters_resets_replicas_stale_samples_and_gauge_peaks():

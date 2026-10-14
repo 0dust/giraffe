@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from giraffe.models import RequestRecord, RunConfig, Target
+from giraffe.models import RequestRecord, RunConfig, Sessions, Target
 from giraffe.reporting import write_report
 from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
@@ -53,13 +53,23 @@ def check(report, name):
 
 
 @pytest.mark.parametrize("mode", ["fixed", "live"])
-async def test_concurrent_session_history_exact_marker_and_no_cross_contamination(tmp_path, mode):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_concurrent_session_history_exact_marker_and_no_cross_contamination(tmp_path, mode, legacy):
     with FakeEndpoint(first_token_delay=0.02) as endpoint:
         settings = {"sessions": 2, "concurrency": 2, "modes": [mode], "delay_seconds": 0.01}
+        if legacy:
+            settings["turns"] = ["Suggest a name for a bakery. Reply with just the name.",
+                                 "Repeat exactly the bakery name you just suggested, with no extra text."]
         report = await run_suite(config(endpoint, sessions=settings, retention="none"))
-        session_calls = [p for p in endpoint.requests if "bakery" in p["messages"][-1]["content"]]
+        session_calls = [p for p in endpoint.requests
+                         if p["messages"][0]["content"].startswith("Suggest a name for a bakery")]
     followups = [p for p in session_calls if p["messages"][-1]["content"].startswith("Repeat")]
     assert len(followups) == 2
+    if not legacy:
+        assert session_calls[0]["messages"][0]["content"] == (
+            "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop."
+        )
+        assert all(p["messages"][-1]["content"] == "Repeat exactly the above answer." for p in followups)
     histories = [p["messages"][1]["content"] for p in followups]
     first_records = [r for r in report.requests if r.scenario == f"session_{mode}_turn0"]
     assert len({r.output for r in first_records}) == 2
@@ -71,6 +81,7 @@ async def test_concurrent_session_history_exact_marker_and_no_cross_contaminatio
         assert all(r.output != "Golden Crust" for r in first_records)
     assert check(report, "sessions").status == "pass"
     turns = [r for r in report.requests if r.scenario == f"session_{mode}_turn1"]
+    assert len(turns) == 2 and all(r.score is True for r in turns)
     assert all(
         r.client_wait_ms is not None and r.client_wait_ms >= 0 and r.history_hash and r.request_hash
         for r in turns
@@ -105,7 +116,11 @@ async def test_session_history_budget_never_silently_crops():
     )
 
 
-async def test_failed_semantic_turn_stops_session_before_next_user_turn():
+@pytest.mark.parametrize("repeat_prompt", [
+    "Repeat exactly the above answer.",
+    "Repeat exactly the bakery name you just suggested, with no extra text.",
+])
+async def test_failed_semantic_turn_stops_session_before_next_user_turn(repeat_prompt):
     with FakeEndpoint(mode="wrong", fault_contains="Repeat exactly") as endpoint:
         report = await run_suite(
             config(
@@ -114,14 +129,15 @@ async def test_failed_semantic_turn_stops_session_before_next_user_turn():
                     "modes": ["live"],
                     "sessions": 1,
                     "turns": [
-                        "Suggest a name for a bakery. Reply with just the name.",
-                        "Repeat exactly the bakery name you just suggested, with no extra text.",
+                        Sessions().turns[0],
+                        repeat_prompt,
                         "Now repeat the bakery name once more.",
                     ],
                 },
             )
         )
-        calls = [p for p in endpoint.requests if "bakery" in p["messages"][-1]["content"]]
+        calls = [p for p in endpoint.requests
+                 if p["messages"][0]["content"].startswith("Suggest a name for a bakery")]
     assert len(calls) == 2
     assert check(report, "sessions").status == "fail"
     assert (

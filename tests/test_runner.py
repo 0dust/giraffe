@@ -102,6 +102,12 @@ def config(**kwargs):
     return RunConfig(**(values | kwargs))
 
 
+async def test_disabled_backend_verification_preserves_legacy_builtin_fingerprint(client):
+    report = await runner.run_suite(config())
+    assert report.manifest["fixture_pack"]["builtin_sha256"] == (
+        "ab9fb04ee49e79b9e10690fdcf03fc840164dd7962f4cee9b47d53214860598b")
+
+
 def check(report, id, target="service"):
     return next(c for c in report.checks if c.id == id and c.target == target)
 
@@ -362,7 +368,7 @@ async def test_deliberate_deadline_and_cancellation_not_serving_failures():
     assert deadline.status == "timeout"
     result = check(report, "cancellation")
     assert result.status == "pass"
-    assert result.metrics["backend_cancellation"] == "unverified"
+    assert result.metrics["backend_cancellation"]["status"] == "unverified"
     assert deadline.id in result.evidence_ids
 
 

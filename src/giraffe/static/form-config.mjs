@@ -51,7 +51,8 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
         if (Object.hasOwn(source.test_options?.correctness || {}, name)) options[name] = source.test_options.correctness[name];
         continue;
       }
-      const value = numeric(values.get(`test_${check.id}_${name}`), name, allowInvalid);
+      const raw = values.get(`test_${check.id}_${name}`);
+      const value = ['trace_file','server_log','backend_verification'].includes(name) ? (String(raw || '').trim() || null) : numeric(raw, name, allowInvalid);
       if (value !== null && value !== optionDefault(config, check, name)) options[name] = value;
     }
     const limits = {};

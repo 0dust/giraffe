@@ -51,6 +51,59 @@ def test_legacy_rate_reports_are_incomparable_with_new_generation_metrics():
     assert "Report schema versions differ." in result.baseline["targets"][0]["reasons"]
 
 
+@pytest.mark.parametrize("verification,expected", [("required", "inconclusive"), ("off", "pass")])
+def test_legacy_cancellation_grading_cannot_claim_a_server_stop_regression(verification, expected):
+    current, previous = make_report(), make_report("baseline")
+    for report in (current, previous):
+        report.manifest["config"]["test_options"] = {"cancellation": {"backend_verification": verification}}
+        report.checks.append(CheckResult(id="cancellation", target="local",
+            title="Limits and cancellation", status="pass", summary="Recorded evidence"))
+    current.checks[-1].metrics["cancellation_results"] = {"server_stopped": {"status": "inconclusive"}}
+    result = compare_baseline(current, previous)
+    assert baseline_check(result).status == expected
+    reasons = result.baseline["targets"][0]["reasons"]
+    assert any("Cancellation verdict definitions differ" in reason for reason in reasons) == (verification == "required")
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("legacy", "pass"), ("inactive", "pass"), ("samples", "inconclusive"),
+    ("enabled", "inconclusive"), ("required_cleanup", "inconclusive"),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cancellation_baselines_ignore_only_inactive_backend_settings(change, expected, reverse):
+    current, previous = make_report(), make_report("baseline")
+    for report in (current, previous):
+        config = RunConfig.model_validate(report.manifest["config"])
+        report.manifest["effective_checks"] = {
+            name: config.effective_check(name) for name in config.checks
+        }
+    settings = previous.manifest["effective_checks"]["cancellation"]
+    if change == "legacy":
+        previous.manifest["effective_checks"]["cancellation"] = {
+            name: value for name, value in settings.items()
+            if name in {"samples", "cancel_after_ms", "deadline_probe_ms", "limits"}
+        }
+    elif change == "inactive":
+        settings.update(trace_file="/another/trace", server_log="/another/log",
+                        cancel_after_chunks=10, cleanup_seconds=1, trace_wait_seconds=2)
+    elif change == "samples":
+        settings["samples"] += 1
+    elif change == "enabled":
+        settings["backend_verification"] = "required"
+    else:
+        for report in (current, previous):
+            report.manifest["effective_checks"]["cancellation"]["backend_verification"] = "required"
+        settings["cleanup_seconds"] += 1
+    if reverse:
+        current, previous = previous, current
+    before = [report.model_dump_json() for report in (current, previous)]
+    result = compare_baseline(current, previous)
+    assert baseline_check(result).status == expected
+    reasons = result.baseline["targets"][0]["reasons"]
+    assert ("Recorded effective_checks differs or is missing." in reasons) == (expected == "inconclusive")
+    assert [report.model_dump_json() for report in (current, previous)] == before
+
+
 def test_generation_rate_comparison_does_not_confuse_longer_prefill_with_slower_decoding():
     current, previous = make_report(), make_report("baseline")
     for record in current.requests:
@@ -353,19 +406,20 @@ def test_intentional_cancellation_is_not_a_retention_failure(tmp_path: Path):
     assert saved.requests[0].output == ""
 
 
-def test_intentional_client_deadline_does_not_create_baseline_error_regression():
+@pytest.mark.parametrize("scenario", ["client_deadline", "backend_cancel"])
+def test_intentional_client_deadline_does_not_create_baseline_error_regression(scenario):
     current, previous = make_report(), make_report("baseline")
     for report in (current, previous):
         intentional = report.requests[0].model_copy(deep=True)
         intentional.id += "-deadline"
-        intentional.scenario = "client_deadline"
-        intentional.status = "timeout"
+        intentional.scenario = scenario
+        intentional.status = "timeout" if scenario == "client_deadline" else "cancelled"
         intentional.valid = False
         intentional.score = None
         report.requests.append(intentional)
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "pass"
-    assert not any(row["scenario"] == "client_deadline"
+    assert not any(row["scenario"] == scenario
                    for row in result.baseline["targets"][0]["comparisons"])
 
 

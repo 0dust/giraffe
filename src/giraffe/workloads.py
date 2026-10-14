@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from giraffe.models import CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec
+from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
@@ -353,11 +353,13 @@ async def sessions(run, target, client):
                 scheduled_ms=(due - run.start) * 1000,
             )
             request.messages, request.input_chars = messages, input_chars
-            # The built-in follow-up has a deterministic expectation even in live mode.
+            # Keep saved configurations using the original follow-up scored too.
             if (
                 turn
-                and prompt
-                == "Repeat exactly the bakery name you just suggested, with no extra text."
+                and prompt in {
+                    SESSION_REPEAT_PROMPT,
+                    "Repeat exactly the bakery name you just suggested, with no extra text.",
+                }
             ):
                 request.scorer, request.expected = "exact", previous
             record = await run.request(target, client, request)
