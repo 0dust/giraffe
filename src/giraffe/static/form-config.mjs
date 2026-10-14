@@ -32,19 +32,94 @@ function numeric(value, label, allowInvalid=false) {
   return result;
 }
 
-export function configureBuckets(source, values, defaults, {allowInvalid=false}={}) {
+function validBucketLevels(levels) {
+  return Array.isArray(levels) && levels.length >= 1 && levels.length <= 16 &&
+    new Set(levels).size === levels.length &&
+    levels.every(level => Number.isInteger(level) && level >= 1 && level <= 256);
+}
+
+export function inferSetupPreset(config) {
+  const checks = config.checks;
+  const matches = expected => Array.isArray(checks) && checks.length === expected.length &&
+    new Set(checks).size === checks.length && expected.every(id => checks.includes(id));
+  if (matches(['access','correctness'])) return 'answers';
+  if (matches(['access','correctness','capacity'])) return 'arrival';
+  if (matches(['access','buckets']) && validBucketLevels(config.buckets?.levels) &&
+      config.concurrency === Math.max(...config.buckets.levels) &&
+      checks.every(id => !Object.keys(config.test_options?.[id] || {}).length)) return 'concurrent';
+  return 'custom';
+}
+
+export function applySetupPreset(source, preset, defaults) {
   const config = structuredClone(source);
-  if (!values.has('buckets_levels')) return config;
-  const settings = structuredClone(source.buckets || defaults);
-  settings.levels = String(values.get('buckets_levels') || '').trim().split(/[\s,]+/)
-    .filter(Boolean).map(value => numeric(value, 'Concurrency levels', allowInvalid));
-  if (!allowInvalid && (!settings.levels.length || settings.levels.length > 16 ||
-      new Set(settings.levels).size !== settings.levels.length ||
-      settings.levels.some(level => !Number.isInteger(level) || level < 1 || level > 256))) {
+  const selection = {
+    answers:['access','correctness'],
+    concurrent:['access','buckets'],
+    arrival:['access','correctness','capacity'],
+  }[preset];
+  if (selection) config.checks = selection;
+  config.structured_json = config.checks.includes('json');
+  config.metrics = config.checks.includes('gpu');
+  config.tool_calling = config.checks.includes('tools');
+  if (preset === 'concurrent') {
+    if (!config.buckets) {
+      config.buckets = structuredClone(defaults);
+      config.buckets.samples_per_bucket = Math.max(
+        config.buckets.samples_per_bucket, config.limits?.min_samples ?? 5);
+      for (const size of Object.keys(config.buckets.output_tokens)) {
+        config.buckets.output_tokens[size] = Math.min(config.buckets.output_tokens[size], config.max_output_tokens);
+      }
+    }
+    if (validBucketLevels(config.buckets.levels)) config.concurrency = Math.max(...config.buckets.levels);
+  }
+  return config;
+}
+
+// Basic concurrent testing has one load control: the tested levels. Advanced
+// configurations retain their independently chosen run ceiling.
+export function configureSetupLoad(source, values, preset, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  if (preset !== 'concurrent') return config;
+  if (!validBucketLevels(config.buckets?.levels)) {
+    if (allowInvalid) return config;
     throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
   }
+  config.concurrency = Math.max(...config.buckets.levels);
+  return config;
+}
+
+export function configureBuckets(source, values, defaults, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  const fields = ['levels','samples_per_bucket','window_seconds',
+    ...['input','output'].flatMap(kind => ['short','medium','long'].map(size => `${kind}_${size}`))];
+  if (!fields.some(name => values.has(`buckets_${name}`))) return config;
+  const settings = structuredClone(source.buckets || defaults);
+  if (values.has('buckets_levels')) {
+    settings.levels = String(values.get('buckets_levels') || '').trim().split(/[\s,]+/)
+      .filter(Boolean).map(value => numeric(value, 'Concurrency levels', allowInvalid));
+    if (!allowInvalid && !validBucketLevels(settings.levels)) {
+      throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+    }
+  }
   for (const name of ['samples_per_bucket','window_seconds']) {
-    settings[name] = numeric(values.get(`buckets_${name}`), name, allowInvalid);
+    if (values.has(`buckets_${name}`)) settings[name] = numeric(values.get(`buckets_${name}`), name, allowInvalid);
+  }
+  for (const [kind, group] of [['input','input_chars'],['output','output_tokens']]) {
+    for (const size of ['short','medium','long']) {
+      const name = `buckets_${kind}_${size}`;
+      if (!values.has(name)) continue;
+      const label = `${size} ${kind === 'input' ? 'question target' : 'answer cap'}`;
+      const value = numeric(values.get(name), label, true);
+      if (!allowInvalid && (!Number.isInteger(value) || value < 1 || value > 65536)) {
+        throw new Error(`${label} must be a whole number from 1 to 65536.`);
+      }
+      settings[group] ||= structuredClone(defaults[group]);
+      settings[group][size] = value;
+    }
+  }
+  if (!allowInvalid && config.checks.some(id => ['buckets','mixed'].includes(id)) &&
+      Object.values(settings.output_tokens).some(cap => cap > config.max_output_tokens)) {
+    throw new Error(`Each answer cap must stay within max_output_tokens (${config.max_output_tokens}).`);
   }
   if (source.buckets || config.checks.some(id => ['buckets','mixed'].includes(id)) ||
       !sameConfig(settings, defaults)) config.buckets = settings;
