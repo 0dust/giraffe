@@ -1,0 +1,249 @@
+"""Describe selected target work without traffic, credentials or local input imports."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from giraffe.fixtures import builtin_fixtures
+from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
+from giraffe.request_pack import active_pack, pack_preview
+from giraffe.workloads import bucket_spec, label_prompt
+
+
+def _steady_count(rate: float, duration: float) -> int:
+    # Match arrival_schedule's n / rate < duration test, including float edges,
+    # without allocating every arrival or assigning its workload class.
+    count = math.ceil(rate * duration)
+    while count > 0 and (count - 1) / rate >= duration:
+        count -= 1
+    while count / rate < duration:
+        count += 1
+    return min(count, MAX_PLANNED_ARRIVALS)
+
+
+def request_plan(config: RunConfig | ConfigDraft, *,
+                 pack_details: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Count complete fixed work before hard caps; leave adaptive totals unknown.
+
+    Rows account for shared controls only once. ``known`` includes only exact
+    fixed portions, and evaluator calls use the existing pack preview contract.
+    The optional preview avoids rebuilding request-pack schedules in the API.
+    """
+    selected = set(config.checks)
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    target_count = len(config.targets)
+    base, extra = divmod(config.max_requests, target_count)
+    quotas = {target.name: base + (index < extra)
+              for index, target in enumerate(config.targets)}
+
+    def add(identifier: str, count: int | None, summary: str, *,
+            source: str = "generated examples", kind: str = "exact", title: str | None = None):
+        rows.append({"id": identifier, "title": title or CHECK_NAMES.get(identifier, identifier),
+                     "requests_per_target": count, "kind": kind, "source": source,
+                     "summary": summary})
+
+    # Only fixture cardinalities are needed. Keep context filler small even if
+    # the operator has configured a very large context limit.
+    fixtures = builtin_fixtures(config.model_copy(update={"context_limit": 128}))
+    initial = bool(selected & {"access", "first_output"})
+    if initial:
+        add("initial", 1, "One generated request checks the connection. Time to first text uses this same request.",
+            title="Connection check")
+    if config.restart_target:
+        add("restart_readiness", None,
+            f"Readiness requests for {config.restart_target} repeat until a response succeeds or a limit stops the run.",
+            kind="bounded", title="Restart readiness")
+    warm_count = max(config.samples if selected & {"serving", "first_output"} else 0,
+                     config.effective_check("fairness")["samples"] if "fairness" in selected else 0)
+    if warm_count:
+        add("warm", warm_count, "Repeated connection requests reused to compare response timing and mixed-length requests.",
+            title="Repeated connection checks")
+    for check in ("access", "serving", "first_output"):
+        if check in selected:
+            add(check, 0, "Reuses connection checks and the other selected tests; adds no requests.")
+
+    if "generation" in selected:
+        count = config.effective_check("generation")["samples"]
+        add("generation", count, f"{count} copies of the generated passage.")
+
+    pack_selected = config.request_source == "request_pack" and bool(selected & {"capacity", "correctness"})
+    pack = active_pack(config)
+    details = pack_details if pack_details is not None else pack_preview(config) if pack else None
+    if pack_selected:
+        count = len(config.request_pack.cases) if pack else None
+        add("pack_control", count, "Sends each of your questions once. The answer and arrival checks reuse these results."
+            if pack else "Add your questions to calculate their request count.",
+            source="your dataset", kind="exact" if pack else "bounded", title="Your questions (one each)")
+        if not pack:
+            warnings.append("The selected dataset is empty; request counts and run readiness are incomplete.")
+
+    if "capacity" in selected:
+        traffic = config.effective_traffic()
+        warnings.append("Scheduled requests use the run limit even when Giraffe cannot send them because all request slots are busy.")
+        limits = config.effective_check("capacity")["limits"]
+        if limits["first_output_ms"] is None and limits["latency_ms"] is None:
+            warnings.append("Arrival performance will be measured, but the capacity verdict remains inconclusive without a first-output or full-answer timing goal.")
+        if pack_selected and not pack:
+            add("capacity", None, "Add your questions to calculate the arrival request count.",
+                source="your dataset", kind="bounded")
+        else:
+            if pack:
+                count = sum(stage["planned"] for stage in details["stages"])
+                kind = "exact"
+            elif traffic.arrival == "steady":
+                count = sum(_steady_count(rate, traffic.duration_seconds) for rate in traffic.rates)
+                kind = "exact"
+            else:
+                count = round(sum(traffic.rates) * traffic.duration_seconds)
+                kind = "estimate"
+            add("capacity", count,
+                (f"About {count} requests are expected across {len(traffic.rates)} rates. " if kind == "estimate"
+                 else f"Starts {count} requests across {len(traffic.rates)} rates. ")
+                + "Requests may be dropped if all request slots are busy.",
+                source="your dataset" if pack else "generated examples", kind=kind)
+        if len(traffic.rates) * traffic.duration_seconds > config.max_duration_seconds:
+            warnings.append("The selected rates need more time than the run limit allows, before connection and answer checks.")
+        if traffic.arrival == "poisson" and not pack:
+            warnings.append("Random arrival timing uses an expected request count. The saved seed may produce more or fewer requests.")
+
+    if "fairness" in selected:
+        count = config.effective_check("fairness")["samples"]
+        if config.stream and config.concurrency >= 2:
+            add("fairness_short", count, "One short request per fairness trial.", title="Fairness short requests")
+            add("fairness", None, f"Up to {count} long requests start only while a short response is streaming.",
+                kind="bounded")
+        else:
+            add("fairness", 0, "Requires streaming and concurrency of at least two; only shared warm controls run.")
+
+    if "context" in selected:
+        count = max(config.effective_check("context")["samples"], len(fixtures["context"]))
+        add("context_first_batch", count, "The first generated context batch.", title="Initial context cases")
+        add("context", None,
+            f"Observed input usage may require a calibration request and up to two further batches of {count} requests.",
+            kind="bounded")
+
+    if "correctness" in selected:
+        if pack_selected:
+            add("correctness", 0, "Uses each question's first result; adds no requests when arrival traffic is also selected.",
+                source="your dataset")
+        elif config.custom_fixtures:
+            add("correctness", None,
+                "Built-in questions plus a local custom-fixture file; its case count is unknown without importing the file.",
+                source="generated examples and your local fixture file", kind="bounded")
+        else:
+            count = max(config.effective_check("correctness")["samples"], len(fixtures["correctness"]))
+            add("correctness", count, f"{count} requests using {len(fixtures['correctness'])} generated questions with known answers.")
+    if "json" in selected:
+        count = max(config.effective_check("json")["samples"], len(fixtures["json"]))
+        add("json", count, f"{count} generated structured-answer requests.")
+
+    if "cancellation" in selected:
+        options = config.effective_check("cancellation")
+        normal = sum(spec.cancel_after_ms is None for spec in fixtures["limits"])
+        cancelled = len(fixtures["limits"]) - normal
+        count = max(options["samples"], normal) + cancelled + bool(cancelled) + options["samples"]
+        add("cancellation", count, "Output/stop controls, a client cancellation, a deadline probe and follow-up health requests.")
+        if options["backend_verification"] == "required":
+            add("backend_cancellation", None,
+                f"Runtime and local evidence availability determine whether up to {3 * options['samples']} additional verification requests run.",
+                kind="bounded", title="Backend cancellation verification")
+    if "recovery" in selected:
+        options = config.effective_check("recovery")
+        add("recovery", options["samples"], "Fixed follow-up health requests after sustained load.")
+        if options["sustained_seconds"] > 0:
+            add("sustained", None,
+                f"Response pace determines the number of load batches during {options['sustained_seconds']:g} seconds.",
+                kind="bounded", title="Sustained load")
+    if "gpu" in selected:
+        add("gpu", 0, "Observes metrics without adding inference requests.", source="configured metrics endpoint")
+
+    if "arrivals" in selected:
+        add("arrivals", config.arrivals.requests,
+            f"{config.arrivals.requests} scheduled offers; the pending queue and run limits can leave some undispatched.")
+    if "prefix" in selected:
+        settings = config.prefix
+        prompt_chars = len(label_prompt(96))
+        history = sum(prompt_chars * (turn + 1) + 4 * turn + 24 + 32 <= config.context_limit
+                      for turn in range(settings.history_turns))
+        add("prefix", 2 * settings.repeats + history,
+            f"{2 * settings.repeats} shared/independent prefix controls and {history} fixed-history requests admitted by the character ceiling.")
+
+    bucket_cases, bucket_levels = [], []
+    if selected & {"buckets", "mixed"}:
+        settings = config.buckets
+        for input_shape in ("short", "medium", "long"):
+            for output_shape in ("short", "medium", "long"):
+                request = bucket_spec(settings, input_shape, output_shape, "preview", "buckets", 1)
+                bucket_cases.append({"input_chars": settings.input_chars[input_shape],
+                                     "actual_input_chars": request.input_chars,
+                                     "output_tokens": request.max_tokens})
+        if "buckets" in selected:
+            bucket_levels = [{"concurrency": level,
+                              "requests_per_case": max(settings.samples_per_bucket, level),
+                              "requests_per_target": 9 * max(settings.samples_per_bucket, level)}
+                             for level in settings.levels]
+            add("buckets", sum(level["requests_per_target"] for level in bucket_levels),
+                "Tests all nine input-size and answer-limit combinations at every selected load. Each combination includes at least one full batch.")
+        if "mixed" in selected:
+            add("mixed_control", settings.mixed_pairs, "Quiet short controls for mixed-load comparisons.",
+                title="Mixed-load controls")
+            if config.concurrency < 2:
+                add("mixed", 0, "Requires concurrency of at least two; only quiet controls run.")
+            else:
+                pairs = sum(settings.heavy_weights.values()) * settings.mixed_pairs
+                add("mixed_fixed", 3 * pairs,
+                    "Two requests per before-output pair and the short request of each active-stream pair.",
+                    title="Fixed mixed-load requests")
+                add("mixed", None, f"Up to {pairs} heavy requests start only while a short response is streaming.",
+                    kind="bounded")
+        if config.request_pack is not None:
+            warnings.append("Bucket and mixed workloads use generated examples; your saved dataset does not replace those requests.")
+    if "sessions" in selected:
+        settings = config.sessions
+        maximum = len(settings.modes) * settings.sessions * len(settings.turns)
+        add("sessions", None,
+            f"Up to {maximum} requests; prior responses and history admission determine whether later turns run.",
+            source="configured session prompts and saved/live history", kind="bounded")
+    if "consistency" in selected:
+        settings = config.consistency
+        levels = len(set([1, *settings.levels]))
+        count = len(settings.shapes) * levels * settings.repetitions
+        add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
+    if "tools" in selected:
+        count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
+        add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")
+
+    judging = details["judging"] if details else None
+    evaluator = {"active": bool(judging and judging["active"]),
+                 "call_upper_bound": judging["planned_call_upper_bound"] if judging else 0,
+                 "judge_count": judging["judge_count"] if judging else 0,
+                 "ready": judging["ready"] if judging else True,
+                 "readiness_errors": judging["readiness_errors"] if judging else []}
+    if evaluator["active"]:
+        warnings.append("AI judge calls run separately from the target request budget and send cases and generated answers to each judge.")
+        warnings.extend(evaluator["readiness_errors"])
+    if config.request_source == "request_pack" and not pack_selected:
+        warnings.append("Your dataset is inactive: select answer correctness or arrival capacity to use it.")
+    if config.overlap_models and target_count > 1:
+        warnings.append("Models run at the same time and share the maximum requests at a time. Their actual overlap depends on when request slots become free.")
+    known = sum(row["requests_per_target"] for row in rows if row["kind"] == "exact")
+    unknown = any(row["requests_per_target"] is None for row in rows)
+    estimated = any(row["kind"] == "estimate" for row in rows)
+    kind = "bounded" if unknown else "estimate" if estimated else "exact"
+    planned = None if unknown else sum(row["requests_per_target"] for row in rows)
+    for target, quota in quotas.items():
+        if known > quota:
+            warnings.append(f"{target} needs at least {known} requests, but its share of the run limit is {quota}. Some tests may be incomplete.")
+        elif planned is not None and planned > quota:
+            warnings.append(f"About {planned} requests are planned for {target}, but its share of the run limit is {quota}. Some tests may be incomplete.")
+    if rows:
+        warnings.append("Counts show the complete plan. The run may stop earlier when its request, time or error limit is reached.")
+    return {"count_kind": kind, "planned_per_target": planned,
+            "planned_total": planned * target_count if planned is not None else None,
+            "known_per_target": known, "known_total": known * target_count,
+            "request_limit": config.max_requests,
+            "required_request_limit": planned * target_count if kind == "exact" else None,
+            "target_quotas": quotas, "rows": rows, "bucket_cases": bucket_cases,
+            "bucket_levels": bucket_levels, "evaluator": evaluator, "warnings": warnings}

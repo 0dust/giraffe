@@ -22,6 +22,7 @@ from giraffe.capabilities import capabilities
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.models import ConfigDraft, Model, RunConfig, RunReport
+from giraffe.planning import request_plan
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from giraffe.request_pack import pack_preview
 from giraffe.runner import run_suite
@@ -102,7 +103,9 @@ def _bootstrap_config(defaults: dict | None) -> dict:
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1",
                                  "model": "placeholder"}]).model_dump(mode="json")
     config["targets"][0]["model"] = ""
-    if defaults is not None:
+    if defaults is None:
+        config["checks"] = ["access", "correctness"]
+    else:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
         config.update(defaults)
     config["restart_target"] = None
@@ -267,7 +270,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         configuration = _bootstrap_config(defaults)
         resolved = ConfigDraft.model_validate(configuration)
         return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
-                "active_run_id": active.get("id")}
+                "active_run_id": active.get("id"), "request_plan": request_plan(resolved)}
 
     @app.get("/api/capabilities")
     async def describe_capabilities():
@@ -277,17 +280,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.post("/api/config/draft")
     async def validate_draft(config: ConfigDraft):
         """Normalize a draft for editing or export without requiring run readiness."""
-        return {"config": config.model_dump(mode="json")}
+        return {"config": config.model_dump(mode="json"), "request_plan": request_plan(config)}
 
     @app.post("/api/config/validate")
     async def validate_config(config: RunConfig):
         """Normalize edits using the same contract as a run without sending traffic."""
-        return {"config": config.model_dump(mode="json")}
+        return {"config": config.model_dump(mode="json"), "request_plan": request_plan(config)}
 
     @app.post("/api/config/preview")
     async def preview_config(config: ConfigDraft):
         """Describe effective requests and coverage without target calls or file imports."""
-        return {"config": config.model_dump(mode="json"), "request_pack_preview": pack_preview(config)}
+        preview = pack_preview(config)
+        return {"config": config.model_dump(mode="json"), "request_pack_preview": preview,
+                "request_plan": request_plan(config, pack_details=preview)}
 
     @app.post("/api/datasets/preview")
     async def preview_dataset_import(body: DatasetPreview):
