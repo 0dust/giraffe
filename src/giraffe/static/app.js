@@ -143,21 +143,21 @@ function bucketFormDefaults(config) {
 }
 function renderBucketEditor(config) {
   const settings=config.buckets || bucketFormDefaults(config),schema=state.bootstrap.buckets.schema;
-  return `<fieldset class="fields" data-bucket-settings>${field('buckets_levels','Concurrency levels',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 2, 4, 8',hint:'Simultaneous requests to test at each input/output size pair. Separate levels with commas. Every level must fit within Maximum in-flight requests.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Minimum requests per size pair',hint:'At each level, sends at least this many requests or one full concurrent batch, whichever is larger.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Time limit per size pair (seconds)'})}</fieldset><p class="hint bucket-profile-summary"></p><p class="hint">Input/output sizes and mixed-workload settings are available in JSON under <code>buckets</code>.</p><button type="button" class="text-button" data-config-tab="json">Edit sizes in JSON</button>`;
+  return `<fieldset class="fields" data-bucket-settings>${field('buckets_levels','Concurrency levels',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 2, 4, 8',hint:'Enter 1, 4, 8 to test 1 request at a time, then 4, then 8. Keep every number at or below Maximum in-flight requests.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Minimum requests per test',hint:'How many requests to send for each test. Testing 8 at a time needs at least 8 requests, even if this is set to 4.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Time limit per test (seconds)',hint:'Stop each test when this time is up.'})}</fieldset><p class="hint bucket-profile-summary"></p><p class="hint">Input/output sizes and mixed-workload settings are available in JSON under <code>buckets</code>.</p><button type="button" class="text-button" data-config-tab="json">Edit sizes in JSON</button>`;
 }
 function renderLoadGuidance(config) {
   const plan=bucketCoveragePlan(config),messages=[];
   const batchBudget=config.concurrency*config.targets.length;
   let budgetNeeded=batchBudget;
   if(plan){
-    messages.push(`<p class="hint">Bucket coverage: levels ${escape(plan.levels.join(' → '))}, ${number(plan.perTarget)} requests per target, ${number(plan.total)} total. This covers 9 input/output size pairs at each level. Time limits can stop coverage early.</p>`);
+    messages.push(`<p class="hint">Test ${escape(plan.levels.join(' → '))} requests at a time: ${number(plan.perTarget)} requests per target, ${number(plan.total)} total. Each level runs 9 tests using short, medium and long questions and answers. Time limits can stop a test early.</p>`);
     budgetNeeded=Math.max(budgetNeeded,plan.total);
     if(plan.peak>config.concurrency)messages.push(notice(`The highest tested level (${plan.peak}) exceeds Maximum in-flight requests (${config.concurrency}). Raise the maximum or lower the tested levels.`,'warning'));
-    if(config.max_requests<plan.total)messages.push(notice(`The total request limit (${number(config.max_requests)}) is below bucket coverage alone (${number(plan.total)}). The selected levels cannot all be covered.`,'warning'));
+    if(config.max_requests<plan.total)messages.push(notice(`This test needs ${number(plan.total)} requests, but your total request limit is ${number(config.max_requests)}. Increase the limit to run all selected levels.`,'warning'));
     else if(config.checks.length>1)messages.push('<p class="hint">Other selected tests share the total request limit and may leave fewer requests for bucket coverage.</p>');
   }
   if(config.max_requests<batchBudget)messages.push(notice(`The total request limit gives at least one target fewer than ${number(config.concurrency)} requests. That target cannot reach the maximum in-flight setting.`,'warning'));
-  if(config.max_requests<budgetNeeded)messages.push(`<button type="button" class="button small" data-action="use-request-budget" data-budget="${budgetNeeded}">Use ${number(budgetNeeded)} total requests</button><p class="hint">${plan?'Covers bucket traffic only; allow more for other selected tests.':'Allows one full batch per target at the maximum in-flight setting; individual tests may use lower levels.'} This changes your total traffic limit.</p>`);
+  if(config.max_requests<budgetNeeded)messages.push(`<button type="button" class="button small" data-action="use-request-budget" data-budget="${budgetNeeded}">Use ${number(budgetNeeded)} total requests</button><p class="hint">${plan?'Enough for this test; other selected tests may need more requests.':'Allows one full batch per target at the maximum in-flight setting; individual tests may use lower levels.'} This changes your total traffic limit.</p>`);
   return messages.join('');
 }
 function renderTrafficEditor(config) {
@@ -515,7 +515,7 @@ function updateBounds() {
   const c=payload.config;
   $('#load-guidance').innerHTML=renderLoadGuidance(c);
   const bucketSummary=$('.bucket-profile-summary');
-  if(bucketSummary){const plan=bucketCoveragePlan({...c,checks:['buckets']});bucketSummary.textContent=plan?`${number(plan.perTarget)} requests per target for all 9 size pairs at each level. The total request limit is shared with other tests.`:'Enter valid concurrency levels and a sample minimum to calculate coverage.';}
+  if(bucketSummary){const plan=bucketCoveragePlan({...c,checks:['buckets']});bucketSummary.textContent=plan?`${number(plan.perTarget)} requests per target. Each level runs 9 tests using short, medium and long questions and answers.`:'Enter the requests to run at a time and the minimum requests per test to see the total.';}
   updateDatasetReadiness(c);
   for(const check of state.bootstrap.checks){
     const card=$(`[data-test-card="${check.id}"]`);
