@@ -1,10 +1,10 @@
-import {applySetupPreset, inferSetupPreset, configureSetupLoad, bucketCoveragePlan, configureBuckets, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261014-setup';
+import {inferSetupPreset, bucketCoveragePlan, configureBuckets, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureProfiles, effectiveProfileDefaults, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261015-ux4';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = (value) => structuredClone(value);
-const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, filter:'all', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
+const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, filter:'all', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'selected', catalogueCategory:'all', catalogueSearch:'', setupStep:1, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
 const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Skipped',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',inconclusive:'!',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -78,7 +78,7 @@ async function pollRuns(version) {
   if(version===state.routeVersion)schedulePoll(pollRuns,version,3000);
 }
 async function pollNew(version) {
-  try { await refreshRuns();if(version!==state.routeVersion)return;connectionError();const button=$('#start-run');if(button&&!state.submitting)button.disabled=Boolean(state.active);const activeNotice=$('#new-active-notice');if(activeNotice){activeNotice.hidden=!state.active;$('a',activeNotice).href=state.active?linkRun(state.active):'#runs';} }
+  try { await refreshRuns();if(version!==state.routeVersion)return;connectionError();const button=$('#start-run');if(button&&!state.submitting)button.disabled=!canStartRun();const activeNotice=$('#new-active-notice');if(activeNotice){activeNotice.hidden=!state.active;$('a',activeNotice).href=state.active?linkRun(state.active):'#runs';} }
   catch(error) {if(version===state.routeVersion)connectionError(error.message);}
   if(version===state.routeVersion)schedulePoll(pollNew,version,3000);
 }
@@ -92,15 +92,20 @@ async function pollDetail(version) {
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
 function renderRuns() {
-  const runs=state.runs.filter(r=>state.filter==='all'||(activeState(r)?'active':r.overall || r.state)===state.filter);
-  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Deployment acceptance</div><h1>Runs</h1><p>Your deployment, put to the test. Inspect results and see what changed.</p></div><a class="button primary" href="#new">${icon('plus')} New run</a></div>
-  ${state.active?`<div class="notice"><strong>A suite is running.</strong> Traffic remains bounded by its configured limits. <a href="${linkRun(state.active)}">Open live run →</a></div>`:''}
-  <div class="history-layout"><section class="panel"><div class="section-heading"><h2>Run history <span class="dim mono">${state.runs.length}</span></h2><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="active">Active</option><option value="error">Runner error</option></select></div></div>
+  if(!state.runs.length&&!state.active){
+    $('#main').innerHTML=`<section class="first-run"><div class="eyebrow">Your first check</div><h1>Know how your LLM endpoint behaves.</h1><p>Check answers, response times and failures using the model you already run.</p><a class="button primary" href="#new">${icon('plus')} Start first check</a><ol class="first-run-steps"><li><strong>Connect your endpoint</strong><p>Enter the server address and test the connection.</p></li><li><strong>Choose what to check</strong><p>Start with answer checks. Review the request limits before running.</p></li><li><strong>Understand the result</strong><p>See what passed, what needs attention, and the requests behind it.</p></li></ol><div class="first-run-outcome"><strong>A report you can act on</strong><p>Save the evidence, adjust your setup, and compare a later run. Reports stay on this machine.</p></div><p class="hint">Use an existing OpenAI-compatible server, such as Ollama, vLLM or SGLang.</p></section>`;
+    return;
+  }
+  const outcomeFor=r=>activeState(r)||['error','cancelled','interrupted'].includes(r.state)?r.state:r.overall || r.state;
+  const runs=state.runs.filter(r=>state.filter==='all'||(activeState(r)?'active':outcomeFor(r))===state.filter);
+  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Your workspace</div><h1>Run history</h1><p>Open a result to inspect the evidence, compare changes or run it again.</p></div><a class="button primary" href="#new">${icon('plus')} New check</a></div>
+  ${state.active?`<div class="notice"><strong>A check is running.</strong> <a href="${linkRun(state.active)}">Open live run →</a></div>`:''}
+  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><h2>Saved runs <span class="dim mono">${state.runs.length}</span></h2><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div>
   ${runs.length?`<div class="history-table"><table><thead><tr><th>Target / model</th><th>Outcome</th><th>Checks</th><th>Started</th><th>Duration</th><th></th></tr></thead><tbody>${runs.map(r=>{
-    const targets=r.targets || [],counts=r.check_counts || {},outcome=activeState(r)?r.state:r.overall || r.state;
-    return `<tr><td><a class="run-link" href="${linkRun(r.id)}">${escape(targets.map(t=>t.name).join(', ') || 'Unnamed run')}</a><small class="mono">${escape(targets.map(t=>t.model).join(', ') || 'No model recorded')}</small></td><td>${badge(outcome)}${r.baseline_id?'<small>Baseline compared</small>':''}</td><td>${activeState(r)?'<span class="muted">In progress</span>':`<span>${number(counts.pass || 0)} passed</span>${counts.fail?`<small style="color:var(--fail)">${number(counts.fail)} failed</small>`:counts.inconclusive?`<small>${number(counts.inconclusive)} inconclusive</small>`:''}`}</td><td class="nowrap">${date(r.started_at)}<small class="run-id">${escape((r.run_id || r.id).slice(0,14))}</small></td><td class="mono">${duration(r)}</td><td><a class="text-button" href="${linkRun(r.id)}" aria-label="Open run ${escape(r.id)}">↗</a></td></tr>`;}).join('')}</tbody></table></div><div class="table-note">Local results · newest first · a failed check is a saved result</div>`:
-  `<div class="empty-state"><svg viewBox="0 0 40 40" aria-hidden="true"><rect x="8" y="5" width="24" height="30" rx="3"/><path d="M14 13h12M14 20h12M14 27h7"/></svg><h2>${state.runs.length?'No runs match this filter':'Start with your endpoint'}</h2><p>${state.runs.length?'Choose another outcome to inspect your saved runs.':'Run the built-in suite against an OpenAI-compatible endpoint. Get a clear result, with the requests behind it.'}</p>${state.runs.length?'<button class="button" data-action="clear-filter">Show all runs</button>':'<a class="button primary" href="#new">Configure first run →</a>'}</div>`}</section>
-  <aside class="context-panel"><div class="eyebrow">One suite. Real evidence.</div><h2>What gets checked</h2><p>Built-in fixtures test serving behavior and known answers. No test authoring required.</p>${suiteList()}<p>Results apply to the targets, traffic and limits recorded in each run.</p></aside></div>`;
+    const targets=r.targets || [],counts=r.check_counts || {},outcome=outcomeFor(r);
+    const attention=['fail','blocked','inconclusive'].filter(key=>counts[key]).map(key=>`${number(counts[key])} ${statusLabels[key].toLowerCase()}`).join(' · ');
+    return `<tr><td><a class="run-link" href="${linkRun(r.id)}">${escape(targets.map(t=>t.name).join(', ') || 'Unnamed run')}</a><small class="mono">${escape(targets.map(t=>t.model).join(', ') || 'No model recorded')}</small></td><td>${badge(outcome)}${r.baseline_id?'<small>Baseline compared</small>':''}</td><td>${activeState(r)?'<span class="muted">In progress</span>':`<span>${number(counts.pass || 0)} passed</span>${attention?`<small>${escape(attention)}</small>`:''}`}</td><td class="nowrap">${date(r.started_at)}<small class="run-id">${escape((r.run_id || r.id).slice(0,14))}</small></td><td class="mono">${duration(r)}</td><td><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run ${escape(r.id)}">${activeState(r)?'View live':'Open result'} →</a></td></tr>`;}).join('')}</tbody></table></div><div class="table-note">Saved on this machine · newest first · failed checks keep their evidence</div>`:
+  `<div class="empty-state"><h2>No runs match this filter</h2><p>Choose another outcome to inspect your saved runs.</p><button class="button" data-action="clear-filter">Show all runs</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
 }
 const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Maximum in-flight requests','Requests running at the same time.',1,1],['max_requests','Total request limit','Requests allowed during the whole run.',1,1],['max_duration_seconds','Maximum duration','seconds',.1,'any'],['request_timeout_seconds','Request deadline','seconds',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
@@ -108,6 +113,7 @@ const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms'
 const fieldDescriptions={
   url:{hint:'Address of your LLM server.',help:'Use the address Giraffe can reach, such as http://localhost:11434/v1 for Ollama or http://localhost:8000/v1 for vLLM. Giraffe connects to an existing server; it does not start or install a model.'},
   model:{hint:'Model name used by your server.',help:'Use an exact model name from your server, including its tag or alias. For Ollama, use a name from ollama list. The model must already be installed.'},
+  api_key_env:{hint:'Variable name, such as OPENAI_API_KEY. Do not paste the key.',help:'Giraffe reads this environment variable from the machine running giraffe ui. Set it before starting Giraffe. The secret key is never stored in this form.'},
   name:{hint:'A name for this endpoint in results.',help:'Choose a unique name such as local or staging. Giraffe uses it to identify this endpoint in reports and comparisons.'},
   context_limit:{help:'The server’s configured limit for the question and answer together, measured in tokens. A token is a small piece of text. Use the context length configured on your server, which can be lower than the model’s advertised maximum.'},
   concurrency:{hint:'Requests running at the same time.',help:'The most requests Giraffe can run at the same time across all servers. You set this number; Giraffe does not detect your hardware limit. Individual tests can use fewer requests. Raising this does not change Total request limit or Concurrency levels.'},
@@ -142,8 +148,8 @@ const fieldDescriptions={
   limit_stream_gap_ms:{help:'The longest acceptable pause between streamed answer chunks, in milliseconds. Network buffering can affect this measurement.'},
   limit_min_output_tokens_per_second:{help:'The minimum acceptable generation speed after the first answer begins, estimated in tokens per second. Single-token answers and responses with missing token usage cannot establish this speed.'},
   limit_fairness_max_ratio:{help:'How much slower a short answer may become when long requests run alongside it. A value of 2 allows up to twice the short-only response time. Use a number greater than 1.'},
-  limit_max_error_rate:{help:'The largest allowed share of failed, timed-out or invalid responses. Enter a fraction from 0 to 1: 0.05 means 5%. Intentional cancellation probes are treated separately.'},
-  limit_min_correctness:{help:'The smallest allowed share of correct answers among scored requests. Enter a fraction from 0 to 1: 0.95 means 95%. Missing or unscored answers can leave a test inconclusive.'},
+  limit_max_error_rate:{help:'The largest allowed share of failed, timed-out or invalid responses. Enter a percentage from 0 to 100: 5 means 5%. Intentional cancellation probes are treated separately.'},
+  limit_min_correctness:{help:'The smallest allowed share of correct answers among scored requests. Enter a percentage from 0 to 100: 95 means 95%. Missing or unscored answers can leave a test inconclusive.'},
   limit_regression_percent:{help:'How much a result may worsen compared with a saved baseline before Giraffe flags a material regression. Timing changes use percent; rate changes use percentage points. Too few comparable samples can leave the comparison inconclusive.'},
   limit_min_samples:{help:'The minimum number of usable measurements needed to judge a result. Fewer samples produce an inconclusive result rather than a pass.'},
   test_samples:{help:'How many sample requests this test should try. Some tests need extra requests to cover every case. Leave blank to use the run setting.'},
@@ -190,10 +196,10 @@ function fieldDescription(name) {
   const key=name.replace(/^judge_\d+_/,'judge_').replace(/^message_\d+_/,'message_').replace(/^buckets_(input|output)_(short|medium|long)$/,'buckets_$1');
   return fieldDescriptions[key] || {};
 }
-function infoHelp(name,label,help) {
+function infoHelp(name,label,help,details='') {
   if(!help)return '';
   const id=`field-${name}`;
-  return `<button type="button" class="field-info" id="${escape(id)}-info" popovertarget="${escape(id)}-help" aria-label="About ${escape(label)}" aria-describedby="${escape(id)}-help-text"><span aria-hidden="true">i</span></button><div id="${escape(id)}-help" class="field-help" popover="auto" data-help-for="${escape(id)}-info" role="note"><strong>${escape(label)}</strong><p id="${escape(id)}-help-text">${escape(help)}</p></div>`;
+  return `<button type="button" class="field-info" id="${escape(id)}-info" popovertarget="${escape(id)}-help" aria-label="About ${escape(label)}" aria-describedby="${escape(id)}-help-text"><span aria-hidden="true">i</span></button><div id="${escape(id)}-help" class="field-help" popover="auto" data-help-for="${escape(id)}-info" role="note"><strong>${escape(label)}</strong><p id="${escape(id)}-help-text">${escape(help)}</p>${details}</div>`;
 }
 function renderField(name,label,control,{hint,help,helpKey=name,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`}={}) {
   const copy=fieldDescription(helpKey);hint ??= copy.hint || '';help ??= copy.help || '';
@@ -223,34 +229,275 @@ function positionFieldHelp(popover) {
   popover.style.top=`${bounds.bottom+8+height<=window.innerHeight-gutter?bounds.bottom+8:Math.max(gutter,bounds.top-height-8)}px`;
 }
 function baselineOptions(selected='') {return `<option value="">No baseline · first or standalone run</option>${state.baselines.map(b=>`<option value="${escape(b.id)}" ${b.id===selected?'selected':''}>${escape(b.name)} · ${statusLabels[b.overall] || b.overall || 'saved'} · ${date(b.saved_at)}</option>`).join('')}`;}
-function schemaField(name,value,schema,{label,hint,helpKey=name,placeholder='Use run setting'}={}) {
+function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder='Use run setting'}={}) {
   const nullable=schema.anyOf?.some(item=>item.type==='null');
   const valueSchema=schema.anyOf?.find(item=>item.type!=='null') || schema;
   label ||= schema.title || human(name);
-  if(valueSchema.enum)return selectField(name,label,valueSchema.enum.map(item=>`<option value="${escape(item)}" ${item===value?'selected':''}>${escape(item==='poisson'?'Uneven (Poisson)':item==='steady'?'Even spacing':human(item))}</option>`).join(''),{hint,helpKey});
-  if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,helpKey,required:true});
-  if(valueSchema.type==='string')return field(name,label,value,{hint,helpKey,required:!nullable,placeholder});
-  return field(name,label,value,{type:'number',hint,helpKey,min:valueSchema.minimum,max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
+  if(valueSchema.enum)return selectField(name,label,valueSchema.enum.map(item=>`<option value="${escape(item)}" ${item===value?'selected':''}>${escape(item==='poisson'?'Uneven (Poisson)':item==='steady'?'Even spacing':human(item))}</option>`).join(''),{hint,help,helpKey});
+  if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,help,helpKey,required:true});
+  if(valueSchema.type==='string')return field(name,label,value,{hint,help,helpKey,required:!nullable,placeholder});
+  return field(name,label,value,{type:'number',hint,help,helpKey,min:valueSchema.minimum ?? (valueSchema.exclusiveMinimum===undefined?undefined:valueSchema.exclusiveMinimum+(valueSchema.type==='integer'?1:.001)),max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
+}
+const checkGroups=[
+  {id:'answers',title:'Answers & basic health',checks:['access','serving','correctness','json','context','tools']},
+  {id:'speed',title:'Speed & load',checks:['first_output','generation','capacity','buckets','arrivals']},
+  {id:'reliability',title:'Reliability & isolation',checks:['fairness','mixed','recovery','sessions','consistency']},
+  {id:'server',title:'Server diagnostics',checks:['cancellation','prefix','gpu']},
+];
+const checkGuide={
+  access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
+  serving:{name:'Errors & empty responses',purpose:'Look for errors, empty answers and incomplete responses.',sends:'Repeated short requests; also inspects responses from the selected checks.',shows:'Invalid responses, timeouts and server errors against your allowed error rate.'},
+  correctness:{name:'Answer correctness',purpose:'Check known answers using built-in examples or your own questions.',sends:'Generated extraction, arithmetic and classification questions, or each of your saved questions.',shows:'Correct answers among scored responses. Missing answers stay visible.'},
+  json:{name:'JSON format & values',purpose:'Check that JSON answers have the right fields, types and values.',sends:'Generated questions requesting a defined JSON structure.',shows:'Valid JSON, required fields, expected types and known values.'},
+  context:{name:'Recall in long prompts',purpose:'Find out whether facts survive inside long questions.',sends:'Known facts placed at different positions and lengths in generated questions.',shows:'Recall at the exercised lengths. Use your server’s configured context limit.',needs:'Check the server context limit'},
+  tools:{name:'Tool-call correctness',purpose:'Check tool names and arguments without executing a tool.',sends:'A generated weather-tool request with automatic tool choice, plus forced choice when enabled.',shows:'Whether the response chooses the expected tool and supplies the expected arguments.',needs:'Tool-capable model and endpoint'},
+  first_output:{name:'Time to first answer',purpose:'Measure how long users wait before useful answer text arrives.',sends:'One initial request and repeated short requests, shared with response-health checks.',shows:'Initial and subsequent answer delays, separate from reasoning text.',needs:'Streaming enabled'},
+  generation:{name:'Answer speed & pauses',purpose:'Measure completion speed and interruptions in streamed answers.',sends:'Repeated requests to reproduce a generated passage.',shows:'Response time, stream pauses and generation rate when usage data supports it.',needs:'Streaming for pause measurements'},
+  capacity:{name:'Capacity under load',purpose:'See when increasing request rates causes slow, incorrect or dropped answers.',sends:'New requests at each configured rate, using generated examples or your own questions.',shows:'Correct answers, latency and drops at each tested rate. Set a time target to judge acceptable capacity for this workload.'},
+  buckets:{name:'Performance by request size',purpose:'Compare short and long questions and answers at different loads.',sends:'Nine question-length and answer-cap combinations at every concurrency level.',shows:'Response quality and timing for each size and load. Caps do not guarantee answer length.'},
+  arrivals:{name:'Steady & burst traffic',purpose:'Compare scheduled requests and sudden groups of arrivals.',sends:'A fixed number of scheduled requests, evenly spaced or grouped into bursts.',shows:'Actual start times, queueing and requests left undispatched by limits.'},
+  fairness:{name:'Stream stalls under load',purpose:'See if long questions interrupt a short answer already streaming.',sends:'Short responses with and without competing long questions.',shows:'Slowdown and pauses during competing work; long requests start only while the short answer streams.',needs:'Streaming and at least 2 in flight'},
+  mixed:{name:'Short-request slowdown',purpose:'See if long requests slow down short requests beside them.',sends:'Short requests alongside a configurable mix of long-question and long-answer requests.',shows:'How short requests behave with and without heavy neighboring work.'},
+  recovery:{name:'Recovery after load',purpose:'Check whether normal responses return after sustained traffic.',sends:'Sustained traffic followed by bounded health-check requests.',shows:'Post-load errors, correctness and response timing. Shared limits can shorten the load period.'},
+  sessions:{name:'Concurrent conversations',purpose:'Check several multi-turn conversations at the same time.',sends:'Conversation turns with prepared history, earlier model replies, or both.',shows:'Completion and turn behavior across concurrent conversations.'},
+  consistency:{name:'Answer consistency',purpose:'Compare repeated answers across request sizes and concurrency levels.',sends:'Repeated generated questions at the chosen sizes and loads.',shows:'Whether these answers agree under exact or whitespace-normalized comparison.'},
+  cancellation:{name:'Cancellation & timeouts',purpose:'Check stopped requests, output limits and service health afterward.',sends:'Output/stop controls, intentional cancellation, short deadlines and follow-up health requests.',shows:'Client behavior and recovery. Server-side proof needs supported logs or traces.'},
+  prefix:{name:'Prompt cache evidence',purpose:'Look for evidence that repeated opening text reuses server work.',sends:'Requests with shared opening text and conversation history, plus comparisons.',shows:'Cache evidence when available. Faster responses alone do not prove cache reuse.'},
+  gpu:{name:'GPU metrics',purpose:'Inspect measurements already exposed by your server.',sends:'Reads your metrics URL; adds no inference requests.',shows:'Available GPU measurements and their freshness. Missing data remains unknown.',needs:'Existing metrics endpoint'},
+};
+function profileDefaults(key,config=state.config) {return effectiveProfileDefaults(config,state.bootstrap.profile_defaults || {},key);}
+function catalogTitle(id) {return checkGuide[id]?.name || human(id);}
+function renderProfileEditor(check,config) {
+  const key=check.id;
+  if(key==='tools')return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_forced_tool_diagnostic','Also test a forced tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Giraffe validates tool calls; it never executes the tool.'})}</div>`;
+  if(key==='mixed'){
+    const settings=config.buckets || bucketFormDefaults(config);
+    return `<div data-bucket-settings class="fields">${field('buckets_mixed_pairs','Short / heavy request pairs',settings.mixed_pairs,{type:'number',min:1,max:100,step:1,required:true})}${field('buckets_heavy_long_input','Long-question weight',settings.heavy_weights.long_input,{type:'number',min:1,max:16,step:1,required:true,hint:'Relative share of heavy work, from 1 to 16.'})}${field('buckets_heavy_long_output','Long-answer weight',settings.heavy_weights.long_output,{type:'number',min:1,max:16,step:1,required:true,hint:'Relative share of heavy work, from 1 to 16.'})}</div><p class="hint">Question lengths and answer caps are shared with Performance by request size. Configure that row to edit them; it does not need to be selected.</p>`;
+  }
+  const profiles={
+    arrivals:{schema:'Arrival',fields:['mode','requests','requests_per_second','burst_size'],advanced:['interval_seconds','max_pending','seed']},
+    prefix:{schema:'Prefix',fields:['prefix_chars','repeats','history_turns']},
+    sessions:{schema:'Sessions',fields:['modes','sessions','concurrency'],advanced:['max_tokens','delay_seconds','turns','saved_answers']},
+    consistency:{schema:'Consistency',fields:['repetitions','levels','shapes','equality','strict'],advanced:['temperature','seed']},
+  };
+  const descriptor=profiles[key];if(!descriptor)return '';
+  const values={...profileDefaults(key,config),...config[key]},schema=state.bootstrap.config_schema.$defs[descriptor.schema];
+  const labels={mode:'Arrival pattern',requests:'Scheduled requests',requests_per_second:'Requests per second',burst_size:'Requests in each burst',interval_seconds:'Seconds between bursts',max_pending:'Maximum pending requests',seed:'Random seed',prefix_chars:'Shared opening length (characters)',repeats:'Repeated requests',history_turns:'Conversation history turns',modes:'Conversation history',sessions:'Conversations',concurrency:'Conversations at a time',max_tokens:'Answer cap per turn (tokens)',delay_seconds:'Pause between turns (seconds)',turns:'Conversation questions · one per line',saved_answers:'Prepared answers · one per line',repetitions:'Repetitions per case',levels:'Requests at a time',shapes:'Question sizes',equality:'Compare answers',temperature:'Temperature',strict:'Require every compared answer to agree'};
+  const hints={mode:'Choose even spacing or bursts of requests.',requests:'Total scheduled requests before the run limits apply.',requests_per_second:'Used only with even spacing.',burst_size:'Used only with bursts; requests scheduled together in each burst.',interval_seconds:'Used only with bursts; time between groups.',max_pending:'Maximum scheduled requests waiting for an available slot.',seed:'Keep this number to repeat the same arrival pattern.',prefix_chars:'Repeated opening text length; characters are different from tokens.',repeats:'Repeat each shared-prefix case this many times.',history_turns:'Prepared conversation turns included in the history comparison.',modes:'Prepared uses saved replies; earlier model replies uses answers from this run.',sessions:'Conversations to run for each chosen history type.',concurrency:'Conversations allowed at once, within the run request ceiling.',max_tokens:'Answer cap for each turn, within the run output cap.',delay_seconds:'Wait this long before the next turn in a conversation.',repetitions:'Answers per question-size and load combination.',levels:'For example: 1, 2, 4. Each level must fit within the run request ceiling.',shapes:'Repeat the selected question sizes at every load.',equality:'Exact text compares characters; ignore extra whitespace normalizes spacing.',temperature:'Sampling temperature sent with repeated questions.',strict:'Require agreement fails if repeated answers differ. Wrong known answers can still fail either mode.'};
+  const render=name=>{
+    const fieldName=`profile_${key}_${name}`,value=values[name];
+    const choices=name==='modes'?[['fixed','Prepared history'],['live','Earlier model replies'],['fixed,live','Both history types']]:name==='shapes'?[['short','Short questions'],['long','Long questions'],['short,long','Short and long questions']]:name==='strict'?[['false','Report consistency'],['true','Require agreement']]:name==='equality'?[['bytes','Exact text'],['whitespace','Ignore extra whitespace']]:null;
+    if(choices){const selected=Array.isArray(value)?value.join(','):String(value);if(!choices.some(([item])=>item===selected))choices.push([selected,'Saved selection']);return selectField(fieldName,labels[name],choices.map(([item,label])=>`<option value="${escape(item)}" ${item===selected?'selected':''}>${label}</option>`).join(''),{hint:hints[name]});}
+    if(['turns','saved_answers'].includes(name))return textField(fieldName,labels[name],(value || []).join('\n'),{hint:'Editing replaces this list. Keep prepared answers aligned with the saved conversation questions.'});
+    return schemaField(fieldName,value,schema.properties[name],{label:labels[name],hint:hints[name]});
+  };
+  return `<input type="hidden" name="profile_edits_${key}" value="[]"><button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="${key}">Reset this profile</button><div data-profile-settings="${key}"><fieldset class="fields">${descriptor.fields.map(render).join('')}</fieldset>${descriptor.advanced?`<details class="check-advanced"><summary>More ${escape(checkGuide[key].name.toLowerCase())} settings</summary><fieldset class="fields">${descriptor.advanced.map(render).join('')}</fieldset></details>`:''}</div>`;
+}
+function checkCoverageWarning(check,config) {
+  const minimum=config.limits.min_samples;
+  let planned;
+  if(check.id==='consistency')planned=(config.consistency || profileDefaults('consistency',config)).repetitions;
+  if(check.id==='mixed')planned=(config.buckets || bucketFormDefaults(config)).mixed_pairs;
+  if(check.id==='buckets'){
+    const buckets=config.buckets || bucketFormDefaults(config);
+    planned=Math.min(...buckets.levels.map(level=>Math.max(buckets.samples_per_bucket,level)));
+  }
+  return planned!=null&&planned<minimum?`Too few planned samples for coverage: ${planned} in a group; ${minimum} required.`:'';
+}
+function checkOverrideWarning(check,config,recovery=false) {
+  const messages=[];
+  for(const [name,label,setting] of [['concurrency','Requested concurrency','Requests at once (maximum)'],['max_output_tokens','Requested answer cap','Maximum answer length (tokens)'],['request_timeout_seconds','Requested deadline','Request timeout (seconds)']]){
+    const value=config.test_options?.[check.id]?.[name];
+    if(value!=null&&value>config[name])messages.push(`${label} ${checkSettingValue(name,value)} exceeds run limit ${checkSettingValue(name,config[name])}.${recovery?` Reset this check’s overrides or raise ${setting} in Shared settings.`:''}`);
+  }
+  return messages.join(' ');
+}
+function effectiveCheckSummary(check,config) {
+  const parts=[];
+  if(check.id==='access')parts.push('1 short request');
+  else if(check.id==='capacity')parts.push(`${config.traffic.rates.join(' → ')} requests/s`,`${config.traffic.duration_seconds}s at each rate`);
+  else if(check.id==='buckets')parts.push(`${(config.buckets || bucketFormDefaults(config)).levels.join(', ')} requests at a time`,'9 size combinations per level');
+  else if(check.id==='gpu')parts.push(config.targets[0].metrics_url?'Metrics URL configured':'Metrics URL needed');
+  else if(check.id==='tools')parts.push(config.forced_tool_diagnostic?'Includes forced tool diagnostic':'Normal tool choice');
+  else if(check.id==='correctness'&&config.request_source==='request_pack'){
+    const count=config.request_pack?.cases?.length;
+    parts.push(count==null?'Each saved question once':`${count} saved ${count===1?'question':'questions'} · each once`);
+  }
+  else if(['arrivals','prefix','sessions','consistency'].includes(check.id)){
+    const profile={...profileDefaults(check.id,config),...config[check.id]};
+    if(check.id==='arrivals')parts.push(`${profile.requests} scheduled requests`,profile.mode==='burst'?`${profile.burst_size} per burst`:`${profile.requests_per_second} requests/s`);
+    if(check.id==='prefix')parts.push(`${profile.repeats} repeats`,`${profile.prefix_chars} shared characters`);
+    if(check.id==='sessions')parts.push(`${profile.sessions} conversations`,`${profile.concurrency} at a time`);
+    if(check.id==='consistency')parts.push(`${profile.repetitions} repeats`,`${(profile.levels || []).join(', ')} requests at a time`);
+  }else{
+    if(check.option_fields.includes('samples')){
+      const samples=optionValue(config,check,'samples');
+      parts.push(['correctness','json'].includes(check.id)?`At least ${samples} questions`:check.id==='context'?`At least ${samples} requests`:`${samples} sample requests`);
+    }
+    if(check.option_fields.includes('concurrency'))parts.push(`${optionValue(config,check,'concurrency')} at a time`);
+  }
+  if(check.id==='serving')parts.push(`${number(limitValue(config,check,'max_error_rate')*100,1)}% errors allowed`);
+  if(check.limit_fields.includes('min_correctness'))parts.push(`${number(limitValue(config,check,'min_correctness')*100,1)}% correct required`);
+  if(check.limit_fields.includes('latency_ms')){const value=limitValue(config,check,'latency_ms');parts.push(value==null?'No response-time target':`Answer within ${ms(value)}`);}
+  if(!parts.length&&check.id==='first_output'){const value=limitValue(config,check,'first_output_ms');parts.push(value==null?'Measure without a first-answer target':`First answer within ${ms(value)}`);}
+  return parts.join(' · ') || 'Uses this check’s defaults';
+}
+function renderCheckInfo(check,config) {
+  const guide=checkGuide[check.id];
+  const details=`<dl class="check-info-details"><div><dt>Sends</dt><dd>${escape(guide.sends)}</dd></div><div><dt>Shows</dt><dd>${escape(guide.shows)}</dd></div><div><dt>Settings</dt><dd data-effective-settings>${escape(effectiveCheckSummary(check,config))}</dd></div></dl>`;
+  return infoHelp(`check_${check.id}`,guide.name,guide.purpose,details);
+}
+function updateCheckRow(check,config,card) {
+  const badge=$('[data-setting-state]',card);if(badge)badge.textContent=testSettingsLabel(check,config);
+  const effective=$('[data-effective-settings]',card);if(effective)effective.textContent=effectiveCheckSummary(check,config);
+}
+function sharedLimitsSummary(config) {
+  return `Up to ${number(config.max_requests)} requests · ${elapsed(config.max_duration_seconds)} · ${number(config.concurrency)} at once`;
+}
+function updateSharedSettingsSummaries(config) {
+  const ceilings=$('#run-ceilings-summary');if(ceilings)ceilings.textContent=sharedLimitsSummary(config);
+  const requests=$('#request-defaults-summary');if(requests)requests.textContent=`· ${number(config.samples)} samples · ${number(config.max_output_tokens)} answer tokens · ${config.stream?'streaming':'complete answers'}`;
+  const acceptance=$('#acceptance-summary');if(acceptance)acceptance.textContent=`· ${number((config.limits.min_correctness ?? 1)*100,1)}% correct · ${config.limits.latency_ms==null?'response time not set':ms(config.limits.latency_ms)}`;
+}
+function renderSharedRunSettings(config) {
+  const primary=[
+    ['max_requests','Total request budget','Across all selected checks and endpoints. Reaching this budget can leave checks unfinished. AI evaluator calls have separate limits.'],
+    ['max_duration_seconds','Time budget (seconds)','Stop test traffic after this long. This does not include AI evaluation or saving the report.'],
+    ['concurrency','Requests at once (maximum)','A ceiling across target requests; individual checks may use fewer.'],
+  ];
+  const requestLabels={samples:'Sample requests per check',max_output_tokens:'Maximum answer length (tokens)',request_timeout_seconds:'Request timeout (seconds)',context_limit:'Server context window (tokens)'};
+  const requestHelp={samples:'Default for checks that use a sample count; not the total run size. Explicit check overrides stay unchanged.',max_output_tokens:'Default and maximum answer length. Checks can request less; answers may finish sooner. Explicit check overrides stay unchanged.',request_timeout_seconds:'Default and maximum wait for one request. A check can use a shorter timeout. Explicit check overrides stay unchanged.',context_limit:'Use the context size configured on your server. Giraffe does not detect it.'};
+  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Shared settings</h2><span class="dim" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit">Edit</span></summary><div class="setup-body">
+  <div class="fields three run-limit-fields">${primary.map(([key,label,help])=>field(key,label,config[key],{type:'number',hint:'',help,min:key==='max_duration_seconds'?.1:1,max:key==='concurrency'?256:undefined,step:key==='max_duration_seconds'?'any':1,required:true})).join('')}</div>
+  <details class="setup-disclosure" id="shared-run-limits"><summary>Request defaults <span class="dim" id="request-defaults-summary"></span></summary><div class="fields">${['samples','max_output_tokens','request_timeout_seconds','context_limit'].map(key=>field(key,requestLabels[key],config[key],{type:'number',min:key==='request_timeout_seconds'?.1:key==='context_limit'?128:1,step:key==='request_timeout_seconds'?'any':1,required:true,hint:'',help:requestHelp[key]})).join('')}${selectField('stream','How answers arrive',`<option value="true" ${config.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${config.stream?'':'selected'}>Wait for the complete answer</option>`,{hint:'',help:'First-answer timing and interruption checks need streaming.'})}</div></details>
+  <details class="setup-disclosure" id="global-acceptance"><summary>Pass criteria defaults <span class="dim" id="acceptance-summary"></span></summary><div class="fields">${field('limit_max_error_rate','Errors allowed (%)',config.limits.max_error_rate*100,{type:'number',hint:'',help:'0% allows no request errors. Used by checks that support this criterion; a check-specific value takes priority.',min:0,max:100,step:'any'})}${field('limit_min_correctness','Correct answers required (%)',config.limits.min_correctness*100,{type:'number',hint:'',help:'100% requires every scored answer to be correct. Used by checks that support this criterion. A check-specific value takes priority; diagnostics with fixed criteria still require every tested case to pass.',min:0,max:100,step:'any'})}${field('limit_min_samples','Minimum usable answers',config.limits.min_samples,{type:'number',hint:'',help:'Required per measured group where used. Too few leaves the result inconclusive.',min:state.bootstrap.limits_schema.properties.min_samples.minimum,step:1,required:true})}</div><h4>Timing, slowdown & comparison targets</h4><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,config.limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Measure only'})).join('')}${field('limit_regression_percent','Change worth flagging (%)',config.limits.regression_percent,{type:'number',hint:'',help:'Used when comparing runs; percentage points for rates.',min:0,step:'any'})}</div></details></div></details><p class="checks-plan-summary" id="checks-plan-summary" role="status">Preparing request estimate…</p></section>`;
+}
+function renderCheckSelection(config) {
+  return `${renderSharedRunSettings(config)}<section class="setup-section check-selection" id="test-selection"><header class="setup-heading"><h2>Choose checks</h2></header><div class="setup-body">
+  <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected checks (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">Browse all ${state.bootstrap.checks.length} checks</button></div></div>
+  <p class="sr-only" id="selection-summary" role="status">${config.checks.length} checks selected</p>
+  <div id="catalogue-browse-tools" ${state.catalogueFilter==='selected'?'hidden':''}><div class="catalogue-browse-header"><label class="catalogue-search"><span class="sr-only">Find a check</span><input type="search" id="check-search" placeholder="Find a check" value="${escape(state.catalogueSearch || '')}" autocomplete="off"></label><button type="button" class="text-button" data-action="quick-checks">Reset to quick check</button></div><div class="catalogue-categories" aria-label="Check categories"><button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="all" aria-pressed="${!state.catalogueCategory||state.catalogueCategory==='all'}">All categories</button>${checkGroups.map(group=>`<button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="${group.id}" aria-pressed="${state.catalogueCategory===group.id}">${group.title}</button>`).join('')}</div></div>
+  <div id="test-catalogue"><div class="test-cards check-catalogue" id="test-cards">${checkGroups.map(group=>`<section class="catalogue-group" data-catalogue-group="${group.id}"><h3>${group.title}</h3>${group.checks.map(id=>renderTestCard(state.bootstrap.checks.find(check=>check.id===id),config)).join('')}</section>`).join('')}</div><p class="hint catalogue-empty" id="catalogue-empty" role="status" hidden></p></div>
+  <p class="hint" id="no-tests-selected" ${config.checks.length?'hidden':''}>Choose at least one check before reviewing the run.</p>
+  </div></section>`;
 }
 function testSettingsLabel(check,config) {
-  if(check.id==='buckets')return `${config.checks.includes('buckets')?'Levels':'Saved levels'}: ${(config.buckets || bucketFormDefaults(config)).levels.join(', ')}`;
-  if(!check.option_fields.length&&!check.limit_fields.length){
-    const key={mixed:'buckets',tools:'forced_tool_diagnostic'}[check.id] || check.id;
-    if(config[key])return config.checks.includes(check.id)?'JSON settings':'JSON settings saved';
+  const custom=Object.keys(config.test_options?.[check.id] || {}).length>0||
+    (check.id==='capacity'&&!sameConfig(config.traffic,state.bootstrap.config.traffic));
+  return custom?(config.checks.includes(check.id)?'Overrides':'Saved overrides'):'';
+}
+function checkSettingValue(name,value) {
+  if(value==null)return ['first_output_ms','latency_ms','stream_gap_ms','min_output_tokens_per_second','fairness_max_ratio'].includes(name)?'measure only':'not set';
+  if(['min_correctness','max_error_rate'].includes(name))return `${number(value*100,1)}%`;
+  const unit={samples:'requests',concurrency:'at a time',context_limit:'tokens',max_output_tokens:'tokens',request_timeout_seconds:'seconds',sustained_seconds:'seconds',metrics_max_age_seconds:'seconds',cancel_after_ms:'ms',deadline_probe_ms:'ms',cancel_after_chunks:'chunks',cleanup_seconds:'seconds',trace_wait_seconds:'seconds',first_output_ms:'ms',latency_ms:'ms',stream_gap_ms:'ms',min_output_tokens_per_second:'tokens/second',min_samples:'usable answers'}[name];
+  return `${value}${unit?' '+unit:''}`;
+}
+function checkFieldHelp(check,name,kind='option') {
+  const descriptions={
+    samples:({generation:'Repeat the generated long-answer request.',fairness:'Short-only baseline samples for the competing-load comparison.',context:'Minimum requests across the generated context cases. Calibration and retries can add requests.',correctness:'Minimum generated questions; every built-in case is covered.',json:'Minimum generated JSON questions; every built-in case is covered.',cancellation:'Requests for normal controls and again for follow-up health checks.',recovery:'Short health requests after the load period.'})[check.id] || 'Requests used by this check.',
+    concurrency:'Requests sent together in this check. The run ceiling still applies.',
+    context_limit:'Declared server context length, used to size generated questions. This does not change the server.',
+    max_output_tokens:'A lower answer cap for this check. It cannot exceed the run output cap.',
+    request_timeout_seconds:'A shorter deadline for the connection request. It cannot exceed the run request deadline.',
+    sustained_seconds:'Send load for this long, then check recovery. The run budget can stop load earlier.',
+    metrics_max_age_seconds:'Older server measurements are reported as stale.',
+    backend_verification:'Required needs supported server logs or traces to prove cancelled work stopped.',
+    server_log:'Path on the Giraffe machine to supported server logs.',trace_file:'Path on the Giraffe machine to supported request traces.',
+    cancel_after_ms:'Cancel the streaming probe after this delay.',deadline_probe_ms:'Intentionally time out a probe after this delay.',
+    cancel_after_chunks:'For server verification, wait for this many answer chunks before cancelling.',
+    cleanup_seconds:'Wait for cancelled server work to finish cleaning up.',trace_wait_seconds:'Wait for cancellation evidence to appear in logs or traces.',
+    min_correctness:'Required share of scored answers that match the expected answer.',max_error_rate:'Largest allowed share of failed requests.',
+    first_output_ms:'Longest acceptable wait for useful answer text.',latency_ms:'Longest acceptable wait for a complete answer.',
+    stream_gap_ms:'Longest acceptable pause between answer chunks.',min_output_tokens_per_second:'Minimum answer generation speed when token usage is available.',
+    fairness_max_ratio:'2 allows short answers to take up to twice as long under competing load.',
+    min_samples:'Fewer usable answers make the measurement inconclusive.',
+  };
+  const help=fieldDescription(`${kind==='limit'?'limit':'test'}_${name}`).help;
+  return [descriptions[name],help,kind==='limit'&&state.bootstrap.limits_schema.properties[name]?.anyOf?'Blank means measure only.':''].filter(Boolean).join(' ');
+}
+function checkFieldHint(check,config,name,kind='option',showValue=false) {
+  const saved=config.test_options?.[check.id] || {},overrides=kind==='limit'?(saved.limits || {}):saved;
+  const overridden=Object.hasOwn(overrides,name)&&(kind==='limit'||overrides[name]!=null);
+  const defaultValue=kind==='limit'?(Object.hasOwn(config.limits || {},name)?config.limits[name]:check.defaults.limits[name]):optionDefault(config,check,name);
+  const value=kind==='limit'?limitValue(config,check,name):optionValue(config,check,name);
+  const origin=(kind==='limit'&&Object.hasOwn(config.limits || {},name))||config[name]!=null?'run default':'check default';
+  const optionalTarget=kind==='limit'&&state.bootstrap.limits_schema.properties[name]?.anyOf?.some(item=>item.type==='null');
+  if(value==null&&optionalTarget)return overridden&&defaultValue!=null?`Measure only · ${origin}: ${checkSettingValue(name,defaultValue)}`:'Measure only';
+  if(overridden)return `Custom · ${origin}: ${checkSettingValue(name,defaultValue)}`;
+  return `${human(origin)}${showValue?`: ${checkSettingValue(name,value)}`:''}`;
+}
+function updateCheckFieldHints(config) {
+  const form=$('#new-run-form');
+  if(form)for(const check of state.bootstrap.checks)for(const name of ['concurrency','max_output_tokens','request_timeout_seconds']){
+    const input=form.elements[`test_${check.id}_${name}`];if(!input)continue;
+    if(typeof config[name]==='number'&&Number.isFinite(config[name]))input.max=String(config[name]);
+    else input.removeAttribute?.('max');
   }
-  const custom=Object.keys(config.test_options?.[check.id] || {}).length>0||(check.id==='capacity'&&!sameConfig(config.traffic,state.bootstrap.config.traffic));
-  return config.checks.includes(check.id)?(custom?'Custom':'Defaults'):(custom?'Custom saved':'Not selected');
+  for(const warning of $$('[data-check-override-warning]')){
+    const check=state.bootstrap.checks.find(item=>item.id===warning.dataset.checkOverrideWarning);
+    const message=check?checkOverrideWarning(check,config,true):'';
+    warning.textContent=message;warning.hidden=!message||!(config.checks.includes(check.id)||state.openTest===check.id);
+  }
+  for(const warning of $$('[data-check-coverage]')){
+    const check=state.bootstrap.checks.find(item=>item.id===warning.dataset.checkCoverage);
+    const message=check?checkCoverageWarning(check,config):'';
+    warning.textContent=message;warning.hidden=!message||!(config.checks.includes(check.id)||state.openTest===check.id);
+  }
+  for(const hint of $$('[data-check-field-hint]')){
+    const check=state.bootstrap.checks.find(item=>item.id===hint.dataset.checkId);
+    if(check){
+      const name=hint.dataset.settingName,kind=hint.dataset.settingKind;
+      const input=form?.elements[`test_${check.id}_${kind==='limit'?'limit_':''}${name}`];
+      hint.textContent=checkFieldHint(check,config,name,kind,input?.value==='');
+    }
+  }
+  for(const reset of $$('[data-reset-test]'))reset.hidden=!Object.keys(config.test_options?.[reset.dataset.resetTest] || {}).length;
+}
+function markCheckHint(markup,check,name,kind) {
+  return markup.replace('class="hint" id=',`class="hint" data-check-field-hint data-check-id="${check.id}" data-setting-name="${name}" data-setting-kind="${kind}" id=`);
 }
 function renderTestCard(check,config) {
-  const selected=config.checks?.includes(check.id),custom=Object.keys(config.test_options?.[check.id] || {}).length>0;
-  const optionLabels={samples:'Sample requests',concurrency:'Requests at a time',context_limit:'Context length (tokens)',max_output_tokens:'Answer cap (tokens)',request_timeout_seconds:'Request time limit (seconds)',sustained_seconds:'Time under load (seconds)',metrics_max_age_seconds:'Maximum metric age (seconds)',backend_verification:'Verify cancelled work on server',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Test request deadline (ms)',cancel_after_chunks:'Cancel after this many answer chunks',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
-  const fields=check.option_fields.map(name=>schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:optionLabels[name] || human(name),helpKey:`test_${name}`,hint:name==='backend_verification'?'Uses the run setting until you change it.':'Leave blank to use the run setting.'}));
-  const profileKey={mixed:'buckets',tools:'tool_calling'}[check.id] || check.id;
-  const advanced=!check.option_fields.length&&!check.limit_fields.length;
-  const limitLabels={first_output_ms:'First output maximum (ms)',latency_ms:'Response time maximum (ms)',stream_gap_ms:'Stream pause maximum (ms)',min_output_tokens_per_second:'Minimum generation rate (tokens/second)',fairness_max_ratio:'Mixed-load slowdown (ratio)',max_error_rate:'Maximum error rate',min_correctness:'Minimum correctness',min_samples:'Minimum usable samples'};
-  const limits=check.limit_fields.filter(name=>!(state.setupPreset==='arrival'&&check.id==='capacity'&&name==='latency_ms')).map(name=>schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,placeholder:'No limit',hint:({max_error_rate:'Fraction: 0.05 means 5%.',min_correctness:'Fraction: 0.95 means 95%.'})[name] || (state.bootstrap.limits_schema.properties[name].anyOf?'Leave blank for no limit on this test.':'')}));
-  return `<section class="test-card" data-test-card="${check.id}"><div class="test-card-heading"><div class="test-row-copy"><div class="test-title"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(check.title)}</span></label>${infoHelp(`check-${check.id}`,check.title,check.details || check.description)}</div><p class="hint test-description">${escape(check.description)}</p>${check.id==='capacity'?'<p class="hint traffic-profile-summary"></p>':''}</div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${escape(testSettingsLabel(check,config))}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Configure ${escape(check.title)}" aria-expanded="false" aria-controls="settings-${check.id}">Configure</button></div></div><input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}"><div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden><p class="hint draft-notice" ${selected?'hidden':''}>Not selected. These settings will be used if you select this test.</p>${check.id==='capacity'?renderTrafficEditor(config):''}<div class="test-settings" data-test-settings="${check.id}"><div class="test-editor-heading"><h3>${check.id==='capacity'?'Acceptance settings':'Test settings'}</h3>${advanced?'':`<button type="button" class="text-button reset-test" data-reset-test="${check.id}">${check.id==='capacity'?'Reset acceptance settings':'Reset to defaults'}</button>`}</div><fieldset class="fields">${fields.join('')}${limits.join('')}</fieldset>${check.id==='buckets'?renderBucketEditor(config):advanced?`<p class="hint">Uses the shared run limits. Edit <code>${escape(profileKey)}</code>${check.id==='tools'?' and forced_tool_diagnostic':''} in JSON for more options.</p><button type="button" class="text-button" data-config-tab="json">Edit in JSON</button>`:''}</div>${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first target',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}<div class="test-editor-footer"><span class="hint">Changes are kept as you edit.</span><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
+  const guide=checkGuide[check.id],selected=config.checks?.includes(check.id),custom=Object.keys(config.test_options?.[check.id] || {}).length>0;
+  const warningsVisible=selected||state.openTest===check.id;
+  const ownQuestions=check.id==='correctness'&&config.request_source==='request_pack';
+  const optionLabels={samples:'Sample requests',concurrency:'Requests at a time',context_limit:'Server context length (tokens)',max_output_tokens:'Answer cap (tokens)',request_timeout_seconds:'Connection time limit (seconds)',sustained_seconds:'Time under load (seconds)',metrics_max_age_seconds:'Maximum metric age (seconds)',backend_verification:'Verify cancelled work on server',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Test request deadline (ms)',cancel_after_chunks:'Cancel after answer chunks',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
+  const advancedOptions=new Set(['backend_verification','server_log','trace_file','cancel_after_chunks','cleanup_seconds','trace_wait_seconds']);
+  const runOptions=new Set(['concurrency','max_output_tokens','request_timeout_seconds']);
+  const option=name=>markCheckHint(schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Questions to send (minimum)':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default'}),check,name,'option');
+  const limitLabels={first_output_ms:'First answer within (ms)',latency_ms:'Complete answer within (ms)',stream_gap_ms:'Maximum stream pause (ms)',min_output_tokens_per_second:'Minimum generation rate (tokens/second)',fairness_max_ratio:'Maximum slowdown (ratio)',max_error_rate:'Errors allowed (%)',min_correctness:'Correct answers required (%)',min_samples:'Minimum usable answers'};
+  const primaryLimits=new Set(['first_output_ms','latency_ms','min_correctness','max_error_rate','fairness_max_ratio','min_samples']);
+  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',min:0,max:100,step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit')}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
+  const inactive=name=>ownQuestions&&['samples','concurrency'].includes(name);
+  const requestFields=check.option_fields.filter(name=>!inactive(name)&&!advancedOptions.has(name)&&!runOptions.has(name));
+  const requests=requestFields.map(option).join('');
+  const inherited=check.option_fields.filter(name=>!inactive(name)&&runOptions.has(name)).map(option).join('');
+  const diagnostics=check.option_fields.filter(name=>advancedOptions.has(name)).map(option).join('');
+  const criteriaFields=check.limit_fields.filter(name=>primaryLimits.has(name));
+  const criteria=criteriaFields.map(limit).join('');
+  const moreCriteria=check.limit_fields.filter(name=>!primaryLimits.has(name)).map(limit).join('');
+  const hostsQuestions=check.id===(config.checks.includes('correctness')?'correctness':config.checks.includes('capacity')?'capacity':null);
+  const sharedQuestions=config.checks.includes('correctness')&&config.checks.includes('capacity');
+  const questionSource=hostsQuestions?`<div class="catalogue-question-source">${sharedQuestions?`<p class="hint question-source-scope">Also used by ${escape(catalogTitle('capacity'))}.</p>`:''}${renderRequestSource(config)}</div>`:'';
+  const inactiveControls=ownQuestions?`<div hidden data-inactive-question-settings>${check.option_fields.filter(inactive).map(option).join('')}</div>`:'';
+  return `<section class="test-card catalogue-row" data-test-card="${check.id}" data-category="${checkGroups.find(group=>group.checks.includes(check.id))?.id || ''}" data-search="${escape(`${guide.name} ${guide.purpose} ${check.title} ${check.id}`.toLowerCase())}">
+  <div class="test-card-heading"><div class="test-row-copy"><div class="test-selection-line"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(guide.name)}</span></label>${renderCheckInfo(check,config)}</div></div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${escape(testSettingsLabel(check,config))}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Settings for ${escape(guide.name)}" aria-expanded="false" aria-controls="settings-${check.id}">Settings</button></div></div>
+  <p class="hint check-row-warning" data-check-override-warning="${check.id}" ${warningsVisible&&checkOverrideWarning(check,config)?'':'hidden'}>${escape(checkOverrideWarning(check,config,true))}</p>
+  <p class="hint check-row-warning" data-check-coverage="${check.id}" ${warningsVisible&&checkCoverageWarning(check,config)?'':'hidden'}>${escape(checkCoverageWarning(check,config))}</p>
+  <input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}">
+  <div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden>
+  <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
+  ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${questionSource}${check.id==='capacity'?renderTrafficEditor(config):''}${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first endpoint',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}
+  <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
+  ${check.option_fields.length||check.limit_fields.length?`<button type="button" class="text-button reset-test" data-reset-test="${check.id}" aria-label="Reset overrides for ${escape(guide.name)}" ${custom?'':'hidden'}>Reset overrides</button>`:''}${inactiveControls}
+  ${requests?`${requestFields.length>1?'<h4>Requests</h4>':''}<fieldset class="fields check-request-fields">${requests}</fieldset>`:''}
+  ${criteria?`${criteriaFields.length>1?'<h4>Pass criteria</h4>':''}<fieldset class="fields check-criteria-fields">${criteria}</fieldset>`:''}
+  ${inherited?`<details class="check-advanced check-run-overrides"><summary>Override run defaults</summary><fieldset class="fields">${inherited}</fieldset></details>`:''}
+  ${moreCriteria?`<details class="check-advanced"><summary>More pass criteria</summary><fieldset class="fields">${moreCriteria}</fieldset></details>`:''}
+  ${diagnostics?`<details class="check-advanced"><summary>Server verification & cleanup</summary><fieldset class="fields">${diagnostics}</fieldset></details>`:''}
+  ${check.id==='buckets'?renderBucketEditor(config):renderProfileEditor(check,config)}</div>
+  <div class="test-editor-footer"><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
 }
+
 function bucketFormDefaults(config) {
   const defaults=clone(state.bootstrap.buckets.defaults);
   defaults.levels=defaults.levels.filter(level=>level<=config.concurrency);
@@ -262,8 +509,8 @@ function renderBucketSizes(settings) {
 }
 function renderBucketEditor(config) {
   const settings=config.buckets || bucketFormDefaults(config),schema=state.bootstrap.buckets.schema;
-  const basic=state.setupPreset==='concurrent';
-  return `<fieldset class="fields" data-bucket-settings>${basic?'':field('buckets_levels','Requests at a time',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 4, 8',hint:'For example: 1, 4, 8 tests one request at a time, then four, then eight.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Minimum requests per size combination',hint:'Each load sends at least this many requests for each of the 9 combinations.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Time limit per size combination (seconds)',hint:'Waiting for an available request slot uses this time too.'})}</fieldset>${basic?'':renderBucketSizes(settings)}<p class="hint bucket-profile-summary"></p><p class="hint">Mixed-workload options are available in JSON under <code>buckets</code>.</p>`;
+  const basic=false;
+  return `<fieldset class="fields" data-bucket-settings>${basic?'':field('buckets_levels','Requests at a time',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 4, 8',hint:'For example: 1, 4, 8 tests one request at a time, then four, then eight.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Minimum requests per size combination',hint:'Each load sends at least this many requests for each of the 9 combinations.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Time limit per size combination (seconds)',hint:'Waiting for an available request slot uses this time too.'})}</fieldset>${basic?'':`<details class="check-advanced"><summary>Question lengths & answer caps · 9 combinations</summary>${renderBucketSizes(settings)}</details>`}<p class="hint bucket-profile-summary"></p><p class="hint" id="bucket-shared-limit">The shared simultaneous-request limit is ${config.concurrency}. Question lengths and answer caps are also used by Short-request slowdown.</p>`;
 }
 function renderLoadGuidance(config) {
   const messages=[];
@@ -277,35 +524,64 @@ function renderLoadGuidance(config) {
 function renderTrafficEditor(config) {
   const traffic=config.traffic || state.bootstrap.config.traffic,custom=!sameConfig(traffic,state.bootstrap.config.traffic),schema=state.bootstrap.traffic_schema;
   const labels={rates:'Request rates (per second)',duration_seconds:'Seconds per rate',arrival:'Arrival pattern',max_in_flight:'Requests at a time',seed:'Random seed',long_input_chars:'Long question size (characters)',long_output_words:'Long answer size (words)',drain_timeout_seconds:'Completion wait (seconds)',scheduler_lag_tolerance_ms:'Allowed start delay (ms)'};
-  const controls=Object.entries(schema.properties).filter(([name])=>name!=='mix'&&!(state.setupPreset==='arrival'&&['rates','duration_seconds'].includes(name))).map(([name,fieldSchema])=>schemaField(`traffic_${name}`,traffic[name],fieldSchema,{label:labels[name] || human(name)}));
-  const mix=schema.$defs.TrafficMix;
-  return `<div class="traffic-editor"><input type="hidden" name="traffic_mode" value="${custom?'custom':'default'}"><div class="test-editor-heading"><h3>Traffic profile</h3><button class="text-button reset-test" type="button" data-action="reset-traffic">Reset traffic profile</button></div><p class="hint">New requests start at the chosen rate. If all request slots are busy, extra arrivals count as dropped.</p><div data-traffic-settings><fieldset class="fields">${controls.join('')}<div class="full traffic-mix-heading"><h4>Request mix</h4><p class="hint">Choose how often to use each request type. Higher weights mean a larger share of traffic.</p></div>${Object.entries(mix.properties).map(([name,s])=>schemaField(`traffic_mix_${name}`,traffic.mix[name],s,{label:({short:'Short requests',long_input:'Long questions',long_output:'Long answers'})[name]})).join('')}</fieldset></div></div>`;
+  const primary=new Set(['rates','duration_seconds','max_in_flight']);
+  const control=([name,fieldSchema])=>schemaField(`traffic_${name}`,traffic[name],fieldSchema,{label:labels[name] || human(name),hint:name==='max_in_flight'?`Leave blank to use the shared limit of ${config.concurrency}. This test cannot exceed that limit.`:undefined});
+  const entries=Object.entries(schema.properties).filter(([name])=>name!=='mix'),mix=schema.$defs.TrafficMix;
+  return `<div class="traffic-editor"><input type="hidden" name="traffic_mode" value="${custom?'custom':'default'}"><div class="test-editor-heading"><h3>Traffic to send</h3><button class="text-button reset-test" type="button" data-action="reset-traffic">Restore traffic defaults</button></div><p class="hint">Each rate is a separate stage. If all request slots are busy, extra arrivals count as dropped.</p><div data-traffic-settings><fieldset class="fields">${entries.filter(([name])=>primary.has(name)).map(control).join('')}</fieldset><details class="check-advanced"><summary>Arrival pattern, request mix & timing</summary><fieldset class="fields">${entries.filter(([name])=>!primary.has(name)).map(control).join('')}<div class="full traffic-mix-heading"><h4>Request mix</h4><p class="hint">Higher weights mean a larger share of traffic. For example, weights 3, 1 and 1 send about 60% short requests, 20% long questions and 20% long answers.</p></div>${Object.entries(mix.properties).map(([name,s])=>schemaField(`traffic_mix_${name}`,traffic.mix[name],s,{label:({short:'Short requests',long_input:'Long questions',long_output:'Long answers'})[name]})).join('')}</fieldset></details></div></div>`;
 }
 function syncTestControls() {
-  syncPackControls();
   const form=$('#new-run-form');if(!form)return;
-  let selectedCount=0;
+  let selectedCount=0,visibleCount=0;
+  const search=(state.catalogueSearch || '').trim().toLowerCase();
   for(const check of state.bootstrap.checks){
     const card=$(`[data-test-card="${check.id}"]`),selected=$('input[name="check"]',card).checked;
     if(selected)selectedCount++;
     const open=state.openTest===check.id;
-    card.classList.toggle('test-disabled',!selected);
-    card.hidden=!selected&&!state.showAvailableTests&&!open;
+    card.classList.toggle('test-disabled',!selected);card.classList.toggle('is-selected',selected);
+    card.hidden=state.catalogueFilter==='selected'?!selected:(state.catalogueCategory&&state.catalogueCategory!=='all'&&state.catalogueCategory!==card.dataset.category)||Boolean(search&&!(card.dataset.search || '').includes(search));
+    if(!card.hidden)visibleCount++;
     const editor=$('[data-test-editor]',card);editor.hidden=!open;
     $('[data-configure-test]',card).setAttribute('aria-expanded',String(open));
     $('.draft-notice',card).hidden=selected;
+    for(const selector of ['[data-check-override-warning]','[data-check-coverage]']){
+      const warning=$(selector,card);if(warning)warning.hidden=!(selected||open)||!warning.textContent;
+    }
     for(const fieldset of $$('fieldset',editor))fieldset.disabled=!open;
-    if(check.id==='capacity')$('.traffic-profile-summary',card).hidden=!selected;
     if(check.id==='gpu')form.elements.metrics_url.disabled=!open;
   }
-  const toggle=$('#add-tests');
-  if(toggle){toggle.textContent=state.showAvailableTests?'Hide unselected tests':`Add tests (${state.bootstrap.checks.length-selectedCount})`;toggle.setAttribute('aria-expanded',String(state.showAvailableTests));}
-  const empty=$('#no-tests-selected');if(empty)empty.hidden=selectedCount>0;
+  for(const group of $$('[data-catalogue-group]'))group.hidden=$$('[data-test-card]',group).every(card=>card.hidden);
+  for(const button of $$('.catalogue-categories [data-category]'))button.setAttribute('aria-pressed',String(button.dataset.category===(state.catalogueCategory || 'all')));
+  for(const button of $$('[data-catalogue-filter]'))button.setAttribute('aria-pressed',String(button.dataset.catalogueFilter===(state.catalogueFilter || 'all')));
+  const count=$('#catalogue-selected-count');if(count)count.textContent=selectedCount;
+  const browse=$('#catalogue-browse-tools');if(browse)browse.hidden=state.catalogueFilter==='selected';
+  const empty=$('#catalogue-empty');if(empty){empty.hidden=visibleCount>0;empty.textContent=state.catalogueFilter==='selected'?'No checks selected. Browse all checks to add one.':'No matching checks. Clear the search or choose All categories.';}
+  const none=$('#no-tests-selected');if(none)none.hidden=selectedCount>0;
+  syncPackControls();
 }
+function revealCatalogueCheck(id) {
+  const card=$(`[data-test-card="${id}"]`);
+  if(!card||card.hidden){
+    state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';
+    const search=$('#check-search');if(search)search.value='';
+  }
+  state.openTest=id;syncTestControls();
+}
+function revealQuestionEditor(config=state.config) {
+  revealSetupStep(2);
+  revealCatalogueCheck(config.checks.includes('correctness')?'correctness':'capacity');
+}
+function editProfileField(input) {
+  const profile=input.closest('[data-profile-settings]');if(!profile)return;
+  const key=profile.dataset.profileSettings,name=input.name.replace(`profile_${key}_`,'');
+  const marker=$('#new-run-form').elements[`profile_edits_${key}`];
+  const edits=new Set(JSON.parse(marker.value || '[]'));edits.add(name);marker.value=JSON.stringify([...edits]);
+}
+
 function toggleTestEditor(id,close=false) {
+  if(state.openTest&&!validateProfileDrafts($('#new-run-form'),state.openTest))return;
   state.openTest=close||state.openTest===id?null:id;
   syncTestControls();updateBounds();
-  if(close)($(`[data-test-card="${id}"]`).hidden?$('#add-tests'):$(`[data-configure-test="${id}"]`))?.focus();
+  if(close)($(`[data-test-card="${id}"]`).hidden?$('[data-catalogue-filter="all"]'):$(`[data-configure-test="${id}"]`))?.focus();
 }
 function editTestField(input) {
   const form=$('#new-run-form'),settings=input.closest('[data-test-settings]');
@@ -313,35 +589,71 @@ function editTestField(input) {
   if(input.closest('[data-traffic-settings]'))form.elements.traffic_mode.value='custom';
   syncTestControls();
 }
-function validateRunForm(form) {
+function savedProfileInput(input,form) {
+  const profile=input.closest('[data-profile-settings]');if(!profile)return false;
+  const key=profile.dataset.profileSettings;
+  return Boolean(state.config[key])||JSON.parse(form.elements[`profile_edits_${key}`]?.value || '[]').length>0;
+}
+function validateProfileDrafts(form,id=null) {
+  if(!form)return true;
+  for(const input of form.querySelectorAll('input, select, textarea')){
+    const profile=input.closest('[data-profile-settings]');if(!profile||id&&profile.dataset.profileSettings!==id||!savedProfileInput(input,form))continue;
+    const fieldset=input.closest('fieldset'),disabled=input.disabled,fieldsetDisabled=fieldset?.disabled;
+    if(fieldset)fieldset.disabled=false;input.disabled=false;
+    const valid=input.checkValidity();input.disabled=disabled;if(fieldset)fieldset.disabled=fieldsetDisabled;
+    if(valid)continue;
+    revealSetupStep(2);revealCatalogueCheck(profile.dataset.profileSettings);
+    for(let parent=input.parentElement;parent;parent=parent.parentElement)if(parent.tagName==='DETAILS')parent.open=true;
+    const error=$('#form-error');if(error){error.textContent='Fix this saved setting or restore its profile defaults.';error.hidden=false;}
+    input.focus?.();input.reportValidity();return false;
+  }
+  return true;
+}
+function refreshDefaultProfileFields(config) {
+  const form=$('#new-run-form');if(!form)return;
+  for(const key of ['arrivals','prefix','sessions','consistency']){
+    if(state.config[key])continue;
+    const edits=new Set(JSON.parse(form.elements[`profile_edits_${key}`]?.value || '[]'));
+    for(const [name,value] of Object.entries(profileDefaults(key,config))){
+      const input=form.elements[`profile_${key}_${name}`];if(!input||edits.has(name))continue;
+      input.value=Array.isArray(value)?value.join(['turns','saved_answers'].includes(name)?'\n':['modes','shapes'].includes(name)?',':', '):value ?? '';
+    }
+  }
+}
+function validateRunForm(form,step=null) {
+  if((step===null||step===2)&&!validateProfileDrafts(form))return false;
   // Closed editors are disabled for native validation and read explicitly by readForm.
   // Inspect selected drafts here, revealing the field before asking the browser to focus it.
   for(const input of form.querySelectorAll('input, select, textarea')){
+    if(step&&Number(input.closest('[data-setup-panel]')?.dataset.setupPanel)!==step)continue;
     if(packSettingInactive(input.name))continue;
     const card=input.closest('[data-test-card]');
     if(card){
       const id=card.dataset.testCard;
       if(!$('input[name="check"]',card).checked)continue;
-      if(input.closest('[data-test-settings]')&&!input.closest('[data-bucket-settings]')&&form.elements[`test_mode_${id}`].value!=='custom')continue;
+      if(input.closest('[data-test-settings]')&&!input.closest('[data-bucket-settings]')&&!input.closest('[data-profile-settings]')&&form.elements[`test_mode_${id}`].value!=='custom')continue;
       if(input.closest('[data-traffic-settings]')&&form.elements.traffic_mode.value!=='custom')continue;
     }
+    if(['url','model','name'].includes(input.name))input.setCustomValidity?.(String(input.value || '').trim()?'':`Enter ${input.name==='url'?'an endpoint URL':input.name==='model'?'a model name, or use Test connection to detect it':'a target name'}.`);
     const fieldset=input.closest('fieldset'),disabled=input.disabled,fieldsetDisabled=fieldset?.disabled;
     if(fieldset)fieldset.disabled=false;input.disabled=false;
     const valid=input.checkValidity();
     input.disabled=disabled;if(fieldset)fieldset.disabled=fieldsetDisabled;
     if(valid)continue;
-    if(card){state.openTest=card.dataset.testCard;syncTestControls();}
+    if(input.name==='model'){const manual=$('#manual-model-field');if(manual)manual.hidden=false;}
+    if(card)revealCatalogueCheck(card.dataset.testCard);
     for(let parent=input.parentElement;parent;parent=parent.parentElement)if(parent.tagName==='DETAILS')parent.open=true;
-    state.configView='form';syncConfigView();input.reportValidity();return false;
+    const panel=input.closest('[data-setup-panel]');if(panel)state.setupStep=Number(panel.dataset.setupPanel);
+    state.configView='form';syncConfigView();syncSetupStep();input.focus?.();input.reportValidity();return false;
   }
   return true;
 }
 function refreshInheritedFields(id,onlyInherited=false) {
   const check=state.bootstrap.checks.find(item=>item.id===id),form=$('#new-run-form');
-  const config=clone(state.config);for(const [name] of numericFields)config[name]=Number(form.elements[name].value);
-  config.limits={...config.limits};for(const name of check.limit_fields){const input=form.elements[`limit_${name}`];if(input)config.limits[name]=input.value===''?null:Number(input.value);}
+  const config=clone(state.config);for(const [name] of numericFields)config[name]=Number(form.elements[name].value);if(form.elements.samples)config.samples=Number(form.elements.samples.value);
+  config.limits={...config.limits};for(const name of check.limit_fields){const input=form.elements[`limit_${name}`];if(input)config.limits[name]=input.value===''?null:Number(input.value)/(['max_error_rate','min_correctness'].includes(name)?100:1);}
   for(const name of check.option_fields){const input=form.elements[`test_${id}_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=optionDefault(config,check,name) ?? '';input.dataset.inherited='true';}}
-  for(const name of check.limit_fields){const input=form.elements[`test_${id}_limit_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=config.limits[name] ?? '';input.dataset.inherited='true';}}
+  for(const name of check.limit_fields){const input=form.elements[`test_${id}_limit_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=config.limits[name]==null?'':config.limits[name]*(['max_error_rate','min_correctness'].includes(name)?100:1);input.dataset.inherited='true';}}
 }
 const inputRetentionNotice='Questions and expected answers are saved with the run. Response retention controls which model answers and evaluator reasons are saved.';
 function configChanged() {
@@ -399,7 +711,7 @@ function renderAnswerChecks(config) {
 }
 function renderRequestSource(config) {
   const pack=config.request_pack,custom=config.request_source==='request_pack',cases=pack?.cases || [];
-  return `<section class="setup-section" id="setup-dataset">${setupSectionHeader(3,'Questions & expected answers','Try one question to inspect the answer before testing them all.')}<div class="setup-body"><div class="request-source"><fieldset class="dataset-source"><legend class="sr-only">Questions to test</legend><label><input type="radio" name="request_source" value="request_pack" ${custom?'checked':''}><span>My questions</span></label><label><input type="radio" name="request_source" value="builtin" ${custom?'':'checked'}><span>Built-in examples</span></label></fieldset>${custom?`<input type="file" id="request-pack-file" accept=".csv,.json,text/csv,application/json" hidden><div class="pack-actions actions"><button type="button" class="button small" data-action="add-example">+ Add question</button><button type="button" class="button small" data-action="import-pack">Import CSV / JSON</button><button type="button" class="text-button" data-action="sample-dataset">Use sample questions</button></div>${cases.length?`<div class="dataset-table question-table"><table><thead><tr><th><input type="checkbox" id="dataset-select-all" aria-label="Select all examples" ${cases.every(item=>state.datasetSelection.includes(item.fixture_id))?'checked':''}></th><th>Question / expected answer</th><th>Answer check</th><th>Actions</th></tr></thead><tbody>${cases.map((item,index)=>`<tr><td><input type="checkbox" data-dataset-select="${escape(item.fixture_id)}" aria-label="Select ${escape(item.fixture_id)}" ${state.datasetSelection.includes(item.fixture_id)?'checked':''}></td><td><strong>${escape(item.fixture_id)}</strong><span class="dataset-excerpt">${escape(item.messages.map(message=>message.content).join(' / '))}</span><small class="dataset-excerpt">Expected: ${Object.hasOwn(item,'expected')?escape(typeof item.expected==='string'?item.expected:JSON.stringify(item.expected)):'Not set'}${item.messages.length>1?` · ${number(item.messages.length)} messages`:''}</small></td><td>${answerChecks[item.scorer]}${item.scorer==='judge'?`<small data-evaluator-needed ${judgesReady(config)?'hidden':''}>Needs evaluator</small>`:''}</td><td><div class="dataset-row-actions"><button type="button" class="text-button" data-action="try-example" data-case-index="${index}" aria-label="Try ${escape(item.fixture_id)}">Try one</button><button type="button" class="text-button" data-action="edit-example" data-case-index="${index}" aria-label="Edit ${escape(item.fixture_id)}">Edit</button><button type="button" class="text-button" data-action="remove-example" data-case-index="${index}" aria-label="Remove ${escape(item.fixture_id)}">Remove</button></div></td></tr>`).join('')}</tbody></table></div><p class="hint dataset-count">${number(cases.length)} questions</p>`:'<div class="dataset-empty"><h3>Add your first question</h3><p class="hint">Enter a question and its expected answer, or use the sample questions to get started.</p></div>'}`:`<p class="hint">Known-answer questions are ready to test.${pack?` Your ${number(cases.length)} questions are saved for later.`:''}</p>`}</div>${renderAnswerChecks(config)}${custom&&cases.length?`<details class="setup-disclosure dataset-advanced"><summary>Advanced dataset settings</summary><p class="hint">${inputRetentionNotice}</p><div id="request-pack-preview"></div></details>`:''}</div></section>`;
+  return `<section class="setup-section" id="setup-dataset"><div class="setup-body"><div class="request-source"><fieldset class="dataset-source"><legend>Questions ${infoHelp('request_source','Questions','Use built-in known-answer examples, or add or import your own questions and expected answers. Each saved question runs once in Answer correctness. Sample count and requests-at-a-time settings are not used for that check with saved questions. Capacity under load uses the same source when selected; other checks use generated requests. Switching sources keeps your saved questions. Try one question to inspect the answer before testing them all.')}</legend><label><input type="radio" name="request_source" value="builtin" ${custom?'':'checked'}><span>Built-in examples</span></label><label><input type="radio" name="request_source" value="request_pack" ${custom?'checked':''}><span>My questions</span></label></fieldset>${custom?`<input type="file" id="request-pack-file" accept=".csv,.json,text/csv,application/json" hidden><div class="pack-actions actions"><button type="button" class="button small" data-action="add-example">+ Add question</button><button type="button" class="button small" data-action="import-pack">Import CSV / JSON</button><button type="button" class="text-button" data-action="sample-dataset">Use sample questions</button></div>${cases.length?`<div class="dataset-table question-table"><table><thead><tr><th><input type="checkbox" id="dataset-select-all" aria-label="Select all examples" ${cases.every(item=>state.datasetSelection.includes(item.fixture_id))?'checked':''}></th><th>Question / expected answer</th><th>Answer check</th><th>Actions</th></tr></thead><tbody>${cases.map((item,index)=>`<tr><td><input type="checkbox" data-dataset-select="${escape(item.fixture_id)}" aria-label="Select ${escape(item.fixture_id)}" ${state.datasetSelection.includes(item.fixture_id)?'checked':''}></td><td><strong>${escape(item.fixture_id)}</strong><span class="dataset-excerpt">${escape(item.messages.map(message=>message.content).join(' / '))}</span><small class="dataset-excerpt">Expected: ${Object.hasOwn(item,'expected')?escape(typeof item.expected==='string'?item.expected:JSON.stringify(item.expected)):'Not set'}${item.messages.length>1?` · ${number(item.messages.length)} messages`:''}</small></td><td>${answerChecks[item.scorer]}${item.scorer==='judge'?`<small data-evaluator-needed ${judgesReady(config)?'hidden':''}>Needs evaluator</small>`:''}</td><td><div class="dataset-row-actions"><button type="button" class="text-button" data-action="try-example" data-case-index="${index}" aria-label="Try ${escape(item.fixture_id)}">Try one</button><button type="button" class="text-button" data-action="edit-example" data-case-index="${index}" aria-label="Edit ${escape(item.fixture_id)}">Edit</button><button type="button" class="text-button" data-action="remove-example" data-case-index="${index}" aria-label="Remove ${escape(item.fixture_id)}">Remove</button></div></td></tr>`).join('')}</tbody></table></div><p class="hint dataset-count">${number(cases.length)} questions</p>`:'<div class="dataset-empty"><h3>Add your first question</h3><p class="hint">Enter a question and its expected answer, or use the sample questions to get started.</p></div>'}`:` ${state.bootstrap.builtin_question_example?`<details class="builtin-example"><summary>View an example</summary><p>${escape(state.bootstrap.builtin_question_example.question)}</p><p><strong>Expected answer:</strong> <code>${escape(state.bootstrap.builtin_question_example.expected)}</code></p><p class="hint">Exact match after whitespace normalization; extra explanation does not match.</p></details>`:''}`}</div>${renderAnswerChecks(config)}${custom&&cases.length?`<details class="setup-disclosure dataset-advanced"><summary>Advanced dataset settings</summary><p class="hint">${inputRetentionNotice}</p><div id="request-pack-preview"></div></details>`:''}</div></section>`;
 }
 function datasetDialog(title,body,footer='') {
   const dialog=$('#dataset-dialog');
@@ -533,18 +845,46 @@ function currentRequestPlan() {
   const saved=state.requestPreview;
   return !hasJsonChanges()&&saved?.status==='current'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?saved.plan:null;
 }
-function renderRequestPlan() {
+function canStartRun() {
+  return Boolean(currentRequestPlan())&&!state.submitting&&!state.configBusy&&!state.active&&state.modelDiscovery?.status!=='pending';
+}
+function renderReviewPassCriteria(config) {
+  if(!config?.limits||!state.bootstrap?.checks)return '';
+  const labels={first_output_ms:'First output within',latency_ms:'Complete answer within',stream_gap_ms:'Maximum stream pause',min_output_tokens_per_second:'Minimum generation rate',fairness_max_ratio:'Maximum slowdown',max_error_rate:'Errors allowed',min_correctness:'Correct answers required',min_samples:'Minimum usable answers'};
+  const rows=config.checks.map(id=>{
+    const check=state.bootstrap.checks.find(item=>item.id===id);if(!check?.limit_fields.length)return '';
+    const limits=check.limit_fields.map(name=>{
+      const value=limitValue(config,check,name);if(value==null)return '';
+      return `${labels[name] || human(name)} ${checkSettingValue(name,value)}`;
+    }).filter(Boolean);
+    const timingFields=id==='first_output'?['first_output_ms']:id==='generation'?['latency_ms','stream_gap_ms','min_output_tokens_per_second']:[];
+    if(timingFields.length&&timingFields.every(name=>limitValue(config,check,name)==null))limits.unshift('Measurement only — no timing target; result is inconclusive');
+    return limits.length?`<article><strong>${escape(catalogTitle(id))}</strong><p class="hint">${escape(limits.join(' · '))}</p></article>`:'';
+  }).filter(Boolean);
+  return rows.length?`<h4>Pass criteria</h4><div class="plan-rows">${rows.join('')}</div>`:'';
+}
+function renderReviewLoad(config) {
+  if(!config?.checks.includes('capacity')||!config.traffic)return '';
+  const traffic=config.traffic,concurrency=Math.min(traffic.max_in_flight ?? config.concurrency,config.concurrency);
+  return `<p class="hint review-load">Capacity target rates: ${escape(traffic.rates.join(' → '))} requests/s · ${escape(traffic.duration_seconds)}s per rate · up to ${number(concurrency)} at once${traffic.arrival==='poisson'?' · random arrivals':''}.</p>`;
+}
+function renderRequestPlan(config=null) {
   const element=$('#request-plan');if(!element)return;
-  const saved=state.requestPreview,plan=currentRequestPlan();
+  const saved=state.requestPreview,plan=currentRequestPlan();config ||= (plan?saved.config:null) || state.config;
+  const start=$('#start-run');if(start)start.disabled=!canStartRun();
+  const checkPlan=$('#checks-plan-summary');if(checkPlan){checkPlan.textContent=plan?`${setupPlanCount(plan)}${plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.required_request_limit>plan.request_limit));}
+  const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
+  const limits=config?`<p class="review-limits">Limits: up to ${number(config.max_requests)} requests · traffic time limit ${elapsed(config.max_duration_seconds)} · ${number(config.concurrency)} at once.</p>`:'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
-    element.innerHTML=`<h3>Request plan</h3><p class="hint" role="status">${escape(status)}</p>${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="text-button" data-action="preview-pack">Retry request plan</button>':''}`;return;
+    element.innerHTML=`${heading}<p class="hint" role="status">${escape(status)}</p>${limits}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}`;return;
   }
-  const total=plan.planned_total,kind=plan.count_kind;
-  const count=kind==='exact'?`${number(total)} target requests planned`:kind==='estimate'?`About ${number(total)} target requests planned`:`${number(plan.known_total)} known target requests, plus adaptive tests`;
+  const count=setupPlanCount(plan);
   const evaluator=plan.evaluator || {},needed=plan.required_request_limit;
   const raise=Number.isInteger(needed)&&needed>plan.request_limit;
-  element.innerHTML=`<h3>Request plan</h3><p class="plan-total" role="status">${escape(count)}</p><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per target`:`${number(plan.planned_per_target)} requests per target`} · total budget ${number(plan.request_limit)} · ${Object.entries(plan.target_quotas || {}).map(([name,quota])=>`${escape(name)} may use ${number(quota)}`).join(' · ')}. Time limits can stop work before the plan finishes.</p><p class="hint">${evaluator.active?`Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} evaluators.`:'0 evaluator calls · built-in answer checks run without an AI evaluator.'}</p>${evaluator.active?'<p class="hint">Questions, expected answers and model answers are sent to every configured evaluator. Evaluator calls have separate limits from target traffic.</p>':''}${(evaluator.readiness_errors || []).map(error=>notice(error,'warning')).join('')}${raise?`<div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or tests</button></div>`:''}${(plan.warnings || []).map(warning=>notice(warning,'warning')).join('')}<details class="request-planning" ${state.setupPreset==='concurrent'?'open':''}><summary>Requests by test and size</summary><div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${number(row.requests_per_target)} per target${row.kind==='estimate'?' (estimate)':''}`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<p class="hint">Every load tests these ${number(plan.bucket_cases.length)} generated question / answer combinations:</p><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per target`).join(' · ')}</p>`:''}</details>`;
+  const evaluatorScope='AI judge calls run separately from the target request budget and send cases and generated answers to each judge.';
+  const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>!evaluator.active||warning!==evaluatorScope);
+  element.innerHTML=`${heading}<p class="plan-total" role="status">${escape(count)}</p>${limits}${renderReviewLoad(config)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}${renderReviewPassCriteria(config)}</details>`;
 }
 function scheduleRequestPlan() {
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
@@ -604,62 +944,163 @@ function renderPackResults(pack) {
   return `<div class="traffic-summary"><h3>Request pack · quiet and loaded evidence</h3><p class="hint">Missing scored completions are insufficient evidence.</p>${pack.control_status?`<p>Quiet control ${badge(pack.control_status)}</p>`:''}</div><div class="metric-table"><table><thead><tr><th>Case</th><th>Quiet</th><th>Loaded · correct / scored, valid</th></tr></thead><tbody>${(pack.cases || []).map(item=>`<tr><td>${escape(item.case_id)}</td><td>${badge(item.quiet?.status || 'inconclusive')}<small>${number(item.quiet?.correct)} / ${number(item.quiet?.scored)} scored · ${number(item.quiet?.valid)} valid</small></td><td>${(item.stages || []).map(stage=>`<div>${number(stage.rate_rps,2)} req/s: ${number(stage.correct)} / ${number(stage.scored)} scored · ${number(stage.valid)} valid<small>${number(stage.offered)} / ${number(stage.planned)} offered · ${number((stage.dropped_local || 0)+(stage.dropped_late || 0))} dropped${!stage.valid||!stage.scored?' · insufficient evidence':''}</small></div>`).join('') || 'No loaded evidence'}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function setupSectionHeader(number,title,description) {
-  return `<header class="setup-heading"><span class="setup-number" aria-hidden="true">${number}</span><div><h2>${escape(title)}</h2><p>${escape(description)}</p></div></header>`;
+  return `<header class="setup-heading">${number?`<span class="setup-number" aria-hidden="true">${number}</span>`:''}<div><h2>${escape(title)}</h2><p>${escape(description)}</p></div></header>`;
 }
-function renderSetupGoal(preset) {
-  const goal=preset==='answers'?'answers':preset==='custom'?'custom':'load';
-  return `<section class="setup-section" id="setup-goal">${setupSectionHeader(1,'What do you want to test?','Choose a starting point. You can adjust the requests and limits before running.')}<div class="setup-body"><fieldset class="setup-goals"><legend class="sr-only">Run goal</legend>${[['answers','Check answers','Send questions and check the responses.'],['load','Test under load','Find how the server behaves as traffic grows.'],['custom','Choose individual tests','Select from all 19 tests and keep individual settings.']].map(([value,label,description])=>`<label><input type="radio" name="setup_goal" value="${value}" ${goal===value?'checked':''}><span><strong>${label}</strong><small>${description}</small></span></label>`).join('')}</fieldset>${goal==='load'?`<fieldset class="setup-load-kind"><legend>How should load increase?</legend><label><input type="radio" name="setup_load" value="concurrent" ${preset==='concurrent'?'checked':''}>Requests at once</label><label><input type="radio" name="setup_load" value="arrival" ${preset==='arrival'?'checked':''}>Requests per second</label></fieldset>`:''}</div></section>`;
-}
-function renderSetupLoad(config,preset) {
-  if(preset==='concurrent'){
-    const settings=config.buckets || bucketFormDefaults(config);
-    return `<div class="setup-load" id="primary-load"><h3>Requests at once</h3><p class="hint">Giraffe-generated requests test each question length and answer cap together. Your saved questions are kept for answer and rate tests.</p><div class="fields">${field('buckets_levels','Requests at a time',settings.levels.join(', '),{required:true,full:true,hint:'1, 4, 8 means one request at a time, then four together, then eight together.',placeholder:'1, 4, 8'})}</div><p class="hint" id="derived-concurrency">At most ${number(config.concurrency)} requests at once.</p>${renderBucketSizes(settings)}</div>`;
+function syncSetupStep({focus=false}={}) {
+  if(!$('#setup-panel-1'))return;
+  const step=state.setupStep;
+  for(const panel of $$('[data-setup-panel]'))panel.hidden=Number(panel.dataset.setupPanel)!==step;
+  for(const button of $$('.setup-stepper [data-setup-step]')){
+    const index=Number(button.dataset.setupStep);
+    button.classList.toggle('is-current',index===step);button.classList.toggle('is-complete',index<step);
+    if(index===step)button.setAttribute('aria-current','step');else button.removeAttribute('aria-current');
   }
-  if(preset==='arrival')return `<div class="setup-load" id="primary-load"><h3>Requests per second</h3><p class="hint">Each rate is a separate stage. New requests start at that rate while previous answers may still be running.</p><div class="fields">${schemaField('traffic_rates',config.traffic.rates,state.bootstrap.traffic_schema.properties.rates,{label:'Requests per second',hint:'For example: 1, 2, 4 sends one, two, then four new requests each second.'})}${schemaField('traffic_duration_seconds',config.traffic.duration_seconds,state.bootstrap.traffic_schema.properties.duration_seconds,{label:'Seconds at each rate',hint:'The same duration applies to each stage.'})}</div></div>`;
-  return preset==='answers'?'<p class="hint" id="primary-load">Checks that your server is reachable, then sends the selected questions and checks the answers.</p>':'<p class="hint" id="primary-load">Choose tests below. Each test uses its saved profile and shared run limits.</p>';
+  const json=state.configView==='json';
+  const next=$('[data-action="setup-next"]'),back=$('[data-action="setup-back"]');
+  next.hidden=step===3&&!json;next.innerHTML=json?'Return to setup':`${step===2?'Review run':'Continue'} ${icon('arrow')}`;
+  const needsModel=step===1&&!$('#new-run-form')?.elements.model.value.trim();
+  next.disabled=state.submitting||hasJsonChanges()||(!json&&needsModel);back.hidden=step===1||json;back.disabled=state.submitting||hasJsonChanges();
+  $('#start-run').hidden=step!==3||json;$('#start-run').disabled=!canStartRun();
+  const navigationHint=$('#setup-navigation-hint');navigationHint.textContent=step===3?'Sends requests to your deployment. You can stop the run at any time.':step===2?'':needsModel?'Test the connection to detect a model, or specify its name.':'No full run starts until you choose Start run.';navigationHint.hidden=step===2;
+  const tools=$('.configuration-tools');if(tools)tools.hidden=step!==3&&!json;
+  const runSummary=$('#run-bar-summary');if(runSummary)runSummary.hidden=step===3;
+  $('.new-run-layout')?.classList.toggle('connecting',step===1||json);
+  $('.new-run-layout')?.classList.toggle('configuring',step===2&&!json);
+  if(focus){const target=step===2?$('#shared-settings > summary'):$(`[data-setup-panel="${step}"] h2`);if(step!==2)target?.setAttribute('tabindex','-1');target?.focus();}
 }
-function changeSetupPreset(preset,{focusLoad=false}={}) {
+function revealSetupStep(step,{focus=false}={}) {
+  state.setupStep=step;
+  if($('#config-panel-form')){state.configView='form';syncConfigView();}
+  syncSetupStep({focus});
+}
+function validateSetupChecks() {
+  const config=readForm(true).config;
+  if(!config.checks.length){state.catalogueFilter='all';syncTestControls();$('#check-search')?.focus();throw new Error('Select at least one check before reviewing the run.');}
+  readForm(false);
+  if(config.request_source==='request_pack'&&config.checks.some(id=>['correctness','capacity'].includes(id))){
+    if(!config.request_pack?.cases?.length){revealQuestionEditor(config);$('[data-action="add-example"]')?.focus();throw new Error('Add a question or choose built-in examples before continuing.');}
+    if(config.request_pack.cases.some(item=>item.scorer==='judge')&&!judgesReady(config)){configureEvaluator();throw new Error('Set up the AI evaluator before reviewing questions that need an AI answer check.');}
+  }
+}
+function navigateSetup(step) {
+  if(state.submitting||step<1||step>3)return;
+  const error=$('#form-error');if(error)error.hidden=true;
   try{
-    assertAppliedConfig();captureFormDraft();
-    state.config=applySetupPreset(state.config,preset,state.bootstrap.buckets.defaults);
-    state.setupPreset=preset;state.showAvailableTests=preset==='custom';state.jsonDraft=null;state.jsonBase=null;
-    configChanged();renderNew(preset);
-    $(focusLoad?`[name="setup_load"][value="${preset}"]`:`[name="setup_goal"][value="${preset==='answers'?'answers':preset==='custom'?'custom':'load'}"]`)?.focus();
-  }catch(error){configError(error);}
+    assertAppliedConfig();
+    if(state.configView==='json'){revealSetupStep(state.setupStep,{focus:true});return;}
+    if(step>state.setupStep){
+      for(let index=state.setupStep;index<step;index++){
+        if(!validateRunForm($('#new-run-form'),index))return;
+        if(index===2){revealSetupStep(2);validateSetupChecks();}
+      }
+    }
+    captureFormDraft();revealSetupStep(step,{focus:true});updateBounds();
+  }catch(problem){if(error){error.textContent=problem.message;error.hidden=false;}else configError(problem);}
+}
+function setupPlanCount(plan) {
+  return plan.count_kind==='exact'?`${number(plan.planned_total)} requests planned`:plan.count_kind==='estimate'?`About ${number(plan.planned_total)} requests`:`${number(plan.known_total)} known requests + adaptive checks`;
+}
+function renderReviewScope(payload) {
+  const config=payload.config,targets=config.targets || [],questionChecks=config.checks.filter(id=>['correctness','capacity'].includes(id)),usesQuestions=questionChecks.length>0;
+  const usesPack=usesQuestions&&config.request_source==='request_pack',cases=config.request_pack?.cases || [];
+  const mixedSources=usesPack&&config.checks.some(id=>!['correctness','capacity','gpu'].includes(id));
+  const source=usesQuestions?(usesPack?`Your questions · ${number(cases.length)} saved ${cases.length===1?'question':'questions'}${mixedSources?` for ${questionChecks.map(catalogTitle).join(' and ')}. Other checks use generated requests.`:''}`:'Built-in examples'):'';
+  const baseline=payload.baseline_id?state.baselines.find(item=>item.id===payload.baseline_id):null;
+  const comparison=payload.baseline_id?`Compare with saved run: ${baseline?.name || payload.baseline_id}`:'';
+  const problems=[];
+  if(targets.some(target=>!target.url?.trim()||!target.model?.trim()))problems.push('Enter an endpoint URL and model for every target.');
+  if(!config.checks.length)problems.push('Select at least one check.');
+  if(usesPack&&!cases.length)problems.push('Add a question or choose built-in examples.');
+  if(usesPack&&cases.some(item=>item.scorer==='judge')&&!judgesReady(config))problems.push('Configure the AI evaluator for questions that need it.');
+  const restart=payload.mode==='cold-start'?targets.find(target=>target.name===payload.restart_target):null;
+  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<p class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</p><p class="hint">Model: ${escape(target.model || 'Model needed')}</p></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-setup-step="2">Edit checks</button></div><p class="review-check-names">${escape(config.checks.map(catalogTitle).join(' · ') || 'No checks selected')}</p>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${comparison?`<p class="hint review-baseline">${escape(comparison)}</p>`:''}${problems.map(problem=>notice(problem,'warning')).join('')}${payload.mode==='cold-start'?notice(restart?.restart_command?.length?`Restart ${restart.name} before testing. This runs its configured restart command.`:'Restart selected, but no restart command is configured for that endpoint. Use the running server or configure a restart command.','warning'):''}`;
+}
+function modelDiscoveryKey() {
+  const form=$('#new-run-form');if(!form)return null;
+  return JSON.stringify({url:form.elements.url.value.trim(),model:form.elements.model.value.trim() || null,
+    api_key_env:form.elements.api_key_env?.value.trim() || null,headers_env:state.config?.targets?.[0]?.headers_env || {},
+    ca_bundle:state.config?.ca_bundle || null,proxy:state.config?.proxy || null,request_options:state.config?.request_options || {}});
+}
+function invalidateModelDiscovery() {
+  state.modelDiscoverySequence++;state.modelDiscovery=null;renderModelDiscovery();
+}
+function renderModelDiscovery() {
+  const status=$('#model-discovery-status'),button=$('[data-action="test-connection"]');
+  if(!status||!button)return;
+  if(state.modelDiscovery?.status==='pending'&&state.modelDiscovery.route!==state.routeVersion)state.modelDiscovery=null;
+  const discovery=state.modelDiscovery?.key===modelDiscoveryKey()?state.modelDiscovery:null;
+  button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Testing connection…':'Test connection';
+  status.textContent=discovery?.message || '';
+  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');
+  const choice=$('#connection-model-choice'),manual=$('#manual-model-field'),options=$('#model-options');
+  const models=discovery?.models || [];
+  if(choice){
+    const value=$('#new-run-form').elements.model.value;
+    choice.innerHTML='<option value="">Choose a model…</option>'+models.map(model=>`<option value="${escape(model)}" ${value===model?'selected':''}>${escape(model)}</option>`).join('')+'<option value="__manual__">Enter a different model name</option>';
+    choice.hidden=models.length<2;choice.previousElementSibling.hidden=models.length<2;
+    manual.hidden=models.length>1&&value!=='__manual__'&&(!value||models.includes(value));
+  }
+  if(discovery?.status==='needs_model'&&options)options.open=true;
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?'Choose a model':$('#new-run-form').elements.model.value?'Model used for this run':'Model selection (automatic)';
+  syncSetupStep();
+}
+async function testConnection() {
+  try{assertAppliedConfig();}catch(error){configError(error);return;}
+  const form=$('#new-run-form'),url=form?.elements.url;
+  url?.setCustomValidity(url.value.trim()?'':'Enter an endpoint URL.');
+  if(!url?.checkValidity()){url?.reportValidity();return;}
+  const key=modelDiscoveryKey(),sequence=++state.modelDiscoverySequence,route=state.routeVersion;
+  state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
+  try{
+    const result=await api('/api/targets/test-connection',{method:'POST',body:key});
+    if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
+    if(result.status==='connected'){
+      if(!JSON.parse(key).model)state.autoModel=result.model;
+      form.elements.model.value=result.model;form.elements.model.setCustomValidity('');
+      state.config.targets[0].model=result.model;
+      configChanged();updateBounds();
+    }
+    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status==='connected'?`Connected · ${result.model} · reply in ${result.latency_ms<1000?ms(result.latency_ms):elapsed(result.latency_ms/1000)}. One short reply received.`:result.message};
+    renderModelDiscovery();
+    if(result.status==='connected')$('#model-options').open=false;
+    if(result.status==='needs_model')(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
+  }catch(error){
+    if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
+    state.modelDiscovery={key,route,status:'error',models:[],message:error.message};renderModelDiscovery();
+  }
 }
 function renderNew(preset=inferSetupPreset(state.config)) {
-  state.openTest=null;state.setupPreset=preset;
+  state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
-  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Deployment acceptance</div><h1>New run</h1><p>Choose a goal, connect your server, then review the requests before running.</p></div><a class="button ghost" href="#runs">Back to runs</a></div>
+  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Deployment acceptance</div><h1>New run</h1><p>Connect your endpoint, choose checks, and see the results.</p></div><button type="button" class="text-button" data-action="import-config">Load saved setup</button></div>
   <div class="notice" id="new-active-notice" ${state.active?'':'hidden'}><strong>A run is already active.</strong> <a href="${state.active?linkRun(state.active):'#runs'}">Inspect or stop it</a> before starting another.</div>
-  <form id="new-run-form" novalidate><div class="config-toolbar"><div class="result-tabs config-tabs" role="tablist" aria-label="Configuration view"><button type="button" role="tab" id="config-tab-form" data-config-tab="form" aria-controls="config-panel-form">Form</button><button type="button" role="tab" id="config-tab-json" data-config-tab="json" aria-controls="config-panel-json">JSON</button></div><div class="actions"><button type="button" class="text-button" data-action="import-config">Import run config</button><button type="button" class="text-button" data-action="export-config">Export config</button><button type="button" class="text-button" data-action="copy-cli">Copy CLI</button></div><input type="file" id="config-file" accept=".json,application/json" hidden></div><div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Clipboard unavailable. Copy this command:</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
-  ${renderSetupGoal(preset)}
-  <section class="setup-section" id="setup-deployment">${setupSectionHeader(2,'Deployment','Where should Giraffe send requests?')}<div class="setup-body"><div class="fields">
-  ${field('url','Endpoint URL',target.url,{type:'url',required:true,placeholder:'http://localhost:11434/v1'})}
-  ${field('model','Model',target.model,{required:true,placeholder:'e.g. qwen2.5:7b-instruct'})}</div>
-  ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} targets configured.</strong> These fields edit the first target. Other targets are preserved and editable in JSON.</div>`:''}
-  <details class="setup-disclosure" id="execution-settings"><summary>Target and execution options</summary><div class="details-content"><div class="fields">${field('name','Target name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Execution mode','<option value="normal">Use running server</option><option value="cold-start">Restart one server first</option>')}<div id="restart-controls" hidden style="margin-top:16px">${selectField('restart_target','Target to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook" style="margin-top:12px"></p><p class="hint" style="margin-top:8px">Only this named target's configured restart command will run.</p></div></div></div></details></div></section>
-  ${preset==='concurrent'?'':renderRequestSource(c)}
-  <section class="setup-section" id="test-selection">${setupSectionHeader(preset==='concurrent'?3:4,'Requests & stop limits','Choose the load and how much traffic this run may send.')}<div class="setup-body">
-  ${renderSetupLoad(c,preset)}
-  <div class="setup-subsection"><h3>Stop limits</h3><p class="hint">The run stops starting requests when it reaches either limit. A short run or small budget can leave tests unfinished.</p><div class="fields three">${numericFields.filter(([key])=>['max_requests','max_duration_seconds'].includes(key)||(key==='concurrency'&&preset!=='concurrent')).map(([key,label,unit,min,step])=>field(key,key==='concurrency'?'Simultaneous request limit':key==='max_requests'?'Total request budget':'Whole-run time limit (seconds)',c[key],{type:'number',hint:key==='concurrency'?(preset==='arrival'?'New arrivals are dropped if every request slot is busy.':'At most this many target requests can run together.'):key==='max_requests'?'Shared across every selected test and server.':'Target traffic ends at this time limit.',min,max:key==='concurrency'?256:undefined,step,required:true})).join('')}${preset==='concurrent'?`<input type="hidden" name="concurrency" value="${escape(c.concurrency)}">`:''}</div></div>
-  ${preset==='arrival'?`<div class="setup-subsection"><div class="fields" data-test-settings="capacity">${field('test_capacity_limit_latency_ms','Maximum answer time (ms)',limitValue(c,state.bootstrap.checks.find(check=>check.id==='capacity'),'latency_ms'),{type:'number',min:.001,step:'any',helpKey:'limit_latency_ms',placeholder:'Measure without an answer-time target',hint:'Leave blank to measure full-answer times without setting a limit.'})}</div></div>`:''}
-  <details class="setup-disclosure" id="test-catalogue" ${preset==='custom'?'open':''}><summary>Individual tests & specialist settings <span class="dim" id="selection-summary"></span></summary><div class="details-content">
-  <div class="test-suite-heading"><div><h3>Selected tests</h3><p class="hint">Configure sampling, acceptance settings and optional checks.</p></div><div class="actions"><button class="button small" id="add-tests" type="button" data-action="toggle-available-tests" aria-expanded="false" aria-controls="test-cards">Add tests</button><button class="button small ghost" type="button" data-action="select-tests">Select all</button><button class="button small ghost" type="button" data-action="clear-tests">Clear</button></div></div>
-  <p class="hint" id="no-tests-selected" hidden>No tests selected. Use Add tests to choose what to run.</p>
-  <div class="test-cards" id="test-cards">${[...(state.bootstrap.checks || [])].sort((a,b)=>Number(c.checks.includes(b.id))-Number(c.checks.includes(a.id))).map(check=>renderTestCard(check,c)).join('')}</div>
-  </div></details>
-  <details class="setup-disclosure" id="advanced-run-limits"><summary>Context, output & request deadlines</summary><div class="details-content"><p class="hint">These safety limits apply to each target request. Raising an answer cap here is an explicit change to the maximum allowed output.</p><div class="fields three">${numericFields.filter(([key])=>['context_limit','request_timeout_seconds','max_output_tokens'].includes(key)).map(([key,label,unit,min,step])=>field(key,label,c[key],{type:'number',hint:unit,min,step,required:true})).join('')}</div></div></details>
-  <details class="setup-disclosure"><summary>Acceptance targets <span class="dim" id="acceptance-summary"></span></summary><div class="details-content"><p class="hint">Set what counts as a pass. Leave a performance limit blank to measure it without requiring a particular result.</p><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Not set'})).join('')}${field('limit_max_error_rate','Maximum error rate',limits.max_error_rate,{type:'number',hint:'Fraction: 0 to 1',min:0,step:'any'})}${field('limit_min_correctness','Minimum correctness',limits.min_correctness,{type:'number',hint:'Fraction: 0 to 1',min:0,step:'any'})}${field('limit_regression_percent','Material regression threshold',limits.regression_percent,{type:'number',hint:'Percent; percentage points for rates',min:0,step:'any'})}</div></div></details>
-</div></section></div>
+  <form id="new-run-form" novalidate>
+  <ol class="setup-stepper" aria-label="Run setup">${['Connect','Choose checks','Review & run'].map((label,index)=>`<li><button type="button" class="setup-step" data-setup-step="${index+1}" aria-controls="setup-panel-${index+1}"><span class="setup-step-index" aria-hidden="true">${index+1}</span><strong>${label}</strong></button></li>`).join('')}</ol>
+<div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Clipboard unavailable. Copy this command:</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
+  <section class="setup-step-content" id="setup-panel-1" data-setup-panel="1" aria-label="Connect">
+  <section class="setup-section" id="setup-deployment">${setupSectionHeader(1,'Connect your endpoint','Paste the OpenAI-compatible address of your LLM server.')}<div class="setup-body"><div class="fields">
+  ${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1'})}</div>
+  <details class="setup-disclosure connection-auth" ${target.api_key_env?'open':''}><summary>API key (optional)</summary><div class="details-content"><p class="hint">Only needed if your endpoint requires an API key. Open local endpoints can leave this empty.</p>${field('api_key_env','Environment variable containing your API key',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
+  <details class="setup-disclosure model-options" id="model-options"><summary><span id="model-options-label">${target.model?'Model used for this run':'Model selection (automatic)'}</span></summary><div class="details-content"><p class="hint">A server can host several models. Giraffe selects it automatically when only one is listed. You can also enter an exact name to skip detection.</p><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model name',target.model || '',{required:true,placeholder:'e.g. llama3.2:3b',hint:'Only needed when automatic detection cannot choose a model.'})}</div></div></details>
+  <div class="connection-test-action"><button type="button" class="button primary" data-action="test-connection">Test connection</button><p class="hint">Detects available models, then sends one short request (up to 32 tokens). If several models are available, you choose which one to test.</p></div>
+  <div class="setup-connection-status" id="model-discovery-status" role="status" aria-live="polite"></div>
+  ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
+  </div></section>
+  </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
+  ${renderCheckSelection(c)}</section>
+  <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
+  <section class="setup-section" id="setup-review"><header class="setup-heading"><h2>Review & run</h2></header><div class="setup-body">
+  <div id="run-bounds"></div>
+  <section id="request-plan" class="request-plan review-section" aria-live="polite"></section><div id="load-guidance" role="status" aria-live="polite"></div>
+  <details class="setup-disclosure" id="execution-settings"><summary>Run options</summary><div class="details-content"><div class="fields">${field('name','Endpoint name in results',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare with a previous run',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
+  </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section>
 
-  <section class="setup-section" id="setup-review">${setupSectionHeader(preset==='concurrent'?4:5,'Review & run','Check the scope and any missing settings before sending traffic.')}<div class="setup-body">
-  <div class="review-baseline">${selectField('baseline_id','Compare against',baselineOptions(state.prefillBaseline || ''))}<p class="hint">Compare results with a saved run to see what got better or worse.</p></div>
-  <dl class="bound-list review-bounds" id="run-bounds"></dl><div id="load-guidance" role="status" aria-live="polite"></div><div id="request-plan" class="request-plan" aria-live="polite"></div></div></section>
-  <div class="run-action-bar"><div><strong id="run-bar-summary"></strong><p class="hint">Sends requests to your configured deployment. You can stop at any time.</p></div><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''}>Run suite ${icon('arrow')}</button><div id="form-error" class="error-message" role="alert" hidden></div></div>
-  </div></form>`;
+  </div>
+  <details class="configuration-tools" ${state.configView==='json'||hasJsonChanges()?'open':''}><summary>Save this setup or use advanced options</summary><div class="config-toolbar"><div class="result-tabs config-tabs" role="tablist" aria-label="Configuration view"><button type="button" role="tab" id="config-tab-form" data-config-tab="form" aria-controls="config-panel-form">Guided setup</button><button type="button" role="tab" id="config-tab-json" data-config-tab="json" aria-controls="config-panel-json">Advanced editor</button></div><div class="actions"><button type="button" class="text-button" data-action="import-config">Load saved setup</button><button type="button" class="text-button" data-action="export-config">Save setup to file</button><button type="button" class="text-button" data-action="copy-cli">Copy terminal command</button></div><input type="file" id="config-file" accept=".json,application/json" hidden></div></details>
+  <div class="run-action-bar setup-navigation"><div><strong id="run-bar-summary"></strong><p class="hint" id="setup-navigation-hint">No test requests are sent automatically.</p></div><div class="actions"><button class="button" type="button" data-action="setup-back" hidden>Back</button><button class="button primary" type="button" data-action="setup-next">Continue ${icon('arrow')}</button><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''} hidden>Start run ${icon('arrow')}</button></div><div id="form-error" class="error-message" role="alert" hidden></div></div>
+  </form>`;
   for(const check of state.bootstrap.checks){
     const options=c.test_options?.[check.id] || {};
     for(const name of check.option_fields)$('#new-run-form').elements[`test_${check.id}_${name}`].dataset.inherited=String(options[name]==null);
@@ -668,32 +1109,37 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   const form=$('#new-run-form');form.elements.mode.value=state.formMode;
   if(state.formRestartTarget&&c.targets.some(t=>t.name===state.formRestartTarget))form.elements.restart_target.value=state.formRestartTarget;
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
-  syncTestControls();updateBounds();updateRestart();syncConfigView();syncPackControls();renderRequestPreview();
+  syncTestControls();updateBounds();updateRestart();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();
 }
 function readForm(allowEmpty=false) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
   // Disabled editors still retain their values when a test is unchecked.
-  for(const input of form.querySelectorAll('[data-test-settings] input, [data-traffic-settings] input, [data-traffic-settings] select'))data.set(input.name,input.value);
+  for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea'))data.set(input.name,input.value);
   if(!config.targets?.length)throw new Error('Configuration must contain at least one target.');
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
+  if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || null;
   first.metrics_url=form.elements.metrics_url.value.trim() || null;
   for(const [key] of numericFields)config[key]=data.get(key)===''?null:Number(data.get(key));
   config.limits ||= {};
-  for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','regression_percent']){const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v);}
-  config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty});
+  for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
+  if(form.elements.samples)config.samples=Number(form.elements.samples.value);
+  if(form.elements.stream)config.stream=form.elements.stream.value==='true';
+  config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty,percentageInputs:true});
   config=configureBuckets(config,data,bucketFormDefaults(config),{allowInvalid:allowEmpty});
   config=configureJudging(config,data,{allowInvalid:allowEmpty});
-  config=configureSetupLoad(config,state.setupPreset || inferSetupPreset(state.config),{allowInvalid:allowEmpty});
+  config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
 function updateBounds() {
   const selected=$$('#new-run-form input[name="check"]:checked').length;
-  $('#selection-summary').textContent=`${selected} of ${state.bootstrap.checks.length} tests selected`;
+  $('#selection-summary').textContent=`${selected} checks selected`;
   let payload;try{payload=readForm(true);}catch{return;}
   const c=payload.config;
+  const trafficLimitHint=$('#field-traffic_max_in_flight-hint');if(trafficLimitHint)trafficLimitHint.textContent=`Leave blank to use the shared limit of ${c.concurrency}. This test cannot exceed that limit.`;
+  const bucketLimitHint=$('#bucket-shared-limit');if(bucketLimitHint)bucketLimitHint.textContent=`The shared simultaneous-request limit is ${c.concurrency}. Question lengths and answer caps are also used by Short-request slowdown.`;refreshDefaultProfileFields(c);
   const derived=$('#derived-concurrency');if(derived){
-    derived.textContent=`At most ${number(c.concurrency)} requests at once.`;
+    derived.textContent=`At most ${number(c.concurrency)} ${c.concurrency===1?'request':'requests'} at once.`;
     const ceiling=$('#new-run-form').elements.concurrency;
     if(ceiling.value!==String(c.concurrency)){ceiling.value=c.concurrency;for(const check of state.bootstrap.checks)refreshInheritedFields(check.id,true);}
   }
@@ -703,44 +1149,13 @@ function updateBounds() {
   updateDatasetReadiness(c);
   for(const check of state.bootstrap.checks){
     const card=$(`[data-test-card="${check.id}"]`);
-    $('[data-setting-state]',card).textContent=testSettingsLabel(check,c);
+    updateCheckRow(check,c,card);
   }
-  const usesPack=c.request_source==='request_pack'&&c.checks.some(id=>['capacity','correctness'].includes(id));
-  const generatedWork=c.checks.some(id=>!['correctness','capacity','access','gpu'].includes(id));
-  const source=usesPack?`${number(c.request_pack?.cases?.length || 0)} saved questions${c.checks.includes('access')?' + generated connection check':''}${generatedWork?' + generated test requests':''}`:c.request_source==='request_pack'?'Giraffe-generated requests · saved questions inactive':'Giraffe-generated examples';
-  const loads=[];
-  if(c.checks.includes('buckets'))loads.push(`${(c.buckets?.levels || []).join(' → ')} requests at once`);
-  if(c.checks.includes('capacity'))loads.push(`${c.traffic.rates.join(' → ')} requests/s · ${c.traffic.duration_seconds}s each`);
-  const load=loads.join(' / ') || (c.checks.includes('correctness')?'Individual answer checks':'Saved test-specific loads');
-  $('#run-bounds').innerHTML=[['Server',c.targets.map(target=>`${target.name}: ${target.url} · ${target.model || 'model needed'}`).join(' / ')],['Requests',source],['Load',load],['Tests',c.checks.map(id=>state.bootstrap.checks.find(check=>check.id===id)?.title || human(id)).join(', ') || 'None'],['Simultaneous limit',`At most ${number(c.concurrency)} requests at once`],['Total request budget',`At most ${number(c.max_requests)} target requests`],['Whole-run time limit',elapsed(c.max_duration_seconds)],['Execution',payload.mode==='normal'?'Use running server':'Restart selected server first']].map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('');
-  if(c.checks.includes('capacity')){
-    const check=state.bootstrap.checks.find(item=>item.id==='capacity');
-    const targets=[['Complete answer',limitValue(c,check,'latency_ms')],['First output',limitValue(c,check,'first_output_ms')]].filter(([,value])=>value!=null);
-    $('#run-bounds').insertAdjacentHTML('beforeend',`<div><dt>Time targets under load</dt><dd>${escape(targets.length?targets.map(([label,value])=>`${label} within ${ms(value)}`).join(' · '):'Measure only · no pass/fail time target')}</dd></div>`);
-  }
-  $('#selection-summary').textContent=`· ${c.checks.length} of ${state.bootstrap.checks.length} selected`;
-  const missing=[];
-  if(c.targets.some(target=>!target.model?.trim()))missing.push('Enter target model');
-  if(c.targets.some(target=>!target.url?.trim()))missing.push('Enter endpoint URL');
-  if(!c.checks.length)missing.push('Select at least one test');
-  if(c.request_source==='request_pack'&&c.checks.some(id=>['capacity','correctness'].includes(id))){
-    const cases=c.request_pack?.cases || [];
-    const limits={...c.limits,...c.test_options?.[c.checks.includes('capacity')?'capacity':'correctness']?.limits};
-    if(!cases.length)missing.push('Add dataset examples');
-    const judged=cases.some(item=>item.scorer==='judge');
-    if(judged&&!judgesReady(c))missing.push('Configure AI evaluator');
-    const rows=[['Dataset',`${cases.length} examples`],['Required correct',`${number((limits.min_correctness ?? 1)*100,1)}%`]];
-    if(!c.checks.includes('capacity'))rows.push(['Response limit',limits.latency_ms==null?'Not set':ms(limits.latency_ms)]);
-    if(c.checks.includes('capacity'))rows.push(['Arrival rates',`${c.traffic.rates.join(' → ')} req/s`]);
-    $('#run-bounds').insertAdjacentHTML('beforeend',rows.map(([label,value])=>`<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join(''));
-  }
-  if(missing.length)$('#run-bounds').insertAdjacentHTML('beforeend',`<div class="setup-needed"><dt>Setup needed</dt><dd>${escape(missing.join(' · '))}</dd></div>`);
-  const summary=$('#run-bar-summary');if(summary)summary.textContent=`${c.checks.length} tests · ${c.targets.length} target${c.targets.length===1?'':'s'} · up to ${number(c.max_requests)} requests`;
-  const ceilings=$('#run-ceilings-summary');if(ceilings)ceilings.textContent=`· ${number(c.max_requests)} requests / ${elapsed(c.max_duration_seconds)}`;
-  const acceptance=$('#acceptance-summary');if(acceptance)acceptance.textContent=`· ${number((c.limits.min_correctness ?? 1)*100,1)}% correct · ${c.limits.latency_ms==null?'response time not set':ms(c.limits.latency_ms)}`;
-  const traffic=c.traffic,profile=$('.traffic-profile-summary');
-  if(profile)profile.textContent=`${traffic.rates.join(' → ')} requests/s · ${traffic.duration_seconds}s per stage · ${traffic.arrival==='poisson'?'uneven':'steady'} arrivals · up to ${traffic.max_in_flight ?? c.concurrency} in flight`;
-  renderRequestPlan();scheduleRequestPlan();
+  $('#run-bounds').innerHTML=renderReviewScope(payload);
+  $('#selection-summary').textContent=`${c.checks.length} checks selected`;
+  const summary=$('#run-bar-summary');if(summary){summary.textContent=state.setupStep===3?'':`${c.checks.length} checks · ${c.targets.length} endpoint${c.targets.length===1?'':'s'}`;summary.hidden=state.setupStep===3;}
+  updateSharedSettingsSummaries(c);
+  updateCheckFieldHints(c);renderRequestPlan(c);scheduleRequestPlan();
 }
 function updateDatasetReadiness(config) {
   const ready=judgesReady(config);
@@ -752,6 +1167,7 @@ function updateDatasetReadiness(config) {
 }
 function configureEvaluator() {
   const details=$('.judge-configuration');if(!details)return;
+  revealQuestionEditor();
   details.open=true;state.judgeEditorOpen=true;
   if(!state.config.judging?.judges?.length)changeJudge('add');
   else $('[name="judge_0_url"]')?.focus();
@@ -759,15 +1175,17 @@ function configureEvaluator() {
 function updateRestart(){const form=$('#new-run-form');if(!form)return;const mode=form.elements.mode.value;$('#restart-controls').hidden=mode!=='cold-start';const name=form.elements.restart_target.value;const target=state.config.targets.find(t=>t.name===name);$('#restart-hook').textContent=target?.restart_command?.length?`Configured command: ${target.restart_command.join(' ')}`:'No restart command is configured for this target. Add restart_command in the configuration before using cold start.';updateBounds();}
 async function startRun(event) {
   event.preventDefault();if(state.submitting||state.active||state.configBusy)return;
+  if($('#setup-panel-1')&&state.setupStep<3){navigateSetup(state.setupStep+1);return;}
   const version=state.routeVersion;$('#form-error').hidden=true;
   try {
     assertAppliedConfig();
     if(!validateRunForm(event.target))return;
     const draft=readForm(true).config;
     if(draft.request_source==='request_pack'&&draft.checks.some(id=>['correctness','capacity'].includes(id))){
-      if(!draft.request_pack?.cases?.length){$('[data-action="add-example"]').focus();throw new Error('Add a question or choose built-in examples before testing.');}
-      if(draft.request_pack.cases.some(item=>item.scorer==='judge')&&!judgesReady(draft)){configureEvaluator();throw new Error('Set up the AI evaluator to check questions that accept paraphrased answers.');}
+      if(!draft.request_pack?.cases?.length){revealQuestionEditor(draft);$('[data-action="add-example"]').focus();throw new Error('Add a question or choose built-in examples before testing.');}
+      if(draft.request_pack.cases.some(item=>item.scorer==='judge')&&!judgesReady(draft)){revealSetupStep(2);configureEvaluator();throw new Error('Set up the AI evaluator to check questions that accept paraphrased answers.');}
     }
+    if(!currentRequestPlan())throw new Error('Wait for the current request plan before starting. If planning failed, use Retry request plan.');
     state.submitting=true;$('#start-run').disabled=true;$('#start-run').textContent='Validating settings…';
     const payload=await validatedSnapshot();
     await refreshRequestPreview(payload.config);
@@ -777,40 +1195,64 @@ async function startRun(event) {
     const result=await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});state.config=clone(payload.config);
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','capacity'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
-  }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=Boolean(state.active);$('#start-run').innerHTML=`Run suite ${icon('arrow')}`;}}finally{state.submitting=false;}
+  }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Start run ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
 }
 function reportConfig(report){return report?.manifest?.config || state.detail?.config || {};}
 function mainFinding(report) {
   const checks=report.checks.filter(c=>c.id!=='baseline'),failed=checks.find(c=>c.status==='fail');
-  if(failed){if(failed.metrics?.scored&&failed.metrics.correct<failed.metrics.scored)return `${failed.title}: ${failed.metrics.correct} of ${failed.metrics.scored} correct`;return `${failed.title} failed`;}
+  if(!checks.length)return 'No checks ran';
+  if(failed){if(failed.metrics?.scored&&failed.metrics.correct<failed.metrics.scored)return `${checkGuide[failed.id]?.name || failed.title}: ${failed.metrics.correct} of ${failed.metrics.scored} correct`;return `${checkGuide[failed.id]?.name || failed.title} failed`;}
   if(report.abort_reason)return 'Run stopped with partial results';
-  const uncertain=checks.find(c=>['blocked','inconclusive'].includes(c.status)&&c.required);
-  if(uncertain)return `${uncertain.title} is ${uncertain.status}`;
-  if(report.overall==='pass')return 'Selected acceptance checks passed';
+  const uncertain=checks.find(c=>['blocked','inconclusive'].includes(c.status));
+  if(uncertain)return `${checkGuide[uncertain.id]?.name || uncertain.title} is ${uncertain.status}`;
   if(report.baseline?.status==='fail')return 'A material regression was detected';
+  if(report.baseline?.status==='inconclusive')return 'The baseline comparison is inconclusive';
+  if(checks.some(c=>c.status==='skipped'&&!unselectedCheck(c,report)))return 'Some selected checks did not run';
+  if(checks.length&&checks.every(c=>c.status==='skipped'))return 'No checks ran';
+  if(report.overall==='pass')return 'Selected acceptance checks passed';
   return 'Review the recorded acceptance results';
+}
+function unselectedCheck(check,report) {
+  if(check.status!=='skipped')return false;
+  const configured=reportConfig(report).checks;
+  return Array.isArray(configured)?!configured.includes(check.id):/^Not selected for this run\.?$/i.test(check.summary || '');
+}
+function resultGuidance(report) {
+  const checks=report.checks.filter(c=>c.id!=='baseline'),problem=checks.find(c=>c.status==='fail') || checks.find(c=>['blocked','inconclusive'].includes(c.status));
+  if(problem)return `${problem.summary || 'This check needs a closer look.'} Inspect its evidence below, then review settings before running again.`;
+  if(report.abort_reason)return 'The evidence collected so far is saved below. Review the stopping reason and request limits before trying again.';
+  if(report.baseline?.status==='fail')return 'Open the baseline comparison to see what regressed and whether the two runs are comparable.';
+  if(report.baseline?.status==='inconclusive')return 'Open the baseline comparison to see what could not be compared. No improvement or regression is established.';
+  if(checks.some(c=>c.status==='skipped'&&!unselectedCheck(c,report)))return 'Open “Not run” to see why selected checks were skipped. Review their settings before trying again.';
+  if(!checks.length||checks.every(c=>c.status==='skipped'))return 'No check produced a result. Review settings to choose what to test, then start a new run.';
+  if(report.overall==='pass')return 'The recorded checks met their configured limits. Save a baseline to compare your next change. This result applies to the endpoint and traffic tested here.';
+  return 'Review the selected checks and their recorded reasons, then adjust the settings for your next run.';
 }
 function renderDetail() {
   const d=state.detail;if(activeState(d)){renderLive();return;}
   const report=d.report;
-  if(!report){$('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>Run could not finish</h1></div><a class="button" href="#new">New run</a></div>${notice(d.error || 'The runner did not produce a report.','error')}<button class="button" data-action="rerun">Review settings</button>`;return;}
+  if(!report){$('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>Run could not finish</h1><p>No report was saved. Review the error and settings before trying again.</p></div></div>${notice(d.error || 'The runner did not produce a report.','error')}<div class="actions"><button class="button primary" data-action="rerun">Review settings</button><a class="button" href="#runs">Back to runs</a></div>`;return;}
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline'),counts={};checks.forEach(c=>counts[c.status]=(counts[c.status] || 0)+1);
   const required=checks.filter(c=>c.required);
-  const absolute=checks.some(c=>c.status==='fail')?'fail':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
-  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<h1>${escape(mainFinding(report))}</h1><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div></div><div class="actions"><button class="button" data-action="rerun">${icon('repeat')} Run again</button><button class="button primary" data-action="baseline-dialog">Save baseline</button></div></div>
+  const absolute=checks.some(c=>c.status==='fail')?'fail':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||checks.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
+  const completePass=d.state==='completed'&&!d.error&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||unselectedCheck(c,report));
+  const compareNext=!completePass&&!checks.some(c=>['fail','blocked','inconclusive'].includes(c.status))&&!report.abort_reason&&['fail','inconclusive'].includes(report.baseline?.status);
+  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext?`<button class="button" data-action="rerun">${icon('repeat')} Run again</button>`:''}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
-  <div class="result-summary">${['pass','fail','inconclusive','blocked','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item"><strong>${counts[k]}</strong>${badge(k)}</div>`).join('')}<span style="margin-left:auto" class="hint">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div>
+  <div class="result-summary">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item"><strong>${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span style="margin-left:auto" class="hint">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div>
   <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
   <section id="result-content" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='checks'?renderChecks(report):state.tab==='baseline'?renderComparison(report):renderConfig(report)}</section>
-  <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a></div>`;
+  <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`;
   syncComparisonFilters();
 }
-function keyMetric(check){if(check.status==='skipped')return 'Not selected';const m=check.metrics || {};if(check.id==='cancellation'&&m.cancellation_results)return `Server stopped: ${human(m.cancellation_results.server_stopped.status)} · Answer: ${human(m.cancellation_results.answer.status)}`;if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.status==='skipped')return 'Not selected';return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
+function keyMetric(check,report){if(check.status==='skipped')return report&&unselectedCheck(check,report)?'Not selected':check.summary || 'No result recorded';const m=check.metrics || {};if(check.id==='cancellation'&&m.cancellation_results)return `Server stopped: ${human(m.cancellation_results.server_stopped.status)} · Answer: ${human(m.cancellation_results.answer.status)}`;if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
 function renderChecks(report) {
   const checks=report.checks.filter(c=>c.id!=='baseline').sort((a,b)=>(order[a.status]??5)-(order[b.status]??5));
   if(!checks.length)return notice('This report contains no check results.');
-  let selected=checks.find(c=>`${c.target}:${c.id}`===state.selectedCheck) || checks[0];state.selectedCheck=`${selected.target}:${selected.id}`;
-  return `<div class="result-grid"><div class="panel check-list" aria-label="Suite checks">${checks.map(c=>`<button class="check-item ${c===selected?'selected':''}" data-check="${escape(`${c.target}:${c.id}`)}" aria-pressed="${c===selected}"><span><span class="check-name">${escape(c.title)}</span><small>${escape(keyMetric(c))}${(reportConfig(report).targets || []).length>1?` · ${escape(c.target)}`:''}</small></span>${badge(c.status)}</button>`).join('')}</div><section class="panel check-detail">${renderCheck(selected,report)}</section></div>`;
+  const selected=checks.find(c=>`${c.target}:${c.id}`===state.selectedCheck) || checks.find(c=>c.status!=='skipped');state.selectedCheck=selected?`${selected.target}:${selected.id}`:null;
+  const attention=checks.filter(c=>!['pass','skipped'].includes(c.status)),passed=checks.filter(c=>c.status==='pass'),skipped=checks.filter(c=>c.status==='skipped');
+  const checkButton=c=>`<button class="check-item ${c===selected?'selected':''}" data-check="${escape(`${c.target}:${c.id}`)}" aria-pressed="${c===selected}"><span><span class="check-name">${escape(checkGuide[c.id]?.name || c.title)}</span><small>${escape(keyMetric(c,report))}${(reportConfig(report).targets || []).length>1?` · ${escape(c.target)}`:''}</small></span>${badge(c.status,unselectedCheck(c,report)?'Not selected':undefined)}</button>`;
+  return `<div class="result-grid"><div class="panel check-list" aria-label="Check results">${attention.length?`<h2 class="check-group-heading">Needs attention · ${attention.length}</h2>${attention.map(checkButton).join('')}`:''}${passed.length?`<h2 class="check-group-heading">Passed checks · ${passed.length}</h2>${passed.map(checkButton).join('')}`:''}${skipped.length?`<details class="checks-not-run" ${selected?.status==='skipped'?'open':''}><summary>Not run · ${skipped.length}</summary>${skipped.map(checkButton).join('')}</details>`:''}</div><section class="panel check-detail">${selected?renderCheck(selected,report):'<div class="empty-state"><h2>No checks ran</h2><p>Expand “Not run” to inspect the recorded reasons, or review settings to choose your checks.</p><button class="button" data-action="rerun">Review settings</button></div>'}</section></div>`;
 }
 function metric(label,value,detail=''){return `<div class="metric"><dt>${escape(label)}</dt><dd>${escape(value)}</dd>${detail?`<small>${escape(detail)}</small>`:''}</div>`;}
 function renderCancellationResults(metrics){
@@ -856,9 +1298,9 @@ function renderCheck(check,report) {
     metrics.push(metric('End-to-end output rate · median',m.output_tokens_per_second_p50==null?'Not reported':`${number(m.output_tokens_per_second_p50,1)} tok/s`,current?'Includes waiting for first output; separate from generation pace':'Older report: the output-rate limit used this end-to-end definition'));
   }
   const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k)));
-  return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
+  return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(checkGuide[check.id]?.name || check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
   ${check.id==='cancellation'&&check.status!=='skipped'?renderCancellationResults(m):''}
-  ${check.status==='skipped'?'<div class="empty-state" style="padding:35px 24px"><p>This optional check was not selected for the run. No result is inferred.</p></div>':`<dl class="metrics-grid">${metrics.join('')}</dl>`}
+  ${check.status==='skipped'?`<div class="empty-state" style="padding:35px 24px"><p>${unselectedCheck(check,report)?'This check was not selected. No result is inferred.':'This check was skipped. The recorded reason is shown above; no passing result is inferred.'}</p></div>`:`<dl class="metrics-grid">${metrics.join('')}</dl>`}
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
@@ -905,10 +1347,15 @@ function renderLive() {
   const finished=progress.completed || 0,started=progress.attempted || 0,active=Math.max(0,started-finished),secs=progress.elapsed_seconds || 0,stopping=d.state==='stopping';
   const judging=progress.phase==='judging'||String(progress.event || '').startsWith('judging_');
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
-  const title=judging?'Evaluating golden answers':'Suite in progress';
-  const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Measuring the configured endpoint. Results are assessed when the suite finishes.';
+  const title=judging?'Evaluating golden answers':d.state==='queued'?'Preparing your check':'Checking your endpoint';
+  const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Measuring the configured endpoint. The final report will explain which checks passed and what needs attention.';
   const bounds=judging?[['Evaluator requests at a time',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Maximum in flight',c.concurrency],['Total request limit',c.max_requests],['Maximum duration',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
-  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping the suite':title}</h1><p>${stopping?'Stopping further work and saving partial evidence.':description}</p></div><button class="button danger" data-action="stop" ${stopping?'disabled':''}>${icon('stop')}${stopping?'Stopping…':'Stop run'}</button></div><div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(human(progress.scenario || progress.event || 'Preparing fixtures'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p><dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl><div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/(c.max_requests || 1)*100)}%"></span></div><div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`Request budget used · ${number(started)} of ${number(c.max_requests)}`}</span><span>${judging?'Inference timing is unchanged':'Budget ceiling, not completion'}</span></div></section><section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Recent activity</h2><span class="hint">Refreshes automatically</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.scenario || e.event || 'Progress'))}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Waiting for the first runner event…</p>'}</div></section></div><aside class="panel run-preview"><h3>${judging?'Evaluation bounds':'Run bounds'}</h3><p>${judging?'Separate limits apply to the configured judges.':'The current suite shares these ceilings across all targets.'}</p><dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Some interruptions are deliberate suite probes.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
+  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p></div><button class="button danger" data-action="stop" ${stopping?'disabled':''}>${icon('stop')}${stopping?'Stopping…':'Stop run'}</button></div>
+  <div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(human(progress.scenario || progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
+  <dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Requests finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl>
+  <div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/(c.max_requests || 1)*100)}%"></span></div><div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`Requests started · ${number(started)} / ${number(c.max_requests)} limit`}</span><span>${judging?'Inference timing is unchanged':'Request ceiling, not completion'}</span></div></section>
+  <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Recent activity</h2><span class="hint">Updates automatically</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.scenario || e.event || 'Progress'))}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
+  <aside class="panel run-preview"><h3>${judging?'Evaluation limits':'This run’s limits'}</h3><p>${judging?'Separate limits apply to the configured judges.':'These limits apply across all selected checks and endpoints.'}</p><dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
 }
 function renderJudgement(judgement) {
   if(!judgement)return '';
@@ -939,7 +1386,7 @@ function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
 async function saveBaseline(event){event.preventDefault();const form=event.target,data=new FormData(form),button=$('#save-baseline'),error=$('#baseline-error');button.disabled=true;error.hidden=true;try{await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:state.detail.id,name:String(data.get('baseline_name')).trim(),replace:data.has('replace')})});const result=await api('/api/baselines');state.baselines=result.baselines || [];$('#baseline-dialog').close();toast('Baseline saved. Select it when configuring your next run.');}catch(e){error.textContent=e.message;error.hidden=false;if(e.status===409)$('#replace-row').hidden=false;}finally{button.disabled=false;}}
 async function stopRun(){const button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion;button.disabled=true;button.textContent='Stopping…';try{const result=await api(`${runPath(id)}/cancel`,{method:'POST',body:'{}'});if(version!==state.routeVersion||state.detail?.id!==id)return;state.detail.state=result.state || 'stopping';renderDetail();schedulePoll(pollDetail,version,500);}catch(error){if(version!==state.routeVersion||state.detail?.id!==id)return;const el=$('#live-error');if(el){el.textContent=error.message;el.hidden=false;}button.disabled=false;button.textContent='Stop run';}}
-function rerun(){const source=state.detail.report?.manifest?.config || state.detail.config;if(!source){toast('No configuration was saved for this run.');return;}state.config=clone(source);state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';}
+function rerun(){const source=state.detail.report?.manifest?.config || state.detail.config;if(!source){toast('No configuration was saved for this run.');return;}state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';}
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
 function assertAppliedConfig() {if(hasJsonChanges())throw new Error('Apply or discard the JSON changes first.');}
@@ -960,13 +1407,23 @@ function syncConfigView() {
   $('#config-panel-form').classList.toggle('config-locked',dirty);
   $('#config-draft-notice').hidden=!dirty;
   $('#json-status').textContent=dirty?'Unapplied changes':'In sync with the form';
+  syncSetupStep();renderModelDiscovery();
 }
 function switchConfigView(view) {
   if(view===state.configView)return;
   if(view==='json'&&!hasJsonChanges()){
     captureFormDraft();state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;
   }
-  state.configView=view;syncConfigView();$(`#config-tab-${view}`).focus();
+  state.configView=view;if(view==='json'&&$('.configuration-tools'))$('.configuration-tools').open=true;syncConfigView();
+  if(view==='json'){
+    $('#config-panel-json').scrollIntoView?.({block:'start'});$('#config-editor').focus({preventScroll:true});
+  }else{
+    const dirty=hasJsonChanges(),panel=dirty?$('#config-draft-notice'):$(`[data-setup-panel="${state.setupStep}"]`) || $('#config-panel-form');
+    panel.scrollIntoView?.({block:'start'});
+    const heading=!dirty?$(`[data-setup-panel="${state.setupStep}"] h2`):null;
+    if(heading){heading.setAttribute('tabindex','-1');heading.focus({preventScroll:true});}
+    else $(`#config-tab-${view}`).focus({preventScroll:true});
+  }
 }
 function configError(error) {const el=$('#config-error');if(el){el.textContent=error?.message || '';el.hidden=!error;}}
 function discardConfig() {
@@ -983,7 +1440,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(parsed)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     captureFormDraft();
-    state.config=result.config;state.datasetSelection=[];
+    state.config=result.config;state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
     state.config.restart_target=null;
@@ -1007,7 +1464,7 @@ async function validatedSnapshot({draft=false}={}) {
     const missing=payload.config.targets.findIndex(target=>!target.model);
     if(missing!==-1){
       switchConfigView(missing===0?'form':'json');
-      if(missing===0)$('#new-run-form').elements.model.focus();else $('#config-editor').focus();
+      if(missing===0){revealSetupStep(1);$('#new-run-form').elements.model.focus();}else $('#config-editor').focus();
       throw new Error(`Enter a model for target "${payload.config.targets[missing].name}" before running or copying a CLI command. You can still apply or export this draft.`);
     }
   }
@@ -1036,10 +1493,18 @@ async function copyCli() {
 
 document.addEventListener('click',async(event)=>{
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
+  const setupStep=event.target.closest('[data-setup-step]');if(setupStep){navigateSetup(Number(setupStep.dataset.setupStep));return;}
   const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;renderDetail();$(`#tab-${state.tab}`).focus();return;}
   const check=event.target.closest('[data-check]');if(check){state.selectedCheck=check.dataset.check;const selectedKey=state.selectedCheck;$('#result-content').innerHTML=renderChecks(state.detail.report);[...document.querySelectorAll('[data-check]')].find(e=>e.dataset.check===selectedKey)?.focus();return;}
   const request=event.target.closest('[data-request]');if(request){openRequest(request.dataset.request);return;}
   const action=event.target.closest('[data-action]')?.dataset.action;
+  if(action==='catalogue-category'){state.catalogueCategory=event.target.closest('[data-category]').dataset.category;syncTestControls();return;}
+  if(action==='catalogue-filter'){state.catalogueFilter=event.target.closest('[data-catalogue-filter]').dataset.catalogueFilter;syncTestControls();return;}
+  if(action==='reset-profile'){try{assertAppliedConfig();const key=event.target.closest('[data-profile]').dataset.profile;captureFormDraft();state.config[key]=null;configChanged();renderNew('custom');$(`[data-profile="${key}"]`)?.focus();}catch(error){configError(error);}return;}
+  if(action==='quick-checks'){try{assertAppliedConfig();captureFormDraft();state.config.checks=['access','correctness'];state.config.structured_json=false;state.config.metrics=false;state.config.tool_calling=false;state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;configChanged();renderNew('custom');$('[data-catalogue-filter="selected"]')?.focus();}catch(error){configError(error);}return;}
+  if(action==='setup-next'){navigateSetup(state.setupStep+1);return;}
+  if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
+  if(action==='test-connection'){await testConnection();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
   if(configure){toggleTestEditor(configure);return;}
   const done=event.target.closest('[data-done-test]')?.dataset.doneTest;
@@ -1064,17 +1529,20 @@ document.addEventListener('click',async(event)=>{
     return;
   }
   if(action==='edit-output-cap'){
-    try{assertAppliedConfig();$('#advanced-run-limits').open=true;$('#new-run-form').elements.max_output_tokens.focus();}catch(error){configError(error);}
+    try{assertAppliedConfig();revealSetupStep(2);$('#shared-settings').open=true;$('#shared-run-limits').open=true;$('#new-run-form').elements.max_output_tokens.focus();}catch(error){configError(error);}
+    return;
+  }
+  if(action==='edit-run-limits'){
+    try{assertAppliedConfig();captureFormDraft();revealSetupStep(2);updateBounds();$('#shared-settings').open=true;$('#new-run-form').elements.max_requests.focus();}catch(error){configError(error);}
     return;
   }
   if(action==='edit-load'){
     try{
-      assertAppliedConfig();
-      if(['concurrent','arrival'].includes(state.setupPreset)){
-        $('#primary-load')?.scrollIntoView({block:'start'});$(`[name="${state.setupPreset==='concurrent'?'buckets_levels':'traffic_rates'}"]`)?.focus();
-      }else{$('#test-catalogue').open=true;$('#test-catalogue').scrollIntoView({block:'start'});$('#add-tests')?.focus();}
-    }catch(error){configError(error);}
-    return;
+      assertAppliedConfig();revealSetupStep(2);
+      const checks=readForm(true).config.checks,id=checks.includes('capacity')?'capacity':checks.includes('buckets')?'buckets':null;
+      if(id){revealCatalogueCheck(id);$(`[data-test-card="${id}"]`)?.scrollIntoView({block:'start'});$(`[data-configure-test="${id}"]`)?.focus();}
+      else{state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;const search=$('#check-search');if(search)search.value='';syncTestControls();$('[data-catalogue-filter="selected"]')?.focus();}
+    }catch(error){configError(error);}return;
   }
   if(action==='toggle-available-tests'){state.showAvailableTests=!state.showAvailableTests;syncTestControls();return;}
   if(action==='select-tests'||action==='clear-tests'){configChanged();for(const input of $$('#new-run-form input[name="check"]'))input.checked=action==='select-tests';captureFormDraft();renderNew('custom');return;}
@@ -1106,19 +1574,25 @@ document.addEventListener('click',async(event)=>{
   if(action==='add-judge')changeJudge('add');
   if(action==='remove-judge')changeJudge('remove',Number(event.target.closest('[data-judge-index]').dataset.judgeIndex));
   if(action==='preview-pack'){try{await refreshRequestPreview();}catch(error){configError(error);}}
-  if(action==='select-pack-tests'){state.showAvailableTests=true;$('#test-catalogue').open=true;syncTestControls();$('#test-selection').scrollIntoView({block:'start'});$('#test-selection input[value="correctness"]').focus();}
+  if(action==='select-pack-tests'){revealSetupStep(2);revealCatalogueCheck('correctness');$('[data-test-card="correctness"]')?.scrollIntoView({block:'start'});$('#test-selection input[value="correctness"]').focus();}
   if(action==='export-config')await exportConfig();
   if(action==='copy-cli')await copyCli();
 });
 document.addEventListener('submit',event=>{if(event.target.id==='new-run-form')startRun(event);if(event.target.id==='baseline-form')saveBaseline(event);if(event.target.id==='dataset-example-form')saveExample(event);if(event.target.id==='dataset-import-form')useImportedDataset(event);if(event.target.id==='dataset-try-form')tryDatasetExample(event);});
 document.addEventListener('input',event=>{
+  if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
+  if(['url','model','name'].includes(event.target.name))event.target.setCustomValidity?.('');
+  if(['url','api_key_env'].includes(event.target.name)&&state.autoModel&&$('#new-run-form').elements.model.value===state.autoModel){$('#new-run-form').elements.model.value='';state.autoModel=null;}
+  if(event.target.name==='model')state.autoModel=null;
+  if(['url','model','api_key_env'].includes(event.target.name))invalidateModelDiscovery();
   if(event.target.id==='config-editor')state.jsonDraft=event.target.value;
   configChanged();$('#cli-fallback').hidden=true;
   if(event.target.id==='config-editor'){syncConfigView();return;}
-  if(event.target.closest('[data-test-settings]')||event.target.closest('[data-traffic-settings]'))editTestField(event.target);
+  if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);
+  else if(event.target.closest('[data-test-settings]')||event.target.closest('[data-traffic-settings]'))editTestField(event.target);
   if(['traffic_rates','traffic_duration_seconds'].includes(event.target.name))$('#new-run-form').elements.traffic_mode.value='custom';
-  if(numericFields.some(([name])=>name===event.target.name)||event.target.name.startsWith('limit_'))for(const check of state.bootstrap.checks)refreshInheritedFields(check.id,true);
+  if(numericFields.some(([name])=>name===event.target.name)||event.target.name==='samples'||event.target.name.startsWith('limit_'))for(const check of state.bootstrap.checks)refreshInheritedFields(check.id,true);
   updateBounds();
 });
 document.addEventListener('change',event=>{
@@ -1129,12 +1603,19 @@ document.addEventListener('change',event=>{
     for(const input of $$('[data-dataset-select]'))input.checked=state.datasetSelection.includes(input.dataset.datasetSelect);
     const section=$('.answer-checks');if(section){captureFormDraft();section.outerHTML=renderAnswerChecks(state.config);}return;
   }
-  if(event.target.name==='setup_goal'){changeSetupPreset(event.target.value==='load'?'concurrent':event.target.value);return;}
-  if(event.target.name==='setup_load'){changeSetupPreset(event.target.value,{focusLoad:true});return;}
+  if(event.target.id==='connection-model-choice'){
+    const input=$('#new-run-form').elements.model,value=event.target.value;
+    input.value=value==='__manual__'?'':value;input.setCustomValidity('');state.autoModel=value==='__manual__'?null:value;
+    // Keep the discovered choices while invalidating any earlier verification.
+    const models=state.modelDiscovery?.models || [];
+    state.modelDiscoverySequence++;state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:'needs_model',models,message:'Model selected. Test the connection, or continue to choose checks.'};
+    renderModelDiscovery();if(value==='__manual__'){$('#manual-model-field').hidden=false;input.focus();}
+    configChanged();updateBounds();return;
+  }
   if(event.target.id==='dataset-bulk-scorer')return;
   if(event.target.name==='example_scorer'){syncExampleScorer();return;}
   if(event.target.closest('#dataset-import-form')){const draft=state.datasetImport;if(draft){draft.mapping=importMappingValues();draft.sequence++;draft.loading=false;draft.mappingDirty=true;renderDatasetImport();}return;}
-  if(event.target.id==='request-pack-file'){const file=event.target.files[0];event.target.value='';importRequestPack(file);return;}if(event.target.name==='request_source'){changeRequestSource(event.target.value);return;}if(event.target.id==='config-file'){const file=event.target.files[0];event.target.value='';importConfig(file);return;}if(event.target.closest('#new-run-form')){configChanged();scheduleRequestPlan();}if(event.target.closest('[data-test-editor]')&&event.target.tagName==='SELECT'){editTestField(event.target);updateBounds();}if(event.target.name==='check'){const id=event.target.value;captureFormDraft();renderNew('custom');$('#test-catalogue').open=true;$(`[name="check"][value="${id}"]`)?.focus();return;}if(['comparison-outcome','comparison-check'].includes(event.target.id)){const id=event.target.id;if(id==='comparison-outcome')state.comparisonFilter=event.target.value;else state.comparisonCheck=event.target.value;$('#result-content').innerHTML=renderComparison(state.detail.report);syncComparisonFilters();$('#'+id).focus();}if(event.target.id==='run-filter'){state.filter=event.target.value;renderRuns();$('#run-filter').focus();}if(['mode','restart_target'].includes(event.target.name)){updateRestart();if(state.configView==='json'&&!hasJsonChanges()){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}}if(event.target.name==='replace')$('#save-baseline').textContent=event.target.checked?'Replace baseline':'Save baseline';});
+  if(event.target.id==='request-pack-file'){const file=event.target.files[0];event.target.value='';importRequestPack(file);return;}if(event.target.name==='request_source'){changeRequestSource(event.target.value);return;}if(event.target.id==='config-file'){const file=event.target.files[0];event.target.value='';importConfig(file);return;}if(event.target.closest('#new-run-form')){configChanged();scheduleRequestPlan();}if(event.target.closest('[data-test-editor]')&&event.target.tagName==='SELECT'){if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);else editTestField(event.target);updateBounds();}if(event.target.name==='check'){const id=event.target.value;captureFormDraft();renderNew('custom');const control=$(`[name="check"][value="${id}"]`);if(control?.closest('[data-test-card]')?.hidden)$('[data-catalogue-filter="all"]')?.focus();else control?.focus();return;}if(['comparison-outcome','comparison-check'].includes(event.target.id)){const id=event.target.id;if(id==='comparison-outcome')state.comparisonFilter=event.target.value;else state.comparisonCheck=event.target.value;$('#result-content').innerHTML=renderComparison(state.detail.report);syncComparisonFilters();$('#'+id).focus();}if(event.target.id==='run-filter'){state.filter=event.target.value;renderRuns();$('#run-filter').focus();}if(['mode','restart_target'].includes(event.target.name)){updateRestart();if(state.configView==='json'&&!hasJsonChanges()){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}}if(event.target.name==='replace')$('#save-baseline').textContent=event.target.checked?'Replace baseline':'Save baseline';});
 document.addEventListener('keydown',event=>{const configTab=event.target.closest('[data-config-tab]');if(configTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();switchConfigView(event.key==='Home'?'form':event.key==='End'?'json':state.configView==='form'?'json':'form');return;}const tab=event.target.closest('[data-tab]');if(tab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();const tabs=['checks','baseline','config'];let i=tabs.indexOf(state.tab);i=event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3;state.tab=tabs[i];renderDetail();$(`#tab-${state.tab}`).focus();}});
 document.addEventListener('toggle',event=>{
   if(event.target.matches('.judge-configuration'))state.judgeEditorOpen=event.target.open;

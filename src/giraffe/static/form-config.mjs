@@ -90,7 +90,7 @@ export function configureSetupLoad(source, preset, {allowInvalid=false}={}) {
 
 export function configureBuckets(source, values, defaults, {allowInvalid=false}={}) {
   const config = structuredClone(source);
-  const fields = ['levels','samples_per_bucket','window_seconds',
+  const fields = ['levels','samples_per_bucket','window_seconds','mixed_pairs','heavy_long_input','heavy_long_output',
     ...['input','output'].flatMap(kind => ['short','medium','long'].map(size => `${kind}_${size}`))];
   if (!fields.some(name => values.has(`buckets_${name}`))) return config;
   const settings = structuredClone(source.buckets || defaults);
@@ -101,7 +101,7 @@ export function configureBuckets(source, values, defaults, {allowInvalid=false}=
       throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
     }
   }
-  for (const name of ['samples_per_bucket','window_seconds']) {
+  for (const name of ['samples_per_bucket','window_seconds','mixed_pairs']) {
     if (values.has(`buckets_${name}`)) settings[name] = numeric(values.get(`buckets_${name}`), name, allowInvalid);
   }
   for (const [kind, group] of [['input','input_chars'],['output','output_tokens']]) {
@@ -117,9 +117,15 @@ export function configureBuckets(source, values, defaults, {allowInvalid=false}=
       settings[group][size] = value;
     }
   }
+  for (const name of ['long_input','long_output']) {
+    if (values.has(`buckets_heavy_${name}`)) {
+      settings.heavy_weights ||= structuredClone(defaults.heavy_weights);
+      settings.heavy_weights[name] = numeric(values.get(`buckets_heavy_${name}`), `${name} weight`, allowInvalid);
+    }
+  }
   if (!allowInvalid && config.checks.some(id => ['buckets','mixed'].includes(id)) &&
       Object.values(settings.output_tokens).some(cap => cap > config.max_output_tokens)) {
-    throw new Error(`Each answer cap must be ${config.max_output_tokens} tokens or less. Lower the answer cap or edit the run output cap under Context, output & request deadlines.`);
+    throw new Error(`Each answer cap must be ${config.max_output_tokens} tokens or less. Lower the answer cap or edit Maximum answer length under Shared run settings → Request defaults.`);
   }
   if (source.buckets || config.checks.some(id => ['buckets','mixed'].includes(id)) ||
       !sameConfig(settings, defaults)) config.buckets = settings;
@@ -137,7 +143,7 @@ export function bucketCoveragePlan(config) {
   return {levels, peak:Math.max(...levels), perTarget, total:perTarget * config.targets.length};
 }
 
-export function configureTests(source, values, checks, trafficDefaults, {allowEmpty=false, allowInvalid=false}={}) {
+export function configureTests(source, values, checks, trafficDefaults, {allowEmpty=false, allowInvalid=false, percentageInputs=false}={}) {
   const config = structuredClone(source);
   config.checks = values.getAll('check');
   if (!config.checks.length && !allowEmpty) throw new Error('Select at least one test before running.');
@@ -166,7 +172,8 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
     }
     const limits = {};
     for (const name of check.limit_fields) {
-      const value = numeric(values.get(`test_${check.id}_limit_${name}`), name, allowInvalid);
+      let value = numeric(values.get(`test_${check.id}_limit_${name}`), name, allowInvalid);
+      if (percentageInputs && ['min_correctness','max_error_rate'].includes(name) && typeof value === 'number') value /= 100;
       const inherited = Object.hasOwn(config.limits || {}, name) ?
         config.limits[name] : check.defaults.limits[name];
       if (value !== inherited || Object.hasOwn(previous.limits || {}, name)) limits[name] = value;
@@ -266,4 +273,47 @@ export function convertExpectedAnswer(value, from, to) {
   catch { throw new Error('Fix the JSON reference before changing the answer check.'); }
   if (typeof parsed !== 'string') throw new Error('Use a JSON string reference before switching to a text answer check.');
   return parsed;
+}
+
+export function effectiveProfileDefaults(config, defaults, key) {
+  const profile = structuredClone(defaults[key] || {});
+  if (key === 'sessions') {
+    profile.concurrency = Math.min(profile.concurrency, config.concurrency);
+    profile.max_tokens = Math.min(profile.max_tokens, config.max_output_tokens);
+  }
+  if (key === 'consistency') profile.levels = (profile.levels || []).filter(level => level <= config.concurrency);
+  return profile;
+}
+
+// Catalog profile forms patch only fields the operator edited. Viewing a null
+// profile or filtering a check must not materialize defaults or erase JSON data.
+export function configureProfiles(source, values, defaults, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  const arrayFields = new Set(['modes', 'shapes', 'levels']);
+  const textFields = new Set(['mode', 'equality']);
+  for (const key of ['arrivals', 'prefix', 'sessions', 'consistency', 'tools']) {
+    const edits = JSON.parse(values.get(`profile_edits_${key}`) || '[]');
+    if (!edits.length) continue;
+    if (key === 'tools') {
+      if (edits.includes('forced_tool_diagnostic')) {
+        config.forced_tool_diagnostic = values.get('profile_tools_forced_tool_diagnostic') === 'true';
+      }
+      continue;
+    }
+    const profile = structuredClone(config[key] || effectiveProfileDefaults(config, defaults, key));
+    for (const name of edits) {
+      if (!Object.hasOwn(defaults[key], name)) continue;
+      const raw = values.get(`profile_${key}_${name}`);
+      if (arrayFields.has(name)) {
+        profile[name] = String(raw || '').split(',').map(value => value.trim()).filter(Boolean);
+        if (name === 'levels') profile[name] = profile[name].map(value => numeric(value, 'Concurrency levels', allowInvalid));
+      } else if (name === 'turns' || name === 'saved_answers') {
+        profile[name] = String(raw || '').split('\n');
+      } else if (name === 'strict') profile[name] = raw === 'true';
+      else if (textFields.has(name)) profile[name] = String(raw || '');
+      else profile[name] = numeric(raw, name, allowInvalid);
+    }
+    config[key] = profile;
+  }
+  return config;
 }

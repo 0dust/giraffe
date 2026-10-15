@@ -34,22 +34,17 @@ await vm.runInNewContext(source+`
 (async()=>{{
 state.bootstrap=bootstrap;state.bootstrap.config=config;state.config=config;state.setupPreset='concurrent';state.jsonDraft=state.jsonBase='synced';
 const before=JSON.stringify(config);
-const goals=renderSetupGoal('concurrent');
-for(const label of ['Check answers','Test under load','Choose individual tests','Requests at once','Requests per second'])assert(goals.includes(label));
-let markup=renderSetupLoad(config,'concurrent');
-assert.match(markup,/Requests at a time/);assert.match(markup,/Giraffe-generated requests/);
+const bucket=state.bootstrap.checks.find(check=>check.id==='buckets');
+let markup=renderTestCard(bucket,config);
+assert.match(markup,/Requests at a time/);
 for(const size of ['short','medium','long']){{
   assert(markup.includes('name="buckets_input_'+size+'"'));
   assert(markup.includes('name="buckets_output_'+size+'"'));
 }}
-assert.doesNotMatch(markup,/Edit sizes in JSON/);assert.equal(JSON.stringify(config),before);
-const bucket=state.bootstrap.checks.find(check=>check.id==='buckets');
-const concurrent=markup+renderTestCard(bucket,config);
-for(const name of ['buckets_levels','buckets_input_short','buckets_output_long'])assert.equal((concurrent.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
-state.setupPreset='arrival';
-const rate=renderSetupLoad(config,'arrival')+renderTestCard(state.bootstrap.checks.find(check=>check.id==='capacity'),config);
+assert.equal(JSON.stringify(config),before);
+for(const name of ['buckets_levels','buckets_input_short','buckets_output_long'])assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
+const rate=renderTestCard(state.bootstrap.checks.find(check=>check.id==='capacity'),config);
 for(const name of ['traffic_rates','traffic_duration_seconds'])assert.equal((rate.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
-assert(rate.includes('Requests per second'));
 state.setupPreset='concurrent';
 config.buckets.output_tokens.long=config.max_output_tokens+1;
 assert.match(renderLoadGuidance(config),/answer cap.*run.*cap/i);
@@ -59,14 +54,14 @@ const plan={{count_kind:'exact',planned_per_target:164,planned_total:164,known_p
 config.max_requests=20;
 state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan,config}};
 renderRequestPlan();
-assert.match(nodes['#request-plan'].innerHTML,/164 target requests/);
+assert.match(nodes['#request-plan'].innerHTML,/164 requests/);
 assert.match(nodes['#request-plan'].innerHTML,/12 evaluator calls/);
 assert.match(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"/);
-assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning" open>/);
+assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning">/);
 assert.match(nodes['#request-plan'].innerHTML,/96 characters sent/);assert.match(nodes['#request-plan'].innerHTML,/64 configured, plus instructions/);
 assert.match(nodes['#request-plan'].innerHTML,/Connection check/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
 configChanged();assert.match(nodes['#request-plan'].innerHTML,/stale/i);
-assert.doesNotMatch(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"|164 target requests/);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"|164 requests/);
 let current=structuredClone(config),resolve;
 readForm=()=>({{config:structuredClone(current)}});
 api=()=>new Promise(done=>resolve=done);
@@ -79,7 +74,7 @@ assert.equal(state.requestPreview.plan.request_limit,200);
 api=async()=>{{throw Error('temporary planning failure');}};
 await assert.rejects(refreshRequestPreview(undefined,{{draft:true}}),/temporary planning failure/);
 assert.match(nodes['#request-plan'].innerHTML,/Retry request plan/);
-assert.doesNotMatch(nodes['#request-plan'].innerHTML,/200 target requests planned/);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/200 requests planned/);
 api=async(path,options)=>({{config:JSON.parse(options.body),request_plan:{{...plan,request_limit:200}}}});
 await listeners.click({{target:{{closest(q){{return q==='[data-action]'?{{dataset:{{action:'preview-pack'}}}}:null;}}}}}});
 assert.equal(state.requestPreview.status,'current');
@@ -89,7 +84,7 @@ const syncView=syncConfigView;syncConfigView=()=>{{}};
 listeners.input({{target:{{id:'config-editor',value:'dirty',matches(){{return false;}},closest(){{return {{}};}}}}}});
 syncConfigView=syncView;
 assert.match(nodes['#request-plan'].innerHTML,/Apply or discard JSON changes/);
-assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 target requests|data-action="use-request-budget"/);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 requests|data-action="use-request-budget"/);
 // Debounced live planning never sends inference, and a replaced timer cannot plan an old form.
 state.jsonDraft=state.jsonBase;nodes['#new-run-form']={{}};
 const paths=[];api=async(path,options)=>{{paths.push(path);return {{config:JSON.parse(options.body),request_plan:plan}};}};
@@ -118,7 +113,7 @@ assert.equal(planningInput.restart_target,'local');assert.equal(current.restart_
 api=()=>new Promise(done=>resolve=done);
 const navigationPreview=refreshRequestPreview(undefined,{{draft:true}});
 state.routeVersion++;state.requestPreview=null;renderRequestPlan();
-assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 target requests|data-action="use-request-budget"/);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 requests|data-action="use-request-budget"/);
 resolve({{config:current,request_plan:plan}});
 await assert.rejects(navigationPreview,/changed during preview/);
 assert.equal(state.requestPreview,null);
@@ -194,7 +189,12 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   const before=JSON.stringify(state.config);renderNew(preset);
   assert.equal(JSON.stringify(state.config),before); // Merely opening never changes selection.
   const markup=nodes['#main'].innerHTML;
-  assert(markup.indexOf('id="setup-goal"')<markup.indexOf('id="setup-deployment"'));
+  assert.doesNotMatch(markup,/setup-side-summary|setup-planned-traffic|review-baseline/);
+  const options=markup.slice(markup.indexOf('id="execution-settings"'),markup.indexOf('</details>',markup.indexOf('id="execution-settings"')));
+  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare with a previous run'));
+  assert(markup.indexOf('id="run-bounds"')<markup.indexOf('id="request-plan"'));
+  for(const name of ['mode','restart_target','baseline_id','name'])assert(controls.some(input=>input.name===name));
+  assert(markup.indexOf('id="setup-deployment"')<markup.indexOf('id="test-selection"'));assert(!markup.includes('name="setup_goal"'));
   for(const name of new Set(controls.map(input=>input.name))){{
     if(['check','setup_goal','setup_load','request_source'].includes(name))continue;
     assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
@@ -202,19 +202,19 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   assert.equal(controls.filter(input=>input.name==='check').length,19);
   for(const name of ['max_requests','max_duration_seconds'])assert(controls.some(input=>input.name===name));
   if(preset==='concurrent'){{
-    assert(!markup.includes('name="request_source"'));assert(markup.includes('Giraffe-generated requests'));
-    assert.equal(form.elements.concurrency.type,'hidden');
+    assert(!markup.includes('name="request_source"'));
+    assert.equal(form.elements.concurrency.type,'number');
     for(const size of ['short','medium','long'])assert(form.elements['buckets_input_'+size]&&form.elements['buckets_output_'+size]);
     form.elements.buckets_levels.value='1, 4, 8';
     for(const [index,size] of ['short','medium','long'].entries()){{form.elements['buckets_input_'+size].value=String(80+index*80);form.elements['buckets_output_'+size].value=String(8+index*8);}}
   }}
   if(preset==='arrival'){{
-    const primary=markup.slice(markup.indexOf('id="primary-load"'),markup.indexOf('id="test-catalogue"'));
+    const primary=markup.slice(markup.indexOf('data-test-card="capacity"'),markup.indexOf('data-test-card="buckets"'));
     assert(primary.includes('name="traffic_rates"'));assert(primary.includes('name="test_capacity_limit_latency_ms"'));
     assert(!primary.includes('name="limit_latency_ms"'));
     assert.equal(form.elements.test_capacity_limit_latency_ms.value,String(config.test_options.capacity.limits.latency_ms ?? ''));
     assert.equal(form.elements.limit_latency_ms.value,'2000');
-    assert(primary.includes('without setting a limit'));
+    assert(primary.includes('Pass criteria'));
   }}
   const result=readForm(true).config;
   assert.equal(JSON.stringify(result.request_pack),savedPack);
@@ -222,13 +222,13 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   assert.equal(JSON.stringify(result.test_options),savedOptions);
   assert.equal(result.max_requests,config.max_requests);
   if(preset==='concurrent'){{
-    assert.equal(result.concurrency,8);
+    assert.equal(result.concurrency,state.config.concurrency);
     for(const [index,size] of ['short','medium','long'].entries()){{assert.equal(result.buckets.input_chars[size],80+index*80);assert.equal(result.buckets.output_tokens[size],8+index*8);}}
     assert.equal(result.max_output_tokens,config.max_output_tokens);
   }}
 }}
 // Explicit goal changes use the form's latest draft rather than a stale applied config.
-form.elements.model.value='latest-model';changeSetupPreset('answers');
+form.elements.model.value='latest-model';await listeners.click({{target:{{closest:q=>q==='[data-action]'?{{dataset:{{action:'quick-checks'}}}}:null}}}});
 assert.equal(state.config.targets[0].model,'latest-model');
 assert.equal(state.config.checks.join(','),'access,correctness');
 assert.equal(JSON.stringify(state.config.request_pack),savedPack);
@@ -244,10 +244,13 @@ state.config=applySetupPreset(config,'arrival',state.bootstrap.buckets.defaults)
 for(const id of ['selection-summary','load-guidance','run-bounds'])nodes['#'+id]={{innerHTML:'',insertAdjacentHTML(position,html){{this.innerHTML+=html;}}}};
 for(const check of state.bootstrap.checks)nodes['[data-test-card="'+check.id+'"]']={{querySelector:()=>({{}})}};
 renderBounds();
-assert.match(nodes['#run-bounds'].innerHTML,/Time targets under load/);
-assert(nodes['#run-bounds'].innerHTML.includes('First output within 300 ms'));
-assert(!nodes['#run-bounds'].innerHTML.includes('Complete answer within 2,000 ms'));
-assert.equal(nodes['#run-bounds'].innerHTML.includes('Complete answer within 700 ms'),config.test_options.capacity.limits.latency_ms===700);
+const reviewCriteria=renderReviewPassCriteria(readForm(true).config);
+assert.match(reviewCriteria,/Pass criteria/);
+assert(reviewCriteria.includes('First output within 300 ms'));
+assert(!reviewCriteria.includes('Complete answer within 2,000 ms'));
+assert.equal(reviewCriteria.includes('Complete answer within 700 ms'),config.test_options.capacity.limits.latency_ms===700);
+assert.match(nodes['#run-bounds'].innerHTML,/review-endpoints/);
+assert.doesNotMatch(nodes['#run-bounds'].innerHTML,/Time targets under load/);
 const primary=form.elements.test_capacity_limit_latency_ms;
 primary.matches=()=>false;
 primary.closest=q=>q==='#new-run-form'?form:q==='[data-test-settings]'?{{dataset:{{testSettings:'capacity'}}}}:null;
@@ -288,6 +291,7 @@ for(const check of ['correctness','capacity']){{
 state.config=applySetupPreset(editable,'concurrent',state.bootstrap.buckets.defaults);renderNew('concurrent');
 nodes['#form-error']={{hidden:true}};nodes['#start-run']={{}};nodes['#new-active-notice']={{hidden:true}};
 validateRunForm=()=>true;setActive=()=>{{}};refreshRequestPreview=async()=>{{}};
+state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan:{{}}}};
 let runPayload;api=async(path,options)=>{{const body=JSON.parse(options.body);if(path==='/api/runs'){{runPayload=body;return {{id:'synthetic-run'}};}}return {{config:body}};}};
 await startRun({{preventDefault(){{}},target:form}});
 assert.equal(runPayload.config.request_source,'builtin');
@@ -319,8 +323,8 @@ def test_field_help_preserves_labels_and_escapes_details():
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {{optionValue,limitValue,sameConfig}} from {json.dumps((static / 'form-config.mjs').as_uri())};
-const context={{structuredClone,optionValue,limitValue,sameConfig,
+import {{optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults}} from {json.dumps((static / 'form-config.mjs').as_uri())};
+const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,
   document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\\n/,'').replace(/\\ninit\\(\\);\\s*$/,'');
@@ -345,7 +349,7 @@ vm.runInNewContext('state.bootstrap=bootstrap;state.bootstrap.config=config;',co
 for(const check of context.bootstrap.checks) {{
   context.check=check;
   const markup=vm.runInNewContext('renderTestCard(check,config)',context);
-  assert.match(markup,/class="field-info"/);
+  assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
   for(const name of check.option_fields) {{
     assert(markup.includes(`name="test_${{check.id}}_${{name}}"`));
     assert(markup.includes(`popovertarget="field-test_${{check.id}}_${{name}}-help"`));
@@ -373,7 +377,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import {{configureBuckets, bucketCoveragePlan, sameConfig}} from {json.dumps((static / 'form-config.mjs').as_uri())};
 const defaults={json.dumps(Buckets().model_dump())};
-const source={{checks:['buckets'],concurrency:8,max_requests:20,targets:[{{name:'a'}},{{name:'b'}}],buckets:null}};
+const source={{checks:['buckets'],concurrency:8,max_requests:20,limits:{{min_samples:5}},targets:[{{name:'a'}},{{name:'b'}}],buckets:null}};
 const values=new FormData();
 values.set('buckets_levels','1, 4 8');
 values.set('buckets_samples_per_bucket','4');
@@ -411,12 +415,12 @@ const context={{structuredClone,sameConfig,bucketCoveragePlan,
   document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
 vm.runInNewContext(app+`\nstate.bootstrap=${{JSON.stringify(bootstrap)}};`,context);
 const html=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='buckets'),
-  {{checks:['buckets'],concurrency:8,max_output_tokens:128,buckets:null,test_options:{{}}}})`,context);
+  {{checks:['buckets'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},buckets:null,test_options:{{}}}})`,context);
 assert.match(html,/name="buckets_levels"/);
 assert.match(html,/name="buckets_samples_per_bucket"/);
 assert.match(html,/Requests at a time/);
 assert.doesNotMatch(html,/Customize <code>buckets<\\/code> in the JSON/);
-context.draft={{checks:['buckets'],concurrency:8,max_output_tokens:128,
+context.draft={{checks:['buckets'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},
   buckets:{{...defaults,levels:['<img src=x>']}}}};
 const draftHtml=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='buckets'),draft)`,context);
 assert.doesNotMatch(draftHtml,/<img src=x>/);
@@ -710,7 +714,7 @@ const latency=input('test_capacity_limit_latency_ms','capacity','test','');
 const rates=input('traffic_rates','capacity','traffic','1, 2, 4');
 const levels=input('buckets_levels','buckets','bucket','1, 8');
 const form={{elements,querySelectorAll:()=>[samples,latency,rates,levels]}};
-const document={{addEventListener:(kind,fn)=>listeners[kind]=fn,querySelector(q){{
+const document={{addEventListener:(kind,fn)=>listeners[kind]=fn,querySelectorAll:()=>[],querySelector(q){{
   if(q==='#new-run-form')return form;
   const card=q.match(/^\[data-test-card="(.*?)"\]$/);if(card)return cards[card[1]];
   const trigger=q.match(/^\[data-configure-test="(.*?)"\]$/);if(trigger)return cards[trigger[1]].trigger;
@@ -724,6 +728,7 @@ state.bootstrap={{checks,config:{{traffic}},buckets:{{defaults:{json.dumps(Bucke
  limits_schema:{{properties:{{latency_ms:{{anyOf:[{{type:'number'}},{{type:'null'}}]}}}}}},
  traffic_schema:{{properties:{{rates:{{type:'array'}},arrival:{{enum:['steady','poisson']}}}},$defs:{{TrafficMix:{{properties:{{short:{{type:'number'}},long_input:{{type:'number'}},long_output:{{type:'number'}}}}}}}}}}}};
 state.config={{checks:['capacity'],targets:[{{}}],samples:6,concurrency:8,max_output_tokens:128,traffic,limits:{{latency_ms:null}},test_options:{{correctness:{{samples:9}}}}}};
+state.catalogueFilter='all';
 syncConfigView=()=>{{}};
 updateBounds=()=>{{}}; // The DOM mock exercises disclosure and input behavior, not report markup.
 let markup=renderTestCard(checks[0],state.config);
@@ -732,21 +737,18 @@ assert.match(markup,/data-test-editor="correctness" hidden/);
 assert.match(markup,/type="hidden" name="test_mode_correctness" value="custom"/);
 assert.doesNotMatch(markup,/<select name="test_mode_/);
 markup=renderTestCard(checks[1],state.config);
-assert(markup.indexOf('Traffic profile')<markup.indexOf('Acceptance settings'));
+assert(markup.indexOf('name="traffic_rates"')>=0);
+assert(markup.indexOf('name="traffic_rates"')<markup.indexOf('name="test_capacity_limit_latency_ms"'));
 assert.doesNotMatch(markup,/<select name="traffic_mode"/);
-const workload={{id:'prefix',title:'Shared prefix',description:'Cache evidence',option_fields:[],limit_fields:[],defaults:{{}}}};
-markup=renderTestCard(workload,{{...state.config,prefix:{{repeats:7}}}});
-assert.match(markup,/data-config-tab="json"/);
-assert.match(markup,/JSON settings saved/);
-assert.doesNotMatch(markup,/<textarea|data-reset-test=/);
 syncTestControls();
-assert.equal(cards.correctness.hidden,true);
+assert.equal(cards.correctness.hidden,false);
 assert.equal(cards.capacity.hidden,false);
-state.showAvailableTests=true;syncTestControls();
+state.catalogueFilter='selected';syncTestControls();assert.equal(cards.correctness.hidden,true);
+state.catalogueFilter='all';syncTestControls();
 assert.equal(cards.correctness.hidden,false);
 assert.equal(cards.correctness.selection.checked,false);
-state.showAvailableTests=false;syncTestControls();
-assert.equal(cards.correctness.hidden,true);
+state.catalogueFilter='all';syncTestControls();
+assert.equal(cards.correctness.hidden,false);
 assert.equal(cards.correctness.editor.hidden,true);
 const before=JSON.stringify(state.config);
 toggleTestEditor('correctness');
@@ -780,11 +782,11 @@ assert.equal(elements.traffic_mode.value,'custom');
 // Labels reflect serialized overrides, not sticky edit flags, even after closing/reopening.
 const effective=structuredClone(state.config);effective.checks=['correctness','capacity'];
 effective.test_options={{}};
-assert.equal(testSettingsLabel(checks[0],effective),'Defaults');
-assert.equal(testSettingsLabel(checks[1],effective),'Defaults');
+assert.equal(testSettingsLabel(checks[0],effective),'');
+assert.equal(testSettingsLabel(checks[1],effective),'');
 effective.test_options.correctness={{samples:9}};
-assert.equal(testSettingsLabel(checks[0],effective),'Custom');
-effective.checks=['capacity'];assert.equal(testSettingsLabel(checks[0],effective),'Custom saved');
+assert.equal(testSettingsLabel(checks[0],effective),'Overrides');
+effective.checks=['capacity'];assert.equal(testSettingsLabel(checks[0],effective),'Saved overrides');
 cards.correctness.status.textContent='Defaults';elements.test_mode_correctness.value='custom';
 toggleTestEditor('correctness',true);toggleTestEditor('correctness');
 assert.equal(cards.correctness.status.textContent,'Defaults');
@@ -1001,12 +1003,13 @@ changeRequestSource('builtin',{remove:true});assert.equal(state.config.request_p
 // Run uses the strict validated snapshot, then previews that same snapshot before sending.
 current={...initial,targets:[{name:'local',model:'model'}],checks:['capacity'],request_source:'request_pack',request_pack:pack};state.config=current;
 validateRunForm=()=>true;setActive=()=>{};const sent=[];
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{}};
 api=async(path,options)=>{const config=JSON.parse(options.body);sent.push({path,config});if(path==='/api/runs')return {id:'done'};return {config,request_pack_preview:preview};};
 await startRun({preventDefault(){},target:form});
 assert.equal(sent.map(x=>x.path).join(','),'/api/config/validate,/api/config/preview,/api/runs');
 assert.equal(JSON.stringify(sent[1].config),JSON.stringify(sent[2].config.config));
 // Edits while the pre-run preview is pending prevent all inference calls.
-state.active=null;sent.length=0;api=async(path,options)=>{sent.push(path);if(path==='/api/config/preview')return new Promise(done=>resolve=done);return {config:JSON.parse(options.body)};};
+state.active=null;sent.length=0;state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{}};api=async(path,options)=>{sent.push(path);if(path==='/api/config/preview')return new Promise(done=>resolve=done);return {config:JSON.parse(options.body)};};
 const running=startRun({preventDefault(){},target:form});await Promise.resolve();await Promise.resolve();
 configChanged();resolve({config:current,request_pack_preview:preview});await running;
 assert(!sent.includes('/api/runs'));assert.match(nodes['#form-error'].textContent,/changed during preview/);

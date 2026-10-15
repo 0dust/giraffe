@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from giraffe.fixtures import SUITE_VERSION
+from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, Limits,
-    RunConfig, TrafficConfig, Buckets, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, Buckets, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
     MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES, RequestPack,
 )
 from giraffe.request_pack import INPUT_RETENTION_NOTICE
@@ -63,7 +63,9 @@ def capabilities(config: RunConfig | None = None) -> dict:
     inherited = configured.model_copy(update={"test_options": {}})
     defaults = inherited.model_dump(mode="json")
     defaults.pop("targets")  # Targets are required inputs, never discovered credentials.
+    example = builtin_fixtures(configured.model_copy(update={"context_limit": 128}))["correctness"][0]
     return {
+        "builtin_question_example": {"question": example.messages[0]["content"], "expected": example.expected},
         "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION,
         "validation_note": "The schema describes configuration. Validate checks semantic constraints; neither command contacts endpoints or verifies runtime availability.",
         "defaults": defaults, "config_schema": RunConfig.model_json_schema(),
@@ -75,6 +77,10 @@ def capabilities(config: RunConfig | None = None) -> dict:
              "limit_fields": sorted(CHECK_LIMIT_FIELDS[key]),
              "defaults": inherited.effective_check(key)} for key, title in CHECK_NAMES.items()
         ],
+        "profile_defaults": {name: model().model_dump(mode="json") for name, model in {
+            "arrivals": Arrival, "prefix": Prefix, "sessions": Sessions,
+            "consistency": Consistency,
+        }.items()},
         "option_schema": CheckOptions.model_json_schema(),
         "limits_schema": Limits.model_json_schema(),
         "traffic_schema": TrafficConfig.model_json_schema(),
