@@ -112,6 +112,35 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
   return config;
 }
 
+export function configureSessions(source, values, defaults, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  if (!values.has('sessions_profile')) return config;
+  const settings = config.sessions ||= {...structuredClone(defaults),
+    concurrency:Math.min(defaults.concurrency,config.concurrency),
+    max_tokens:Math.min(defaults.max_tokens,config.max_output_tokens)};
+  settings.profile = values.get('sessions_profile');
+  if (settings.profile !== 'performance') return config;
+  settings.modes = ['live'];
+  settings.sessions = numeric(values.get('sessions_count'), 'Total conversations', allowInvalid);
+  settings.concurrency = Math.min(config.concurrency,settings.sessions);
+  settings.delay_seconds = numeric(values.get('sessions_delay'), 'Pause between turns', allowInvalid);
+  settings.max_tokens = numeric(values.get('sessions_max_tokens'), 'Conversation output cap', allowInvalid);
+  settings.workloads = [];
+  for (let i=0;i<Number(values.get('session_workload_count'));i++) {
+    if (values.get(`session_enabled_${i}`) !== 'on') continue;
+    const previous = source.sessions?.workloads?.[i] || {};
+    settings.workloads.push({...previous,
+      name: String(values.get(`session_name_${i}`) || '').trim(),
+      weight: numeric(values.get(`session_weight_${i}`), 'Conversation weight', allowInvalid),
+      max_tokens: numeric(values.get(`session_cap_${i}`), 'Task output cap', allowInvalid),
+      turns: Array.from({length:Number(values.get(`session_turn_count_${i}`))}, (_, turn) =>
+        String(values.get(`session_turn_${i}_${turn}`) || '')),
+    });
+  }
+  if (!settings.workloads.length && !allowInvalid) throw new Error('Select at least one conversation task.');
+  return config;
+}
+
 export function datasetCaseFromValues(previous, values) {
   const item = structuredClone(previous || {});
   item.fixture_id = String(values.get('example_id') || '').trim();

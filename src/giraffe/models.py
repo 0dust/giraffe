@@ -104,7 +104,41 @@ class Buckets(Model):
         return self
 
 
+class SessionWorkload(Model):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    weight: float = Field(default=1, gt=0, le=10000)
+    turns: list[str] = Field(min_length=2, max_length=32)
+    max_tokens: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def bounded_turns(self):
+        if any(not turn.strip() or len(turn) > 8192 for turn in self.turns):
+            raise ValueError("workloads need non-empty user turns of at most 8192 characters")
+        return self
+
+
+def session_workload_presets() -> list[SessionWorkload]:
+    return [
+        SessionWorkload(name="coding", turns=[
+            "Write a Python function that removes duplicates from a list while preserving order. Explain how it works.",
+            "Extend your previous solution to handle unhashable items. Explain the trade-offs.",
+            "Add tests for your previous solution, including empty input and repeated values. Explain each test.",
+        ]),
+        SessionWorkload(name="essay", turns=[
+            "Write three paragraphs explaining the benefits and drawbacks of public transport in cities.",
+            "Expand your previous discussion with a concrete example and a counterargument in three paragraphs.",
+            "Revise your argument into three paragraphs aimed at a city council. Include a practical recommendation.",
+        ]),
+        SessionWorkload(name="chat", turns=[
+            "Explain in a full paragraph how to plan a weekend picnic with friends.",
+            "Using your previous plan, explain in a full paragraph how you would adapt it for rainy weather.",
+            "Using our discussion, give a detailed checklist and explain the most important preparations.",
+        ]),
+    ]
+
+
 class Sessions(Model):
+    profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
     sessions: int = Field(default=2, ge=1, le=32)
     concurrency: int = Field(default=2, ge=1, le=32)
@@ -114,11 +148,22 @@ class Sessions(Model):
     saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"])
     delay_seconds: float = Field(default=0, ge=0, le=60)
     max_tokens: int = Field(default=32, ge=1)
+    # Non-empty workloads select live performance conversations. Empty retains
+    # the existing fixed/live exact-repeat correctness test and its saved config.
+    workloads: list[SessionWorkload] = Field(default_factory=list, max_length=16)
     # Stop rather than inventing an answer or silently cropping required history.
     failure_policy: Literal["stop"] = "stop"
 
     @model_validator(mode="after")
     def valid_session(self):
+        if self.profile == "performance":
+            if not self.workloads:
+                raise ValueError("select at least one performance workload")
+            if self.modes != ["live"]:
+                raise ValueError("mixed performance workloads require modes: [live]")
+            names = [workload.name for workload in self.workloads]
+            if len(names) != len(set(names)):
+                raise ValueError("session workload names must be unique")
         if not self.modes or len(set(self.modes)) != len(self.modes):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= 32 or any(not t.strip() or len(t) > 8192 for t in self.turns):
@@ -658,6 +703,9 @@ class RunConfig(Model):
                 raise ValueError("session concurrency must not exceed the global ceiling")
             if self.sessions.max_tokens > self.max_output_tokens:
                 raise ValueError("session output budget must stay within max_output_tokens")
+            if any(workload.max_tokens is not None and workload.max_tokens > self.max_output_tokens
+                   for workload in self.sessions.workloads):
+                raise ValueError("session workload output budgets must stay within max_output_tokens")
         if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
             raise ValueError("bucket output budgets must stay within max_output_tokens")
         from giraffe.deployment import sanitize
@@ -778,6 +826,7 @@ class RequestRecord(Model):
     error: str | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
+    client_cancelled_monotonic_ns: int | None = None
     elapsed_ms: float = 0
     first_output_ms: float | None = None
     last_output_ms: float | None = None

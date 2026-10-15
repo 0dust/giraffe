@@ -668,6 +668,32 @@ def _traffic_table(check: CheckResult) -> str:
     return "".join(parts)
 
 
+def _session_performance_html(data: dict[str, Any]) -> str:
+    headline = (f'<p><strong>Average generation speed per user: '
+                f'{_number(data["mean_user_generation_tokens_per_second"])} tok/s</strong> '
+                f'({_e(data["users_with_measured_generation"])} measured users). '
+                f'{_e(data["completed_conversations"])} / {_e(data["planned_conversations"])} '
+                f'conversations completed; {_e(data["achieved_request_overlap"])} / '
+                f'{_e(data["configured_concurrency"])} concurrent requests observed/configured.</p>'
+                f'<p class="muted">{_e(data["interpretation"])}</p>')
+    rows = []
+    for row in data["turns"]:
+        rows.append(f'<tr><td>{_e(row["task_type"])} / {_e(row["mode"])} / turn {_e(row["turn"])}</td>'
+                    f'<td>{_e(row["completed"])} / {_e(row["attempted"])}</td>'
+                    f'<td>{_number(row["generation_tokens_per_second_mean"])} / '
+                    f'{_number(row["generation_tokens_per_second_p50"])} / '
+                    f'{_number(row["generation_tokens_per_second_p10"])}</td>'
+                    f'<td>{_number(row["first_output_p95_ms"])}</td>'
+                    f'<td>{_number(row["p95_ms"])}</td>'
+                    f'<td>{_e(row["unmeasured_generation_requests"])} / '
+                    f'{_e(row["capped_responses"])}</td></tr>')
+    return (headline + '<details><summary>Conversation performance by task and turn</summary>'
+            '<div class="table"><table><tr><th>Task / mode / turn</th><th>Completed / sent</th>'
+            '<th>Generation mean / median / p10 tok/s</th><th>First output p95 ms</th>'
+            '<th>Response p95 ms</th><th>Unmeasured rate / capped replies</th></tr>'
+            + ''.join(rows) + '</table></div></details>')
+
+
 def _traffic_baseline_html(target: dict[str, Any]) -> str:
     traffic = target["traffic_capacity"]
     delta = traffic.get("delta_rps")
@@ -753,6 +779,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "sessions" and check.metrics.get("conversation_performance"):
+            metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(check.title)}</strong>'
                      f'<br>{"Required" if check.required else "Optional"}</td>'
                      f'<td>{_badge(check.status)}</td><td>{_e(check.summary)}'

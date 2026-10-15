@@ -1,4 +1,4 @@
-import {convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261012-evaluation-feedback';
+import {convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261014-conversations';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -119,6 +119,7 @@ function schemaField(name,value,schema,{label,hint='',placeholder='Inherit run s
   return field(name,label,value,{type:'number',hint,min:valueSchema.minimum,max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
 }
 function testSettingsLabel(check,config) {
+  if(check.id==='sessions')return config.sessions?.profile==='performance'?'Mixed conversations':'Exact-repeat correctness';
   if(!check.option_fields.length&&!check.limit_fields.length){
     const key={mixed:'buckets',tools:'forced_tool_diagnostic'}[check.id] || check.id;
     if(config[key])return config.checks.includes(check.id)?'JSON settings':'JSON settings saved';
@@ -130,10 +131,50 @@ function renderTestCard(check,config) {
   const selected=config.checks?.includes(check.id),custom=Object.keys(config.test_options?.[check.id] || {}).length>0;
   const fields=check.option_fields.map(name=>schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:human(name),hint:'Blank inherits the run setting.'}));
   const profileKey={mixed:'buckets',tools:'tool_calling'}[check.id] || check.id;
-  const advanced=!check.option_fields.length&&!check.limit_fields.length;
+  const advanced=!check.option_fields.length&&!check.limit_fields.length&&check.id!=='sessions';
   const limits=check.limit_fields.map(name=>schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:human(name),placeholder:'No limit',hint:state.bootstrap.limits_schema.properties[name].anyOf?'Blank removes this limit for this test.':''}));
-  return `<section class="test-card" data-test-card="${check.id}"><div class="test-card-heading"><div class="test-row-copy"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(check.title)}</span></label><p class="hint test-description">${escape(check.description)}</p>${check.id==='capacity'?'<p class="hint traffic-profile-summary"></p>':''}</div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${testSettingsLabel(check,config)}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Configure ${escape(check.title)}" aria-expanded="false" aria-controls="settings-${check.id}">Configure</button></div></div><input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}"><div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden><p class="hint draft-notice" ${selected?'hidden':''}>Not selected. These settings will be used if you select this test.</p>${check.id==='capacity'?renderTrafficEditor(config):''}<div class="test-settings" data-test-settings="${check.id}"><div class="test-editor-heading"><h3>${check.id==='capacity'?'Acceptance settings':'Test settings'}</h3>${advanced?'':`<button type="button" class="text-button reset-test" data-reset-test="${check.id}">${check.id==='capacity'?'Reset acceptance settings':'Reset to defaults'}</button>`}</div><fieldset class="fields">${fields.join('')}${limits.join('')}</fieldset>${advanced?`<p class="hint">Uses the shared run bounds. Customize <code>${escape(profileKey)}</code>${check.id==='tools'?' and forced_tool_diagnostic':''} in the JSON configuration.</p><button type="button" class="text-button" data-config-tab="json">Edit in JSON</button>`:''}</div>${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first target',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}<div class="test-editor-footer"><span class="hint">Changes are kept as you edit.</span><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
+  return `<section class="test-card" data-test-card="${check.id}"><div class="test-card-heading"><div class="test-row-copy"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(check.title)}</span></label><p class="hint test-description">${escape(check.description)}</p>${check.id==='capacity'?'<p class="hint traffic-profile-summary"></p>':''}</div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${testSettingsLabel(check,config)}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Configure ${escape(check.title)}" aria-expanded="false" aria-controls="settings-${check.id}">Configure</button></div></div><input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}"><div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden><p class="hint draft-notice" ${selected?'hidden':''}>Not selected. These settings will be used if you select this test.</p>${check.id==='capacity'?renderTrafficEditor(config):''}<div class="test-settings" data-test-settings="${check.id}"><div class="test-editor-heading"><h3>${check.id==='capacity'?'Acceptance settings':'Test settings'}</h3>${advanced?'':`<button type="button" class="text-button reset-test" data-reset-test="${check.id}">${check.id==='capacity'?'Reset acceptance settings':'Reset to defaults'}</button>`}</div>${check.id==='sessions'?renderSessionEditor(config):''}<fieldset class="fields">${fields.join('')}${limits.join('')}</fieldset>${advanced?`<p class="hint">Uses the shared run bounds. Customize <code>${escape(profileKey)}</code>${check.id==='tools'?' and forced_tool_diagnostic':''} in the JSON configuration.</p><button type="button" class="text-button" data-config-tab="json">Edit in JSON</button>`:''}</div>${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first target',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}<div class="test-editor-footer"><span class="hint">Changes are kept as you edit.</span><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
 }
+function renderSessionResults(performance) {
+  const rate=value=>value==null?'Unmeasured':`${number(value,1)} tok/s`;
+  const columns=row=>`<td>${row.completed ?? 0} / ${row.attempted ?? 0}</td><td>${rate(row.generation_tokens_per_second_mean)}</td><td>${rate(row.generation_tokens_per_second_p50)}</td><td>${rate(row.generation_tokens_per_second_p10)}</td><td>${ms(row.first_output_p95_ms)}</td><td>${ms(row.p95_ms)}</td><td>${ms(row.max_stream_gap_ms)}</td><td>${row.unmeasured_generation_requests ?? 0}</td><td>${row.capped_responses ?? 0}</td>`;
+  const header='<th>Completed / sent</th><th>Mean tok/s</th><th>Median tok/s</th><th>p10 tok/s</th><th>First output p95</th><th>Response p95</th><th>Longest pause</th><th>Unmeasured rate</th><th>Capped replies</th>';
+  return `<section class="check-observations"><h3>Conversation performance</h3><dl class="metrics-grid">${metric('Average generation speed per user',rate(performance.mean_user_generation_tokens_per_second),`Equal weight for ${performance.users_with_measured_generation} measured users; excludes first-output waiting and inter-turn pauses`)}${metric('Conversation completion',`${performance.completed_conversations} / ${performance.planned_conversations}`,'All planned turns completed; output caps and answer quality are reported separately')}${metric('Concurrent requests observed',`${performance.achieved_request_overlap} / ${performance.configured_concurrency}`,'Observed client overlap / configured conversation concurrency; users may pause between turns')}${metric('Total output throughput',rate(performance.aggregate_output_tokens_per_second),'All measured users combined over the recorded workload window, including pauses')}</dl><p class="hint">Raw client-observed estimates; see client timing quality above. p10 describes slower responses. Capped replies are not quality-certified.</p>
+  <h3>By task type</h3><div class="metric-table"><table><thead><tr><th>Task</th>${header}</tr></thead><tbody>${performance.tasks.map(row=>`<tr><td>${escape(row.task_type)}<small>${escape(row.mode)}</small></td>${columns(row)}</tr>`).join('')}</tbody></table></div>
+  <details><summary>By conversation turn</summary><div class="metric-table"><table><thead><tr><th>Task / turn</th>${header}</tr></thead><tbody>${performance.turns.map(row=>`<tr><td>${escape(row.task_type)} · turn ${row.turn}<small>${escape(row.mode)}</small></td>${columns(row)}</tr>`).join('')}</tbody></table></div></details>
+  <details><summary>Each user's results</summary><div class="metric-table"><table><thead><tr><th>User / task</th>${header}<th>Conversation</th></tr></thead><tbody>${performance.users.map(row=>`<tr><td>${escape(row.session_id)}<small>${escape(row.task_type)}</small></td>${columns(row)}<td>${row.conversation_completed?'Completed':escape(row.stop_reason || 'Incomplete')}</td></tr>`).join('')}</tbody></table></div></details></section>`;
+}
+
+function renderSessionEditor(config) {
+  const defaults=state.bootstrap.session_workloads,settings=config.sessions || defaults.defaults;
+  const mixed=settings.profile==='performance',saved=settings.workloads || [];
+  const workloads=[...saved,...defaults.presets.filter(item=>!saved.some(row=>row.name===item.name))];
+  return `<div data-session-settings><label>Conversation test<select name="sessions_profile"><option value="correctness" ${mixed?'':'selected'}>Exact-repeat correctness</option><option value="performance" ${mixed?'selected':''}>Mixed workload performance</option></select></label>
+  <p class="hint">Mixed performance runs use actual replies as conversation history. Concurrent users inherit the shared concurrency ceiling. Answer quality is not scored.</p>
+  <div data-session-mix ${mixed?'':'hidden'}><div class="fields">${field('sessions_count','Total conversations',mixed?settings.sessions:Math.max(6,settings.sessions),{type:'number',min:1,max:32,step:1})}${field('sessions_delay','Pause between turns (seconds)',settings.delay_seconds,{type:'number',min:0,max:60,step:'any'})}${field('sessions_max_tokens','Output cap per turn',mixed?settings.max_tokens:Math.min(128,config.max_output_tokens),{type:'number',min:1,max:config.max_output_tokens,step:1})}</div>
+  <p class="hint">Weights divide the total conversation budget among selected tasks. Each conversation keeps its task and history. Output caps limit length; actual input/output tokens are reported.</p>
+  <input type="hidden" name="session_workload_count" value="${workloads.length}">${workloads.map((item,i)=>`<details class="setup-disclosure"><summary>${escape(human(item.name))} · ${item.turns.length} turns</summary><label class="test-selection"><input type="checkbox" name="session_enabled_${i}" ${(saved.length?saved.some(row=>row.name===item.name):true)?'checked':''}><span>Include this task</span></label><div class="fields">${field(`session_name_${i}`,'Task name',item.name,{required:true})}${field(`session_weight_${i}`,'Conversation weight',item.weight,{type:'number',min:.001,max:10000,step:'any',required:true})}${field(`session_cap_${i}`,'Task output cap (optional)',item.max_tokens,{type:'number',min:1,max:config.max_output_tokens,step:1,placeholder:'Use conversation output cap'})}</div><input type="hidden" name="session_turn_count_${i}" value="${item.turns.length}">${item.turns.map((turn,j)=>`<label>Turn ${j+1}<textarea name="session_turn_${i}_${j}" rows="3" maxlength="8192" required>${escape(turn)}</textarea></label>`).join('')}<button type="button" class="text-button" data-action="add-session-turn" data-session-index="${i}">Add turn</button>${item.turns.length>2?`<button type="button" class="text-button" data-action="remove-session-turn" data-session-index="${i}">Remove last turn</button>`:''}</details>`).join('')}
+  <button type="button" class="text-button" data-action="add-session-workload" ${workloads.length>=16?'disabled':''}>Add custom task</button></div>
+  <p class="hint" data-session-legacy ${mixed?'hidden':''}>Uses the saved fixed/live exact-repeat conversations. Their prompts and modes remain configurable in JSON.</p></div>`;
+}
+
+function editSessionWorkload(action,index) {
+  const form=$('#new-run-form'),name=form.elements[`session_name_${index}`]?.value;
+  if(index!==undefined&&!form.elements[`session_enabled_${index}`]?.checked){toast('Select this task before changing its turn count.');return;}
+  captureFormDraft();
+  const settings=state.config.sessions;
+  if(action==='add-session-workload'){
+    let suffix=1;while(settings.workloads.some(item=>item.name===`custom-${suffix}`))suffix++;
+    settings.workloads.push({name:`custom-${suffix}`,weight:1,max_tokens:null,turns:['Explain a topic relevant to your users in detail.','Build on your previous answer with a detailed example.']});
+  }else{
+    const item=settings.workloads.find(row=>row.name===name);if(!item)return;
+    if(action==='add-session-turn'&&item.turns.length<32)item.turns.push('Build on your previous answer and explain the next step in detail.');
+    if(action==='remove-session-turn'&&item.turns.length>2)item.turns.pop();
+  }
+  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  state.openTest='sessions';syncTestControls();
+}
+
 function renderTrafficEditor(config) {
   const traffic=config.traffic || state.bootstrap.config.traffic,custom=!sameConfig(traffic,state.bootstrap.config.traffic),schema=state.bootstrap.traffic_schema;
   const descriptions={rates:'Requests per second, in increasing order. Use commas between stages.',duration_seconds:'Each rate runs for this many seconds, then drains.',max_in_flight:'Blank inherits the global concurrency ceiling.',seed:'Repeat the arrival pattern and request mix.',long_input_chars:'Characters of input for long-input requests.',long_output_words:'Words copied by long-output requests. The global output cap still applies.',drain_timeout_seconds:'Wait for admitted requests after each arrival window.',scheduler_lag_tolerance_ms:'Late arrivals are counted as generator limitations.'};
@@ -158,6 +199,8 @@ function syncTestControls() {
     if(check.id==='capacity')$('.traffic-profile-summary',card).hidden=!selected;
     if(check.id==='gpu')form.elements.metrics_url.disabled=!open;
   }
+  const sessionProfile=form.elements.sessions_profile;
+  if(sessionProfile){const mixed=sessionProfile.value==='performance';$('[data-session-mix]',form).hidden=!mixed;$('[data-session-legacy]',form).hidden=mixed;}
   const toggle=$('#add-tests');
   if(toggle){toggle.textContent=state.showAvailableTests?'Hide unselected tests':`Add tests (${state.bootstrap.checks.length-selectedCount})`;toggle.setAttribute('aria-expanded',String(state.showAvailableTests));}
   const empty=$('#no-tests-selected');if(empty)empty.hidden=selectedCount>0;
@@ -178,6 +221,11 @@ function validateRunForm(form) {
   // Inspect selected drafts here, revealing the field before asking the browser to focus it.
   for(const input of form.querySelectorAll('input, select, textarea')){
     if(packSettingInactive(input.name))continue;
+    if(input.closest('[data-session-settings]')&&input.name!=='sessions_profile'){
+      if(form.elements.sessions_profile.value!=='performance')continue;
+      const match=input.name.match(/^session_(?:name|weight|cap|turn)_([0-9]+)_?/);
+      if(match&&!form.elements[`session_enabled_${match[1]}`]?.checked)continue;
+    }
     const card=input.closest('[data-test-card]');
     if(card){
       const id=card.dataset.testCard;
@@ -469,7 +517,7 @@ function renderNew() {
 function readForm(allowEmpty=false) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
   // Disabled editors still retain their values when a test is unchecked.
-  for(const input of form.querySelectorAll('[data-test-settings] input, [data-traffic-settings] input, [data-traffic-settings] select'))data.set(input.name,input.value);
+  for(const input of form.querySelectorAll('[data-test-settings] input, [data-traffic-settings] input, [data-traffic-settings] select, [data-session-settings] input, [data-session-settings] select, [data-session-settings] textarea'))data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);
   if(!config.targets?.length)throw new Error('Configuration must contain at least one target.');
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
   first.metrics_url=form.elements.metrics_url.value.trim() || null;
@@ -478,6 +526,7 @@ function readForm(allowEmpty=false) {
   for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','regression_percent']){const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v);}
   config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty});
   config=configureJudging(config,data,{allowInvalid:allowEmpty});
+  config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
@@ -639,6 +688,7 @@ function renderCheck(check,report) {
   ${check.status==='skipped'?'<div class="empty-state" style="padding:35px 24px"><p>This optional check was not selected for the run. No result is inferred.</p></div>':`<dl class="metrics-grid">${metrics.join('')}</dl>`}
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
+  ${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
   ${check.id==='capacity'&&m.levels?`<div class="metric-table"><table><thead><tr><th>Load</th><th>Achieved</th><th>Correct</th><th>p95</th></tr></thead><tbody>${Object.entries(m.levels).map(([k,v])=>`<tr><td class="mono">${escape(k)}</td><td>${number(v.achieved_concurrency)}</td><td>${v.correct ?? 0} / ${v.scored ?? 0}</td><td class="mono">${ms(v.p95_ms)}</td></tr>`).join('')}</tbody></table></div>`:''}
@@ -819,7 +869,9 @@ document.addEventListener('click',async(event)=>{
   const done=event.target.closest('[data-done-test]')?.dataset.doneTest;
   if(done){toggleTestEditor(done,true);return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
+  if(reset==='sessions'){captureFormDraft();state.config.sessions=clone(state.bootstrap.session_workloads.defaults);state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
   if(reset){configChanged();const form=$('#new-run-form');form.elements[`test_mode_${reset}`].value='default';refreshInheritedFields(reset);syncTestControls();updateBounds();return;}
+  if(['add-session-workload','add-session-turn','remove-session-turn'].includes(action)){editSessionWorkload(action,event.target.closest('[data-session-index]')?.dataset.sessionIndex);return;}
   if(action==='toggle-available-tests'){state.showAvailableTests=!state.showAvailableTests;syncTestControls();return;}
   if(action==='select-tests'||action==='clear-tests'){configChanged();for(const input of $$('#new-run-form input[name="check"]'))input.checked=action==='select-tests';syncTestControls();updateBounds();return;}
   if(action==='reset-traffic'){configChanged();const form=$('#new-run-form');form.elements.traffic_mode.value='default';const defaults=state.bootstrap.config.traffic;for(const [key,value] of Object.entries(defaults)){if(key==='mix'){for(const [kind,weight] of Object.entries(value))form.elements[`traffic_mix_${kind}`].value=weight;}else form.elements[`traffic_${key}`].value=Array.isArray(value)?value.join(', '):value ?? '';}syncTestControls();updateBounds();return;}

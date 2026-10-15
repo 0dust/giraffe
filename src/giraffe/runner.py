@@ -603,7 +603,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     batches += 1
                 run.observations[target.name]["sustained_batches"] = batches
                 run.observations[target.name]["sustained_complete"] = time.monotonic() >= end and batches > 0
-                await run.group(target, client, fixtures["short"], "recovery",
+                await run.group(target, client, fixtures["sustained"], "recovery",
                                 count=effective.samples, checks=["recovery"])
             await workloads.execute(run, target, client, fixtures)
     except asyncio.CancelledError:

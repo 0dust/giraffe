@@ -138,16 +138,21 @@ class LLMClient:
         self.config = config
         self._client: httpx.AsyncClient | None = None
 
-    async def __aenter__(self) -> LLMClient:
+    def _create_client(self) -> httpx.AsyncClient:
+        # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
+        # synchronous setup away from concurrent inference and the heartbeat.
         headers = _headers(self.target)
         verify: bool | ssl.SSLContext = True
         if self.config.ca_bundle:
             verify = ssl.create_default_context(cafile=self.config.ca_bundle)
-        self._client = httpx.AsyncClient(
+        return httpx.AsyncClient(
             headers=headers, timeout=None, verify=verify, proxy=self.config.proxy,
             trust_env=True, follow_redirects=False,
             limits=httpx.Limits(max_connections=self.config.concurrency),
         )
+
+    async def __aenter__(self) -> LLMClient:
+        self._client = await asyncio.to_thread(self._create_client)
         return self
 
     async def __aexit__(self, *_: Any) -> None:
@@ -323,6 +328,7 @@ class LLMClient:
                                     and record.answer_chunks >= spec.cancel_after_chunks
                                     and record.finish_reason is None):
                                 record.client_cancelled_at_ns = time.time_ns()
+                                record.client_cancelled_monotonic_ns = time.monotonic_ns()
                                 raise _IntentionalCancellation
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")

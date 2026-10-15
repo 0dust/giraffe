@@ -368,12 +368,8 @@ async def snapshot(target, config, deadline, stop):
     if stop.is_set() or remaining <= 0:
         result["discovery"].append({"status": "run_stopped"})
         return result
-    import ssl
-
-    verify = ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True
-    async with httpx.AsyncClient(
-        timeout=remaining, verify=verify, proxy=config.proxy, follow_redirects=False
-    ) as client:
+    client = await asyncio.to_thread(_discovery_client, config, remaining)
+    async with client:
         try:
             async with asyncio.timeout(remaining):
                 reported = {}
@@ -475,6 +471,16 @@ async def snapshot(target, config, deadline, stop):
         f"{c}.{f}" for c, fields in CATEGORIES.items() for f in fields if f"{c}.{f}" not in known
     )
     return result
+
+
+def _discovery_client(config, timeout):
+    import ssl
+
+    # Discovery can run beside inference on other targets. TLS setup is blocking.
+    verify = ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True
+    return httpx.AsyncClient(
+        timeout=timeout, verify=verify, proxy=config.proxy, follow_redirects=False,
+    )
 
 
 def observed_signature(snapshot):

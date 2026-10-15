@@ -102,10 +102,10 @@ def config(**kwargs):
     return RunConfig(**(values | kwargs))
 
 
-async def test_disabled_backend_verification_preserves_legacy_builtin_fingerprint(client):
+async def test_versioned_recovery_prompt_has_stable_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
-        "ab9fb04ee49e79b9e10690fdcf03fc840164dd7962f4cee9b47d53214860598b")
+        "3f0247a4c363e0669076f4b834ddbe45e1cf907d63ac5c10667714fa8428ad60")
 
 
 def check(report, id, target="service"):
@@ -199,10 +199,13 @@ async def test_context_override_controls_declared_limit_and_fixture_sizes():
 async def test_recovery_honors_correctness_allowance_without_hiding_protocol_failure(client, monkeypatch):
     original = client.execute
 
+    wrong_probe_ids = set()
+
     async def one_wrong_probe(self, spec, **kwargs):
         record = await original(self, spec, **kwargs)
-        if spec.scenario == "recovery" and spec.fixture_id == "short.copy.v2":
+        if spec.scenario == "recovery" and not wrong_probe_ids:
             record.output = "wrong answer"
+            wrong_probe_ids.add(record.id)
         return record
 
     monkeypatch.setattr(client, "execute", one_wrong_probe)
@@ -214,9 +217,11 @@ async def test_recovery_honors_correctness_allowance_without_hiding_protocol_fai
     assert .5 <= result.metrics["accuracy"] < 1
     assert result.status == "pass"
 
+    wrong_probe_ids.clear()
+
     async def broken_probe(self, spec, **kwargs):
         record = await one_wrong_probe(self, spec, **kwargs)
-        if spec.scenario == "recovery" and spec.fixture_id == "short.code.v2":
+        if record.id in wrong_probe_ids:
             record.valid = False
             record.status = "failed"
         return record
@@ -470,10 +475,11 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     client, monkeypatch, check_id,
 ):
     original = client.execute
+    failed_fixture = "sustained.copy.v3" if check_id == "recovery" else "short.copy.v2"
 
     async def refused_copy(self, spec, **kwargs):
         result = await original(self, spec, **kwargs)
-        if spec.fixture_id == "short.copy.v2":
+        if spec.fixture_id == failed_fixture:
             result.output = "I cannot copy that sentence."
         return result
 
@@ -484,10 +490,10 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     result = check(report, check_id)
     assert result.status == "fail"
     assert "Answer checks failed" in result.summary
-    assert "short.copy.v2" in result.summary
+    assert failed_fixture in result.summary
     assert ("warm-up" in result.summary) == (check_id == "fairness")
     failure = next(f for f in result.metrics["answer_failures"]
-                   if f["fixture_id"] == "short.copy.v2")
+                   if f["fixture_id"] == failed_fixture)
     assert failure["warmup_failed"] == (1 if check_id == "fairness" else 0)
     assert failure["failed"] > 0
 
@@ -498,7 +504,7 @@ async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeyp
 
     async def refused_copy(self, spec, **kwargs):
         result = await original(self, spec, **kwargs)
-        if spec.fixture_id == "short.copy.v2":
+        if spec.fixture_id == "sustained.copy.v3":
             result.output = "I cannot copy that sentence."
         return result
 
@@ -508,7 +514,7 @@ async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeyp
     result = check(report, "recovery")
     assert result.status == "fail"
     assert "timing limits exceeded" in result.summary
-    assert "short.copy.v2" in result.summary
+    assert "sustained.copy.v3" in result.summary
 
 
 @pytest.mark.parametrize("fault,message", [

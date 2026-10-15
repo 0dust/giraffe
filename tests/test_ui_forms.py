@@ -10,6 +10,52 @@ import pytest
 from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
 
 
+def test_mixed_session_form_roundtrip_preserves_editable_tasks_and_shared_concurrency():
+    from giraffe.models import RunConfig, Sessions, session_workload_presets
+
+    module = (Path(__file__).parents[1] / "src/giraffe/static/form-config.mjs").as_uri()
+    source = {"targets": [{"name": "local", "url": "http://localhost:1", "model": "test"}],
+              "concurrency": 3, "max_output_tokens": 128, "checks": ["sessions"]}
+    defaults = Sessions().model_dump(mode="json")
+    tasks = [item.model_dump(mode="json") for item in session_workload_presets()]
+    script = f"""
+import assert from 'node:assert/strict';
+import {{configureSessions}} from {json.dumps(module)};
+const source={json.dumps(source)},defaults={json.dumps(defaults)},tasks={json.dumps(tasks)};
+const values=new FormData();
+values.set('sessions_profile','performance');values.set('sessions_count','6');
+values.set('sessions_delay','1.5');values.set('sessions_max_tokens','96');
+values.set('session_workload_count','3');
+tasks.forEach((task,i)=>{{
+  values.set(`session_enabled_${{i}}`,i===2?'off':'on');
+  values.set(`session_name_${{i}}`,task.name);values.set(`session_weight_${{i}}`,i===0?'2':'1');
+  values.set(`session_cap_${{i}}`,i===0?'64':'');
+  values.set(`session_turn_count_${{i}}`,task.turns.length);
+  task.turns.forEach((turn,j)=>values.set(`session_turn_${{i}}_${{j}}`,turn));
+}});
+values.set('session_turn_0_1','Custom follow-up with <literal> characters.');
+const result=configureSessions(source,values,defaults);
+assert.equal(result.sessions.concurrency,3);assert.equal(result.sessions.workloads.length,2);
+assert.deepEqual(result.sessions.modes,['live']);
+assert.equal(result.sessions.workloads[0].turns[1],'Custom follow-up with <literal> characters.');
+assert.equal(result.sessions.workloads[0].max_tokens,64);
+assert.equal(source.sessions,undefined);
+values.set('session_enabled_0','off');values.set('session_enabled_1','off');
+assert.throws(()=>configureSessions(source,values,defaults),/Select at least/);
+assert.equal(configureSessions(result,new FormData(),defaults).sessions.profile,'performance');
+const legacy=new FormData();legacy.set('sessions_profile','correctness');
+const bounded=configureSessions({{...source,concurrency:1,max_output_tokens:16}},legacy,defaults);
+assert.equal(bounded.sessions.concurrency,1);assert.equal(bounded.sessions.max_tokens,16);
+console.log(JSON.stringify(result));
+"""
+    completed = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
+                               capture_output=True, text=True, check=True)
+    normalized = RunConfig.model_validate(json.loads(completed.stdout))
+    assert normalized.sessions.workloads[0].weight == 2
+    assert normalized.sessions.delay_seconds == 1.5
+
+
+
 @pytest.mark.parametrize("scenario", [
     "selection", "defaults", "nullable_limits", "traffic", "empty_selection", "round_trip",
     "optional_workloads", "request_pack", "cancellation",

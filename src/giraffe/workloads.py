@@ -310,21 +310,29 @@ async def buckets(run, target, client):
 
 async def sessions(run, target, client):
     settings = run.config.sessions
+    mixed = settings.profile == "performance"
     observation = {
         "failure_policy": settings.failure_policy,
         "sessions": [],
         "history_admission": "Conservative characters plus output/template reserve; actual tokens reported separately. Never crop required history.",
         "live_baseline": "Live generated inputs can differ; compare measured shape/hash evidence, not presumed identical histories.",
+        "kind": settings.profile,
+        "planned_sessions": settings.sessions * len(settings.modes),
+        "configured_concurrency": settings.concurrency,
     }
     run.observations[target.name]["sessions"] = observation
 
-    async def session(mode, index):
+    async def session(mode, index, workload=None):
         history, previous = [], None
         session_id = f"{target.name}:{mode}:{index}"
-        item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None}
+        turns = workload.turns if workload else settings.turns
+        budget = (workload.max_tokens if workload else None) or settings.max_tokens
+        item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None,
+                "task_type": workload.name if workload else "exact_repeat",
+                "planned_turns": len(turns)}
         observation["sessions"].append(item)
         due = time.monotonic()
-        for turn, prompt in enumerate(settings.turns):
+        for turn, prompt in enumerate(turns):
             if not run.allowed(target.name):
                 item["stop_reason"] = run.reason or "target request budget reached"
                 run.unfinished[target.name].add("sessions")
@@ -334,7 +342,7 @@ async def sessions(run, target, client):
             )
             messages = [*history, {"role": "user", "content": prompt}]
             input_chars = sum(len(m["content"]) for m in messages)
-            if input_chars + settings.max_tokens + 32 > run.config.context_limit:
+            if input_chars + budget + 32 > run.config.context_limit:
                 item["stop_reason"] = (
                     "history admission ceiling reached; required history not cropped"
                 )
@@ -344,8 +352,9 @@ async def sessions(run, target, client):
                 prompt,
                 f"session_{mode}_turn{turn}",
                 "sessions",
-                max_tokens=settings.max_tokens,
+                max_tokens=budget,
                 session_id=session_id,
+                task_type=item["task_type"],
                 turn_id=turn,
                 mode=mode,
                 history_messages=len(history),
@@ -355,7 +364,7 @@ async def sessions(run, target, client):
             request.messages, request.input_chars = messages, input_chars
             # Keep saved configurations using the original follow-up scored too.
             if (
-                turn
+                not workload and turn
                 and prompt in {
                     SESSION_REPEAT_PROMPT,
                     "Repeat exactly the bakery name you just suggested, with no extra text.",
@@ -371,7 +380,7 @@ async def sessions(run, target, client):
             if (
                 not record.valid
                 or record.status != "completed"
-                or record.finish_reason == "length"
+                or (not workload and record.finish_reason == "length")
                 or record.score is False
             ):
                 item["stop_reason"] = (
@@ -381,7 +390,7 @@ async def sessions(run, target, client):
                 break
             if (
                 record.input_tokens is not None
-                and record.input_tokens + settings.max_tokens > run.config.context_limit
+                and record.input_tokens + budget > run.config.context_limit
             ):
                 item["stop_reason"] = "observed context budget reached"
                 run.unfinished[target.name].add("sessions")
@@ -396,7 +405,21 @@ async def sessions(run, target, client):
             history = [*messages, {"role": "assistant", "content": previous}]
             due = time.monotonic() + settings.delay_seconds
         item["completed_turns"] = len(item["turns"])
-        item["planned_turns"] = len(settings.turns)
+
+    if mixed:
+        from .session_metrics import workload_plan
+
+        pending = asyncio.Queue()
+        for index, workload in enumerate(workload_plan(settings.workloads, settings.sessions)):
+            pending.put_nowait((index, workload))
+
+        async def worker():
+            while not pending.empty():
+                index, workload = pending.get_nowait()
+                await session("live", index, workload)
+
+        await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
+        return
 
     for mode in settings.modes:
         for start in range(0, settings.sessions, settings.concurrency):
@@ -603,6 +626,9 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 )
         if check == "sessions":
             metrics["sessions"] = run.observations[target.name].get("sessions")
+            from .session_metrics import performance
+
+            metrics["conversation_performance"] = performance(metrics["sessions"], records, stats)
             if not metrics["sessions"] or any(
                 s["stop_reason"] for s in metrics["sessions"]["sessions"]
             ):
@@ -751,6 +777,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 "inconclusive",
                 "Requested workload coverage unfinished within shared budgets.",
             )
+        if check == "sessions" and status == "pass" and run.config.sessions.profile == "performance":
+            summary = "Concurrent conversation performance met configured limits. Answer quality was not assessed; capped replies are reported separately."
         result.append(
             CheckResult(
                 id=check,

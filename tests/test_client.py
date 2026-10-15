@@ -14,6 +14,35 @@ def spec(**changes):
     )
 
 
+async def test_client_setup_keeps_event_loop_responsive(monkeypatch):
+    import asyncio
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    actual = httpx.AsyncClient
+
+    def slow_client(**kwargs):
+        started.set()
+        if not release.wait(timeout=1):
+            raise AssertionError("Inference client setup blocked the event loop")
+        return actual(**kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+
+    monkeypatch.setattr(httpx, "AsyncClient", slow_client)
+    target = Target(name="local", url="http://local", model="test")
+
+    async def setup():
+        async with LLMClient(target, RunConfig(targets=[target])) as client:
+            assert client._client is not None
+        assert client._client is None
+
+    async def heartbeat():
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+
+    await asyncio.gather(setup(), heartbeat())
+
+
 @pytest.mark.asyncio
 async def test_answer_stream_counts_usage_and_preserves_finish(monkeypatch):
     target = Target(name="local", url="http://local/v1", model="test")
