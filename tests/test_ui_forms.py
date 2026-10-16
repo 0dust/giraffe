@@ -653,13 +653,13 @@ assert.doesNotMatch(markup,/0 recorded metric comparisons|0 comparable metrics|N
 target.comparisons.push({{check:'correctness',metric:'error_rate',status:'pass'}});
 markup=renderComparison(report);
 assert.match(markup,/comparison-filters/);
-assert.match(markup,/1 recorded metric comparisons/);
-assert(markup.includes('1 / 1 metrics shown'));
+assert.match(markup,/1 measurements, grouped by check/);
+assert.match(markup,/data-comparison-group="correctness"/);
 target.configuration_diff={{confounded:true,changed_fields:['runtime.version']}};
 target.telemetry={{coverage:'partial'}};
 markup=renderComparison(report);
 assert.match(markup,/runtime.version|confounded experiment/);
-assert.match(markup,/Serving telemetry and repeatability comparison/);
+assert.match(markup,/Deployment and comparison details/);
 assert.match(markup,/Tested arrival capacity/);
 state.detail={{id:'run-one'}};
 const configMarkup=renderConfig({{manifest:{{config:{{}}}},observations:{{targets:{{local:{{deployment:{{runtime:'vllm'}},serving_telemetry:{{coverage:'partial'}}}}}}}}}});

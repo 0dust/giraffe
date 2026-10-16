@@ -118,7 +118,8 @@ def test_progressive_navigation_keeps_drafts_and_enter_never_starts_early():
     run_browser_logic(r"""
 for(const id of ['setup-panel-1','form-error','start-run','setup-navigation-hint','run-bar-summary'])nodes['#'+id]=element();
 for(const action of ['setup-next','setup-back'])nodes['[data-action="'+action+'"]']=element();
-nodes['#shared-settings > summary']=element();
+nodes['#test-selection h2']=element({focus(options){assert(options.preventScroll);this.focused=true;}});
+let scrolledToTop=false;window.scrollTo=options=>{assert.equal(options.top,0);scrolledToTop=true;};
 const panels=[1,2,3].map(step=>element({dataset:{setupPanel:String(step)}}));
 const buttons=[1,2,3].map(step=>element({dataset:{setupStep:String(step)}}));
 groups['[data-setup-panel]']=panels;groups['.setup-stepper [data-setup-step]']=buttons;
@@ -133,7 +134,7 @@ await startRun({preventDefault(){},target:form});
 assert.equal(state.setupStep,2);assert.equal(calls,0);assert.equal(validated.join(','),'1');
 assert.equal(JSON.stringify(state.config),JSON.stringify(draft));assert.equal(state.prefillBaseline,'reference');
 assert(panels[0].hidden);assert(!panels[1].hidden);assert(nodes['#start-run'].hidden);
-assert(nodes['#shared-settings > summary'].focused);assert(nodes['#setup-navigation-hint'].hidden);
+assert(nodes['#test-selection h2'].focused);assert(scrolledToTop);assert(nodes['#setup-navigation-hint'].hidden);
 navigateSetup(1);assert.equal(state.setupStep,1);assert.equal(JSON.stringify(state.config),JSON.stringify(draft));
 validated.length=0;navigateSetup(3);assert.equal(validated.join(','),'1,2');assert.equal(state.setupStep,3);
 assert(!nodes['#start-run'].hidden);assert(nodes['[data-action="setup-next"]'].hidden);

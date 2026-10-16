@@ -87,7 +87,7 @@ const failed=report([check('correctness','fail',{
 let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
 assert.match(html,/Expected &lt;Paris&gt;/);
-assert.match(html,/class="button primary" data-action="rerun">Review settings/);
+assert.match(html,/class="button primary" data-action="inspect-finding">Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 assert.match(html,/Save as reference baseline/);
 assert.match(html,/report\.html" download/);
@@ -175,4 +175,47 @@ renderLive();html=nodes['#main'].innerHTML;
 assert.match(html,/Target traffic finished/);
 assert.match(html,/Evaluation calls · 3 of 8/);
 assert.doesNotMatch(html,/Requests started ·/);
+""")
+
+
+def test_grouped_comparison_preserves_measurements_filters_and_uncertainty():
+    run_render_checks(r"""
+const row=(check,metric,status,reason)=>({check,metric,status,reason,scenario:'question <one>',
+  baseline:100,current:125,baseline_samples:6,current_samples:6,worsening:25,threshold:20});
+const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'local <gpu>',status:'inconclusive',
+  comparisons:[row('context','latency_ms','fail','Threshold exceeded'),
+    row('context','first_output_ms','inconclusive','Sample variation'),
+    row('correctness','correctness_rate','pass','No material regression')]}]};
+const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
+state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
+let html=renderComparison(value);
+assert.match(html,/The comparison is inconclusive/);assert.match(html,/does not establish improvement or regression/);
+assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);
+assert.match(html,/data-comparison-group="context"/);assert.match(html,/Recall in long prompts/);
+assert.match(html,/1 regressed · 1 inconclusive/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
+assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
+assert.equal((html.match(/<tr>/g)||[]).length,5); // Three measurements and two group headers.
+state.comparisonFilter='pass';state.comparisonCheck='context';html=renderComparison(value);
+assert.match(html,/No measurements match/);
+assert.equal(JSON.stringify(value),original);
+""")
+
+
+def test_failure_action_selects_evidence_from_the_failed_check_only():
+    run_render_checks(r"""
+const failed=check('correctness','fail',{metrics:{correct:1,scored:2},evidence_ids:['bad','good']});
+const value=report([check('access','pass'),failed],{overall:'fail',requests:[
+  {id:'unrelated',score:false},{id:'good',score:true},{id:'bad',score:false}]});
+let html=detail(value);
+assert.match(html,/data-action="inspect-finding">Inspect failed answer/);
+assert.match(html,/1 of 2 scored answers did not meet/);
+let opened;openRequest=id=>opened=id;inspectFinding();assert.equal(opened,'bad');
+assert.equal((html.match(/data-check="local:correctness"/g)||[]).length,1);
+assert.doesNotMatch(html,/result-check-strip/);
+value.requests=[];detail(value);assert.equal(findingEvidence(value).record,undefined);
+assert.match(nodes['#main'].innerHTML,/data-action="inspect-finding">Inspect check/);
 """)

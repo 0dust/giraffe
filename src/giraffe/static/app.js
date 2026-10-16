@@ -4,7 +4,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = (value) => structuredClone(value);
-const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, filter:'all', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'selected', catalogueCategory:'all', catalogueSearch:'', setupStep:1, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
+const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'selected', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
 const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Skipped',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',inconclusive:'!',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -42,12 +42,12 @@ function toast(message) { const el=$('#toast');el.textContent=message;el.hidden=
 function connectionError(message='') { $('#connection-error').textContent=message;$('#connection-error').hidden=!message; }
 function setActive(id) {
   state.active=id || null;
-  const link=$('#active-run-link');link.hidden=!id;link.href=id?linkRun(id):'#runs';link.innerHTML=`${badge('running','A suite is active')}<br><small>Open live run →</small>`;
+  const link=$('#active-run-link');link.hidden=!id;link.href=id?linkRun(id):'#runs';link.innerHTML=`${badge('running','Run in progress')}<span aria-hidden="true"> →</span>`;
 }
 function updateNav(section, label) {
   $('#nav-runs').classList.toggle('current',section==='runs');$('#nav-new').classList.toggle('current',section==='new');
   $('#nav-runs').setAttribute('aria-current',section==='runs'?'page':'false');$('#nav-new').setAttribute('aria-current',section==='new'?'page':'false');
-  $('#breadcrumb').innerHTML=`<a href="#runs">Workspace</a><span>/</span>${escape(label)}`;
+  $('#breadcrumb').innerHTML=`<a href="#runs">Endpoint checks</a><span>/</span>${escape(label)}`;
   document.title=`${label} · Giraffe`;
 }
 function clearPoll() { clearTimeout(state.poll);state.poll=null; }
@@ -65,11 +65,13 @@ async function route() {
       const id=decodeURIComponent(hash.slice(6));updateNav('runs','Run detail');
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
-      state.detail=detail;state.selectedCheck=null;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();
+      state.detail=detail;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();
       if(activeState(detail))schedulePoll(pollDetail,version);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
-    await refreshRuns();if(version!==state.routeVersion)return;renderRuns();schedulePoll(pollRuns,version,3000);
+    await refreshRuns();if(version!==state.routeVersion)return;
+    if(!location.hash&&!state.runs.length&&!state.active){location.hash='#new';return;}
+    renderRuns();schedulePoll(pollRuns,version,3000);
   } catch(error) { if(version===state.routeVersion) $('#main').innerHTML=`<div class="page-heading"><h1>Could not open this view</h1></div>${notice(error.message,'error')}<button class="button" data-action="retry">Try again</button>`; }
 }
 async function pollRuns(version) {
@@ -91,22 +93,41 @@ async function pollDetail(version) {
   } catch(error) {if(version!==state.routeVersion)return;connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
+function runOutcome(run) {
+  return activeState(run)||['error','cancelled','interrupted'].includes(run.state)?run.state:run.overall || run.state;
+}
+function filteredRuns() {
+  const query=state.historySearch.trim().toLowerCase();
+  return state.runs.filter(run=>(state.filter==='all'||(activeState(run)?'active':runOutcome(run))===state.filter)&&
+    (!query||[run.id,run.run_id,...(run.targets || []).flatMap(target=>[target.name,target.model,target.url])].join(' ').toLowerCase().includes(query)));
+}
+function renderHistoryOverview(run) {
+  if(!run)return '';
+  const counts=run.check_counts || {},targets=run.targets || [];
+  const segments=Object.entries(counts).filter(([,count])=>count>0).map(([status,count])=>`<span class="history-segment ${escape(status)}" style="flex:${Number(count)}" title="${number(count)} ${escape(statusLabels[status] || status)}"></span>`).join('');
+  return `<a class="history-overview" href="${linkRun(run.id)}"><div><span class="eyebrow">${activeState(run)?'In progress':'Latest run'}</span><h2>${escape(targets.map(target=>target.model).join(', ') || 'Unnamed model')}</h2><p>${escape(targets.map(target=>target.name).join(' · '))} <span>· ${date(run.started_at)}</span></p></div><div class="history-overview-result">${badge(runOutcome(run))}<div class="history-state-rail" aria-hidden="true">${segments}</div><p>${Object.entries(counts).filter(([,count])=>count>0).map(([status,count])=>`${number(count)} ${escape(statusLabels[status]?.toLowerCase() || status)}`).join(' · ') || 'Waiting for results'}</p></div><span class="overview-arrow" aria-label="Open latest run">${icon('arrow')}</span></a>`;
+}
 function renderRuns() {
+  const focused=document.activeElement,focusId=['run-search','run-filter'].includes(focused?.id)?focused.id:null;
+  const selection=focusId==='run-search'?[focused.selectionStart,focused.selectionEnd]:null;
+
   if(!state.runs.length&&!state.active){
     $('#main').innerHTML=`<section class="first-run"><div class="eyebrow">Your first check</div><h1>Know how your LLM endpoint behaves.</h1><p>Check answers, response times and failures using the model you already run.</p><a class="button primary" href="#new">${icon('plus')} Start first check</a><ol class="first-run-steps"><li><strong>Connect your endpoint</strong><p>Enter the server address and test the connection.</p></li><li><strong>Choose what to check</strong><p>Start with answer checks. Review the request limits before running.</p></li><li><strong>Understand the result</strong><p>See what passed, what needs attention, and the requests behind it.</p></li></ol><div class="first-run-outcome"><strong>A report you can act on</strong><p>Save the evidence, adjust your setup, and compare a later run. Reports stay on this machine.</p></div><p class="hint">Use an existing OpenAI-compatible server, such as Ollama, vLLM or SGLang.</p></section>`;
     return;
   }
-  const outcomeFor=r=>activeState(r)||['error','cancelled','interrupted'].includes(r.state)?r.state:r.overall || r.state;
-  const runs=state.runs.filter(r=>state.filter==='all'||(activeState(r)?'active':outcomeFor(r))===state.filter);
-  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Your workspace</div><h1>Run history</h1><p>Open a result to inspect the evidence, compare changes or run it again.</p></div><a class="button primary" href="#new">${icon('plus')} New check</a></div>
+  const outcomeFor=runOutcome;
+  const runs=filteredRuns();
+  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Your testing workspace</div><h1>Run history</h1><p>Test your endpoint. Find what changed. Understand why.</p></div><a class="button primary" href="#new">${icon('plus')} New run</a></div>
   ${state.active?`<div class="notice"><strong>A check is running.</strong> <a href="${linkRun(state.active)}">Open live run →</a></div>`:''}
-  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><h2>Saved runs <span class="dim mono">${state.runs.length}</span></h2><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div>
+  ${state.filter==='all'&&!state.historySearch.trim()?renderHistoryOverview(state.runs[0]):''}
+  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><h2>Run history <span class="dim mono">${state.runs.length}</span></h2><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Find a model or run…" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
   ${runs.length?`<div class="history-table"><table><thead><tr><th>Target / model</th><th>Outcome</th><th>Checks</th><th>Started</th><th>Duration</th><th></th></tr></thead><tbody>${runs.map(r=>{
     const targets=r.targets || [],counts=r.check_counts || {},outcome=outcomeFor(r);
     const attention=['fail','blocked','inconclusive'].filter(key=>counts[key]).map(key=>`${number(counts[key])} ${statusLabels[key].toLowerCase()}`).join(' · ');
     return `<tr><td><a class="run-link" href="${linkRun(r.id)}">${escape(targets.map(t=>t.name).join(', ') || 'Unnamed run')}</a><small class="mono">${escape(targets.map(t=>t.model).join(', ') || 'No model recorded')}</small></td><td>${badge(outcome)}${r.baseline_id?'<small>Baseline compared</small>':''}</td><td>${activeState(r)?'<span class="muted">In progress</span>':`<span>${number(counts.pass || 0)} passed</span>${attention?`<small>${escape(attention)}</small>`:''}`}</td><td class="nowrap">${date(r.started_at)}<small class="run-id">${escape((r.run_id || r.id).slice(0,14))}</small></td><td class="mono">${duration(r)}</td><td><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run ${escape(r.id)}">${activeState(r)?'View live':'Open result'} →</a></td></tr>`;}).join('')}</tbody></table></div><div class="table-note">Saved on this machine · newest first · failed checks keep their evidence</div>`:
-  `<div class="empty-state"><h2>No runs match this filter</h2><p>Choose another outcome to inspect your saved runs.</p><button class="button" data-action="clear-filter">Show all runs</button></div>`}</section></div>`;
+  `<div class="empty-state"><h2>No runs match this filter</h2><p>Try a different model, run name or outcome.</p><button class="button" data-action="clear-filter">Show all runs</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
+  if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
 }
 const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Maximum in-flight requests','Requests running at the same time.',1,1],['max_requests','Total request limit','Requests allowed during the whole run.',1,1],['max_duration_seconds','Maximum duration','seconds',.1,'any'],['request_timeout_seconds','Request deadline','seconds',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output (estimate)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
@@ -373,13 +394,14 @@ function renderSharedRunSettings(config) {
   <details class="setup-disclosure" id="global-acceptance"><summary>Pass criteria defaults <span class="dim" id="acceptance-summary"></span></summary><div class="fields">${field('limit_max_error_rate','Errors allowed (%)',config.limits.max_error_rate*100,{type:'number',hint:'',help:'0% allows no request errors. Used by checks that support this criterion; a check-specific value takes priority.',min:0,max:100,step:'any'})}${field('limit_min_correctness','Correct answers required (%)',config.limits.min_correctness*100,{type:'number',hint:'',help:'100% requires every scored answer to be correct. Used by checks that support this criterion. A check-specific value takes priority; diagnostics with fixed criteria still require every tested case to pass.',min:0,max:100,step:'any'})}${field('limit_min_samples','Minimum usable answers',config.limits.min_samples,{type:'number',hint:'',help:'Required per measured group where used. Too few leaves the result inconclusive.',min:state.bootstrap.limits_schema.properties.min_samples.minimum,step:1,required:true})}</div><h4>Timing, slowdown & comparison targets</h4><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,config.limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Measure only'})).join('')}${field('limit_regression_percent','Change worth flagging (%)',config.limits.regression_percent,{type:'number',hint:'',help:'Used when comparing runs; percentage points for rates.',min:0,step:'any'})}</div></details></div></details><p class="checks-plan-summary" id="checks-plan-summary" role="status">Preparing request estimate…</p></section>`;
 }
 function renderCheckSelection(config) {
-  return `${renderSharedRunSettings(config)}<section class="setup-section check-selection" id="test-selection"><header class="setup-heading"><h2>Choose checks</h2></header><div class="setup-body">
-  <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected checks (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">Browse all ${state.bootstrap.checks.length} checks</button></div></div>
+  return `<section class="setup-section check-selection" id="test-selection"><header class="setup-heading"><div><h2 tabindex="-1">Choose checks</h2><p>Start with the selected checks. Add others to investigate a specific question.</p></div></header><div class="setup-body">
+
+  <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected checks (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">Add checks</button></div></div>
   <p class="sr-only" id="selection-summary" role="status">${config.checks.length} checks selected</p>
   <div id="catalogue-browse-tools" ${state.catalogueFilter==='selected'?'hidden':''}><div class="catalogue-browse-header"><label class="catalogue-search"><span class="sr-only">Find a check</span><input type="search" id="check-search" placeholder="Find a check" value="${escape(state.catalogueSearch || '')}" autocomplete="off"></label><button type="button" class="text-button" data-action="quick-checks">Reset to quick check</button></div><div class="catalogue-categories" aria-label="Check categories"><button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="all" aria-pressed="${!state.catalogueCategory||state.catalogueCategory==='all'}">All categories</button>${checkGroups.map(group=>`<button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="${group.id}" aria-pressed="${state.catalogueCategory===group.id}">${group.title}</button>`).join('')}</div></div>
   <div id="test-catalogue"><div class="test-cards check-catalogue" id="test-cards">${checkGroups.map(group=>`<section class="catalogue-group" data-catalogue-group="${group.id}"><h3>${group.title}</h3>${group.checks.map(id=>renderTestCard(state.bootstrap.checks.find(check=>check.id===id),config)).join('')}</section>`).join('')}</div><p class="hint catalogue-empty" id="catalogue-empty" role="status" hidden></p></div>
   <p class="hint" id="no-tests-selected" ${config.checks.length?'hidden':''}>Choose at least one check before reviewing the run.</p>
-  </div></section>`;
+  </div></section>${renderSharedRunSettings(config)}`;
 }
 function testSettingsLabel(check,config) {
   const custom=Object.keys(config.test_options?.[check.id] || {}).length>0||
@@ -480,7 +502,7 @@ function renderTestCard(check,config) {
   const questionSource=hostsQuestions?`<div class="catalogue-question-source">${sharedQuestions?`<p class="hint question-source-scope">Also used by ${escape(catalogTitle('capacity'))}.</p>`:''}${renderRequestSource(config)}</div>`:'';
   const inactiveControls=ownQuestions?`<div hidden data-inactive-question-settings>${check.option_fields.filter(inactive).map(option).join('')}</div>`:'';
   return `<section class="test-card catalogue-row" data-test-card="${check.id}" data-category="${checkGroups.find(group=>group.checks.includes(check.id))?.id || ''}" data-search="${escape(`${guide.name} ${guide.purpose} ${check.title} ${check.id}`.toLowerCase())}">
-  <div class="test-card-heading"><div class="test-row-copy"><div class="test-selection-line"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(guide.name)}</span></label>${renderCheckInfo(check,config)}</div></div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${escape(testSettingsLabel(check,config))}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Settings for ${escape(guide.name)}" aria-expanded="false" aria-controls="settings-${check.id}">Settings</button></div></div>
+  <div class="test-card-heading"><div class="test-row-copy"><div class="test-selection-line"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(guide.name)}</span></label>${renderCheckInfo(check,config)}</div><p class="test-description">${escape(guide.purpose)}</p></div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${escape(testSettingsLabel(check,config))}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Settings for ${escape(guide.name)}" aria-expanded="false" aria-controls="settings-${check.id}">Settings</button></div></div>
   <p class="hint check-row-warning" data-check-override-warning="${check.id}" ${warningsVisible&&checkOverrideWarning(check,config)?'':'hidden'}>${escape(checkOverrideWarning(check,config,true))}</p>
   <p class="hint check-row-warning" data-check-coverage="${check.id}" ${warningsVisible&&checkCoverageWarning(check,config)?'':'hidden'}>${escape(checkCoverageWarning(check,config))}</p>
   <input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}">
@@ -550,6 +572,7 @@ function syncTestControls() {
     if(check.id==='gpu')form.elements.metrics_url.disabled=!open;
   }
   for(const group of $$('[data-catalogue-group]'))group.hidden=$$('[data-test-card]',group).every(card=>card.hidden);
+  for(const button of $$('.check-intents [data-category]'))button.setAttribute('aria-pressed',String(state.catalogueFilter==='all'&&button.dataset.category===state.catalogueCategory));
   for(const button of $$('.catalogue-categories [data-category]'))button.setAttribute('aria-pressed',String(button.dataset.category===(state.catalogueCategory || 'all')));
   for(const button of $$('[data-catalogue-filter]'))button.setAttribute('aria-pressed',String(button.dataset.catalogueFilter===(state.catalogueFilter || 'all')));
   const count=$('#catalogue-selected-count');if(count)count.textContent=selectedCount;
@@ -861,7 +884,7 @@ function renderReviewPassCriteria(config) {
     if(timingFields.length&&timingFields.every(name=>limitValue(config,check,name)==null))limits.unshift('Measurement only — no timing target; result is inconclusive');
     return limits.length?`<article><strong>${escape(catalogTitle(id))}</strong><p class="hint">${escape(limits.join(' · '))}</p></article>`:'';
   }).filter(Boolean);
-  return rows.length?`<h4>Pass criteria</h4><div class="plan-rows">${rows.join('')}</div>`:'';
+  return rows.length?`<section class="review-criteria review-section"><div class="review-section-heading"><h3>Pass criteria</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><div class="plan-rows">${rows.join('')}</div></section>`:'';
 }
 function renderReviewLoad(config) {
   if(!config?.checks.includes('capacity')||!config.traffic)return '';
@@ -870,11 +893,14 @@ function renderReviewLoad(config) {
 }
 function renderRequestPlan(config=null) {
   const element=$('#request-plan');if(!element)return;
-  const saved=state.requestPreview,plan=currentRequestPlan();config ||= (plan?saved.config:null) || state.config;
+  const saved=state.requestPreview,plan=currentRequestPlan();
+  if(!config&&$('#run-blueprint')){try{config=readForm(true).config;}catch{}}
+  config ||= (plan?saved.config:null) || state.config;
+  syncRunBlueprint(config,plan);
   const start=$('#start-run');if(start)start.disabled=!canStartRun();
   const checkPlan=$('#checks-plan-summary');if(checkPlan){checkPlan.textContent=plan?`${setupPlanCount(plan)}${plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.required_request_limit>plan.request_limit));}
   const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
-  const limits=config?`<p class="review-limits">Limits: up to ${number(config.max_requests)} requests · traffic time limit ${elapsed(config.max_duration_seconds)} · ${number(config.concurrency)} at once.</p>`:'';
+  const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>`:'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
     element.innerHTML=`${heading}<p class="hint" role="status">${escape(status)}</p>${limits}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}`;return;
@@ -884,7 +910,7 @@ function renderRequestPlan(config=null) {
   const raise=Number.isInteger(needed)&&needed>plan.request_limit;
   const evaluatorScope='AI judge calls run separately from the target request budget and send cases and generated answers to each judge.';
   const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>!evaluator.active||warning!==evaluatorScope);
-  element.innerHTML=`${heading}<p class="plan-total" role="status">${escape(count)}</p>${limits}${renderReviewLoad(config)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}${renderReviewPassCriteria(config)}</details>`;
+  element.innerHTML=`${heading}<p class="plan-total" role="status">${escape(count)}</p>${limits}${renderReviewLoad(config)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details>${renderReviewPassCriteria(config)}`;
 }
 function scheduleRequestPlan() {
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
@@ -946,9 +972,21 @@ function renderPackResults(pack) {
 function setupSectionHeader(number,title,description) {
   return `<header class="setup-heading">${number?`<span class="setup-number" aria-hidden="true">${number}</span>`:''}<div><h2>${escape(title)}</h2><p>${escape(description)}</p></div></header>`;
 }
+function syncSetupIdentity() {
+  const element=$('#setup-context'),form=$('#new-run-form');if(!element||!form)return;
+  const model=form.elements.model.value.trim(),url=form.elements.url.value.trim();
+  element.hidden=state.setupStep!==2||state.configView==='json';
+  element.innerHTML=`<div><span class="context-label">Testing</span><strong>${escape(model || 'Choose a model')}</strong><span class="context-endpoint">${escape(url)}</span>${state.config.targets.length>1?`<span>+ ${state.config.targets.length-1} more endpoints</span>`:''}</div><button type="button" class="text-button" data-setup-step="1">Edit connection</button>`;
+}
 function syncSetupStep({focus=false}={}) {
   if(!$('#setup-panel-1'))return;
   const step=state.setupStep;
+  const titles=['New run','Select checks','Review run'];
+  const descriptions=['Connect an endpoint. Define a workload. Inspect the results.', 'Choose what this run should measure.', 'Review the workload before sending requests to your endpoint.'];
+  const heading=$('#setup-title'),description=$('#setup-description');
+  if(heading)heading.textContent=titles[step-1];if(description)description.textContent=descriptions[step-1];
+  syncSetupIdentity();
+  const blueprint=$('#run-blueprint');if(blueprint)blueprint.hidden=state.configView==='json'||step===3;
   for(const panel of $$('[data-setup-panel]'))panel.hidden=Number(panel.dataset.setupPanel)!==step;
   for(const button of $$('.setup-stepper [data-setup-step]')){
     const index=Number(button.dataset.setupStep);
@@ -957,7 +995,7 @@ function syncSetupStep({focus=false}={}) {
   }
   const json=state.configView==='json';
   const next=$('[data-action="setup-next"]'),back=$('[data-action="setup-back"]');
-  next.hidden=step===3&&!json;next.innerHTML=json?'Return to setup':`${step===2?'Review run':'Continue'} ${icon('arrow')}`;
+  next.hidden=step===3&&!json;next.innerHTML=json?'Return to setup':`${state.returnToReview?'Return to review':step===2?'Review run':'Continue'} ${icon('arrow')}`;
   const needsModel=step===1&&!$('#new-run-form')?.elements.model.value.trim();
   next.disabled=state.submitting||hasJsonChanges()||(!json&&needsModel);back.hidden=step===1||json;back.disabled=state.submitting||hasJsonChanges();
   $('#start-run').hidden=step!==3||json;$('#start-run').disabled=!canStartRun();
@@ -966,10 +1004,10 @@ function syncSetupStep({focus=false}={}) {
   const runSummary=$('#run-bar-summary');if(runSummary)runSummary.hidden=step===3;
   $('.new-run-layout')?.classList.toggle('connecting',step===1||json);
   $('.new-run-layout')?.classList.toggle('configuring',step===2&&!json);
-  if(focus){const target=step===2?$('#shared-settings > summary'):$(`[data-setup-panel="${step}"] h2`);if(step!==2)target?.setAttribute('tabindex','-1');target?.focus();}
+  if(focus){const target=step===3?$('#setup-title'):step===2?$('#test-selection h2'):$(`[data-setup-panel="${step}"] h2`);if(step!==2)target?.setAttribute('tabindex','-1');target?.focus({preventScroll:true});window.scrollTo?.({top:0,left:0,behavior:'instant'});}
 }
 function revealSetupStep(step,{focus=false}={}) {
-  state.setupStep=step;
+  state.setupStep=step;if(step===3)state.returnToReview=false;
   if($('#config-panel-form')){state.configView='form';syncConfigView();}
   syncSetupStep({focus});
 }
@@ -998,7 +1036,7 @@ function navigateSetup(step) {
   }catch(problem){if(error){error.textContent=problem.message;error.hidden=false;}else configError(problem);}
 }
 function setupPlanCount(plan) {
-  return plan.count_kind==='exact'?`${number(plan.planned_total)} requests planned`:plan.count_kind==='estimate'?`About ${number(plan.planned_total)} requests`:`${number(plan.known_total)} known requests + adaptive checks`;
+  return plan.count_kind==='exact'?`${number(plan.planned_total)} ${plan.planned_total===1?'request':'requests'} planned`:plan.count_kind==='estimate'?`About ${number(plan.planned_total)} requests`:`${number(plan.known_total)} known requests + adaptive checks`;
 }
 function renderReviewScope(payload) {
   const config=payload.config,targets=config.targets || [],questionChecks=config.checks.filter(id=>['correctness','capacity'].includes(id)),usesQuestions=questionChecks.length>0;
@@ -1013,7 +1051,25 @@ function renderReviewScope(payload) {
   if(usesPack&&!cases.length)problems.push('Add a question or choose built-in examples.');
   if(usesPack&&cases.some(item=>item.scorer==='judge')&&!judgesReady(config))problems.push('Configure the AI evaluator for questions that need it.');
   const restart=payload.mode==='cold-start'?targets.find(target=>target.name===payload.restart_target):null;
-  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<p class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</p><p class="hint">Model: ${escape(target.model || 'Model needed')}</p></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-setup-step="2">Edit checks</button></div><p class="review-check-names">${escape(config.checks.map(catalogTitle).join(' · ') || 'No checks selected')}</p>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${comparison?`<p class="hint review-baseline">${escape(comparison)}</p>`:''}${problems.map(problem=>notice(problem,'warning')).join('')}${payload.mode==='cold-start'?notice(restart?.restart_command?.length?`Restart ${restart.name} before testing. This runs its configured restart command.`:'Restart selected, but no restart command is configured for that endpoint. Use the running server or configure a restart command.','warning'):''}`;
+  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${comparison?`<p class="hint review-baseline">${escape(comparison)}</p>`:''}${problems.map(problem=>notice(problem,'warning')).join('')}${payload.mode==='cold-start'?notice(restart?.restart_command?.length?`Restart ${restart.name} before testing. This runs its configured restart command.`:'Restart selected, but no restart command is configured for that endpoint. Use the running server or configure a restart command.','warning'):''}`;
+}
+function browseCheckIntent(category) {
+  if(!checkGroups.some(group=>group.id===category))return;
+  state.catalogueFilter='all';state.catalogueCategory=category;state.catalogueSearch='';
+  const search=$('#check-search');if(search)search.value='';
+  syncTestControls();
+}
+function useRuntimeShortcut(runtime) {
+  const urls={Ollama:'http://localhost:11434/v1',vLLM:'http://localhost:8000/v1',SGLang:'http://localhost:30000/v1'};
+  if(!urls[runtime])return;
+  try {
+    assertAppliedConfig();const form=$('#new-run-form');
+    if(form.elements.url.value.trim()===urls[runtime])return;
+    form.elements.url.value=urls[runtime];form.elements.url.setCustomValidity('');
+    if(state.autoModel&&form.elements.model.value===state.autoModel)form.elements.model.value='';
+    state.autoModel=null;invalidateModelDiscovery();captureFormDraft();configChanged();updateBounds();
+    form.elements.url.focus();
+  }catch(error){configError(error);}
 }
 function modelDiscoveryKey() {
   const form=$('#new-run-form');if(!form)return null;
@@ -1069,33 +1125,55 @@ async function testConnection() {
     state.modelDiscovery={key,route,status:'error',models:[],message:error.message};renderModelDiscovery();
   }
 }
+function renderRunBlueprint(config,plan=null) {
+  const traffic=(plan?.rows || []).filter(row=>row.requests_per_target!==0);
+  const waiting=state.requestPreview?.status==='error'?'Plan unavailable. Review your configuration.':hasJsonChanges()?'Apply JSON changes to update this plan.':'Calculating traffic…';
+  return `<header class="blueprint-heading"><h2>Planned workload</h2></header>
+  <p class="blueprint-intro">${escape(plan?setupPlanCount(plan):waiting)}</p>
+  <dl class="workload-bounds"><div><dt>Request ceiling</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>
+  <p class="hint workload-help">Limits apply across the run. They are ceilings, not a completion estimate.</p>
+  ${traffic.length?`<details class="workload-breakdown"><summary>Request breakdown</summary><div>${traffic.map(row=>`<details data-plan-row="${escape(row.id)}"><summary><strong>${row.requests_per_target==null?'Adaptive':`${row.kind==='estimate'?'~ ':''}${number(row.requests_per_target)}`}</strong> ${escape(row.title)}</summary><p>${escape(row.summary)}</p><small>${escape(row.source)} · ${row.requests_per_target==null?'bounded by your limits':'per endpoint, before run limits'}</small></details>`).join('')}</div></details>`:''}
+  ${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}${plan&&plan.required_request_limit>plan.request_limit?'<p class="blueprint-note">The request limit is below the planned workload; some checks may remain incomplete.</p>':''}`;
+}
+function syncRunBlueprint(config,plan=null) {
+  const element=$('#run-blueprint');if(!element)return;
+  const open=[...element.querySelectorAll('details[open]')].map(item=>item.dataset.planRow?['planRow',item.dataset.planRow]:['planCheck',item.dataset.planCheck]);
+  const focused=document.activeElement?.closest?.('[data-plan-row], [data-plan-check]');
+  const focusKey=focused?(focused.dataset.planRow?['planRow',focused.dataset.planRow]:['planCheck',focused.dataset.planCheck]):null;
+  element.innerHTML=renderRunBlueprint(config,plan);
+  for(const node of element.querySelectorAll('details')){
+    if(open.some(([key,value])=>node.dataset[key]===value))node.open=true;
+    if(focusKey&&node.dataset[focusKey[0]]===focusKey[1])node.querySelector('summary')?.focus({preventScroll:true});
+  }
+}
 function renderNew(preset=inferSetupPreset(state.config)) {
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
-  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Deployment acceptance</div><h1>New run</h1><p>Connect your endpoint, choose checks, and see the results.</p></div><button type="button" class="text-button" data-action="import-config">Load saved setup</button></div>
+  $('#main').innerHTML=`<div class="page-heading setup-page-heading"><div><div class="eyebrow">New run</div><h1 id="setup-title">New run</h1><p id="setup-description">Connect an endpoint. Define a workload. Inspect the results.</p></div><button type="button" class="text-button" data-action="import-config">Load saved setup</button></div>
   <div class="notice" id="new-active-notice" ${state.active?'':'hidden'}><strong>A run is already active.</strong> <a href="${state.active?linkRun(state.active):'#runs'}">Inspect or stop it</a> before starting another.</div>
   <form id="new-run-form" novalidate>
   <ol class="setup-stepper" aria-label="Run setup">${['Connect','Choose checks','Review & run'].map((label,index)=>`<li><button type="button" class="setup-step" data-setup-step="${index+1}" aria-controls="setup-panel-${index+1}"><span class="setup-step-index" aria-hidden="true">${index+1}</span><strong>${label}</strong></button></li>`).join('')}</ol>
-<div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Clipboard unavailable. Copy this command:</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
+<div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Clipboard unavailable. Copy this command:</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div id="setup-context" class="setup-context" hidden></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
   <section class="setup-step-content" id="setup-panel-1" data-setup-panel="1" aria-label="Connect">
-  <section class="setup-section" id="setup-deployment">${setupSectionHeader(1,'Connect your endpoint','Paste the OpenAI-compatible address of your LLM server.')}<div class="setup-body"><div class="fields">
-  ${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1'})}</div>
+  <div class="connection-layout"><section class="setup-section" id="setup-deployment">${setupSectionHeader(null,'Endpoint','OpenAI-compatible server')}<div class="setup-body"><div class="fields">
+  ${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}</div>
+  <div class="runtime-shortcuts"><span>Local defaults</span>${['Ollama','vLLM','SGLang'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div>
   <details class="setup-disclosure connection-auth" ${target.api_key_env?'open':''}><summary>API key (optional)</summary><div class="details-content"><p class="hint">Only needed if your endpoint requires an API key. Open local endpoints can leave this empty.</p>${field('api_key_env','Environment variable containing your API key',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
   <details class="setup-disclosure model-options" id="model-options"><summary><span id="model-options-label">${target.model?'Model used for this run':'Model selection (automatic)'}</span></summary><div class="details-content"><p class="hint">A server can host several models. Giraffe selects it automatically when only one is listed. You can also enter an exact name to skip detection.</p><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model name',target.model || '',{required:true,placeholder:'e.g. llama3.2:3b',hint:'Only needed when automatic detection cannot choose a model.'})}</div></div></details>
   <div class="connection-test-action"><button type="button" class="button primary" data-action="test-connection">Test connection</button><p class="hint">Detects available models, then sends one short request (up to 32 tokens). If several models are available, you choose which one to test.</p></div>
   <div class="setup-connection-status" id="model-discovery-status" role="status" aria-live="polite"></div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
-  </div></section>
+  </div></section></div>
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
   ${renderCheckSelection(c)}</section>
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
-  <section class="setup-section" id="setup-review"><header class="setup-heading"><h2>Review & run</h2></header><div class="setup-body">
+  <section class="setup-section" id="setup-review"><header class="setup-heading"><h2>Run configuration</h2><p>Confirm the endpoint, checks and workload before starting.</p></header><div class="setup-body">
   <div id="run-bounds"></div>
   <section id="request-plan" class="request-plan review-section" aria-live="polite"></section><div id="load-guidance" role="status" aria-live="polite"></div>
   <details class="setup-disclosure" id="execution-settings"><summary>Run options</summary><div class="details-content"><div class="fields">${field('name','Endpoint name in results',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare with a previous run',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
   </div></section></section></div>
-<section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section>
+<section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" aria-label="Preview of this run"></aside>
 
   </div>
   <details class="configuration-tools" ${state.configView==='json'||hasJsonChanges()?'open':''}><summary>Save this setup or use advanced options</summary><div class="config-toolbar"><div class="result-tabs config-tabs" role="tablist" aria-label="Configuration view"><button type="button" role="tab" id="config-tab-form" data-config-tab="form" aria-controls="config-panel-form">Guided setup</button><button type="button" role="tab" id="config-tab-json" data-config-tab="json" aria-controls="config-panel-json">Advanced editor</button></div><div class="actions"><button type="button" class="text-button" data-action="import-config">Load saved setup</button><button type="button" class="text-button" data-action="export-config">Save setup to file</button><button type="button" class="text-button" data-action="copy-cli">Copy terminal command</button></div><input type="file" id="config-file" accept=".json,application/json" hidden></div></details>
@@ -1136,6 +1214,7 @@ function updateBounds() {
   $('#selection-summary').textContent=`${selected} checks selected`;
   let payload;try{payload=readForm(true);}catch{return;}
   const c=payload.config;
+  syncSetupIdentity();
   const trafficLimitHint=$('#field-traffic_max_in_flight-hint');if(trafficLimitHint)trafficLimitHint.textContent=`Leave blank to use the shared limit of ${c.concurrency}. This test cannot exceed that limit.`;
   const bucketLimitHint=$('#bucket-shared-limit');if(bucketLimitHint)bucketLimitHint.textContent=`The shared simultaneous-request limit is ${c.concurrency}. Question lengths and answer caps are also used by Short-request slowdown.`;refreshDefaultProfileFields(c);
   const derived=$('#derived-concurrency');if(derived){
@@ -1152,8 +1231,8 @@ function updateBounds() {
     updateCheckRow(check,c,card);
   }
   $('#run-bounds').innerHTML=renderReviewScope(payload);
-  $('#selection-summary').textContent=`${c.checks.length} checks selected`;
-  const summary=$('#run-bar-summary');if(summary){summary.textContent=state.setupStep===3?'':`${c.checks.length} checks · ${c.targets.length} endpoint${c.targets.length===1?'':'s'}`;summary.hidden=state.setupStep===3;}
+  $('#selection-summary').textContent=`${c.checks.length} ${c.checks.length===1?'check':'checks'} selected`;
+  const summary=$('#run-bar-summary');if(summary){summary.textContent=state.setupStep===3?'':`${c.checks.length} ${c.checks.length===1?'check':'checks'} · ${c.targets.length} endpoint${c.targets.length===1?'':'s'}`;summary.hidden=state.setupStep===3;}
   updateSharedSettingsSummaries(c);
   updateCheckFieldHints(c);renderRequestPlan(c);scheduleRequestPlan();
 }
@@ -1219,7 +1298,7 @@ function unselectedCheck(check,report) {
 }
 function resultGuidance(report) {
   const checks=report.checks.filter(c=>c.id!=='baseline'),problem=checks.find(c=>c.status==='fail') || checks.find(c=>['blocked','inconclusive'].includes(c.status));
-  if(problem)return `${problem.summary || 'This check needs a closer look.'} Inspect its evidence below, then review settings before running again.`;
+  if(problem){const scored=problem.metrics?.scored,correct=problem.metrics?.correct;return scored&&correct<scored?`${scored-correct} of ${scored} scored answers did not meet the correctness requirement. Inspect the returned answers to understand the failure.`:`${problem.summary || 'This check needs a closer look.'} Inspect the recorded evidence for this check.`;}
   if(report.abort_reason)return 'The evidence collected so far is saved below. Review the stopping reason and request limits before trying again.';
   if(report.baseline?.status==='fail')return 'Open the baseline comparison to see what regressed and whether the two runs are comparable.';
   if(report.baseline?.status==='inconclusive')return 'Open the baseline comparison to see what could not be compared. No improvement or regression is established.';
@@ -1227,6 +1306,20 @@ function resultGuidance(report) {
   if(!checks.length||checks.every(c=>c.status==='skipped'))return 'No check produced a result. Review settings to choose what to test, then start a new run.';
   if(report.overall==='pass')return 'The recorded checks met their configured limits. Save a baseline to compare your next change. This result applies to the endpoint and traffic tested here.';
   return 'Review the selected checks and their recorded reasons, then adjust the settings for your next run.';
+}
+function findingEvidence(report) {
+  const check=report.checks.find(c=>c.id!=='baseline'&&c.status==='fail') || report.checks.find(c=>c.id!=='baseline'&&['blocked','inconclusive'].includes(c.status));
+  if(!check)return {check:null,record:null};
+  const ids=new Set(check.evidence_ids || []),records=report.requests.filter(record=>ids.has(record.id));
+  const record=records.find(record=>record.score===false) || records.find(record=>['failed','timed_out'].includes(record.status)) || records[0];
+  return {check,record};
+}
+function inspectFinding() {
+  const {check,record}=findingEvidence(state.detail.report);
+  if(record){openRequest(record.id);return;}
+  if(check)state.selectedCheck=`${check.target}:${check.id}`;
+  state.tab='checks';renderDetail();
+  const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus();
 }
 function renderDetail() {
   const d=state.detail;if(activeState(d)){renderLive();return;}
@@ -1236,8 +1329,9 @@ function renderDetail() {
   const required=checks.filter(c=>c.required);
   const absolute=checks.some(c=>c.status==='fail')?'fail':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||checks.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
   const completePass=d.state==='completed'&&!d.error&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||unselectedCheck(c,report));
+  const finding=findingEvidence(report);
   const compareNext=!completePass&&!checks.some(c=>['fail','blocked','inconclusive'].includes(c.status))&&!report.abort_reason&&['fail','inconclusive'].includes(report.baseline?.status);
-  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext?`<button class="button" data-action="rerun">${icon('repeat')} Run again</button>`:''}</div></div>
+  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
   <div class="result-summary">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item"><strong>${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span style="margin-left:auto" class="hint">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div>
   <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
@@ -1252,7 +1346,7 @@ function renderChecks(report) {
   const selected=checks.find(c=>`${c.target}:${c.id}`===state.selectedCheck) || checks.find(c=>c.status!=='skipped');state.selectedCheck=selected?`${selected.target}:${selected.id}`:null;
   const attention=checks.filter(c=>!['pass','skipped'].includes(c.status)),passed=checks.filter(c=>c.status==='pass'),skipped=checks.filter(c=>c.status==='skipped');
   const checkButton=c=>`<button class="check-item ${c===selected?'selected':''}" data-check="${escape(`${c.target}:${c.id}`)}" aria-pressed="${c===selected}"><span><span class="check-name">${escape(checkGuide[c.id]?.name || c.title)}</span><small>${escape(keyMetric(c,report))}${(reportConfig(report).targets || []).length>1?` · ${escape(c.target)}`:''}</small></span>${badge(c.status,unselectedCheck(c,report)?'Not selected':undefined)}</button>`;
-  return `<div class="result-grid"><div class="panel check-list" aria-label="Check results">${attention.length?`<h2 class="check-group-heading">Needs attention · ${attention.length}</h2>${attention.map(checkButton).join('')}`:''}${passed.length?`<h2 class="check-group-heading">Passed checks · ${passed.length}</h2>${passed.map(checkButton).join('')}`:''}${skipped.length?`<details class="checks-not-run" ${selected?.status==='skipped'?'open':''}><summary>Not run · ${skipped.length}</summary>${skipped.map(checkButton).join('')}</details>`:''}</div><section class="panel check-detail">${selected?renderCheck(selected,report):'<div class="empty-state"><h2>No checks ran</h2><p>Expand “Not run” to inspect the recorded reasons, or review settings to choose your checks.</p><button class="button" data-action="rerun">Review settings</button></div>'}</section></div>`;
+  return `<div class="result-grid"><section class="panel check-detail">${selected?renderCheck(selected,report):'<div class="empty-state"><h2>No checks ran</h2><p>Open the check list to inspect recorded reasons, or review settings to choose your checks.</p><button class="button" data-action="rerun">Review settings</button></div>'}</section><div class="result-navigator ${state.checkNavigatorOpen?'is-expanded':''}"><button type="button" class="button check-navigator-toggle" data-action="toggle-checks" aria-expanded="${Boolean(state.checkNavigatorOpen)}" aria-controls="check-result-list">${state.checkNavigatorOpen?'Hide check list':'Browse check results'}</button><nav class="check-list" id="check-result-list" aria-label="Check results">${attention.length?`<h2 class="check-group-heading">Needs attention · ${attention.length}</h2>${attention.map(checkButton).join('')}`:''}${passed.length?`<h2 class="check-group-heading">Passed checks · ${passed.length}</h2>${passed.map(checkButton).join('')}`:''}${skipped.length?`<details class="checks-not-run" ${selected?.status==='skipped'?'open':''}><summary>Not run · ${skipped.length}</summary>${skipped.map(checkButton).join('')}</details>`:''}</nav></div></div>`;
 }
 function metric(label,value,detail=''){return `<div class="metric"><dt>${escape(label)}</dt><dd>${escape(value)}</dd>${detail?`<small>${escape(detail)}</small>`:''}</div>`;}
 function renderCancellationResults(metrics){
@@ -1321,20 +1415,35 @@ function renderTrafficComparison(capacity){
   return `<div class="traffic-summary"><h3>Tested arrival capacity ${badge(capacity.status)}</h3><p class="hint">${escape(capacity.reason || '')}</p><dl class="metrics-grid"><div class="metric"><dt>Baseline accepted rate</dt><dd>${rate(capacity.baseline_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Current accepted rate</dt><dd>${rate(capacity.current_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Capacity change</dt><dd>${capacity.delta_rps==null?'Unconfirmed':`${capacity.delta_rps>0?'+':''}${number(capacity.delta_rps,2)} req/s`}</dd><small>${capacity.change_percent==null?'Matching, complete stages required':`${capacity.change_percent>0?'+':''}${number(capacity.change_percent,1)}%`}</small></div></dl></div>${capacity.stages?.length?`<div class="metric-table"><table><thead><tr><th>Rate</th><th>Baseline goodput</th><th>Current goodput</th><th>Capacity evidence</th></tr></thead><tbody>${capacity.stages.map(stage=>`<tr><td>${rate(stage.rate_rps)}</td><td>${rate(stage.baseline?.goodput_rps)}</td><td>${rate(stage.current?.goodput_rps)}</td><td>${badge(stage.status)}<small>${escape(stage.reason || '')}</small>${stage.timing_comparable===false?`<small>${escape(stage.timing_comparison_reason || '')}</small>`:''}</td></tr>`).join('')}</tbody></table></div>`:''}`;
 }
 function isProbe(r){return ['client_cancel','client_deadline','deadline_probe'].includes(r.scenario)||/intentional cancellation/i.test(r.error || '');}
+function comparisonTable(rows) {
+  return `<div class="comparison-table"><table><thead><tr><th>Measurement / scenario</th><th>Baseline</th><th>Current</th><th>Worsening</th><th>Result</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${escape(row.metric==='output_tokens_per_second'?'End-to-end output rate':row.metric==='generation_tokens_per_second'?'Generation pace (estimate)':human(row.metric))}<small>${escape(row.scenario)}</small><small>${escape(row.reason || '')}</small></td><td class="mono">${comparisonValue(row,row.baseline)}<small>n=${number(row.baseline_samples)}</small></td><td class="mono">${comparisonValue(row,row.current)}<small>n=${number(row.current_samples)}</small></td><td class="mono">${row.worsening==null?'—':`${row.worsening>0?'+':''}${number(row.worsening,1)}${row.change_unit==='percentage_points'?' pp':'%'}`}<small>${row.threshold==null?'':`Threshold ${number(row.threshold,1)}${row.change_unit==='percentage_points'?' pp':'%'}`}</small></td><td>${badge(row.status)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function comparisonGroup(id,rows) {
+  const status=rows.some(row=>row.status==='fail')?'fail':rows.some(row=>row.status==='inconclusive')?'inconclusive':rows.every(row=>row.status==='pass')?'pass':rows[0]?.status || 'inconclusive';
+  const reasons=[...new Set(rows.map(row=>row.reason).filter(Boolean))];
+  const counts=['fail','inconclusive','pass'].map(key=>[key,rows.filter(row=>row.status===key).length]).filter(([,count])=>count);
+  return `<details class="comparison-check-group" data-comparison-group="${escape(id)}"><summary><span class="comparison-group-name">${escape(catalogTitle(id))}<small>${counts.map(([key,count])=>`${number(count)} ${key==='fail'?'regressed':key==='pass'?'without material regression':'inconclusive'}`).join(' · ')}</small></span>${badge(status)}<span class="disclosure-arrow" aria-hidden="true">⌄</span></summary><div class="comparison-group-body">${reasons.length?`<ul class="comparison-reason-list">${reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul>`:''}${comparisonTable(rows)}</div></details>`;
+}
+function baselineIdentity(baseline) {
+  const saved=state.baselines.find(item=>item.id===state.detail?.baseline_id || (baseline.run_id&&item.run_id===baseline.run_id));
+  const run=state.runs.find(item=>baseline.run_id&&item.run_id===baseline.run_id);
+  const label=saved?.name || run?.targets?.map(target=>target.model).filter(Boolean).join(', ') || 'Saved reference run';
+  const when=baseline.source_started_at || run?.started_at || saved?.saved_at;
+  return `<strong>${escape(label)}</strong>${when?`<span>${date(when)}</span>`:''}<details class="baseline-identifier"><summary>Reference ID</summary><code>${escape(baseline.run_id || 'Not recorded')}</code></details>`;
+}
 function renderComparison(report) {
-  const b=report.baseline;if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><p>This run still evaluates its configured acceptance limits. Save a reference run, then select it when starting another suite to measure change.</p><button class="button primary" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
-  const allRows=(b.targets || []).flatMap(t=>t.comparisons || []),checkIds=[...new Set(allRows.map(r=>r.check))].sort();
-  state.comparisonFilter ??= allRows.some(r=>r.status!=='pass')?'attention':'all';
-  const trafficOnly=!allRows.length&&(b.targets || []).some(target=>target.traffic_capacity);
-  const filters=trafficOnly?'':`<div class="comparison-filters"><div><label for="comparison-outcome">Metric outcome</label><select id="comparison-outcome"><option value="attention">Needs attention</option><option value="all">All outcomes</option><option value="fail">Regressions</option><option value="inconclusive">Inconclusive</option><option value="pass">No material regression</option></select></div><div><label for="comparison-check">Check</label><select id="comparison-check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(state.bootstrap.checks.find(c=>c.id===id)?.title || human(id))}</option>`).join('')}</select></div><span class="hint">${number(allRows.length)} recorded metric comparisons</span></div>`;
+  const b=report.baseline;if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><p>Save a reference run, then select it when starting another suite to measure change. This run still evaluates its own acceptance limits.</p><button class="button primary" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
+  const allRows=(b.targets || []).flatMap(t=>t.comparisons || []),checkIds=[...new Set(allRows.map(row=>row.check))].sort();
+  state.comparisonFilter ??= allRows.some(row=>row.status!=='pass')?'attention':'all';
+  const conclusion=b.status==='fail'?'A material regression was detected':b.status==='pass'?'No material regression detected':'The comparison is inconclusive';
+  const guidance=b.status==='inconclusive'?'The recorded evidence does not establish improvement or regression. Open a check to see which measurements could not resolve the comparison.':b.status==='pass'?'The comparable measurements stayed within the configured regression limits. This is separate from the run’s acceptance result.':'Open the affected checks to inspect the changes and the conditions under which they were measured.';
+  const filters=allRows.length?`<div class="comparison-filters"><div><label for="comparison-outcome">Show</label><select id="comparison-outcome"><option value="attention">Needs attention</option><option value="all">All outcomes</option><option value="fail">Regressions</option><option value="inconclusive">Inconclusive</option><option value="pass">No material regression</option></select></div><div><label for="comparison-check">Check</label><select id="comparison-check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div><span class="hint">${number(allRows.length)} measurements, grouped by check</span></div>`:'';
   const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='attention'?row.status!=='pass':row.status===state.comparisonFilter))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
-  return `${filters}<div class="notice"><strong>${escape(statusLabels[b.status] || b.status)} comparison</strong> against <span class="mono">${escape(b.run_id)}</span>. Baseline results are separate from absolute acceptance checks.</div>${(b.targets || []).map(t=>{
-    const rows=[...(t.comparisons || [])].filter(filterRow).sort((a,c)=>(order[a.status]??5)-(order[c.status]??5));
-    const onlyTraffic=!(t.comparisons || []).length&&Boolean(t.traffic_capacity);
-    const count=onlyTraffic?`${t.traffic_capacity.stages?.length || 0} traffic stages compared`:`${rows.length} / ${(t.comparisons || []).length} metrics shown`;
-    const summary=onlyTraffic?t.traffic_capacity.reason:t.summary || report.checks.find(c=>c.id==='baseline'&&c.target===t.target)?.summary || '';
-    return `<section class="panel comparison-section"><div class="section-heading"><div><h2>${escape(t.target || t.name || 'Target')} <span class="hint">${escape(count)}</span></h2><p>${escape(summary)}</p></div>${badge(t.status)}</div>${t.traffic_capacity?renderTrafficComparison(t.traffic_capacity):''}<details class="check-observations"><summary>Deployment changes · ${t.configuration_diff?.confounded?'confounded experiment':'causality unverified'}</summary><pre>${escape(JSON.stringify(t.configuration_diff || {unknown_baseline:true},null,2))}</pre></details><details class="check-observations"><summary>Serving telemetry and repeatability comparison</summary><pre>${escape(JSON.stringify({telemetry:t.telemetry,consistency:t.consistency_changes},null,2))}</pre></details>${(t.reasons || []).length?`<div class="comparison-reasons">${t.reasons.map(x=>`<p>${escape(x)}</p>`).join('')}</div>`:''}${rows.length?`<div class="comparison-table"><table><thead><tr><th>Metric / scenario</th><th>Baseline</th><th>Current</th><th>Worsening</th><th>Result</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${escape(row.metric==='output_tokens_per_second'?'End-to-end output rate':row.metric==='generation_tokens_per_second'?'Generation pace (estimate)':human(row.metric))}<small>${escape(row.check)} · ${escape(row.scenario)}</small><small>${escape(row.reason || '')}</small></td><td class="mono">${comparisonValue(row,row.baseline)}<small>n=${number(row.baseline_samples)}</small></td><td class="mono">${comparisonValue(row,row.current)}<small>n=${number(row.current_samples)}</small></td><td class="mono">${row.worsening==null?'—':`${row.worsening>0?'+':''}${number(row.worsening,1)}${row.change_unit==='percentage_points'?' pp':'%'}`}<small>${row.threshold==null?'':`Threshold ${number(row.threshold,1)}${row.change_unit==='percentage_points'?' pp':'%'}`}</small></td><td>${badge(row.status)}</td></tr>`).join('')}</tbody></table></div>`:onlyTraffic?'':'<div class="comparison-reasons">No metric rows match these filters.</div>'}${Object.keys(t.identity_changes || {}).length?`<details class="check-observations"><summary>Declared deployment identity changes</summary><pre>${escape(JSON.stringify(t.identity_changes,null,2))}</pre></details>`:''}</section>`;
-  }).join('')}<details class="panel details-box"><summary>Comparison method</summary><div class="details-content"><p class="hint">${escape(b.method || '')}</p></div></details>`;
+  return `<header class="comparison-conclusion"><div>${badge(b.status,'Comparison '+(statusLabels[b.status] || b.status).toLowerCase())}<h2>${escape(conclusion)}</h2><p>${escape(guidance)}</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}</div></header>${filters}${(b.targets || []).map(target=>{
+    const rows=[...(target.comparisons || [])].filter(filterRow).sort((a,c)=>(order[a.status]??5)-(order[c.status]??5));
+    const groups=new Map();for(const row of rows){if(!groups.has(row.check))groups.set(row.check,[]);groups.get(row.check).push(row);}
+    return `<section class="comparison-section"><div class="comparison-target-heading"><h3>${escape(target.target || target.name || 'Target')}${!(target.comparisons || []).length&&target.traffic_capacity?` <span class="hint">${target.traffic_capacity.stages?.length || 0} traffic stages compared</span>`:''}</h3>${badge(target.status)}</div>${(target.comparisons || []).length&&target.summary?`<p class="hint comparison-target-summary">${escape(target.summary)}</p>`:''}${target.traffic_capacity?renderTrafficComparison(target.traffic_capacity):''}${(target.reasons || []).length?`<ul class="comparison-reason-list">${target.reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul>`:''}${[...groups].map(([id,values])=>comparisonGroup(id,values)).join('')}${!groups.size&&(target.comparisons || []).length?'<p class="comparison-reasons">No measurements match these filters.</p>':''}<details class="comparison-support"><summary>Deployment and comparison details</summary><p class="hint">${target.configuration_diff?.confounded?'Confounded experiment':'Causality unverified'}. Baseline comparisons are separate from absolute acceptance checks.</p><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></details></section>`;
+  }).join('')}<details class="comparison-support"><summary>Comparison method</summary><p class="hint">${escape(b.method || 'Method was not recorded in this report.')}</p></details>`;
 }
 function syncComparisonFilters(){if($('#comparison-outcome'))$('#comparison-outcome').value=state.comparisonFilter;if($('#comparison-check'))$('#comparison-check').value=state.comparisonCheck;}
 function comparisonValue(row,value){if(value==null)return '—';if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':''}`;}
@@ -1379,7 +1488,7 @@ function renderEvaluationEvidence(record,report) {
 function openRequest(id) {
   const report=state.detail.report,r=report.requests.find(x=>x.id===id);if(!r)return;
   const dialog=$('#request-dialog'),retention=reportConfig(report).retention || 'failures';
-  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Request evidence</div><h2 id="request-title">${escape(r.fixture_id)}</h2><p class="mono">${escape(r.id)}</p></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body"><div class="statline"><span class="pill">${escape(r.target)}</span><span class="muted">${escape(r.scenario)}</span><span>Response: ${escape(r.status)}</span>${r.score===false?badge('fail','Incorrect answer'):r.score===true?badge('pass','Correct answer'):'<span class="dim">Answer unscored</span>'}</div>${isProbe(r)?'<div class="notice" style="margin-top:20px">This request is an intentional cancellation or deadline probe. Its transport status alone does not indicate a failed suite check.</div>':''}${r.error?`<div class="notice ${isProbe(r)?'':'error'}" style="margin-top:20px">${escape(r.error)}</div>`:''}<dl class="metrics-grid" style="margin-top:24px">${r.traffic_stage!=null?metric('Arrival rate',`${number(r.traffic_rate_rps,2)} requests/s`,r.traffic_class || '')+metric('Local dispatch delay',ms(r.dispatch_lag_ms),'Measured from planned arrival; not server queue time'):''}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Last answer',ms(r.last_output_ms))}${metric('First reasoning',ms(r.first_reasoning_ms))}${metric('Longest stream gap',ms(r.max_stream_gap_ms))}${metric('Input / output tokens',`${number(r.input_tokens)} / ${number(r.output_tokens)}`,'Server-reported usage')}${metric('HTTP / finish reason',`${r.http_status ?? '—'} / ${r.finish_reason || '—'}`)}</dl>${r.score_message?`<p class="hint" style="margin-top:18px">${escape(r.score_message)}</p>`:''}<div class="request-comparison"><section>${renderEvaluationEvidence(r,report)}</section><section><h3>Actual answer <span class="hint">${number(r.output_chars)} recorded characters</span></h3><div class="body-output">${r.output?`<pre>${escape(r.output)}</pre>`:r.output_chars>0?`<p class="body-not-retained">Body not retained (retention: ${escape(retention)}). Measurements and scoring are preserved.</p>`:'<p class="body-not-retained">No answer text was recorded for this request.</p>'}</div></section></div>${renderJudgement(r.judgement)}<h3>Reasoning output</h3><div class="body-output">${r.reasoning?`<pre>${escape(r.reasoning)}</pre>`:`<p class="body-not-retained">${retention==='all'?'No reasoning text was recorded.':'No reasoning body retained. This does not establish whether the model reasoned.'}</p>`}</div><p class="hint" style="margin-top:18px">${r.valid?'Valid non-empty completion':'Completion not validated'} · ${r.stream?'Streaming':'Non-streaming'} · ${r.stream_terminated?'Stream termination observed':'Stream termination not recorded'}</p></div><div class="dialog-footer"><button class="button" data-action="close-dialog">Close</button></div>`;
+  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Request evidence</div><h2 id="request-title">${escape(r.fixture_id)}</h2><p class="mono">${escape(r.id)}</p></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body"><div class="statline"><span class="pill">${escape(r.target)}</span><span class="muted">${escape(r.scenario)}</span><span>Response: ${escape(r.status)}</span>${r.score===false?badge('fail','Incorrect answer'):r.score===true?badge('pass','Correct answer'):'<span class="dim">Answer unscored</span>'}</div>${isProbe(r)?'<div class="notice" style="margin-top:20px">This request is an intentional cancellation or deadline probe. Its transport status alone does not indicate a failed suite check.</div>':''}${r.error?`<div class="notice ${isProbe(r)?'':'error'}" style="margin-top:20px">${escape(r.error)}</div>`:''}${r.score_message?`<p class="hint" style="margin-top:18px">${escape(r.score_message)}</p>`:''}<div class="request-comparison"><section>${renderEvaluationEvidence(r,report)}</section><section><h3>Actual answer <span class="hint">${number(r.output_chars)} recorded characters</span></h3><div class="body-output">${r.output?`<pre>${escape(r.output)}</pre>`:r.output_chars>0?`<p class="body-not-retained">Body not retained (retention: ${escape(retention)}). Measurements and scoring are preserved.</p>`:'<p class="body-not-retained">No answer text was recorded for this request.</p>'}</div></section></div>${renderJudgement(r.judgement)}<details class="request-timing"><summary>Timing & transport details</summary><dl class="metrics-grid" style="margin-top:24px">${r.traffic_stage!=null?metric('Arrival rate',`${number(r.traffic_rate_rps,2)} requests/s`,r.traffic_class || '')+metric('Local dispatch delay',ms(r.dispatch_lag_ms),'Measured from planned arrival; not server queue time'):''}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Last answer',ms(r.last_output_ms))}${metric('First reasoning',ms(r.first_reasoning_ms))}${metric('Longest stream gap',ms(r.max_stream_gap_ms))}${metric('Input / output tokens',`${number(r.input_tokens)} / ${number(r.output_tokens)}`,'Server-reported usage')}${metric('HTTP / finish reason',`${r.http_status ?? '—'} / ${r.finish_reason || '—'}`)}</dl></details><details class="request-reasoning"><summary>Reasoning output</summary><div class="body-output">${r.reasoning?`<pre>${escape(r.reasoning)}</pre>`:`<p class="body-not-retained">${retention==='all'?'No reasoning text was recorded.':'No reasoning body retained. This does not establish whether the model reasoned.'}</p>`}</div></details><p class="hint" style="margin-top:18px">${r.valid?'Valid non-empty completion':'Completion not validated'} · ${r.stream?'Streaming':'Non-streaming'} · ${r.stream_terminated?'Stream termination observed':'Stream termination not recorded'}</p></div><div class="dialog-footer"><button class="button" data-action="close-dialog">Close</button></div>`;
   dialog.showModal();
 }
 function openBaselineDialog(){
@@ -1493,16 +1602,20 @@ async function copyCli() {
 
 document.addEventListener('click',async(event)=>{
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
-  const setupStep=event.target.closest('[data-setup-step]');if(setupStep){navigateSetup(Number(setupStep.dataset.setupStep));return;}
+  const setupStep=event.target.closest('[data-setup-step]');if(setupStep){state.returnToReview=Boolean(setupStep.dataset.reviewEdit);navigateSetup(Number(setupStep.dataset.setupStep));return;}
   const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;renderDetail();$(`#tab-${state.tab}`).focus();return;}
-  const check=event.target.closest('[data-check]');if(check){state.selectedCheck=check.dataset.check;const selectedKey=state.selectedCheck;$('#result-content').innerHTML=renderChecks(state.detail.report);[...document.querySelectorAll('[data-check]')].find(e=>e.dataset.check===selectedKey)?.focus();return;}
+  const check=event.target.closest('[data-check]');if(check){state.selectedCheck=check.dataset.check;state.checkNavigatorOpen=false;$('#result-content').innerHTML=renderChecks(state.detail.report);const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus();return;}
   const request=event.target.closest('[data-request]');if(request){openRequest(request.dataset.request);return;}
   const action=event.target.closest('[data-action]')?.dataset.action;
+  if(action==='inspect-finding'){inspectFinding();return;}
+  if(action==='toggle-checks'){state.checkNavigatorOpen=!state.checkNavigatorOpen;$('#result-content').innerHTML=renderChecks(state.detail.report);$('[data-action="toggle-checks"]')?.focus({preventScroll:true});return;}
+  if(action==='check-intent'){browseCheckIntent(event.target.closest('[data-category]').dataset.category);return;}
+  if(action==='runtime-shortcut'){useRuntimeShortcut(event.target.closest('[data-runtime]').dataset.runtime);return;}
   if(action==='catalogue-category'){state.catalogueCategory=event.target.closest('[data-category]').dataset.category;syncTestControls();return;}
   if(action==='catalogue-filter'){state.catalogueFilter=event.target.closest('[data-catalogue-filter]').dataset.catalogueFilter;syncTestControls();return;}
   if(action==='reset-profile'){try{assertAppliedConfig();const key=event.target.closest('[data-profile]').dataset.profile;captureFormDraft();state.config[key]=null;configChanged();renderNew('custom');$(`[data-profile="${key}"]`)?.focus();}catch(error){configError(error);}return;}
   if(action==='quick-checks'){try{assertAppliedConfig();captureFormDraft();state.config.checks=['access','correctness'];state.config.structured_json=false;state.config.metrics=false;state.config.tool_calling=false;state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;configChanged();renderNew('custom');$('[data-catalogue-filter="selected"]')?.focus();}catch(error){configError(error);}return;}
-  if(action==='setup-next'){navigateSetup(state.setupStep+1);return;}
+  if(action==='setup-next'){navigateSetup(state.returnToReview?3:state.setupStep+1);return;}
   if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
   if(action==='test-connection'){await testConnection();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
@@ -1533,7 +1646,7 @@ document.addEventListener('click',async(event)=>{
     return;
   }
   if(action==='edit-run-limits'){
-    try{assertAppliedConfig();captureFormDraft();revealSetupStep(2);updateBounds();$('#shared-settings').open=true;$('#new-run-form').elements.max_requests.focus();}catch(error){configError(error);}
+    try{assertAppliedConfig();state.returnToReview=state.setupStep===3;captureFormDraft();revealSetupStep(2);updateBounds();$('#shared-settings').open=true;$('#new-run-form').elements.max_requests.focus();}catch(error){configError(error);}
     return;
   }
   if(action==='edit-load'){
@@ -1547,7 +1660,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='toggle-available-tests'){state.showAvailableTests=!state.showAvailableTests;syncTestControls();return;}
   if(action==='select-tests'||action==='clear-tests'){configChanged();for(const input of $$('#new-run-form input[name="check"]'))input.checked=action==='select-tests';captureFormDraft();renderNew('custom');return;}
   if(action==='reset-traffic'){configChanged();const form=$('#new-run-form');form.elements.traffic_mode.value='default';const defaults=state.bootstrap.config.traffic;for(const [key,value] of Object.entries(defaults)){if(key==='mix'){for(const [kind,weight] of Object.entries(value))form.elements[`traffic_mix_${kind}`].value=weight;}else form.elements[`traffic_${key}`].value=Array.isArray(value)?value.join(', '):value ?? '';}syncTestControls();updateBounds();return;}
-  if(action==='retry')route();if(action==='clear-filter'){state.filter='all';renderRuns();}
+  if(action==='retry')route();if(action==='clear-filter'){state.filter='all';state.historySearch='';renderRuns();}
   if(action==='stop')await stopRun();if(action==='rerun')rerun();if(action==='baseline-dialog')openBaselineDialog();
   if(action==='close-dialog')event.target.closest('dialog').close();if(action==='apply-config')await applyConfig();
   if(action==='discard-config')discardConfig();
@@ -1580,6 +1693,7 @@ document.addEventListener('click',async(event)=>{
 });
 document.addEventListener('submit',event=>{if(event.target.id==='new-run-form')startRun(event);if(event.target.id==='baseline-form')saveBaseline(event);if(event.target.id==='dataset-example-form')saveExample(event);if(event.target.id==='dataset-import-form')useImportedDataset(event);if(event.target.id==='dataset-try-form')tryDatasetExample(event);});
 document.addEventListener('input',event=>{
+  if(event.target.id==='run-search'){state.historySearch=event.target.value;renderRuns();return;}
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
   if(['url','model','name'].includes(event.target.name))event.target.setCustomValidity?.('');

@@ -84,7 +84,8 @@ def test_check_rows_keep_details_in_accessible_info_and_update_live_settings():
     browser_logic(r"""
 for(const check of bootstrap.checks){
   const row=renderTestCard(check,config),helpId='field-check_'+check.id+'-help';
-  assert.doesNotMatch(row,/test-description|test-effective-summary|traffic-profile-summary|check-explanation-disclosure/);
+  assert(row.includes('<p class="test-description">'+escape(checkGuide[check.id].purpose)+'</p>'));
+  assert.doesNotMatch(row,/test-effective-summary|traffic-profile-summary|check-explanation-disclosure/);
   assert.match(row,new RegExp('</label><button type="button" class="field-info"[^>]*popovertarget="'+helpId+'"'));
   assert(row.includes('aria-label="About '+escape(catalogTitle(check.id))+'"'));
   assert(row.includes('id="'+helpId+'" class="field-help" popover="auto"'));
@@ -322,8 +323,8 @@ for(const id of ['run-ceilings-summary','request-defaults-summary','acceptance-s
 config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
 assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
-assert(catalogue.indexOf('id="shared-settings"')<catalogue.indexOf('id="test-selection"'));
+assert(catalogue.indexOf('id="test-selection"')<catalogue.indexOf('id="shared-settings"'));
 assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
-assert.doesNotMatch(catalogue,/catalogue-view-hint|Start with the selected checks/);
+assert.doesNotMatch(catalogue,/catalogue-view-hint/);
 """)

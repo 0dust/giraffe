@@ -28,7 +28,8 @@ state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
 assert.match(visible,/<h3>Traffic<\/h3>/);assert(visible.includes(setupPlanCount(plan)));
-assert.match(visible,/Limits: up to/);assert.match(visible,/traffic time limit/);
+assert.match(visible,/<dt>Request limit<\/dt>/);assert.match(visible,/<dt>Traffic time limit<\/dt>/);
+assert(visible.includes(`<dd>${number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${elapsed(config.max_duration_seconds)}</dd>`));
 assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass criteria|requests per endpoint/);
 assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
 assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
@@ -65,7 +66,8 @@ let markup=renderReviewScope({config,mode:'cold-start',restart_target:'staging <
 for(const value of ['http://local/v1','https://stage.example/v1','model-a','model-b','staging &lt;b&gt;'])assert(markup.includes(value));
 assert.match(markup,/Your questions · 2 saved questions/);assert.match(markup,/Restart staging &lt;b&gt; before testing/);
 assert.match(markup,/data-setup-step="1">Edit connection/);assert.match(markup,/data-setup-step="2">Edit checks/);
-assert.doesNotMatch(markup,/Your run|setup-side-summary|<dl|Simultaneous limit|Whole-run time limit/);
+assert.doesNotMatch(markup,/Your run|setup-side-summary|Simultaneous limit|Whole-run time limit/);
+assert.match(markup,/<dl class="review-identity">/);assert.match(markup,/<ul class="review-check-names"><li>Endpoint response<\/li><li>Answer correctness<\/li><\/ul>/);
 assert.equal(JSON.stringify(config),before);
 config.checks=['access'];markup=renderReviewScope({config,mode:'normal'});
 assert.doesNotMatch(markup,/Your questions|saved questions|Restart /); // Inactive dataset is not advertised as traffic.
