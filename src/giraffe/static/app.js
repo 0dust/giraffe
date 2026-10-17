@@ -32,28 +32,59 @@ function requestOutcome(record) {
 }
 const mosaicPageSize=240;
 const mosaicGeometry=new Map();
-function reticulateCells(count) {
-  if(mosaicGeometry.has(count))return mosaicGeometry.get(count);
-  const columns=Math.min(20,Math.max(4,Math.ceil(Math.sqrt(count*3)))),rows=Math.ceil(count/columns);
-  const width=960,height=Math.max(120,rows*28),dx=width/columns,dy=height/rows;
-  const noise=n=>{const v=Math.sin(n*127.1+311.7)*43758.5453;return v-Math.floor(v);};
-  const points=Array.from({length:count},(_,i)=>[(i%columns+.25+noise(i)*.5)*dx,(Math.floor(i/columns)+.25+noise(i+401)*.5)*dy]);
-  const cells=points.map(([x,y],index)=>{
-    let polygon=[[0,0],[width,0],[width,height],[0,height]];
-    for(let j=0;j<points.length;j++){
+// A giraffe coat is a Voronoi diagram: each site owns the plane nearest to it.
+// Sites start on a staggered grid, are jittered, then relaxed once so spots are even.
+function coatPolygons(sites,width,height,inset=0,reach=Infinity) {
+  return sites.map(([x,y],index)=>{
+    let polygon=[[inset,inset],[width-inset,inset],[width-inset,height-inset],[inset,height-inset]];
+    for(let j=0;j<sites.length&&polygon.length;j++){
       if(j===index)continue;
-      const [px,py]=points[j],a=px-x,b=py-y,c=(px*px+py*py-x*x-y*y)/2;
-      const clipped=[];
+      const [px,py]=sites[j],a=px-x,b=py-y;
+      if(Math.abs(a)>reach||Math.abs(b)>reach)continue;
+      const c=(px*px+py*py-x*x-y*y)/2-inset*Math.hypot(a,b),clipped=[];
       for(let k=0;k<polygon.length;k++){
         const p=polygon[k],q=polygon[(k+1)%polygon.length],dp=a*p[0]+b*p[1]-c,dq=a*q[0]+b*q[1]-c;
         if(dp<=0)clipped.push(p);
         if((dp<0&&dq>0)||(dp>0&&dq<0)){const t=dp/(dp-dq);clipped.push([p[0]+t*(q[0]-p[0]),p[1]+t*(q[1]-p[1])]);}
       }
-      polygon=clipped;if(!polygon.length)break;
+      polygon=clipped;
     }
-    return polygon.map(([px,py])=>`${px.toFixed(2)},${py.toFixed(2)}`).join(' ');
+    return polygon;
   });
-  const geometry={cells,width,height,columns};
+}
+function coatGeometry(count,width,height,{seed=count,columns,inset=4.5,jitter=.55,relax=true}={}) {
+  let state32=(seed*2654435761)>>>0;
+  const random=()=>{state32=(state32+0x6D2B79F5)>>>0;let t=state32;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return ((t^t>>>14)>>>0)/4294967296;};
+  columns ||= Math.max(1,Math.round(Math.sqrt(count*width/height)));
+  const rows=Math.ceil(count/columns),dx=width/columns,dy=height/rows;
+  // Spread sites evenly across rows so a short final row never stretches into slabs.
+  const perRow=Array.from({length:rows},(_,row)=>Math.floor(count/rows)+(row<count%rows?1:0));
+  let sites=perRow.flatMap((n,row)=>Array.from({length:n},(_,column)=>{
+    const step=width/n,shift=row%2?.25:-.25;
+    return [Math.min(width-1,Math.max(1,(column+.5+shift+(random()-.5)*jitter)*step)),Math.min(height-1,Math.max(1,(row+.5+(random()-.5)*jitter)*dy))];
+  }));
+  // One Lloyd step: move each site to its cell centroid.
+  const reach=4*Math.max(dx,dy);
+  if(relax)sites=coatPolygons(sites,width,height,0,reach).map((polygon,i)=>{
+    if(polygon.length<3)return sites[i];
+    let area=0,cx=0,cy=0;
+    for(let k=0;k<polygon.length;k++){const [x0,y0]=polygon[k],[x1,y1]=polygon[(k+1)%polygon.length],cross=x0*y1-x1*y0;area+=cross;cx+=(x0+x1)*cross;cy+=(y0+y1)*cross;}
+    return area?[cx/(3*area),cy/(3*area)]:sites[i];
+  });
+  const outlines=coatPolygons(sites,width,height,0,reach),inner=coatPolygons(sites,width,height,inset,reach);
+  return sites.map((site,i)=>({site,points:(inner[i].length>2?inner[i]:outlines[i]).map(([x,y])=>`${x.toFixed(2)},${y.toFixed(2)}`).join(' ')}));
+}
+function reticulateCells(count) {
+  if(mosaicGeometry.has(count))return mosaicGeometry.get(count);
+  // Spots stay a readable size: a handful of requests never stretch into slabs.
+  const size=Math.max(34,Math.min(84,Math.sqrt(960*300/Math.max(1,count))));
+  // Keep the coat roughly 3:1 so small runs still read as spots, not slabs.
+  const rows=Math.ceil(count/Math.max(1,Math.min(count,Math.round(960/size),Math.ceil(Math.sqrt(count*3))))),columns=Math.ceil(count/rows);
+  const width=Math.round(columns*size),height=Math.round(Math.max(1,rows)*size*.86);
+  // Inset each cell by half the channel plus the corner radius; the stroke adds the radius back as a rounded edge.
+  const round=Math.max(1.6,size*.075),channel=Math.max(2.4,size*.05);
+  const cells=coatGeometry(count,width,height,{columns,inset:channel/2+round}).map(cell=>cell.points);
+  const geometry={cells,width,height,columns,round:Number((round*2).toFixed(2))};
   if(mosaicGeometry.size>8)mosaicGeometry.clear();
   mosaicGeometry.set(count,geometry);return geometry;
 }
@@ -69,12 +100,13 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const pages=Math.ceil(total/mosaicPageSize),page=Math.min(state.mosaicPage || 0,pages-1),offset=page*mosaicPageSize;
   state.mosaicPage=page;
   const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count);
+  const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
   const bySlot=new Map(records.map((r,i)=>[live?r.slot:i,r]));
   const statuses=live?['pass','fail','inconclusive','running','idle']:['pass','fail','inconclusive'];
-  return `<section class="request-viz"><div class="viz-heading"><div><span class="eyebrow">Every request, one spot</span><h2>${live?'Request budget':'Request mosaic'}</h2></div><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span></div><div class="mosaic-scroll"><svg class="request-mosaic" viewBox="0 0 ${geometry.width} ${geometry.height}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
+  return `<section class="request-viz"><div class="viz-heading"><div><span class="eyebrow">Every request, one spot</span><h2>${live?'Request budget':'Request mosaic'}</h2></div><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span></div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
     const r=bySlot.get(offset+i),status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',label=r?`Request ${offset+i+1}: ${r.fixture_id || r.scenario || ''}. ${statusLabels[status] || status}. ${r.elapsed_ms==null?'Timing pending':ms(r.elapsed_ms)}`:status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
     const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
-    return `<g class="request-spot ${status}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><title>${escape(label)}</title><polygon points="${points}"/></g>`;
+    return `<g class="request-spot ${status}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><title>${escape(label)}</title><polygon points="${points}"/></g>`;
   }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}"></i>${status==='idle'?'Unused':statusLabels[status]}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed request, invalid completion or incorrect answer. Unscored answers, cancellations and intentional probes stay inconclusive. Check verdicts also consider timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
 }
 function renderBeeswarm(records) {
@@ -82,14 +114,18 @@ function renderBeeswarm(records) {
   if(!measured.length)return '<section class="latency-viz"><h2>Request latency</h2><p class="viz-empty">No latency measurements.</p></section>';
   // Use the mosaic's page so every rendered dot remains individually inspectable.
   const page=records.slice((state.mosaicPage || 0)*mosaicPageSize,((state.mosaicPage || 0)+1)*mosaicPageSize).filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0);
-  const max=measured.reduce((max,r)=>Math.max(max,r.elapsed_ms),1),width=960,placed=[];
+  const values=measured.map(r=>r.elapsed_ms).sort((a,b)=>a-b),quantile=q=>values[Math.ceil(q*values.length)-1];
+  // Tight clusters far from zero get a zoomed axis; the left label always states where it starts.
+  const max=Math.max(values.at(-1),1),low=values[0]>max*.35?Math.floor(values[0]*.85):0,span=Math.max(1e-9,max-low),width=960,placed=[];
+  const xOf=value=>16+(value-low)/span*(width-32);
   for(const r of [...page].sort((a,b)=>a.elapsed_ms-b.elapsed_ms)){
-    const x=12+r.elapsed_ms/max*(width-24);let lane=0,y=0;
+    const x=xOf(r.elapsed_ms);let lane=0,y=0;
     while(placed.some(p=>Math.abs(p.x-x)<10&&Math.abs(p.y-y)<10)){lane++;y=(lane%2?1:-1)*Math.ceil(lane/2)*10;}
     placed.push({r,x,y});
   }
-  const extent=Math.max(25,...placed.map(p=>Math.abs(p.y)+10)),height=extent*2+10;
-  return `<section class="latency-viz"><div class="viz-heading"><h2>Request latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M12 ${height/2}H948" class="swarm-axis"/>${placed.map(({r,x,y},i)=>`<circle cx="${x.toFixed(2)}" cy="${(height/2+y).toFixed(2)}" r="4" class="swarm-dot ${requestOutcome(r)}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"><title>${escape(r.fixture_id)} · ${ms(r.elapsed_ms)}</title></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>0 ms</span><span>${ms(max)}</span></div></section>`;
+  const extent=Math.max(25,...placed.map(p=>Math.abs(p.y)+10)),top=22,height=extent*2+10+top*2,mid=top+extent+5;
+  const markers=values.length>=4?[['p50',quantile(.5),top-8],['p95',quantile(.95),height-4]].map(([label,value,y])=>{const x=xOf(value),anchor=x>width-140?'end':x<140?'start':'middle';return `<g class="swarm-marker ${label}"><line x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" y1="${top-4}" y2="${height-top+4}"/><text x="${x.toFixed(2)}" y="${y}" text-anchor="${anchor}">${label} ${escape(ms(value))}</text></g>`;}).join(''):'';
+  return `<section class="latency-viz"><div class="viz-heading"><h2>Request latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M16 ${mid}H944" class="swarm-axis"/>${markers}${placed.map(({r,x,y},i)=>`<circle cx="${x.toFixed(2)}" cy="${(mid+y).toFixed(2)}" r="4.5" class="swarm-dot ${requestOutcome(r)}" style="--i:${i}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"><title>${escape(r.fixture_id)} · ${ms(r.elapsed_ms)}</title></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>${ms(low)}</span><span>${ms(max)}</span></div></section>`;
 }
 function renderFlightPlan(plan) {
   if(!plan)return '';
@@ -114,21 +150,30 @@ function openLiveRequest(slot) {
   dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Live request</div><h2 id="request-title">${escape(r.fixture_id || r.scenario)}</h2></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body">${badge(requestOutcome(r))}<p class="hint">Snapshot at opening. Full evidence is available when the run finishes.</p><dl class="metrics-grid">${metric('Transport',r.status)}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Answer',r.score===true?'Correct':r.score===false?'Incorrect':'Unscored')}${metric('Endpoint',r.target)}${metric('Scenario',r.scenario)}</dl></div>`;dialog.showModal();
 }
 function renderOutcomeStrip() {
-  return `<section class="outcome-overview"><div class="viz-heading"><h2>Run outcomes</h2><span class="hint">${number(state.runs.length)} ${state.runs.length===1?'run':'runs'} · newest first</span></div><div class="outcome-strip">${state.runs.map(r=>`<a href="${linkRun(r.id)}" class="outcome-segment ${runOutcome(r)}" aria-label="${escape((r.targets || []).map(t=>t.model).join(', '))}: ${escape(statusLabels[runOutcome(r)] || runOutcome(r))}, ${date(r.started_at)}"><span class="sr-only">${escape(statusLabels[runOutcome(r)] || runOutcome(r))}</span></a>`).join('')}</div></section>`;
+  const finished=state.runs.filter(r=>!activeState(r)),tally=key=>finished.filter(r=>runOutcome(r)===key).length;
+  const stats=[['Runs',number(state.runs.length),''],['Passed',number(tally('pass')),'pass'],['Failed',number(tally('fail')),'fail'],['Latest',relativeTime(state.runs[0]?.started_at) || '—','']];
+  return `<section class="outcome-overview"><dl class="run-stats">${stats.map(([label,value,kind])=>`<div class="${kind}"><dt>${label}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl><div class="outcome-track"><div class="viz-heading"><h2>Run outcomes</h2><span class="hint">${number(state.runs.length)} ${state.runs.length===1?'run':'runs'} · newest first</span></div><div class="outcome-strip">${state.runs.map(r=>`<a href="${linkRun(r.id)}" class="outcome-segment ${runOutcome(r)}" aria-label="${escape((r.targets || []).map(t=>t.model).join(', '))}: ${escape(statusLabels[runOutcome(r)] || runOutcome(r))}, ${date(r.started_at)}"><span class="sr-only">${escape(statusLabels[runOutcome(r)] || runOutcome(r))}</span></a>`).join('')}</div></div></section>`;
 }
+let heroEntered=false;
 function renderHeroCoat() {
-  const {cells,width,height}=reticulateCells(48);
-  return `<svg class="hero-coat" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid slice" aria-hidden="true">${cells.map(points=>`<polygon points="${points}"/>`).join('')}</svg>`;
+  const width=1440,height=760,cells=coatGeometry(64,width,height,{seed:23,inset:15,jitter:.95,relax:false}),entering=!heroEntered;heroEntered=true;
+  return `<div class="hero-coat${entering?' is-entering':''}" aria-hidden="true"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid slice">${cells.map(({site,points},i)=>`<polygon points="${points}" style="--i:${i};--x:${(site[0]/width).toFixed(3)};--y:${(site[1]/height).toFixed(3)}"/>`).join('')}</svg></div>`;
 }
+const themeIcons={dark:'<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.5"/><path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4"/></svg>',light:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 12.2A6.5 6.5 0 0 1 7.8 4.5a6.5 6.5 0 1 0 7.7 7.7Z"/></svg>'};
 function setTheme(theme) {
   document.documentElement.dataset.theme=theme;
   try{localStorage.setItem('giraffe-theme',theme);}catch{}
-  const toggle=$('[data-action="theme"]');if(toggle){toggle.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);toggle.textContent=theme==='dark'?'☼':'◐';}
+  const toggle=$('[data-action="theme"]');if(toggle){toggle.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);toggle.innerHTML=themeIcons[theme==='dark'?'dark':'light'];}
 }
-const commandItems=[{label:'New run',key:'N',action:()=>{location.hash='#new';}},{label:'Runs',key:'G R',action:()=>{location.hash='#runs';}},{label:'Toggle theme',key:'',action:()=>setTheme(document.documentElement.dataset.theme==='light'?'dark':'light')},{label:'Primary action',key:'⌘ ↵',action:()=>primaryAction()},{label:'Shortcuts',key:'?',action:()=>openCommands(true)},{label:'Commands',key:'⌘ K',action:()=>openCommands()}];
+const commandIcons={go:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>',plus:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>',history:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 10a6.5 6.5 0 1 0 2-4.7M3.5 3.5v3h3M10 6.5V10l2.5 1.5"/></svg>',theme:'<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M10 3.5v13a6.5 6.5 0 0 0 0-13Z" fill="currentColor"/></svg>',bolt:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 2.5 4.5 11H10l-1 6.5L15.5 9H10z"/></svg>',keys:'<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="5" width="15" height="10" rx="2"/><path d="M5.5 8h1M9.5 8h1M13.5 8h1M6.5 12h7"/></svg>'};
+const commandItems=[{label:'New run',key:'N',icon:'plus',group:'Navigate',action:()=>{location.hash='#new';}},{label:'Runs',key:'G R',icon:'history',group:'Navigate',action:()=>{location.hash='#runs';}},{label:'Primary action',key:'⌘ ↵',icon:'bolt',group:'Actions',action:()=>primaryAction()},{label:'Toggle theme',key:'',icon:'theme',group:'Actions',action:()=>setTheme(document.documentElement.dataset.theme==='light'?'dark':'light')},{label:'Shortcuts',key:'?',icon:'keys',group:'Actions',action:()=>openCommands(true)},{label:'Commands',key:'⌘ K',icon:'go',group:'Actions',action:()=>openCommands()}];
+let commandList=commandItems;
 function openCommands(shortcuts=false) {
   const dialog=$('#command-dialog');
-  dialog.innerHTML=`<div class="dialog-head"><h2 id="command-title">${shortcuts?'Keyboard shortcuts':'Go to…'}</h2><button class="text-button" data-action="close-commands" aria-label="Close commands">Esc</button></div>${shortcuts?'':'<label class="sr-only" for="command-search">Find a command</label><input id="command-search" placeholder="Find a command…" autocomplete="off">'}<div class="command-list">${commandItems.map((item,i)=>`<button class="command-item" data-command="${i}"><span>${item.label}</span><kbd>${item.key}</kbd></button>`).join('')}</div><p class="command-hint">↑ ↓ navigate · ↵ select · Esc close</p>`;
+  const recent=shortcuts?[]:state.runs.slice(0,5).map(run=>({label:(run.targets || []).map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model',key:'',meta:relativeTime(run.started_at),icon:'go',group:'Recent runs',status:runOutcome(run),action:()=>{location.hash=linkRun(run.id);}}));
+  commandList=shortcuts?commandItems.filter(item=>item.key):[...commandItems,...recent];
+  const groups=[...new Set(commandList.map(item=>item.group))];
+  dialog.innerHTML=`<div class="dialog-head command-head">${shortcuts?'<h2 id="command-title">Keyboard shortcuts</h2>':`<h2 id="command-title" class="sr-only">Go to…</h2><svg class="command-search-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5"/><path d="m13 13 3.5 3.5"/></svg><label class="sr-only" for="command-search">Find a command</label><input id="command-search" placeholder="Type a command or search runs…" autocomplete="off">`}<button class="text-button" data-action="close-commands" aria-label="Close commands"><kbd>Esc</kbd></button></div><div class="command-list">${groups.map(group=>`<div class="command-group" role="group" aria-label="${escape(group)}"><p class="command-group-title">${escape(group)}</p>${commandList.map((item,i)=>item.group!==group?'':`<button class="command-item" data-command="${i}">${item.status?`<span class="command-glyph status-spot ${escape(item.status)}" aria-hidden="true"></span>`:`<span class="command-glyph" aria-hidden="true">${commandIcons[item.icon] || ''}</span>`}<span class="command-label">${escape(item.label)}</span>${item.meta?`<span class="command-meta">${escape(item.meta)}</span>`:''}${item.key?`<kbd>${escape(item.key)}</kbd>`:''}</button>`).join('')}</div>`).join('')}</div><p class="command-hint"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>↵</kbd> select</span><span><kbd>Esc</kbd> close</span></p>`;
   if(!dialog.open)dialog.showModal();(shortcuts?$('.command-item',dialog):$('#command-search'))?.focus();
 }
 function primaryAction() {
@@ -166,6 +211,7 @@ function setActive(id) {
   const link=$('#active-run-link');link.hidden=!id;link.href=id?linkRun(id):'#runs';link.innerHTML=`${badge('running','Run in progress')}<span aria-hidden="true"> →</span>`;
 }
 function updateNav(section, label) {
+  renderRailRuns();
   $('#nav-runs').classList.toggle('current',section==='runs');$('#nav-new').classList.toggle('current',section==='new');$('#nav-new').hidden=false;
   $('#nav-runs').setAttribute('aria-current',section==='runs'?'page':'false');$('#nav-new').setAttribute('aria-current',section==='new'?'page':'false');
   $('#breadcrumb').textContent=label;
@@ -174,7 +220,27 @@ function updateNav(section, label) {
 function clearPoll() { clearTimeout(state.poll);state.poll=null; }
 function schedulePoll(callback, version, delay=1800) { clearPoll();state.poll=setTimeout(()=>{if(version===state.routeVersion) callback(version);},delay); }
 async function refreshRuns() {
-  const data=await api('/api/runs');state.runs=data.runs || [];setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';return data;
+  const data=await api('/api/runs');state.runs=data.runs || [];setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
+}
+function relativeTime(value) {
+  const then=Date.parse(value);if(!Number.isFinite(then))return '';
+  const seconds=Math.max(0,(Date.now()-then)/1000);
+  return seconds<60?'now':seconds<3600?`${Math.floor(seconds/60)}m`:seconds<86400?`${Math.floor(seconds/3600)}h`:seconds<86400*7?`${Math.floor(seconds/86400)}d`:new Date(then).toLocaleDateString(undefined,{month:'short',day:'numeric'});
+}
+// The rail keeps the last few runs one click away, wherever the user is.
+function renderRailRuns() {
+  const list=$('#rail-runs'),section=$('#rail-recent');if(!list||!section)return;
+  const current=location.hash.startsWith('#runs/')?decodeURIComponent(location.hash.slice(6)):null;
+  section.hidden=!state.runs.length;
+  list.innerHTML=state.runs.slice(0,6).map(run=>{
+    const model=(run.targets || []).map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model',outcome=runOutcome(run);
+    return `<li><a href="${linkRun(run.id)}" class="${run.id===current?'current':''}" ${run.id===current?'aria-current="page"':''} title="${escape(model)} · ${escape(statusLabels[outcome] || outcome)}"><span class="status-spot ${escape(outcome)}" aria-hidden="true"></span><span class="rail-run-model">${escape(model)}</span><time>${escape(relativeTime(run.started_at))}</time><span class="sr-only">${escape(statusLabels[outcome] || outcome)}</span></a></li>`;
+  }).join('');
+}
+// Route changes glide in; re-renders within a view (polling, toggles) stay still.
+function enterRoute() {
+  const main=document.querySelector?.('#main');
+  if(main?.animate&&!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)main.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'none'}],{duration:420,easing:'cubic-bezier(.2,.8,.2,1)'});
 }
 async function route() {
   if($('#dataset-dialog')?.open)closeDatasetDialog();
@@ -184,17 +250,17 @@ async function route() {
   clearPoll();const version=++state.routeVersion;const hash=location.hash;
   try {
     if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
-    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();schedulePoll(pollNew,version,3000);return; }
+    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();enterRoute();schedulePoll(pollNew,version,3000);return; }
     if (hash.startsWith('#runs/')) {
       const id=decodeURIComponent(hash.slice(6));updateNav('runs','Run detail');
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
-      state.detail=detail;state.mosaicPage=0;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();
+      state.detail=detail;state.mosaicPage=0;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();enterRoute();
       if(activeState(detail))schedulePoll(pollDetail,version);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
     await refreshRuns();if(version!==state.routeVersion)return;
-    renderRuns();schedulePoll(pollRuns,version,3000);
+    renderRuns();enterRoute();schedulePoll(pollRuns,version,3000);
   } catch(error) { if(version===state.routeVersion) $('#main').innerHTML=`<div class="page-heading"><h1>Could not open this view</h1></div>${notice(error.message,'error')}<button class="button" data-action="retry">Try again</button>`; }
 }
 async function pollRuns(version) {
@@ -242,7 +308,8 @@ function renderRuns() {
     const targets=r.targets || [],model=targets.map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model';
     const names=targets.map(t=>t.name).filter(name=>name&&name!=='local').join(', ');
     const started=`<time${r.started_at?` datetime="${escape(r.started_at)}"`:''}>${date(r.started_at)}</time>`;
-    return `<tr><td class="history-identity"><a class="run-link" href="${linkRun(r.id)}"${names?` title="${escape(names)}"`:''}>${escape(model)}</a><small class="history-mobile-date">${started}</small></td><td class="history-result">${badge(runOutcome(r))}</td><td class="history-date">${started}</td><td class="history-open"><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run for ${escape(model)}${r.started_at?` from ${escape(date(r.started_at))}`:''}">${icon('arrow')}</a></td></tr>`;}).join('')}</tbody></table></div>`:
+    const hosts=[...new Set(targets.map(t=>{try{return new URL(t.url).host;}catch{return '';}}).filter(Boolean))].join(', ');
+    return `<tr class="history-row ${escape(runOutcome(r))}"><td class="history-identity"><span class="status-spot ${escape(runOutcome(r))}" aria-hidden="true"></span><span class="history-names"><a class="run-link" href="${linkRun(r.id)}"${names?` title="${escape(names)}"`:''}>${escape(model)}</a>${hosts?`<small class="history-host">${escape(hosts)}</small>`:''}<small class="history-mobile-date">${started}</small></span></td><td class="history-result">${badge(runOutcome(r))}</td><td class="history-date">${started}</td><td class="history-open"><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run for ${escape(model)}${r.started_at?` from ${escape(date(r.started_at))}`:''}">${icon('arrow')}</a></td></tr>`;}).join('')}</tbody></table></div>`:
   `<div class="empty-state"><h2>No matching runs</h2><button class="button" data-action="clear-filter">Clear filters</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
@@ -1017,6 +1084,7 @@ function renderRequestPlan(config=null) {
   syncRunBlueprint(config,plan);
   const start=$('#start-run');if(start)start.disabled=!canStartRun();
   const checkPlan=$('#checks-plan-summary');if(checkPlan){checkPlan.textContent=plan?`${setupPlanCount(plan)}${plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.required_request_limit>plan.request_limit));}
+  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;dock.innerHTML=`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${plan?escape(setupPlanCount(plan)):'Planning…'}`;}
   const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
   const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>`:'';
   if(!plan){
@@ -1098,6 +1166,7 @@ function syncSetupStep({focus=false}={}) {
   const step=state.setupStep;
   const titles=['Point Giraffe at an endpoint.','Choose your checks.','Ready for launch.'];
   const heading=$('#setup-title');if(heading)heading.textContent=titles[step-1];
+  const lede=$('#setup-lede');if(lede)lede.textContent=['One short request confirms the server and finds its model.','Every check sends bounded traffic and keeps evidence for each request.','Nothing is sent until you launch. You can stop at any time.'][step-1];
   syncSetupIdentity();
   const blueprint=$('#run-blueprint');if(blueprint)blueprint.hidden=step!==2||state.configView==='json';
   for(const panel of $$('[data-setup-panel]'))panel.hidden=Number(panel.dataset.setupPanel)!==step;
@@ -1266,7 +1335,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
-  $('#main').innerHTML=`${renderHeroCoat()}<div class="page-heading setup-page-heading"><div><h1 id="setup-title">Test your endpoint</h1></div><button type="button" class="text-button setup-import" data-action="import-config">Load saved setup</button></div>
+  $('#main').innerHTML=`${renderHeroCoat()}<div class="page-heading setup-page-heading"><div><h1 id="setup-title">Test your endpoint</h1><p class="setup-lede" id="setup-lede"></p></div><button type="button" class="text-button setup-import" data-action="import-config">Load saved setup</button></div>
   <div class="notice" id="new-active-notice" ${state.active?'':'hidden'}><strong>A run is already active.</strong> <a href="${state.active?linkRun(state.active):'#runs'}">Inspect or stop it</a> before starting another.</div>
   <form id="new-run-form" novalidate>
   <ol class="setup-stepper" aria-label="Run setup">${['Connect','Checks','Launch'].map((label,index)=>`<li><button type="button" class="setup-step" data-setup-step="${index+1}" aria-controls="setup-panel-${index+1}"><span class="setup-step-index" aria-hidden="true">${index+1}</span><strong>${label}</strong></button></li>`).join('')}</ol>
@@ -1293,7 +1362,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
 
   </div>
   <details class="configuration-tools" ${state.configView==='json'||hasJsonChanges()?'open':''}><summary>Advanced options</summary><div class="config-toolbar"><div class="result-tabs config-tabs" role="tablist" aria-label="Configuration view"><button type="button" role="tab" id="config-tab-form" data-config-tab="form" aria-controls="config-panel-form">Guided setup</button><button type="button" role="tab" id="config-tab-json" data-config-tab="json" aria-controls="config-panel-json">Advanced editor</button></div><div class="actions"><button type="button" class="text-button" data-action="import-config">Load saved setup</button><button type="button" class="text-button" data-action="export-config">Save setup</button><button type="button" class="text-button" data-action="copy-cli">Copy terminal command</button></div><input type="file" id="config-file" accept=".json,application/json" hidden></div></details>
-  <div class="run-action-bar setup-navigation"><div><strong id="run-bar-summary" hidden></strong><p class="hint" id="setup-navigation-hint">No test requests are sent automatically.</p></div><div class="actions"><button class="button" type="button" data-action="setup-back" hidden>Back</button><button class="button primary" type="button" data-action="setup-next">Continue ${icon('arrow')}</button><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''} hidden>Launch <kbd>⌘ ↵</kbd></button></div><div id="form-error" class="error-message" role="alert" hidden></div></div>
+  <div class="run-action-bar setup-navigation"><div><span class="dock-summary" id="dock-summary" aria-hidden="true"></span><strong id="run-bar-summary" hidden></strong><p class="hint" id="setup-navigation-hint">No test requests are sent automatically.</p></div><div class="actions"><button class="button" type="button" data-action="setup-back" hidden>Back</button><button class="button primary" type="button" data-action="setup-next">Continue ${icon('arrow')}</button><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''} hidden>Launch <kbd>⌘ ↵</kbd></button></div><div id="form-error" class="error-message" role="alert" hidden></div></div>
   </form>`;
   for(const check of state.bootstrap.checks){
     const options=c.test_options?.[check.id] || {};
@@ -1447,7 +1516,8 @@ function renderDetail() {
   const completePass=d.state==='completed'&&!d.error&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||unselectedCheck(c,report));
   const finding=findingEvidence(report);
   const compareNext=!completePass&&!checks.some(c=>['fail','blocked','inconclusive'].includes(c.status))&&!report.abort_reason&&['fail','inconclusive'].includes(report.baseline?.status);
-  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
+  const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
+  $('#main').innerHTML=`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
   ${renderMosaic(orderedRequests(report))}${renderBeeswarm(orderedRequests(report))}
   <div class="result-summary">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item"><strong>${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span style="margin-left:auto" class="hint">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div>
@@ -1721,10 +1791,11 @@ document.addEventListener('click',async(event)=>{
   if(event.target.closest('.skip-link')){event.preventDefault();const main=$('#main');main.setAttribute('tabindex','-1');main.focus({preventScroll:true});main.scrollIntoView({block:'start'});return;}
   const liveSpot=event.target.closest('[data-live-slot]');if(liveSpot){openLiveRequest(Number(liveSpot.dataset.liveSlot));return;}
   const runFilter=event.target.closest('[data-run-filter]');if(runFilter){state.filter=runFilter.dataset.runFilter;renderRuns();$(`[data-run-filter="${state.filter}"]`)?.focus();return;}
-  const command=event.target.closest('[data-command]');if(command){$('#command-dialog').close();commandItems[Number(command.dataset.command)]?.action();return;}
+  const command=event.target.closest('[data-command]');if(command){$('#command-dialog').close();commandList[Number(command.dataset.command)]?.action();return;}
   const shellAction=event.target.closest('[data-action]')?.dataset.action;
   if(shellAction==='theme'){setTheme(document.documentElement.dataset.theme==='light'?'dark':'light');return;}
   if(shellAction==='commands'){openCommands();return;}
+  if(shellAction==='shortcuts'){openCommands(true);return;}
   if(shellAction==='close-commands'){$('#command-dialog').close();return;}
   if(shellAction==='mosaic-prev'||shellAction==='mosaic-next'){state.mosaicPage=Math.max(0,(state.mosaicPage || 0)+(shellAction==='mosaic-next'?1:-1));renderDetail();$('.request-mosaic [tabindex="0"]')?.focus({preventScroll:true});return;}
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
@@ -1819,7 +1890,7 @@ document.addEventListener('click',async(event)=>{
 });
 document.addEventListener('submit',event=>{if(event.target.id==='new-run-form')startRun(event);if(event.target.id==='baseline-form')saveBaseline(event);if(event.target.id==='dataset-example-form')saveExample(event);if(event.target.id==='dataset-import-form')useImportedDataset(event);if(event.target.id==='dataset-try-form')tryDatasetExample(event);});
 document.addEventListener('input',event=>{
-  if(event.target.id==='command-search'){const query=event.target.value.toLowerCase();for(const item of $$('.command-item'))item.hidden=!item.textContent.toLowerCase().includes(query);return;}
+  if(event.target.id==='command-search'){const query=event.target.value.toLowerCase();for(const item of $$('.command-item'))item.hidden=!item.textContent.toLowerCase().includes(query);for(const group of $$('.command-group'))group.hidden=!$$('.command-item',group).some(item=>!item.hidden);return;}
 
   if(event.target.id==='run-search'){state.historySearch=event.target.value;renderRuns();return;}
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
@@ -1896,6 +1967,11 @@ document.addEventListener('scroll',event=>{
   for(const popover of $$('.field-help:popover-open'))popover.hidePopover();
 },true);
 document.addEventListener('cancel',event=>{if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
+document.addEventListener('pointermove',event=>{
+  const coat=document.querySelector?.('.hero-coat');if(!coat)return;
+  const bounds=coat.getBoundingClientRect();
+  coat.style.setProperty('--mx',`${event.clientX-bounds.left}px`);coat.style.setProperty('--my',`${event.clientY-bounds.top}px`);
+},{passive:true});
 window.addEventListener('hashchange',route);
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';await route();}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';refreshRuns().catch(()=>{});await route();}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
 init();
