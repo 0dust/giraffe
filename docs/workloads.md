@@ -110,7 +110,8 @@ answer from a subsequent conversation turn.
 In the check catalogue, open **Tool-call correctness → Settings** to choose response
 modes and edit the fixture list as JSON. `[]` restores the built-in weather fixture.
 The advanced editor accepts the same configuration. Each custom fixture defines
-`fixture_id`, `messages`, OpenAI-compatible function `tools`, and `expected_calls`.
+`fixture_id`, `messages`, OpenAI-compatible function `tools`, and either
+`expected_calls` or an explicit `choice` rule.
 Fixture IDs are unique, use letters, digits, underscores, hyphens or dots, start
 with a letter or digit, and have at most 128 characters. Each configuration has at
 most 16 fixtures, each with at most 16 tools and expected calls; the entire
@@ -176,6 +177,51 @@ Complete and streaming requests are independent generations. Different outputs d
 not by themselves prove that a runtime dropped text. Replayed identical outputs
 can establish reconstruction correctness; live runs establish only whether the
 observed responses met the declared acceptance requirements.
+
+### Tool-choice contract checks
+
+[examples/tool-choice.yaml](../examples/tool-choice.yaml) exercises all four choices
+in complete and streaming responses. Set its endpoint and model, then run
+`giraffe run --config examples/tool-choice.yaml`. No tool executes.
+
+Add `choice` to a fixture to check the request's API rule separately from the task:
+
+| `choice.mode` | Accepted completed response |
+| --- | --- |
+| `none` | Zero structured tool calls. Prose, refusal text and tool-shaped JSON text are permitted. |
+| `required` | At least one declared function call with valid arguments. |
+| `named` | At least one call, every call to `choice.name`, with valid arguments. |
+| `auto` | Prose or declared function calls with valid arguments. |
+
+`choice.max_calls` bounds calls at 1–16 (default 16). `none` always permits zero;
+`parallel_tool_calls: false` limits every other mode to one call. Set it to true to
+explicitly allow multiple calls within `max_calls`, or omit it to leave the server
+setting unspecified. `max_calls` is a local acceptance bound, not an API field.
+The typed rule owns `tools`, `tool_choice` and `parallel_tool_calls` for this fixture,
+including overriding global request options. Sent tool options are recorded.
+Legacy forced-choice diagnostics apply only to fixtures without `choice`.
+
+`expected_calls` may be omitted or null for contract-only checks. An explicit `[]`
+asserts that the task should produce no calls. A nonempty list adds exact task
+expectations as described above. Contradictions with `choice` are rejected before
+sending traffic. For example, `auto` can pass mode compliance and fail a task that
+expected a call. Optional `expected_content` still checks assistant text separately.
+
+`choice.support: required` is the default: API rejection fails acceptance.
+`support: discover` records HTTP 400, 422 or 501 as **rejected**, leaves the verdict
+**inconclusive**. Rejections still count toward the global
+`stop_after_errors` bound. These statuses do not prove the option is unsupported; rejection can have another cause. Authentication, routing, throttling,
+server errors and transport failures remain failures. A completed response violating
+the choice rule fails even during discovery. **Observed** support means only that
+this response honored the mode; it is not a guarantee about other prompts or models.
+
+Protocol/completeness, choice compliance, argument schemas, task expectations and
+assistant text have separate outcomes in JSON, HTML and request details. Giraffe
+assembles streamed fragments before evaluation. Timeouts, truncation and early EOF
+cannot pass `none`. Every configured fixture/transport pair needs coverage; budget
+exhaustion cannot turn an incomplete matrix into a pass. Existing request, token,
+duration, concurrency and retention limits apply. Stored response bodies follow
+retention; configured expectations, sent tool options and verdicts remain available.
 
 ## Deployment metadata
 

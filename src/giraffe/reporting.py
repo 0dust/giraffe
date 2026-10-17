@@ -577,10 +577,13 @@ def _tool_evidence(record: RequestRecord) -> str:
     if expectation is not None:
         parts.append('<h3>Tool-call expectations</h3>'
                      '<p>Expected calls are checked in order, including their count.</p>'
-                     f'<pre>{_json([call.model_dump() for call in expectation.expected_calls])}</pre>'
+                     f'<pre>{_json([call.model_dump() for call in expectation.expected_calls]) if expectation.expected_calls is not None else "No task-specific call expectation configured."}</pre>'
                      '<details><summary>Declared tools</summary>'
-                     f'<pre>{_json(expectation.tools)}</pre></details>'
-                     '<h3>Assistant content expectation</h3>')
+                     f'<pre>{_json(expectation.tools)}</pre></details>')
+        if expectation.choice:
+            parts.append('<h3>Tool choice rule</h3>'
+                         f'<pre>{_json(expectation.choice.model_dump())}</pre>')
+        parts.append('<h3>Assistant content expectation</h3>')
         content = expectation.expected_content
         if content is None:
             parts.append('<p>No assistant content expectation configured.</p>')
@@ -592,12 +595,22 @@ def _tool_evidence(record: RequestRecord) -> str:
         parts.append('<h3>Tool response outcomes</h3>'
                      '<table><thead><tr><th>Component</th><th>Outcome</th>'
                      '<th>Evidence</th></tr></thead><tbody>')
-        for field, label in (("protocol", "Protocol"), ("content", "Assistant content"),
-                             ("calls", "Tool calls")):
+        components = [("protocol", "Protocol"), ("content", "Assistant content")]
+        components += ([("choice", "Tool choice"), ("arguments", "Argument schemas"),
+                        ("task", "Task expectations")] if record.tool_evaluation.choice
+                       else [("calls", "Tool calls")])
+        if record.tool_evaluation.support:
+            parts.append(f'<tr><td>Support</td><td colspan="2">{_e(record.tool_evaluation.support)}</td></tr>')
+        for field, label in components:
             outcome = getattr(record.tool_evaluation, field)
+            if outcome is None:
+                continue
             parts.append(f'<tr><td>{label}</td><td>{_e(outcome.status.replace("_", " "))}</td>'
                          f'<td>{_e(outcome.message)}</td></tr>')
         parts.append('</tbody></table>')
+    if record.tool_request_options is not None:
+        parts.append('<details><summary>Sent tool options</summary>'
+                     f'<pre>{_json(record.tool_request_options)}</pre></details>')
     parts.append('<h3>Retained tool calls</h3>')
     if record.tool_calls:
         parts.append(f'<pre>{_json(record.tool_calls)}</pre>')

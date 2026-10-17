@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 
 from giraffe.logprob_workload import corpus_width
-from giraffe.tool_checks import default_tool_fixture, resolved_tool_fixtures, resolved_tool_modes
+from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, resolved_tool_fixtures, resolved_tool_modes
 
 from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec, ToolExpectation
 
@@ -449,15 +449,21 @@ async def tools(run, target, client):
     expectations = {
         fixture.fixture_id: ToolExpectation(
             tools=fixture.tools, expected_calls=fixture.expected_calls,
-            expected_content=fixture.expected_content)
+            expected_content=fixture.expected_content, choice=fixture.choice)
         for fixture in fixtures
     }
     for forced in [False, True] if run.config.forced_tool_diagnostic else [False]:
         for fixture in fixtures:
+            if forced and fixture.choice:
+                continue
             for mode in modes:
-                selection = "forced diagnostic" if forced else "automatic"
+                if not run.allowed(target.name):
+                    run.unfinished[target.name].add("tools")
+                    return
+                selection = "forced diagnostic" if forced else "contract" if fixture.choice else "automatic"
                 prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
-                scenario = f"{prefix}_{'forced' if forced else 'auto'}_{mode}"
+                choice_mode = "forced" if forced else fixture.choice.mode if fixture.choice else "auto"
+                scenario = f"{prefix}_{choice_mode}_{mode}"
                 messages = [message.model_dump() for message in fixture.messages]
                 request = RequestSpec(
                     fixture_id=f"{scenario}.v1", scenario=scenario, check_ids=["tools"],
@@ -465,8 +471,9 @@ async def tools(run, target, client):
                     input_chars=sum(len(message["content"]) for message in messages),
                     max_tokens=run.config.max_output_tokens,
                     options={**fixture.options, "tools": fixture.tools,
-                             "tool_choice": {"type": "function", "function": {
-                                 "name": fixture.expected_calls[0].name}} if forced else "auto"},
+                             **({} if fixture.choice else {
+                                 "tool_choice": {"type": "function", "function": {
+                                     "name": fixture.expected_calls[0].name}} if forced else "auto"})},
                     tool_expectation=expectations[fixture.fixture_id],
                     workload={"selection": selection, "capability": "required when selected",
                               "tool_fixture_id": fixture.fixture_id, "mode": mode},
@@ -662,7 +669,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if not comparisons:
                 status = "inconclusive"
         if check == "tools":
-            auto = [r for r in records if r.workload.get("selection") == "automatic"]
+            auto = [r for r in records if r.workload.get("selection") in {"automatic", "contract"}]
             expected_cases = {(fixture.fixture_id, mode)
                               for fixture in resolved_tool_fixtures(run.config)
                               for mode in resolved_tool_modes(run.config)}
@@ -696,10 +703,11 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if complete_coverage and all(r.score is True for r in auto)
                 else "rejected or unverified; see request outcomes"
             )
-            if any(r.score is False or not r.valid or r.status != "completed" for r in auto):
+            if any(not is_discovery_rejection(r) and
+                   (r.score is False or not r.valid or r.status != "completed") for r in auto):
                 status, summary = (
                     "fail",
-                    "Required automatic tool fixture failed; declared text and calls must pass. "
+                    "Required tool fixture failed; declared choice, text and calls must pass. "
                     "No tools were executed.",
                 )
             elif any(r.score is None for r in auto):
@@ -707,12 +715,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             elif not complete_coverage:
                 status, summary = (
                     "inconclusive",
-                    "Automatic tool coverage unfinished. Forced selection is separate diagnostic evidence.",
+                    "Tool fixture coverage unfinished. Legacy forced selection is separate diagnostic evidence.",
                 )
         assessed = (
             records
             if check != "tools"
-            else [r for r in records if r.workload.get("selection") == "automatic"]
+            else [r for r in records if r.workload.get("selection") in {"automatic", "contract"}
+                  and not is_discovery_rejection(r)]
         )
         if check == "consistency" and run.config.consistency.logprobs:
             from giraffe.logprob_workload import summarize_logprobs
