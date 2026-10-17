@@ -286,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
 
             print(f"Giraffe UI: http://127.0.0.1:{args.port}\n"
                   f"Local runs: {args.runs_dir.resolve()}\n"
-                  "Open the address in your browser. Review the plan, then choose Start run.",
+                  "Open the address in your browser. Review the plan, then choose Launch.",
                   flush=True)
             uvicorn.run(create_app(runs_dir=args.runs_dir, defaults=defaults),
                         host="127.0.0.1", port=args.port, log_level="warning")

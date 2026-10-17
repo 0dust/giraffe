@@ -122,7 +122,7 @@ for(const query of [' ALPHA ','external-one','Production','GPU-A']){
 }
 state.historySearch='llama';state.filter='pass';assert.equal(filteredRuns().map(run=>run.id).join(','),'beta');
 state.filter='active';state.historySearch='qWen';assert.equal(filteredRuns().map(run=>run.id).join(','),'gamma');
-state.filter='pass';renderRuns();assert(!nodes['#main'].innerHTML.includes('href="#runs/alpha"'));
+state.filter='pass';renderRuns();assert(!nodes['#main'].innerHTML.split('class="history-layout')[1].includes('href="#runs/alpha"'));
 state.historySearch='"><img src=x>';renderRuns();
 assert.match(nodes['#main'].innerHTML,/&quot;&gt;&lt;img src=x&gt;/);assert.doesNotMatch(nodes['#main'].innerHTML,/<img src=x>/);
 await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'clear-filter'}}:null}});
@@ -198,7 +198,7 @@ assert.match(nodes['#request-dialog'].innerHTML,/123 ms/);
 """)
 
 
-def test_only_new_empty_workspaces_auto_open_setup():
+def test_default_route_opens_setup_and_history_is_explicit():
     run_browser_logic(r"""
 nodes['#main']=element();let rendered=0,scheduled=0,requests=0;
 clearPoll=updateNav=()=>{};renderRuns=()=>rendered++;schedulePoll=()=>scheduled++;
@@ -206,7 +206,7 @@ refreshRuns=async()=>{};api=()=>{requests++;throw new Error('Navigation must not
 location.hash='';state.runs=[];state.active=null;await route();
 assert.equal(location.hash,'#new');assert.equal(rendered,0);assert.equal(scheduled,0);
 location.hash='#runs';await route();assert.equal(location.hash,'#runs');assert.equal(rendered,1);
-location.hash='';state.runs=[{id:'saved'}];await route();assert.equal(location.hash,'');assert.equal(rendered,2);
-state.runs=[];state.active='active-run';await route();assert.equal(location.hash,'');assert.equal(rendered,3);
+location.hash='';state.runs=[{id:'saved'}];await route();assert.equal(location.hash,'#new');assert.equal(rendered,1);
+location.hash='';state.runs=[];state.active='active-run';await route();assert.equal(location.hash,'#runs/active-run');assert.equal(rendered,1);
 assert.equal(requests,0);
 """)

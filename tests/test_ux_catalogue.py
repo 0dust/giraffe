@@ -63,7 +63,7 @@ for(const name of ['traffic_rates','traffic_duration_seconds','buckets_levels','
   assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 }
 assert.doesNotMatch(markup,/name="setup_goal"|name="setup_load"/);
-assert.match(markup,/Correct answers required \(%\)/);assert.match(markup,/<h4>Requests<\/h4>/);assert.match(markup,/<h4>Pass criteria<\/h4>/);
+assert.match(markup,/Correct answers \(%\)/);assert.match(markup,/<h4>Requests<\/h4>/);assert.match(markup,/<h4>Pass criteria<\/h4>/);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -119,7 +119,7 @@ for(const check of bootstrap.checks){
     dataset:{category:checkGroups.find(x=>x.checks.includes(check.id)).id,search:(checkGuide[check.id].name+' '+checkGuide[check.id].purpose).toLowerCase()}};
   nodes['[data-test-card="'+check.id+'"]']=card;cards.push(card);
 }
-syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
+syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,19);
 state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,19);
 state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
@@ -301,14 +301,16 @@ def test_catalogue_example_is_an_actual_scored_builtin_request():
     }
 
 
-def test_shared_settings_are_collapsed_but_keep_every_control_and_visible_estimate():
+def test_run_limits_are_collapsed_and_keep_controls_without_repeating_workload():
     browser_logic(r"""
 config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
 assert.match(markup,/<details class="shared-settings-editor" id="shared-settings">/);
-assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Shared settings<\/h2>/);
+assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits<\/h2>/);
 assert.match(markup,/Up to 160 requests · 5m 0s · 4 at once/);assert.match(markup,/class="shared-settings-edit">Edit/);
 assert(markup.lastIndexOf('</details>')<markup.indexOf('id="checks-plan-summary"'));
+assert.match(markup,/class="sr-only" id="run-ceilings-summary"/);
+assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary" role="status"/);
 const expected=['max_requests','max_duration_seconds','concurrency','samples','max_output_tokens','request_timeout_seconds','context_limit','stream',
   ...limitFields.map(([name])=>'limit_'+name),'limit_max_error_rate','limit_min_correctness','limit_min_samples','limit_regression_percent'];
 for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);

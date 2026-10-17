@@ -1371,3 +1371,22 @@ async def test_recursive_schema_does_not_abort_remaining_examples(client):
     assert second.evaluation.expected == "Paris"
     assert check(report, "correctness").status == "inconclusive"
     assert report.abort_reason is None
+
+
+async def test_live_request_events_keep_identity_and_exclude_response_bodies(client):
+    events = []
+    result = await runner.run_suite(config(checks=["access", "correctness"]), progress=events.append)
+    started = [event for event in events if event["event"] == "request_started"]
+    completed = [event for event in events if event["event"] == "request_completed"]
+    assert len(started) == len(completed) == len(result.requests)
+    assert {event["request_slot"] for event in started} == set(range(len(started)))
+    assert {event["request_slot"] for event in completed} == set(range(len(started)))
+    assert {event["request"]["id"] for event in completed} == {r.id for r in result.requests}
+    by_id = {record.id: record for record in result.requests}
+    for event in completed:
+        record = event["request"]
+        assert record["elapsed_ms"] == by_id[record["id"]].elapsed_ms
+        assert record["score"] == by_id[record["id"]].score
+        assert set(record) == {"id", "target", "fixture_id", "scenario", "status", "valid",
+                               "score", "elapsed_ms", "first_output_ms", "check_ids"}
+        assert event["budget_used"] >= event["attempted"]

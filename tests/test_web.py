@@ -683,3 +683,32 @@ async def test_real_api_to_runner_to_http_endpoint(tmp_path):
             assert {check["id"] for check in detail["report"]["checks"]
                     if check["status"] != "skipped"} == {
                 "access", "serving", "correctness"}
+
+
+async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_path, monkeypatch):
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "scenario_started", "target": "local", "scenario": "warm",
+                  "elapsed_seconds": 0})
+        for slot in range(120):
+            progress({"event": "request_started", "request_slot": slot, "target": "local",
+                      "scenario": "warm", "fixture_id": f"fixture-{slot}"})
+        for slot in reversed(range(120)):
+            progress({"event": "request_completed", "request_slot": slot,
+                      "request": {"id": f"request-{slot}", "status": "completed", "score": None}})
+        progress({"event": "scenario_finished", "target": "local", "scenario": "warm",
+                  "elapsed_seconds": 12})
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr("giraffe.web.run_suite", waiting)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        await asyncio.sleep(0)
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        assert len(detail["events"]) == 100
+        assert len(detail["live_requests"]) == 120
+        assert [r["slot"] for r in detail["live_requests"]] == list(range(120))
+        assert detail["live_requests"][0]["id"] == "request-0"
+        assert [p["event"] for p in detail["phases"]] == ["scenario_started", "scenario_finished"]
+        await client.post(f"/api/runs/{identifier}/cancel", json={})
+        await finished(client, identifier)

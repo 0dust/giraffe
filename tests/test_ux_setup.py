@@ -74,7 +74,7 @@ assert.equal(state.modelDiscovery,null);
 form.elements.model.value='';
 const retry=testConnection();pending[5].resolve({status:'connected',model:'only-model',latency_ms:42});await retry;
 assert.equal(form.elements.model.value,'only-model');assert.equal(state.config.targets[0].model,'only-model');
-assert.match(nodes['#model-discovery-status'].textContent,/Connected · only-model/);
+assert.equal(nodes['#model-discovery-status'].textContent,'Connected · only-model · 42 ms');
 assert.equal(state.modelDiscovery.key,modelDiscoveryKey());
 assert.equal(state.autoModel,'only-model');
 // Editing an endpoint or credentials invalidates inferred model choice, not just the green status.
@@ -116,7 +116,7 @@ assert(validateRunForm(form,2));
 
 def test_progressive_navigation_keeps_drafts_and_enter_never_starts_early():
     run_browser_logic(r"""
-for(const id of ['setup-panel-1','form-error','start-run','setup-navigation-hint','run-bar-summary'])nodes['#'+id]=element();
+for(const id of ['setup-panel-1','form-error','start-run','setup-navigation-hint','run-bar-summary','run-blueprint','setup-title','setup-description'])nodes['#'+id]=element();
 for(const action of ['setup-next','setup-back'])nodes['[data-action="'+action+'"]']=element();
 nodes['#test-selection h2']=element({focus(options){assert(options.preventScroll);this.focused=true;}});
 let scrolledToTop=false;window.scrollTo=options=>{assert.equal(options.top,0);scrolledToTop=true;};
@@ -130,15 +130,20 @@ readForm=()=>({config:structuredClone(draft)});updateBounds=()=>{};
 const validated=[];validateRunForm=(_,step)=>{validated.push(step);return true;};validateSetupChecks=()=>{};
 let calls=0;api=async()=>{calls++;throw Error('No target requests allowed');};
 syncSetupStep();assert(!panels[0].hidden);assert(panels[1].hidden);assert(nodes['#start-run'].hidden);
+assert.equal(nodes['#setup-title'].textContent,'Point Giraffe at an endpoint.');
+assert(nodes['#run-blueprint'].hidden);assert(nodes['#run-bar-summary'].hidden);
 await startRun({preventDefault(){},target:form});
 assert.equal(state.setupStep,2);assert.equal(calls,0);assert.equal(validated.join(','),'1');
 assert.equal(JSON.stringify(state.config),JSON.stringify(draft));assert.equal(state.prefillBaseline,'reference');
 assert(panels[0].hidden);assert(!panels[1].hidden);assert(nodes['#start-run'].hidden);
 assert(nodes['#test-selection h2'].focused);assert(scrolledToTop);assert(nodes['#setup-navigation-hint'].hidden);
+assert.equal(nodes['#setup-title'].textContent,'Choose your checks.');
+assert(!nodes['#run-blueprint'].hidden);assert(nodes['#run-bar-summary'].hidden);
 navigateSetup(1);assert.equal(state.setupStep,1);assert.equal(JSON.stringify(state.config),JSON.stringify(draft));
 validated.length=0;navigateSetup(3);assert.equal(validated.join(','),'1,2');assert.equal(state.setupStep,3);
 assert(!nodes['#start-run'].hidden);assert(nodes['[data-action="setup-next"]'].hidden);
 assert(nodes['#run-bar-summary'].hidden);assert(!nodes['#setup-navigation-hint'].hidden);
+assert.equal(nodes['#setup-title'].textContent,'Ready for launch.');assert(nodes['#run-blueprint'].hidden);
 assert.equal(buttons[2].attributes['aria-current'],'step');
 navigateSetup(1);validateRunForm=()=>false;navigateSetup(2);assert.equal(state.setupStep,1);
 state.jsonDraft='unapplied';navigateSetup(2);assert.equal(state.setupStep,1);assert.match(nodes['#form-error'].textContent,/Apply or discard/);
@@ -206,4 +211,60 @@ assert.equal(calls.join(','),'scroll:step2,focus:step2');assert.equal(state.setu
 state.jsonDraft='{ unfinished';state.configView='form';calls.length=0;
 switchConfigView('json');assert.equal(state.jsonDraft,'{ unfinished');
 assert.equal(calls.join(','),'scroll:config-panel-json,focus:config-editor');
+""")
+
+
+def test_skip_link_focuses_content_without_changing_the_current_route():
+    run_browser_logic(r"""
+let scrolled=false,prevented=false;
+nodes['#main']=element({focus(options){assert(options.preventScroll);this.focused=true;},scrollIntoView(options){assert.equal(options.block,'start');scrolled=true;}});
+state.setupStep=2;state.config={targets:[{model:'draft-model'}]};
+for(const hash of ['#new','#runs/saved-run']){
+  location.hash=hash;nodes['#main'].focused=false;
+  await listeners.click({target:{closest(q){assert.equal(q,'.skip-link');return this;}},preventDefault(){prevented=true;}});
+  assert.equal(location.hash,hash);assert.equal(state.setupStep,2);
+  assert.equal(state.config.targets[0].model,'draft-model');
+  assert.equal(nodes['#main'].attributes.tabindex,'-1');assert(nodes['#main'].focused);
+}
+assert(prevented);assert(scrolled);
+""")
+
+
+def test_connect_has_one_primary_action_and_manual_model_bypass():
+    run_browser_logic(r"""
+for(const id of ['setup-panel-1','start-run','setup-navigation-hint','run-bar-summary','model-discovery-status','model-options','model-options-label','connection-options'])nodes['#'+id]=element();
+for(const action of ['setup-next','setup-back','test-connection'])nodes['[data-action="'+action+'"]']=element();
+const primary=new Set();nodes['[data-action="test-connection"]'].classList={toggle(name,value){if(value)primary.add(name);else primary.delete(name);}};
+nodes['#new-run-form']={elements:{model:element(),url:element({value:'http://local/v1'}),api_key_env:element()}};
+state.config={targets:[{}]};state.jsonDraft=state.jsonBase='synced';state.setupStep=1;
+renderModelDiscovery();
+assert(nodes['[data-action="setup-next"]'].hidden);assert(primary.has('primary'));
+assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
+assert(nodes['#setup-navigation-hint'].hidden);
+// A manual model permits continuing without endpoint traffic.
+nodes['#new-run-form'].elements.model.value='manual-model';renderModelDiscovery();
+assert(!nodes['[data-action="setup-next"]'].hidden);assert.match(nodes['[data-action="setup-next"]'].innerHTML,/Choose checks/);
+assert(!primary.has('primary'));assert(primary.has('small'));
+assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
+assert.equal(nodes['[data-action="test-connection"]'].title,'Sends one short request (32-token limit).');
+// Successful discovery selects the same next action, while a reset restores testing.
+state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:'connected',message:'Connected'};renderModelDiscovery();
+assert(!nodes['[data-action="setup-next"]'].hidden);assert(!primary.has('primary'));
+nodes['#new-run-form'].elements.model.value='';invalidateModelDiscovery();
+assert(nodes['[data-action="setup-next"]'].hidden);assert(primary.has('primary'));
+// Model selection and connection problems reveal their controls automatically.
+for(const status of ['needs_model','error']){
+  nodes['#connection-options'].open=false;
+  state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status,message:'Configure connection'};renderModelDiscovery();
+  assert(nodes['#connection-options'].open);
+}
+assert(nodes['#model-options'].open);
+""")
+
+
+def test_shell_preserves_new_run_navigation_on_each_screen():
+    run_browser_logic(r"""
+for(const id of ['nav-new','nav-runs','breadcrumb'])nodes['#'+id]=element();
+updateNav('new','New run');assert(!nodes['#nav-new'].hidden);assert.equal(nodes['#nav-new'].attributes['aria-current'],'page');
+updateNav('runs','Run history');assert(!nodes['#nav-new'].hidden);
 """)

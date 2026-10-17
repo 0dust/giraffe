@@ -358,6 +358,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         return {"id": identifier, "state": live.get("state", meta.get("state", "completed")),
                 "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
+                "live_requests": list(live.get("requests", {}).values()),
+                "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": meta.get("baseline_id"), "report": persisted,
                 "started_at": (persisted or {}).get("started_at", meta.get("started_at")),
@@ -396,6 +398,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             job["progress"] = event
             job["events"].append(event)
             del job["events"][:-100]
+            slot = event.get("request_slot")
+            if isinstance(slot, int) and 0 <= slot < config.max_requests:
+                if event["event"] == "request_started":
+                    job["requests"][slot] = {"slot": slot, "status": "running",
+                        "target": event.get("target"), "scenario": event.get("scenario"),
+                        "fixture_id": event.get("fixture_id")}
+                elif event["event"] == "request_completed" and event.get("request"):
+                    job["requests"][slot] = {**event["request"], "slot": slot,
+                        "intentional": event.get("intentional", False)}
+            if event["event"] in {"scenario_started", "scenario_finished"}:
+                job["phases"].append({key: event.get(key) for key in
+                    ("event", "target", "scenario", "elapsed_seconds")})
+                del job["phases"][:-1024]
 
         try:
             report = await run_suite(config, progress=progress, stop_event=job["stop"])
@@ -411,7 +426,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             meta.update(state="error", finished_at=_now(),
                         error=f"Run could not finish ({type(error).__name__}). Review the configuration and retry.")
         finally:
-            meta.update(progress=job["progress"], events=job["events"])
+            meta.update(progress=job["progress"], events=job["events"], phases=job["phases"])
             try:
                 _write(job["directory"] / ".web.json", meta)
             except OSError:
@@ -548,7 +563,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
                 "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
         _write(directory / ".web.json", meta)
         active.update(id=identifier, state="running", directory=directory, meta=meta,
-                      progress={}, events=[], stop=asyncio.Event())
+                      progress={}, events=[], requests={}, phases=[], stop=asyncio.Event())
         active["task"] = asyncio.create_task(execute(active, config, baseline))
         return {"id": identifier, "state": "running"}
 

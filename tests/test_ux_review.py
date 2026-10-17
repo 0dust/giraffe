@@ -94,7 +94,7 @@ assert.match(visible,/Questions, expected answers and model answers/);assert.mat
 assert.match(visible,/judge-model/);assert.match(visible,/https:\/\/judge.example\/v1/);
 const criteria=renderReviewPassCriteria(config);
 assert(criteria.includes(catalogTitle('correctness')));assert(criteria.includes(catalogTitle('capacity')));
-assert.match(criteria,/Correct answers required 95%/);assert.match(criteria,/Correct answers required 80%/);
+assert.match(criteria,/Correct answers 95%/);assert.match(criteria,/Correct answers 80%/);
 assert(markup.indexOf('Pass criteria')>markup.indexOf('Request breakdown'));
 plan.evaluator.readiness_errors=['Evaluator needs a URL'];plan.warnings.push('Evaluator needs a URL');renderRequestPlan();
 assert.equal((nodes['#request-plan'].innerHTML.match(/Evaluator needs a URL/g)||[]).length,1);
@@ -158,11 +158,11 @@ def test_review_explains_measurement_only_timing_with_explicit_null_overrides():
     browser_logic(r"""
 const original=JSON.stringify(config);let markup=renderReviewPassCriteria(config);
 assert.equal((markup.match(/Measurement only — no timing target; result is inconclusive/g)||[]).length,2);
-assert.match(markup,/Minimum usable answers/);assert.doesNotMatch(markup,/First output within 400|Complete answer within 2,000/);
+assert.match(markup,/Minimum usable answers/);assert.doesNotMatch(markup,/First output within 400|Completion limit 2,000/);
 assert.equal(JSON.stringify(config),original);
 config.test_options.generation.limits.stream_gap_ms=150;markup=renderReviewPassCriteria(config);
 assert.equal((markup.match(/Measurement only — no timing target/g)||[]).length,1);
-assert.match(markup,/Maximum stream pause 150 ms/);
+assert.match(markup,/Stream pause 150 ms/);
 delete config.test_options.first_output;markup=renderReviewPassCriteria(config);
 assert.doesNotMatch(markup,/Measurement only/);assert.match(markup,/First output within 400 ms/);
 """, config)

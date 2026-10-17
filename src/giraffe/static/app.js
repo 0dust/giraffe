@@ -4,9 +4,9 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = (value) => structuredClone(value);
-const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'selected', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
-const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Skipped',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
-const statusIcons = {pass:'✓',fail:'×',inconclusive:'!',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
+const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
+const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Not run',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
+const statusIcons = {pass:'✓',fail:'×',inconclusive:'?',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
 const icon = (name) => ({plus:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>',arrow:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>',repeat:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15 6A6 6 0 1 0 16 12M15 2v5h-5"/></svg>',stop:'<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10"/></svg>'}[name] || '');
 const badge = (status, label) => `<span class="status ${escape(status)}"><span class="status-icon" aria-hidden="true">${statusIcons[status] || '·'}</span>${escape(label || statusLabels[status] || status)}</span>`;
@@ -20,6 +20,127 @@ const activeState = (run) => run && ['running','queued','stopping'].includes(run
 const runPath = (id) => `/api/runs/${encodeURIComponent(id)}`;
 const linkRun = (id) => `#runs/${encodeURIComponent(id)}`;
 const notice = (message, kind='') => `<div class="notice ${kind}">${escape(message)}</div>`;
+
+// Request glyphs describe request evidence, not the parent check's verdict.
+function requestOutcome(record) {
+  if(record.status==='running')return 'running';
+  if(record.intentional||isProbe(record))return 'inconclusive';
+  if(record.status==='cancelled')return 'inconclusive';
+  if(['failed','timeout'].includes(record.status)||record.score===false||record.valid===false)return 'fail';
+  if(record.status==='completed'&&record.valid===true&&record.score===true)return 'pass';
+  return 'inconclusive';
+}
+const mosaicPageSize=240;
+const mosaicGeometry=new Map();
+function reticulateCells(count) {
+  if(mosaicGeometry.has(count))return mosaicGeometry.get(count);
+  const columns=Math.min(20,Math.max(4,Math.ceil(Math.sqrt(count*3)))),rows=Math.ceil(count/columns);
+  const width=960,height=Math.max(120,rows*28),dx=width/columns,dy=height/rows;
+  const noise=n=>{const v=Math.sin(n*127.1+311.7)*43758.5453;return v-Math.floor(v);};
+  const points=Array.from({length:count},(_,i)=>[(i%columns+.25+noise(i)*.5)*dx,(Math.floor(i/columns)+.25+noise(i+401)*.5)*dy]);
+  const cells=points.map(([x,y],index)=>{
+    let polygon=[[0,0],[width,0],[width,height],[0,height]];
+    for(let j=0;j<points.length;j++){
+      if(j===index)continue;
+      const [px,py]=points[j],a=px-x,b=py-y,c=(px*px+py*py-x*x-y*y)/2;
+      const clipped=[];
+      for(let k=0;k<polygon.length;k++){
+        const p=polygon[k],q=polygon[(k+1)%polygon.length],dp=a*p[0]+b*p[1]-c,dq=a*q[0]+b*q[1]-c;
+        if(dp<=0)clipped.push(p);
+        if((dp<0&&dq>0)||(dp>0&&dq<0)){const t=dp/(dp-dq);clipped.push([p[0]+t*(q[0]-p[0]),p[1]+t*(q[1]-p[1])]);}
+      }
+      polygon=clipped;if(!polygon.length)break;
+    }
+    return polygon.map(([px,py])=>`${px.toFixed(2)},${py.toFixed(2)}`).join(' ');
+  });
+  const geometry={cells,width,height,columns};
+  if(mosaicGeometry.size>8)mosaicGeometry.clear();
+  mosaicGeometry.set(count,geometry);return geometry;
+}
+function orderedRequests(report) {
+  return [...report.requests].sort((a,b)=>{
+    if(Number.isFinite(a.dispatch_ms)&&Number.isFinite(b.dispatch_ms))return a.dispatch_ms-b.dispatch_ms;
+    return (Date.parse(a.started_at)||0)-(Date.parse(b.started_at)||0);
+  });
+}
+function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length}={}) {
+  const total=Math.max(records.length,budget || 0);
+  if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
+  const pages=Math.ceil(total/mosaicPageSize),page=Math.min(state.mosaicPage || 0,pages-1),offset=page*mosaicPageSize;
+  state.mosaicPage=page;
+  const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count);
+  const bySlot=new Map(records.map((r,i)=>[live?r.slot:i,r]));
+  const statuses=live?['pass','fail','inconclusive','running','idle']:['pass','fail','inconclusive'];
+  return `<section class="request-viz"><div class="viz-heading"><div><span class="eyebrow">Every request, one spot</span><h2>${live?'Request budget':'Request mosaic'}</h2></div><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span></div><div class="mosaic-scroll"><svg class="request-mosaic" viewBox="0 0 ${geometry.width} ${geometry.height}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
+    const r=bySlot.get(offset+i),status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',label=r?`Request ${offset+i+1}: ${r.fixture_id || r.scenario || ''}. ${statusLabels[status] || status}. ${r.elapsed_ms==null?'Timing pending':ms(r.elapsed_ms)}`:status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
+    const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
+    return `<g class="request-spot ${status}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><title>${escape(label)}</title><polygon points="${points}"/></g>`;
+  }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}"></i>${status==='idle'?'Unused':statusLabels[status]}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed request, invalid completion or incorrect answer. Unscored answers, cancellations and intentional probes stay inconclusive. Check verdicts also consider timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
+}
+function renderBeeswarm(records) {
+  const measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
+  if(!measured.length)return '<section class="latency-viz"><h2>Request latency</h2><p class="viz-empty">No latency measurements.</p></section>';
+  // Use the mosaic's page so every rendered dot remains individually inspectable.
+  const page=records.slice((state.mosaicPage || 0)*mosaicPageSize,((state.mosaicPage || 0)+1)*mosaicPageSize).filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0);
+  const max=measured.reduce((max,r)=>Math.max(max,r.elapsed_ms),1),width=960,placed=[];
+  for(const r of [...page].sort((a,b)=>a.elapsed_ms-b.elapsed_ms)){
+    const x=12+r.elapsed_ms/max*(width-24);let lane=0,y=0;
+    while(placed.some(p=>Math.abs(p.x-x)<10&&Math.abs(p.y-y)<10)){lane++;y=(lane%2?1:-1)*Math.ceil(lane/2)*10;}
+    placed.push({r,x,y});
+  }
+  const extent=Math.max(25,...placed.map(p=>Math.abs(p.y)+10)),height=extent*2+10;
+  return `<section class="latency-viz"><div class="viz-heading"><h2>Request latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M12 ${height/2}H948" class="swarm-axis"/>${placed.map(({r,x,y},i)=>`<circle cx="${x.toFixed(2)}" cy="${(height/2+y).toFixed(2)}" r="4" class="swarm-dot ${requestOutcome(r)}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"><title>${escape(r.fixture_id)} · ${ms(r.elapsed_ms)}</title></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>0 ms</span><span>${ms(max)}</span></div></section>`;
+}
+function renderFlightPlan(plan) {
+  if(!plan)return '';
+  const rows=(plan.rows || []).filter(r=>r.requests_per_target!==0),max=Math.max(1,...rows.map(r=>r.requests_per_target || 0));
+  return `<div class="flight-plan"><div class="viz-heading"><h3>Flight plan</h3><span class="hint">Per endpoint</span></div>${rows.map(r=>`<div class="flight-row"><div><span>${escape(checkGuide[r.id]?catalogTitle(r.id):r.title)}</span><span class="mono">${r.requests_per_target==null?'Adaptive':`${r.kind==='estimate'?'~':''}${number(r.requests_per_target)}`}</span></div><div class="flight-track ${r.requests_per_target==null?'adaptive':''}">${r.requests_per_target==null?'':`<span style="width:${r.requests_per_target/max*100}%"></span>`}</div></div>`).join('')}</div>`;
+}
+function renderPhases(events) {
+  const phases=[];
+  for(const e of events){
+    if(e.event==='scenario_started')phases.push({key:`${e.target}:${e.scenario}`,title:e.scenario,target:e.target,start:e.elapsed_seconds,end:null});
+    if(e.event==='scenario_finished'){
+      const phase=phases.findLast(p=>p.key===`${e.target}:${e.scenario}`&&p.end===null);
+      if(phase)phase.end=e.elapsed_seconds;
+      else phases.push({key:`${e.target}:${e.scenario}`,title:e.scenario,target:e.target,start:null,end:e.elapsed_seconds});
+    }
+  }
+  return `<section class="phase-timeline"><h2>Phases</h2>${phases.length?`<ol>${phases.map(p=>`<li class="${p.end===null?'running':'finished'}"><span class="phase-mark">${p.end===null?'·':'✓'}</span><div><strong>${escape(human(p.title))}</strong><small>${escape(p.target)}</small></div><span class="mono">${p.start===null?'Start unavailable':p.end===null?'Running':elapsed(p.end-p.start)}</span></li>`).join('')}</ol>`:'<p class="hint">Waiting for scenario events.</p>'}</section>`;
+}
+function openLiveRequest(slot) {
+  const r=(state.detail.live_requests || []).find(r=>r.slot===slot);if(!r)return;
+  const dialog=$('#request-dialog');
+  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Live request</div><h2 id="request-title">${escape(r.fixture_id || r.scenario)}</h2></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body">${badge(requestOutcome(r))}<p class="hint">Snapshot at opening. Full evidence is available when the run finishes.</p><dl class="metrics-grid">${metric('Transport',r.status)}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Answer',r.score===true?'Correct':r.score===false?'Incorrect':'Unscored')}${metric('Endpoint',r.target)}${metric('Scenario',r.scenario)}</dl></div>`;dialog.showModal();
+}
+function renderOutcomeStrip() {
+  return `<section class="outcome-overview"><div class="viz-heading"><h2>Run outcomes</h2><span class="hint">${number(state.runs.length)} ${state.runs.length===1?'run':'runs'} · newest first</span></div><div class="outcome-strip">${state.runs.map(r=>`<a href="${linkRun(r.id)}" class="outcome-segment ${runOutcome(r)}" aria-label="${escape((r.targets || []).map(t=>t.model).join(', '))}: ${escape(statusLabels[runOutcome(r)] || runOutcome(r))}, ${date(r.started_at)}"><span class="sr-only">${escape(statusLabels[runOutcome(r)] || runOutcome(r))}</span></a>`).join('')}</div></section>`;
+}
+function renderHeroCoat() {
+  const {cells,width,height}=reticulateCells(48);
+  return `<svg class="hero-coat" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid slice" aria-hidden="true">${cells.map(points=>`<polygon points="${points}"/>`).join('')}</svg>`;
+}
+function setTheme(theme) {
+  document.documentElement.dataset.theme=theme;
+  try{localStorage.setItem('giraffe-theme',theme);}catch{}
+  const toggle=$('[data-action="theme"]');if(toggle){toggle.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);toggle.textContent=theme==='dark'?'☼':'◐';}
+}
+const commandItems=[{label:'New run',key:'N',action:()=>{location.hash='#new';}},{label:'Runs',key:'G R',action:()=>{location.hash='#runs';}},{label:'Toggle theme',key:'',action:()=>setTheme(document.documentElement.dataset.theme==='light'?'dark':'light')},{label:'Primary action',key:'⌘ ↵',action:()=>primaryAction()},{label:'Shortcuts',key:'?',action:()=>openCommands(true)},{label:'Commands',key:'⌘ K',action:()=>openCommands()}];
+function openCommands(shortcuts=false) {
+  const dialog=$('#command-dialog');
+  dialog.innerHTML=`<div class="dialog-head"><h2 id="command-title">${shortcuts?'Keyboard shortcuts':'Go to…'}</h2><button class="text-button" data-action="close-commands" aria-label="Close commands">Esc</button></div>${shortcuts?'':'<label class="sr-only" for="command-search">Find a command</label><input id="command-search" placeholder="Find a command…" autocomplete="off">'}<div class="command-list">${commandItems.map((item,i)=>`<button class="command-item" data-command="${i}"><span>${item.label}</span><kbd>${item.key}</kbd></button>`).join('')}</div><p class="command-hint">↑ ↓ navigate · ↵ select · Esc close</p>`;
+  if(!dialog.open)dialog.showModal();(shortcuts?$('.command-item',dialog):$('#command-search'))?.focus();
+}
+function primaryAction() {
+  if(document.querySelector('dialog[open]'))return;
+  const main=$('#main');
+  const action=[...main.querySelectorAll('.button.primary, .button.danger')].find(el=>!el.disabled&&el.getClientRects().length);
+  action?.click();
+}
+function initReticulate() {
+  let theme='dark';try{theme=localStorage.getItem('giraffe-theme') || theme;}catch{}
+  setTheme(theme==='light'?'light':'dark');
+}
 
 async function api(path, options={}) {
   let response;
@@ -39,15 +160,15 @@ async function api(path, options={}) {
   return body;
 }
 function toast(message) { const el=$('#toast');el.textContent=message;el.hidden=false;setTimeout(()=>{el.hidden=true;},4500); }
-function connectionError(message='') { $('#connection-error').textContent=message;$('#connection-error').hidden=!message; }
+function connectionError(message='') { if(document.body)document.body.dataset.runner=message?'unavailable':'connected';$('#connection-error').textContent=message;$('#connection-error').hidden=!message; }
 function setActive(id) {
   state.active=id || null;
   const link=$('#active-run-link');link.hidden=!id;link.href=id?linkRun(id):'#runs';link.innerHTML=`${badge('running','Run in progress')}<span aria-hidden="true"> →</span>`;
 }
 function updateNav(section, label) {
-  $('#nav-runs').classList.toggle('current',section==='runs');$('#nav-new').classList.toggle('current',section==='new');
+  $('#nav-runs').classList.toggle('current',section==='runs');$('#nav-new').classList.toggle('current',section==='new');$('#nav-new').hidden=false;
   $('#nav-runs').setAttribute('aria-current',section==='runs'?'page':'false');$('#nav-new').setAttribute('aria-current',section==='new'?'page':'false');
-  $('#breadcrumb').innerHTML=`<a href="#runs">Endpoint checks</a><span>/</span>${escape(label)}`;
+  $('#breadcrumb').textContent=label;
   document.title=`${label} · Giraffe`;
 }
 function clearPoll() { clearTimeout(state.poll);state.poll=null; }
@@ -57,20 +178,22 @@ async function refreshRuns() {
 }
 async function route() {
   if($('#dataset-dialog')?.open)closeDatasetDialog();
+  for(const id of ['request-dialog','baseline-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
   if ($('#new-run-form')) captureFormDraft();
-  clearPoll();const version=++state.routeVersion;const hash=location.hash || '#runs';
+  window.scrollTo?.({top:0,left:0,behavior:'instant'});
+  clearPoll();const version=++state.routeVersion;const hash=location.hash;
   try {
+    if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
     if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();schedulePoll(pollNew,version,3000);return; }
     if (hash.startsWith('#runs/')) {
       const id=decodeURIComponent(hash.slice(6));updateNav('runs','Run detail');
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
-      state.detail=detail;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();
+      state.detail=detail;state.mosaicPage=0;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();
       if(activeState(detail))schedulePoll(pollDetail,version);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
     await refreshRuns();if(version!==state.routeVersion)return;
-    if(!location.hash&&!state.runs.length&&!state.active){location.hash='#new';return;}
     renderRuns();schedulePoll(pollRuns,version,3000);
   } catch(error) { if(version===state.routeVersion) $('#main').innerHTML=`<div class="page-heading"><h1>Could not open this view</h1></div>${notice(error.message,'error')}<button class="button" data-action="retry">Try again</button>`; }
 }
@@ -88,7 +211,10 @@ async function pollDetail(version) {
   const id=state.detail.id;
   try {
     const detail=await api(runPath(id));if(version!==state.routeVersion || state.detail.id!==id)return;
+    const focused=document.activeElement,slot=focused?.dataset?.liveSlot,action=focused?.dataset?.action;
     connectionError();state.detail=detail;renderDetail();
+    if(slot!==undefined)$(`[data-live-slot="${slot}"]`)?.focus({preventScroll:true});
+    else if(action==='stop')$('[data-action="stop"]')?.focus({preventScroll:true});
     if(activeState(detail))schedulePoll(pollDetail,version);else {if(state.active===id)setActive(null);await refreshRuns();}
   } catch(error) {if(version!==state.routeVersion)return;connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
 }
@@ -101,31 +227,23 @@ function filteredRuns() {
   return state.runs.filter(run=>(state.filter==='all'||(activeState(run)?'active':runOutcome(run))===state.filter)&&
     (!query||[run.id,run.run_id,...(run.targets || []).flatMap(target=>[target.name,target.model,target.url])].join(' ').toLowerCase().includes(query)));
 }
-function renderHistoryOverview(run) {
-  if(!run)return '';
-  const counts=run.check_counts || {},targets=run.targets || [];
-  const segments=Object.entries(counts).filter(([,count])=>count>0).map(([status,count])=>`<span class="history-segment ${escape(status)}" style="flex:${Number(count)}" title="${number(count)} ${escape(statusLabels[status] || status)}"></span>`).join('');
-  return `<a class="history-overview" href="${linkRun(run.id)}"><div><span class="eyebrow">${activeState(run)?'In progress':'Latest run'}</span><h2>${escape(targets.map(target=>target.model).join(', ') || 'Unnamed model')}</h2><p>${escape(targets.map(target=>target.name).join(' · '))} <span>· ${date(run.started_at)}</span></p></div><div class="history-overview-result">${badge(runOutcome(run))}<div class="history-state-rail" aria-hidden="true">${segments}</div><p>${Object.entries(counts).filter(([,count])=>count>0).map(([status,count])=>`${number(count)} ${escape(statusLabels[status]?.toLowerCase() || status)}`).join(' · ') || 'Waiting for results'}</p></div><span class="overview-arrow" aria-label="Open latest run">${icon('arrow')}</span></a>`;
-}
 function renderRuns() {
   const focused=document.activeElement,focusId=['run-search','run-filter'].includes(focused?.id)?focused.id:null;
   const selection=focusId==='run-search'?[focused.selectionStart,focused.selectionEnd]:null;
 
   if(!state.runs.length&&!state.active){
-    $('#main').innerHTML=`<section class="first-run"><div class="eyebrow">Your first check</div><h1>Know how your LLM endpoint behaves.</h1><p>Check answers, response times and failures using the model you already run.</p><a class="button primary" href="#new">${icon('plus')} Start first check</a><ol class="first-run-steps"><li><strong>Connect your endpoint</strong><p>Enter the server address and test the connection.</p></li><li><strong>Choose what to check</strong><p>Start with answer checks. Review the request limits before running.</p></li><li><strong>Understand the result</strong><p>See what passed, what needs attention, and the requests behind it.</p></li></ol><div class="first-run-outcome"><strong>A report you can act on</strong><p>Save the evidence, adjust your setup, and compare a later run. Reports stay on this machine.</p></div><p class="hint">Use an existing OpenAI-compatible server, such as Ollama, vLLM or SGLang.</p></section>`;
+    $('#main').innerHTML=`<section class="first-run"><h1>Run history</h1><p>No runs yet.</p><a class="button primary" href="#new">${icon('plus')} New run</a></section>`;
     return;
   }
-  const outcomeFor=runOutcome;
   const runs=filteredRuns();
-  $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Your testing workspace</div><h1>Run history</h1><p>Test your endpoint. Find what changed. Understand why.</p></div><a class="button primary" href="#new">${icon('plus')} New run</a></div>
-  ${state.active?`<div class="notice"><strong>A check is running.</strong> <a href="${linkRun(state.active)}">Open live run →</a></div>`:''}
-  ${state.filter==='all'&&!state.historySearch.trim()?renderHistoryOverview(state.runs[0]):''}
-  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><h2>Run history <span class="dim mono">${state.runs.length}</span></h2><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Find a model or run…" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
-  ${runs.length?`<div class="history-table"><table><thead><tr><th>Target / model</th><th>Outcome</th><th>Checks</th><th>Started</th><th>Duration</th><th></th></tr></thead><tbody>${runs.map(r=>{
-    const targets=r.targets || [],counts=r.check_counts || {},outcome=outcomeFor(r);
-    const attention=['fail','blocked','inconclusive'].filter(key=>counts[key]).map(key=>`${number(counts[key])} ${statusLabels[key].toLowerCase()}`).join(' · ');
-    return `<tr><td><a class="run-link" href="${linkRun(r.id)}">${escape(targets.map(t=>t.name).join(', ') || 'Unnamed run')}</a><small class="mono">${escape(targets.map(t=>t.model).join(', ') || 'No model recorded')}</small></td><td>${badge(outcome)}${r.baseline_id?'<small>Baseline compared</small>':''}</td><td>${activeState(r)?'<span class="muted">In progress</span>':`<span>${number(counts.pass || 0)} passed</span>${attention?`<small>${escape(attention)}</small>`:''}`}</td><td class="nowrap">${date(r.started_at)}<small class="run-id">${escape((r.run_id || r.id).slice(0,14))}</small></td><td class="mono">${duration(r)}</td><td><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run ${escape(r.id)}">${activeState(r)?'View live':'Open result'} →</a></td></tr>`;}).join('')}</tbody></table></div><div class="table-note">Saved on this machine · newest first · failed checks keep their evidence</div>`:
-  `<div class="empty-state"><h2>No runs match this filter</h2><p>Try a different model, run name or outcome.</p><button class="button" data-action="clear-filter">Show all runs</button></div>`}</section></div>`;
+  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','cancelled','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
+  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Search runs" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
+  ${runs.length?`<div class="history-table"><table aria-label="Saved endpoint runs"><thead><tr><th>Model</th><th>Outcome</th><th>Started</th><th><span class="sr-only">Open run</span></th></tr></thead><tbody>${runs.map(r=>{
+    const targets=r.targets || [],model=targets.map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model';
+    const names=targets.map(t=>t.name).filter(name=>name&&name!=='local').join(', ');
+    const started=`<time${r.started_at?` datetime="${escape(r.started_at)}"`:''}>${date(r.started_at)}</time>`;
+    return `<tr><td class="history-identity"><a class="run-link" href="${linkRun(r.id)}"${names?` title="${escape(names)}"`:''}>${escape(model)}</a><small class="history-mobile-date">${started}</small></td><td class="history-result">${badge(runOutcome(r))}</td><td class="history-date">${started}</td><td class="history-open"><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run for ${escape(model)}${r.started_at?` from ${escape(date(r.started_at))}`:''}">${icon('arrow')}</a></td></tr>`;}).join('')}</tbody></table></div>`:
+  `<div class="empty-state"><h2>No matching runs</h2><button class="button" data-action="clear-filter">Clear filters</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
 }
@@ -260,24 +378,24 @@ function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder
   return field(name,label,value,{type:'number',hint,help,helpKey,min:valueSchema.minimum ?? (valueSchema.exclusiveMinimum===undefined?undefined:valueSchema.exclusiveMinimum+(valueSchema.type==='integer'?1:.001)),max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
 }
 const checkGroups=[
-  {id:'answers',title:'Answers & basic health',checks:['access','serving','correctness','json','context','tools']},
+  {id:'answers',title:'Answers',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',checks:['first_output','generation','capacity','buckets','arrivals']},
-  {id:'reliability',title:'Reliability & isolation',checks:['fairness','mixed','recovery','sessions','consistency']},
-  {id:'server',title:'Server diagnostics',checks:['cancellation','prefix','gpu']},
+  {id:'reliability',title:'Reliability',checks:['fairness','mixed','recovery','sessions','consistency']},
+  {id:'server',title:'Diagnostics',checks:['cancellation','prefix','gpu']},
 ];
 const checkGuide={
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
-  serving:{name:'Errors & empty responses',purpose:'Look for errors, empty answers and incomplete responses.',sends:'Repeated short requests; also inspects responses from the selected checks.',shows:'Invalid responses, timeouts and server errors against your allowed error rate.'},
+  serving:{name:'Invalid responses',purpose:'Look for errors, empty answers and incomplete responses.',sends:'Repeated short requests; also inspects responses from the selected checks.',shows:'Invalid responses, timeouts and server errors against your allowed error rate.'},
   correctness:{name:'Answer correctness',purpose:'Check known answers using built-in examples or your own questions.',sends:'Generated extraction, arithmetic and classification questions, or each of your saved questions.',shows:'Correct answers among scored responses. Missing answers stay visible.'},
-  json:{name:'JSON format & values',purpose:'Check that JSON answers have the right fields, types and values.',sends:'Generated questions requesting a defined JSON structure.',shows:'Valid JSON, required fields, expected types and known values.'},
-  context:{name:'Recall in long prompts',purpose:'Find out whether facts survive inside long questions.',sends:'Known facts placed at different positions and lengths in generated questions.',shows:'Recall at the exercised lengths. Use your server’s configured context limit.',needs:'Check the server context limit'},
+  json:{name:'JSON correctness',purpose:'Check that JSON answers have the right fields, types and values.',sends:'Generated questions requesting a defined JSON structure.',shows:'Valid JSON, required fields, expected types and known values.'},
+  context:{name:'Context recall',purpose:'Find out whether facts survive inside long questions.',sends:'Known facts placed at different positions and lengths in generated questions.',shows:'Recall at the exercised lengths. Use your server’s configured context limit.',needs:'Check the server context limit'},
   tools:{name:'Tool-call correctness',purpose:'Check tool names and arguments without executing a tool.',sends:'A generated weather-tool request with automatic tool choice, plus forced choice when enabled.',shows:'Whether the response chooses the expected tool and supplies the expected arguments.',needs:'Tool-capable model and endpoint'},
-  first_output:{name:'Time to first answer',purpose:'Measure how long users wait before useful answer text arrives.',sends:'One initial request and repeated short requests, shared with response-health checks.',shows:'Initial and subsequent answer delays, separate from reasoning text.',needs:'Streaming enabled'},
-  generation:{name:'Answer speed & pauses',purpose:'Measure completion speed and interruptions in streamed answers.',sends:'Repeated requests to reproduce a generated passage.',shows:'Response time, stream pauses and generation rate when usage data supports it.',needs:'Streaming for pause measurements'},
+  first_output:{name:'First answer',purpose:'Measure how long users wait before useful answer text arrives.',sends:'One initial request and repeated short requests, shared with response-health checks.',shows:'Initial and subsequent answer delays, separate from reasoning text.',needs:'Streaming enabled'},
+  generation:{name:'Generation',purpose:'Measure completion speed and interruptions in streamed answers.',sends:'Repeated requests to reproduce a generated passage.',shows:'Response time, stream pauses and generation rate when usage data supports it.',needs:'Streaming for pause measurements'},
   capacity:{name:'Capacity under load',purpose:'See when increasing request rates causes slow, incorrect or dropped answers.',sends:'New requests at each configured rate, using generated examples or your own questions.',shows:'Correct answers, latency and drops at each tested rate. Set a time target to judge acceptable capacity for this workload.'},
-  buckets:{name:'Performance by request size',purpose:'Compare short and long questions and answers at different loads.',sends:'Nine question-length and answer-cap combinations at every concurrency level.',shows:'Response quality and timing for each size and load. Caps do not guarantee answer length.'},
-  arrivals:{name:'Steady & burst traffic',purpose:'Compare scheduled requests and sudden groups of arrivals.',sends:'A fixed number of scheduled requests, evenly spaced or grouped into bursts.',shows:'Actual start times, queueing and requests left undispatched by limits.'},
-  fairness:{name:'Stream stalls under load',purpose:'See if long questions interrupt a short answer already streaming.',sends:'Short responses with and without competing long questions.',shows:'Slowdown and pauses during competing work; long requests start only while the short answer streams.',needs:'Streaming and at least 2 in flight'},
+  buckets:{name:'Request sizes',purpose:'Compare short and long questions and answers at different loads.',sends:'Nine question-length and answer-cap combinations at every concurrency level.',shows:'Response quality and timing for each size and load. Caps do not guarantee answer length.'},
+  arrivals:{name:'Arrival traffic',purpose:'Compare scheduled requests and sudden groups of arrivals.',sends:'A fixed number of scheduled requests, evenly spaced or grouped into bursts.',shows:'Actual start times, queueing and requests left undispatched by limits.'},
+  fairness:{name:'Stream fairness',purpose:'See if long questions interrupt a short answer already streaming.',sends:'Short responses with and without competing long questions.',shows:'Slowdown and pauses during competing work; long requests start only while the short answer streams.',needs:'Streaming and at least 2 in flight'},
   mixed:{name:'Short-request slowdown',purpose:'See if long requests slow down short requests beside them.',sends:'Short requests alongside a configurable mix of long-question and long-answer requests.',shows:'How short requests behave with and without heavy neighboring work.'},
   recovery:{name:'Recovery after load',purpose:'Check whether normal responses return after sustained traffic.',sends:'Sustained traffic followed by bounded health-check requests.',shows:'Post-load errors, correctness and response timing. Shared limits can shorten the load period.'},
   sessions:{name:'Concurrent conversations',purpose:'Check several multi-turn conversations at the same time.',sends:'Conversation turns with prepared history, earlier model replies, or both.',shows:'Completion and turn behavior across concurrent conversations.'},
@@ -290,10 +408,10 @@ function profileDefaults(key,config=state.config) {return effectiveProfileDefaul
 function catalogTitle(id) {return checkGuide[id]?.name || human(id);}
 function renderProfileEditor(check,config) {
   const key=check.id;
-  if(key==='tools')return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_forced_tool_diagnostic','Also test a forced tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Giraffe validates tool calls; it never executes the tool.'})}</div>`;
+  if(key==='tools')return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_forced_tool_diagnostic','Force tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Giraffe validates tool calls; it never executes the tool.'})}</div>`;
   if(key==='mixed'){
     const settings=config.buckets || bucketFormDefaults(config);
-    return `<div data-bucket-settings class="fields">${field('buckets_mixed_pairs','Short / heavy request pairs',settings.mixed_pairs,{type:'number',min:1,max:100,step:1,required:true})}${field('buckets_heavy_long_input','Long-question weight',settings.heavy_weights.long_input,{type:'number',min:1,max:16,step:1,required:true,hint:'Relative share of heavy work, from 1 to 16.'})}${field('buckets_heavy_long_output','Long-answer weight',settings.heavy_weights.long_output,{type:'number',min:1,max:16,step:1,required:true,hint:'Relative share of heavy work, from 1 to 16.'})}</div><p class="hint">Question lengths and answer caps are shared with Performance by request size. Configure that row to edit them; it does not need to be selected.</p>`;
+    return `<div data-bucket-settings class="fields">${field('buckets_mixed_pairs','Short/heavy pairs',settings.mixed_pairs,{type:'number',min:1,max:100,step:1,required:true})}${field('buckets_heavy_long_input','Long-question weight',settings.heavy_weights.long_input,{type:'number',min:1,max:16,step:1,required:true,hint:'Relative share of heavy work, from 1 to 16.'})}${field('buckets_heavy_long_output','Long-answer weight',settings.heavy_weights.long_output,{type:'number',min:1,max:16,step:1,required:true,hint:'Relative share of heavy work, from 1 to 16.'})}</div><p class="hint">Question lengths and answer caps are shared with Request sizes. Configure that row to edit them; it does not need to be selected.</p>`;
   }
   const profiles={
     arrivals:{schema:'Arrival',fields:['mode','requests','requests_per_second','burst_size'],advanced:['interval_seconds','max_pending','seed']},
@@ -303,7 +421,7 @@ function renderProfileEditor(check,config) {
   };
   const descriptor=profiles[key];if(!descriptor)return '';
   const values={...profileDefaults(key,config),...config[key]},schema=state.bootstrap.config_schema.$defs[descriptor.schema];
-  const labels={mode:'Arrival pattern',requests:'Scheduled requests',requests_per_second:'Requests per second',burst_size:'Requests in each burst',interval_seconds:'Seconds between bursts',max_pending:'Maximum pending requests',seed:'Random seed',prefix_chars:'Shared opening length (characters)',repeats:'Repeated requests',history_turns:'Conversation history turns',modes:'Conversation history',sessions:'Conversations',concurrency:'Conversations at a time',max_tokens:'Answer cap per turn (tokens)',delay_seconds:'Pause between turns (seconds)',turns:'Conversation questions · one per line',saved_answers:'Prepared answers · one per line',repetitions:'Repetitions per case',levels:'Requests at a time',shapes:'Question sizes',equality:'Compare answers',temperature:'Temperature',strict:'Require every compared answer to agree'};
+  const labels={mode:'Arrival pattern',requests:'Scheduled requests',requests_per_second:'Requests per second',burst_size:'Requests per burst',interval_seconds:'Seconds between bursts',max_pending:'Maximum pending requests',seed:'Random seed',prefix_chars:'Shared prefix (characters)',repeats:'Repeated requests',history_turns:'Conversation history turns',modes:'Conversation history',sessions:'Conversations',concurrency:'Concurrent conversations',max_tokens:'Turn cap (tokens)',delay_seconds:'Turn pause (seconds)',turns:'Conversation questions',saved_answers:'Prepared answers',repetitions:'Repetitions per case',levels:'Concurrent requests',shapes:'Question sizes',equality:'Compare answers',temperature:'Temperature',strict:'Require unanimous answers'};
   const hints={mode:'Choose even spacing or bursts of requests.',requests:'Total scheduled requests before the run limits apply.',requests_per_second:'Used only with even spacing.',burst_size:'Used only with bursts; requests scheduled together in each burst.',interval_seconds:'Used only with bursts; time between groups.',max_pending:'Maximum scheduled requests waiting for an available slot.',seed:'Keep this number to repeat the same arrival pattern.',prefix_chars:'Repeated opening text length; characters are different from tokens.',repeats:'Repeat each shared-prefix case this many times.',history_turns:'Prepared conversation turns included in the history comparison.',modes:'Prepared uses saved replies; earlier model replies uses answers from this run.',sessions:'Conversations to run for each chosen history type.',concurrency:'Conversations allowed at once, within the run request ceiling.',max_tokens:'Answer cap for each turn, within the run output cap.',delay_seconds:'Wait this long before the next turn in a conversation.',repetitions:'Answers per question-size and load combination.',levels:'For example: 1, 2, 4. Each level must fit within the run request ceiling.',shapes:'Repeat the selected question sizes at every load.',equality:'Exact text compares characters; ignore extra whitespace normalizes spacing.',temperature:'Sampling temperature sent with repeated questions.',strict:'Require agreement fails if repeated answers differ. Wrong known answers can still fail either mode.'};
   const render=name=>{
     const fieldName=`profile_${key}_${name}`,value=values[name];
@@ -327,9 +445,9 @@ function checkCoverageWarning(check,config) {
 }
 function checkOverrideWarning(check,config,recovery=false) {
   const messages=[];
-  for(const [name,label,setting] of [['concurrency','Requested concurrency','Requests at once (maximum)'],['max_output_tokens','Requested answer cap','Maximum answer length (tokens)'],['request_timeout_seconds','Requested deadline','Request timeout (seconds)']]){
+  for(const [name,label,setting] of [['concurrency','Requested concurrency','Concurrency ceiling'],['max_output_tokens','Requested answer cap','Output cap (tokens)'],['request_timeout_seconds','Requested deadline','Request timeout (seconds)']]){
     const value=config.test_options?.[check.id]?.[name];
-    if(value!=null&&value>config[name])messages.push(`${label} ${checkSettingValue(name,value)} exceeds run limit ${checkSettingValue(name,config[name])}.${recovery?` Reset this check’s overrides or raise ${setting} in Shared settings.`:''}`);
+    if(value!=null&&value>config[name])messages.push(`${label} ${checkSettingValue(name,value)} exceeds run limit ${checkSettingValue(name,config[name])}.${recovery?` Reset this check’s overrides or raise ${setting} in Run limits.`:''}`);
   }
   return messages.join(' ');
 }
@@ -360,7 +478,7 @@ function effectiveCheckSummary(check,config) {
   if(check.id==='serving')parts.push(`${number(limitValue(config,check,'max_error_rate')*100,1)}% errors allowed`);
   if(check.limit_fields.includes('min_correctness'))parts.push(`${number(limitValue(config,check,'min_correctness')*100,1)}% correct required`);
   if(check.limit_fields.includes('latency_ms')){const value=limitValue(config,check,'latency_ms');parts.push(value==null?'No response-time target':`Answer within ${ms(value)}`);}
-  if(!parts.length&&check.id==='first_output'){const value=limitValue(config,check,'first_output_ms');parts.push(value==null?'Measure without a first-answer target':`First answer within ${ms(value)}`);}
+  if(!parts.length&&check.id==='first_output'){const value=limitValue(config,check,'first_output_ms');parts.push(value==null?'Measure without a first-answer target':`First answer ${ms(value)}`);}
   return parts.join(' · ') || 'Uses this check’s defaults';
 }
 function renderCheckInfo(check,config) {
@@ -384,21 +502,21 @@ function renderSharedRunSettings(config) {
   const primary=[
     ['max_requests','Total request budget','Across all selected checks and endpoints. Reaching this budget can leave checks unfinished. AI evaluator calls have separate limits.'],
     ['max_duration_seconds','Time budget (seconds)','Stop test traffic after this long. This does not include AI evaluation or saving the report.'],
-    ['concurrency','Requests at once (maximum)','A ceiling across target requests; individual checks may use fewer.'],
+    ['concurrency','Concurrency ceiling','A ceiling across target requests; individual checks may use fewer.'],
   ];
-  const requestLabels={samples:'Sample requests per check',max_output_tokens:'Maximum answer length (tokens)',request_timeout_seconds:'Request timeout (seconds)',context_limit:'Server context window (tokens)'};
+  const requestLabels={samples:'Samples per check',max_output_tokens:'Output cap (tokens)',request_timeout_seconds:'Request timeout (seconds)',context_limit:'Context window (tokens)'};
   const requestHelp={samples:'Default for checks that use a sample count; not the total run size. Explicit check overrides stay unchanged.',max_output_tokens:'Default and maximum answer length. Checks can request less; answers may finish sooner. Explicit check overrides stay unchanged.',request_timeout_seconds:'Default and maximum wait for one request. A check can use a shorter timeout. Explicit check overrides stay unchanged.',context_limit:'Use the context size configured on your server. Giraffe does not detect it.'};
-  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Shared settings</h2><span class="dim" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit">Edit</span></summary><div class="setup-body">
+  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits</h2><span class="sr-only" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit">Edit</span></summary><div class="setup-body">
   <div class="fields three run-limit-fields">${primary.map(([key,label,help])=>field(key,label,config[key],{type:'number',hint:'',help,min:key==='max_duration_seconds'?.1:1,max:key==='concurrency'?256:undefined,step:key==='max_duration_seconds'?'any':1,required:true})).join('')}</div>
   <details class="setup-disclosure" id="shared-run-limits"><summary>Request defaults <span class="dim" id="request-defaults-summary"></span></summary><div class="fields">${['samples','max_output_tokens','request_timeout_seconds','context_limit'].map(key=>field(key,requestLabels[key],config[key],{type:'number',min:key==='request_timeout_seconds'?.1:key==='context_limit'?128:1,step:key==='request_timeout_seconds'?'any':1,required:true,hint:'',help:requestHelp[key]})).join('')}${selectField('stream','How answers arrive',`<option value="true" ${config.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${config.stream?'':'selected'}>Wait for the complete answer</option>`,{hint:'',help:'First-answer timing and interruption checks need streaming.'})}</div></details>
-  <details class="setup-disclosure" id="global-acceptance"><summary>Pass criteria defaults <span class="dim" id="acceptance-summary"></span></summary><div class="fields">${field('limit_max_error_rate','Errors allowed (%)',config.limits.max_error_rate*100,{type:'number',hint:'',help:'0% allows no request errors. Used by checks that support this criterion; a check-specific value takes priority.',min:0,max:100,step:'any'})}${field('limit_min_correctness','Correct answers required (%)',config.limits.min_correctness*100,{type:'number',hint:'',help:'100% requires every scored answer to be correct. Used by checks that support this criterion. A check-specific value takes priority; diagnostics with fixed criteria still require every tested case to pass.',min:0,max:100,step:'any'})}${field('limit_min_samples','Minimum usable answers',config.limits.min_samples,{type:'number',hint:'',help:'Required per measured group where used. Too few leaves the result inconclusive.',min:state.bootstrap.limits_schema.properties.min_samples.minimum,step:1,required:true})}</div><h4>Timing, slowdown & comparison targets</h4><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,config.limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Measure only'})).join('')}${field('limit_regression_percent','Change worth flagging (%)',config.limits.regression_percent,{type:'number',hint:'',help:'Used when comparing runs; percentage points for rates.',min:0,step:'any'})}</div></details></div></details><p class="checks-plan-summary" id="checks-plan-summary" role="status">Preparing request estimate…</p></section>`;
+  <details class="setup-disclosure" id="global-acceptance"><summary>Pass criteria defaults <span class="dim" id="acceptance-summary"></span></summary><div class="fields">${field('limit_max_error_rate','Errors allowed (%)',config.limits.max_error_rate*100,{type:'number',hint:'',help:'0% allows no request errors. Used by checks that support this criterion; a check-specific value takes priority.',min:0,max:100,step:'any'})}${field('limit_min_correctness','Correct answers (%)',config.limits.min_correctness*100,{type:'number',hint:'',help:'100% requires every scored answer to be correct. Used by checks that support this criterion. A check-specific value takes priority; diagnostics with fixed criteria still require every tested case to pass.',min:0,max:100,step:'any'})}${field('limit_min_samples','Minimum usable answers',config.limits.min_samples,{type:'number',hint:'',help:'Required per measured group where used. Too few leaves the result inconclusive.',min:state.bootstrap.limits_schema.properties.min_samples.minimum,step:1,required:true})}</div><h4>Timing, slowdown & comparison targets</h4><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,config.limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Measure only'})).join('')}${field('limit_regression_percent','Regression threshold (%)',config.limits.regression_percent,{type:'number',hint:'',help:'Used when comparing runs; percentage points for rates.',min:0,step:'any'})}</div></details></div></details><p class="checks-plan-summary sr-only" id="checks-plan-summary" role="status">Preparing request estimate…</p></section>`;
 }
 function renderCheckSelection(config) {
-  return `<section class="setup-section check-selection" id="test-selection"><header class="setup-heading"><div><h2 tabindex="-1">Choose checks</h2><p>Start with the selected checks. Add others to investigate a specific question.</p></div></header><div class="setup-body">
+  return `<section class="setup-section check-selection" id="test-selection"><h2 class="sr-only" tabindex="-1">Check selection</h2><div class="setup-body">
 
-  <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected checks (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">Add checks</button></div></div>
+  <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">All checks</button></div></div>
   <p class="sr-only" id="selection-summary" role="status">${config.checks.length} checks selected</p>
-  <div id="catalogue-browse-tools" ${state.catalogueFilter==='selected'?'hidden':''}><div class="catalogue-browse-header"><label class="catalogue-search"><span class="sr-only">Find a check</span><input type="search" id="check-search" placeholder="Find a check" value="${escape(state.catalogueSearch || '')}" autocomplete="off"></label><button type="button" class="text-button" data-action="quick-checks">Reset to quick check</button></div><div class="catalogue-categories" aria-label="Check categories"><button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="all" aria-pressed="${!state.catalogueCategory||state.catalogueCategory==='all'}">All categories</button>${checkGroups.map(group=>`<button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="${group.id}" aria-pressed="${state.catalogueCategory===group.id}">${group.title}</button>`).join('')}</div></div>
+  <div id="catalogue-browse-tools" ${state.catalogueFilter==='selected'?'hidden':''}><div class="catalogue-browse-header"><label class="catalogue-search"><span class="sr-only">Find a check</span><input type="search" id="check-search" placeholder="Find a check" value="${escape(state.catalogueSearch || '')}" autocomplete="off"></label><button type="button" class="text-button" data-action="quick-checks">Reset selection</button></div><div class="catalogue-categories" aria-label="Check categories"><button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="all" aria-pressed="${!state.catalogueCategory||state.catalogueCategory==='all'}">All categories</button>${checkGroups.map(group=>`<button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="${group.id}" aria-pressed="${state.catalogueCategory===group.id}">${group.title}</button>`).join('')}</div></div>
   <div id="test-catalogue"><div class="test-cards check-catalogue" id="test-cards">${checkGroups.map(group=>`<section class="catalogue-group" data-catalogue-group="${group.id}"><h3>${group.title}</h3>${group.checks.map(id=>renderTestCard(state.bootstrap.checks.find(check=>check.id===id),config)).join('')}</section>`).join('')}</div><p class="hint catalogue-empty" id="catalogue-empty" role="status" hidden></p></div>
   <p class="hint" id="no-tests-selected" ${config.checks.length?'hidden':''}>Choose at least one check before reviewing the run.</p>
   </div></section>${renderSharedRunSettings(config)}`;
@@ -482,11 +600,11 @@ function renderTestCard(check,config) {
   const guide=checkGuide[check.id],selected=config.checks?.includes(check.id),custom=Object.keys(config.test_options?.[check.id] || {}).length>0;
   const warningsVisible=selected||state.openTest===check.id;
   const ownQuestions=check.id==='correctness'&&config.request_source==='request_pack';
-  const optionLabels={samples:'Sample requests',concurrency:'Requests at a time',context_limit:'Server context length (tokens)',max_output_tokens:'Answer cap (tokens)',request_timeout_seconds:'Connection time limit (seconds)',sustained_seconds:'Time under load (seconds)',metrics_max_age_seconds:'Maximum metric age (seconds)',backend_verification:'Verify cancelled work on server',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Test request deadline (ms)',cancel_after_chunks:'Cancel after answer chunks',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
+  const optionLabels={samples:'Sample requests',concurrency:'Concurrent requests',context_limit:'Context length (tokens)',max_output_tokens:'Answer cap (tokens)',request_timeout_seconds:'Connection timeout (seconds)',sustained_seconds:'Load duration (seconds)',metrics_max_age_seconds:'Metric freshness (seconds)',backend_verification:'Verify server cancellation',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Probe deadline (ms)',cancel_after_chunks:'Chunks before cancellation',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
   const advancedOptions=new Set(['backend_verification','server_log','trace_file','cancel_after_chunks','cleanup_seconds','trace_wait_seconds']);
   const runOptions=new Set(['concurrency','max_output_tokens','request_timeout_seconds']);
-  const option=name=>markCheckHint(schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Questions to send (minimum)':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default'}),check,name,'option');
-  const limitLabels={first_output_ms:'First answer within (ms)',latency_ms:'Complete answer within (ms)',stream_gap_ms:'Maximum stream pause (ms)',min_output_tokens_per_second:'Minimum generation rate (tokens/second)',fairness_max_ratio:'Maximum slowdown (ratio)',max_error_rate:'Errors allowed (%)',min_correctness:'Correct answers required (%)',min_samples:'Minimum usable answers'};
+  const option=name=>markCheckHint(schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Minimum questions':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default'}),check,name,'option');
+  const limitLabels={first_output_ms:'First answer (ms)',latency_ms:'Completion limit (ms)',stream_gap_ms:'Stream pause (ms)',min_output_tokens_per_second:'Minimum rate (tok/s)',fairness_max_ratio:'Maximum slowdown (ratio)',max_error_rate:'Errors allowed (%)',min_correctness:'Correct answers (%)',min_samples:'Minimum usable answers'};
   const primaryLimits=new Set(['first_output_ms','latency_ms','min_correctness','max_error_rate','fairness_max_ratio','min_samples']);
   const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',min:0,max:100,step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit')}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
   const inactive=name=>ownQuestions&&['samples','concurrency'].includes(name);
@@ -508,7 +626,7 @@ function renderTestCard(check,config) {
   <input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}">
   <div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden>
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
-  ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${questionSource}${check.id==='capacity'?renderTrafficEditor(config):''}${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','Metrics URL for first endpoint',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}
+  ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${questionSource}${check.id==='capacity'?renderTrafficEditor(config):''}${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','First metrics URL',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
   ${check.option_fields.length||check.limit_fields.length?`<button type="button" class="text-button reset-test" data-reset-test="${check.id}" aria-label="Reset overrides for ${escape(guide.name)}" ${custom?'':'hidden'}>Reset overrides</button>`:''}${inactiveControls}
   ${requests?`${requestFields.length>1?'<h4>Requests</h4>':''}<fieldset class="fields check-request-fields">${requests}</fieldset>`:''}
@@ -527,12 +645,12 @@ function bucketFormDefaults(config) {
   return defaults;
 }
 function renderBucketSizes(settings) {
-  return `<div class="bucket-sizes"><h3>Questions and answer caps</h3><p class="hint">Giraffe sends all 9 combinations below at each load. Question lengths are in characters; answer caps are in tokens (pieces of text). A cap limits an answer; it does not guarantee that length.</p><div class="fields three">${['short','medium','long'].map((size,index)=>field(`buckets_input_${size}`,`Question length ${index+1} (characters)`,settings.input_chars[size],{type:'number',min:1,max:65536,step:1,required:true})).join('')}${['short','medium','long'].map((size,index)=>field(`buckets_output_${size}`,`Answer cap ${index+1} (tokens)`,settings.output_tokens[size],{type:'number',min:1,max:65536,step:1,required:true,hint:index===0?'Asks for the box label only.':'Asks for the label, then a list of numbers.'})).join('')}</div><p class="hint">Generated questions include “The box label is K7P4.” Longer-answer cases also ask for a list of numbers. Instructions can add characters; the request plan shows the actual length sent.</p></div>`;
+  return `<div class="bucket-sizes"><h3>Questions and answer caps</h3><p class="hint">Giraffe sends all 9 combinations below at each load. Question lengths are in characters; answer caps are in tokens (pieces of text). A cap limits an answer; it does not guarantee that length.</p><div class="fields three">${['short','medium','long'].map((size,index)=>field(`buckets_input_${size}`,`Question ${index+1} (characters)`,settings.input_chars[size],{type:'number',min:1,max:65536,step:1,required:true})).join('')}${['short','medium','long'].map((size,index)=>field(`buckets_output_${size}`,`Answer ${index+1} (tokens)`,settings.output_tokens[size],{type:'number',min:1,max:65536,step:1,required:true,hint:index===0?'Asks for the box label only.':'Asks for the label, then a list of numbers.'})).join('')}</div><p class="hint">Generated questions include “The box label is K7P4.” Longer-answer cases also ask for a list of numbers. Instructions can add characters; the request plan shows the actual length sent.</p></div>`;
 }
 function renderBucketEditor(config) {
   const settings=config.buckets || bucketFormDefaults(config),schema=state.bootstrap.buckets.schema;
   const basic=false;
-  return `<fieldset class="fields" data-bucket-settings>${basic?'':field('buckets_levels','Requests at a time',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 4, 8',hint:'For example: 1, 4, 8 tests one request at a time, then four, then eight.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Minimum requests per size combination',hint:'Each load sends at least this many requests for each of the 9 combinations.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Time limit per size combination (seconds)',hint:'Waiting for an available request slot uses this time too.'})}</fieldset>${basic?'':`<details class="check-advanced"><summary>Question lengths & answer caps · 9 combinations</summary>${renderBucketSizes(settings)}</details>`}<p class="hint bucket-profile-summary"></p><p class="hint" id="bucket-shared-limit">The shared simultaneous-request limit is ${config.concurrency}. Question lengths and answer caps are also used by Short-request slowdown.</p>`;
+  return `<fieldset class="fields" data-bucket-settings>${basic?'':field('buckets_levels','Concurrent requests',settings.levels.join(', '),{required:true,full:true,placeholder:'1, 4, 8',hint:'For example: 1, 4, 8 tests one request at a time, then four, then eight.'})}${schemaField('buckets_samples_per_bucket',settings.samples_per_bucket,schema.properties.samples_per_bucket,{label:'Requests per combination',hint:'Each load sends at least this many requests for each of the 9 combinations.'})}${schemaField('buckets_window_seconds',settings.window_seconds,schema.properties.window_seconds,{label:'Combination timeout (seconds)',hint:'Waiting for an available request slot uses this time too.'})}</fieldset>${basic?'':`<details class="check-advanced"><summary>Question lengths & answer caps · 9 combinations</summary>${renderBucketSizes(settings)}</details>`}<p class="hint bucket-profile-summary"></p><p class="hint" id="bucket-shared-limit">The shared simultaneous-request limit is ${config.concurrency}. Question lengths and answer caps are also used by Short-request slowdown.</p>`;
 }
 function renderLoadGuidance(config) {
   const messages=[];
@@ -545,7 +663,7 @@ function renderLoadGuidance(config) {
 }
 function renderTrafficEditor(config) {
   const traffic=config.traffic || state.bootstrap.config.traffic,custom=!sameConfig(traffic,state.bootstrap.config.traffic),schema=state.bootstrap.traffic_schema;
-  const labels={rates:'Request rates (per second)',duration_seconds:'Seconds per rate',arrival:'Arrival pattern',max_in_flight:'Requests at a time',seed:'Random seed',long_input_chars:'Long question size (characters)',long_output_words:'Long answer size (words)',drain_timeout_seconds:'Completion wait (seconds)',scheduler_lag_tolerance_ms:'Allowed start delay (ms)'};
+  const labels={rates:'Rates (requests/second)',duration_seconds:'Seconds per rate',arrival:'Arrival pattern',max_in_flight:'Concurrent requests',seed:'Random seed',long_input_chars:'Long question (characters)',long_output_words:'Long answer (words)',drain_timeout_seconds:'Completion wait (seconds)',scheduler_lag_tolerance_ms:'Start delay (ms)'};
   const primary=new Set(['rates','duration_seconds','max_in_flight']);
   const control=([name,fieldSchema])=>schemaField(`traffic_${name}`,traffic[name],fieldSchema,{label:labels[name] || human(name),hint:name==='max_in_flight'?`Leave blank to use the shared limit of ${config.concurrency}. This test cannot exceed that limit.`:undefined});
   const entries=Object.entries(schema.properties).filter(([name])=>name!=='mix'),mix=schema.$defs.TrafficMix;
@@ -697,7 +815,7 @@ function syncPackControls() {
 function renderJudging(config) {
   if(config.request_source!=='request_pack'||!config.request_pack?.cases.some(item=>item.scorer==='judge'))return '';
   const settings={judges:[],concurrency:2,request_timeout_seconds:30,max_duration_seconds:300,max_output_tokens:256,...config.judging};
-  return `<div class="judging-editor"><div class="test-editor-heading"><h3>AI evaluator</h3><button type="button" class="text-button" data-action="add-judge" ${settings.judges.length>=8?'disabled':''}>Add evaluator</button></div><p class="hint">An AI model compares each answer with your expected answer and accepts correct paraphrases.</p><input type="hidden" name="judge_count" value="${settings.judges.length}">${settings.judges.map((judge,index)=>`<fieldset class="judge-row"><legend>Evaluator ${index+1}</legend><div class="fields">${field(`judge_${index}_model`,'Model',judge.model)}${field(`judge_${index}_url`,'Endpoint URL',judge.url,{type:'url',full:true,placeholder:'http://localhost:9000/v1'})}</div><details class="evaluator-options"><summary>Credentials & evaluator name</summary><div class="fields">${field(`judge_${index}_name`,'Name',judge.name)}${field(`judge_${index}_api_key_env`,'API key environment variable (optional)',judge.api_key_env,{full:true,placeholder:'JUDGE_API_KEY'})}</div></details><button type="button" class="text-button" data-action="remove-judge" data-judge-index="${index}" aria-label="Remove evaluator ${index+1}">Remove</button></fieldset>`).join('')}<details class="judge-limits"><summary>Evaluation limits</summary><div class="fields">${field('judging_concurrency','Evaluator requests at a time',settings.concurrency,{type:'number',min:1,max:256,step:1})}${field('judging_request_timeout_seconds','Evaluator request limit (seconds)',settings.request_timeout_seconds,{type:'number',min:0,step:'any'})}${field('judging_max_duration_seconds','Total evaluation time (seconds)',settings.max_duration_seconds,{type:'number',min:0,step:'any'})}${field('judging_max_output_tokens','Evaluator answer cap (tokens)',settings.max_output_tokens,{type:'number',min:1,step:1})}</div><p class="hint">More connection and authentication settings are available in JSON.</p></details><p class="hint judge-disclosure">Questions, expected answers and model answers are sent to your configured evaluators. With several evaluators, more than half must agree. A tie or missing vote leaves the result inconclusive.</p></div>`;
+  return `<div class="judging-editor"><div class="test-editor-heading"><h3>AI evaluator</h3><button type="button" class="text-button" data-action="add-judge" ${settings.judges.length>=8?'disabled':''}>Add evaluator</button></div><p class="hint">An AI model compares each answer with your expected answer and accepts correct paraphrases.</p><input type="hidden" name="judge_count" value="${settings.judges.length}">${settings.judges.map((judge,index)=>`<fieldset class="judge-row"><legend>Evaluator ${index+1}</legend><div class="fields">${field(`judge_${index}_model`,'Model',judge.model)}${field(`judge_${index}_url`,'Endpoint URL',judge.url,{type:'url',full:true,placeholder:'http://localhost:9000/v1'})}</div><details class="evaluator-options"><summary>Credentials & evaluator name</summary><div class="fields">${field(`judge_${index}_name`,'Name',judge.name)}${field(`judge_${index}_api_key_env`,'API key environment variable (optional)',judge.api_key_env,{full:true,placeholder:'JUDGE_API_KEY'})}</div></details><button type="button" class="text-button" data-action="remove-judge" data-judge-index="${index}" aria-label="Remove evaluator ${index+1}">Remove</button></fieldset>`).join('')}<details class="judge-limits"><summary>Evaluation limits</summary><div class="fields">${field('judging_concurrency','Evaluator concurrency',settings.concurrency,{type:'number',min:1,max:256,step:1})}${field('judging_request_timeout_seconds','Evaluator timeout (seconds)',settings.request_timeout_seconds,{type:'number',min:0,step:'any'})}${field('judging_max_duration_seconds','Evaluation duration (seconds)',settings.max_duration_seconds,{type:'number',min:0,step:'any'})}${field('judging_max_output_tokens','Evaluator cap (tokens)',settings.max_output_tokens,{type:'number',min:1,step:1})}</div><p class="hint">More connection and authentication settings are available in JSON.</p></details><p class="hint judge-disclosure">Questions, expected answers and model answers are sent to your configured evaluators. With several evaluators, more than half must agree. A tie or missing vote leaves the result inconclusive.</p></div>`;
 }
 function changeJudge(action,index) {
   try {
@@ -873,7 +991,7 @@ function canStartRun() {
 }
 function renderReviewPassCriteria(config) {
   if(!config?.limits||!state.bootstrap?.checks)return '';
-  const labels={first_output_ms:'First output within',latency_ms:'Complete answer within',stream_gap_ms:'Maximum stream pause',min_output_tokens_per_second:'Minimum generation rate',fairness_max_ratio:'Maximum slowdown',max_error_rate:'Errors allowed',min_correctness:'Correct answers required',min_samples:'Minimum usable answers'};
+  const labels={first_output_ms:'First output within',latency_ms:'Completion limit',stream_gap_ms:'Stream pause',min_output_tokens_per_second:'Minimum generation rate',fairness_max_ratio:'Maximum slowdown',max_error_rate:'Errors allowed',min_correctness:'Correct answers',min_samples:'Minimum usable answers'};
   const rows=config.checks.map(id=>{
     const check=state.bootstrap.checks.find(item=>item.id===id);if(!check?.limit_fields.length)return '';
     const limits=check.limit_fields.map(name=>{
@@ -910,7 +1028,7 @@ function renderRequestPlan(config=null) {
   const raise=Number.isInteger(needed)&&needed>plan.request_limit;
   const evaluatorScope='AI judge calls run separately from the target request budget and send cases and generated answers to each judge.';
   const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>!evaluator.active||warning!==evaluatorScope);
-  element.innerHTML=`${heading}<p class="plan-total" role="status">${escape(count)}</p>${limits}${renderReviewLoad(config)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details>${renderReviewPassCriteria(config)}`;
+  element.innerHTML=`${heading}<p class="plan-total" role="status">${escape(count)}</p>${renderFlightPlan(plan)}${limits}${renderReviewLoad(config)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details>${renderReviewPassCriteria(config)}`;
 }
 function scheduleRequestPlan() {
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
@@ -969,9 +1087,6 @@ function changeRequestSource(source,{remove=false}={}) {
 function renderPackResults(pack) {
   return `<div class="traffic-summary"><h3>Request pack · quiet and loaded evidence</h3><p class="hint">Missing scored completions are insufficient evidence.</p>${pack.control_status?`<p>Quiet control ${badge(pack.control_status)}</p>`:''}</div><div class="metric-table"><table><thead><tr><th>Case</th><th>Quiet</th><th>Loaded · correct / scored, valid</th></tr></thead><tbody>${(pack.cases || []).map(item=>`<tr><td>${escape(item.case_id)}</td><td>${badge(item.quiet?.status || 'inconclusive')}<small>${number(item.quiet?.correct)} / ${number(item.quiet?.scored)} scored · ${number(item.quiet?.valid)} valid</small></td><td>${(item.stages || []).map(stage=>`<div>${number(stage.rate_rps,2)} req/s: ${number(stage.correct)} / ${number(stage.scored)} scored · ${number(stage.valid)} valid<small>${number(stage.offered)} / ${number(stage.planned)} offered · ${number((stage.dropped_local || 0)+(stage.dropped_late || 0))} dropped${!stage.valid||!stage.scored?' · insufficient evidence':''}</small></div>`).join('') || 'No loaded evidence'}</td></tr>`).join('')}</tbody></table></div>`;
 }
-function setupSectionHeader(number,title,description) {
-  return `<header class="setup-heading">${number?`<span class="setup-number" aria-hidden="true">${number}</span>`:''}<div><h2>${escape(title)}</h2><p>${escape(description)}</p></div></header>`;
-}
 function syncSetupIdentity() {
   const element=$('#setup-context'),form=$('#new-run-form');if(!element||!form)return;
   const model=form.elements.model.value.trim(),url=form.elements.url.value.trim();
@@ -981,12 +1096,10 @@ function syncSetupIdentity() {
 function syncSetupStep({focus=false}={}) {
   if(!$('#setup-panel-1'))return;
   const step=state.setupStep;
-  const titles=['New run','Select checks','Review run'];
-  const descriptions=['Connect an endpoint. Define a workload. Inspect the results.', 'Choose what this run should measure.', 'Review the workload before sending requests to your endpoint.'];
-  const heading=$('#setup-title'),description=$('#setup-description');
-  if(heading)heading.textContent=titles[step-1];if(description)description.textContent=descriptions[step-1];
+  const titles=['Point Giraffe at an endpoint.','Choose your checks.','Ready for launch.'];
+  const heading=$('#setup-title');if(heading)heading.textContent=titles[step-1];
   syncSetupIdentity();
-  const blueprint=$('#run-blueprint');if(blueprint)blueprint.hidden=state.configView==='json'||step===3;
+  const blueprint=$('#run-blueprint');if(blueprint)blueprint.hidden=step!==2||state.configView==='json';
   for(const panel of $$('[data-setup-panel]'))panel.hidden=Number(panel.dataset.setupPanel)!==step;
   for(const button of $$('.setup-stepper [data-setup-step]')){
     const index=Number(button.dataset.setupStep);
@@ -995,13 +1108,13 @@ function syncSetupStep({focus=false}={}) {
   }
   const json=state.configView==='json';
   const next=$('[data-action="setup-next"]'),back=$('[data-action="setup-back"]');
-  next.hidden=step===3&&!json;next.innerHTML=json?'Return to setup':`${state.returnToReview?'Return to review':step===2?'Review run':'Continue'} ${icon('arrow')}`;
   const needsModel=step===1&&!$('#new-run-form')?.elements.model.value.trim();
+  next.hidden=!json&&(step===3||needsModel);next.innerHTML=json?'Return to setup':`${state.returnToReview?'Return to review':step===2?'Review run':'Choose checks'} ${icon('arrow')}`;
   next.disabled=state.submitting||hasJsonChanges()||(!json&&needsModel);back.hidden=step===1||json;back.disabled=state.submitting||hasJsonChanges();
   $('#start-run').hidden=step!==3||json;$('#start-run').disabled=!canStartRun();
-  const navigationHint=$('#setup-navigation-hint');navigationHint.textContent=step===3?'Sends requests to your deployment. You can stop the run at any time.':step===2?'':needsModel?'Test the connection to detect a model, or specify its name.':'No full run starts until you choose Start run.';navigationHint.hidden=step===2;
+  const navigationHint=$('#setup-navigation-hint');navigationHint.textContent=step===3?'You can stop the run at any time.':'';navigationHint.hidden=step!==3;
   const tools=$('.configuration-tools');if(tools)tools.hidden=step!==3&&!json;
-  const runSummary=$('#run-bar-summary');if(runSummary)runSummary.hidden=step===3;
+  const runSummary=$('#run-bar-summary');if(runSummary)runSummary.hidden=true;
   $('.new-run-layout')?.classList.toggle('connecting',step===1||json);
   $('.new-run-layout')?.classList.toggle('configuring',step===2&&!json);
   if(focus){const target=step===3?$('#setup-title'):step===2?$('#test-selection h2'):$(`[data-setup-panel="${step}"] h2`);if(step!==2)target?.setAttribute('tabindex','-1');target?.focus({preventScroll:true});window.scrollTo?.({top:0,left:0,behavior:'instant'});}
@@ -1060,7 +1173,7 @@ function browseCheckIntent(category) {
   syncTestControls();
 }
 function useRuntimeShortcut(runtime) {
-  const urls={Ollama:'http://localhost:11434/v1',vLLM:'http://localhost:8000/v1',SGLang:'http://localhost:30000/v1'};
+  const urls={Ollama:'http://localhost:11434/v1',vLLM:'http://localhost:8000/v1',SGLang:'http://localhost:30000/v1','LM Studio':'http://localhost:1234/v1','llama.cpp':'http://localhost:8080/v1'};
   if(!urls[runtime])return;
   try {
     assertAppliedConfig();const form=$('#new-run-form');
@@ -1085,7 +1198,9 @@ function renderModelDiscovery() {
   if(!status||!button)return;
   if(state.modelDiscovery?.status==='pending'&&state.modelDiscovery.route!==state.routeVersion)state.modelDiscovery=null;
   const discovery=state.modelDiscovery?.key===modelDiscoveryKey()?state.modelDiscovery:null;
-  button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Testing connection…':'Test connection';
+  const model=$('#new-run-form')?.elements.model.value.trim();
+  button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Connecting…':discovery?.status==='connected'?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status==='pending');
+  button.classList.toggle('primary',!model);button.classList.toggle('small',Boolean(model));button.title='Sends one short request (32-token limit).';
   status.textContent=discovery?.message || '';
   status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');
   const choice=$('#connection-model-choice'),manual=$('#manual-model-field'),options=$('#model-options');
@@ -1097,7 +1212,8 @@ function renderModelDiscovery() {
     manual.hidden=models.length>1&&value!=='__manual__'&&(!value||models.includes(value));
   }
   if(discovery?.status==='needs_model'&&options)options.open=true;
-  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?'Choose a model':$('#new-run-form').elements.model.value?'Model used for this run':'Model selection (automatic)';
+  const connectionOptions=$('#connection-options');if(connectionOptions&&['needs_model','error'].includes(discovery?.status))connectionOptions.open=true;
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?'Choose a model':$('#new-run-form').elements.model.value?`Model: ${$('#new-run-form').elements.model.value}`:'Specify model manually';
   syncSetupStep();
 }
 async function testConnection() {
@@ -1116,7 +1232,7 @@ async function testConnection() {
       state.config.targets[0].model=result.model;
       configChanged();updateBounds();
     }
-    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status==='connected'?`Connected · ${result.model} · reply in ${result.latency_ms<1000?ms(result.latency_ms):elapsed(result.latency_ms/1000)}. One short reply received.`:result.message};
+    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status==='connected'?`Connected · ${result.model}${result.latency_ms==null?' · latency unavailable':` · ${ms(result.latency_ms)}`}`:result.message};
     renderModelDiscovery();
     if(result.status==='connected')$('#model-options').open=false;
     if(result.status==='needs_model')(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
@@ -1128,7 +1244,7 @@ async function testConnection() {
 function renderRunBlueprint(config,plan=null) {
   const traffic=(plan?.rows || []).filter(row=>row.requests_per_target!==0);
   const waiting=state.requestPreview?.status==='error'?'Plan unavailable. Review your configuration.':hasJsonChanges()?'Apply JSON changes to update this plan.':'Calculating traffic…';
-  return `<header class="blueprint-heading"><h2>Planned workload</h2></header>
+  return `<header class="blueprint-heading"><h2>Run plan</h2></header>
   <p class="blueprint-intro">${escape(plan?setupPlanCount(plan):waiting)}</p>
   <dl class="workload-bounds"><div><dt>Request ceiling</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>
   <p class="hint workload-help">Limits apply across the run. They are ceilings, not a completion estimate.</p>
@@ -1150,34 +1266,34 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
-  $('#main').innerHTML=`<div class="page-heading setup-page-heading"><div><div class="eyebrow">New run</div><h1 id="setup-title">New run</h1><p id="setup-description">Connect an endpoint. Define a workload. Inspect the results.</p></div><button type="button" class="text-button" data-action="import-config">Load saved setup</button></div>
+  $('#main').innerHTML=`${renderHeroCoat()}<div class="page-heading setup-page-heading"><div><h1 id="setup-title">Test your endpoint</h1></div><button type="button" class="text-button setup-import" data-action="import-config">Load saved setup</button></div>
   <div class="notice" id="new-active-notice" ${state.active?'':'hidden'}><strong>A run is already active.</strong> <a href="${state.active?linkRun(state.active):'#runs'}">Inspect or stop it</a> before starting another.</div>
   <form id="new-run-form" novalidate>
-  <ol class="setup-stepper" aria-label="Run setup">${['Connect','Choose checks','Review & run'].map((label,index)=>`<li><button type="button" class="setup-step" data-setup-step="${index+1}" aria-controls="setup-panel-${index+1}"><span class="setup-step-index" aria-hidden="true">${index+1}</span><strong>${label}</strong></button></li>`).join('')}</ol>
-<div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Clipboard unavailable. Copy this command:</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div id="setup-context" class="setup-context" hidden></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
+  <ol class="setup-stepper" aria-label="Run setup">${['Connect','Checks','Launch'].map((label,index)=>`<li><button type="button" class="setup-step" data-setup-step="${index+1}" aria-controls="setup-panel-${index+1}"><span class="setup-step-index" aria-hidden="true">${index+1}</span><strong>${label}</strong></button></li>`).join('')}</ol>
+<div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Copy command</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div id="setup-context" class="setup-context" hidden></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
   <section class="setup-step-content" id="setup-panel-1" data-setup-panel="1" aria-label="Connect">
-  <div class="connection-layout"><section class="setup-section" id="setup-deployment">${setupSectionHeader(null,'Endpoint','OpenAI-compatible server')}<div class="setup-body"><div class="fields">
-  ${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}</div>
-  <div class="runtime-shortcuts"><span>Local defaults</span>${['Ollama','vLLM','SGLang'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div>
-  <details class="setup-disclosure connection-auth" ${target.api_key_env?'open':''}><summary>API key (optional)</summary><div class="details-content"><p class="hint">Only needed if your endpoint requires an API key. Open local endpoints can leave this empty.</p>${field('api_key_env','Environment variable containing your API key',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
-  <details class="setup-disclosure model-options" id="model-options"><summary><span id="model-options-label">${target.model?'Model used for this run':'Model selection (automatic)'}</span></summary><div class="details-content"><p class="hint">A server can host several models. Giraffe selects it automatically when only one is listed. You can also enter an exact name to skip detection.</p><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model name',target.model || '',{required:true,placeholder:'e.g. llama3.2:3b',hint:'Only needed when automatic detection cannot choose a model.'})}</div></div></details>
-  <div class="connection-test-action"><button type="button" class="button primary" data-action="test-connection">Test connection</button><p class="hint">Detects available models, then sends one short request (up to 32 tokens). If several models are available, you choose which one to test.</p></div>
+  <div class="connection-layout"><section class="setup-section" id="setup-deployment"><h2 class="sr-only">Connection settings</h2><div class="setup-body"><div class="fields">
+  <div class="endpoint-connect">${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}<button type="button" class="button primary" data-action="test-connection">Connect</button></div></div><div class="runtime-shortcuts">${['Ollama','vLLM','SGLang','LM Studio','llama.cpp'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div>
+  <details class="setup-disclosure connection-options" id="connection-options" ${target.api_key_env?'open':''}><summary>Connection options</summary><div class="details-content">
+  <details class="setup-disclosure connection-auth" ${target.api_key_env?'open':''}><summary>API key (optional)</summary><div class="details-content"><p class="hint">Only needed if your endpoint requires an API key. Open local endpoints can leave this empty.</p>${field('api_key_env','API key variable',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
+  <details class="setup-disclosure model-options" id="model-options"><summary><span id="model-options-label">${target.model?`Model: ${escape(target.model)}`:'Specify model manually'}</span></summary><div class="details-content"><p class="hint">Choose a detected model or enter its exact name to skip detection.</p><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model name',target.model || '',{required:true,placeholder:'e.g. llama3.2:3b',hint:''})}</div></div></details>
+  <button type="button" class="text-button" data-action="import-config">Load saved setup</button></div></details>
   <div class="setup-connection-status" id="model-discovery-status" role="status" aria-live="polite"></div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
   </div></section></div>
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
   ${renderCheckSelection(c)}</section>
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
-  <section class="setup-section" id="setup-review"><header class="setup-heading"><h2>Run configuration</h2><p>Confirm the endpoint, checks and workload before starting.</p></header><div class="setup-body">
-  <div id="run-bounds"></div>
-  <section id="request-plan" class="request-plan review-section" aria-live="polite"></section><div id="load-guidance" role="status" aria-live="polite"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Run options</summary><div class="details-content"><div class="fields">${field('name','Endpoint name in results',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare with a previous run',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
+  <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
+  <div class="review-main"><div id="run-bounds"></div>
+  <details class="setup-disclosure" id="execution-settings"><summary>Run options</summary><div class="details-content"><div class="fields">${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare baseline',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
+  </div><section id="request-plan" class="request-plan review-section" aria-live="polite"></section><div id="load-guidance" role="status" aria-live="polite"></div>
   </div></section></section></div>
-<section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" aria-label="Preview of this run"></aside>
+<section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" aria-label="Preview of this run" hidden></aside>
 
   </div>
-  <details class="configuration-tools" ${state.configView==='json'||hasJsonChanges()?'open':''}><summary>Save this setup or use advanced options</summary><div class="config-toolbar"><div class="result-tabs config-tabs" role="tablist" aria-label="Configuration view"><button type="button" role="tab" id="config-tab-form" data-config-tab="form" aria-controls="config-panel-form">Guided setup</button><button type="button" role="tab" id="config-tab-json" data-config-tab="json" aria-controls="config-panel-json">Advanced editor</button></div><div class="actions"><button type="button" class="text-button" data-action="import-config">Load saved setup</button><button type="button" class="text-button" data-action="export-config">Save setup to file</button><button type="button" class="text-button" data-action="copy-cli">Copy terminal command</button></div><input type="file" id="config-file" accept=".json,application/json" hidden></div></details>
-  <div class="run-action-bar setup-navigation"><div><strong id="run-bar-summary"></strong><p class="hint" id="setup-navigation-hint">No test requests are sent automatically.</p></div><div class="actions"><button class="button" type="button" data-action="setup-back" hidden>Back</button><button class="button primary" type="button" data-action="setup-next">Continue ${icon('arrow')}</button><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''} hidden>Start run ${icon('arrow')}</button></div><div id="form-error" class="error-message" role="alert" hidden></div></div>
+  <details class="configuration-tools" ${state.configView==='json'||hasJsonChanges()?'open':''}><summary>Advanced options</summary><div class="config-toolbar"><div class="result-tabs config-tabs" role="tablist" aria-label="Configuration view"><button type="button" role="tab" id="config-tab-form" data-config-tab="form" aria-controls="config-panel-form">Guided setup</button><button type="button" role="tab" id="config-tab-json" data-config-tab="json" aria-controls="config-panel-json">Advanced editor</button></div><div class="actions"><button type="button" class="text-button" data-action="import-config">Load saved setup</button><button type="button" class="text-button" data-action="export-config">Save setup</button><button type="button" class="text-button" data-action="copy-cli">Copy terminal command</button></div><input type="file" id="config-file" accept=".json,application/json" hidden></div></details>
+  <div class="run-action-bar setup-navigation"><div><strong id="run-bar-summary" hidden></strong><p class="hint" id="setup-navigation-hint">No test requests are sent automatically.</p></div><div class="actions"><button class="button" type="button" data-action="setup-back" hidden>Back</button><button class="button primary" type="button" data-action="setup-next">Continue ${icon('arrow')}</button><button class="button primary" type="submit" id="start-run" ${state.active?'disabled':''} hidden>Launch <kbd>⌘ ↵</kbd></button></div><div id="form-error" class="error-message" role="alert" hidden></div></div>
   </form>`;
   for(const check of state.bootstrap.checks){
     const options=c.test_options?.[check.id] || {};
@@ -1232,7 +1348,7 @@ function updateBounds() {
   }
   $('#run-bounds').innerHTML=renderReviewScope(payload);
   $('#selection-summary').textContent=`${c.checks.length} ${c.checks.length===1?'check':'checks'} selected`;
-  const summary=$('#run-bar-summary');if(summary){summary.textContent=state.setupStep===3?'':`${c.checks.length} ${c.checks.length===1?'check':'checks'} · ${c.targets.length} endpoint${c.targets.length===1?'':'s'}`;summary.hidden=state.setupStep===3;}
+  const summary=$('#run-bar-summary');if(summary){summary.textContent='';summary.hidden=true;}
   updateSharedSettingsSummaries(c);
   updateCheckFieldHints(c);renderRequestPlan(c);scheduleRequestPlan();
 }
@@ -1274,7 +1390,7 @@ async function startRun(event) {
     const result=await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});state.config=clone(payload.config);
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','capacity'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
-  }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Start run ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
+  }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Launch ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
 }
 function reportConfig(report){return report?.manifest?.config || state.detail?.config || {};}
 function mainFinding(report) {
@@ -1331,10 +1447,11 @@ function renderDetail() {
   const completePass=d.state==='completed'&&!d.error&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||unselectedCheck(c,report));
   const finding=findingEvidence(report);
   const compareNext=!completePass&&!checks.some(c=>['fail','blocked','inconclusive'].includes(c.status))&&!report.abort_reason&&['fail','inconclusive'].includes(report.baseline?.status);
-  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
+  $('#main').innerHTML=`<div class="page-heading result-heading"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
+  ${renderMosaic(orderedRequests(report))}${renderBeeswarm(orderedRequests(report))}
   <div class="result-summary">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item"><strong>${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span style="margin-left:auto" class="hint">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div>
-  <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
+  <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" tabindex="${state.tab==='checks'?0:-1}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" tabindex="${state.tab==='baseline'?0:-1}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" tabindex="${state.tab==='config'?0:-1}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
   <section id="result-content" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='checks'?renderChecks(report):state.tab==='baseline'?renderComparison(report):renderConfig(report)}</section>
   <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`;
   syncComparisonFilters();
@@ -1346,7 +1463,7 @@ function renderChecks(report) {
   const selected=checks.find(c=>`${c.target}:${c.id}`===state.selectedCheck) || checks.find(c=>c.status!=='skipped');state.selectedCheck=selected?`${selected.target}:${selected.id}`:null;
   const attention=checks.filter(c=>!['pass','skipped'].includes(c.status)),passed=checks.filter(c=>c.status==='pass'),skipped=checks.filter(c=>c.status==='skipped');
   const checkButton=c=>`<button class="check-item ${c===selected?'selected':''}" data-check="${escape(`${c.target}:${c.id}`)}" aria-pressed="${c===selected}"><span><span class="check-name">${escape(checkGuide[c.id]?.name || c.title)}</span><small>${escape(keyMetric(c,report))}${(reportConfig(report).targets || []).length>1?` · ${escape(c.target)}`:''}</small></span>${badge(c.status,unselectedCheck(c,report)?'Not selected':undefined)}</button>`;
-  return `<div class="result-grid"><section class="panel check-detail">${selected?renderCheck(selected,report):'<div class="empty-state"><h2>No checks ran</h2><p>Open the check list to inspect recorded reasons, or review settings to choose your checks.</p><button class="button" data-action="rerun">Review settings</button></div>'}</section><div class="result-navigator ${state.checkNavigatorOpen?'is-expanded':''}"><button type="button" class="button check-navigator-toggle" data-action="toggle-checks" aria-expanded="${Boolean(state.checkNavigatorOpen)}" aria-controls="check-result-list">${state.checkNavigatorOpen?'Hide check list':'Browse check results'}</button><nav class="check-list" id="check-result-list" aria-label="Check results">${attention.length?`<h2 class="check-group-heading">Needs attention · ${attention.length}</h2>${attention.map(checkButton).join('')}`:''}${passed.length?`<h2 class="check-group-heading">Passed checks · ${passed.length}</h2>${passed.map(checkButton).join('')}`:''}${skipped.length?`<details class="checks-not-run" ${selected?.status==='skipped'?'open':''}><summary>Not run · ${skipped.length}</summary>${skipped.map(checkButton).join('')}</details>`:''}</nav></div></div>`;
+  return `<div class="result-grid"><div class="result-navigator ${state.checkNavigatorOpen?'is-expanded':''}"><button type="button" class="button check-navigator-toggle" data-action="toggle-checks" aria-expanded="${Boolean(state.checkNavigatorOpen)}" aria-controls="check-result-list">${state.checkNavigatorOpen?'Hide check list':'Browse check results'}</button><nav class="check-list" id="check-result-list" aria-label="Check results">${attention.length?`<h2 class="check-group-heading">Needs attention · ${attention.length}</h2>${attention.map(checkButton).join('')}`:''}${passed.length?`<h2 class="check-group-heading">Passed checks · ${passed.length}</h2>${passed.map(checkButton).join('')}`:''}${skipped.length?`<details class="checks-not-run" ${selected?.status==='skipped'?'open':''}><summary>Not run · ${skipped.length}</summary>${skipped.map(checkButton).join('')}</details>`:''}</nav></div><section class="panel check-detail">${selected?renderCheck(selected,report):'<div class="empty-state"><h2>No checks ran</h2><p>Open the check list to inspect recorded reasons, or review settings to choose your checks.</p><button class="button" data-action="rerun">Review settings</button></div>'}</section></div>`;
 }
 function metric(label,value,detail=''){return `<div class="metric"><dt>${escape(label)}</dt><dd>${escape(value)}</dd>${detail?`<small>${escape(detail)}</small>`:''}</div>`;}
 function renderCancellationResults(metrics){
@@ -1456,15 +1573,15 @@ function renderLive() {
   const finished=progress.completed || 0,started=progress.attempted || 0,active=Math.max(0,started-finished),secs=progress.elapsed_seconds || 0,stopping=d.state==='stopping';
   const judging=progress.phase==='judging'||String(progress.event || '').startsWith('judging_');
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
-  const title=judging?'Evaluating golden answers':d.state==='queued'?'Preparing your check':'Checking your endpoint';
-  const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Measuring the configured endpoint. The final report will explain which checks passed and what needs attention.';
-  const bounds=judging?[['Evaluator requests at a time',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Maximum in flight',c.concurrency],['Total request limit',c.max_requests],['Maximum duration',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
+  const title=judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Mission control';
+  const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Requests appear as they start. Select a spot for evidence.';
+  const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Maximum in flight',c.concurrency],['Total request limit',c.max_requests],['Maximum duration',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
   $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p></div><button class="button danger" data-action="stop" ${stopping?'disabled':''}>${icon('stop')}${stopping?'Stopping…':'Stop run'}</button></div>
-  <div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(human(progress.scenario || progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
+  ${renderMosaic(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started})}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(human(progress.scenario || progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
   <dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Requests finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl>
   <div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/(c.max_requests || 1)*100)}%"></span></div><div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`Requests started · ${number(started)} / ${number(c.max_requests)} limit`}</span><span>${judging?'Inference timing is unchanged':'Request ceiling, not completion'}</span></div></section>
-  <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Recent activity</h2><span class="hint">Updates automatically</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.scenario || e.event || 'Progress'))}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
-  <aside class="panel run-preview"><h3>${judging?'Evaluation limits':'This run’s limits'}</h3><p>${judging?'Separate limits apply to the configured judges.':'These limits apply across all selected checks and endpoints.'}</p><dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
+  <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Recent activity</h2><span class="hint">Updates automatically</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.event || 'Progress'))}${e.scenario?` · ${escape(human(e.scenario))}`:''}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
+  <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'This run’s limits'}</h3><p>${judging?'Separate limits apply to the configured judges.':'These limits apply across all selected checks and endpoints.'}</p><dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
 }
 function renderJudgement(judgement) {
   if(!judgement)return '';
@@ -1601,6 +1718,15 @@ async function copyCli() {
 }
 
 document.addEventListener('click',async(event)=>{
+  if(event.target.closest('.skip-link')){event.preventDefault();const main=$('#main');main.setAttribute('tabindex','-1');main.focus({preventScroll:true});main.scrollIntoView({block:'start'});return;}
+  const liveSpot=event.target.closest('[data-live-slot]');if(liveSpot){openLiveRequest(Number(liveSpot.dataset.liveSlot));return;}
+  const runFilter=event.target.closest('[data-run-filter]');if(runFilter){state.filter=runFilter.dataset.runFilter;renderRuns();$(`[data-run-filter="${state.filter}"]`)?.focus();return;}
+  const command=event.target.closest('[data-command]');if(command){$('#command-dialog').close();commandItems[Number(command.dataset.command)]?.action();return;}
+  const shellAction=event.target.closest('[data-action]')?.dataset.action;
+  if(shellAction==='theme'){setTheme(document.documentElement.dataset.theme==='light'?'dark':'light');return;}
+  if(shellAction==='commands'){openCommands();return;}
+  if(shellAction==='close-commands'){$('#command-dialog').close();return;}
+  if(shellAction==='mosaic-prev'||shellAction==='mosaic-next'){state.mosaicPage=Math.max(0,(state.mosaicPage || 0)+(shellAction==='mosaic-next'?1:-1));renderDetail();$('.request-mosaic [tabindex="0"]')?.focus({preventScroll:true});return;}
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
   const setupStep=event.target.closest('[data-setup-step]');if(setupStep){state.returnToReview=Boolean(setupStep.dataset.reviewEdit);navigateSetup(Number(setupStep.dataset.setupStep));return;}
   const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;renderDetail();$(`#tab-${state.tab}`).focus();return;}
@@ -1693,6 +1819,8 @@ document.addEventListener('click',async(event)=>{
 });
 document.addEventListener('submit',event=>{if(event.target.id==='new-run-form')startRun(event);if(event.target.id==='baseline-form')saveBaseline(event);if(event.target.id==='dataset-example-form')saveExample(event);if(event.target.id==='dataset-import-form')useImportedDataset(event);if(event.target.id==='dataset-try-form')tryDatasetExample(event);});
 document.addEventListener('input',event=>{
+  if(event.target.id==='command-search'){const query=event.target.value.toLowerCase();for(const item of $$('.command-item'))item.hidden=!item.textContent.toLowerCase().includes(query);return;}
+
   if(event.target.id==='run-search'){state.historySearch=event.target.value;renderRuns();return;}
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
@@ -1730,7 +1858,34 @@ document.addEventListener('change',event=>{
   if(event.target.name==='example_scorer'){syncExampleScorer();return;}
   if(event.target.closest('#dataset-import-form')){const draft=state.datasetImport;if(draft){draft.mapping=importMappingValues();draft.sequence++;draft.loading=false;draft.mappingDirty=true;renderDatasetImport();}return;}
   if(event.target.id==='request-pack-file'){const file=event.target.files[0];event.target.value='';importRequestPack(file);return;}if(event.target.name==='request_source'){changeRequestSource(event.target.value);return;}if(event.target.id==='config-file'){const file=event.target.files[0];event.target.value='';importConfig(file);return;}if(event.target.closest('#new-run-form')){configChanged();scheduleRequestPlan();}if(event.target.closest('[data-test-editor]')&&event.target.tagName==='SELECT'){if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);else editTestField(event.target);updateBounds();}if(event.target.name==='check'){const id=event.target.value;captureFormDraft();renderNew('custom');const control=$(`[name="check"][value="${id}"]`);if(control?.closest('[data-test-card]')?.hidden)$('[data-catalogue-filter="all"]')?.focus();else control?.focus();return;}if(['comparison-outcome','comparison-check'].includes(event.target.id)){const id=event.target.id;if(id==='comparison-outcome')state.comparisonFilter=event.target.value;else state.comparisonCheck=event.target.value;$('#result-content').innerHTML=renderComparison(state.detail.report);syncComparisonFilters();$('#'+id).focus();}if(event.target.id==='run-filter'){state.filter=event.target.value;renderRuns();$('#run-filter').focus();}if(['mode','restart_target'].includes(event.target.name)){updateRestart();if(state.configView==='json'&&!hasJsonChanges()){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}}if(event.target.name==='replace')$('#save-baseline').textContent=event.target.checked?'Replace baseline':'Save baseline';});
-document.addEventListener('keydown',event=>{const configTab=event.target.closest('[data-config-tab]');if(configTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();switchConfigView(event.key==='Home'?'form':event.key==='End'?'json':state.configView==='form'?'json':'form');return;}const tab=event.target.closest('[data-tab]');if(tab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();const tabs=['checks','baseline','config'];let i=tabs.indexOf(state.tab);i=event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3;state.tab=tabs[i];renderDetail();$(`#tab-${state.tab}`).focus();}});
+let navigationPrefix=0;
+document.addEventListener('keydown',event=>{
+  if(event.isComposing)return;
+  if((event.metaKey||event.ctrlKey)&&event.key.toLowerCase()==='k'){event.preventDefault();openCommands();return;}
+  const palette=$('#command-dialog');
+  if(palette?.open&&['ArrowDown','ArrowUp','Enter'].includes(event.key)){
+    const items=$$('.command-item',palette).filter(el=>!el.hidden),current=items.indexOf(document.activeElement);
+    event.preventDefault();if(event.key==='Enter'){(items[current] || items[0])?.click();return;}
+    items[(current+(event.key==='ArrowDown'?1:-1)+items.length)%items.length]?.focus();return;
+  }
+  if(document.querySelector('dialog[open]'))return;
+  const spot=event.target.closest('.request-spot, .swarm-dot');
+  if(spot&&['Enter',' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)){
+    event.preventDefault();if(event.key==='Enter'||event.key===' '){spot.dispatchEvent(new MouseEvent('click',{bubbles:true}));return;}
+    const svg=spot.closest('svg'),spots=$$('[tabindex]',svg),index=spots.indexOf(spot),cols=Number(svg.dataset.columns || 1);
+    const delta=event.key==='ArrowLeft'?-1:event.key==='ArrowRight'?1:event.key==='ArrowUp'?-cols:cols;
+    const next=event.key==='Home'?0:event.key==='End'?spots.length-1:Math.max(0,Math.min(spots.length-1,index+delta));
+    spot.setAttribute('tabindex','-1');spots[next].setAttribute('tabindex','0');spots[next].focus();return;
+  }
+  if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();primaryAction();return;}
+  if(!event.metaKey&&!event.ctrlKey&&!event.altKey&&!event.target.closest('input,textarea,select,[contenteditable="true"]')){
+    const key=event.key.toLowerCase();
+    if(key==='n'){event.preventDefault();location.hash='#new';return;}
+    if(key==='g'){navigationPrefix=Date.now();return;}
+    if(key==='r'&&Date.now()-navigationPrefix<1200){event.preventDefault();navigationPrefix=0;location.hash='#runs';return;}
+    if(key==='?'){event.preventDefault();openCommands(true);return;}
+  }
+  const configTab=event.target.closest('[data-config-tab]');if(configTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();switchConfigView(event.key==='Home'?'form':event.key==='End'?'json':state.configView==='form'?'json':'form');return;}const tab=event.target.closest('[data-tab]');if(tab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();const tabs=['checks','baseline','config'];let i=tabs.indexOf(state.tab);i=event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3;state.tab=tabs[i];renderDetail();$(`#tab-${state.tab}`).focus();}});
 document.addEventListener('toggle',event=>{
   if(event.target.matches('.judge-configuration'))state.judgeEditorOpen=event.target.open;
   if(event.target.matches('.field-help')&&event.newState==='open')positionFieldHelp(event.target);
@@ -1742,5 +1897,5 @@ document.addEventListener('scroll',event=>{
 },true);
 document.addEventListener('cancel',event=>{if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
 window.addEventListener('hashchange',route);
-async function init(){try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';await route();}catch(error){$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';await route();}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
 init();
