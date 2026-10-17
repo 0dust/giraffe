@@ -214,8 +214,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         count = len(settings.shapes) * levels * settings.repetitions
         add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
     if "tools" in selected:
-        count = len(resolved_tool_fixtures(config)) * len(resolved_tool_modes(config)) * (2 if config.forced_tool_diagnostic else 1)
-        add("tools", count, "Tool fixtures in each selected response mode; automatic checks precede optional forced diagnostics. No tools execute.",
+        fixtures = resolved_tool_fixtures(config)
+        count = (len(fixtures) + sum(fixture.choice is None for fixture in fixtures)
+                 * config.forced_tool_diagnostic) * len(resolved_tool_modes(config))
+        add("tools", count, "Tool fixtures in each selected response mode; declared choice rules and task checks precede optional legacy forced diagnostics. No tools execute.",
             source="configured tool fixtures" if config.tool_checks and config.tool_checks.fixtures else "generated examples")
 
     judging = details["judging"] if details else None

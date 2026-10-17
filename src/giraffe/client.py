@@ -174,6 +174,13 @@ class LLMClient:
         }
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
+        if spec.scorer == "tool":
+            if spec.tool_expectation and spec.tool_expectation.choice:
+                payload["tools"] = spec.tool_expectation.tools
+                payload.pop("parallel_tool_calls", None)
+                payload.update(spec.tool_expectation.choice.request_options())
+            record.tool_request_options = {key: payload[key] for key in
+                ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
         if stream:
             payload.setdefault("stream_options", {"include_usage": True})
         record.workload = dict(spec.workload)
