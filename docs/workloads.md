@@ -73,8 +73,8 @@ workload generator source. Source changes conservatively prevent like-for-like
 baseline comparison even when settings stay the same. Live histories may change input
 work across runs: comparison checks observed input lengths and request hashes and
 marks affected timing/rates inconclusive rather than claiming identical inputs.
-Log-probability requests can be supplied through request options, but Giraffe does
-not currently persist or compare log-probabilities.
+Optional `consistency.logprobs` collects and compares content token probabilities
+independently of answer hashes; see [Token probability consistency](#token-probability-consistency).
 
 Percentiles include valid completions and show sample counts. Failures, timeouts,
 cancellation, unknown lengths and finish reasons appear alongside them. Aggregate
@@ -184,3 +184,87 @@ credential-bearing URLs and secret environment expressions before persistence.
 Reports, UI job metadata, baseline diffs and reproduction exports keep secret
 reference names, not resolved secret values. Redactions are visible. Supply omitted
 credentials/settings manually when reproducing a run.
+
+## Token probability consistency
+
+Run `giraffe run --config examples/logprob-consistency.yaml --output runs/logprobs`
+after setting the example's URL and model to an existing vLLM endpoint. The
+Repeated-request consistency editor exposes the same `logprobs` JSON object;
+CLI YAML, API preview/export, saved runs and reruns use this configuration.
+Omit it or set it to `null` to preserve ordinary answer-only consistency.
+
+Enabling it sends `logprobs: true`, `top_logprobs` (0–20), and `stream: false`.
+`response_mode: complete` is the only supported mode; `stream` is rejected during
+configuration validation. The profile explicitly overrides global streaming for
+these requests. A non-streaming completion is not evidence about streaming.
+
+Each input shape uses a fixed corpus of identical independent prompts with
+`max(levels)` numbered slots. Every condition replays that same corpus, first at
+level 1, then at each configured level. `repetitions` is the number of measured
+rounds in this mode. `priming_rounds` (0–2) adds excluded warmup rounds before each
+condition. No response is appended to a later prompt. Temperature, seed, options,
+model and messages stay fixed; the server's enforcement of requested generation
+options remains unverified. Priming does not establish a cold cache or remove
+possible ordering effects.
+
+The request count per target is
+`shapes × distinct([1, *levels]) × max(levels) × (repetitions + priming_rounds)`.
+The example sends 40 requests. Preview shows this count before a run. Requested
+concurrency, per-round client overlap, issued/completed/missing requests and
+usable samples remain visible. Client overlap does not prove which requests the
+server batched together. Rounds run in bounded batches; a final batch may be
+smaller than the requested level. Each request records its own observed overlap.
+Request, duration, cancellation, context and error limits
+still apply; unfinished rounds or inadequate overlap make coverage inconclusive.
+
+For each corpus slot, the comparator groups matching effective request hashes,
+observed model/backend identities and preceding token histories. At each aligned
+position, min/max ranges cover all pairs, including later-versus-later variation.
+`compare_levels: true` additionally compares each pair of concurrency levels.
+Token identity uses token IDs when provided, otherwise bytes, otherwise token
+text. A token or length divergence is reported separately; probabilities after
+diverging histories are never compared. Alternative tokens are matched by
+identity rather than rank, and changed top-k membership is reported separately.
+Returned alternatives are a partial distribution: an absent alternative is never
+assigned zero probability. Returned lists may be shorter than requested.
+
+Probability values use natural-log units. Non-finite or malformed values are
+invalid evidence. The OpenAI `-9999.0` sentinel and absent requested alternatives
+are unknown. Raw precision is retained for comparisons and exports; display
+rounding does not set tolerance. With `strict: false` the probability result is
+`diagnostic`, even when differences exist. Set both `strict: true` and an explicit
+nonnegative `tolerance` to enforce numeric equality within that absolute tolerance.
+The independent outer `consistency.strict` continues to govern answer equality.
+A known numeric violation fails even if some other samples are incomplete.
+
+Unsupported, missing, malformed, truncated, misaligned or incomplete evidence
+cannot produce a probability pass. `support: discover` leaves an explicit
+logprob-field rejection or missing logprobs inconclusive; `support: required`
+fails those capability expectations. Unrelated HTTP errors and wrong answers
+still use ordinary acceptance limits. A strict result with token divergence,
+changed alternative membership or unknown probabilities remains inconclusive
+unless a comparable numeric pair already proves a violation.
+
+Per-response evidence is bounded to 4,096 content tokens, 16,384 total chosen and
+alternative entries, and 512 KiB of token text/bytes. Each run admits at most
+16 MiB of serialized token evidence; each condition comparison admits two million
+entries. Exceeding any bound is explicit and inconclusive, never silent sampling.
+The transport's existing response-size limit also applies. Large top-k values
+increase response size and work. Use smaller counts or output caps when appropriate.
+
+JSON and HTML include separate answer and probability outcomes, extrema, coverage,
+and representative request IDs and positions. Request evidence contains chosen
+token bytes, positions, logprobs and returned alternatives. Existing `all`,
+`failures` and `none` retention policies also govern these raw tokens; numerical
+summaries survive body removal. Live progress events omit token bodies. Workload
+settings and comparator source participate in baseline identity, so enabling or
+changing this instrumentation prevents a like-for-like performance claim.
+
+This check detects observed differences; it does not establish a scheduler cause,
+model correctness, or a currently reproducible vLLM defect. The motivating
+[vLLM report](https://github.com/vllm-project/vllm/issues/51187) describes particular
+hardware, versions and concurrency. Later comments report clean runs after an
+[RMSNorm fix](https://github.com/vllm-project/vllm/pull/48391). Record the actual
+runtime/model/hardware and test the workload on your deployment; the original
+reported concurrency threshold is not a universal trigger. The token evidence
+contract follows the [Chat Completions API](https://developers.openai.com/api/reference/resources/chat).
