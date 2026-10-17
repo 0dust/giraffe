@@ -1,0 +1,58 @@
+# Review model ID, context and acceptance limits for your deployment.
+# These limits are a starting profile, not engine or hardware guarantees.
+targets:
+- name: llamacpp
+  url: http://127.0.0.1:8080/v1
+  model: replace-with-served-model-id
+  deployment:
+    discovery: llamacpp
+    runtime:
+      engine: llamacpp
+  metrics_profile: llamacpp
+  metrics_url: http://127.0.0.1:8080/metrics
+checks:
+- access
+- serving
+- first_output
+- generation
+- capacity
+- concurrency
+- context
+- correctness
+- json
+- cancellation
+- recovery
+- gpu
+- arrivals
+- prefix
+- sessions
+- consistency
+- tools
+concurrency: 2
+max_requests: 700
+max_duration_seconds: 1800
+request_timeout_seconds: 60
+max_output_tokens: 128
+context_limit: 4096
+samples: 5
+sustained_seconds: 5
+retention: failures
+request_options:
+  temperature: 0
+limits:
+  min_samples: 5
+  first_output_ms: 10000
+  latency_ms: 60000
+  stream_gap_ms: 10000
+  min_output_tokens_per_second: 1
+  fairness_max_ratio: 5
+  max_error_rate: 0
+  min_correctness: 1
+
+# Large-token cases report insufficient limits with this small-memory profile.
+# Use concurrent-workloads.yaml and matching server limits to execute both 10k cases.
+concurrent_workloads:
+  scenarios: [size_matrix, mixed_interference, streaming_fairness, token_stress]
+  levels: [1, 2]
+  samples_per_bucket: 5
+  mixed_pairs: 5

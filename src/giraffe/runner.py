@@ -21,8 +21,10 @@ from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures)
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
+from .timing import TimingHealth, configured_metrics, qualified_violations, run_quality
 from .models import (
-    CHECK_NAMES, CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
+    INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
+    CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
     overall_status,
 )
 
@@ -128,6 +130,7 @@ class _Run:
         self.active = Counter()
         self.peak = Counter()
         self.max_lag_ms = 0.0
+        self.timing_health = TimingHealth(self.start)
         self.inflight = []
         for observation in self.observations.values():
             observation.update(deployment=None, deployment_history=[], phase_boundaries=[],
@@ -278,6 +281,8 @@ class _Run:
                 record.error = "maximum run duration reached"
             record.completed_at = _now()
             record.dispatch_ms = (started-self.start)*1000
+            record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
+                if record._timing_started_monotonic is not None else record.dispatch_ms)
             record.completed_ms = (time.monotonic()-self.start)*1000
             record.workload = dict(spec.workload)
             record.scheduled_ms = spec.workload.get("scheduled_ms")
@@ -319,12 +324,11 @@ class _Run:
         return result
 
     async def monitor(self, tasks):
-        last = time.monotonic()
         while not all(task.done() for task in tasks):
             await asyncio.sleep(.05)
             now = time.monotonic()
-            self.max_lag_ms = max(self.max_lag_ms, (now-last-.05)*1000)
-            last = now
+            self.timing_health.sample(now)
+            self.max_lag_ms = max(self.max_lag_ms, self.timing_health.max_lag_ms)
             if self.stop.is_set() or now >= self.deadline or self.errors >= self.config.stop_after_errors:
                 self.allowed(self.config.targets[0].name)
                 for task in tasks:
@@ -535,6 +539,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                            case_sequence(config, len(schedule), index)],
                             "active_case_specs": run.pack_specs,
                         }
+                    stage_start = (time.monotonic() - run.start) * 1000
                     stage = await run_stage(
                         traffic=traffic, rate_rps=rate, stage_index=index,
                         fixtures=mixed_fixtures, execute=execute,
@@ -545,6 +550,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                           if any(spec.scorer == "judge" for spec in run.pack_specs) else None),
                         **pack_arguments,
                     )
+                    stage["timing_interval_ms"] = [stage_start, (time.monotonic() - run.start) * 1000]
                     run.observations[target.name]["capacity"].append(stage)
                     if run.reason or run.stop.is_set() or time.monotonic() >= run.deadline:
                         run.unfinished[target.name].add("capacity")
@@ -618,7 +624,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     batches += 1
                 run.observations[target.name]["sustained_batches"] = batches
                 run.observations[target.name]["sustained_complete"] = time.monotonic() >= end and batches > 0
-                await run.group(target, client, fixtures["short"], "recovery",
+                await run.group(target, client, fixtures["sustained"], "recovery",
                                 count=effective.samples, checks=["recovery"])
             await workloads.execute(run, target, client, fixtures)
     except asyncio.CancelledError:
@@ -753,7 +759,6 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]
-    saturated = run.max_lag_ms > max(100, (_stats(warm)["first_output_p50_ms"] or 0)*.1)
     for check_id in CORE_CHECKS:
         title = CHECK_NAMES[check_id]
         config = _check_config(run.config, check_id)
@@ -774,6 +779,12 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         if check_id == "generation":
             records = [r for r in records if r.scenario == "generation"]
         metrics, status, summary = _stats(records), "pass", "Observed requests met configured checks."
+        timing_records = ([r for r in records if r.scenario == "fairness_short"] + warm
+                          if check_id == "fairness" else records)
+        quality = run_quality(run, timing_records, target.name, configured_metrics(limits, check_id))
+        saturated = quality["status"] == "client_delayed"
+        if check_id in {"first_output", "generation", "capacity", "fairness", "recovery"}:
+            metrics["timing_quality"] = quality
         if check_id not in config.checks:
             status, summary = "skipped", "Not selected for this run."
         elif observations["restart"] and observations["restart"]["status"] == "blocked":
@@ -814,8 +825,14 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             violations = _timing_violations(records, limits.model_copy(update={"first_output_ms": None}))
             if check_id == "first_output":
                 violations = [r.id for r in records if limits.first_output_ms and r.first_output_ms is not None and r.first_output_ms > limits.first_output_ms]
-            if violations and saturated:
-                status, summary = "inconclusive", "Generator saturation prevents attributing observed timing violations to the endpoint."
+            assessed_limits = limits.model_copy(update={"latency_ms": None, "stream_gap_ms": None,
+                "min_output_tokens_per_second": None}) if check_id == "first_output" else limits.model_copy(update={"first_output_ms": None})
+            qualified = qualified_violations(records, assessed_limits, quality)
+            if qualified:
+                status, summary = "fail", "Observed request timing exceeded a configured limit without overlapping client scheduling delay."
+                metrics["violations"] = qualified
+            elif violations and saturated:
+                status, summary = "inconclusive", "Client scheduling delay prevents attributing observed timing violations to the endpoint."
                 metrics["unattributed_timing_violations"] = violations
             elif violations:
                 status, summary = "fail", "Observed request timing exceeded a configured limit."
@@ -823,7 +840,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif not thresholds:
                 status, summary = "inconclusive", "Timing observed; no acceptance limit configured."
             elif saturated or metrics["completed"] < limits.min_samples:
-                status, summary = "inconclusive", "Timing has too few successful samples or generator saturation."
+                status, summary = "inconclusive", "Timing has too few successful samples or overlapping client scheduling delay."
             elif check_id == "first_output" and any(r.valid and r.first_output_ms is None for r in records):
                 status, summary = "inconclusive", "Useful first-output timing unavailable for some responses."
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
@@ -834,8 +851,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Too few measurable streamed answers to assess generation pace."
         elif check_id == "capacity":
             stages = observations["capacity"]
-            if saturated:
-                for stage in stages:
+            for stage in stages:
+                stage_records = [r for r in records if r.traffic_stage == stage["stage_index"]]
+                interval = stage.get("timing_interval_ms")
+                stage_quality = run_quality(run, stage_records, target.name,
+                    configured_metrics(limits), phase_intervals=(tuple(interval),) if interval else ())
+                stage["timing_quality"] = stage_quality
+                if stage_quality["status"] == "client_delayed":
                     stage["accepted"] = False
                     stage["generator_limited"] = True
                     # Missing judgments may still pass; preserve a correctness
@@ -847,10 +869,14 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     independent_failure = (
                         stage["error_rate"] is not None and stage["error_rate"] > limits.max_error_rate
                     ) or (best_possible_correctness is not None
-                          and best_possible_correctness < limits.min_correctness)
+                          and best_possible_correctness < limits.min_correctness) or bool(
+                              qualified_violations(stage_records, limits, stage_quality, arrival=True))
                     if not independent_failure:
                         stage["status"] = "inconclusive"
-                    stage["reasons"].append("Run-wide generator scheduling lag prevents timing attribution.")
+                    stage["reasons"].append("Client scheduling delay overlapped this traffic stage; endpoint timing attribution is uncertain.")
+            if any(stage["timing_quality"]["phase_affected"] for stage in stages):
+                metrics["timing_quality"]["phase_affected"] = True
+                metrics["timing_quality"]["status"] = "client_delayed"
             accepted = [stage["rate_rps"] for stage in stages if stage["accepted"]]
             metrics["traffic_stages"] = stages
             metrics["highest_acceptable_rate_rps"] = max(accepted, default=None)
@@ -877,8 +903,12 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "fail", "Mixed-load requests failed; short and long traffic did not both complete successfully."
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Mixed short/long traffic failed the configured known-answer correctness limit."
+            elif qualified_violations(mixed_records, limits.model_copy(update={
+                    "first_output_ms": None, "latency_ms": None,
+                    "min_output_tokens_per_second": None}), quality):
+                status, summary = "fail", "Active short-stream pauses exceeded the configured stream-gap limit without overlapping client scheduling delay."
             elif saturated:
-                status, summary = "inconclusive", "Generator saturation prevents attributing mixed-traffic timing effects to the endpoint."
+                status, summary = "inconclusive", "Client scheduling delay prevents attributing mixed-traffic timing effects to the endpoint."
             elif limits.stream_gap_ms and mixed["max_stream_gap_ms"] is not None and mixed["max_stream_gap_ms"] > limits.stream_gap_ms:
                 status, summary = "fail", "Active short-stream pauses exceeded the configured stream-gap limit under mixed traffic."
             elif ratio is not None and limits.fairness_max_ratio and ratio > limits.fairness_max_ratio:
@@ -971,13 +1001,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                             "rolling_windows": [_stats(window) for window in windows]})
             violations = _timing_violations(records, limits)
             if ((metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate)
-                    or (violations and not saturated)
+                    or qualified_violations(records, limits, quality)
                     or (accuracy is not None and accuracy < limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
             elif accuracy is None or metrics["unscored_completions"]:
                 status, summary = "inconclusive", "Some sustained or recovery completions lack a local correctness score."
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms, limits.min_output_tokens_per_second)):
-                status, summary = "inconclusive", "Generator saturation prevents attributing sustained and recovery timing to the endpoint."
+                status, summary = "inconclusive", "Client scheduling delay prevents attributing sustained and recovery timing to the endpoint."
             elif _missing_timing(records, limits):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits)
                 status, summary = "inconclusive", "Configured sustained and recovery limits cannot be checked with available timing or token measurements."
@@ -1043,14 +1073,16 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                   summary=summary, metrics=metrics,
                                   evidence_ids=[r.id for r in records]))
     from giraffe.workloads import results
-    return result + results(run, target, _stats, _timing_violations, _missing_timing,
-                            saturated=saturated)
+    return result + results(run, target, _stats, _timing_violations, _missing_timing)
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
-    config = config.model_copy(deep=True)
+    from .concurrent_workloads import execution_config, consolidate_checks
+
+    public_config = config.model_copy(deep=True)
+    config = execution_config(public_config)
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     fixtures = builtin_fixtures(config)
@@ -1078,6 +1110,10 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
+        # A blocked callback may complete all requests before the monitor wakes.
+        # Capture that final interval before cancelling the monitor.
+        run.timing_health.sample(time.monotonic())
+        run.max_lag_ms = max(run.max_lag_ms, run.timing_health.max_lag_ms)
         monitor.cancel()
         await asyncio.gather(monitor, return_exceptions=True)
     inference_duration = time.monotonic() - run.start
@@ -1103,10 +1139,13 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         limits = _check_config(config, "capacity").limits
         for target in config.targets:
             if run.stage_evidence[target.name]:
+                stages = run.observations[target.name]["capacity"]
                 run.observations[target.name]["capacity"] = [
-                    finalize_stage(evidence, limits) for evidence in run.stage_evidence[target.name]
-                ]
+                    finalize_stage(evidence, limits) | {
+                        "timing_interval_ms": stages[index]["timing_interval_ms"]}
+                    for index, evidence in enumerate(run.stage_evidence[target.name])]
     checks = [check for target in config.targets for check in _checks(run, target)]
+    checks = consolidate_checks(run, public_config, checks)
     counts = defaultdict(dict)
     for target in config.targets:
         for scenario in sorted({r.scenario for r in run.records if r.target == target.name}):
@@ -1116,12 +1155,13 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     if any(check.metrics.get("low_confidence") for check in checks):
         warnings.append("Some checks have too few successful samples for confident timing conclusions.")
     if run.max_lag_ms > 100:
-        warnings.append("Generator scheduling lag was observed; affected timing checks are inconclusive.")
+        warnings.append("Client scheduling delay was observed. Timing quality is qualified by overlapping request/stage intervals; raw measurements are retained. Its cause is not established.")
     if run.budget_used >= config.max_requests:
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
     if run.pack_specs:
         warnings.append("Repeated, warmed workload: quiet controls and traffic repeat the same requests and may benefit caches.")
     observations = {"targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
+                    "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
                     "inference_duration_seconds": inference_duration,
                     **({"judging": judging_summary} if judging_summary is not None else {}),
@@ -1131,8 +1171,10 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
     from giraffe.workloads import FIXTURE_SOURCE_SHA256, WORKLOAD_CHECKS
-    config_values = config.model_dump(mode="json")
-    workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
+    config_values = public_config.model_dump(mode="json")
+    workload_settings = {key: (getattr(config, key).model_dump(mode="json")
+                              if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
+                         for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
@@ -1143,10 +1185,11 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                 if spec[field] == default:
                     del spec[field]
     manifest = {"config": config_values,
+                "timing_measurement_version": 2,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
-                "workload_selection": {key: "selected" if key in config.checks else "not selected"
-                                       for key in CHECK_NAMES if key not in CORE_CHECKS},
-                "effective_checks": {name: config.effective_check(name) for name in config.checks},
+                "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
+                                       for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
+                "effective_checks": {name: public_config.effective_check(name) for name in public_config.checks},
                 "effective_traffic": (config.effective_traffic().model_dump(mode="json")
                                       if "capacity" in config.checks else None),
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,

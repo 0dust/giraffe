@@ -20,14 +20,16 @@ from giraffe.sglang_traces import TraceTail, terminal_spans
 def trace(**changes):
     return {"schema_version": 1, "source": "sglang::request", "request_id": "rid",
             "model": "tiny", "finish_reasons": ["abort"], "trace_id": "abcd",
-            "started_at_ns": 100, "finished_at_ns": 300, "received_at_ns": 400} | changes
+            "started_at_ns": 100, "finished_at_ns": 300, "received_at_ns": 400,
+            "received_monotonic_ns": 400} | changes
 
 
 def cancelled(**changes):
     return RequestRecord(id="client", target="local", fixture_id="cancel", scenario="backend_cancel",
                          check_ids=["cancellation"], started_at="now", status="cancelled",
                          server_request_id="rid", observed_model="tiny",
-                         client_cancelled_at_ns=200).model_copy(update=changes)
+                         client_cancelled_at_ns=200,
+                         client_cancelled_monotonic_ns=200).model_copy(update=changes)
 
 
 def test_sglang_fixtures_are_opt_in_versioned_and_respect_output_ceiling():
@@ -43,19 +45,19 @@ def test_sglang_fixtures_are_opt_in_versioned_and_respect_output_ceiling():
     assert followup.scorer == "none" and followup.max_tokens == 8
 
 
-@pytest.mark.parametrize("reason,end,status", [
-    ("abort", 300, "pass"), ("abort", 2_000_000_200, "fail"),
-    ("length", 2_000_000_200, "fail"), ("stop", 300, "inconclusive"),
+@pytest.mark.parametrize("reason,received,status", [
+    ("abort", 300, "pass"), ("abort", 2_000_000_200, "inconclusive"),
+    ("length", 2_000_000_200, "inconclusive"), ("stop", 300, "inconclusive"),
 ])
-def test_correlated_terminal_reason_and_actual_finish_time_decide_verdict(reason, end, status):
-    row = trace(finish_reasons=[reason], finished_at_ns=end, received_at_ns=10_000_000_000)
+def test_correlated_terminal_reason_and_local_receipt_bound_decide_verdict(reason, received, status):
+    row = trace(finish_reasons=[reason], received_monotonic_ns=received)
     assert evaluate(cancelled(), row, 90, 1)["status"] == status
 
 
 @pytest.mark.parametrize("changes", [
     {"request_id": "other"}, {"model": "other"}, {"source": "sglang::scheduler"},
-    {"started_at_ns": 80}, {"finished_at_ns": 150}, {"finished_at_ns": "300"},
-    {"received_at_ns": 250}, {"finish_reasons": ["abort_requested"]},
+    {"started_at_ns": 0}, {"finished_at_ns": 80}, {"finished_at_ns": "300"},
+    {"received_at_ns": 0}, {"received_monotonic_ns": 150}, {"finish_reasons": ["abort_requested"]},
     {"schema_version": 2},
 ])
 def test_unrelated_stale_malformed_or_dispatch_only_evidence_cannot_pass(changes):
@@ -79,6 +81,7 @@ def test_native_protobuf_collector_only_saves_terminal_metadata():
     rows = terminal_spans(request.SerializeToString())
     assert len(rows) == 1 and rows[0]["finish_reasons"] == ["abort"]
     assert rows[0]["request_id"] == "rid" and rows[0]["finished_at_ns"] == 300
+    assert 0 < rows[0]["received_monotonic_ns"] <= time.monotonic_ns()
     assert "private" not in json.dumps(rows) and "Authorization" not in json.dumps(rows)
     with pytest.raises(Exception):
         terminal_spans(b"not protobuf")
@@ -188,14 +191,15 @@ async def test_real_client_closes_after_answer_chunks_and_keeps_exact_server_id(
     assert result.status == "cancelled" and result.answer_chunks == 2
     assert result.output == "12" and stream.closed
     assert result.server_request_id == "native-rid" and result.client_cancelled_at_ns
+    assert 0 < result.client_cancelled_monotonic_ns <= time.monotonic_ns()
     assert not result.stream_terminated
 
 
 @pytest.mark.parametrize("mode,expected", [
-    ("abort", "pass"), ("late", "fail"), ("missing", "inconclusive"),
+    ("abort", "pass"), ("late", "inconclusive"), ("missing", "inconclusive"),
     ("natural", "inconclusive"), ("followup_error", "fail"),
-    ("wrong_id", "inconclusive"), ("budget", "inconclusive"), ("late_budget", "fail"),
-    ("answer_mismatch", "fail"),
+    ("wrong_id", "inconclusive"), ("budget", "inconclusive"), ("late_budget", "inconclusive"),
+    ("answer_mismatch", "fail"), ("clock_skew", "pass"),
     ("generation_error", "fail"), ("generation_timeout", "fail"),
 ])
 async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, tmp_path, mode, expected):
@@ -220,6 +224,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
                     status=status, valid=status == "completed", output=("Blue" if mode == "answer_mismatch" and spec.fixture_id == "limits.stop.v1"
                             else str(spec.expected or "answer") if spec.scorer != "none" else "1 2"), output_tokens=1)
             now = time.time_ns()
+            cancel_mono = None
             if spec.cancel_after_chunks:
                 if mode in {"generation_error", "generation_timeout"}:
                     return RequestRecord(
@@ -234,14 +239,17 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
                 start = now
                 await asyncio.sleep(.001)
                 cancel = time.time_ns()
+                cancel_mono = time.monotonic_ns()
                 delay = .002 if mode in {"late", "late_budget"} else .0001
                 await asyncio.sleep(delay)
                 end = time.time_ns()
                 if mode != "missing":
+                    offset = -18_000_000 if mode == "clock_skew" else 0
                     with path.open("a") as sink:
                         sink.write(json.dumps(trace(
                             request_id="other" if mode == "wrong_id" else "rid",
-                            started_at_ns=start, finished_at_ns=end, received_at_ns=time.time_ns(),
+                            started_at_ns=start+offset, finished_at_ns=end+offset, received_at_ns=time.time_ns(),
+                            received_monotonic_ns=time.monotonic_ns(),
                             finish_reasons=["stop" if mode == "natural" else "abort"])) + "\n")
                 status, output, timestamp = "cancelled", "1 2", cancel
             else:
@@ -252,6 +260,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
                 check_ids=spec.check_ids, target="local", started_at=datetime.now(timezone.utc).isoformat(),
                 status=status, valid=status == "completed", output=output, observed_model="tiny",
                 server_request_id="rid", client_cancelled_at_ns=timestamp, http_status=200,
+                client_cancelled_monotonic_ns=cancel_mono,
             )
 
     monkeypatch.setattr(runner, "LLMClient", Client)
@@ -287,7 +296,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
         assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "pass"
         assert check.metrics["cancellation_results"]["answer"]["status"] == "pass"
     if mode == "late":
-        assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "fail"
+        assert check.metrics["cancellation_results"]["server_stopped"]["status"] == "inconclusive"
         assert check.metrics["cancellation_results"]["answer"]["status"] == "pass"
     if expected == "pass":
         assert backend["probes"][0]["trace"]["finish_reasons"] == ["abort"]
