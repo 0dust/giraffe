@@ -359,6 +359,81 @@ def test_serialized_retention_preserves_measurements_scores_and_source(policy, t
     assert "Errors / timeouts" in html_path.read_text()
 
 
+@pytest.mark.parametrize("policy", ["all", "failures", "none"])
+@pytest.mark.parametrize("content_status", ["pass", "fail", "not_checked"])
+def test_tool_evidence_retention_and_html(policy, content_status, tmp_path):
+    report = make_report(count=1)
+    report.manifest["config"]["retention"] = policy
+    record = report.requests[0]
+    expected_content = None if content_status == "not_checked" else {
+        "mode": "exact", "value": "Expected <tail>", "normalization": "none",
+    }
+    expectation = {
+        "tools": [{"type": "function", "function": {
+            "name": "lookup", "description": "Look up <city>",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }}],
+        "expected_calls": [{"name": "lookup", "arguments": {"city": "<Delhi>"}}],
+        "expected_content": expected_content,
+    }
+    outcomes = {
+        "protocol": {"status": "pass", "message": "Completed protocol."},
+        "content": {"status": content_status, "message": "Content <verdict>."},
+        "calls": {"status": "pass", "message": "Matched configured calls."},
+    }
+    actual_calls = [{"id": "call_1", "type": "function", "function": {
+        "name": "lookup", "arguments": '{"city":"<observed-secret>"}',
+    }}]
+    events = [
+        {"sequence": 0, "kind": "content", "offset": 0, "length": 17},
+        {"sequence": 1, "kind": "tool_call", "index": 0, "name_length": 6,
+         "arguments_length": 28, "id_present": True, "type_present": True},
+    ]
+    report.requests[0] = RequestRecord.model_validate(record.model_dump() | {
+        "score": content_status != "fail", "output": "<actual-response>",
+        "output_chars": 17, "reasoning": "<actual-reasoning>", "tool_calls": actual_calls,
+        "evaluation": {
+            "messages": [{"role": "user", "content": "Check <city>"}],
+            "scorer": "tool", "tool_expectation": expectation,
+        },
+        "tool_evaluation": outcomes,
+        "response_events": events, "response_events_truncated": True,
+    })
+    before = report.model_dump()
+    json_path, html_path = write_report(report, tmp_path)
+    saved = RunReport.model_validate_json(json_path.read_text()).requests[0]
+    retained = policy == "all" or (policy == "failures" and content_status == "fail")
+    assert saved.tool_evaluation.model_dump() == outcomes
+    assert saved.evaluation.tool_expectation.model_dump() == expectation
+    assert bool(saved.output) == retained
+    assert bool(saved.reasoning) == retained
+    assert saved.tool_calls == (actual_calls if retained else [])
+    assert saved.response_events == events
+    assert saved.response_events_truncated is True
+    assert saved.score == (content_status != "fail")
+    assert report.model_dump() == before
+    html = html_path.read_text()
+    for label in ("Tool-call expectations", "Assistant content", "Tool calls", "Protocol"):
+        assert label in html
+    assert "Content &lt;verdict&gt;." in html
+    assert "&lt;Delhi&gt;" in html
+    assert "<actual-response>" not in html
+    assert "<observed-secret>" not in html
+    assert ("&lt;observed-secret&gt;" in html) == retained
+    assert ("&lt;actual-response&gt;" in html) == retained
+    assert ("Expected &lt;tail&gt;" in html) == (content_status != "not_checked")
+    assert "No expected answer configured." not in html
+
+
+def test_legacy_tool_report_remains_readable(tmp_path):
+    report = make_report(count=1)
+    report.requests[0].evaluation = None
+    json_path, html_path = write_report(report, tmp_path)
+    saved = RunReport.model_validate_json(json_path.read_text())
+    assert saved.requests[0].tool_evaluation is None
+    assert "Request evidence" in html_path.read_text()
+
+
 def test_baseline_roundtrip_works_after_bodies_are_stripped(tmp_path: Path):
     previous = make_report("baseline")
     previous.manifest["config"]["retention"] = "none"
