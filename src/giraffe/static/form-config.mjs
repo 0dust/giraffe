@@ -285,6 +285,18 @@ export function effectiveProfileDefaults(config, defaults, key) {
   return profile;
 }
 
+export function parseToolFixtures(raw) {
+  if (raw.length > 65536) throw new Error('Tool fixtures must fit within 65,536 characters.');
+  let fixtures;
+  try { fixtures = JSON.parse(raw); }
+  catch { throw new Error('Tool fixtures must be a JSON array. Use [] for the built-in weather check.'); }
+  if (!Array.isArray(fixtures) || fixtures.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+    throw new Error('Tool fixtures must be a JSON array of fixture objects.');
+  }
+  if (fixtures.length > 16) throw new Error('Configure at most 16 tool fixtures.');
+  return fixtures;
+}
+
 // Catalog profile forms patch only fields the operator edited. Viewing a null
 // profile or filtering a check must not materialize defaults or erase JSON data.
 export function configureProfiles(source, values, defaults, {allowInvalid=false}={}) {
@@ -297,6 +309,25 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
     if (key === 'tools') {
       if (edits.includes('forced_tool_diagnostic')) {
         config.forced_tool_diagnostic = values.get('profile_tools_forced_tool_diagnostic') === 'true';
+      }
+      if (edits.includes('modes') || edits.includes('fixtures')) {
+        const profile = structuredClone(config.tool_checks || {fixtures: [], modes: null});
+        if (edits.includes('modes')) {
+          const raw = String(values.get('profile_tools_modes') || '');
+          if (!['', 'complete', 'stream', 'complete,stream', 'stream,complete'].includes(raw)) {
+            throw new Error('Choose complete, streaming, both, or the run default for tool requests.');
+          }
+          profile.modes = raw ? raw.split(',') : null;
+        }
+        if (edits.includes('fixtures')) {
+          const raw = String(values.get('profile_tools_fixtures') ?? '[]');
+          try { profile.fixtures = parseToolFixtures(raw); }
+          catch (error) {
+            if (!allowInvalid) throw error;
+            profile.fixtures = raw;
+          }
+        }
+        config.tool_checks = profile;
       }
       continue;
     }
@@ -314,6 +345,12 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
       else profile[name] = numeric(raw, name, allowInvalid);
     }
     config[key] = profile;
+  }
+  if (!allowInvalid && typeof config.tool_checks?.fixtures === 'string') {
+    config.tool_checks.fixtures = parseToolFixtures(config.tool_checks.fixtures);
+  }
+  if (!allowInvalid && config.tool_calling && config.tool_checks?.modes?.includes('stream') && !config.stream) {
+    throw new Error('Enable streaming in Run limits or choose complete tool requests.');
   }
   return config;
 }

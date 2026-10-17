@@ -567,6 +567,57 @@ def _json(value: Any) -> str:
     return _e(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False))
 
 
+def _tool_evidence(record: RequestRecord) -> str:
+    expectation = record.evaluation.tool_expectation if record.evaluation else None
+    if expectation is None and record.tool_evaluation is None:
+        return ""
+    parts = []
+    if expectation is not None:
+        parts.append('<h3>Tool-call expectations</h3>'
+                     '<p>Expected calls are checked in order, including their count.</p>'
+                     f'<pre>{_json([call.model_dump() for call in expectation.expected_calls]) if expectation.expected_calls is not None else "No task-specific call expectation configured."}</pre>'
+                     '<details><summary>Declared tools</summary>'
+                     f'<pre>{_json(expectation.tools)}</pre></details>')
+        if expectation.choice:
+            parts.append('<h3>Tool choice rule</h3>'
+                         f'<pre>{_json(expectation.choice.model_dump())}</pre>')
+        parts.append('<h3>Assistant content expectation</h3>')
+        content = expectation.expected_content
+        if content is None:
+            parts.append('<p>No assistant content expectation configured.</p>')
+        else:
+            parts.append(f'<p>Match: {_e(content.mode)}; '
+                         f'normalization: {_e(content.normalization)}.</p>'
+                         f'<pre>{_e(content.value)}</pre>')
+    if record.tool_evaluation is not None:
+        parts.append('<h3>Tool response outcomes</h3>'
+                     '<table><thead><tr><th>Component</th><th>Outcome</th>'
+                     '<th>Evidence</th></tr></thead><tbody>')
+        components = [("protocol", "Protocol"), ("content", "Assistant content")]
+        components += ([("choice", "Tool choice"), ("arguments", "Argument schemas"),
+                        ("task", "Task expectations")] if record.tool_evaluation.choice
+                       else [("calls", "Tool calls")])
+        if record.tool_evaluation.support:
+            parts.append(f'<tr><td>Support</td><td colspan="2">{_e(record.tool_evaluation.support)}</td></tr>')
+        for field, label in components:
+            outcome = getattr(record.tool_evaluation, field)
+            if outcome is None:
+                continue
+            parts.append(f'<tr><td>{label}</td><td>{_e(outcome.status.replace("_", " "))}</td>'
+                         f'<td>{_e(outcome.message)}</td></tr>')
+        parts.append('</tbody></table>')
+    if record.tool_request_options is not None:
+        parts.append('<details><summary>Sent tool options</summary>'
+                     f'<pre>{_json(record.tool_request_options)}</pre></details>')
+    parts.append('<h3>Retained tool calls</h3>')
+    if record.tool_calls:
+        parts.append(f'<pre>{_json(record.tool_calls)}</pre>')
+    else:
+        parts.append('<p>No retained tool-call body. Consult the recorded outcomes; '
+                     'absence here does not establish that no call was returned.</p>')
+    return "".join(parts)
+
+
 def _number(value: float | None) -> str:
     return "—" if value is None or not math.isfinite(value) else f"{value:,.1f}"
 
@@ -827,15 +878,17 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             evidence = record.evaluation
             parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages)}</pre>'
                          f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
-            if evidence.expected_provided:
-                expected = _json(evidence.expected) if evidence.scorer == "json" else _e(evidence.expected)
-                parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
-            else:
-                parts.append('<p>No expected answer configured.</p>')
+            if evidence.tool_expectation is None:
+                if evidence.expected_provided:
+                    expected = _json(evidence.expected) if evidence.scorer == "json" else _e(evidence.expected)
+                    parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
+                else:
+                    parts.append('<p>No expected answer configured.</p>')
             if evidence.rubric:
                 parts.append(f'<h3>Judge rubric</h3><pre>{_e(evidence.rubric)}</pre>')
             if evidence.schema_ is not None:
                 parts.append(f'<h3>JSON schema</h3><pre>{_json(evidence.schema_)}</pre>')
+        parts.append(_tool_evidence(record))
         parts.append(_judgement_table(record))
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_e(record.output)}</pre>')

@@ -64,7 +64,8 @@ question, and a token cap does not guarantee an answer reaches that length.
 | `buckets.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the exact completed answer from that session; fixed history uses saved answers. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
 | `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is diagnostic unless `strict: true`. Temperature/seed support is requested, not universally verified. |
-| `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
+| `tool_calling` / `checks: [tools]` | Automatic tool selection using the built-in Delhi weather request or configured `tool_checks.fixtures` | Separate response protocol, tool-call and optional assistant-text outcomes. Calls must match the expected count, order, names, argument schemas and any exact argument values. No tool is executed. |
+| `tool_checks` | Custom tool fixtures and complete/stream response modes | Every declared expectation must pass. Empty fixtures preserve the built-in weather check; omitted modes inherit the run streaming setting. See the mixed text/tool example below. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
 Conversation fixtures, modes, generation options, schedules and seeds contribute
@@ -89,6 +90,138 @@ and additional workloads. If the generator cannot keep up, configured timing
 limits remain inconclusive; observed task/protocol failures remain failures.
 Mixed-load latency ratios require enough successful control/load samples and
 actual overlap before they can fail the interference check.
+
+## Assistant text alongside tool calls
+
+Use [examples/tool-content.yaml](../examples/tool-content.yaml) to require both
+assistant prose and a function call in one response:
+
+```sh
+giraffe run --config examples/tool-content.yaml --output runs/tool-content
+```
+
+Set its endpoint and model to a deployment that supports mixed assistant content
+and tool calls. This example is a configurable acceptance requirement, not a claim
+that a particular model or runtime has passed live qualification. Models that omit
+required prose fail that requirement even when they return the right call. No
+function executes: required prose is assistant content, not a tool result or an
+answer from a subsequent conversation turn.
+
+In the check catalogue, open **Tool-call correctness → Settings** to choose response
+modes and edit the fixture list as JSON. `[]` restores the built-in weather fixture.
+The advanced editor accepts the same configuration. Each custom fixture defines
+`fixture_id`, `messages`, OpenAI-compatible function `tools`, and either
+`expected_calls` or an explicit `choice` rule.
+Fixture IDs are unique, use letters, digits, underscores, hyphens or dots, start
+with a letter or digit, and have at most 128 characters. Each configuration has at
+most 16 fixtures, each with at most 16 tools and expected calls; the entire
+`tool_checks` configuration is limited to 64 KiB. `options` accepts supported
+request settings, such as temperature, without overriding the tool contract.
+
+`expected_calls` compares exact call count and order. Each call must have a call ID,
+a declared function name and valid strict JSON arguments satisfying its function's
+parameter schema. An `arguments` object additionally requires that exact value;
+`arguments: null` checks the schema without fixing the value. Numeric values compare
+by value (`1` equals `1.0`, and `-0.0` equals `0`); booleans remain distinct from
+numbers, including in nested arrays and objects.
+
+Tool parameter schemas use a bounded JSON Schema subset. Supported assertions
+are `type` (including nullable type lists), `enum`, `const`, `required`, numeric
+minimum/maximum and exclusive bounds, and string/array/object minimum and maximum
+sizes. Structural schemas support `properties`, `additionalProperties`, `items`,
+`additionalItems`, `prefixItems`, finite `anyOf`/`oneOf`/`allOf`, and acyclic local
+JSON-pointer `$ref` references through `$defs` or `definitions`. Standard descriptive
+annotations are allowed. Draft 4, 6, 7, 2019-09 and 2020-12 dialects are accepted;
+the chosen dialect's normal keyword semantics apply.
+
+Configuration rejects regex keywords, `format`, `uniqueItems`, `multipleOf`,
+conditionals, recursive references and other unsupported keywords rather than
+silently ignoring their assertions. These restrictions apply to tool schemas,
+not the separate structured-JSON scorer. They prevent model output or an operator
+schema from blocking the runner with regex backtracking or recursive combinators.
+
+Each schema and argument object is limited to 64 KiB and depth 32. Schemas may
+contain at most 2,048 JSON value nodes and expand to at most 256 schema nodes after
+following references; argument objects may contain at most 1,024 value nodes.
+The product of expanded schema nodes and argument value nodes must be at most
+4,096, which also bounds the error trees built by failing combinators. Configured
+expected arguments exceeding these limits are rejected. Generated arguments
+exceeding them produce an **inconclusive** evaluation, never a pass or an
+incorrect-answer verdict. Objects, arrays and scalar values each count as one
+node; object keys do not count as separate nodes.
+
+`expected_content` is optional. Omitting it permits tool-only responses, including
+null content. When supplied, `mode: exact` compares the entire concatenated
+assistant content, including text arriving before, between or after streamed tool
+fragments. This detects missing or duplicated text. `mode: contains` only requires
+the specified nonempty substring; it permits additional and repeated prose.
+`normalization: none` preserves whitespace; `normalization: whitespace` collapses
+whitespace runs and trims the result before comparison. These checks evaluate the
+assembled content, not whether text preceded or followed a call on the wire.
+
+`modes: [complete]`, `[stream]` or `[complete, stream]` selects the request modes.
+Omitting modes runs both when global `stream: true`, and complete responses when
+`stream: false`. Any explicit streaming mode requires global streaming to be
+turned on. Every fixture/mode combination has its own sample coverage. The review
+screen includes these combinations in its request budget.
+
+Request evidence shows separate **Response protocol**, **Assistant text** and
+**Tool calls** outcomes, the declared expectations, and retained actual calls.
+Incomplete streams remain protocol failures; a correct call cannot hide missing
+required text. Response events retain bounded metadata about arrival order without
+text or argument fragments, and disclose truncation. Response text and actual
+call bodies follow the run retention setting, while scoring remains available.
+Older reports without these outcomes remain readable.
+
+Complete and streaming requests are independent generations. Different outputs do
+not by themselves prove that a runtime dropped text. Replayed identical outputs
+can establish reconstruction correctness; live runs establish only whether the
+observed responses met the declared acceptance requirements.
+
+### Tool-choice contract checks
+
+[examples/tool-choice.yaml](../examples/tool-choice.yaml) exercises all four choices
+in complete and streaming responses. Set its endpoint and model, then run
+`giraffe run --config examples/tool-choice.yaml`. No tool executes.
+
+Add `choice` to a fixture to check the request's API rule separately from the task:
+
+| `choice.mode` | Accepted completed response |
+| --- | --- |
+| `none` | Zero structured tool calls. Prose, refusal text and tool-shaped JSON text are permitted. |
+| `required` | At least one declared function call with valid arguments. |
+| `named` | At least one call, every call to `choice.name`, with valid arguments. |
+| `auto` | Prose or declared function calls with valid arguments. |
+
+`choice.max_calls` bounds calls at 1–16 (default 16). `none` always permits zero;
+`parallel_tool_calls: false` limits every other mode to one call. Set it to true to
+explicitly allow multiple calls within `max_calls`, or omit it to leave the server
+setting unspecified. `max_calls` is a local acceptance bound, not an API field.
+The typed rule owns `tools`, `tool_choice` and `parallel_tool_calls` for this fixture,
+including overriding global request options. Sent tool options are recorded.
+Legacy forced-choice diagnostics apply only to fixtures without `choice`.
+
+`expected_calls` may be omitted or null for contract-only checks. An explicit `[]`
+asserts that the task should produce no calls. A nonempty list adds exact task
+expectations as described above. Contradictions with `choice` are rejected before
+sending traffic. For example, `auto` can pass mode compliance and fail a task that
+expected a call. Optional `expected_content` still checks assistant text separately.
+
+`choice.support: required` is the default: API rejection fails acceptance.
+`support: discover` records HTTP 400, 422 or 501 as **rejected**, leaves the verdict
+**inconclusive**. Rejections still count toward the global
+`stop_after_errors` bound. These statuses do not prove the option is unsupported; rejection can have another cause. Authentication, routing, throttling,
+server errors and transport failures remain failures. A completed response violating
+the choice rule fails even during discovery. **Observed** support means only that
+this response honored the mode; it is not a guarantee about other prompts or models.
+
+Protocol/completeness, choice compliance, argument schemas, task expectations and
+assistant text have separate outcomes in JSON, HTML and request details. Giraffe
+assembles streamed fragments before evaluation. Timeouts, truncation and early EOF
+cannot pass `none`. Every configured fixture/transport pair needs coverage; budget
+exhaustion cannot turn an incomplete matrix into a pass. Existing request, token,
+duration, concurrency and retention limits apply. Stored response bodies follow
+retention; configured expectations, sent tool options and verdicts remain available.
 
 ## Deployment metadata
 

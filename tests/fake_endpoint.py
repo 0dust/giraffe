@@ -136,11 +136,20 @@ class FakeEndpoint:
                 calls = [{"id": "call-1", "type": "function", "function": {"name": function, "arguments": arguments}}]
                 if mode=="tool_multiple":
                     calls += [{"id": "call-2", "type": "function", "function": {"name": function, "arguments": arguments}}]
+                text = ""
+                if mode.startswith("tool_content"):
+                    arguments = '{"city":"Warsaw"}'
+                    calls[0]["function"]["arguments"] = arguments
+                    text = "Checking Warsaw. "
+                    if mode != "tool_content_missing":
+                        text += "Request prepared."
+                    if mode == "tool_content_duplicate":
+                        text += "Request prepared."
                 if mode=="tool_missing":
                     self._json(200, {"choices": [{"message": {"content": arguments}, "finish_reason": "stop"}]})
                     return
                 if not payload.get("stream"):
-                    self._json(200, {"model": payload["model"], "choices": [{"message": {"content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
+                    self._json(200, {"model": payload["model"], "choices": [{"message": {"content": text or None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -150,10 +159,56 @@ class FakeEndpoint:
                     data = {"model": payload["model"], "choices": [{"delta": delta, "finish_reason": finish}]}
                     self.wfile.write(("data: "+json.dumps(data)+"\n\n").encode())
                     self.wfile.flush()
+                if text:
+                    event({"content": "Checking Warsaw. "})
                 event({"tool_calls": [dict(index=i, id=c["id"], type="function", function={"name": c["function"]["name"][:4], "arguments": c["function"]["arguments"][:4]}) for i,c in enumerate(calls)]})
                 event({"tool_calls": [{"index": i, "function": {"name": c["function"]["name"][4:], "arguments": c["function"]["arguments"][4:]}} for i,c in enumerate(calls)]})
-                event({}, "tool_calls")
+                event({"content": text.removeprefix("Checking Warsaw. ")} if text else {}, "tool_calls")
                 if mode!="tool_truncated":
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+
+            def _tool_choice(self, payload, mode):
+                choice = payload.get("tool_choice")
+                calls, text = [], "Hello."
+                if mode != "tool_choice_text" and (choice == "required" or isinstance(choice, dict)
+                                                   or mode in {"tool_choice_ignored", "tool_choice_parallel", "tool_choice_bad_arguments"}):
+                    name = choice["function"]["name"] if isinstance(choice, dict) else "get_weather"
+                    if mode == "tool_choice_ignored":
+                        name = "get_weather"
+                    args = {} if name == "get_time" else {"city": "Delhi"}
+                    if mode == "tool_choice_bad_arguments":
+                        args = {"city": 42}
+                    calls = [{"id": "choice-1", "type": "function", "function": {
+                        "name": name, "arguments": json.dumps(args)}}]
+                    if mode == "tool_choice_parallel":
+                        calls.append({**calls[0], "id": "choice-2"})
+                    text = ""
+                finish = "length" if mode == "tool_choice_truncated" else "tool_calls" if calls else "stop"
+                if not payload.get("stream"):
+                    self._json(200, {"model": payload["model"], "choices": [{"index": 0,
+                        "message": {"content": text or None, "tool_calls": calls}, "finish_reason": finish}]})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                def event(delta, reason=None):
+                    self.wfile.write(("data: " + json.dumps({"choices": [{"index": 0, "delta": delta,
+                        "finish_reason": reason}]}) + "\n\n").encode())
+                    self.wfile.flush()
+                event({})
+                if text:
+                    event({"content": text})
+                if calls:
+                    event({"tool_calls": [{"index": i, "id": c["id"], "type": "function", "function": {
+                        "name": c["function"]["name"][:4], "arguments": c["function"]["arguments"][:2]}}
+                        for i, c in enumerate(calls)]})
+                    event({"tool_calls": [{"index": i, "function": {
+                        "name": c["function"]["name"][4:], "arguments": c["function"]["arguments"][2:]}}
+                        for i, c in reversed(list(enumerate(calls)))]})
+                event({}, finish)
+                if mode != "tool_choice_eof":
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
 
@@ -175,6 +230,9 @@ class FakeEndpoint:
                     output += " " * (len(endpoint.requests)%3)
                 if mode == "tool_rejection" and payload.get("tools"):
                     self._json(400, {"error": {"message": "unsupported tools"}})
+                    return
+                if payload.get("tools") and mode.startswith("tool_choice_"):
+                    self._tool_choice(payload, mode)
                     return
                 if payload.get("tools"):
                     self._tools(payload, mode)
