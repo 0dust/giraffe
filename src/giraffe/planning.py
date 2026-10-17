@@ -9,6 +9,7 @@ from giraffe.fixtures import builtin_fixtures
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, label_prompt
+from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 
 def _steady_count(rate: float, duration: float) -> int:
@@ -213,8 +214,14 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         count = len(settings.shapes) * levels * settings.repetitions
         add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
     if "tools" in selected:
-        count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
-        add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")
+        fixtures = resolved_tool_fixtures(config)
+        count = (len(fixtures) + sum(fixture.choice is None for fixture in fixtures)
+                 * config.forced_tool_diagnostic) * len(resolved_tool_modes(config))
+        conversations = config.tool_checks.conversations if config.tool_checks else []
+        count += sum(len(fixture.steps) + 1 for fixture in conversations) * len(resolved_tool_modes(config))
+        add("tools", count, "Tool fixtures in each selected mode. Conversation counts are upper bounds: expected calls plus one final answer; invalid or repeated calls stop a conversation early. No tools execute.",
+            source="configured tool fixtures" if config.tool_checks and (config.tool_checks.fixtures or conversations) else "generated examples",
+            kind="bounded" if conversations else "exact")
 
     judging = details["judging"] if details else None
     evaluator = {"active": bool(judging and judging["active"]),
@@ -232,7 +239,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     known = sum(row["requests_per_target"] for row in rows if row["kind"] == "exact")
     unknown = any(row["requests_per_target"] is None for row in rows)
     estimated = any(row["kind"] == "estimate" for row in rows)
-    kind = "bounded" if unknown else "estimate" if estimated else "exact"
+    kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
     planned = None if unknown else sum(row["requests_per_target"] for row in rows)
     for target, quota in quotas.items():
         if known > quota:

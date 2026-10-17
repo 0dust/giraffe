@@ -202,7 +202,7 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, evaluate_record=None):
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
@@ -284,6 +284,8 @@ class _Run:
             record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
             record.overlap = slot["peak"]
             record = score_response(spec, record)
+            if evaluate_record is not None:
+                evaluate_record(record)
             self.records.append(record)
             intentional = (spec.cancel_after_ms is not None and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
@@ -1134,12 +1136,27 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     config_values = config.model_dump(mode="json")
     workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
+    workload_identity = {
+        "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
+        "settings": workload_settings,
+    }
+    if "tools" in config.checks:
+        from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        from giraffe.tool_conversations import SOURCE_SHA256
+        workload_identity["resolved_tool_checks"] = {
+            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
+            "modes": resolved_tool_modes(config),
+            **({"conversations": [fixture.model_dump(mode="json") for fixture in config.tool_checks.conversations],
+                "conversation_source_sha256": SOURCE_SHA256}
+               if config.tool_checks and config.tool_checks.conversations else {}),
+        }
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
         for spec in specs:
             for field, default in (("cancel_after_chunks", None),
-                                   ("expected_provided", False), ("rubric", None)):
+                                   ("expected_provided", False), ("rubric", None),
+                                   ("tool_expectation", None)):
                 if spec[field] == default:
                     del spec[field]
     manifest = {"config": config_values,
@@ -1153,9 +1170,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"capacity", "correctness"}
                                                     else fixture_hash(fixture_values)),
-                                 "workload_fixture_sha256": fixture_hash({
-                                     "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
-                                     "settings": workload_settings})},
+                                 "workload_fixture_sha256": fixture_hash(workload_identity)},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),
                                  "machine": platform.machine(), "python": platform.python_version()},
                 "load_shape": {**({"arrival_rates_rps": config.traffic.rates,
