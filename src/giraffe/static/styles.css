@@ -695,8 +695,7 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .evidence-band.is-compact > * + * { border-top: 0 !important; border-left: 1px solid var(--line) !important; }
 .evidence-band.is-compact .request-viz, .evidence-band.is-compact .latency-viz { display: flex; flex-direction: column; }
 .evidence-band.is-compact .latency-viz .mosaic-scroll { flex: 1; display: flex; align-items: center; }
-.evidence-band.is-compact .request-viz .mosaic-scroll { margin-top: auto; display: flex; justify-content: center; }
-.evidence-band.is-compact .request-mosaic { max-width: calc(var(--mosaic-w) * 1.4); }
+.evidence-band.is-compact .request-viz .mosaic-scroll { margin-top: auto; }
 .evidence-band.is-compact .request-viz .viz-footer { margin-bottom: auto; padding-top: 16px; }
 .evidence-band.is-compact .latency-viz .viz-footer { margin-top: auto; }
 .request-viz, .latency-viz { margin-bottom: 18px; padding: 20px 22px; border-radius: var(--r-xl); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--highlight); }
@@ -706,7 +705,7 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .viz-heading .hint { font: 12px var(--mono); color: var(--text-3); }
 .viz-empty { color: var(--text-3); font-size: 13px; padding: 12px 0; }
 .mosaic-scroll { overflow-x: auto; }
-.request-mosaic { width: 100%; max-width: var(--mosaic-w, 100%); height: auto; overflow: visible; }
+.request-mosaic { display: block; width: 100%; height: auto; overflow: visible; }
 .request-spot { cursor: default; outline: none; }
 .request-spot[role=button] { cursor: pointer; }
 .request-spot polygon { fill: var(--spot); stroke: var(--spot); stroke-width: var(--spot-round, 5); stroke-linejoin: round; shape-rendering: geometricPrecision; }
