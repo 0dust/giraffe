@@ -183,25 +183,34 @@ class _Run:
         self.slots.put_nowait(None)
 
     @asynccontextmanager
-    async def slot(self, reserved: bool):
+    async def slot(self, reserved: bool, deadline: float | None = None):
         if not reserved:
-            await self.slots.get()
+            if deadline is None:
+                await self.slots.get()
+            else:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await self.slots.get()
+                except TimeoutError:
+                    yield False
+                    return
         try:
-            yield
+            yield True
         finally:
             if not reserved:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None):
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
-        async with self.slot(slot_reserved):
+        async with self.slot(slot_reserved, deadline_override) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
-            stopped = self.stop.is_set() or time.monotonic() >= self.deadline or (
+            stopped = not admitted or self.stop.is_set() or time.monotonic() >= min(
+                self.deadline, deadline_override if deadline_override is not None else self.deadline) or (
                 self.errors >= self.config.stop_after_errors)
             if stopped or (not budget_reserved and not self.reserve_offer(target.name)):
                 self.unfinished[target.name].update(spec.check_ids)
@@ -222,6 +231,9 @@ class _Run:
                 on_start()
             self.emit("request_started", target.name, spec.scenario)
             try:
+                if deadline_override is not None:
+                    timeout_override = min(timeout_override or self.config.request_timeout_seconds,
+                                           deadline_override - time.monotonic())
                 remaining = self.deadline - time.monotonic()
                 request_timeout = min(self.config.request_timeout_seconds,
                                       spec.request_timeout_seconds or self.config.request_timeout_seconds)

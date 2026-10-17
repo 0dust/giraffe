@@ -99,7 +99,7 @@ def _digest(value: Any) -> str:
                                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def _stages(config: RunConfig) -> list[dict[str, Any]]:
+def _stages(config: RunConfig, *, include_schedule_hash: bool = True) -> list[dict[str, Any]]:
     if not active_pack(config) or "capacity" not in config.checks:
         return []
     from .traffic import arrival_schedule
@@ -107,9 +107,11 @@ def _stages(config: RunConfig) -> list[dict[str, Any]]:
     stages = []
     for index, rate in enumerate(config.traffic.rates):
         schedule, truncated = arrival_schedule(config.effective_traffic(), rate, index)
-        stages.append({"stage_index": index, "rate_rps": rate, "planned": len(schedule),
-                       "counts": case_counts(config, len(schedule)), "truncated": truncated,
-                       "schedule_hash": _digest([offset for offset, _ in schedule])})
+        stage = {"stage_index": index, "rate_rps": rate, "planned": len(schedule),
+                 "counts": case_counts(config, len(schedule)), "truncated": truncated}
+        if include_schedule_hash:
+            stage["schedule_hash"] = _digest([offset for offset, _ in schedule])
+        stages.append(stage)
     return stages
 
 
@@ -158,15 +160,47 @@ def pack_identity(config: RunConfig) -> dict[str, Any] | None:
             **({"judging": evaluation} if evaluation is not None else {})}
 
 
+def _pack_summary(config: RunConfig, stages: list[dict[str, Any]]) -> dict[str, Any]:
+    cases = config.request_pack.cases if active_pack(config) else []
+    quiet = len(cases)
+    planned = quiet + sum(stage["planned"] for stage in stages)
+    base, extra = divmod(config.max_requests, len(config.targets))
+    quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
+    judge_ids = {case.fixture_id for case in cases if case.scorer == "judge"}
+    planned_judged = len(judge_ids) + sum(
+        sum(stage["counts"].get(case_id, 0) for case_id in judge_ids) for stage in stages)
+    judge_count = len(config.judging.judges) if judge_ids else 0
+    readiness_errors = []
+    if judge_ids:
+        if not config.judging.judges:
+            readiness_errors.append("Add at least one judge.")
+        for index, judge in enumerate(config.judging.judges):
+            missing = [field for field in ("name", "url", "model") if not getattr(judge, field).strip()]
+            if missing:
+                readiness_errors.append(f"Judge {index + 1} needs: {', '.join(missing)}.")
+    judging = {"active": bool(judge_ids), "judge_count": judge_count,
+               "ready": not readiness_errors, "readiness_errors": readiness_errors,
+               "planned_requests_per_target": planned_judged,
+               "planned_call_upper_bound": planned_judged * len(config.targets) * judge_count,
+               "quota_call_upper_bound": sum(min(planned_judged, quota) for quota in quotas.values()) * judge_count}
+    return {"quiet_requests": quiet, "stages": stages, "planned_requests_per_target": planned,
+            "per_target_request_quota": quotas, "request_cap": config.max_requests, "judging": judging}
+
+
+def pack_summary(config: RunConfig) -> dict[str, Any]:
+    """Count seeded dataset work and judge calls without payloads or identity hashes."""
+    return _pack_summary(config, _stages(config, include_schedule_hash=False))
+
+
 def pack_preview(config: RunConfig) -> dict[str, Any]:
     specs = pack_specs(config)
     active = active_pack(config)
     cases = {case.fixture_id: case for case in config.request_pack.cases} if config.request_pack else {}
-    stages = _stages(config)
-    quiet = len(specs)
-    planned = quiet + sum(stage["planned"] for stage in stages)
-    base, extra = divmod(config.max_requests, len(config.targets))
-    quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
+    summary = _pack_summary(config, _stages(config))
+    stages = summary["stages"]
+    planned = summary["planned_requests_per_target"]
+    quotas = summary["per_target_request_quota"]
+    judging = summary["judging"] | {"identity": judging_identity(config)}
     warnings = []
     if config.request_source == "request_pack" and not active:
         warnings.append("Request pack is inactive: select correctness or capacity to exercise it.")
@@ -184,27 +218,9 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
             warnings.append("Streaming is disabled; the configured stream-gap limit will lack evidence.")
         if set(config.checks) - {"capacity", "correctness"}:
             warnings.append("Other selected checks consume additional shared request and time budget; their requests are not included in the pack subtotal.")
-    judge_ids = {spec.workload["case_id"] for spec in specs if spec.scorer == "judge"}
-    planned_judged = len(judge_ids) + sum(
-        sum(stage["counts"].get(case_id, 0) for case_id in judge_ids) for stage in stages)
-    judge_count = len(config.judging.judges) if judge_ids else 0
-    readiness_errors = []
-    if judge_ids:
-        if not config.judging.judges:
-            readiness_errors.append("Add at least one judge.")
-        for index, judge in enumerate(config.judging.judges):
-            missing = [field for field in ("name", "url", "model") if not getattr(judge, field).strip()]
-            if missing:
-                readiness_errors.append(f"Judge {index + 1} needs: {', '.join(missing)}.")
-    judging = {"active": bool(judge_ids), "judge_count": judge_count,
-               "ready": not readiness_errors, "readiness_errors": readiness_errors,
-               "planned_requests_per_target": planned_judged,
-               "planned_call_upper_bound": planned_judged * len(config.targets) * judge_count,
-               "quota_call_upper_bound": sum(min(planned_judged, quota) for quota in quotas.values()) * judge_count,
-               "identity": judging_identity(config)}
-    if judge_ids:
+    if judging["active"]:
         warnings.append("AI judging runs after target traffic. Messages, golden answers and generated answers are sent to every configured judge.")
-        if readiness_errors:
+        if judging["readiness_errors"]:
             warnings.append("Configure at least one judge with a name, URL and model before running judge-scored cases.")
     effective_requests = {_digest({"messages": spec.messages, **_effective(spec)}) for spec in specs}
     return {"source": config.request_source, "active": active,
@@ -216,7 +232,7 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
                        "requested": {"max_tokens": cases[spec.workload["case_id"]].max_tokens,
                                      "options": cases[spec.workload["case_id"]].options},
                        "effective": _effective(spec)} for spec in specs],
-            "quiet_requests": quiet, "stages": stages,
+            "quiet_requests": summary["quiet_requests"], "stages": stages,
             "planned_requests_per_target": planned, "known_selected_check_subtotal": planned,
             "per_target_request_quota": quotas, "request_cap": config.max_requests,
             "unique_effective_requests": len(effective_requests),

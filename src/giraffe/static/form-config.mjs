@@ -32,7 +32,118 @@ function numeric(value, label, allowInvalid=false) {
   return result;
 }
 
-export function configureTests(source, values, checks, trafficDefaults, {allowEmpty=false, allowInvalid=false}={}) {
+function validBucketLevels(levels) {
+  return Array.isArray(levels) && levels.length >= 1 && levels.length <= 16 &&
+    new Set(levels).size === levels.length &&
+    levels.every(level => Number.isInteger(level) && level >= 1 && level <= 256);
+}
+
+export function inferSetupPreset(config) {
+  const checks = config.checks;
+  const matches = expected => Array.isArray(checks) && checks.length === expected.length &&
+    new Set(checks).size === checks.length && expected.every(id => checks.includes(id));
+  if (matches(['access','correctness'])) return 'answers';
+  if (matches(['access','correctness','capacity'])) return 'arrival';
+  if (matches(['access','buckets']) && validBucketLevels(config.buckets?.levels) &&
+      config.concurrency === Math.max(...config.buckets.levels) &&
+      checks.every(id => !Object.keys(config.test_options?.[id] || {}).length)) return 'concurrent';
+  return 'custom';
+}
+
+export function applySetupPreset(source, preset, defaults) {
+  const config = structuredClone(source);
+  const selection = {
+    answers:['access','correctness'],
+    concurrent:['access','buckets'],
+    arrival:['access','correctness','capacity'],
+  }[preset];
+  if (selection) config.checks = selection;
+  config.structured_json = config.checks.includes('json');
+  config.metrics = config.checks.includes('gpu');
+  config.tool_calling = config.checks.includes('tools');
+  if (preset === 'concurrent') {
+    if (!config.buckets) {
+      config.buckets = structuredClone(defaults);
+      config.buckets.samples_per_bucket = Math.max(
+        config.buckets.samples_per_bucket, config.limits?.min_samples ?? 5);
+      for (const size of Object.keys(config.buckets.output_tokens)) {
+        config.buckets.output_tokens[size] = Math.min(config.buckets.output_tokens[size], config.max_output_tokens);
+      }
+    }
+    if (validBucketLevels(config.buckets.levels)) config.concurrency = Math.max(...config.buckets.levels);
+  }
+  return config;
+}
+
+// Basic concurrent testing has one load control: the tested levels. Advanced
+// configurations retain their independently chosen run ceiling.
+export function configureSetupLoad(source, preset, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  if (preset !== 'concurrent') return config;
+  if (!validBucketLevels(config.buckets?.levels)) {
+    if (allowInvalid) return config;
+    throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+  }
+  config.concurrency = Math.max(...config.buckets.levels);
+  return config;
+}
+
+export function configureBuckets(source, values, defaults, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  const fields = ['levels','samples_per_bucket','window_seconds','mixed_pairs','heavy_long_input','heavy_long_output',
+    ...['input','output'].flatMap(kind => ['short','medium','long'].map(size => `${kind}_${size}`))];
+  if (!fields.some(name => values.has(`buckets_${name}`))) return config;
+  const settings = structuredClone(source.buckets || defaults);
+  if (values.has('buckets_levels')) {
+    settings.levels = String(values.get('buckets_levels') || '').trim().split(/[\s,]+/)
+      .filter(Boolean).map(value => numeric(value, 'Concurrency levels', allowInvalid));
+    if (!allowInvalid && !validBucketLevels(settings.levels)) {
+      throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+    }
+  }
+  for (const name of ['samples_per_bucket','window_seconds','mixed_pairs']) {
+    if (values.has(`buckets_${name}`)) settings[name] = numeric(values.get(`buckets_${name}`), name, allowInvalid);
+  }
+  for (const [kind, group] of [['input','input_chars'],['output','output_tokens']]) {
+    for (const size of ['short','medium','long']) {
+      const name = `buckets_${kind}_${size}`;
+      if (!values.has(name)) continue;
+      const label = `${size} ${kind === 'input' ? 'question target' : 'answer cap'}`;
+      const value = numeric(values.get(name), label, true);
+      if (!allowInvalid && (!Number.isInteger(value) || value < 1 || value > 65536)) {
+        throw new Error(`${label} must be a whole number from 1 to 65536.`);
+      }
+      settings[group] ||= structuredClone(defaults[group]);
+      settings[group][size] = value;
+    }
+  }
+  for (const name of ['long_input','long_output']) {
+    if (values.has(`buckets_heavy_${name}`)) {
+      settings.heavy_weights ||= structuredClone(defaults.heavy_weights);
+      settings.heavy_weights[name] = numeric(values.get(`buckets_heavy_${name}`), `${name} weight`, allowInvalid);
+    }
+  }
+  if (!allowInvalid && config.checks.some(id => ['buckets','mixed'].includes(id)) &&
+      Object.values(settings.output_tokens).some(cap => cap > config.max_output_tokens)) {
+    throw new Error(`Each answer cap must be ${config.max_output_tokens} tokens or less. Lower the answer cap or edit Maximum answer length under Shared run settings → Request defaults.`);
+  }
+  if (source.buckets || config.checks.some(id => ['buckets','mixed'].includes(id)) ||
+      !sameConfig(settings, defaults)) config.buckets = settings;
+  return config;
+}
+
+// A level needs at least one full concurrent batch for each of the nine size pairs.
+// This is bucket traffic only; other selected checks share the same request budget.
+export function bucketCoveragePlan(config) {
+  if (!config.checks.includes('buckets') || !config.buckets) return null;
+  const {levels, samples_per_bucket: samples} = config.buckets;
+  if (!levels.length || levels.some(level => !Number.isInteger(level) || level < 1 || level > 256) ||
+      !Number.isInteger(samples) || samples < 2) return null;
+  const perTarget = 9 * levels.reduce((total, level) => total + Math.max(samples, level), 0);
+  return {levels, peak:Math.max(...levels), perTarget, total:perTarget * config.targets.length};
+}
+
+export function configureTests(source, values, checks, trafficDefaults, {allowEmpty=false, allowInvalid=false, percentageInputs=false}={}) {
   const config = structuredClone(source);
   config.checks = values.getAll('check');
   if (!config.checks.length && !allowEmpty) throw new Error('Select at least one test before running.');
@@ -45,22 +156,27 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
       delete config.test_options[check.id];
       continue;
     }
+    const previous = source.test_options?.[check.id] || {};
     const options = {};
     for (const name of check.option_fields) {
       if (config.request_source === 'request_pack' && check.id === 'correctness' && ['samples','concurrency'].includes(name)) {
-        if (Object.hasOwn(source.test_options?.correctness || {}, name)) options[name] = source.test_options.correctness[name];
+        if (Object.hasOwn(previous, name)) options[name] = previous[name];
         continue;
       }
       const raw = values.get(`test_${check.id}_${name}`);
       const value = ['trace_file','server_log','backend_verification'].includes(name) ? (String(raw || '').trim() || null) : numeric(raw, name, allowInvalid);
-      if (value !== null && value !== optionDefault(config, check, name)) options[name] = value;
+      // A saved override still owns its value when the global setting happens
+      // to match it. Blank options and Reset remain explicit ways to inherit.
+      if (value !== null && (value !== optionDefault(config, check, name) ||
+          (Object.hasOwn(previous, name) && previous[name] != null))) options[name] = value;
     }
     const limits = {};
     for (const name of check.limit_fields) {
-      const value = numeric(values.get(`test_${check.id}_limit_${name}`), name, allowInvalid);
+      let value = numeric(values.get(`test_${check.id}_limit_${name}`), name, allowInvalid);
+      if (percentageInputs && ['min_correctness','max_error_rate'].includes(name) && typeof value === 'number') value /= 100;
       const inherited = Object.hasOwn(config.limits || {}, name) ?
         config.limits[name] : check.defaults.limits[name];
-      if (value !== inherited) limits[name] = value;
+      if (value !== inherited || Object.hasOwn(previous.limits || {}, name)) limits[name] = value;
     }
     if (Object.keys(limits).length) options.limits = limits;
     if (Object.keys(options).length) config.test_options[check.id] = options;
@@ -157,4 +273,47 @@ export function convertExpectedAnswer(value, from, to) {
   catch { throw new Error('Fix the JSON reference before changing the answer check.'); }
   if (typeof parsed !== 'string') throw new Error('Use a JSON string reference before switching to a text answer check.');
   return parsed;
+}
+
+export function effectiveProfileDefaults(config, defaults, key) {
+  const profile = structuredClone(defaults[key] || {});
+  if (key === 'sessions') {
+    profile.concurrency = Math.min(profile.concurrency, config.concurrency);
+    profile.max_tokens = Math.min(profile.max_tokens, config.max_output_tokens);
+  }
+  if (key === 'consistency') profile.levels = (profile.levels || []).filter(level => level <= config.concurrency);
+  return profile;
+}
+
+// Catalog profile forms patch only fields the operator edited. Viewing a null
+// profile or filtering a check must not materialize defaults or erase JSON data.
+export function configureProfiles(source, values, defaults, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  const arrayFields = new Set(['modes', 'shapes', 'levels']);
+  const textFields = new Set(['mode', 'equality']);
+  for (const key of ['arrivals', 'prefix', 'sessions', 'consistency', 'tools']) {
+    const edits = JSON.parse(values.get(`profile_edits_${key}`) || '[]');
+    if (!edits.length) continue;
+    if (key === 'tools') {
+      if (edits.includes('forced_tool_diagnostic')) {
+        config.forced_tool_diagnostic = values.get('profile_tools_forced_tool_diagnostic') === 'true';
+      }
+      continue;
+    }
+    const profile = structuredClone(config[key] || effectiveProfileDefaults(config, defaults, key));
+    for (const name of edits) {
+      if (!Object.hasOwn(defaults[key], name)) continue;
+      const raw = values.get(`profile_${key}_${name}`);
+      if (arrayFields.has(name)) {
+        profile[name] = String(raw || '').split(',').map(value => value.trim()).filter(Boolean);
+        if (name === 'levels') profile[name] = profile[name].map(value => numeric(value, 'Concurrency levels', allowInvalid));
+      } else if (name === 'turns' || name === 'saved_answers') {
+        profile[name] = String(raw || '').split('\n');
+      } else if (name === 'strict') profile[name] = raw === 'true';
+      else if (textFields.has(name)) profile[name] = String(raw || '');
+      else profile[name] = numeric(raw, name, allowInvalid);
+    }
+    config[key] = profile;
+  }
+  return config;
 }
