@@ -124,11 +124,15 @@ def test_sample_coverage_warnings_use_each_comparison_group_not_totals():
     browser_logic(r"""
 config.limits.min_samples=5;
 const check=id=>bootstrap.checks.find(x=>x.id===id);
-config.buckets={...bootstrap.buckets.defaults,levels:[1,8],samples_per_bucket:4,mixed_pairs:2};
-assert.match(checkCoverageWarning(check('buckets'),config),/4 in a group; 5 required/);
-config.buckets.levels=[8];assert.equal(checkCoverageWarning(check('buckets'),config),'');
-assert.match(checkCoverageWarning(check('mixed'),config),/2 in a group; 5 required/);
-config.buckets.mixed_pairs=5;assert.equal(checkCoverageWarning(check('mixed'),config),'');
+config.concurrent_workloads={...bootstrap.concurrent_workloads.defaults,levels:[1,8],samples_per_bucket:4,mixed_pairs:5,scenarios:['size_matrix','mixed_interference']};
+assert.match(checkCoverageWarning(check('concurrency'),config),/4 in a group; 5 required/);
+config.concurrent_workloads.levels=[8];assert.equal(checkCoverageWarning(check('concurrency'),config),'');
+config.concurrent_workloads.mixed_pairs=2;assert.match(checkCoverageWarning(check('concurrency'),config),/2 in a group; 5 required/);
+config.concurrent_workloads.mixed_pairs=5;assert.equal(checkCoverageWarning(check('concurrency'),config),'');
+config.concurrent_workloads.mixed_pairs=2;
+config.test_options.concurrency={limits:{min_samples:2}};
+assert.equal(checkCoverageWarning(check('concurrency'),config),'');
+delete config.test_options.concurrency;
 config.consistency={...bootstrap.profile_defaults.consistency,repetitions:4,levels:[1,2],shapes:['short','long']};
 assert.match(checkCoverageWarning(check('consistency'),config),/4 in a group; 5 required/);
 config.consistency.repetitions=5;assert.equal(checkCoverageWarning(check('consistency'),config),'');

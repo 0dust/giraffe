@@ -44,6 +44,34 @@ SGLANG = {
 }
 # Exact metric contracts from the source used for the live Apple Silicon run.
 SGLANG_REFERENCE = "SGLang 44bc47886 srt/observability/metrics_collector.py"
+LLAMACPP = {
+    "llamacpp:requests_processing": ("running", "gauge", "requests"),
+    "llamacpp:requests_deferred": ("waiting", "gauge", "requests"),
+    "llamacpp:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
+    "llamacpp:tokens_predicted_total": ("generated_tokens", "counter", "tokens"),
+}
+LMDEPLOY = {
+    "lmdeploy:num_requests_running": ("running", "gauge", "requests"),
+    "lmdeploy:num_requests_waiting": ("waiting", "gauge", "requests"),
+    "lmdeploy:gpu_cache_usage_perc": ("cache_occupancy", "gauge", "fraction"),
+    "lmdeploy:prefix_cache_hit_rate": ("prefix_hit_rate", "gauge", "fraction"),
+    "lmdeploy:cached_tokens_total": ("cached_tokens", "counter", "tokens"),
+    "lmdeploy:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
+    "lmdeploy:generation_tokens_total": ("generated_tokens", "counter", "tokens"),
+}
+TGI = {
+    "tgi_request_queue_duration_sum": ("server_queue_sum", "counter", "seconds"),
+    "tgi_request_queue_duration_count": ("server_queue_count", "counter", "requests"),
+    "tgi_request_inference_duration_sum": ("server_inference_sum", "counter", "seconds"),
+    "tgi_request_inference_duration_count": ("server_inference_count", "counter", "requests"),
+}
+ENGINE_METRICS = {"llamacpp": LLAMACPP, "lmdeploy": LMDEPLOY, "tgi": TGI}
+ENGINE_METRIC_REFERENCES = {
+    "llamacpp": "llama.cpp tools/server/README.md /metrics contract (b11696)",
+    "lmdeploy": "LMDeploy lmdeploy/metrics/loggers.py; runtime/version qualification required",
+    "tgi": "TGI router/src/server.rs duration histograms in seconds; runtime/version qualification required",
+    "tensorrt-llm": "Native /metrics iteration JSON is not a Prometheus contract; use a separate Prometheus exporter for GPU observations.",
+}
 GPU = {
     "DCGM_FI_DEV_FB_USED": ("memory", "gauge", "MiB"),
     "DCGM_FI_DEV_GPU_UTIL": ("utilization", "gauge", "percent"),
@@ -89,7 +117,7 @@ def parse(body, target, config):
         if target.metrics_profile == "vllm-legacy"
         else SGLANG
         if target.metrics_profile == "sglang"
-        else {}
+        else ENGINE_METRICS.get(target.metrics_profile, {})
     )
     mapping = profile | GPU
     samples, recognized, truncated = [], 0, False
@@ -164,7 +192,7 @@ def parse(body, target, config):
         if target.metrics_profile == "sglang"
         else "explicit legacy metric-name contract; runtime/version qualification required"
         if target.metrics_profile == "vllm-legacy"
-        else "No serving metric-name contract selected.",
+        else ENGINE_METRIC_REFERENCES.get(target.metrics_profile, "No serving metric-name contract selected."),
         "runtime_version": target.metrics_runtime_version,
         "version_verification": "user-supplied profile/version; verify with recorded deployment discovery",
         "instrumentation": target.instrumentation,

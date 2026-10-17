@@ -799,6 +799,18 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<tr><td>{_e(check.target)}<br>{_e(outcome["title"])}</td>'
                          f'<td>{_badge(outcome["status"])}</td>'
                          f'<td>{_e(outcome["summary"])}</td></tr>')
+        for scenario in check.metrics.get("scenarios", {}).values():
+            parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(scenario["title"])}</strong></td>'
+                         f'<td>{_badge(scenario["status"])}</td><td>{_e(scenario["summary"])}'
+                         f'<details><summary>Scenario measurements and evidence</summary>'
+                         f'<pre>{_json(scenario)}</pre></details></td></tr>')
+            for case in scenario.get("metrics", {}).get("cases", {}).values():
+                parts.append(f'<tr><td>{_e(case["title"])}</td><td>{_badge(case["status"])}</td>'
+                             f'<td>Requested input/output tokens: {_e(case["requested_input_tokens"])} / '
+                             f'{_e(case["requested_output_tokens"])}. '
+                             f'Observed input: {_e(case["actual_input_tokens"])}; '
+                             f'output: {_e(case["actual_output_tokens"])}. '
+                             f'{_e("; ".join(case["coverage_gaps"]))}</td></tr>')
     # A partially selected suite must not look like complete coverage.
     seen = {check.id for check in report.checks}
     absent = [title for check_id, title in CHECK_NAMES.items() if check_id not in seen]

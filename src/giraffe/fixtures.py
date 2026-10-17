@@ -20,7 +20,7 @@ from referencing.exceptions import Unresolvable
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig, EvaluationEvidence, validated_json_schema
 
 FIXTURE_VERSION = "0.3.0"
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
 
@@ -282,7 +282,8 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
 
     Exact checks compare the complete case-sensitive answer after whitespace
     normalization. ``contains`` is an explicit custom substring check, never
-    used by built-ins. JSON permits one complete markdown fence, but not prose
+    used by ordinary smoke fixtures. Token-stress summaries check a required fact,
+    without claiming full summary quality. JSON permits one complete markdown fence, but not prose
     surrounding an object. Reasoning content never substitutes for the answer.
     """
     record = record.model_copy(update={"evaluation": EvaluationEvidence(

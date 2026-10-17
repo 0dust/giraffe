@@ -109,16 +109,21 @@ async def test_versioned_recovery_prompt_has_stable_builtin_fingerprint(client):
 
 
 def check(report, id, target="service"):
+    if id == "fairness":
+        from giraffe.models import CheckResult
+        merged = next(c for c in report.checks if c.id == "concurrency" and c.target == target)
+        return CheckResult.model_validate(merged.metrics["scenarios"]["streaming_fairness"])
     return next(c for c in report.checks if c.id == id and c.target == target)
 
 
 async def test_bucket_window_expires_while_waiting_for_shared_concurrency(client):
     from giraffe.workloads import buckets
+    from giraffe.concurrent_workloads import execution_config
 
     configuration = config(checks=["buckets"], concurrency=8,
                            buckets={"levels": [8], "samples_per_bucket": 2,
                                     "window_seconds": .01})
-    run = runner._Run(configuration, None, None)
+    run = runner._Run(execution_config(configuration), None, None)
     target = configuration.targets[0]
     for _ in range(configuration.concurrency):
         run.slots.get_nowait()

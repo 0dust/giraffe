@@ -48,7 +48,7 @@ await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;state.bootstrap.con
 def test_all_checks_have_local_settings_and_one_question_source():
     browser_logic(r"""
 const original=JSON.stringify(config),markup=renderCheckSelection(config);
-assert.equal((markup.match(/data-test-card="/g)||[]).length,19);
+assert.equal((markup.match(/data-test-card="/g)||[]).length,17);
 for(const check of bootstrap.checks){
   assert.equal((markup.match(new RegExp('data-test-card="'+check.id+'"','g'))||[]).length,1);
   const row=renderTestCard(check,config);assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
@@ -59,7 +59,7 @@ assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),confi
 const capacity={...config,checks:['capacity']};
 assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='capacity'),capacity),/id="setup-dataset"/);
 assert.doesNotMatch(renderCheckSelection({...config,checks:['access']}),/id="setup-dataset"/);
-for(const name of ['traffic_rates','traffic_duration_seconds','buckets_levels','buckets_input_short','profile_sessions_concurrency']){
+for(const name of ['traffic_rates','traffic_duration_seconds','concurrent_levels','concurrent_input_short','profile_sessions_concurrency']){
   assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 }
 assert.doesNotMatch(markup,/name="setup_goal"|name="setup_load"/);
@@ -119,15 +119,15 @@ for(const check of bootstrap.checks){
     dataset:{category:checkGroups.find(x=>x.checks.includes(check.id)).id,search:(checkGuide[check.id].name+' '+checkGuide[check.id].purpose).toLowerCase()}};
   nodes['[data-test-card="'+check.id+'"]']=card;cards.push(card);
 }
-syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,19);
-state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,19);
+syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,17);
+state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,17);
 state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 // Browse filters must not hide selected checks when returning to the run.
 state.catalogueCategory='server';state.catalogueSearch='gpu';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 state.catalogueCategory='all';
 state.catalogueFilter='all';state.catalogueSearch='concurrent conversations';syncTestControls();assert.equal(cards.filter(x=>!x.hidden)[0].id,'sessions');
-revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,19);
+revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,17);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -154,7 +154,7 @@ state.openTest=null;configureEvaluator();assert(added);
 def test_browse_warnings_follow_selection_and_open_draft_without_losing_values():
     browser_logic(r"""
 config.limits.min_samples=5;config.max_output_tokens=32;
-config.buckets={...bootstrap.buckets.defaults,levels:[1],samples_per_bucket:4,mixed_pairs:2};
+config.concurrent_workloads={...bootstrap.concurrent_workloads.defaults,levels:[1],samples_per_bucket:4,mixed_pairs:2};
 config.consistency={...bootstrap.profile_defaults.consistency,repetitions:4,levels:[1,2],shapes:['short','long']};
 config.test_options.generation={max_output_tokens:64};
 state.catalogueFilter='all';state.openTest=null;
@@ -172,13 +172,13 @@ for(const check of bootstrap.checks){
   nodes['[data-test-card="'+check.id+'"]']={dataset:{category:'all',search:''},classList:{toggle(){}},querySelector:selector=>controls[selector]};
 }
 const original=JSON.stringify(config);
-for(const id of ['buckets','mixed','consistency']){
+for(const id of ['concurrency','consistency']){
   const check=bootstrap.checks.find(item=>item.id===id),markup=renderTestCard(check,config);
   assert.match(markup,new RegExp('data-check-coverage="'+id+'" hidden'));
   assert(warnings[id].coverage.textContent.length>0);
 }
 syncTestControls();updateCheckFieldHints(config);
-for(const id of ['buckets','mixed','consistency'])assert.equal(warnings[id].coverage.hidden,true);
+for(const id of ['concurrency','consistency'])assert.equal(warnings[id].coverage.hidden,true);
 assert.equal(warnings.generation.override.hidden,true);
 // An unselected draft gets feedback only while the user is editing it.
 state.openTest='consistency';syncTestControls();updateCheckFieldHints(config);
@@ -189,12 +189,12 @@ state.openTest=null;syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.generation.override.hidden,true);
 assert.equal(JSON.stringify(config),original);
 // Selected checks keep warnings visible with their editor closed.
-config.checks.push('buckets');selections.buckets.checked=true;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.buckets.coverage.hidden,false);
-config.checks=config.checks.filter(id=>id!=='buckets');selections.buckets.checked=false;
-state.openTest='buckets';syncTestControls();assert.equal(warnings.buckets.coverage.hidden,false);
+config.checks.push('concurrency');selections.concurrency.checked=true;syncTestControls();updateCheckFieldHints(config);
+assert.equal(warnings.concurrency.coverage.hidden,false);
+config.checks=config.checks.filter(id=>id!=='concurrency');selections.concurrency.checked=false;
+state.openTest='concurrency';syncTestControls();assert.equal(warnings.concurrency.coverage.hidden,false);
 state.openTest=null;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.buckets.coverage.hidden,true);
+assert.equal(warnings.concurrency.coverage.hidden,true);
 assert.equal(config.test_options.generation.max_output_tokens,64);
 """)
 

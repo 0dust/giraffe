@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec
+from giraffe.models import INTERNAL_CHECK_NAMES as CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
@@ -17,6 +17,7 @@ WORKLOAD_CHECKS = {
     "buckets": {"buckets", "mixed"}, "sessions": {"sessions"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"},
+    "concurrent_workloads": {"concurrency", "token_stress"},
 }
 
 
@@ -493,10 +494,13 @@ async def tools(run, target, client):
 
 
 async def execute(run, target, client, fixtures):
+    from giraffe.concurrent_workloads import token_stress
+
     for field, callback in (
         ("arrivals", arrivals),
         ("prefix", prefixes),
         ("buckets", buckets),
+        ("concurrent_workloads", token_stress),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -517,19 +521,24 @@ async def execute(run, target, client, fixtures):
 def results(run, target, stats, violations, missing_timing, *, saturated=False):
     from .timing import configured_metrics, qualified_violations, run_quality
 
+    config = run.config
     result = []
-    selected = set(run.config.checks) - set(CORE_CHECKS)
+    selected = set(config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
+        if check in {"concurrency", "token_stress"}:
+            continue
         if check not in selected:
             continue
+        from giraffe.runner import _check_config
+        config = _check_config(run.config, "concurrency") if check in {"buckets", "mixed"} else run.config
         records = [r for r in run.records if r.target == target.name and check in r.check_ids]
         metrics = stats(records)
-        quality = run_quality(run, records, target.name, configured_metrics(run.config.limits, check))
+        quality = run_quality(run, records, target.name, configured_metrics(config.limits, check))
         saturated = quality["status"] == "client_delayed"
         metrics["timing_quality"] = quality
         status = "pass"
         summary = "Bounded workload observed; untested combinations remain unverified."
-        minimum = run.config.limits.min_samples
+        minimum = config.limits.min_samples
         groups = {}
         for scenario in dict.fromkeys(r.scenario for r in records):
             items = [r for r in records if r.scenario == scenario]
@@ -545,19 +554,19 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 entry.update(
                     distinct_answer_hashes=dict(hashes),
                     agreement_rate=max(hashes.values()) / sum(hashes.values()) if hashes else None,
-                    equality=run.config.consistency.equality,
+                    equality=config.consistency.equality,
                     correctness=entry["correct"] / entry["scored"] if entry["scored"] else None,
-                    expected_samples=run.config.consistency.repetitions,
+                    expected_samples=config.consistency.repetitions,
                 )
-                if len(hashes) > 1 and run.config.consistency.strict:
+                if len(hashes) > 1 and config.consistency.strict:
                     status, summary = (
                         "fail",
                         "Configured strict consistency violated; correctness is reported independently.",
                     )
-                if len(hashes) > 1 and not run.config.consistency.strict:
+                if len(hashes) > 1 and not config.consistency.strict:
                     summary = "Answer variation observed; variation alone is diagnostic, not a correctness failure."
                 if (
-                    len(items) < run.config.consistency.repetitions
+                    len(items) < config.consistency.repetitions
                     or entry["completed"] < minimum
                     or entry["achieved_overlap"] < items[0].workload["level"]
                 ):
@@ -654,7 +663,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 qualified = (
                     observed
                     and control["completed"] >= minimum
-                    and row["completed"] >= max(minimum, run.config.buckets.mixed_pairs)
+                    and row["completed"] >= max(minimum, config.buckets.mixed_pairs)
                 )
                 comparison_quality = run_quality(run, controls + [
                     r for r in records if r.scenario == name], target.name, ("latency_ms",))
@@ -677,8 +686,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if (
                     qualified
                     and ratio is not None
-                    and run.config.limits.fairness_max_ratio
-                    and ratio > run.config.limits.fairness_max_ratio
+                    and config.limits.fairness_max_ratio
+                    and ratio > config.limits.fairness_max_ratio
                     and comparison_quality["status"] != "client_delayed"
                 ):
                     status, summary = (
@@ -690,7 +699,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 status = "inconclusive"
         if check == "tools":
             auto = [r for r in records if r.workload.get("selection") == "automatic"]
-            expected_count = 2 if run.config.stream else 1
+            expected_count = 2 if config.stream else 1
             metrics["forced_diagnostic"] = [
                 {
                     "request_id": r.id,
@@ -734,14 +743,14 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if (
             cap_violations
             or any(r.score is False for r in assessed)
-            or (errors is not None and errors > run.config.limits.max_error_rate)
+            or (errors is not None and errors > config.limits.max_error_rate)
         ):
             status, summary = (
                 "fail",
                 "Workload task checks or request errors violated configured limits; variation and telemetry are assessed separately.",
             )
-        timing = violations(assessed, run.config.limits)
-        missing = missing_timing(assessed, run.config.limits) if assessed else []
+        timing = violations(assessed, config.limits)
+        missing = missing_timing(assessed, config.limits) if assessed else []
         if missing:
             metrics["missing_timing_metrics"] = missing
             if check != "tools" and status != "fail":
@@ -751,7 +760,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 )
         if timing:
             metrics["timing_violations"] = timing
-            qualified = qualified_violations(assessed, run.config.limits, quality)
+            qualified = qualified_violations(assessed, config.limits, quality)
             if qualified:
                 metrics["qualified_timing_violations"] = qualified
                 status, summary = "fail", "Workload exceeded configured timing limits without overlapping client scheduling delay."
@@ -766,9 +775,9 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             saturated
             and check != "tools"
             and status != "fail"
-            and any((run.config.limits.first_output_ms, run.config.limits.latency_ms,
-                     run.config.limits.stream_gap_ms,
-                     run.config.limits.min_output_tokens_per_second))
+            and any((config.limits.first_output_ms, config.limits.latency_ms,
+                     config.limits.stream_gap_ms,
+                     config.limits.min_output_tokens_per_second))
         ):
             status, summary = (
                 "inconclusive",
@@ -779,7 +788,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 "inconclusive",
                 "Requested workload coverage unfinished within shared budgets.",
             )
-        if check == "sessions" and status == "pass" and run.config.sessions.profile == "performance":
+        if check == "sessions" and status == "pass" and config.sessions.profile == "performance":
             summary = "Concurrent conversation performance met configured limits. Answer quality was not assessed; capped replies are reported separately."
         result.append(
             CheckResult(

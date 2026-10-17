@@ -44,8 +44,8 @@ export function inferSetupPreset(config) {
     new Set(checks).size === checks.length && expected.every(id => checks.includes(id));
   if (matches(['access','correctness'])) return 'answers';
   if (matches(['access','correctness','capacity'])) return 'arrival';
-  if (matches(['access','buckets']) && validBucketLevels(config.buckets?.levels) &&
-      config.concurrency === Math.max(...config.buckets.levels) &&
+  if (matches(['access','concurrency']) && validBucketLevels(config.concurrent_workloads?.levels) &&
+      config.concurrency === Math.max(...config.concurrent_workloads.levels) &&
       checks.every(id => !Object.keys(config.test_options?.[id] || {}).length)) return 'concurrent';
   return 'custom';
 }
@@ -54,7 +54,7 @@ export function applySetupPreset(source, preset, defaults) {
   const config = structuredClone(source);
   const selection = {
     answers:['access','correctness'],
-    concurrent:['access','buckets'],
+    concurrent:['access','concurrency'],
     arrival:['access','correctness','capacity'],
   }[preset];
   if (selection) config.checks = selection;
@@ -62,15 +62,16 @@ export function applySetupPreset(source, preset, defaults) {
   config.metrics = config.checks.includes('gpu');
   config.tool_calling = config.checks.includes('tools');
   if (preset === 'concurrent') {
-    if (!config.buckets) {
-      config.buckets = structuredClone(defaults);
-      config.buckets.samples_per_bucket = Math.max(
-        config.buckets.samples_per_bucket, config.limits?.min_samples ?? 5);
-      for (const size of Object.keys(config.buckets.output_tokens)) {
-        config.buckets.output_tokens[size] = Math.min(config.buckets.output_tokens[size], config.max_output_tokens);
+    if (!config.concurrent_workloads) {
+      config.concurrent_workloads = structuredClone(defaults);
+      config.concurrent_workloads.scenarios = ['size_matrix'];
+      config.concurrent_workloads.samples_per_bucket = Math.max(
+        config.concurrent_workloads.samples_per_bucket, config.limits?.min_samples ?? 5);
+      for (const size of Object.keys(config.concurrent_workloads.output_tokens)) {
+        config.concurrent_workloads.output_tokens[size] = Math.min(config.concurrent_workloads.output_tokens[size], config.max_output_tokens);
       }
     }
-    if (validBucketLevels(config.buckets.levels)) config.concurrency = Math.max(...config.buckets.levels);
+    if (validBucketLevels(config.concurrent_workloads.levels)) config.concurrency = Math.max(...config.concurrent_workloads.levels);
   }
   return config;
 }
@@ -80,33 +81,33 @@ export function applySetupPreset(source, preset, defaults) {
 export function configureSetupLoad(source, preset, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   if (preset !== 'concurrent') return config;
-  if (!validBucketLevels(config.buckets?.levels)) {
+  if (!validBucketLevels(config.concurrent_workloads?.levels)) {
     if (allowInvalid) return config;
     throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
   }
-  config.concurrency = Math.max(...config.buckets.levels);
+  config.concurrency = Math.max(...config.concurrent_workloads.levels);
   return config;
 }
 
-export function configureBuckets(source, values, defaults, {allowInvalid=false}={}) {
+export function configureConcurrentWorkloads(source, values, defaults, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   const fields = ['levels','samples_per_bucket','window_seconds','mixed_pairs','heavy_long_input','heavy_long_output',
     ...['input','output'].flatMap(kind => ['short','medium','long'].map(size => `${kind}_${size}`))];
-  if (!fields.some(name => values.has(`buckets_${name}`))) return config;
-  const settings = structuredClone(source.buckets || defaults);
-  if (values.has('buckets_levels')) {
-    settings.levels = String(values.get('buckets_levels') || '').trim().split(/[\s,]+/)
+  if (!fields.some(name => values.has(`concurrent_${name}`))) return config;
+  const settings = structuredClone(source.concurrent_workloads || defaults);
+  if (values.has('concurrent_levels')) {
+    settings.levels = String(values.get('concurrent_levels') || '').trim().split(/[\s,]+/)
       .filter(Boolean).map(value => numeric(value, 'Concurrency levels', allowInvalid));
     if (!allowInvalid && !validBucketLevels(settings.levels)) {
       throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
     }
   }
   for (const name of ['samples_per_bucket','window_seconds','mixed_pairs']) {
-    if (values.has(`buckets_${name}`)) settings[name] = numeric(values.get(`buckets_${name}`), name, allowInvalid);
+    if (values.has(`concurrent_${name}`)) settings[name] = numeric(values.get(`concurrent_${name}`), name, allowInvalid);
   }
   for (const [kind, group] of [['input','input_chars'],['output','output_tokens']]) {
     for (const size of ['short','medium','long']) {
-      const name = `buckets_${kind}_${size}`;
+      const name = `concurrent_${kind}_${size}`;
       if (!values.has(name)) continue;
       const label = `${size} ${kind === 'input' ? 'question target' : 'answer cap'}`;
       const value = numeric(values.get(name), label, true);
@@ -118,25 +119,37 @@ export function configureBuckets(source, values, defaults, {allowInvalid=false}=
     }
   }
   for (const name of ['long_input','long_output']) {
-    if (values.has(`buckets_heavy_${name}`)) {
+    if (values.has(`concurrent_heavy_${name}`)) {
       settings.heavy_weights ||= structuredClone(defaults.heavy_weights);
-      settings.heavy_weights[name] = numeric(values.get(`buckets_heavy_${name}`), `${name} weight`, allowInvalid);
+      settings.heavy_weights[name] = numeric(values.get(`concurrent_heavy_${name}`), `${name} weight`, allowInvalid);
     }
   }
-  if (!allowInvalid && config.checks.some(id => ['buckets','mixed'].includes(id)) &&
+  if (values.has('concurrent_scenarios_rendered')) {
+    settings.scenarios = ['size_matrix','mixed_interference','streaming_fairness','token_stress'].filter(name => values.get(`concurrent_scenario_${name}`) === 'on');
+    for (const name of ['input_token_tolerance','calibration_attempts']) {
+      if (values.has(`concurrent_${name}`)) settings[name] = numeric(values.get(`concurrent_${name}`), name, allowInvalid);
+    }
+    settings.stress_cases = ['long_input_summary','short_input_long_output'].filter(name => values.get(`concurrent_${name}_enabled`) === 'on').map(name => ({
+      ...(settings.stress_cases || defaults.stress_cases || []).find(item => item.name === name), name,
+      input_tokens: name === 'long_input_summary' ? numeric(values.get(`concurrent_${name}_input`), 'Input token target', allowInvalid) : null,
+      output_tokens: numeric(values.get(`concurrent_${name}_output`), 'Output token target', allowInvalid),
+      min_output_tokens: numeric(values.get(`concurrent_${name}_minimum`), 'Minimum observed output', allowInvalid),
+    }));
+  }
+  if (!allowInvalid && config.checks.some(id => id === 'concurrency') &&
       Object.values(settings.output_tokens).some(cap => cap > config.max_output_tokens)) {
     throw new Error(`Each answer cap must be ${config.max_output_tokens} tokens or less. Lower the answer cap or edit Maximum answer length under Shared run settings → Request defaults.`);
   }
-  if (source.buckets || config.checks.some(id => ['buckets','mixed'].includes(id)) ||
-      !sameConfig(settings, defaults)) config.buckets = settings;
+  if (source.concurrent_workloads || config.checks.some(id => id === 'concurrency') ||
+      !sameConfig(settings, defaults)) config.concurrent_workloads = settings;
   return config;
 }
 
 // A level needs at least one full concurrent batch for each of the nine size pairs.
 // This is bucket traffic only; other selected checks share the same request budget.
 export function bucketCoveragePlan(config) {
-  if (!config.checks.includes('buckets') || !config.buckets) return null;
-  const {levels, samples_per_bucket: samples} = config.buckets;
+  if (!config.checks.includes('concurrency') || !config.concurrent_workloads?.scenarios?.includes('size_matrix')) return null;
+  const {levels, samples_per_bucket: samples} = config.concurrent_workloads;
   if (!levels.length || levels.some(level => !Number.isInteger(level) || level < 1 || level > 256) ||
       !Number.isInteger(samples) || samples < 2) return null;
   const perTarget = 9 * levels.reduce((total, level) => total + Math.max(samples, level), 0);
@@ -203,6 +216,7 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
       if (Object.hasOwn(source.traffic, name)) config.traffic[name] = structuredClone(source.traffic[name]);
     }
   }
+
   return config;
 }
 
@@ -231,6 +245,7 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
 export function configureSessions(source, values, defaults, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   if (!values.has('sessions_profile')) return config;
+  if (values.get('sessions_profile') === 'correctness' && !config.sessions) return config;
   const settings = config.sessions ||= {...structuredClone(defaults),
     concurrency:Math.min(defaults.concurrency,config.concurrency),
     max_tokens:Math.min(defaults.max_tokens,config.max_output_tokens)};

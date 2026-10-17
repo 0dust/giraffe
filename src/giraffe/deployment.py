@@ -290,6 +290,61 @@ def _sglang_metadata(info):
     return reported
 
 
+ENGINE_DISCOVERY_ROUTES = {
+    "llamacpp": "/props", "tensorrt-llm": "/version",
+    "lmdeploy": "/v1/models", "tgi": "/info",
+}
+
+
+def _engine_metadata(engine, info, model):
+    """Select documented fields; model paths and arbitrary server settings stay private."""
+    if not isinstance(info, dict):
+        raise ValueError("runtime discovery must be an object")
+    reported = {"runtime": {"engine": engine}, "model": {}, "serving": {}}
+    if engine == "llamacpp":
+        settings = info.get("default_generation_settings")
+        if not isinstance(settings, dict) or type(info.get("total_slots")) is not int:
+            raise ValueError("invalid llama.cpp properties")
+        if isinstance(info.get("build_info"), str):
+            reported["runtime"]["version"] = info["build_info"]
+        for key, value in (("context_limit", settings.get("n_ctx")),
+                           ("max_num_seqs", info["total_slots"])):
+            if type(value) is int and value > 0:
+                reported["serving"][key] = value
+        if isinstance(info.get("chat_template"), str):
+            reported["model"]["chat_template"] = (
+                "sha256:" + hashlib.sha256(info["chat_template"].encode()).hexdigest())
+    elif engine == "tensorrt-llm":
+        if not isinstance(info.get("version"), str) or not info["version"]:
+            raise ValueError("invalid TensorRT-LLM version")
+        reported["runtime"]["version"] = info["version"]
+    elif engine == "lmdeploy":
+        models = info.get("data")
+        if not isinstance(models, list) or not any(
+            isinstance(item, dict) and item.get("id") == model
+            and item.get("owned_by") == "lmdeploy" for item in models
+        ):
+            raise ValueError("requested model not reported by LMDeploy")
+        reported["model"]["served"] = model
+        # /v1/models does not publish a runtime version or resolved settings.
+    elif engine == "tgi":
+        if info.get("router") != "text-generation-router" or not isinstance(info.get("model_id"), str):
+            raise ValueError("invalid TGI server info")
+        for source, category, key in (
+            ("version", "runtime", "version"), ("sha", "runtime", "commit"),
+            ("model_id", "model", "served"), ("model_sha", "model", "revision"),
+        ):
+            if isinstance(info.get(source), str):
+                reported[category][key] = info[source]
+        if type(info.get("max_total_tokens")) is int and info["max_total_tokens"] > 0:
+            reported["serving"]["context_limit"] = info["max_total_tokens"]
+        reported["serving"]["resolved_settings"] = {
+            key: info[key] for key in ("max_input_tokens", "max_total_tokens", "max_concurrent_requests")
+            if type(info.get(key)) is int and info[key] > 0
+        }
+    return reported
+
+
 async def snapshot(target, config, deadline, stop):
     import time
     from giraffe.client import _headers
@@ -423,6 +478,13 @@ async def snapshot(target, config, deadline, stop):
                         reported = _sglang_metadata(info)
                         result["discovery"].append(
                             {"status": "available", "source": "sglang /get_server_info"}
+                        )
+                    elif deployment.discovery in ENGINE_DISCOVERY_ROUTES:
+                        route = ENGINE_DISCOVERY_ROUTES[deployment.discovery]
+                        info = await _read(client, origin + route)
+                        reported = _engine_metadata(deployment.discovery, info, target.model)
+                        result["discovery"].append(
+                            {"status": "available", "source": deployment.discovery + " " + route}
                         )
                     else:
                         version = await _read(client, origin + "/version")

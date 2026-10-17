@@ -23,7 +23,8 @@ from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_cu
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
 from .timing import TimingHealth, configured_metrics, qualified_violations, run_quality
 from .models import (
-    CHECK_NAMES, CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
+    INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
+    CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
     overall_status,
 )
 
@@ -1078,7 +1079,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
-    config = config.model_copy(deep=True)
+    from .concurrent_workloads import execution_config, consolidate_checks
+
+    public_config = config.model_copy(deep=True)
+    config = execution_config(public_config)
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     fixtures = builtin_fixtures(config)
@@ -1141,6 +1145,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "timing_interval_ms": stages[index]["timing_interval_ms"]}
                     for index, evidence in enumerate(run.stage_evidence[target.name])]
     checks = [check for target in config.targets for check in _checks(run, target)]
+    checks = consolidate_checks(run, public_config, checks)
     counts = defaultdict(dict)
     for target in config.targets:
         for scenario in sorted({r.scenario for r in run.records if r.target == target.name}):
@@ -1166,8 +1171,10 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
     from giraffe.workloads import FIXTURE_SOURCE_SHA256, WORKLOAD_CHECKS
-    config_values = config.model_dump(mode="json")
-    workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
+    config_values = public_config.model_dump(mode="json")
+    workload_settings = {key: (getattr(config, key).model_dump(mode="json")
+                              if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
+                         for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
@@ -1180,9 +1187,9 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     manifest = {"config": config_values,
                 "timing_measurement_version": 2,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
-                "workload_selection": {key: "selected" if key in config.checks else "not selected"
-                                       for key in CHECK_NAMES if key not in CORE_CHECKS},
-                "effective_checks": {name: config.effective_check(name) for name in config.checks},
+                "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
+                                       for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
+                "effective_checks": {name: public_config.effective_check(name) for name in public_config.checks},
                 "effective_traffic": (config.effective_traffic().model_dump(mode="json")
                                       if "capacity" in config.checks else None),
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,

@@ -111,6 +111,9 @@ async def exercise(run, target, client, fixtures) -> None:
             declarations.add({"vllm-v1": "vllm", "vllm-legacy": "vllm"}.get(value, value))
     runtime = next(iter(declarations)) if len(declarations) == 1 else None
     evidence["runtime"] = runtime
+    if runtime in {"llamacpp", "tensorrt-llm", "lmdeploy", "tgi"}:
+        evidence.update(summary=f"Native per-request termination verification is unavailable for {runtime}; client close and follow-up health do not prove server termination.")
+        return
     if runtime not in {"sglang", "vllm", "ollama"} or urlsplit(target.url).hostname not in {"localhost", "127.0.0.1", "::1"}:
         evidence.update(status="blocked", summary="Requires unambiguous runtime metadata and a same-host target (shared clock).")
         return

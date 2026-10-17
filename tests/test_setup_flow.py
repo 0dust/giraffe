@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from giraffe.models import Buckets, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
+from giraffe.models import ConcurrentWorkloads, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
 
 
 MODULE = (Path(__file__).parents[1] / "src/giraffe/static/form-config.mjs").as_uri()
@@ -30,7 +30,7 @@ def run_setup_script(script):
 import assert from 'node:assert/strict';
 import * as setup from {json.dumps(MODULE)};
 const source = {json.dumps(config.model_dump(mode='json'))};
-const defaults = {json.dumps(Buckets().model_dump(mode='json'))};
+const defaults = {json.dumps(ConcurrentWorkloads().model_dump(mode='json'))};
 const checks = {json.dumps(checks)};
 """
     result = subprocess.run(
@@ -53,8 +53,8 @@ source.checks = ['access', 'correctness', 'json'];
 assert.equal(setup.inferSetupPreset(source), 'custom');
 source.checks = ['access', 'access', 'correctness'];
 assert.equal(setup.inferSetupPreset(source), 'custom');
-source.checks = ['buckets', 'access'];
-source.buckets = {...defaults, levels:[1, 4, 8]};
+source.checks = ['concurrency', 'access'];
+source.concurrent_workloads = {...defaults, levels:[1, 4, 8]};
 source.concurrency = 8;
 assert.equal(setup.inferSetupPreset(source), 'concurrent');
 source.concurrency = 16;
@@ -70,7 +70,7 @@ source.test_options.access = {request_timeout_seconds:12};
 assert.equal(setup.inferSetupPreset(source), 'custom');
 source.test_options = {};
 for (const levels of [[], ['8'], [1, 1], [0], [257], null]) {
-  source.buckets.levels = levels;
+  source.concurrent_workloads.levels = levels;
   assert.equal(setup.inferSetupPreset(source), 'custom');
 }
 """)
@@ -95,11 +95,11 @@ source.limits.min_samples = 7;
 const before = structuredClone(source);
 const concurrent = setup.applySetupPreset(source, 'concurrent', defaults);
 assert.deepEqual(source, before);
-assert.deepEqual(concurrent.checks, ['access','buckets']);
+assert.deepEqual(concurrent.checks, ['access','concurrency']);
 assert.equal(concurrent.structured_json, false);
 assert.equal(concurrent.metrics, false);
 assert.equal(concurrent.tool_calling, false);
-assert.equal(concurrent.buckets.samples_per_bucket, 7);
+assert.equal(concurrent.concurrent_workloads.samples_per_bucket, 7);
 assert.equal(concurrent.concurrency, 2);
 assert.equal(concurrent.max_requests, 100);
 assert.equal(concurrent.max_output_tokens, 128);
@@ -119,14 +119,14 @@ assert.deepEqual(custom.checks,source.checks);
 assert.equal(custom.structured_json,true);
 assert.equal(custom.metrics,true);
 assert.equal(custom.tool_calling,true);
-source.buckets = {...defaults,levels:[1,4,8],samples_per_bucket:3,input_chars:{short:25,medium:50,long:100},output_tokens:{short:5,medium:20,long:40},mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
+source.concurrent_workloads = {...defaults,levels:[1,4,8],samples_per_bucket:3,input_chars:{short:25,medium:50,long:100},output_tokens:{short:5,medium:20,long:40},mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
 const existing = setup.applySetupPreset(source,'concurrent',defaults);
 assert.equal(existing.concurrency,8);
-assert.deepEqual(existing.buckets,source.buckets);
-assert.equal(existing.buckets.samples_per_bucket,3);
-source.buckets = null;
+assert.deepEqual(existing.concurrent_workloads,source.concurrent_workloads);
+assert.equal(existing.concurrent_workloads.samples_per_bucket,3);
+source.concurrent_workloads = null;
 source.limits.min_samples = 5;
-assert.equal(setup.applySetupPreset(source,'concurrent',defaults).buckets.samples_per_bucket,5);
+assert.equal(setup.applySetupPreset(source,'concurrent',defaults).concurrent_workloads.samples_per_bucket,5);
 """)
 
 
@@ -135,14 +135,14 @@ def test_setup_load_derives_only_basic_concurrency_without_raising_budgets():
 assert.equal(typeof setup.configureSetupLoad, 'function');
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
 const values = new FormData();
-values.set('buckets_levels','1, 4 8');
-values.set('buckets_samples_per_bucket','5');
-values.set('buckets_window_seconds','30');
-const buckets = setup.configureBuckets(preset,values,defaults);
+values.set('concurrent_levels','1, 4 8');
+values.set('concurrent_samples_per_bucket','5');
+values.set('concurrent_window_seconds','30');
+const buckets = setup.configureConcurrentWorkloads(preset,values,defaults);
 const before = structuredClone(buckets);
 const configured = setup.configureSetupLoad(buckets,'concurrent');
 assert.deepEqual(buckets,before);
-assert.deepEqual(configured.buckets.levels,[1,4,8]);
+assert.deepEqual(configured.concurrent_workloads.levels,[1,4,8]);
 assert.equal(configured.concurrency,8);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
@@ -162,10 +162,10 @@ def test_setup_load_keeps_invalid_drafts_and_rejects_them_when_running():
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
 for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']) {
   const values = new FormData();
-  values.set('buckets_levels',raw);
-  values.set('buckets_samples_per_bucket','5');
-  values.set('buckets_window_seconds','30');
-  const draft = setup.configureBuckets(preset,values,defaults,{allowInvalid:true});
+  values.set('concurrent_levels',raw);
+  values.set('concurrent_samples_per_bucket','5');
+  values.set('concurrent_window_seconds','30');
+  const draft = setup.configureConcurrentWorkloads(preset,values,defaults,{allowInvalid:true});
   const before = structuredClone(draft);
   assert.deepEqual(setup.configureSetupLoad(draft,'concurrent',{allowInvalid:true}),before);
   assert.deepEqual(draft,before);
@@ -177,69 +177,69 @@ for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']
 
 def test_bucket_sizes_are_editable_and_keep_explicit_output_safety_limit():
     result = run_setup_script("""
-source.checks = ['access','buckets'];
+source.checks = ['access','concurrency'];
 source.concurrency = 8;
-source.buckets = {...defaults,levels:[1,4,8],mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
+source.concurrent_workloads = {...defaults,levels:[1,4,8],mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
 const values = new FormData();
 for (const [name,value] of Object.entries({
-  buckets_input_short:100,buckets_input_medium:600,buckets_input_long:1200,
-  buckets_output_short:12,buckets_output_medium:36,buckets_output_long:120,
+  concurrent_input_short:100,concurrent_input_medium:600,concurrent_input_long:1200,
+  concurrent_output_short:12,concurrent_output_medium:36,concurrent_output_long:120,
 })) values.set(name,String(value));
 const before = structuredClone(source);
-const configured = setup.configureBuckets(source,values,defaults);
+const configured = setup.configureConcurrentWorkloads(source,values,defaults);
 assert.deepEqual(source,before);
-assert.deepEqual(configured.buckets.input_chars,{short:100,medium:600,long:1200});
-assert.deepEqual(configured.buckets.output_tokens,{short:12,medium:36,long:120});
-assert.deepEqual(configured.buckets.levels,[1,4,8]);
-assert.equal(configured.buckets.samples_per_bucket,defaults.samples_per_bucket);
-assert.equal(configured.buckets.window_seconds,defaults.window_seconds);
-assert.equal(configured.buckets.mixed_pairs,7);
-assert.deepEqual(configured.buckets.heavy_weights,source.buckets.heavy_weights);
+assert.deepEqual(configured.concurrent_workloads.input_chars,{short:100,medium:600,long:1200});
+assert.deepEqual(configured.concurrent_workloads.output_tokens,{short:12,medium:36,long:120});
+assert.deepEqual(configured.concurrent_workloads.levels,[1,4,8]);
+assert.equal(configured.concurrent_workloads.samples_per_bucket,defaults.samples_per_bucket);
+assert.equal(configured.concurrent_workloads.window_seconds,defaults.window_seconds);
+assert.equal(configured.concurrent_workloads.mixed_pairs,7);
+assert.deepEqual(configured.concurrent_workloads.heavy_weights,source.concurrent_workloads.heavy_weights);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
-values.set('buckets_output_long','256');
-assert.throws(()=>setup.configureBuckets(source,values,defaults),/answer cap must be 128 tokens or less/i);
-const draft = setup.configureBuckets(source,values,defaults,{allowInvalid:true});
-assert.equal(draft.buckets.output_tokens.long,256);
+values.set('concurrent_output_long','256');
+assert.throws(()=>setup.configureConcurrentWorkloads(source,values,defaults),/answer cap must be 128 tokens or less/i);
+const draft = setup.configureConcurrentWorkloads(source,values,defaults,{allowInvalid:true});
+assert.equal(draft.concurrent_workloads.output_tokens.long,256);
 assert.equal(draft.max_output_tokens,128);
 const inactive = {...source,checks:['access','correctness']};
-assert.equal(setup.configureBuckets(inactive,values,defaults).buckets.output_tokens.long,256);
-for (const name of ['buckets_input_short','buckets_input_medium','buckets_input_long',
-                    'buckets_output_short','buckets_output_medium','buckets_output_long']) {
+assert.equal(setup.configureConcurrentWorkloads(inactive,values,defaults).concurrent_workloads.output_tokens.long,256);
+for (const name of ['concurrent_input_short','concurrent_input_medium','concurrent_input_long',
+                    'concurrent_output_short','concurrent_output_medium','concurrent_output_long']) {
   for (const raw of ['', '0', '65537', '1.5', 'oops', 'Infinity']) {
     const invalid = new FormData();
     invalid.set(name,raw);
-    assert.throws(()=>setup.configureBuckets(source,invalid,defaults),/whole number.*1.*65536/);
-    const kept = setup.configureBuckets(source,invalid,defaults,{allowInvalid:true});
-    const [group,size] = name.replace('buckets_','').split('_');
+    assert.throws(()=>setup.configureConcurrentWorkloads(source,invalid,defaults),/whole number.*1.*65536/);
+    const kept = setup.configureConcurrentWorkloads(source,invalid,defaults,{allowInvalid:true});
+    const [group,size] = name.replace('concurrent_','').split('_');
     const expected = raw === '' ? null : Number.isFinite(Number(raw)) ? Number(raw) : raw;
-    assert.equal(kept.buckets[group === 'input' ? 'input_chars' : 'output_tokens'][size],expected);
+    assert.equal(kept.concurrent_workloads[group === 'input' ? 'input_chars' : 'output_tokens'][size],expected);
   }
 }
 console.log(JSON.stringify(configured));
 """)
     configured = RunConfig.model_validate(result)
-    assert configured.buckets.input_chars["long"] == 1200
-    assert configured.buckets.output_tokens["long"] == 120
+    assert configured.concurrent_workloads.input_chars["long"] == 1200
+    assert configured.concurrent_workloads.output_tokens["long"] == 120
 
 
 def test_legacy_bucket_forms_preserve_sizes_and_do_not_activate_workloads():
     run_setup_script("""
-source.buckets = {...defaults,input_chars:{short:20,medium:40,long:80},output_tokens:{short:10,medium:20,long:30},mixed_pairs:9};
+source.concurrent_workloads = {...defaults,input_chars:{short:20,medium:40,long:80},output_tokens:{short:10,medium:20,long:30},mixed_pairs:9};
 const values = new FormData();
-values.set('buckets_levels','1, 2');
-const result = setup.configureBuckets(source,values,defaults);
-assert.deepEqual(result.buckets,source.buckets);
-assert.deepEqual(setup.configureBuckets(source,new FormData(),defaults),source);
-source.buckets = null;
-values.set('buckets_samples_per_bucket',String(defaults.samples_per_bucket));
-values.set('buckets_window_seconds',String(defaults.window_seconds));
+values.set('concurrent_levels','1, 2');
+const result = setup.configureConcurrentWorkloads(source,values,defaults);
+assert.deepEqual(result.concurrent_workloads,source.concurrent_workloads);
+assert.deepEqual(setup.configureConcurrentWorkloads(source,new FormData(),defaults),source);
+source.concurrent_workloads = null;
+values.set('concurrent_samples_per_bucket',String(defaults.samples_per_bucket));
+values.set('concurrent_window_seconds',String(defaults.window_seconds));
 for (const size of ['short','medium','long']) {
-  values.set(`buckets_input_${size}`,String(defaults.input_chars[size]));
-  values.set(`buckets_output_${size}`,String(defaults.output_tokens[size]));
+  values.set(`concurrent_input_${size}`,String(defaults.input_chars[size]));
+  values.set(`concurrent_output_${size}`,String(defaults.output_tokens[size]));
 }
-const inactive = setup.configureBuckets(source,values,defaults);
-assert.equal(inactive.buckets,null);
+const inactive = setup.configureConcurrentWorkloads(source,values,defaults);
+assert.equal(inactive.concurrent_workloads,null);
 assert.deepEqual(inactive.checks,['access','correctness']);
 """)
 
@@ -248,13 +248,13 @@ def test_new_concurrent_defaults_fit_existing_output_limit_without_rewriting_pro
     result = run_setup_script("""
 source.max_output_tokens = 32;
 const configured = setup.applySetupPreset(source,'concurrent',defaults);
-assert.deepEqual(configured.buckets.output_tokens,{short:16,medium:32,long:32});
+assert.deepEqual(configured.concurrent_workloads.output_tokens,{short:16,medium:32,long:32});
 assert.equal(configured.max_output_tokens,32);
 assert.equal(configured.max_requests,100);
 assert.deepEqual(defaults.output_tokens,{short:16,medium:48,long:96});
-source.buckets = structuredClone(defaults);
+source.concurrent_workloads = structuredClone(defaults);
 const preserved = setup.applySetupPreset(source,'concurrent',defaults);
-assert.deepEqual(preserved.buckets,defaults);
+assert.deepEqual(preserved.concurrent_workloads,defaults);
 assert.equal(preserved.max_output_tokens,32);
 console.log(JSON.stringify(configured));
 """)
@@ -273,7 +273,7 @@ source.judging.ca_bundle = '/judge/ca';
 source.judging.proxy = 'http://proxy';
 source.test_options = {access:{request_timeout_seconds:12},correctness:{samples:9,concurrency:4},recovery:{sustained_seconds:2}};
 source.prefix = {prefix_chars:512,repeats:7,history_turns:3};
-source.buckets = {...defaults,levels:[1,4,8],samples_per_bucket:5,input_chars:{short:100,medium:600,long:1200},output_tokens:{short:12,medium:36,long:120},mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
+source.concurrent_workloads = {...defaults,levels:[1,4,8],samples_per_bucket:5,input_chars:{short:100,medium:600,long:1200},output_tokens:{short:12,medium:36,long:120},mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
 const before = structuredClone(preset);
 const values = new FormData();
@@ -284,14 +284,14 @@ for (const check of checks) {
   for (const name of check.limit_fields) values.set(`test_${check.id}_limit_${name}`,setup.limitValue(preset,check,name) ?? '');
 }
 values.set('traffic_mode','default');
-values.set('buckets_levels','1, 4, 8');
+values.set('concurrent_levels','1, 4, 8');
 values.set('judge_count','1');
 for (const key of ['name','url','model','api_key_env']) values.set(`judge_0_${key}`,preset.judging.judges[0][key]);
 for (const key of ['concurrency','request_timeout_seconds','max_duration_seconds','max_output_tokens']) {
   values.set(`judging_${key}`,String(preset.judging[key]));
 }
 let configured = setup.configureTests(preset,values,checks,preset.traffic);
-configured = setup.configureBuckets(configured,values,defaults);
+configured = setup.configureConcurrentWorkloads(configured,values,defaults);
 configured = setup.configureJudging(configured,values);
 configured = setup.configureSetupLoad(configured,'concurrent');
 assert.deepEqual(preset,before);
@@ -303,7 +303,7 @@ for (const mode of ['answers','arrival','custom']) {
   assert.deepEqual(switched.test_options,source.test_options);
   assert.deepEqual(switched.judging,source.judging);
   assert.deepEqual(switched.request_pack,source.request_pack);
-  assert.deepEqual(switched.buckets,source.buckets);
+  assert.deepEqual(switched.concurrent_workloads,source.concurrent_workloads);
   assert.equal(switched.concurrency,8);
 }
 console.log(JSON.stringify(configured));
@@ -337,7 +337,7 @@ source.test_options = {
   capacity:{limits:{latency_ms:1200,first_output_ms:null}},
   recovery:{sustained_seconds:2},
 };
-source.buckets = {...defaults,levels:[1,4,8],samples_per_bucket:5};
+source.concurrent_workloads = {...defaults,levels:[1,4,8],samples_per_bucket:5};
 const before = structuredClone(source);
 const concurrent = setup.applySetupPreset(source,'concurrent',defaults);
 assert.equal(concurrent.concurrency,8);

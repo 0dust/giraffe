@@ -5,7 +5,7 @@ from __future__ import annotations
 from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, Limits,
-    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, Buckets, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, ConcurrentWorkloads, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
     MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES, RequestPack, session_workload_presets,
 )
 from giraffe.request_pack import INPUT_RETENTION_NOTICE
@@ -16,6 +16,7 @@ CHECK_DESCRIPTIONS = {
     "first_output": "How long do users wait before an answer starts?",
     "generation": "How fast do answers arrive, and how often do they pause?",
     "capacity": "How much traffic can the server handle while giving correct, timely answers?",
+    "concurrency": "Compare request sizes, mixed workloads, stream fairness and token stress at configurable loads.",
     "fairness": "Do long questions slow down a short answer already in progress?",
     "context": "Can the model recall facts from long questions?",
     "correctness": "Does the model give correct answers when requests run together?",
@@ -38,6 +39,7 @@ CHECK_DETAILS = {
     "first_output": "Measures the wait for useful answer text. Reports the first request separately from later requests, and keeps reasoning text separate from the answer.",
     "generation": "Measures complete response time, pauses between streamed chunks, answer length and generation speed. Token speed needs token counts reported by the server.",
     "capacity": "Starts requests at each chosen rate without waiting for previous answers. Tracks correct answers, response times and dropped requests to estimate useful capacity. The request and time limits still apply.",
+    "concurrency": "Runs selected scenarios with separate verdicts and all original measurements. Token-stress cases verify observed token lengths; insufficient limits remain inconclusive.",
     "fairness": "Starts a short response, then sends long questions alongside it. Compares the short response with a run without competing long questions to measure slowdown.",
     "context": "Places known facts at different positions in questions of different lengths, then asks the model to recall them. Use the context length configured on your server.",
     "correctness": "Uses questions with known answers, including extraction, arithmetic and classification. Checks whether answers remain correct while multiple requests run at once. Your own dataset replaces the built-in questions when selected.",
@@ -84,9 +86,10 @@ def capabilities(config: RunConfig | None = None) -> dict:
         "option_schema": CheckOptions.model_json_schema(),
         "limits_schema": Limits.model_json_schema(),
         "traffic_schema": TrafficConfig.model_json_schema(),
+        "concurrent_workloads": {"defaults": ConcurrentWorkloads().model_dump(mode="json"),
+                                 "schema": ConcurrentWorkloads.model_json_schema()},
         "session_workloads": {"defaults": Sessions().model_dump(mode="json"),
                               "presets": [item.model_dump(mode="json") for item in session_workload_presets()]},
-        "buckets": {"schema": Buckets.model_json_schema(), "defaults": Buckets().model_dump(mode="json")},
         "judging": {"schema": JudgingConfig.model_json_schema(),
                     "defaults": JudgingConfig().model_dump(mode="json"),
                     "prompt_version": JUDGE_PROMPT_VERSION, "voting_rule": JUDGE_VOTING_RULE},
