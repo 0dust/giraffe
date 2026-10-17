@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
+from giraffe.logprob_workload import corpus_width
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, label_prompt
@@ -211,7 +212,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         settings = config.consistency
         levels = len(set([1, *settings.levels]))
         count = len(settings.shapes) * levels * settings.repetitions
-        add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
+        if settings.logprobs:
+            count = len(settings.shapes) * levels * corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
+            add("consistency", count, f"{settings.repetitions} measured rounds plus {settings.logprobs.priming_rounds} priming rounds per shape and level; {corpus_width(settings)} fixed corpus requests per round. Complete responses with logprobs enabled; client overlap does not prove server batching.")
+        else:
+            add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
     if "tools" in selected:
         count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
         add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")

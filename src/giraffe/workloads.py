@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from giraffe.logprob_workload import corpus_width
 from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec
 
 # One settings block can drive multiple selectable workloads.
@@ -411,6 +412,10 @@ async def sessions(run, target, client):
 
 async def consistency(run, target, client, fixtures):
     settings = run.config.consistency
+    if settings.logprobs is not None:
+        from giraffe.logprob_workload import run_logprob_consistency
+        await run_logprob_consistency(run, target, client, fixtures)
+        return
     # Always sequential first, then selected concurrent levels, using independent identical requests.
     for shape in settings.shapes:
         base = fixtures[shape][0].model_copy(deep=True)
@@ -504,7 +509,9 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         minimum = run.config.limits.min_samples
         groups = {}
         for scenario in dict.fromkeys(r.scenario for r in records):
-            items = [r for r in records if r.scenario == scenario]
+            items = [r for r in records if r.scenario == scenario and r.workload.get("phase") != "priming"]
+            if not items:
+                continue
             entry = stats(items)
             entry["achieved_overlap"] = max((r.overlap for r in items), default=0)
             entry["workload"] = items[0].workload
@@ -519,7 +526,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     agreement_rate=max(hashes.values()) / sum(hashes.values()) if hashes else None,
                     equality=run.config.consistency.equality,
                     correctness=entry["correct"] / entry["scored"] if entry["scored"] else None,
-                    expected_samples=run.config.consistency.repetitions,
+                    expected_samples=run.config.consistency.repetitions * (corpus_width(run.config.consistency) if run.config.consistency.logprobs else 1),
                 )
                 if len(hashes) > 1 and run.config.consistency.strict:
                     status, summary = (
@@ -529,7 +536,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if len(hashes) > 1 and not run.config.consistency.strict:
                     summary = "Answer variation observed; variation alone is diagnostic, not a correctness failure."
                 if (
-                    len(items) < run.config.consistency.repetitions
+                    len(items) < entry["expected_samples"]
                     or entry["completed"] < minimum
                     or entry["achieved_overlap"] < items[0].workload["level"]
                 ):
@@ -687,10 +694,20 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if check != "tools"
             else [r for r in records if r.workload.get("selection") == "automatic"]
         )
+        if check == "consistency" and run.config.consistency.logprobs:
+            from giraffe.logprob_workload import summarize_logprobs
+            metrics["logprobs"] = summarize_logprobs(records, run.config.consistency)
+            probability_status = metrics["logprobs"]["status"]
+            if probability_status == "fail" or (probability_status == "inconclusive" and status != "fail"):
+                status, summary = probability_status, "Token probability consistency or capability expectation is not satisfied; see independent probability outcomes."
+            elif status == "pass":
+                summary = "Token probability comparison completed (" + probability_status + "); answer correctness is separate."
         assessed_stats = stats(assessed)
         if check != "tools" and assessed_stats["completed"] < minimum and status != "fail":
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
-        errors = assessed_stats["error_rate"]
+        errors = stats([r for r in assessed if not (check == "consistency" and r.logprob_evidence and
+                        r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
+                        run.config.consistency.logprobs.support == "discover")])["error_rate"]
         cap_violations = [
             r.id
             for r in assessed

@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
+from giraffe.logprobs import LogprobBudget
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -134,6 +135,7 @@ class LLMClient:
     def __init__(self, target: Target, config: RunConfig):
         self.target = target
         self.config = config
+        self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> LLMClient:
@@ -228,6 +230,9 @@ class LLMClient:
             if not isinstance(content, dict):
                 raise _ProtocolError("response is missing assistant content")
             answer = _text(content.get("content"))
+            if spec.workload.get("logprobs") and not streaming:
+                record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
+                                                          spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = time.perf_counter()
             calls = content.get("tool_calls")
@@ -302,6 +307,17 @@ class LLMClient:
                         "x-replica-id",
                     )
                     if not 200 <= response.status_code < 300:
+                        if spec.workload.get("logprobs"):
+                            from giraffe.models import LogprobEvidence
+                            error_body = await _limited_body(response)
+                            try:
+                                error_data = json.loads(error_body).get("error", {})
+                                rejected = response.status_code in {400, 422} and isinstance(error_data, dict) and error_data.get("param") in {"logprobs", "top_logprobs"}
+                            except (ValueError, AttributeError, TypeError):
+                                rejected = False
+                            record.logprob_evidence = LogprobEvidence(status="rejected" if rejected else "incomplete",
+                                reason="Logprob request field rejected." if rejected else "HTTP request failed; logprob support unverified.",
+                                requested_top_logprobs=spec.workload["top_logprobs"])
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):
