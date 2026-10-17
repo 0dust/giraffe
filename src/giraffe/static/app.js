@@ -76,14 +76,14 @@ function coatGeometry(count,width,height,{seed=count,columns,inset=4.5,jitter=.5
 }
 function reticulateCells(count) {
   if(mosaicGeometry.has(count))return mosaicGeometry.get(count);
-  // Spots have one fixed size, like cells on an instrument: a few requests stay a few spots.
-  const size=count<=24?30:count<=80?25:21;
+  // Spots stay a readable size: a handful of requests never stretch into slabs.
+  const size=Math.max(34,Math.min(84,Math.sqrt(960*300/Math.max(1,count))));
   // Keep the coat roughly 3:1 so small runs still read as spots, not slabs.
   const rows=Math.ceil(count/Math.max(1,Math.min(count,Math.round(960/size),Math.ceil(Math.sqrt(count*3))))),columns=Math.ceil(count/rows);
-  const width=Math.round(columns*size),height=Math.round(Math.max(1,rows)*size*.9);
+  const width=Math.round(columns*size),height=Math.round(Math.max(1,rows)*size*.86);
   // Inset each cell by half the channel plus the corner radius; the stroke adds the radius back as a rounded edge.
-  const round=1.3,channel=2.2;
-  const cells=coatGeometry(count,width,height,{columns,inset:channel/2+round,jitter:.8,stagger:0}).map(cell=>cell.points);
+  const round=Math.max(1.6,size*.075),channel=Math.max(2.4,size*.05);
+  const cells=coatGeometry(count,width,height,{columns,inset:channel/2+round}).map(cell=>cell.points);
   const geometry={cells,width,height,columns,round:Number((round*2).toFixed(2))};
   if(mosaicGeometry.size>8)mosaicGeometry.clear();
   mosaicGeometry.set(count,geometry);return geometry;
@@ -1559,7 +1559,7 @@ function renderDetail() {
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
   $('#main').innerHTML=`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
-  <div class="evidence-band${report.requests.length<=72?' is-compact':''}">${renderMosaic(orderedRequests(report))}${renderBeeswarm(orderedRequests(report),{width:report.requests.length<=72?680:960})}</div>
+  <div class="evidence-band${report.requests.length<=72?' is-compact':''}">${renderMosaic(orderedRequests(report))}${renderBeeswarm(orderedRequests(report),{width:report.requests.length<=72?500:960})}</div>
   <div class="result-summary"><div class="summary-bar" aria-hidden="true">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<span class="summary-seg ${k}" style="flex-grow:${counts[k]}"></span>`).join('')}</div><div class="summary-items">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item ${k}"><strong data-count="${counts[k]}">${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span class="hint summary-targets">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div></div>
   <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" tabindex="${state.tab==='checks'?0:-1}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" tabindex="${state.tab==='baseline'?0:-1}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" tabindex="${state.tab==='config'?0:-1}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
   <section id="result-content" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='checks'?renderChecks(report):state.tab==='baseline'?renderComparison(report):renderConfig(report)}</section>

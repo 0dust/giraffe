@@ -691,11 +691,12 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .evidence-band { display: grid; margin-bottom: 18px; border-radius: var(--r-xl); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--highlight); overflow: hidden; }
 .evidence-band > * { margin: 0 !important; min-width: 0; border: 0 !important; border-radius: 0 !important; box-shadow: none !important; background: transparent !important; }
 .evidence-band > * + * { border-top: 1px solid var(--line) !important; }
-.evidence-band.is-compact { grid-template-columns: minmax(300px, max-content) minmax(0, 1fr); }
+.evidence-band.is-compact { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
 .evidence-band.is-compact > * + * { border-top: 0 !important; border-left: 1px solid var(--line) !important; }
 .evidence-band.is-compact .request-viz, .evidence-band.is-compact .latency-viz { display: flex; flex-direction: column; }
 .evidence-band.is-compact .latency-viz .mosaic-scroll { flex: 1; display: flex; align-items: center; }
-.evidence-band.is-compact .request-viz .mosaic-scroll { margin-top: auto; }
+.evidence-band.is-compact .request-viz .mosaic-scroll { margin-top: auto; display: flex; justify-content: center; }
+.evidence-band.is-compact .request-mosaic { max-width: calc(var(--mosaic-w) * 1.4); }
 .evidence-band.is-compact .request-viz .viz-footer { margin-bottom: auto; padding-top: 16px; }
 .evidence-band.is-compact .latency-viz .viz-footer { margin-top: auto; }
 .request-viz, .latency-viz { margin-bottom: 18px; padding: 20px 22px; border-radius: var(--r-xl); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--highlight); }
@@ -708,14 +709,15 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .request-mosaic { width: 100%; max-width: var(--mosaic-w, 100%); height: auto; overflow: visible; }
 .request-spot { cursor: default; outline: none; }
 .request-spot[role=button] { cursor: pointer; }
-.request-spot polygon { fill: var(--spot); stroke: var(--spot); stroke-width: var(--spot-round, 4.8); stroke-linejoin: round; transition: fill .15s var(--ease), stroke .15s var(--ease); }
-.request-spot.pass { --spot: color-mix(in oklab, var(--pass) 50%, var(--surface)); --spot-hot: var(--pass); }
-.request-spot.fail { --spot: var(--fail); --spot-hot: color-mix(in oklab, var(--fail) 80%, #fff); }
-.request-spot.inconclusive { --spot: color-mix(in oklab, var(--unknown) 46%, var(--surface)); --spot-hot: var(--unknown); }
+.request-spot polygon { fill: var(--spot); stroke: var(--spot); stroke-width: var(--spot-round, 5); stroke-linejoin: round; shape-rendering: geometricPrecision; }
+.request-spot.pass { --spot: color-mix(in oklab, var(--pass) 82%, var(--bg)); --spot-hot: color-mix(in oklab, var(--pass) 88%, #fff); }
+.request-spot.fail { --spot: var(--fail); --spot-hot: color-mix(in oklab, var(--fail) 82%, #fff); }
+.request-spot.inconclusive { --spot: color-mix(in oklab, var(--unknown) 78%, var(--bg)); --spot-hot: color-mix(in oklab, var(--unknown) 90%, #fff); }
 .request-spot.running { --spot: var(--live); --spot-hot: var(--live); }
 .request-spot.idle { --spot: color-mix(in oklab, var(--text) 6%, var(--surface)); }
 .request-spot.running polygon { animation: spot-live 1.3s ease-in-out infinite; }
-.request-spot[role=button]:hover polygon, .request-spot:focus-visible polygon { fill: var(--spot-hot); stroke: var(--spot-hot); }
+.request-spot[role=button]:hover polygon { fill: var(--spot-hot); stroke: var(--spot-hot); }
+.request-spot:focus-visible polygon { fill: var(--spot-hot); stroke: var(--text); }
 .request-spot:focus-visible { outline: none; }
 .request-mosaic.is-entering .request-spot polygon { animation: fade .5s var(--ease) both; animation-delay: min(calc(var(--i) * 3ms), 600ms); }
 .request-mosaic.is-live .request-spot.pass polygon, .request-mosaic.is-live .request-spot.fail polygon, .request-mosaic.is-live .request-spot.inconclusive polygon { animation: fade .4s var(--ease); }
@@ -723,7 +725,7 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .mosaic-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--text-2); }
 .mosaic-legend span { display: inline-flex; align-items: center; gap: 7px; }
 .mosaic-legend b { font: 600 12px var(--mono); color: var(--text); margin-left: 2px; }
-.legend-dot.pass { --spot: color-mix(in oklab, var(--pass) 55%, var(--surface)); } .legend-dot.inconclusive { --spot: color-mix(in oklab, var(--unknown) 50%, var(--surface)); } .legend-dot.fail { --spot: var(--fail); }
+.legend-dot.pass { --spot: color-mix(in oklab, var(--pass) 82%, var(--bg)); } .legend-dot.inconclusive { --spot: color-mix(in oklab, var(--unknown) 78%, var(--bg)); } .legend-dot.fail { --spot: var(--fail); }
 .legend-dot { width: 8px; height: 8px; border-radius: 2.5px; transform: rotate(45deg); background: var(--spot, var(--s, var(--idle))); }
 .legend-dot.running { --s: var(--live); }
 .legend-dot.idle { --spot: color-mix(in oklab, var(--text) 10%, var(--surface)); }
