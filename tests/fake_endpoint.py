@@ -136,11 +136,20 @@ class FakeEndpoint:
                 calls = [{"id": "call-1", "type": "function", "function": {"name": function, "arguments": arguments}}]
                 if mode=="tool_multiple":
                     calls += [{"id": "call-2", "type": "function", "function": {"name": function, "arguments": arguments}}]
+                text = ""
+                if mode.startswith("tool_content"):
+                    arguments = '{"city":"Warsaw"}'
+                    calls[0]["function"]["arguments"] = arguments
+                    text = "Checking Warsaw. "
+                    if mode != "tool_content_missing":
+                        text += "Request prepared."
+                    if mode == "tool_content_duplicate":
+                        text += "Request prepared."
                 if mode=="tool_missing":
                     self._json(200, {"choices": [{"message": {"content": arguments}, "finish_reason": "stop"}]})
                     return
                 if not payload.get("stream"):
-                    self._json(200, {"model": payload["model"], "choices": [{"message": {"content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
+                    self._json(200, {"model": payload["model"], "choices": [{"message": {"content": text or None, "tool_calls": calls}, "finish_reason": "tool_calls"}]})
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -150,9 +159,11 @@ class FakeEndpoint:
                     data = {"model": payload["model"], "choices": [{"delta": delta, "finish_reason": finish}]}
                     self.wfile.write(("data: "+json.dumps(data)+"\n\n").encode())
                     self.wfile.flush()
+                if text:
+                    event({"content": "Checking Warsaw. "})
                 event({"tool_calls": [dict(index=i, id=c["id"], type="function", function={"name": c["function"]["name"][:4], "arguments": c["function"]["arguments"][:4]}) for i,c in enumerate(calls)]})
                 event({"tool_calls": [{"index": i, "function": {"name": c["function"]["name"][4:], "arguments": c["function"]["arguments"][4:]}} for i,c in enumerate(calls)]})
-                event({}, "tool_calls")
+                event({"content": text.removeprefix("Checking Warsaw. ")} if text else {}, "tool_calls")
                 if mode!="tool_truncated":
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()

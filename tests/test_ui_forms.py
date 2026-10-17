@@ -1365,3 +1365,30 @@ assert.match(renderCancellationResults({{}}),/older report/);
 """
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_tool_profile_serializer_preserves_custom_data_and_invalid_drafts():
+    from tests.test_ux_catalogue import browser_logic
+
+    browser_logic(r"""
+config.tool_checks={fixtures:[{fixture_id:'custom',messages:[{role:'user',content:'ask'}],tools:[{custom:true}],expected_calls:[{name:'call',arguments:{x:1}}],options:{temperature:0}}],modes:['stream','complete']};
+const original=JSON.stringify(config),values=new Map();
+assert.equal(JSON.stringify(configureProfiles(config,values,{})),original);
+values.set('profile_edits_tools','["forced_tool_diagnostic"]');values.set('profile_tools_forced_tool_diagnostic','true');
+const forced=configureProfiles(config,values,{});assert.equal(JSON.stringify(forced.tool_checks),JSON.stringify(config.tool_checks));assert(forced.forced_tool_diagnostic);
+values.set('profile_edits_tools','["modes"]');values.set('profile_tools_modes','complete');
+const complete=configureProfiles(config,values,{});assert.equal(JSON.stringify(complete.tool_checks.fixtures),JSON.stringify(config.tool_checks.fixtures));assert.equal(complete.tool_checks.modes.join(','),'complete');
+values.set('profile_tools_modes','');assert.equal(configureProfiles(config,values,{}).tool_checks.modes,null);
+values.set('profile_edits_tools','["fixtures"]');values.set('profile_tools_fixtures','[{"unfinished"');
+assert.throws(()=>configureProfiles(config,values,{}),/JSON array/);
+const draft=configureProfiles(config,values,{}, {allowInvalid:true});assert.equal(draft.tool_checks.fixtures,'[{"unfinished"');
+assert.throws(()=>configureProfiles(draft,new Map(),{}),/JSON array/);
+for(const raw of ['null','{}','[null]','[[]]','[1]','[true]',JSON.stringify(Array(17).fill({})),' '.repeat(65537)]){
+  values.set('profile_tools_fixtures',raw);assert.throws(()=>configureProfiles(config,values,{}));
+}
+values.set('profile_tools_fixtures','[]');assert.equal(configureProfiles(config,values,{}).tool_checks.fixtures.length,0);
+assert.equal(JSON.stringify(config),original);
+config.tool_calling=true;config.stream=false;
+assert.throws(()=>configureProfiles(config,new Map(),{}),/Enable streaming/);
+config.tool_calling=false;assert.doesNotThrow(()=>configureProfiles(config,new Map(),{}));
+""")
