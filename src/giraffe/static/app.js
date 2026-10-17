@@ -464,10 +464,10 @@ function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder
   return field(name,label,value,{type:'number',hint,help,helpKey,min:valueSchema.minimum ?? (valueSchema.exclusiveMinimum===undefined?undefined:valueSchema.exclusiveMinimum+(valueSchema.type==='integer'?1:.001)),max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
 }
 const checkGroups=[
-  {id:'answers',title:'Answers',checks:['access','serving','correctness','json','context','tools']},
-  {id:'speed',title:'Speed & load',checks:['first_output','generation','capacity','buckets','arrivals']},
-  {id:'reliability',title:'Reliability',checks:['fairness','mixed','recovery','sessions','consistency']},
-  {id:'server',title:'Diagnostics',checks:['cancellation','prefix','gpu']},
+  {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
+  {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','capacity','buckets','arrivals']},
+  {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['fairness','mixed','recovery','sessions','consistency']},
+  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu']},
 ];
 const checkGuide={
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
@@ -603,7 +603,7 @@ function renderCheckSelection(config) {
   <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">All checks</button></div><div class="catalogue-bulk"><button type="button" class="text-button" data-action="select-tests">Select all</button><button type="button" class="text-button" data-action="clear-tests">Clear</button></div></div>
   <p class="sr-only" id="selection-summary" role="status">${config.checks.length} checks selected</p>
   <div id="catalogue-browse-tools" ${state.catalogueFilter==='selected'?'hidden':''}><div class="catalogue-browse-header"><label class="catalogue-search"><span class="sr-only">Find a check</span><input type="search" id="check-search" placeholder="Find a check" value="${escape(state.catalogueSearch || '')}" autocomplete="off"></label><button type="button" class="text-button" data-action="quick-checks">Reset to defaults</button></div><div class="catalogue-categories" aria-label="Check categories"><button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="all" aria-pressed="${!state.catalogueCategory||state.catalogueCategory==='all'}">All categories</button>${checkGroups.map(group=>`<button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="${group.id}" aria-pressed="${state.catalogueCategory===group.id}">${group.title}</button>`).join('')}</div></div>
-  <div id="test-catalogue"><div class="test-cards check-catalogue" id="test-cards">${checkGroups.map(group=>{const chosen=group.checks.filter(id=>config.checks.includes(id)).length;return `<section class="catalogue-group" data-catalogue-group="${group.id}"><div class="catalogue-group-heading"><h3>${group.title}</h3><span class="group-count" data-group-count>${chosen}/${group.checks.length}</span><button type="button" class="text-button group-toggle" data-action="select-group" data-category="${group.id}" data-group-toggle>${chosen===group.checks.length?'Clear':'Select all'}</button></div><div class="catalogue-group-cards">${group.checks.map(id=>renderTestCard(state.bootstrap.checks.find(check=>check.id===id),config)).join('')}</div></section>`;}).join('')}</div><p class="hint catalogue-empty" id="catalogue-empty" role="status" hidden></p></div>
+  <div id="test-catalogue"><div class="test-cards check-catalogue" id="test-cards">${checkGroups.map(group=>{const chosen=group.checks.filter(id=>config.checks.includes(id)).length;return `<section class="catalogue-group${chosen?' has-selection':''}" data-catalogue-group="${group.id}" aria-labelledby="group-${group.id}-title"><div class="catalogue-group-heading"><div class="group-title"><h3 id="group-${group.id}-title">${group.title}</h3><p class="group-blurb">${group.blurb}</p></div><span class="group-count" data-group-count>${chosen} of ${group.checks.length}</span><button type="button" class="text-button group-toggle" data-action="select-group" data-category="${group.id}" data-group-toggle>${chosen===group.checks.length?'Clear':'Select all'}</button></div><div class="catalogue-group-cards">${group.checks.map(id=>renderTestCard(state.bootstrap.checks.find(check=>check.id===id),config)).join('')}</div></section>`;}).join('')}</div><p class="hint catalogue-empty" id="catalogue-empty" role="status" hidden></p></div>
   <p class="hint" id="no-tests-selected" ${config.checks.length?'hidden':''}>Choose at least one check before reviewing the run.</p>
   </div></section>${renderSharedRunSettings(config)}`;
 }
@@ -711,6 +711,7 @@ function renderTestCard(check,config) {
   <p class="hint check-row-warning" data-check-coverage="${check.id}" ${warningsVisible&&checkCoverageWarning(check,config)?'':'hidden'}>${escape(checkCoverageWarning(check,config))}</p>
   <input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}">
   <div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden>
+  <div class="test-editor-head"><span class="eyebrow">${escape(checkGroups.find(group=>group.checks.includes(check.id))?.title || 'Check')}</span><h3 tabindex="-1" data-editor-title>${escape(guide.name)}</h3><button type="button" class="button ghost icon-button" data-close-test="${check.id}" aria-label="Close ${escape(guide.name)} settings"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div>
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
   ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${questionSource}${check.id==='capacity'?renderTrafficEditor(config):''}${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','First metrics URL',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
@@ -763,7 +764,7 @@ function syncTestControls() {
     const card=$(`[data-test-card="${check.id}"]`),selected=$('input[name="check"]',card).checked;
     if(selected)selectedCount++;
     const open=state.openTest===check.id;
-    card.classList.toggle('test-disabled',!selected);card.classList.toggle('is-selected',selected);
+    card.classList.toggle('test-disabled',!selected);card.classList.toggle('is-selected',selected);card.classList.toggle('is-editing',open);
     card.hidden=state.catalogueFilter==='selected'?!selected:(state.catalogueCategory&&state.catalogueCategory!=='all'&&state.catalogueCategory!==card.dataset.category)||Boolean(search&&!(card.dataset.search || '').includes(search));
     if(!card.hidden)visibleCount++;
     const editor=$('[data-test-editor]',card);editor.hidden=!open;
@@ -779,7 +780,7 @@ function syncTestControls() {
     const cards=$$('[data-test-card]',group);group.hidden=cards.every(card=>card.hidden);
     const chosen=cards.filter(card=>card.querySelector?.('input[name="check"]')?.checked).length;
     const count=group.querySelector?.('[data-group-count]'),toggle=group.querySelector?.('[data-group-toggle]');
-    if(count)count.textContent=`${chosen}/${cards.length}`;if(toggle)toggle.textContent=chosen===cards.length?'Clear':'Select all';
+    if(count)count.textContent=`${chosen} of ${cards.length}`;group.classList?.toggle?.('has-selection',chosen>0);if(toggle)toggle.textContent=chosen===cards.length?'Clear':'Select all';
   }
   for(const button of $$('.check-intents [data-category]'))button.setAttribute('aria-pressed',String(state.catalogueFilter==='all'&&button.dataset.category===state.catalogueCategory));
   for(const button of $$('.catalogue-categories [data-category]'))button.setAttribute('aria-pressed',String(button.dataset.category===(state.catalogueCategory || 'all')));
@@ -813,6 +814,7 @@ function toggleTestEditor(id,close=false) {
   if(state.openTest&&!validateProfileDrafts($('#new-run-form'),state.openTest))return;
   state.openTest=close||state.openTest===id?null:id;
   syncTestControls();updateBounds();
+  if(state.openTest&&window.matchMedia?.('(min-width: 1180px)').matches)$(`#settings-${state.openTest} [data-editor-title]`)?.focus?.({preventScroll:true});
   if(close)($(`[data-test-card="${id}"]`).hidden?$('[data-catalogue-filter="all"]'):$(`[data-configure-test="${id}"]`))?.focus();
 }
 function editTestField(input) {
@@ -1093,7 +1095,7 @@ function renderReviewPassCriteria(config) {
     if(timingFields.length&&timingFields.every(name=>limitValue(config,check,name)==null))limits.unshift('Measurement only — no timing target; result is inconclusive');
     return limits.length?`<article><strong>${escape(catalogTitle(id))}</strong><p class="hint">${escape(limits.join(' · '))}</p></article>`:'';
   }).filter(Boolean);
-  return rows.length?`<section class="review-criteria review-section"><div class="review-section-heading"><h3>Pass criteria</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><div class="plan-rows">${rows.join('')}</div></section>`:'';
+  return rows.length?`<section class="review-criteria review-section"><div class="review-section-heading"><h3>Pass criteria</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit criteria</button></div><div class="plan-rows">${rows.join('')}</div></section>`:'';
 }
 function renderReviewLoad(config) {
   if(!config?.checks.includes('capacity')||!config.traffic)return '';
@@ -1108,19 +1110,20 @@ function renderRequestPlan(config=null) {
   syncRunBlueprint(config,plan);
   const start=$('#start-run');if(start)start.disabled=!canStartRun();
   const checkPlan=$('#checks-plan-summary');if(checkPlan){checkPlan.textContent=plan?`${setupPlanCount(plan)}${plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.required_request_limit>plan.request_limit));}
-  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;dock.innerHTML=`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${plan?escape(setupPlanCount(plan)):'Planning…'}`;}
+  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;dock.innerHTML=state.setupStep===3?`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> stops at ${number(config.max_requests)} requests or ${escape(elapsed(config.max_duration_seconds))}`:`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${plan?escape(setupPlanCount(plan)):'Planning…'}`;}
   const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
   const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>`:'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
-    element.innerHTML=`${heading}<p class="hint" role="status">${escape(status)}</p>${limits}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}`;return;
+    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status" role="status">${escape(status)}</p>${limits}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
   }
   const count=setupPlanCount(plan);
   const evaluator=plan.evaluator || {},needed=plan.required_request_limit;
   const raise=Number.isInteger(needed)&&needed>plan.request_limit;
   const evaluatorScope='AI judge calls run separately from the target request budget and send cases and generated answers to each judge.';
   const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>!evaluator.active||warning!==evaluatorScope);
-  element.innerHTML=`${heading}<p class="plan-total" role="status">${escape(count)}</p>${renderFlightPlan(plan)}${limits}${renderReviewLoad(config)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details>${renderReviewPassCriteria(config)}`;
+  const filled=Math.min(100,(plan.planned_total ?? plan.known_total ?? 0)/Math.max(1,plan.request_limit)*100);
+  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total" role="status">${escape(count)}</p><div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>${limits}${renderReviewLoad(config)}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${renderFlightPlan(plan)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?'Adaptive / bounded':`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details></div>${renderReviewPassCriteria(config)}`;
 }
 function scheduleRequestPlan() {
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
@@ -1205,7 +1208,7 @@ function syncSetupStep({focus=false}={}) {
   next.hidden=!json&&(step===3||needsModel);next.innerHTML=json?'Return to setup':`${state.returnToReview?'Return to review':step===2?'Review run':'Choose checks'} ${icon('arrow')}`;
   next.disabled=state.submitting||hasJsonChanges()||(!json&&needsModel);back.hidden=step===1||json;back.disabled=state.submitting||hasJsonChanges();
   $('#start-run').hidden=step!==3||json;$('#start-run').disabled=!canStartRun();
-  const navigationHint=$('#setup-navigation-hint');navigationHint.textContent=step===3?'You can stop the run at any time.':'';navigationHint.hidden=step!==3;
+  const navigationHint=$('#setup-navigation-hint');navigationHint.textContent=step===3?'Press ⌘↵ to launch. You can stop at any time.':'';navigationHint.hidden=step!==3;
   const tools=$('.configuration-tools');if(tools)tools.hidden=step!==3&&!json;
   const runSummary=$('#run-bar-summary');if(runSummary)runSummary.hidden=true;
   $('.new-run-layout')?.classList.toggle('connecting',step===1||json);
@@ -1271,7 +1274,7 @@ function renderRecentEndpoints() {
   for(const run of state.runs || [])for(const target of run.targets || [])if(target.url&&target.model&&!seen.has(`${target.url} ${target.model}`))seen.set(`${target.url} ${target.model}`,{...target,outcome:runOutcome(run)});
   const recent=[...seen.values()].slice(0,3);
   if(!recent.length)return '';
-  return `<div class="recent-endpoints"><span class="recent-endpoints-label">Recent</span>${recent.map(target=>{let host=target.url;try{host=new URL(target.url).host;}catch{}return `<button type="button" data-action="recent-endpoint" data-url="${escape(target.url)}" data-model="${escape(target.model)}" title="${escape(target.url)}"><span class="status-spot ${escape(target.outcome)}" aria-hidden="true"></span><span class="recent-model">${escape(target.model)}</span><span class="recent-host">${escape(host)}</span></button>`;}).join('')}</div>`;
+  return `<div class="start-row recent-endpoints"><span class="start-label">Recent</span><div class="recent-list">${recent.map(target=>{let host=target.url;try{host=new URL(target.url).host;}catch{}return `<button type="button" data-action="recent-endpoint" data-url="${escape(target.url)}" data-model="${escape(target.model)}" title="${escape(target.url)}"><span class="status-spot ${escape(target.outcome)}" aria-hidden="true"></span><span class="recent-model">${escape(target.model)}</span><span class="recent-host">${escape(host)}</span></button>`;}).join('')}</div></div>`;
 }
 function useRecentEndpoint(url,model) {
   try {
@@ -1322,7 +1325,8 @@ function renderModelDiscovery() {
   }
   if(discovery?.status==='needs_model'&&options)options.open=true;
   const connectionOptions=$('#connection-options');if(connectionOptions&&['needs_model','error'].includes(discovery?.status))connectionOptions.open=true;
-  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?'Choose a model':$('#new-run-form').elements.model.value?`Model: ${$('#new-run-form').elements.model.value}`:'Choose the model yourself';
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:discovery?.status==='connected'?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
+  const auth=$('#connection-auth');if(auth&&discovery?.status==='error'&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
   syncSetupStep();
 }
 async function testConnection() {
@@ -1356,7 +1360,7 @@ function renderRunBlueprint(config,plan=null) {
   return `<header class="blueprint-heading"><h2>Run plan</h2></header>
   <p class="blueprint-intro">${escape(plan?setupPlanCount(plan):waiting)}</p>
   <dl class="workload-bounds"><div><dt>Request ceiling</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>
-  <p class="hint workload-help">Upper limits for the whole run, not predictions.</p>
+  <p class="hint workload-help">Upper limits for the whole run, not predictions.</p><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits">Edit limits</button>
   ${traffic.length?`<details class="workload-breakdown"><summary>Request breakdown</summary><div>${traffic.map(row=>`<details data-plan-row="${escape(row.id)}"><summary><strong>${row.requests_per_target==null?'Adaptive':`${row.kind==='estimate'?'~ ':''}${number(row.requests_per_target)}`}</strong> ${escape(row.title)}</summary><p>${escape(row.summary)}</p><small>${escape(row.source)} · ${row.requests_per_target==null?'bounded by your limits':'per endpoint, before run limits'}</small></details>`).join('')}</div></details>`:''}
   ${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}${plan&&plan.required_request_limit>plan.request_limit?'<p class="blueprint-note">The request limit is below the planned workload; some checks may remain incomplete.</p>':''}`;
 }
@@ -1382,12 +1386,12 @@ function renderNew(preset=inferSetupPreset(state.config)) {
 <div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Copy command</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div id="setup-context" class="setup-context" hidden></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
   <section class="setup-step-content" id="setup-panel-1" data-setup-panel="1" aria-label="Connect">
   <div class="connection-layout"><section class="setup-section" id="setup-deployment"><h2 class="sr-only">Connection settings</h2><div class="setup-body"><div class="fields">
-  <div class="endpoint-connect">${field('url','Server address',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}<button type="button" class="button primary" data-action="test-connection">Connect</button></div></div><div class="runtime-shortcuts">${['Ollama','vLLM','SGLang','LM Studio','llama.cpp'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div>${renderRecentEndpoints()}
-  <details class="setup-disclosure connection-options" id="connection-options" ${target.api_key_env?'open':''}><summary>More options · API key, model</summary><div class="details-content">
-  <details class="setup-disclosure connection-auth" ${target.api_key_env?'open':''}><summary>API key (optional)</summary><div class="details-content"><p class="hint">Only needed if your endpoint requires an API key. Open local endpoints can leave this empty.</p>${field('api_key_env','API key variable',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
-  <details class="setup-disclosure model-options" id="model-options"><summary><span id="model-options-label">${target.model?`Model: ${escape(target.model)}`:'Choose the model yourself'}</span></summary><div class="details-content"><p class="hint">Choose a detected model or enter its exact name to skip detection.</p><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model name',target.model || '',{required:true,placeholder:'e.g. llama3.2:3b',hint:''})}</div></div></details>
-  <button type="button" class="text-button" data-action="import-config">Load saved setup</button></div></details>
-  <div class="setup-connection-status" id="model-discovery-status" role="status" aria-live="polite"></div>
+  <div class="endpoint-connect">${field('url','Server address',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}<button type="button" class="button primary" data-action="test-connection">Connect</button></div></div><div class="setup-connection-status" id="model-discovery-status" role="status" aria-live="polite"></div>
+  <div class="start-from"><div class="start-row"><span class="start-label">Quick fill</span><div class="runtime-shortcuts">${['Ollama','vLLM','SGLang','LM Studio','llama.cpp'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div></div>${renderRecentEndpoints()}<div class="start-row"><span class="start-label">Saved setup</span><div><button type="button" class="button small start-file" data-action="import-config"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 13V3.5M6.5 7 10 3.5 13.5 7M4 12.5v3A1.5 1.5 0 0 0 5.5 17h9a1.5 1.5 0 0 0 1.5-1.5v-3"/></svg>Load from file…</button></div></div></div>
+  <div class="connection-details" id="connection-options">
+  <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model || '',{required:true,placeholder:'Found when you connect',hint:''})}</div><p class="hint" id="model-options-label"></p></div></div>
+  <details class="connection-row connection-auth" id="connection-auth" ${target.api_key_env?'open':''}><summary><span class="row-label">API key</span><span class="row-value">${target.api_key_env?`<code>${escape(target.api_key_env)}</code>`:'Not needed for most local servers'}</span><span class="row-action">${target.api_key_env?'Change':'Add'}</span></summary><div class="row-control">${field('api_key_env','API key variable',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
+  </div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
   </div></section></div>
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
@@ -1841,7 +1845,14 @@ document.addEventListener('click',async(event)=>{
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
   const setupStep=event.target.closest('[data-setup-step]');if(setupStep){state.returnToReview=Boolean(setupStep.dataset.reviewEdit);navigateSetup(Number(setupStep.dataset.setupStep));return;}
   const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;renderDetail();$(`#tab-${state.tab}`).focus();return;}
-  const check=event.target.closest('[data-check]');if(check){state.selectedCheck=check.dataset.check;state.checkNavigatorOpen=false;$('#result-content').innerHTML=renderChecks(state.detail.report);const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus();return;}
+  const check=event.target.closest('[data-check]');if(check){
+    // Keep the user's place: the list keeps its scroll, the clicked check stays marked, and the page only moves enough to show its details.
+    const list=$('.check-list'),listScroll=list?.scrollTop || 0;
+    state.selectedCheck=check.dataset.check;state.checkNavigatorOpen=false;$('#result-content').innerHTML=renderChecks(state.detail.report);
+    const nextList=$('.check-list');if(nextList)nextList.scrollTop=listScroll;
+    const detail=$('.check-detail'),top=detail?.getBoundingClientRect?.().top;
+    if(Number.isFinite(top)&&(top<64||top>window.innerHeight*.6))window.scrollTo?.({top:window.scrollY+top-76,behavior:'smooth'});
+    const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});return;}
   const request=event.target.closest('[data-request]');if(request){openRequest(request.dataset.request);return;}
   const action=event.target.closest('[data-action]')?.dataset.action;
   if(action==='inspect-finding'){inspectFinding();return;}
@@ -1858,6 +1869,8 @@ document.addEventListener('click',async(event)=>{
   if(action==='test-connection'){await testConnection();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
   if(configure){toggleTestEditor(configure);return;}
+  const closeTest=event.target.closest('[data-close-test]')?.dataset.closeTest;
+  if(closeTest){toggleTestEditor(closeTest,true);return;}
   const done=event.target.closest('[data-done-test]')?.dataset.doneTest;
   if(done){toggleTestEditor(done,true);return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
@@ -1987,6 +2000,7 @@ document.addEventListener('keydown',event=>{
     items[(current+(event.key==='ArrowDown'?1:-1)+items.length)%items.length]?.focus();return;
   }
   if(document.querySelector('dialog[open]'))return;
+  if(event.key==='Escape'&&state.openTest&&event.target.closest?.('[data-test-editor]')&&!document.querySelector?.(':popover-open')){toggleTestEditor(state.openTest,true);return;}
   const spot=event.target.closest('.request-spot, .swarm-dot');
   if(spot&&['Enter',' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)){
     event.preventDefault();if(event.key==='Enter'||event.key===' '){spot.dispatchEvent(new MouseEvent('click',{bubbles:true}));return;}
