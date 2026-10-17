@@ -401,3 +401,61 @@ hardware, versions and concurrency. Later comments report clean runs after an
 runtime/model/hardware and test the workload on your deployment; the original
 reported concurrency threshold is not a universal trigger. The token evidence
 contract follows the [Chat Completions API](https://developers.openai.com/api/reference/resources/chat).
+
+## Tool-result conversations
+
+`tool_checks.conversations` adds bounded conversations to the tool check. Run
+`giraffe run --config examples/tool-result-conversation.yaml --output runs/tool-results`
+against a running tool-capable endpoint. The example targets local Ollama; edit
+its URL and model for your server. The Tools editor accepts the same fixture JSON,
+and configuration preview, CLI export and rerun preserve it.
+
+Each fixture declares initial `messages`, `tools`, one to four `steps`, and
+`final_content` assertions. A step declares one to sixteen ordered
+`expected_calls`, each with a function `name`, exact `arguments`, an inert JSON
+`result`, and optional `outcome: success` or `error`. Giraffe validates the actual
+call IDs, functions and arguments, appends the actual assistant message, and sends
+each result with that call's actual `tool_call_id`. No tool code runs. Complete
+and streaming responses are separate sessions; streaming calls are reconstructed
+before any result is supplied. Unsupported assistant fields fail
+explicitly rather than silently dropping history.
+
+Include `{{observation_id}}` in a result and a final assertion. Each session gets a
+fresh value that is absent from its initial question. All final assertions must
+match: `exact` compares the entire answer, `contains` checks a literal substring,
+and `normalization: whitespace` optionally ignores whitespace differences. Choose
+assertions strong enough for your task: a substring such as `15` alone does not
+prove a correct temperature. The example additionally checks the conditions and
+fresh observation ID, while allowing prose formatting.
+
+Tools remain available with `tool_choice: auto` on every request. A repeat of a
+successfully supplied operation fails, even if the model changes its call ID or
+JSON key order. Fingerprints include the function and parsed arguments; numeric
+`1` and `1.0` match, but booleans and numbers do not. A different operation is
+allowed only when declared in the next step. A declared error result permits a
+retry. A step's optional `user_message` starts a new question and resets the set
+of satisfied operations; this allows deliberate later reuse of a tool. Calls
+within a step must match the declared order. Unplanned calls fail without being
+supplied results.
+
+Request and duration limits, cancellation, error-stop limits, response-size and
+output limits still apply. Histories also use the configured context ceiling,
+with a serialized UTF-8 byte admission bound for history and tool definitions.
+This is a heuristic because tokenization is endpoint-specific. A timeout, truncated answer, or exhausted budget leaves a
+conversation inconclusive; it never promotes a successful first call to a passed
+conversation. A verified repeat remains a failure even if the response later
+truncates. Protocol/API errors, unexpected calls, and final-answer mismatches have
+separate reasons. A pass establishes the configured bounded conversation, not
+absence of loops on arbitrary tasks.
+
+JSON, standalone HTML and request details include session/turn IDs, actual call
+IDs, operation fingerprints, repetition counts, supplied-result request IDs and
+final-answer checks. Dynamic history, assistant messages, result bodies and
+expanded assertions follow response retention; status and fingerprints remain.
+Fixture configuration remains in reproduction exports, so use synthetic result
+data rather than secrets. Up to sixteen conversations and sixteen single-response
+fixtures share the 64 KiB tool configuration limit. When conversations are set and
+`fixtures` is empty, the built-in weather check is skipped. Legacy forced-choice
+diagnostics apply only to single-response fixtures without explicit choice rules.
+
+The message linkage follows the [OpenAI function-calling conversation contract](https://developers.openai.com/api/docs/guides/function-calling).

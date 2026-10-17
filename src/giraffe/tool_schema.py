@@ -125,3 +125,23 @@ def bounded_tool_schema(schema: dict[str, Any], *, instance: Any = None):
     from giraffe.models import validated_json_schema
 
     return validated_json_schema(schema)
+
+
+def tool_call_fingerprint(name: str, arguments: dict) -> str:
+    import hashlib
+
+    bounded_json_tree(arguments)
+
+    def canonical(value):
+        if isinstance(value, dict):
+            return ["object", [[key, canonical(item)] for key, item in sorted(value.items())]]
+        if isinstance(value, list):
+            return ["array", [canonical(item) for item in value]]
+        if isinstance(value, bool):
+            return ["boolean", value]
+        if isinstance(value, (int, float)):
+            numerator, denominator = value.as_integer_ratio() if isinstance(value, float) else (value, 1)
+            return ["number", str(numerator), str(denominator)]
+        return ["null"] if value is None else ["string", value]
+
+    return hashlib.sha256(json.dumps([name, canonical(arguments)], ensure_ascii=False).encode()).hexdigest()

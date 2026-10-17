@@ -199,6 +199,78 @@ class FakeEndpoint:
                     "finish_reason": "length" if mode == "logprob_length" else "stop",
                     "logprobs": evidence}], "usage": {"prompt_tokens": 32, "completion_tokens": 1}})
 
+            def _conversation(self, payload, mode):
+                messages = payload['messages']
+                results = [m for m in messages if m['role'] == 'tool']
+                initial = not results or messages[-1]['role'] == 'user'
+                retry = bool(results and json.loads(results[-1]['content']).get('error'))
+                calls, text = [], ''
+                if initial or retry or mode in {'conversation_repeat', 'conversation_repeat_truncated', 'conversation_repeat_semantic', 'conversation_repeat_timeout'}:
+                    city = 'Paris' if messages[-1].get('content') == 'Now check Paris.' else 'Warsaw'
+                    if mode == 'conversation_wrong_city':
+                        city = 'Berlin'
+                    arguments = '{broken' if mode == 'conversation_malformed' else json.dumps({'city': city})
+                    if mode == 'conversation_repeat_semantic':
+                        arguments = '{"city":"Warsaw","days":1}' if initial else '{"days":1.0,"city":"Warsaw"}'
+                    calls = [{'id': 'fresh-' + str(len(messages)), 'type': 'function',
+                              'function': {'name': 'get_weather', 'arguments': arguments}}]
+                    if mode == 'conversation_missing_id':
+                        calls[0]['id'] = ''
+                    if 'two cities' in messages[0]['content']:
+                        calls.append({'id': 'second-' + str(len(messages)), 'type': 'function',
+                                      'function': {'name': 'get_weather', 'arguments': '{"city":"Paris"}'}})
+                    if mode == 'conversation_duplicate_id':
+                        calls.append(dict(calls[0]))
+                    text = 'Checking.'
+                    if mode == 'conversation_initial_text':
+                        calls, text = [], '15 sunny invented-observation'
+                    if mode == 'conversation_reasoning':
+                        text = ''
+                else:
+                    result = json.loads(results[-1]['content'])
+                    if mode == 'conversation_wrong_answer':
+                        result['temperature_c'] = 99
+                    if mode == 'conversation_wrong_marker':
+                        result['observation_id'] = 'invented-observation'
+                    text = json.dumps(result)
+                if results and mode == 'conversation_timeout':
+                    time.sleep(0.2)
+                finish = 'length' if results and mode in {'conversation_truncated', 'conversation_repeat_truncated'} else 'tool_calls' if calls else 'stop'
+                extras = {'reasoning_content': 'Need weather.'} if mode == 'conversation_reasoning' else {}
+                if mode == 'conversation_unknown_field':
+                    extras = {'unrecognized_history': 'opaque'}
+                if not payload.get('stream'):
+                    self._json(200, {'choices': [{'message': {'role': 'assistant', 'content': text or None,
+                        'tool_calls': calls, **extras}, 'finish_reason': finish}]})
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                def event(delta, reason=None):
+                    self.wfile.write(('data: ' + json.dumps({'choices': [{'index': 0, 'delta': delta,
+                        'finish_reason': reason}]}) + '\n\n').encode())
+                    self.wfile.flush()
+                event({'role': 'assistant', 'content': '' if text else None})
+                for key, value in extras.items():
+                    event({key: value[:5]})
+                    event({key: value[5:]})
+                event({})
+                event({'content': text[:3] if text else None})
+                if calls:
+                    event({'tool_calls': [{'index': i, 'id': c['id'], 'type': 'function', 'function': {
+                        'name': c['function']['name'][:4], 'arguments': c['function']['arguments'][:3]}}
+                        for i, c in enumerate(calls)]})
+                    event({'tool_calls': [{'index': i, **({'id': 'conflicting-id'} if mode == 'conversation_conflicting_id' else {}),
+                        'function': {'name': c['function']['name'][4:],
+                        'arguments': c['function']['arguments'][3:]}} for i, c in reversed(list(enumerate(calls)))]})
+                    if results and mode == 'conversation_repeat_timeout':
+                        time.sleep(0.2)
+                event({'content': text[3:] if text else None}, finish)
+                if not (results and mode == 'conversation_eof'):
+                    self.wfile.write(b'data: [DONE]\n\n')
+                    self.wfile.flush()
+
             def _tool_choice(self, payload, mode):
                 choice = payload.get("tool_choice")
                 calls, text = [], "Hello."
@@ -244,7 +316,7 @@ class FakeEndpoint:
                     self.wfile.flush()
 
             def _completion(self, payload: dict[str, Any]) -> None:
-                prompt = "\n".join(message["content"] for message in payload["messages"])
+                prompt = "\n".join(message.get("content") or "" for message in payload["messages"])
                 applies = endpoint.fault_contains is None or endpoint.fault_contains in prompt
                 mode = endpoint.mode if applies else "healthy"
                 if mode == "http_error":
@@ -264,6 +336,9 @@ class FakeEndpoint:
                     output += " " * (len(endpoint.requests)%3)
                 if mode == "tool_rejection" and payload.get("tools"):
                     self._json(400, {"error": {"message": "unsupported tools"}})
+                    return
+                if payload.get("tools") and mode.startswith("conversation_"):
+                    self._conversation(payload, mode)
                     return
                 if payload.get("tools") and mode.startswith("tool_choice_"):
                     self._tool_choice(payload, mode)
