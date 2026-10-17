@@ -79,7 +79,10 @@ class Buckets(Model):
     output_tokens: dict[str, int] = Field(default_factory=lambda: {
         "short": 16, "medium": 48, "long": 96})
     levels: list[int] = Field(default_factory=lambda: [1, 2])
-    samples_per_bucket: int = Field(default=4, ge=2, le=100)
+    samples_per_bucket: int = Field(
+        default=4, ge=2, le=100,
+        description="Minimum requests per input/output pair at each level. Each level sends at least one full concurrent batch.",
+    )
     window_seconds: float = Field(default=30, gt=0)
     mixed_pairs: int = Field(default=2, ge=1, le=100)
     heavy_weights: dict[str, int] = Field(default_factory=lambda: {
@@ -575,8 +578,10 @@ class RequestJudgement(Model):
 class RunConfig(Model):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
     targets: list[Target] = Field(min_length=1)
-    concurrency: int = Field(default=4, ge=1, le=256)
-    max_requests: int = Field(default=160, ge=1)
+    concurrency: int = Field(default=4, ge=1, le=256,
+                             description="Maximum simultaneous target requests across the run, chosen by the user; not detected hardware capacity.")
+    max_requests: int = Field(default=160, ge=1,
+                              description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
@@ -694,10 +699,11 @@ class RunConfig(Model):
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
         bucket_selected = bool({"buckets", "mixed"}.intersection(self.checks))
-        for selected, settings in ((bucket_selected, self.buckets),
-                                   ("consistency" in self.checks, self.consistency)):
+        for selected, settings, field in ((bucket_selected, self.buckets, "buckets"),
+                                          ("consistency" in self.checks, self.consistency, "consistency")):
             if selected and settings and max(settings.levels) > self.concurrency:
-                raise ValueError("workload levels must not exceed the global concurrency ceiling")
+                raise ValueError(f"{field}.levels must not exceed concurrency ({self.concurrency}); "
+                                 "raise the maximum in-flight requests or lower the tested levels")
         if "sessions" in self.checks and self.sessions:
             if self.sessions.concurrency > self.concurrency:
                 raise ValueError("session concurrency must not exceed the global ceiling")

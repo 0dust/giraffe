@@ -154,6 +154,8 @@ async def exercise(run, target, client, fixtures) -> None:
         evidence["attempted"] += 1
         probe = {"request_id": record.id, "server_request_id": record.server_request_id,
                  "status": "inconclusive", "reason": "Generation was not observably cancelled after answer chunks."}
+        if record.status in {"failed", "timeout"}:
+            probe.update(status="fail", reason="Generation failed before cancellation could be verified.")
         evidence["probes"].append(probe)
         followup = None
         if control:

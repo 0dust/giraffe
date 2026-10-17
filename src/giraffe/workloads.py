@@ -217,6 +217,7 @@ async def buckets(run, target, client):
     settings = run.config.buckets
     if "buckets" in run.config.checks:
         for level in settings.levels:
+            samples = max(settings.samples_per_bucket, level)
             for input_shape in ("short", "medium", "long"):
                 for output_shape in ("short", "medium", "long"):
                     scenario = f"bucket_c{level}_{input_shape}_{output_shape}"
@@ -226,24 +227,24 @@ async def buckets(run, target, client):
                     end = min(run.deadline, time.monotonic() + settings.window_seconds)
                     count = 0
                     while (
-                        count < settings.samples_per_bucket
+                        count < samples
                         and time.monotonic() < end
                         and run.allowed(target.name)
                     ):
-                        batch = min(level, settings.samples_per_bucket - count)
+                        batch = min(level, samples - count)
                         results = await asyncio.gather(
                             *(
                                 run.request(
                                     target,
                                     client,
                                     request,
-                                    timeout_override=max(0.001, end - time.monotonic()),
+                                    deadline_override=end,
                                 )
                                 for _ in range(batch)
                             )
                         )
                         count += sum(r is not None for r in results)
-                    if count < settings.samples_per_bucket:
+                    if count < samples:
                         run.unfinished[target.name].add("buckets")
     if "mixed" not in run.config.checks:
         return
@@ -573,7 +574,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 )
                 entry["input_length_verified"] = sum(r.input_tokens is not None for r in items)
                 gaps = []
-                if len(items) < run.config.buckets.samples_per_bucket or entry["completed"] < minimum:
+                entry["expected_samples"] = max(run.config.buckets.samples_per_bucket, level)
+                if len(items) < entry["expected_samples"] or entry["completed"] < minimum:
                     gaps.append("Insufficient requested or successful samples.")
                 if entry["achieved_overlap"] < level:
                     gaps.append("Requested concurrency was not observed.")

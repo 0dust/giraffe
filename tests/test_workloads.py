@@ -444,6 +444,22 @@ async def test_strict_consistency_and_insufficient_samples_are_explicit():
     assert check(short, "consistency").status == "inconclusive"
 
 
+@pytest.mark.parametrize("budget", [5, 72])
+async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_budget(budget):
+    with FakeEndpoint(first_token_delay=0.02) as endpoint:
+        report = await run_suite(config(
+            endpoint, checks=["buckets"], concurrency=8, max_requests=budget,
+            buckets={"levels": [8], "samples_per_bucket": 2},
+        ))
+    assert len(report.requests) == budget
+    cells = check(report, "buckets").metrics["buckets"]
+    assert max(cell["achieved_overlap"] for cell in cells.values()) == min(8, budget)
+    if budget == 72:
+        assert len(cells) == 9
+        assert all(cell["attempted"] == cell["expected_samples"] == 8 for cell in cells.values())
+        assert all(cell["achieved_overlap"] == 8 for cell in cells.values())
+
+
 async def test_buckets_keep_shape_overlap_lengths_and_eos_coverage_separate():
     with FakeEndpoint(first_token_delay=0.02, chunk_delay=0.015) as endpoint:
         report = await run_suite(

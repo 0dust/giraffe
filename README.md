@@ -74,8 +74,9 @@ Inspect the failed responses before treating the result as a vLLM server fault.
 
 ## Run and compare
 
-Open **http://127.0.0.1:8765**, select **New run**, review the settings, and select
-**Run suite**. The web interface uses the same runner and scores as the CLI. It lets
+Open **http://127.0.0.1:8765** and select **New run**. Follow **Connect → Choose
+checks → Review & run**, then select **Start run**. The web interface uses the same
+runner and scores as the CLI. It lets
 you follow live activity, stop and keep partial results, inspect failed checks and
 individual responses, save a named baseline, and compare a later run. Existing
 CLI reports in `runs/` appear in the history. A finished run can still fail its
@@ -83,16 +84,44 @@ acceptance checks; those are displayed separately.
 
 `giraffe ui` starts on loopback only and never starts inference automatically.
 Use `--port 8766` to select another port or `--runs-dir /path/to/runs` for another
-report directory. The optional `--config` prefills the form. **Form** and **JSON** at
-the top of **New run** are two views of the same configuration. The JSON view
+report directory. Paste your endpoint in **Connect** and select **Test connection**.
+Giraffe discovers available models and selects one automatically if only one is
+listed. If several are available, choose one; if listing is unsupported, enter its
+name. An explicitly entered model skips discovery. The test sends at most one
+short completion (32 output tokens, 15 seconds total), separately from a full run.
+It checks that a usable reply returns, not answer accuracy or load capacity. No run
+report is created. Editing the endpoint, model or authentication clears that result.
+You can continue with a manually specified model without a successful probe.
+
+**API key (optional)** accepts the name of an environment variable on the machine
+running Giraffe, not the secret key. Open local endpoints need no key. The connection
+API also honors configured header variables, TLS trust and proxy settings.
+`POST /api/targets/test-connection` accepts `url`, optional `model`, `api_key_env`,
+`headers_env`, `ca_bundle`, `proxy` and `request_options`; it returns `connected`
+or `needs_model`. `POST /api/targets/models` remains a metadata-only lookup.
+
+**Choose checks** opens on your selected checks. Use **Add checks** to search
+the full catalog by purpose. The initial selection is endpoint response and
+answer correctness. Each check has an **i**
+button for details and a **Settings** button for its controls. Load settings belong to their load
+check; answer checks and rate tests can use your own questions. Shared request
+and time limits apply across the run. The final review shows planned requests,
+stopping limits and separate evaluator calls before you start. Plans update as
+you edit; adaptive tests are labeled as bounded and built-in random arrival counts
+as estimates. Increasing the total request limit always requires an explicit
+action. **Start run** becomes available only after the current request plan is ready.
+
+The optional `--config` prefills the form and preserves the supplied test selection.
+In **Review & run**, expand **Save this setup or use advanced options** to save
+a setup, copy a terminal command, or open the **Advanced editor**. Its JSON view
 supports the same multi-model/replica settings as the CLI. **Apply changes** validates
 JSON before updating the form; unapplied edits are retained and must be applied or
-discarded before running, exporting, or copying a command. **Import config** loads
-a local JSON file, and **Export config** downloads the current configuration draft.
+discarded before running, exporting, or copying a command. **Load saved setup** loads
+a local JSON file, and **Save setup to file** downloads the current configuration draft.
 Applying, importing, and exporting allow blank models and no tests selected while
 you are setting up a run. Running and copying a CLI command require a model for
 every target and at least one selected test.
-**Copy CLI command** carries the configuration and selected baseline into a command
+**Copy terminal command** carries the configuration and selected baseline into a command
 you can run from a terminal. It does not start traffic. All UI assets are bundled
 locally, with no CDN or frontend build step. Closing the browser does not stop a run;
 use **Stop run**. One run is active at a time to avoid competing benchmark traffic.
@@ -237,8 +266,9 @@ environment-variable names. HTTPX honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PR
 `ca_bundle` supplies a private CA file. Nothing disables TLS verification.
 
 `--nonstream` exercises nonstreaming Chat Completions. `--checks serving,correctness`
-runs a selected subset. The UI exposes every check with a selection checkbox and
-**Configure** action. Settings start collapsed, including saved custom settings.
+runs a selected subset. **Add checks** in the UI exposes all 19 checks
+with a selection checkbox and **Settings** action. Specialist settings stay in
+advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one
 editor is open at a time. Defaults inherit the run configuration;
 custom settings change only the selected test. Deselecting a test does not run its
@@ -514,6 +544,9 @@ The local HTTP API provides the same configuration and runner contracts:
 | `GET /api/capabilities` | Supported tests, defaults and full configuration schema |
 | `POST /api/config/validate` | Validate and normalize a run configuration without traffic |
 | `POST /api/config/draft` | Normalize an editable draft, allowing blank models and no selected tests; never starts traffic |
+| `POST /api/targets/test-connection` | Discover or choose a model and send one bounded completion without saving a run |
+| `POST /api/targets/models` | List advertised model IDs without inference |
+| `POST /api/config/preview` | Preview the selected tests, request counts, sources and evaluator calls without sending traffic |
 | `POST /api/runs` | Start a run with `config`, optional `baseline_id`, and explicit execution mode |
 | `GET /api/runs/{id}` | Inspect state, progress and the completed report |
 | `POST /api/runs/{id}/cancel` | Stop traffic and retain partial results |

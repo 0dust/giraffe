@@ -65,6 +65,45 @@ def test_legacy_cancellation_grading_cannot_claim_a_server_stop_regression(verif
     assert any("Cancellation verdict definitions differ" in reason for reason in reasons) == (verification == "required")
 
 
+@pytest.mark.parametrize("change,expected", [
+    ("legacy", "pass"), ("inactive", "pass"), ("samples", "inconclusive"),
+    ("enabled", "inconclusive"), ("required_cleanup", "inconclusive"),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cancellation_baselines_ignore_only_inactive_backend_settings(change, expected, reverse):
+    current, previous = make_report(), make_report("baseline")
+    for report in (current, previous):
+        config = RunConfig.model_validate(report.manifest["config"])
+        report.manifest["effective_checks"] = {
+            name: config.effective_check(name) for name in config.checks
+        }
+    settings = previous.manifest["effective_checks"]["cancellation"]
+    if change == "legacy":
+        previous.manifest["effective_checks"]["cancellation"] = {
+            name: value for name, value in settings.items()
+            if name in {"samples", "cancel_after_ms", "deadline_probe_ms", "limits"}
+        }
+    elif change == "inactive":
+        settings.update(trace_file="/another/trace", server_log="/another/log",
+                        cancel_after_chunks=10, cleanup_seconds=1, trace_wait_seconds=2)
+    elif change == "samples":
+        settings["samples"] += 1
+    elif change == "enabled":
+        settings["backend_verification"] = "required"
+    else:
+        for report in (current, previous):
+            report.manifest["effective_checks"]["cancellation"]["backend_verification"] = "required"
+        settings["cleanup_seconds"] += 1
+    if reverse:
+        current, previous = previous, current
+    before = [report.model_dump_json() for report in (current, previous)]
+    result = compare_baseline(current, previous)
+    assert baseline_check(result).status == expected
+    reasons = result.baseline["targets"][0]["reasons"]
+    assert ("Recorded effective_checks differs or is missing." in reasons) == (expected == "inconclusive")
+    assert [report.model_dump_json() for report in (current, previous)] == before
+
+
 def test_generation_rate_comparison_does_not_confuse_longer_prefill_with_slower_decoding():
     current, previous = make_report(), make_report("baseline")
     for record in current.requests:

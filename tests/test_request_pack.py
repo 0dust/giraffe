@@ -281,3 +281,51 @@ def test_judge_preview_is_read_only_draft_readiness_and_panel_bounds(monkeypatch
     assert preview["planned_call_upper_bound"] == 20
     assert preview["quota_call_upper_bound"] == 6
     assert preview["ready"]
+
+
+@pytest.mark.parametrize("arrival", ["steady", "poisson"])
+@pytest.mark.parametrize("checks", [["capacity", "correctness"], ["correctness"], ["buckets"]])
+@pytest.mark.parametrize("ready", [True, False])
+def test_pack_summary_matches_full_preview_counts_and_evaluator_bounds(arrival, checks, ready):
+    from giraffe.request_pack import case_counts, pack_summary
+    from giraffe.traffic import arrival_schedule
+
+    configured = config([case("judged", scorer="judge", weight=3, max_tokens=128),
+                         case("exact", weight=1, max_tokens=16)],
+                        judging=judge_config(), traffic={"rates": [1.5, 3], "duration_seconds": 2,
+                                                       "arrival": arrival},
+                        max_requests=3, max_output_tokens=32, stream=False)
+    configured = ConfigDraft.model_validate(configured.model_dump() | {
+        "checks": checks,
+        "targets": [{"name": name, "url": "http://localhost/v1", "model": ""} for name in ("a", "b")],
+        "judging": {"judges": [{"name": name, "url": "http://localhost/v1" if ready else "",
+                                 "model": "judge" if ready else ""} for name in ("one", "two")]},
+    })
+    preview = pack_preview(configured)
+    summary = pack_summary(configured)
+    expected = {key: preview[key] for key in summary}
+    expected["stages"] = [{key: value for key, value in stage.items() if key != "schedule_hash"}
+                          for stage in preview["stages"]]
+    expected["judging"] = {key: value for key, value in preview["judging"].items() if key != "identity"}
+    assert summary == expected
+    assert summary["request_cap"] == 3
+    assert summary["per_target_request_quota"] == {"a": 2, "b": 1}
+
+    active = bool({"correctness", "capacity"}.intersection(checks))
+    staged_judged = 0
+    if "capacity" in checks:
+        for index, stage in enumerate(summary["stages"]):
+            schedule, truncated = arrival_schedule(configured.effective_traffic(), stage["rate_rps"], index)
+            assert stage["planned"] == len(schedule)
+            assert stage["truncated"] == truncated
+            assert stage["counts"] == case_counts(configured, len(schedule))
+            staged_judged += stage["counts"]["judged"]
+    else:
+        assert summary["stages"] == []
+    judged = int(active) + staged_judged
+    if active:
+        assert {item["fixture_id"]: item["effective"]["max_tokens"] for item in preview["cases"]} == {
+            "exact": 16, "judged": 32}
+    assert summary["judging"]["planned_call_upper_bound"] == judged * 2 * (2 if active else 0)
+    assert summary["judging"]["quota_call_upper_bound"] == (min(judged, 2) + min(judged, 1)) * (2 if active else 0)
+    assert summary["judging"]["ready"] == (ready or not active)

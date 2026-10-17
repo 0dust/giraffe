@@ -95,6 +95,16 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
     def effective_value(manifest, key):
         value = manifest.get(key)
+        if key == "effective_checks" and isinstance(value, dict):
+            cancellation = value.get("cancellation")
+            if isinstance(cancellation, dict) and cancellation.get("backend_verification", "off") == "off":
+                # Legacy reports omit these fields; none affect traffic while
+                # backend verification is off. Keep executed settings strict.
+                inactive = {"backend_verification", "trace_file", "server_log",
+                            "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"}
+                value = {**value, "cancellation": {
+                    name: setting for name, setting in cancellation.items() if name not in inactive
+                }}
         if key == "effective_traffic" and all(pack_modes) and isinstance(value, dict):
             return {name: setting for name, setting in value.items()
                     if name not in {"mix", "long_input_chars", "long_output_words"}}

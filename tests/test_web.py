@@ -65,7 +65,8 @@ async def test_pack_preview_matches_cli_and_preserves_blank_model_draft(tmp_path
             assert (await client.post(endpoint, json={"config": normalized})).status_code == 422
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
         assert main(["preview", "--config", "-"]) == 0
-        assert json.loads(capsys.readouterr().out) == response.json()
+        assert json.loads(capsys.readouterr().out) == {
+            key: value for key, value in response.json().items() if key != "request_plan"}
         assert (await client.get("/api/runs")).json()["runs"] == []
 
 
@@ -173,10 +174,38 @@ async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
             assert set(check["limit_fields"]) <= result["limits_schema"]["properties"].keys()
         assert result["traffic_schema"]["properties"]["arrival"]["enum"] == ["steady", "poisson"]
         assert result["config"]["traffic"]["rates"] == [1, 2, 4]
-        assert set(result["config"]["checks"]) == {
-            "access", "serving", "first_output", "generation", "capacity", "fairness", "context",
-            "correctness", "cancellation", "recovery",
-        }
+        assert result["config"]["checks"] == ["access", "correctness"]
+
+
+async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkeypatch):
+    from giraffe.request_pack import pack_preview
+
+    monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Setup sent traffic"))
+    async with browser(tmp_path) as client:
+        bootstrap = (await client.get("/api/bootstrap")).json()
+        assert bootstrap["request_plan"]["planned_per_target"] == 7
+        values = config(checks=["access", "correctness"])
+        for endpoint in ("draft", "validate", "preview"):
+            response = await client.post(f"/api/config/{endpoint}", json=values)
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert result["config"] == values
+            assert result["request_plan"] == bootstrap["request_plan"]
+            if endpoint == "preview":
+                assert result["request_pack_preview"] == pack_preview(RunConfig.model_validate(values))
+        values["targets"][0]["model"] = ""
+        values["checks"] = []
+        draft = (await client.post("/api/config/draft", json=values)).json()
+        assert draft["config"]["checks"] == []
+        assert draft["request_plan"]["planned_total"] == 0
+
+
+async def test_launcher_defaults_preserve_explicit_checks(tmp_path):
+    values = config(checks=["access", "generation", "capacity"])
+    async with browser(tmp_path, defaults=values) as client:
+        result = (await client.get("/api/bootstrap")).json()
+        assert result["config"]["checks"] == values["checks"]
+        assert result["request_plan"]["planned_per_target"] == 42
 
 
 async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_path, monkeypatch):
@@ -654,3 +683,32 @@ async def test_real_api_to_runner_to_http_endpoint(tmp_path):
             assert {check["id"] for check in detail["report"]["checks"]
                     if check["status"] != "skipped"} == {
                 "access", "serving", "correctness"}
+
+
+async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_path, monkeypatch):
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "scenario_started", "target": "local", "scenario": "warm",
+                  "elapsed_seconds": 0})
+        for slot in range(120):
+            progress({"event": "request_started", "request_slot": slot, "target": "local",
+                      "scenario": "warm", "fixture_id": f"fixture-{slot}"})
+        for slot in reversed(range(120)):
+            progress({"event": "request_completed", "request_slot": slot,
+                      "request": {"id": f"request-{slot}", "status": "completed", "score": None}})
+        progress({"event": "scenario_finished", "target": "local", "scenario": "warm",
+                  "elapsed_seconds": 12})
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr("giraffe.web.run_suite", waiting)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        await asyncio.sleep(0)
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        assert len(detail["events"]) == 100
+        assert len(detail["live_requests"]) == 120
+        assert [r["slot"] for r in detail["live_requests"]] == list(range(120))
+        assert detail["live_requests"][0]["id"] == "request-0"
+        assert [p["event"] for p in detail["phases"]] == ["scenario_started", "scenario_finished"]
+        await client.post(f"/api/runs/{identifier}/cancel", json={})
+        await finished(client, identifier)

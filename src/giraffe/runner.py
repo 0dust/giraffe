@@ -148,6 +148,7 @@ class _Run:
         if self.progress:
             self.progress({"event": event, "target": target, "scenario": scenario,
                            "completed": len(self.records), "attempted": self.attempted,
+                           "budget_used": self.budget_used,
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
@@ -185,30 +186,40 @@ class _Run:
         self.slots.put_nowait(None)
 
     @asynccontextmanager
-    async def slot(self, reserved: bool):
+    async def slot(self, reserved: bool, deadline: float | None = None):
         if not reserved:
-            await self.slots.get()
+            if deadline is None:
+                await self.slots.get()
+            else:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await self.slots.get()
+                except TimeoutError:
+                    yield False
+                    return
         try:
-            yield
+            yield True
         finally:
             if not reserved:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None):
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
-        async with self.slot(slot_reserved):
+        async with self.slot(slot_reserved, deadline_override) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
-            stopped = self.stop.is_set() or time.monotonic() >= self.deadline or (
+            stopped = not admitted or self.stop.is_set() or time.monotonic() >= min(
+                self.deadline, deadline_override if deadline_override is not None else self.deadline) or (
                 self.errors >= self.config.stop_after_errors)
             if stopped or (not budget_reserved and not self.reserve_offer(target.name)):
                 self.unfinished[target.name].update(spec.check_ids)
                 return None
             self.attempted += 1
+            request_slot = self.attempted - 1
             self.counts[target.name] += 1
             key = (target.name, spec.scenario)
             self.active[key] += 1
@@ -222,8 +233,12 @@ class _Run:
                     item["peak"] = max(item["peak"], concurrent)
             if on_start:
                 on_start()
-            self.emit("request_started", target.name, spec.scenario)
+            self.emit("request_started", target.name, spec.scenario,
+                      request_slot=request_slot, fixture_id=spec.fixture_id)
             try:
+                if deadline_override is not None:
+                    timeout_override = min(timeout_override or self.config.request_timeout_seconds,
+                                           deadline_override - time.monotonic())
                 remaining = self.deadline - time.monotonic()
                 request_timeout = min(self.config.request_timeout_seconds,
                                       spec.request_timeout_seconds or self.config.request_timeout_seconds)
@@ -278,7 +293,12 @@ class _Run:
                 timeout_override is not None and record.status == "timeout")
             if not intentional and record.status != "cancelled" and (record.status != "completed" or not record.valid):
                 self.errors += 1
-            self.emit("request_completed", target.name, spec.scenario, status=record.status)
+            # Live visualization gets measurements only, never retained response bodies.
+            self.emit("request_completed", target.name, spec.scenario, status=record.status,
+                      request_slot=request_slot, request=record.model_dump(mode="json", include={
+                          "id", "target", "fixture_id", "scenario", "status", "valid", "score",
+                          "elapsed_ms", "first_output_ms", "check_ids",
+                      }), intentional=intentional)
             return record
 
     async def group(self, target, client, specs, scenario, count=None, concurrency=1, checks=()):
