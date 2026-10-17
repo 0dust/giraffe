@@ -1162,3 +1162,10 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 #request-dialog .statline { padding: 12px 14px; border-radius: var(--r); background: var(--bg-elev); border: 1px solid var(--line); }
 #request-dialog .dialog-body > .hint { color: var(--text-2); }
 #request-dialog .request-timing, #request-dialog .request-reasoning { margin-top: 4px; }
+
+/* Saved-baseline status on results */
+.baseline-saved { display: flex; align-items: center; gap: 8px; margin: 0; padding: 8px 12px; border-radius: var(--r-sm); border: 1px solid color-mix(in oklab, var(--pass) 35%, transparent); background: color-mix(in oklab, var(--pass) 9%, var(--surface)); color: var(--text); font-size: 13px; max-width: 100%; }
+.baseline-saved span { color: var(--pass); font-weight: 700; }
+.baseline-saved strong { font-family: var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#setup-review .review-compare { border-top: 1px solid var(--line); }
+#setup-review .review-compare .review-baseline { color: var(--text); font-size: 14px; margin-top: 0; }
