@@ -531,8 +531,69 @@ class ToolFixture(ToolExpectation):
         return self
 
 
+class ToolResultCall(ExpectedToolCall):
+    arguments: dict[str, Any]
+    result: Any
+    outcome: Literal["success", "error"] = "success"
+
+    @model_validator(mode="after")
+    def bounded_result(self):
+        from giraffe.tool_schema import bounded_json_tree
+        if finite_tool_json(self.result) > 65536:
+            raise ValueError("tool result must not exceed 64 KiB")
+        bounded_json_tree(self.result)
+        return self
+
+
+class ToolConversationStep(ToolContractModel):
+    expected_calls: list[ToolResultCall] = Field(min_length=1, max_length=16)
+    user_message: str | None = Field(default=None, min_length=1, max_length=16384)
+
+
+class ToolConversationFixture(ToolContractModel):
+    fixture_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    messages: list[RequestPackMessage] = Field(min_length=1, max_length=64)
+    tools: list[dict[str, Any]] = Field(min_length=1, max_length=16)
+    steps: list[ToolConversationStep] = Field(min_length=1, max_length=4)
+    final_content: list[ToolContentExpectation] = Field(min_length=1, max_length=16)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_conversation(self):
+        from giraffe.tool_schema import tool_call_fingerprint
+        satisfied = set()
+        for step in self.steps:
+            ToolExpectation(tools=self.tools, expected_calls=[
+                ExpectedToolCall(name=call.name, arguments=call.arguments) for call in step.expected_calls])
+            if step.user_message is not None:
+                if not step.user_message.strip():
+                    raise ValueError("conversation user_message must contain text")
+                satisfied = set()
+            for call in step.expected_calls:
+                fingerprint = tool_call_fingerprint(call.name, call.arguments)
+                if fingerprint in satisfied:
+                    raise ValueError("a successful operation cannot repeat without a new user_message")
+                if call.outcome == "success":
+                    satisfied.add(fingerprint)
+        if {"tools", "tool_choice", "parallel_tool_calls"}.intersection(self.options):
+            raise ValueError("conversation options cannot override tool selection")
+        finite_tool_json(self.options)
+        validate_pack_options(self.options)
+        marker = "{{observation_id}}"
+        if not any(marker in json.dumps(call.result) for step in self.steps for call in step.expected_calls):
+            raise ValueError("a conversation result must include {{observation_id}}")
+        if not any(marker in item.value for item in self.final_content):
+            raise ValueError("final_content must check {{observation_id}} from the result")
+        if marker in json.dumps([m.model_dump() for m in self.messages]) or any(
+                marker in (step.user_message or "") or marker in json.dumps(call.arguments)
+                for step in self.steps for call in step.expected_calls):
+            raise ValueError("observation marker is only allowed in results and final_content")
+        return self
+
+
 class ToolChecks(ToolContractModel):
     fixtures: list[ToolFixture] = Field(default_factory=list, max_length=16)
+    conversations: list[ToolConversationFixture] = Field(default_factory=list, max_length=16)
     modes: list[Literal["complete", "stream"]] | None = Field(default=None, min_length=1, max_length=2)
 
     @model_validator(mode="before")
@@ -543,6 +604,9 @@ class ToolChecks(ToolContractModel):
             if isinstance(values.get("fixtures"), list):
                 values["fixtures"] = [item.model_dump(mode="python") if isinstance(item, ToolFixture) else item
                                       for item in values["fixtures"]]
+            if isinstance(values.get("conversations"), list):
+                values["conversations"] = [item.model_dump(mode="python") if isinstance(item, ToolConversationFixture) else item
+                                           for item in values["conversations"]]
             if finite_tool_json(values) > 65536:
                 raise ValueError("tool_checks must not exceed 64 KiB")
         return value
@@ -551,7 +615,7 @@ class ToolChecks(ToolContractModel):
     def validate_checks(self):
         if finite_tool_json(self.model_dump(mode="python")) > 65536:
             raise ValueError("tool_checks must not exceed 64 KiB")
-        ids = [fixture.fixture_id for fixture in self.fixtures]
+        ids = [fixture.fixture_id for fixture in [*self.fixtures, *self.conversations]]
         if len(ids) != len(set(ids)):
             raise ValueError("tool fixture IDs must be unique")
         if self.modes is not None and len(self.modes) != len(set(self.modes)):
@@ -997,6 +1061,8 @@ class RequestRecord(Model):
     evaluation_error: str | None = None
     tool_evaluation: ToolEvaluation | None = None
     tool_request_options: dict[str, Any] | None = None
+    assistant_message: dict[str, Any] | None = None
+    tool_conversation: dict[str, Any] | None = None
     response_events: list[dict[str, Any]] = Field(default_factory=list)
     response_events_truncated: bool = False
     judgement: RequestJudgement | None = None

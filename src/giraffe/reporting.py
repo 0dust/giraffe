@@ -553,6 +553,13 @@ def _retained(report: RunReport) -> RunReport:
             record.output = ""
             record.reasoning = ""
             record.tool_calls = []
+            record.assistant_message = None
+            if record.tool_conversation:
+                record.tool_conversation["final_content"] = None
+                for call in record.tool_conversation["calls"]:
+                    call["result"] = None
+                if record.evaluation:
+                    record.evaluation.messages = []
             if record.judgement:
                 for vote in record.judgement.votes:
                     vote.reason = None
@@ -572,6 +579,9 @@ def _tool_evidence(record: RequestRecord) -> str:
     if expectation is None and record.tool_evaluation is None:
         return ""
     parts = []
+    if record.tool_conversation:
+        parts.append('<h3>Tool-result conversation</h3>'
+                     f'<pre>{_json(record.tool_conversation)}</pre>')
     if expectation is not None:
         parts.append('<h3>Tool-call expectations</h3>'
                      '<p>Expected calls are checked in order, including their count.</p>'

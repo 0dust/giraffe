@@ -24,6 +24,8 @@ def default_tool_fixture() -> ToolFixture:
 def resolved_tool_fixtures(config: RunConfig) -> list[ToolFixture]:
     if config.tool_checks and config.tool_checks.fixtures:
         return config.tool_checks.fixtures
+    if config.tool_checks and config.tool_checks.conversations:
+        return []
     return [default_tool_fixture()]
 
 

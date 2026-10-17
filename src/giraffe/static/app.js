@@ -1,4 +1,4 @@
-import {inferSetupPreset, bucketCoveragePlan, configureBuckets, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureProfiles, parseToolFixtures, effectiveProfileDefaults, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261015-ux4';
+import {inferSetupPreset, bucketCoveragePlan, configureBuckets, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureProfiles, parseToolFixtures, effectiveProfileDefaults, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261017-conversations1';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -523,7 +523,8 @@ function renderProfileEditor(check,config) {
     const modes=[['','Run default'],['complete','Complete responses'],['stream','Streaming responses'],['complete,stream','Complete and streaming']];
     if(!modes.some(([value])=>value===selected))modes.push([selected,'Saved selection']);
     const fixtures=typeof profile.fixtures==='string'?profile.fixtures:JSON.stringify(profile.fixtures || [],null,2);
-    return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_modes','Response modes',modes.map(([value,label])=>`<option value="${escape(value)}" ${value===selected?'selected':''}>${label}</option>`).join(''),{hint:'Run default tests both modes when streaming is enabled, otherwise complete responses. Explicit streaming requires streaming in Run limits.'})}${selectField('profile_tools_forced_tool_diagnostic','Force tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Applies to fixtures without an explicit choice rule. Giraffe never executes tools.'})}${textField('profile_tools_fixtures','Tool fixtures (JSON)',fixtures,{rows:10,maxLength:65536,hint:'Use [] for the built-in weather check, or up to 16 fixture objects with fixture_id, messages, tools, expected_calls (task assertions) or choice (mode: none, auto, required, named; named also needs name), and optional expected_content. choice.support is required or discover; max_calls defaults to 16; parallel_tool_calls is optional. Exact content checks the combined assistant text. The server validates fixture schemas and the 64 KiB configuration limit.'})}</div>`;
+    const conversations=typeof profile.conversations==='string'?profile.conversations:JSON.stringify(profile.conversations || [],null,2);
+    return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_modes','Response modes',modes.map(([value,label])=>`<option value="${escape(value)}" ${value===selected?'selected':''}>${label}</option>`).join(''),{hint:'Run default tests both modes when streaming is enabled, otherwise complete responses. Explicit streaming requires streaming in Run limits.'})}${selectField('profile_tools_forced_tool_diagnostic','Force tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Applies to fixtures without an explicit choice rule. Giraffe never executes tools.'})}${textField('profile_tools_fixtures','Tool fixtures (JSON)',fixtures,{rows:10,maxLength:65536,hint:'Use [] for the built-in weather check, or up to 16 fixture objects with fixture_id, messages, tools, expected_calls (task assertions) or choice (mode: none, auto, required, named; named also needs name), and optional expected_content. choice.support is required or discover; max_calls defaults to 16; parallel_tool_calls is optional. Exact content checks the combined assistant text. The server validates fixture schemas and the 64 KiB configuration limit.'})}${textField('profile_tools_conversations','Tool-result conversations (JSON)',conversations,{rows:10,maxLength:65536,hint:'Optional bounded conversations: fixture_id, messages, tools, steps, final_content. Each step declares expected_calls with name, arguments, result and optional outcome (success or error). Put {{observation_id}} in a result and a final_content check. Up to 4 steps; all final checks must pass. Tools stay available to detect repeated operations. With conversations configured, an empty fixture list skips the built-in check.'})}</div>`;
   }
   if(key==='mixed'){
     const settings=config.buckets || bucketFormDefaults(config);
@@ -574,12 +575,13 @@ function effectiveCheckSummary(check,config) {
   else if(check.id==='buckets')parts.push(`${(config.buckets || bucketFormDefaults(config)).levels.join(', ')} requests at a time`,'9 size combinations per level');
   else if(check.id==='gpu')parts.push(config.targets[0].metrics_url?'Metrics URL configured':'Metrics URL needed');
   else if(check.id==='tools'){
-    const fixtures=config.tool_checks?.fixtures;
-    parts.push(typeof fixtures==='string'?'Invalid tool fixture draft':Array.isArray(fixtures)&&fixtures.length?`${fixtures.length} tool ${fixtures.length===1?'fixture':'fixtures'}`:'Built-in weather check');
+    const fixtures=config.tool_checks?.fixtures,conversations=config.tool_checks?.conversations;
+    parts.push(typeof fixtures==='string'?'Invalid tool fixture draft':Array.isArray(fixtures)&&fixtures.length?`${fixtures.length} tool ${fixtures.length===1?'fixture':'fixtures'}`:conversations?.length?'No single-response fixtures':'Built-in weather check');
+    if(conversations?.length)parts.push(typeof conversations==='string'?'Invalid conversation draft':`${conversations.length} tool-result conversations`);
     if(Array.isArray(fixtures)){const choices=[...new Set(fixtures.map(f=>f.choice?.mode).filter(Boolean))];if(choices.length)parts.push(`Choice: ${choices.join(', ')}`);}
     parts.push((config.tool_checks?.modes || (config.stream?['complete','stream']:['complete'])).map(mode=>mode==='stream'?'Streaming':'Complete').join(' + '));
     if(Array.isArray(fixtures)&&fixtures.some(item=>item.expected_content))parts.push('Assistant text and calls checked');
-    if(!Array.isArray(fixtures)||!fixtures.length||fixtures.some(item=>!item.choice))parts.push(config.forced_tool_diagnostic?'Includes forced tool diagnostic':'Normal tool choice');
+    if((!fixtures?.length&&!conversations?.length)||(Array.isArray(fixtures)&&fixtures.some(item=>!item.choice)))parts.push(config.forced_tool_diagnostic?'Includes forced tool diagnostic':'Normal tool choice');
   }
   else if(check.id==='correctness'&&config.request_source==='request_pack'){
     const count=config.request_pack?.cases?.length;
@@ -869,7 +871,7 @@ function validateProfileDrafts(form,id=null) {
   if(!form)return true;
   for(const input of form.querySelectorAll('input, select, textarea')){
     const profile=input.closest('[data-profile-settings]');if(!profile||id&&profile.dataset.profileSettings!==id||!savedProfileInput(input,form))continue;
-    if(input.name==='profile_tools_fixtures'){
+    if(['profile_tools_fixtures','profile_tools_conversations'].includes(input.name)){
       let message='';try{parseToolFixtures(input.value);}catch(error){message=error.message;}
       input.setCustomValidity?.(message);
     }
@@ -1752,7 +1754,7 @@ function renderToolEvaluation(record) {
   return `<section class="tool-evaluation"><h3>Tool response checks</h3>${evaluation.support?`<p class="hint">Support: ${escape(evaluation.support)}</p>`:''}${components.map(([key,label])=>{
     const result=evaluation[key];if(!result)return '';
     return `<div class="statline"><strong>${label}</strong>${badge(result.status,result.status==='not_checked'?'Not checked':undefined)}</div><p class="hint">${escape(result.message || '')}</p>`;
-  }).join('')}</section>`;
+  }).join('')}${record.tool_conversation?`<h3>Tool-result conversation</h3><pre>${escape(JSON.stringify(record.tool_conversation,null,2))}</pre>`:''}</section>`;
 }
 function renderActualToolCalls(record) {
   if(!record.tool_evaluation&&!record.evaluation?.tool_expectation&&!record.tool_calls?.length)return '';

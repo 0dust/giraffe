@@ -191,6 +191,9 @@ class LLMClient:
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
         response_sequence = -1
+        conversation = spec.workload.get("selection") == "conversation"
+        assistant_content_present = False
+        assistant_extras: dict[str, list[str]] = {}
 
         def trace(kind: str, **metadata: int | bool) -> None:
             # Sequence identifies a response choice, not field order within its JSON.
@@ -204,7 +207,7 @@ class LLMClient:
             record.response_events.append({"sequence": response_sequence, "kind": kind, **metadata})
 
         def receive(data: dict[str, Any], *, streaming: bool) -> None:
-            nonlocal last_answer, response_sequence
+            nonlocal last_answer, response_sequence, assistant_content_present
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
                     and len(server_id) > 4096):
@@ -250,6 +253,20 @@ class LLMClient:
             content = choice.get("delta" if streaming else "message")
             if not isinstance(content, dict):
                 raise _ProtocolError("response is missing assistant content")
+            if conversation:
+                if content.get("role", "assistant") != "assistant":
+                    raise _ProtocolError("conversation response must have assistant role")
+                if set(content) - {"role", "content", "tool_calls", "reasoning_content", "reasoning", "refusal"}:
+                    raise _ProtocolError("unsupported assistant field in conversation")
+                for key in ("reasoning_content", "reasoning", "refusal"):
+                    if content.get(key) is not None:
+                        value = _text(content[key])
+                        if streaming:
+                            assistant_extras.setdefault(key, []).append(value)
+                if not streaming:
+                    record.assistant_message = {"role": "assistant", **content}
+                else:
+                    assistant_content_present |= isinstance(content.get("content"), str)
             answer = _text(content.get("content"))
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = time.perf_counter()
@@ -260,6 +277,8 @@ class LLMClient:
                 for ordinal, call in enumerate(calls):
                     if not isinstance(call, dict):
                         raise _ProtocolError("invalid tool-call structure")
+                    if conversation and set(call) - {"id", "type", "index", "function"}:
+                        raise _ProtocolError("unsupported tool-call field in conversation")
                     index = call.get("index") if streaming else ordinal
                     if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 16:
                         raise _ProtocolError("invalid tool-call index")
@@ -275,6 +294,8 @@ class LLMClient:
                     function = call.get("function", {})
                     if not isinstance(function, dict):
                         raise _ProtocolError("invalid tool-call function")
+                    if conversation and set(function) - {"name", "arguments"}:
+                        raise _ProtocolError("unsupported tool function field in conversation")
                     name = _text(function.get("name"))
                     arguments = _text(function.get("arguments"))
                     trace("tool_call", index=index, name_length=len(name),
@@ -366,6 +387,12 @@ class LLMClient:
                             raise _ProtocolError("incomplete tool-call ID/type/function structure")
                     if record.first_output_ms is None or (not record.output.strip() and spec.scorer != "tool"):
                         raise _ProtocolError("response contained no useful answer output")
+                    if conversation and stream:
+                        record.assistant_message = {"role": "assistant",
+                            "content": record.output if assistant_content_present else None,
+                            **{key: "".join(parts) for key, parts in assistant_extras.items()}}
+                    if conversation and record.tool_calls:
+                        record.assistant_message["tool_calls"] = record.tool_calls
                     record.status, record.valid = "completed", True
         except _IntentionalCancellation:
             record.status, record.error = "cancelled", "intentional cancellation after answer chunks"
