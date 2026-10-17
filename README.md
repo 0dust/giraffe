@@ -100,8 +100,9 @@ API also honors configured header variables, TLS trust and proxy settings.
 `headers_env`, `ca_bundle`, `proxy` and `request_options`; it returns `connected`
 or `needs_model`. `POST /api/targets/models` remains a metadata-only lookup.
 
-**Choose checks** shows a searchable catalog grouped by purpose. The initial
-selection is endpoint response and answer correctness. Each check has an **i**
+**Choose checks** opens on your selected checks. Use **Add checks** to search
+the full catalog by purpose. The initial selection is endpoint response and
+answer correctness. Each check has an **i**
 button for details and a **Settings** button for its controls. Load settings belong to their load
 check; answer checks and rate tests can use your own questions. Shared request
 and time limits apply across the run. The final review shows planned requests,
@@ -265,7 +266,7 @@ environment-variable names. HTTPX honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PR
 `ca_bundle` supplies a private CA file. Nothing disables TLS verification.
 
 `--nonstream` exercises nonstreaming Chat Completions. `--checks serving,correctness`
-runs a selected subset. **Browse all 19 checks** in the UI exposes every check
+runs a selected subset. **Add checks** in the UI exposes all 19 checks
 with a selection checkbox and **Settings** action. Specialist settings stay in
 advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one

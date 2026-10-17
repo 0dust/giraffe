@@ -36,7 +36,7 @@ state.bootstrap=bootstrap;state.bootstrap.config=config;state.config=config;stat
 const before=JSON.stringify(config);
 const bucket=state.bootstrap.checks.find(check=>check.id==='buckets');
 let markup=renderTestCard(bucket,config);
-assert.match(markup,/Requests at a time/);
+assert.match(markup,/Concurrent requests/);
 for(const size of ['short','medium','long']){{
   assert(markup.includes('name="buckets_input_'+size+'"'));
   assert(markup.includes('name="buckets_output_'+size+'"'));
@@ -191,7 +191,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   const markup=nodes['#main'].innerHTML;
   assert.doesNotMatch(markup,/setup-side-summary|setup-planned-traffic|review-baseline/);
   const options=markup.slice(markup.indexOf('id="execution-settings"'),markup.indexOf('</details>',markup.indexOf('id="execution-settings"')));
-  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare with a previous run'));
+  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare baseline'));
   assert(markup.indexOf('id="run-bounds"')<markup.indexOf('id="request-plan"'));
   for(const name of ['mode','restart_target','baseline_id','name'])assert(controls.some(input=>input.name===name));
   assert(markup.indexOf('id="setup-deployment"')<markup.indexOf('id="test-selection"'));assert(!markup.includes('name="setup_goal"'));
@@ -247,8 +247,8 @@ renderBounds();
 const reviewCriteria=renderReviewPassCriteria(readForm(true).config);
 assert.match(reviewCriteria,/Pass criteria/);
 assert(reviewCriteria.includes('First output within 300 ms'));
-assert(!reviewCriteria.includes('Complete answer within 2,000 ms'));
-assert.equal(reviewCriteria.includes('Complete answer within 700 ms'),config.test_options.capacity.limits.latency_ms===700);
+assert(!reviewCriteria.includes('Completion limit 2,000 ms'));
+assert.equal(reviewCriteria.includes('Completion limit 700 ms'),config.test_options.capacity.limits.latency_ms===700);
 assert.match(nodes['#run-bounds'].innerHTML,/review-endpoints/);
 assert.doesNotMatch(nodes['#run-bounds'].innerHTML,/Time targets under load/);
 const primary=form.elements.test_capacity_limit_latency_ms;
@@ -418,7 +418,7 @@ const html=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.i
   {{checks:['buckets'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},buckets:null,test_options:{{}}}})`,context);
 assert.match(html,/name="buckets_levels"/);
 assert.match(html,/name="buckets_samples_per_bucket"/);
-assert.match(html,/Requests at a time/);
+assert.match(html,/Concurrent requests/);
 assert.doesNotMatch(html,/Customize <code>buckets<\\/code> in the JSON/);
 context.draft={{checks:['buckets'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},
   buckets:{{...defaults,levels:['<img src=x>']}}}};
@@ -653,13 +653,13 @@ assert.doesNotMatch(markup,/0 recorded metric comparisons|0 comparable metrics|N
 target.comparisons.push({{check:'correctness',metric:'error_rate',status:'pass'}});
 markup=renderComparison(report);
 assert.match(markup,/comparison-filters/);
-assert.match(markup,/1 recorded metric comparisons/);
-assert(markup.includes('1 / 1 metrics shown'));
+assert.match(markup,/1 measurements, grouped by check/);
+assert.match(markup,/data-comparison-group="correctness"/);
 target.configuration_diff={{confounded:true,changed_fields:['runtime.version']}};
 target.telemetry={{coverage:'partial'}};
 markup=renderComparison(report);
 assert.match(markup,/runtime.version|confounded experiment/);
-assert.match(markup,/Serving telemetry and repeatability comparison/);
+assert.match(markup,/Deployment and comparison details/);
 assert.match(markup,/Tested arrival capacity/);
 state.detail={{id:'run-one'}};
 const configMarkup=renderConfig({{manifest:{{config:{{}}}},observations:{{targets:{{local:{{deployment:{{runtime:'vllm'}},serving_telemetry:{{coverage:'partial'}}}}}}}}}});
@@ -1100,8 +1100,8 @@ markup=renderJudgement({status:'inconclusive',votes:[votes[0],{judge:'second',st
 state.detail={report:{requests:[{id:'r',fixture_id:'refund',judgement:{status:'inconclusive',votes},score:null}],manifest:{config:{retention:'all'}}}};
 openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI evaluation/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
 state.detail={id:'run',state:'running',config:{targets:[{name:'target',model:'m'}],judging:config.judging,max_requests:50},progress:{event:'judging_progress',attempted:20,completed:20,judge_calls_total:40,judge_calls_completed:7,elapsed_seconds:10},events:[]};
-renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating golden answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
-state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert.match(nodes['#main'].innerHTML,/Measuring the configured endpoint/);
+renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
+state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert.match(nodes['#main'].innerHTML,/Requests appear as they start/);
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))

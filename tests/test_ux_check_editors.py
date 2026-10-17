@@ -39,7 +39,7 @@ assert(context.indexOf('name="test_context_context_limit"')<context.indexOf('cla
 assert.match(context,/Minimum requests across the generated context cases/);
 assert.match(context,/Calibration and retries can add requests/);
 assert.doesNotMatch(context,/Minimum requests for each context-length group/);
-assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config),/Questions to send \(minimum\)/);
+assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config),/Minimum questions/);
 const timing=renderTestCard(bootstrap.checks.find(x=>x.id==='first_output'),config);
 assert.match(timing,/Minimum usable answers/);
 assert(timing.indexOf('name="test_first_output_limit_min_samples"')<timing.indexOf('data-done-test="first_output"'));
@@ -177,7 +177,7 @@ assert.equal(elements.test_context_context_limit.max,'65536');
 assert.equal(config.test_options.correctness.concurrency,8);
 config.request_source='request_pack';config.request_pack={cases:[]};
 const recovery=checkOverrideWarning(check,config,true);
-assert.match(recovery,/Reset this check’s overrides or raise Requests at once \(maximum\) in Shared settings/);
+assert.match(recovery,/Reset this check’s overrides or raise Concurrency ceiling in Run limits/);
 const markup=renderTestCard(check,config);
 assert.match(markup,/data-check-override-warning="correctness" >/);
 assert(markup.indexOf('data-check-override-warning')<markup.indexOf('data-test-editor="correctness" hidden'));

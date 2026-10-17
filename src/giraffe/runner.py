@@ -146,6 +146,7 @@ class _Run:
         if self.progress:
             self.progress({"event": event, "target": target, "scenario": scenario,
                            "completed": len(self.records), "attempted": self.attempted,
+                           "budget_used": self.budget_used,
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
@@ -216,6 +217,7 @@ class _Run:
                 self.unfinished[target.name].update(spec.check_ids)
                 return None
             self.attempted += 1
+            request_slot = self.attempted - 1
             self.counts[target.name] += 1
             key = (target.name, spec.scenario)
             self.active[key] += 1
@@ -229,7 +231,8 @@ class _Run:
                     item["peak"] = max(item["peak"], concurrent)
             if on_start:
                 on_start()
-            self.emit("request_started", target.name, spec.scenario)
+            self.emit("request_started", target.name, spec.scenario,
+                      request_slot=request_slot, fixture_id=spec.fixture_id)
             try:
                 if deadline_override is not None:
                     timeout_override = min(timeout_override or self.config.request_timeout_seconds,
@@ -286,7 +289,12 @@ class _Run:
                 timeout_override is not None and record.status == "timeout")
             if not intentional and record.status != "cancelled" and (record.status != "completed" or not record.valid):
                 self.errors += 1
-            self.emit("request_completed", target.name, spec.scenario, status=record.status)
+            # Live visualization gets measurements only, never retained response bodies.
+            self.emit("request_completed", target.name, spec.scenario, status=record.status,
+                      request_slot=request_slot, request=record.model_dump(mode="json", include={
+                          "id", "target", "fixture_id", "scenario", "status", "valid", "score",
+                          "elapsed_ms", "first_output_ms", "check_ids",
+                      }), intentional=intentional)
             return record
 
     async def group(self, target, client, specs, scenario, count=None, concurrency=1, checks=()):

@@ -17,9 +17,9 @@ def run_render_checks(assertions: str) -> None:
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}};
-const context={assert,structuredClone,nodes,
-  document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener(){}},
+const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}},listeners={};
+const context={assert,structuredClone,nodes,listeners,
+  document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},
   window:{addEventListener(){}}};
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
@@ -52,31 +52,49 @@ function detail(value,extra={}) {
     assert result.returncode == 0, result.stderr
 
 
-def test_first_run_and_filtered_history_have_distinct_next_actions():
+def test_history_prioritizes_models_and_preserves_escaping_filtering_and_search():
     run_render_checks(r"""
 state.bootstrap={checks:[{title:'Do not show full catalogue'}]};
 renderRuns();
 let html=nodes['#main'].innerHTML;
 assert.equal((html.match(/class="button primary"/g)||[]).length,1);
-assert.match(html,/Start first check/);
-assert.match(html,/Connect your endpoint/);
-assert.match(html,/Understand the result/);
-assert.doesNotMatch(html,/Do not show full catalogue|run-filter|suite-list/);
-state.runs=[{id:'failed',state:'completed',overall:'fail',targets:[{name:'<target>',model:'model'}],
-  check_counts:{fail:1,blocked:2,inconclusive:3}},
-  {id:'cancelled',state:'cancelled',overall:'fail',check_counts:{}}];
+assert.match(html,/<h1>Run history<\/h1>/);assert.match(html,/No runs yet/);
+assert.match(html,/> New run<\/a>/);
+assert.doesNotMatch(html,/Do not show full catalogue|run-filter|suite-list|first-run-steps/);
+state.runs=[{id:'failed',state:'completed',overall:'fail',targets:[{name:'<target>',model:'<model>'}],
+  started_at:'2026-10-15T10:00:00Z',check_counts:{fail:1,blocked:2,inconclusive:3},baseline_id:'base'},
+  {id:'cancelled',state:'cancelled',overall:'fail',targets:[{name:'local',model:'second-model'}],check_counts:{}}];
 renderRuns();html=nodes['#main'].innerHTML;
-assert.match(html,/1 failed · 2 blocked · 3 inconclusive/);
-assert.match(html,/&lt;target&gt;/);
-assert.match(html,/Open result/);
-assert.doesNotMatch(html,/What gets checked|suite-list/);
+assert.match(html,/&lt;target&gt;/);assert.match(html,/&lt;model&gt;/);
+assert.doesNotMatch(html,/<target>|<model>/);
+assert.match(html,/class="history-identity"/);assert.match(html,/class="history-result"/);
+assert.match(html,/class="history-mobile-date"/);assert.match(html,/class="history-date"/);
+assert.match(html,/aria-label="Open run for &lt;model&gt; from/);
+assert.match(html,/<table aria-label="Saved endpoint runs">/);
+assert.match(html,/placeholder="Search runs"/);
+assert.doesNotMatch(html,/Latest run|history-overview|What gets checked|suite-list|2 saved runs|table-note|run-id|Baseline compared|Duration|1 failed|2 blocked|3 inconclusive/);
 state.filter='pass';renderRuns();html=nodes['#main'].innerHTML;
-assert.match(html,/No runs match this filter/);
-assert.match(html,/data-action="clear-filter"/);
-assert.doesNotMatch(html,/Start first check/);
+assert.match(html,/No matching runs/);assert.match(html,/data-action="clear-filter"/);
 state.filter='cancelled';renderRuns();html=nodes['#main'].innerHTML;
-assert.match(html,/#runs\/cancelled/);
-assert.doesNotMatch(html,/#runs\/failed/);
+assert.match(html,/#runs\/cancelled/);assert.match(html,/Cancelled/);
+assert.doesNotMatch(html.split('class="history-table"')[1],/#runs\/failed/);
+state.filter='all';state.historySearch='<target>';renderRuns();html=nodes['#main'].innerHTML;
+assert.match(html,/#runs\/failed/);assert.doesNotMatch(html.split('class="history-table"')[1],/#runs\/cancelled/);
+state.historySearch='second-model';renderRuns();html=nodes['#main'].innerHTML;
+assert.match(html,/#runs\/cancelled/);assert.doesNotMatch(html.split('class="history-table"')[1],/#runs\/failed/);
+state.runs.push({id:'live',state:'running',overall:'fail',targets:[{model:'active-model'}]});
+state.filter='active';state.historySearch='';renderRuns();html=nodes['#main'].innerHTML;
+assert.match(html,/#runs\/live/);assert.match(html,/Running/);assert.doesNotMatch(html.split('class="history-layout')[1],/#runs\/failed|#runs\/cancelled/);
+""")
+
+
+def test_history_refresh_preserves_search_focus_and_caret():
+    run_render_checks(r"""
+state.runs=[{id:'saved',state:'completed',overall:'pass',targets:[{model:'test'}]}];
+state.historySearch='test';
+const search={id:'run-search',selectionStart:1,selectionEnd:3,focus(options){assert(options.preventScroll);this.focused=true;},setSelectionRange(start,end){this.start=start;this.end=end;}};
+nodes['#run-search']=search;document.activeElement=search;
+renderRuns();assert(search.focused);assert.equal(search.start,1);assert.equal(search.end,3);
 """)
 
 
@@ -87,7 +105,7 @@ const failed=report([check('correctness','fail',{
 let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
 assert.match(html,/Expected &lt;Paris&gt;/);
-assert.match(html,/class="button primary" data-action="rerun">Review settings/);
+assert.match(html,/class="button primary" data-action="inspect-finding">Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 assert.match(html,/Save as reference baseline/);
 assert.match(html,/report\.html" download/);
@@ -159,7 +177,7 @@ state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'te
   max_requests:100,concurrency:4,max_duration_seconds:60,request_timeout_seconds:10,max_output_tokens:32},
   progress:{attempted:12,completed:9,elapsed_seconds:5},events:[]};
 renderLive();let html=nodes['#main'].innerHTML;
-assert.match(html,/Checking your endpoint/);
+assert.match(html,/Mission control/);
 assert.match(html,/Requests finished \/ started/);
 assert.match(html,/Active requests<\/dt><dd>3/);
 assert.match(html,/Requests started · 12 \/ 100 limit/);
@@ -175,4 +193,70 @@ renderLive();html=nodes['#main'].innerHTML;
 assert.match(html,/Target traffic finished/);
 assert.match(html,/Evaluation calls · 3 of 8/);
 assert.doesNotMatch(html,/Requests started ·/);
+""")
+
+
+def test_grouped_comparison_preserves_measurements_filters_and_uncertainty():
+    run_render_checks(r"""
+const row=(check,metric,status,reason)=>({check,metric,status,reason,scenario:'question <one>',
+  baseline:100,current:125,baseline_samples:6,current_samples:6,worsening:25,threshold:20});
+const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'local <gpu>',status:'inconclusive',
+  comparisons:[row('context','latency_ms','fail','Threshold exceeded'),
+    row('context','first_output_ms','inconclusive','Sample variation'),
+    row('correctness','correctness_rate','pass','No material regression')]}]};
+const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
+state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
+let html=renderComparison(value);
+assert.match(html,/The comparison is inconclusive/);assert.match(html,/does not establish improvement or regression/);
+assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);
+assert.match(html,/data-comparison-group="context"/);assert.match(html,/Context recall/);
+assert.match(html,/1 regressed · 1 inconclusive/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
+assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
+assert.equal((html.match(/<tr>/g)||[]).length,5); // Three measurements and two group headers.
+state.comparisonFilter='pass';state.comparisonCheck='context';html=renderComparison(value);
+assert.match(html,/No measurements match/);
+assert.equal(JSON.stringify(value),original);
+""")
+
+
+def test_failure_action_selects_evidence_from_the_failed_check_only():
+    run_render_checks(r"""
+const failed=check('correctness','fail',{metrics:{correct:1,scored:2},evidence_ids:['bad','good']});
+const value=report([check('access','pass'),failed],{overall:'fail',requests:[
+  {id:'unrelated',score:false},{id:'good',score:true},{id:'bad',score:false}]});
+let html=detail(value);
+assert.match(html,/data-action="inspect-finding">Inspect failed answer/);
+assert.match(html,/1 of 2 scored answers did not meet/);
+let opened;openRequest=id=>opened=id;inspectFinding();assert.equal(opened,'bad');
+assert.equal((html.match(/data-check="local:correctness"/g)||[]).length,1);
+assert.doesNotMatch(html,/result-check-strip/);
+value.requests=[];detail(value);assert.equal(findingEvidence(value).record,undefined);
+assert.match(nodes['#main'].innerHTML,/data-action="inspect-finding">Inspect check/);
+""")
+
+
+def test_report_tabs_keep_one_tab_stop_and_support_keyboard_navigation():
+    run_render_checks(r"""
+const value=report([check('access','pass')]);
+let html=detail(value);
+assert.match(html,/id="tab-checks" aria-selected="true" tabindex="0"/);
+assert.match(html,/id="tab-baseline" aria-selected="false" tabindex="-1"/);
+assert.match(html,/id="tab-config" aria-selected="false" tabindex="-1"/);
+for(const tab of ['checks','baseline','config'])nodes['#tab-'+tab]={focus(){this.focused=true;}};
+const target={closest(q){return q==='[data-tab]'?this:null;}};
+let prevented=0;
+listeners.keydown({target,key:'ArrowRight',preventDefault(){prevented++;}});
+html=nodes['#main'].innerHTML;
+assert.equal(state.tab,'baseline');assert(nodes['#tab-baseline'].focused);
+assert.match(html,/id="tab-baseline" aria-selected="true" tabindex="0"/);
+assert.match(html,/id="tab-checks" aria-selected="false" tabindex="-1"/);
+listeners.keydown({target,key:'End',preventDefault(){prevented++;}});
+assert.equal(state.tab,'config');assert(nodes['#tab-config'].focused);
+listeners.keydown({target,key:'ArrowRight',preventDefault(){prevented++;}});
+assert.equal(state.tab,'checks');assert(nodes['#tab-checks'].focused);
+assert.equal(prevented,3);
 """)

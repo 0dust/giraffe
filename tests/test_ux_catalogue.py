@@ -63,7 +63,7 @@ for(const name of ['traffic_rates','traffic_duration_seconds','buckets_levels','
   assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 }
 assert.doesNotMatch(markup,/name="setup_goal"|name="setup_load"/);
-assert.match(markup,/Correct answers required \(%\)/);assert.match(markup,/<h4>Requests<\/h4>/);assert.match(markup,/<h4>Pass criteria<\/h4>/);
+assert.match(markup,/Correct answers \(%\)/);assert.match(markup,/<h4>Requests<\/h4>/);assert.match(markup,/<h4>Pass criteria<\/h4>/);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -84,7 +84,8 @@ def test_check_rows_keep_details_in_accessible_info_and_update_live_settings():
     browser_logic(r"""
 for(const check of bootstrap.checks){
   const row=renderTestCard(check,config),helpId='field-check_'+check.id+'-help';
-  assert.doesNotMatch(row,/test-description|test-effective-summary|traffic-profile-summary|check-explanation-disclosure/);
+  assert(row.includes('<p class="test-description">'+escape(checkGuide[check.id].purpose)+'</p>'));
+  assert.doesNotMatch(row,/test-effective-summary|traffic-profile-summary|check-explanation-disclosure/);
   assert.match(row,new RegExp('</label><button type="button" class="field-info"[^>]*popovertarget="'+helpId+'"'));
   assert(row.includes('aria-label="About '+escape(catalogTitle(check.id))+'"'));
   assert(row.includes('id="'+helpId+'" class="field-help" popover="auto"'));
@@ -118,7 +119,7 @@ for(const check of bootstrap.checks){
     dataset:{category:checkGroups.find(x=>x.checks.includes(check.id)).id,search:(checkGuide[check.id].name+' '+checkGuide[check.id].purpose).toLowerCase()}};
   nodes['[data-test-card="'+check.id+'"]']=card;cards.push(card);
 }
-syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
+syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,19);
 state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,19);
 state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
@@ -300,14 +301,16 @@ def test_catalogue_example_is_an_actual_scored_builtin_request():
     }
 
 
-def test_shared_settings_are_collapsed_but_keep_every_control_and_visible_estimate():
+def test_run_limits_are_collapsed_and_keep_controls_without_repeating_workload():
     browser_logic(r"""
 config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
 assert.match(markup,/<details class="shared-settings-editor" id="shared-settings">/);
-assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Shared settings<\/h2>/);
+assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits<\/h2>/);
 assert.match(markup,/Up to 160 requests · 5m 0s · 4 at once/);assert.match(markup,/class="shared-settings-edit">Edit/);
 assert(markup.lastIndexOf('</details>')<markup.indexOf('id="checks-plan-summary"'));
+assert.match(markup,/class="sr-only" id="run-ceilings-summary"/);
+assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary" role="status"/);
 const expected=['max_requests','max_duration_seconds','concurrency','samples','max_output_tokens','request_timeout_seconds','context_limit','stream',
   ...limitFields.map(([name])=>'limit_'+name),'limit_max_error_rate','limit_min_correctness','limit_min_samples','limit_regression_percent'];
 for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
@@ -322,8 +325,8 @@ for(const id of ['run-ceilings-summary','request-defaults-summary','acceptance-s
 config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
 assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
-assert(catalogue.indexOf('id="shared-settings"')<catalogue.indexOf('id="test-selection"'));
+assert(catalogue.indexOf('id="test-selection"')<catalogue.indexOf('id="shared-settings"'));
 assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
-assert.doesNotMatch(catalogue,/catalogue-view-hint|Start with the selected checks/);
+assert.doesNotMatch(catalogue,/catalogue-view-hint/);
 """)
