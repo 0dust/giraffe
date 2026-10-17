@@ -132,6 +132,14 @@ function renderFlightPlan(plan) {
   const rows=(plan.rows || []).filter(r=>r.requests_per_target!==0),max=Math.max(1,...rows.map(r=>r.requests_per_target || 0));
   return `<div class="flight-plan"><div class="viz-heading"><h3>Flight plan</h3><span class="hint">Per endpoint</span></div>${rows.map(r=>`<div class="flight-row"><div><span>${escape(checkGuide[r.id]?catalogTitle(r.id):r.title)}</span><span class="mono">${r.requests_per_target==null?'Adaptive':`${r.kind==='estimate'?'~':''}${number(r.requests_per_target)}`}</span></div><div class="flight-track ${r.requests_per_target==null?'adaptive':''}">${r.requests_per_target==null?'':`<span style="width:${r.requests_per_target/max*100}%"></span>`}</div></div>`).join('')}</div>`;
 }
+const phaseNames={initial:'First request',warm:'Warm-up',generation:'Generation speed',sustained:'Sustained load',recovery:'Recovery check',cancellation_probe:'Cancellation probes',client_cancel:'Client cancellation',backend_cancel:'Server cancellation',context:'Long-context recall',limits:'Output limits',pack_control:'Quiet baseline',readiness:'Readiness',short:'Short requests',request_pack:'Your questions',judging:'AI evaluation',connection:'Connection'};
+const phaseHelp={sustained:'Steady traffic that loads the server before the recovery check.',recovery:'Checks normal answers return after the load.',warm:'Repeated short requests after the first one.',initial:'The very first request, timed separately.',pack_control:'Your questions sent with no other load, for comparison.'};
+function phaseName(id) {
+  if(phaseNames[id])return phaseNames[id];
+  const stage=/^traffic_stage_(\d+)$/.exec(id);if(stage)return `Traffic stage ${Number(stage[1])+1}`;
+  if(/^correctness/.test(id))return 'Answer correctness';
+  return human(id);
+}
 function renderPhases(events) {
   const phases=[];
   for(const e of events){
@@ -142,7 +150,16 @@ function renderPhases(events) {
       else phases.push({key:`${e.target}:${e.scenario}`,title:e.scenario,target:e.target,start:null,end:e.elapsed_seconds});
     }
   }
-  return `<section class="phase-timeline"><h2>Phases</h2>${phases.length?`<ol>${phases.map(p=>`<li class="${p.end===null?'running':'finished'}"><span class="phase-mark">${p.end===null?'·':'✓'}</span><div><strong>${escape(human(p.title))}</strong><small>${escape(p.target)}</small></div><span class="mono">${p.start===null?'Start unavailable':p.end===null?'Running':elapsed(p.end-p.start)}</span></li>`).join('')}</ol>`:'<p class="hint">Waiting for scenario events.</p>'}</section>`;
+  // Back-to-back repeats of one phase (e.g. many sustained-load rounds) read as one line with a round count.
+  const groups=[];
+  for(const p of phases){
+    const last=groups.at(-1);
+    if(last&&last.key===p.key&&last.end!==null&&last.start!==null&&p.start!==null){last.rounds++;last.end=p.end;last.busy+=p.end===null?0:p.end-p.start;last.running=p.end===null;continue;}
+    groups.push({...p,rounds:1,busy:p.end===null||p.start===null?0:p.end-p.start,running:p.end===null});
+  }
+  const row=p=>`<li class="${p.running?'running':'finished'}" ${phaseHelp[p.title]?`title="${escape(phaseHelp[p.title])}"`:''}><span class="phase-mark">${p.running?'·':'✓'}</span><div><strong>${escape(phaseName(p.title))}</strong><small>${escape(p.target)}${p.rounds>1?` · ${number(p.rounds)} rounds`:''}</small></div><span class="mono">${p.start===null?'Start unavailable':p.running?'Running':elapsed(p.rounds>1?p.end-p.start:p.end-p.start)}</span></li>`;
+  const visible=groups.slice(-6),earlier=groups.slice(0,-6);
+  return `<section class="phase-timeline"><h2>Phases</h2>${groups.length?`${earlier.length?`<details class="phase-earlier"><summary>${number(earlier.length)} earlier ${earlier.length===1?'phase':'phases'}</summary><ol>${earlier.map(row).join('')}</ol></details>`:''}<ol>${visible.map(row).join('')}</ol>`:'<p class="hint">Waiting for scenario events.</p>'}</section>`;
 }
 function openLiveRequest(slot) {
   const r=(state.detail.live_requests || []).find(r=>r.slot===slot);if(!r)return;
@@ -160,13 +177,19 @@ function renderHeroCoat() {
   return `<div class="hero-coat${entering?' is-entering':''}" aria-hidden="true"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid slice">${cells.map(({site,points},i)=>`<polygon points="${points}" style="--i:${i};--x:${(site[0]/width).toFixed(3)};--y:${(site[1]/height).toFixed(3)}"/>`).join('')}</svg></div>`;
 }
 const themeIcons={dark:'<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.5"/><path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4"/></svg>',light:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 12.2A6.5 6.5 0 0 1 7.8 4.5a6.5 6.5 0 1 0 7.7 7.7Z"/></svg>'};
+function toggleRail(force) {
+  const root=document.documentElement,collapsed=force ?? !root.classList.contains('rail-collapsed');
+  root.classList.toggle('rail-collapsed',collapsed);
+  try{localStorage.setItem('giraffe-rail',collapsed?'collapsed':'open');}catch{}
+  const button=$('[data-action="toggle-rail"]');if(button){button.setAttribute('aria-expanded',String(!collapsed));button.setAttribute('aria-label',collapsed?'Expand sidebar':'Collapse sidebar');}
+}
 function setTheme(theme) {
   document.documentElement.dataset.theme=theme;
   try{localStorage.setItem('giraffe-theme',theme);}catch{}
   const toggle=$('[data-action="theme"]');if(toggle){toggle.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);toggle.innerHTML=themeIcons[theme==='dark'?'dark':'light'];}
 }
 const commandIcons={go:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>',plus:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>',history:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 10a6.5 6.5 0 1 0 2-4.7M3.5 3.5v3h3M10 6.5V10l2.5 1.5"/></svg>',theme:'<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M10 3.5v13a6.5 6.5 0 0 0 0-13Z" fill="currentColor"/></svg>',bolt:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 2.5 4.5 11H10l-1 6.5L15.5 9H10z"/></svg>',keys:'<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="5" width="15" height="10" rx="2"/><path d="M5.5 8h1M9.5 8h1M13.5 8h1M6.5 12h7"/></svg>'};
-const commandItems=[{label:'New run',key:'N',icon:'plus',group:'Navigate',action:()=>{location.hash='#new';}},{label:'Runs',key:'G R',icon:'history',group:'Navigate',action:()=>{location.hash='#runs';}},{label:'Primary action',key:'⌘ ↵',icon:'bolt',group:'Actions',action:()=>primaryAction()},{label:'Toggle theme',key:'',icon:'theme',group:'Actions',action:()=>setTheme(document.documentElement.dataset.theme==='light'?'dark':'light')},{label:'Shortcuts',key:'?',icon:'keys',group:'Actions',action:()=>openCommands(true)},{label:'Commands',key:'⌘ K',icon:'go',group:'Actions',action:()=>openCommands()}];
+const commandItems=[{label:'New run',key:'N',icon:'plus',group:'Navigate',action:()=>{location.hash='#new';}},{label:'Runs',key:'G R',icon:'history',group:'Navigate',action:()=>{location.hash='#runs';}},{label:'Primary action',key:'⌘ ↵',icon:'bolt',group:'Actions',action:()=>primaryAction()},{label:'Toggle sidebar',key:'[',icon:'keys',group:'Actions',action:()=>toggleRail()},{label:'Toggle theme',key:'',icon:'theme',group:'Actions',action:()=>setTheme(document.documentElement.dataset.theme==='light'?'dark':'light')},{label:'Shortcuts',key:'?',icon:'keys',group:'Actions',action:()=>openCommands(true)},{label:'Commands',key:'⌘ K',icon:'go',group:'Actions',action:()=>openCommands()}];
 let commandList=commandItems;
 function openCommands(shortcuts=false) {
   const dialog=$('#command-dialog');
@@ -185,6 +208,7 @@ function primaryAction() {
 function initReticulate() {
   let theme='dark';try{theme=localStorage.getItem('giraffe-theme') || theme;}catch{}
   setTheme(theme==='light'?'light':'dark');
+  toggleRail(document.documentElement.classList.contains('rail-collapsed'));
 }
 
 async function api(path, options={}) {
@@ -1691,10 +1715,10 @@ function renderLive() {
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Requests appear as they start. Select a spot for evidence.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Maximum in flight',c.concurrency],['Total request limit',c.max_requests],['Maximum duration',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
   $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p></div><button class="button danger" data-action="stop" ${stopping?'disabled':''}>${icon('stop')}${stopping?'Stopping…':'Stop run'}</button></div>
-  ${renderMosaic(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started})}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(human(progress.scenario || progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
+  ${renderMosaic(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started})}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?'Post-run AI evaluation':escape(progress.scenario?phaseName(progress.scenario):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
   <dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Requests finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl>
   <div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/(c.max_requests || 1)*100)}%"></span></div><div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`Requests started · ${number(started)} / ${number(c.max_requests)} limit`}</span><span>${judging?'Inference timing is unchanged':'Request ceiling, not completion'}</span></div></section>
-  <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Activity</h2><span class="hint">Updates live</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.event || 'Progress'))}${e.scenario?` · ${escape(human(e.scenario))}`:''}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
+  <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Activity</h2><span class="hint">Updates live</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.event || 'Progress'))}${e.scenario?` · ${escape(phaseName(e.scenario))}`:''}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
 }
 function renderJudgement(judgement) {
@@ -1840,6 +1864,7 @@ document.addEventListener('click',async(event)=>{
   if(shellAction==='theme'){setTheme(document.documentElement.dataset.theme==='light'?'dark':'light');return;}
   if(shellAction==='commands'){openCommands();return;}
   if(shellAction==='shortcuts'){openCommands(true);return;}
+  if(shellAction==='toggle-rail'){toggleRail();return;}
   if(shellAction==='close-commands'){$('#command-dialog').close();return;}
   if(shellAction==='mosaic-prev'||shellAction==='mosaic-next'){state.mosaicPage=Math.max(0,(state.mosaicPage || 0)+(shellAction==='mosaic-next'?1:-1));renderDetail();$('.request-mosaic [tabindex="0"]')?.focus({preventScroll:true});return;}
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
@@ -1869,6 +1894,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='test-connection'){await testConnection();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
   if(configure){toggleTestEditor(configure);return;}
+  if(state.openTest&&event.target.id==='new-run-form'&&window.matchMedia?.('(min-width: 1180px)').matches){toggleTestEditor(state.openTest,true);return;}
   const closeTest=event.target.closest('[data-close-test]')?.dataset.closeTest;
   if(closeTest){toggleTestEditor(closeTest,true);return;}
   const done=event.target.closest('[data-done-test]')?.dataset.doneTest;
@@ -2016,6 +2042,7 @@ document.addEventListener('keydown',event=>{
     if(key==='g'){navigationPrefix=Date.now();return;}
     if(key==='r'&&Date.now()-navigationPrefix<1200){event.preventDefault();navigationPrefix=0;location.hash='#runs';return;}
     if(key==='?'){event.preventDefault();openCommands(true);return;}
+    if(event.key==='['){event.preventDefault();toggleRail();return;}
   }
   const configTab=event.target.closest('[data-config-tab]');if(configTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();switchConfigView(event.key==='Home'?'form':event.key==='End'?'json':state.configView==='form'?'json':'form');return;}const tab=event.target.closest('[data-tab]');if(tab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();const tabs=['checks','baseline','config'];let i=tabs.indexOf(state.tab);i=event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3;state.tab=tabs[i];renderDetail();$(`#tab-${state.tab}`).focus();}});
 document.addEventListener('toggle',event=>{

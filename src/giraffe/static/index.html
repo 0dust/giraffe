@@ -9,9 +9,9 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23F7C25A'/%3E%3Cstop offset='1' stop-color='%23E07A2C'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cg fill='%232A1806' stroke='%232A1806' stroke-width='2.4' stroke-linejoin='round'%3E%3Cpath d='M6.5 7.2 13.6 6l1.3 6.3-6.2 2.6-2.9-3.4z'/%3E%3Cpath d='m17.9 6.1 7.6 1.3.2 5.8-6.9.9z'/%3E%3Cpath d='m6.2 18.6 4.3-1 5 2-1.6 6.4-7.4-.4z'/%3E%3Cpath d='m19 17.2 6.7-.9-.4 9.4-8 .4z'/%3E%3C/g%3E%3C/svg%3E">
   <link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="/static/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
-  <script>try{document.documentElement.dataset.theme=localStorage.getItem("giraffe-theme")==="light"?"light":"dark";}catch{}</script>
-  <link rel="stylesheet" href="/static/styles.css?v=20261017-savanna11">
-  <script type="module" src="/static/app.js?v=20261017-savanna11"></script>
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem("giraffe-theme")==="light"?"light":"dark";if(localStorage.getItem("giraffe-rail")==="collapsed")document.documentElement.classList.add("rail-collapsed");}catch{}</script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261017-savanna13">
+  <script type="module" src="/static/app.js?v=20261017-savanna13"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -42,6 +42,7 @@
     </header>
     <div class="workspace">
       <div class="workspace-path">
+        <button class="rail-toggle" type="button" data-action="toggle-rail" aria-label="Collapse sidebar" aria-expanded="true" title="Toggle sidebar ( [ )"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="M7.5 3.5v13"/></svg></button>
         <div id="breadcrumb">New run</div>
         <a id="active-run-link" class="active-run-link" hidden></a>
         <button class="command-trigger" type="button" data-action="commands" aria-label="Open command palette"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5"/><path d="m13 13 3.5 3.5"/></svg><span>Search runs or jump to…</span><kbd>⌘K</kbd></button>
