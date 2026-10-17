@@ -106,17 +106,17 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   return `<section class="request-viz"><div class="viz-heading"><div><span class="eyebrow">Every request, one spot</span><h2>${live?'Request budget':'Request mosaic'}</h2></div><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span></div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
     const r=bySlot.get(offset+i),status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',label=r?`Request ${offset+i+1}: ${r.fixture_id || r.scenario || ''}. ${statusLabels[status] || status}. ${r.elapsed_ms==null?'Timing pending':ms(r.elapsed_ms)}`:status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
     const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
-    return `<g class="request-spot ${status}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><title>${escape(label)}</title><polygon points="${points}"/></g>`;
+    return `<g class="request-spot ${status}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/></g>`;
   }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}"></i>${status==='idle'?'Unused':statusLabels[status]}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed request, invalid completion or incorrect answer. Unscored answers, cancellations and intentional probes stay inconclusive. Check verdicts also consider timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
 }
-function renderBeeswarm(records) {
+function renderBeeswarm(records,{width=960}={}) {
   const measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
   if(!measured.length)return '<section class="latency-viz"><h2>Request latency</h2><p class="viz-empty">No latency measurements.</p></section>';
   // Use the mosaic's page so every rendered dot remains individually inspectable.
   const page=records.slice((state.mosaicPage || 0)*mosaicPageSize,((state.mosaicPage || 0)+1)*mosaicPageSize).filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0);
   const values=measured.map(r=>r.elapsed_ms).sort((a,b)=>a-b),quantile=q=>values[Math.ceil(q*values.length)-1];
   // Tight clusters far from zero get a zoomed axis; the left label always states where it starts.
-  const max=Math.max(values.at(-1),1),low=values[0]>max*.35?Math.floor(values[0]*.85):0,span=Math.max(1e-9,max-low),width=960,placed=[];
+  const max=Math.max(values.at(-1),1),low=values[0]>max*.35?Math.floor(values[0]*.85):0,span=Math.max(1e-9,max-low),placed=[];
   const xOf=value=>16+(value-low)/span*(width-32);
   for(const r of [...page].sort((a,b)=>a.elapsed_ms-b.elapsed_ms)){
     const x=xOf(r.elapsed_ms);let lane=0,y=0;
@@ -124,8 +124,8 @@ function renderBeeswarm(records) {
     placed.push({r,x,y});
   }
   const extent=Math.max(25,...placed.map(p=>Math.abs(p.y)+10)),top=22,height=extent*2+10+top*2,mid=top+extent+5;
-  const markers=values.length>=4?[['p50',quantile(.5),top-8],['p95',quantile(.95),height-4]].map(([label,value,y])=>{const x=xOf(value),anchor=x>width-140?'end':x<140?'start':'middle';return `<g class="swarm-marker ${label}"><line x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" y1="${top-4}" y2="${height-top+4}"/><text x="${x.toFixed(2)}" y="${y}" text-anchor="${anchor}">${label} ${escape(ms(value))}</text></g>`;}).join(''):'';
-  return `<section class="latency-viz"><div class="viz-heading"><h2>Request latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M16 ${mid}H944" class="swarm-axis"/>${markers}${placed.map(({r,x,y},i)=>`<circle cx="${x.toFixed(2)}" cy="${(mid+y).toFixed(2)}" r="4.5" class="swarm-dot ${requestOutcome(r)}" style="--i:${i}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"><title>${escape(r.fixture_id)} · ${ms(r.elapsed_ms)}</title></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>${ms(low)}</span><span>${ms(max)}</span></div></section>`;
+  const markers=values.length>=4?[['p50',quantile(.5),top-8],['p95',quantile(.95),height-4]].map(([label,value,y])=>{const x=xOf(value),anchor=x>width-120?'end':x<120?'start':'middle';return `<g class="swarm-marker ${label}"><line x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" y1="${top-4}" y2="${height-top+4}"/><text x="${x.toFixed(2)}" y="${y}" text-anchor="${anchor}">${label} ${escape(ms(value))}</text></g>`;}).join(''):'';
+  return `<section class="latency-viz"><div class="viz-heading"><h2>Request latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M16 ${mid}H${width-16}" class="swarm-axis"/>${markers}${placed.map(({r,x,y},i)=>`<circle cx="${x.toFixed(2)}" cy="${(mid+y).toFixed(2)}" r="4.5" class="swarm-dot ${requestOutcome(r)}" style="--i:${i}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>${ms(low)}</span><span>${ms(max)}</span></div></section>`;
 }
 function renderFlightPlan(plan) {
   if(!plan)return '';
@@ -152,7 +152,7 @@ function openLiveRequest(slot) {
 function renderOutcomeStrip() {
   const finished=state.runs.filter(r=>!activeState(r)),tally=key=>finished.filter(r=>runOutcome(r)===key).length;
   const stats=[['Runs',number(state.runs.length),''],['Passed',number(tally('pass')),'pass'],['Failed',number(tally('fail')),'fail'],['Latest',relativeTime(state.runs[0]?.started_at) || '—','']];
-  return `<section class="outcome-overview"><dl class="run-stats">${stats.map(([label,value,kind])=>`<div class="${kind}"><dt>${label}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl><div class="outcome-track"><div class="viz-heading"><h2>Run outcomes</h2><span class="hint">${number(state.runs.length)} ${state.runs.length===1?'run':'runs'} · newest first</span></div><div class="outcome-strip">${state.runs.map(r=>`<a href="${linkRun(r.id)}" class="outcome-segment ${runOutcome(r)}" aria-label="${escape((r.targets || []).map(t=>t.model).join(', '))}: ${escape(statusLabels[runOutcome(r)] || runOutcome(r))}, ${date(r.started_at)}"><span class="sr-only">${escape(statusLabels[runOutcome(r)] || runOutcome(r))}</span></a>`).join('')}</div></div></section>`;
+  return `<section class="outcome-overview"><dl class="run-stats">${stats.map(([label,value,kind])=>`<div class="${kind}"><dt>${label}</dt><dd${/^\d+$/.test(value)?` data-count="${value}"`:''}>${escape(value)}</dd></div>`).join('')}</dl><div class="outcome-track"><div class="viz-heading"><h2>Run outcomes</h2><span class="hint">${number(state.runs.length)} ${state.runs.length===1?'run':'runs'} · newest first</span></div><div class="outcome-strip">${state.runs.map(r=>`<a href="${linkRun(r.id)}" class="outcome-segment ${runOutcome(r)}" aria-label="${escape((r.targets || []).map(t=>t.model).join(', '))}: ${escape(statusLabels[runOutcome(r)] || runOutcome(r))}, ${date(r.started_at)}"><span class="sr-only">${escape(statusLabels[runOutcome(r)] || runOutcome(r))}</span></a>`).join('')}</div></div></section>`;
 }
 let heroEntered=false;
 function renderHeroCoat() {
@@ -240,9 +240,28 @@ function renderRailRuns() {
 // Route changes glide in; re-renders within a view (polling, toggles) stay still.
 function enterRoute() {
   const main=document.querySelector?.('#main');
-  if(main?.animate&&!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)main.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'none'}],{duration:420,easing:'cubic-bezier(.2,.8,.2,1)'});
+  if(!main?.animate||window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
+  main.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'none'}],{duration:420,easing:'cubic-bezier(.2,.8,.2,1)'});
+  // Headline counts tick up from zero; the final text is always the real value.
+  for(const element of main.querySelectorAll('[data-count]')){
+    const target=Number(element.dataset.count),start=performance.now();if(!Number.isFinite(target)||target<2)continue;
+    const tick=now=>{const t=Math.min(1,(now-start)/650),eased=1-Math.pow(1-t,3);element.textContent=t<1?Math.round(target*eased).toLocaleString():element.dataset.countText || target.toLocaleString();if(t<1)requestAnimationFrame(tick);};
+    element.dataset.countText=element.textContent;requestAnimationFrame(tick);
+  }
 }
+// One shared tooltip for spots and dots: instant, and it reads the same label assistive tech hears.
+function showSpotTip(target,x,y) {
+  const tip=$('#spot-tip'),label=target?.getAttribute('aria-label');if(!tip||!label)return;
+  const outcome=['pass','fail','inconclusive','running','idle'].find(name=>target.classList.contains(name)) || 'idle';
+  const [head,...rest]=label.split(/(?<=[.:])\s+/);
+  tip.innerHTML=`<span class="status-spot ${outcome}"></span><span><strong>${escape(head.replace(/[.:]$/,''))}</strong>${rest.length?`<small>${escape(rest.join(' ').replace(/\.\s+/g,' · ').replace(/\.$/,''))}</small>`:''}</span>`;
+  tip.hidden=false;
+  const bounds=tip.getBoundingClientRect(),left=Math.min(window.innerWidth-bounds.width-12,Math.max(12,x+14)),top=y-bounds.height-14<12?y+18:y-bounds.height-14;
+  tip.style.transform=`translate(${Math.round(left)}px,${Math.round(top)}px)`;
+}
+function hideSpotTip() {const tip=$('#spot-tip');if(tip)tip.hidden=true;}
 async function route() {
+  hideSpotTip();
   if($('#dataset-dialog')?.open)closeDatasetDialog();
   for(const id of ['request-dialog','baseline-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
   if ($('#new-run-form')) captureFormDraft();
@@ -1241,6 +1260,22 @@ function browseCheckIntent(category) {
   const search=$('#check-search');if(search)search.value='';
   syncTestControls();
 }
+// Endpoints already tested from this machine, one click from being tested again.
+function renderRecentEndpoints() {
+  const seen=new Map();
+  for(const run of state.runs || [])for(const target of run.targets || [])if(target.url&&target.model&&!seen.has(`${target.url} ${target.model}`))seen.set(`${target.url} ${target.model}`,{...target,outcome:runOutcome(run)});
+  const recent=[...seen.values()].slice(0,3);
+  if(!recent.length)return '';
+  return `<div class="recent-endpoints"><span class="recent-endpoints-label">Recent</span>${recent.map(target=>{let host=target.url;try{host=new URL(target.url).host;}catch{}return `<button type="button" data-action="recent-endpoint" data-url="${escape(target.url)}" data-model="${escape(target.model)}" title="${escape(target.url)}"><span class="status-spot ${escape(target.outcome)}" aria-hidden="true"></span><span class="recent-model">${escape(target.model)}</span><span class="recent-host">${escape(host)}</span></button>`;}).join('')}</div>`;
+}
+function useRecentEndpoint(url,model) {
+  try {
+    assertAppliedConfig();const form=$('#new-run-form');
+    form.elements.url.value=url;form.elements.url.setCustomValidity('');form.elements.model.value=model;form.elements.model.setCustomValidity('');
+    state.autoModel=null;invalidateModelDiscovery();captureFormDraft();configChanged();updateBounds();
+    $('[data-action="test-connection"]')?.focus();
+  }catch(error){configError(error);}
+}
 function useRuntimeShortcut(runtime) {
   const urls={Ollama:'http://localhost:11434/v1',vLLM:'http://localhost:8000/v1',SGLang:'http://localhost:30000/v1','LM Studio':'http://localhost:1234/v1','llama.cpp':'http://localhost:8080/v1'};
   if(!urls[runtime])return;
@@ -1342,7 +1377,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
 <div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Copy command</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div id="setup-context" class="setup-context" hidden></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
   <section class="setup-step-content" id="setup-panel-1" data-setup-panel="1" aria-label="Connect">
   <div class="connection-layout"><section class="setup-section" id="setup-deployment"><h2 class="sr-only">Connection settings</h2><div class="setup-body"><div class="fields">
-  <div class="endpoint-connect">${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}<button type="button" class="button primary" data-action="test-connection">Connect</button></div></div><div class="runtime-shortcuts">${['Ollama','vLLM','SGLang','LM Studio','llama.cpp'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div>
+  <div class="endpoint-connect">${field('url','Endpoint URL',target.url,{type:'url',required:true,full:true,placeholder:'http://localhost:11434/v1',hint:''})}<button type="button" class="button primary" data-action="test-connection">Connect</button></div></div><div class="runtime-shortcuts">${['Ollama','vLLM','SGLang','LM Studio','llama.cpp'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div>${renderRecentEndpoints()}
   <details class="setup-disclosure connection-options" id="connection-options" ${target.api_key_env?'open':''}><summary>Connection options</summary><div class="details-content">
   <details class="setup-disclosure connection-auth" ${target.api_key_env?'open':''}><summary>API key (optional)</summary><div class="details-content"><p class="hint">Only needed if your endpoint requires an API key. Open local endpoints can leave this empty.</p>${field('api_key_env','API key variable',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
   <details class="setup-disclosure model-options" id="model-options"><summary><span id="model-options-label">${target.model?`Model: ${escape(target.model)}`:'Specify model manually'}</span></summary><div class="details-content"><p class="hint">Choose a detected model or enter its exact name to skip detection.</p><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model name',target.model || '',{required:true,placeholder:'e.g. llama3.2:3b',hint:''})}</div></div></details>
@@ -1519,8 +1554,8 @@ function renderDetail() {
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
   $('#main').innerHTML=`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
-  ${renderMosaic(orderedRequests(report))}${renderBeeswarm(orderedRequests(report))}
-  <div class="result-summary">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item"><strong>${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span style="margin-left:auto" class="hint">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div>
+  <div class="evidence-band${report.requests.length<=72?' is-compact':''}">${renderMosaic(orderedRequests(report))}${renderBeeswarm(orderedRequests(report),{width:report.requests.length<=72?500:960})}</div>
+  <div class="result-summary"><div class="summary-bar" aria-hidden="true">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<span class="summary-seg ${k}" style="flex-grow:${counts[k]}"></span>`).join('')}</div><div class="summary-items">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item ${k}"><strong data-count="${counts[k]}">${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}<span class="hint summary-targets">${escape((config.targets || []).map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span></div></div>
   <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" tabindex="${state.tab==='checks'?0:-1}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" tabindex="${state.tab==='baseline'?0:-1}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" tabindex="${state.tab==='config'?0:-1}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
   <section id="result-content" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='checks'?renderChecks(report):state.tab==='baseline'?renderComparison(report):renderConfig(report)}</section>
   <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`;
@@ -1808,6 +1843,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='toggle-checks'){state.checkNavigatorOpen=!state.checkNavigatorOpen;$('#result-content').innerHTML=renderChecks(state.detail.report);$('[data-action="toggle-checks"]')?.focus({preventScroll:true});return;}
   if(action==='check-intent'){browseCheckIntent(event.target.closest('[data-category]').dataset.category);return;}
   if(action==='runtime-shortcut'){useRuntimeShortcut(event.target.closest('[data-runtime]').dataset.runtime);return;}
+  if(action==='recent-endpoint'){const chip=event.target.closest('[data-url]');useRecentEndpoint(chip.dataset.url,chip.dataset.model);return;}
   if(action==='catalogue-category'){state.catalogueCategory=event.target.closest('[data-category]').dataset.category;syncTestControls();return;}
   if(action==='catalogue-filter'){state.catalogueFilter=event.target.closest('[data-catalogue-filter]').dataset.catalogueFilter;syncTestControls();return;}
   if(action==='reset-profile'){try{assertAppliedConfig();const key=event.target.closest('[data-profile]').dataset.profile;captureFormDraft();state.config[key]=null;configChanged();renderNew('custom');$(`[data-profile="${key}"]`)?.focus();}catch(error){configError(error);}return;}
@@ -1967,11 +2003,14 @@ document.addEventListener('scroll',event=>{
   for(const popover of $$('.field-help:popover-open'))popover.hidePopover();
 },true);
 document.addEventListener('cancel',event=>{if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
+document.addEventListener('pointerover',event=>{const spot=event.target.closest?.('.request-spot, .swarm-dot');if(spot)showSpotTip(spot,event.clientX,event.clientY);else hideSpotTip();});
+document.addEventListener('focusin',event=>{const spot=event.target.closest?.('.request-spot, .swarm-dot');if(!spot){hideSpotTip();return;}const box=spot.getBoundingClientRect();showSpotTip(spot,box.left+box.width/2,box.top);});
 document.addEventListener('pointermove',event=>{
+  if(!$('#spot-tip')?.hidden&&event.target.closest?.('.request-spot, .swarm-dot'))showSpotTip(event.target.closest('.request-spot, .swarm-dot'),event.clientX,event.clientY);
   const coat=document.querySelector?.('.hero-coat');if(!coat)return;
   const bounds=coat.getBoundingClientRect();
   coat.style.setProperty('--mx',`${event.clientX-bounds.left}px`);coat.style.setProperty('--my',`${event.clientY-bounds.top}px`);
 },{passive:true});
 window.addEventListener('hashchange',route);
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';refreshRuns().catch(()=>{});await route();}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';await refreshRuns().catch(()=>{});await route();}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
 init();
