@@ -10,14 +10,16 @@ from collections import Counter
 from pathlib import Path
 
 from giraffe.logprob_workload import corpus_width
-from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec
+from giraffe.tool_checks import default_tool_fixture, resolved_tool_fixtures, resolved_tool_modes
+
+from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec, ToolExpectation
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
     "arrivals": {"arrivals"}, "prefix": {"prefix"},
     "buckets": {"buckets", "mixed"}, "sessions": {"sessions"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
-    "forced_tool_diagnostic": {"tools"},
+    "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
 }
 
 
@@ -437,41 +439,39 @@ async def consistency(run, target, client, fixtures):
             )
 
 
-TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Return the weather for a city.",
-        "parameters": {
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-            "additionalProperties": False,
-        },
-    },
-}
+TOOL = default_tool_fixture().tools[0]
 
 
 async def tools(run, target, client):
+    fixtures = resolved_tool_fixtures(run.config)
+    modes = resolved_tool_modes(run.config)
+    custom = bool(run.config.tool_checks and run.config.tool_checks.fixtures)
+    expectations = {
+        fixture.fixture_id: ToolExpectation(
+            tools=fixture.tools, expected_calls=fixture.expected_calls,
+            expected_content=fixture.expected_content)
+        for fixture in fixtures
+    }
     for forced in [False, True] if run.config.forced_tool_diagnostic else [False]:
-        for stream in (False, True) if run.config.stream else (False,):
-            options = {
-                "tools": [TOOL],
-                "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
-                if forced
-                else "auto",
-            }
-            request = spec(
-                "Use get_weather to check the weather in Delhi.",
-                f"tools_{'forced' if forced else 'auto'}_{'stream' if stream else 'complete'}",
-                "tools",
-                max_tokens=run.config.max_output_tokens,
-                options=options,
-                selection="forced diagnostic" if forced else "automatic",
-                capability="required when selected",
-            )
-            request.scorer, request.stream = "tool", stream
-            await run.request(target, client, request)
+        for fixture in fixtures:
+            for mode in modes:
+                selection = "forced diagnostic" if forced else "automatic"
+                prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
+                scenario = f"{prefix}_{'forced' if forced else 'auto'}_{mode}"
+                messages = [message.model_dump() for message in fixture.messages]
+                request = RequestSpec(
+                    fixture_id=f"{scenario}.v1", scenario=scenario, check_ids=["tools"],
+                    messages=messages, scorer="tool", stream=mode == "stream",
+                    input_chars=sum(len(message["content"]) for message in messages),
+                    max_tokens=run.config.max_output_tokens,
+                    options={**fixture.options, "tools": fixture.tools,
+                             "tool_choice": {"type": "function", "function": {
+                                 "name": fixture.expected_calls[0].name}} if forced else "auto"},
+                    tool_expectation=expectations[fixture.fixture_id],
+                    workload={"selection": selection, "capability": "required when selected",
+                              "tool_fixture_id": fixture.fixture_id, "mode": mode},
+                )
+                await run.request(target, client, request)
 
 
 async def execute(run, target, client, fixtures):
@@ -663,28 +663,48 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 status = "inconclusive"
         if check == "tools":
             auto = [r for r in records if r.workload.get("selection") == "automatic"]
-            expected_count = 2 if run.config.stream else 1
+            expected_cases = {(fixture.fixture_id, mode)
+                              for fixture in resolved_tool_fixtures(run.config)
+                              for mode in resolved_tool_modes(run.config)}
+            observed_cases = [(r.workload.get("tool_fixture_id"), r.workload.get("mode"))
+                              for r in auto]
+            complete_coverage = (len(observed_cases) == len(expected_cases)
+                                 and set(observed_cases) == expected_cases)
             metrics["forced_diagnostic"] = [
-                {
-                    "request_id": r.id,
-                    "status": r.status,
-                    "score": r.score,
-                    "reason": r.error or r.score_message,
-                }
+                {"request_id": r.id, "status": r.status, "score": r.score,
+                 "reason": r.error or r.score_message}
+                for r in records if r.workload.get("selection") == "forced diagnostic"
+            ]
+            metrics["outcomes"] = [
+                {"request_id": r.id, "fixture_id": r.workload.get("tool_fixture_id"),
+                 "mode": r.workload.get("mode"), "selection": r.workload.get("selection"),
+                 "score": r.score,
+                 **(r.tool_evaluation.model_dump() if r.tool_evaluation else {})}
                 for r in records
-                if r.workload.get("selection") == "forced diagnostic"
+            ]
+            metrics["parity"] = {
+                "status": "not_established", "basis": "independent_generations",
+                "reason": "Each mode is checked against its fixture. Independent generations "
+                          "can differ; these outcomes do not establish parser loss or exact parity.",
+            }
+            metrics["missing_cases"] = [
+                {"fixture_id": fixture_id, "mode": mode}
+                for fixture_id, mode in sorted(expected_cases - set(observed_cases))
             ]
             metrics["capability_support"] = (
-                "observed for built-in fixture"
-                if len(auto) == expected_count and all(r.score is True for r in auto)
+                "observed for configured fixtures"
+                if complete_coverage and all(r.score is True for r in auto)
                 else "rejected or unverified; see request outcomes"
             )
-            if any(r.score is not True for r in auto):
+            if any(r.score is False or not r.valid or r.status != "completed" for r in auto):
                 status, summary = (
                     "fail",
-                    "Required automatic tool capability failed; parsed calls required and no tools executed.",
+                    "Required automatic tool fixture failed; declared text and calls must pass. "
+                    "No tools were executed.",
                 )
-            elif len(auto) < expected_count:
+            elif any(r.score is None for r in auto):
+                status, summary = "inconclusive", "Tool fixture evaluation could not establish correctness. See component outcomes."
+            elif not complete_coverage:
                 status, summary = (
                     "inconclusive",
                     "Automatic tool coverage unfinished. Forced selection is separate diagnostic evidence.",

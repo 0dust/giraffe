@@ -10,6 +10,7 @@ from giraffe.logprob_workload import corpus_width
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, label_prompt
+from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 
 def _steady_count(rate: float, duration: float) -> int:
@@ -218,8 +219,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         else:
             add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
     if "tools" in selected:
-        count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
-        add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")
+        count = len(resolved_tool_fixtures(config)) * len(resolved_tool_modes(config)) * (2 if config.forced_tool_diagnostic else 1)
+        add("tools", count, "Tool fixtures in each selected response mode; automatic checks precede optional forced diagnostics. No tools execute.",
+            source="configured tool fixtures" if config.tool_checks and config.tool_checks.fixtures else "generated examples")
 
     judging = details["judging"] if details else None
     evaluator = {"active": bool(judging and judging["active"]),

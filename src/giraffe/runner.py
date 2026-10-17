@@ -1146,12 +1146,19 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         workload_identity["logprob_source_sha256"] = hashlib.sha256(
             Path(logprobs.__file__).read_bytes() + Path(logprob_workload.__file__).read_bytes()
         ).hexdigest()
+    if "tools" in config.checks:
+        from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        workload_identity["resolved_tool_checks"] = {
+            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
+            "modes": resolved_tool_modes(config),
+        }
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
         for spec in specs:
             for field, default in (("cancel_after_chunks", None),
-                                   ("expected_provided", False), ("rubric", None)):
+                                   ("expected_provided", False), ("rubric", None),
+                                   ("tool_expectation", None)):
                 if spec[field] == default:
                     del spec[field]
     manifest = {"config": config_values,

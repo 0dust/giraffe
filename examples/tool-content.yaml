@@ -1,0 +1,48 @@
+# Use a model and chat template that support text and tool calls in one response.
+# Giraffe sends requests to this existing endpoint; it never executes the tool.
+targets:
+  - name: local
+    url: http://127.0.0.1:8000/v1
+    model: your-tool-capable-model
+    # api_key_env: INFERENCE_API_KEY
+checks: [tools]
+stream: true
+max_requests: 20
+max_duration_seconds: 120
+request_timeout_seconds: 30
+max_output_tokens: 256
+samples: 3
+retention: failures
+limits:
+  min_samples: 3
+  min_correctness: 1
+  max_error_rate: 0
+tool_checks:
+  modes: [complete, stream]
+  fixtures:
+    - fixture_id: weather-with-text
+      messages:
+        - role: user
+          content: >-
+            In the same assistant response, write exactly "Checking Delhi weather."
+            as assistant text and call get_weather with city Delhi. Do not write
+            any other text. Do not invent weather results.
+      tools:
+        - type: function
+          function:
+            name: get_weather
+            description: Look up the current weather for a city.
+            parameters:
+              type: object
+              properties:
+                city: {type: string}
+              required: [city]
+              additionalProperties: false
+      expected_calls:
+        - name: get_weather
+          arguments: {city: Delhi}
+      expected_content:
+        mode: exact
+        value: Checking Delhi weather.
+        normalization: none
+      options: {temperature: 0}

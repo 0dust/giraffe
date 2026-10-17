@@ -224,3 +224,38 @@ assert(details.open&&input.focused&&input.reported);assert.equal(input.value,'8'
 card.hidden=true;revealCatalogueCheck('correctness');assert.equal(state.catalogueFilter,'all');
 assert.equal(state.catalogueCategory,'all');assert.equal(state.catalogueSearch,'');
 """)
+
+
+def test_tool_fixture_editor_preserves_modes_and_escapes_json():
+    browser_logic(r"""
+const check=bootstrap.checks.find(x=>x.id==='tools');
+config.tool_checks={modes:['stream','complete'],fixtures:[{fixture_id:'mixed',expected_content:{mode:'exact',value:'</textarea><script>bad</script>'}}]};
+const original=JSON.stringify(config),markup=renderProfileEditor(check,config);
+assert.match(markup,/<option value="stream,complete" selected>Saved selection/);
+assert.match(markup,/name="profile_tools_fixtures"[^>]*maxlength="65536"/);
+assert.match(markup,/&lt;\/textarea&gt;&lt;script&gt;bad&lt;\/script&gt;/);
+assert.doesNotMatch(markup,/<script>/);
+assert.match(effectiveCheckSummary(check,config),/1 tool fixture.*Streaming \+ Complete.*Assistant text and calls checked/);
+assert.equal(JSON.stringify(config),original);
+config.tool_checks=null;config.stream=false;
+assert.match(effectiveCheckSummary(check,config),/Built-in weather check.*Complete/);
+assert.doesNotMatch(effectiveCheckSummary(check,config),/Streaming/);
+config.stream=true;assert.match(effectiveCheckSummary(check,config),/Complete \+ Streaming/);
+config.tool_checks={modes:null,fixtures:'[{"unfinished"'};
+assert.match(effectiveCheckSummary(check,config),/Invalid tool fixture draft/);
+assert.match(renderProfileEditor(check,config),/\[\{&quot;unfinished&quot;/);
+""")
+
+
+def test_invalid_tool_fixture_editor_shows_native_error_before_closing():
+    browser_logic(r"""
+config.tool_checks={fixtures:[],modes:null};
+const profile={dataset:{profileSettings:'tools'}},input={name:'profile_tools_fixtures',value:'[',disabled:true,
+  closest(selector){return selector==='[data-profile-settings]'?profile:null;},
+  setCustomValidity(message){this.message=message;},checkValidity(){return !this.message;},focus(){this.focused=true;},reportValidity(){this.reported=true;}};
+const form={elements:{profile_edits_tools:{value:'[]'}},querySelectorAll:()=>[input]};
+revealSetupStep=()=>{};revealCatalogueCheck=()=>{};
+assert.equal(validateProfileDrafts(form,'tools'),false);assert.match(input.message,/JSON array/);
+assert(input.focused&&input.reported);assert.equal(input.disabled,true);
+input.value='[]';assert.equal(validateProfileDrafts(form,'tools'),true);assert.equal(input.message,'');
+""")

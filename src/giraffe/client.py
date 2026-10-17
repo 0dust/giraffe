@@ -21,6 +21,7 @@ from giraffe.logprobs import LogprobBudget
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_RESPONSE_EVENTS = 256
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 
 
@@ -184,9 +185,21 @@ class LLMClient:
         record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
+        response_sequence = -1
+
+        def trace(kind: str, **metadata: int | bool) -> None:
+            # Sequence identifies a response choice, not field order within its JSON.
+            # Text and calls in the same delta have the same sequence. Retain only
+            # bounded structural metadata; prompt/answer fragments and IDs stay out.
+            if spec.scorer != "tool":
+                return
+            if len(record.response_events) >= _MAX_RESPONSE_EVENTS:
+                record.response_events_truncated = True
+                return
+            record.response_events.append({"sequence": response_sequence, "kind": kind, **metadata})
 
         def receive(data: dict[str, Any], *, streaming: bool) -> None:
-            nonlocal last_answer
+            nonlocal last_answer, response_sequence
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
                     and len(server_id) > 4096):
@@ -226,6 +239,9 @@ class LLMClient:
             if len(choices) != 1 or not isinstance(choices[0], dict):
                 raise _ProtocolError("response must contain one completion choice")
             choice = choices[0]
+            if "index" in choice and (type(choice["index"]) is not int or choice["index"] != 0):
+                raise _ProtocolError("invalid completion choice index")
+            response_sequence += 1
             content = choice.get("delta" if streaming else "message")
             if not isinstance(content, dict):
                 raise _ProtocolError("response is missing assistant content")
@@ -242,7 +258,7 @@ class LLMClient:
                 for ordinal, call in enumerate(calls):
                     if not isinstance(call, dict):
                         raise _ProtocolError("invalid tool-call structure")
-                    index = call.get("index", ordinal) if streaming else ordinal
+                    index = call.get("index") if streaming else ordinal
                     if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 16:
                         raise _ProtocolError("invalid tool-call index")
                     part = tool_parts.setdefault(index, {"id": "", "type": "", "function": {"name": "", "arguments": ""}})
@@ -257,8 +273,13 @@ class LLMClient:
                     function = call.get("function", {})
                     if not isinstance(function, dict):
                         raise _ProtocolError("invalid tool-call function")
-                    for key in ("name", "arguments"):
-                        part["function"][key] += _text(function.get(key))
+                    name = _text(function.get("name"))
+                    arguments = _text(function.get("arguments"))
+                    trace("tool_call", index=index, name_length=len(name),
+                          arguments_length=len(arguments), id_present=call.get("id") is not None,
+                          type_present=call.get("type") is not None)
+                    part["function"]["name"] += name
+                    part["function"]["arguments"] += arguments
                     if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
                         record.first_output_ms = (now-start)*1000
                         if first_output_event is not None:
@@ -266,6 +287,7 @@ class LLMClient:
             if answer:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
+                trace("content", offset=len(record.output), length=len(answer))
                 record.output += answer
                 if answer.strip():
                     if record.first_output_ms is None:
@@ -291,6 +313,8 @@ class LLMClient:
             if finish is not None:
                 if not isinstance(finish, str) or not finish:
                     raise _ProtocolError("invalid completion finish reason")
+                if record.finish_reason is not None:
+                    raise _ProtocolError("repeated completion finish reason")
                 record.finish_reason = finish
 
         intentional = spec.cancel_after_ms is not None and (
