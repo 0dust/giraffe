@@ -34,6 +34,9 @@ class FakeClient:
     async def __aexit__(self, *_):
         type(self).closed.append(self.target.name)
 
+    async def ready(self, deadline):
+        return True
+
     async def execute(self, spec, *, first_output_event=None):
         cls = type(self)
         cls.active += 1
@@ -333,7 +336,7 @@ async def test_user_stop_stops_submissions_and_saves_partial(client):
 
 
 async def test_missing_optional_telemetry_does_not_block_api():
-    report = await runner.run_suite(config(checks=["serving", "gpu"], metrics=True))
+    report = await runner.run_suite(config(checks=["serving", "gpu"], metrics=True, gpu_min_observation_seconds=0))
     assert check(report, "serving").status == "pass"
     assert check(report, "gpu").status == "inconclusive"
     assert report.overall == "pass"
@@ -605,12 +608,12 @@ async def test_unstreamed_generation_cannot_pass_a_generation_rate_limit():
     assert result.metrics["generation_rate_samples"] == 0
 
 
-async def test_sustained_timing_failure_visible_even_when_recovery_is_fast(client):
+async def test_sustained_timing_is_observational_when_recovery_is_fast(client):
     client.bad_sustained = True
     report = await runner.run_suite(config(checks=["recovery"],
                                           limits=Limits(latency_ms=100, min_samples=2)))
     result = check(report, "recovery")
-    assert result.status == "fail"
+    assert result.status == "pass"
     assert result.metrics["recovery"]["p95_ms"] < 100
     assert result.metrics["sustained"]["p95_ms"] == 500
 
@@ -654,12 +657,12 @@ async def test_failed_limit_response_cannot_pass_cancellation(client, monkeypatc
     report = await runner.run_suite(config(checks=["cancellation"]))
     result = check(report, "cancellation")
     assert result.status == "fail"
-    assert len(result.metrics["failed_limit_requests"]) == 3
+    assert len(result.metrics["failed_limit_requests"]) == 2
 
 
 async def test_one_sample_still_exercises_both_output_and_stop_limits():
     report = await runner.run_suite(config(checks=["cancellation"], samples=1))
-    assert {r.fixture_id for r in report.requests if r.scenario == "limits"} == {
+    assert {r.fixture_id for r in report.requests if r.scenario in {"limits", "stop_control"}} == {
         "limits.output_cap.v1", "limits.stop.v1", "limits.stop_control.v1"}
     assert check(report, "cancellation").status == "pass"
 
@@ -715,7 +718,7 @@ async def test_metrics_never_inherits_inference_credentials(monkeypatch, same_or
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics" if same_origin else "http://localhost:5555/metrics",
                     api_key_env="GIRAFFE_TEST_KEY")
-    report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True))
+    report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True, gpu_min_observation_seconds=0))
     assert 2 <= len(seen) <= 256
     assert all("Authorization" not in request.headers for request in seen)
     assert "local-test-key" not in report.model_dump_json()
@@ -737,7 +740,7 @@ async def test_stale_gpu_samples_are_unavailable(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
-    report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True))
+    report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True, gpu_min_observation_seconds=0))
     result = check(report, "gpu")
     assert result.status == "inconclusive"
     assert len(result.metrics["unavailable_families"]) == 5
@@ -792,7 +795,7 @@ async def test_oversized_metrics_response_is_unavailable_and_bounded(monkeypatch
     monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
-    report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True))
+    report = await runner.run_suite(config(targets=[target], checks=["gpu"], metrics=True, gpu_min_observation_seconds=0))
     result = check(report, "gpu")
     assert result.status == "inconclusive"
     assert len(consumed) == 2 * len(result.metrics["snapshots"])  # 1 MiB retained + rejecting chunk per scrape.
@@ -997,11 +1000,12 @@ async def test_gpu_freshness_override_survives_shared_telemetry_collection(monke
         **kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(200, text=metrics))))
     target = Target(name="service", model="local", url="http://localhost:1234",
                     metrics_url="http://localhost:1234/metrics")
-    baseline = await runner.run_suite(config(targets=[target], checks=["gpu"]))
-    strict = await runner.run_suite(config(targets=[target], checks=["gpu"],
+    baseline = await runner.run_suite(config(targets=[target], checks=["gpu"], gpu_min_observation_seconds=0))
+    strict = await runner.run_suite(config(targets=[target], checks=["gpu"], gpu_min_observation_seconds=0,
         test_options={"gpu": {"metrics_max_age_seconds": 5}}))
     assert not baseline.requests and not strict.requests
-    assert check(baseline, "gpu").status == "fail"
+    assert check(baseline, "gpu").status == "inconclusive"
+    assert check(baseline, "gpu").metrics["warnings"][0]["historical_xid"] == 1
     assert check(strict, "gpu").status == "inconclusive"
     assert len(check(strict, "gpu").metrics["unavailable_families"]) == 5
     assert strict.observations["targets"]["service"]["serving_telemetry"]["snapshots"]

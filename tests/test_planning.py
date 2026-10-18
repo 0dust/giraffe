@@ -38,8 +38,8 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     ("generation", {"test_options": {"generation": {"samples": 3}}}, 3),
     ("correctness", {"test_options": {"correctness": {"samples": 1}}}, 3),
     ("json", {}, 6),
-    ("cancellation", {}, 14),
-    ("recovery", {"sustained_seconds": 0}, 6),
+    ("cancellation", {}, 15),
+    ("recovery", {"sustained_seconds": 0}, 12),
     ("gpu", {}, 0),
     ("arrivals", {}, 8),
     ("prefix", {}, 15),
@@ -53,8 +53,8 @@ def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, upda
 
 
 @pytest.mark.parametrize("stream,concurrency,kind,known", [
-    (False, 2, "exact", 6),
-    (True, 1, "exact", 6),
+    (False, 2, "exact", 0),
+    (True, 1, "exact", 0),
     (True, 2, "bounded", 12),
 ])
 def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, concurrency, kind, known):
@@ -187,7 +187,7 @@ def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
 
 
 @pytest.mark.parametrize("updates,known", [
-    ({"checks": ["access", "recovery"]}, 7),
+    ({"checks": ["access", "recovery"]}, 13),
     ({"checks": ["access", "context"]}, 7),
     ({"checks": ["access"], "restart_target": "local"}, 1),
     ({"checks": ["access", "correctness"], "custom_fixtures": "/unread/questions.json"}, 1),
@@ -276,3 +276,44 @@ async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview
     assert response.status_code == 200, response.text
     assert response.json()["request_plan"] == expected
     assert schedule_calls == [0, 1]
+
+
+@pytest.mark.parametrize('dataset', [False, True])
+async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch, dataset):
+    from collections import Counter
+    from giraffe import runner
+    from giraffe.models import DEFAULT_CHECKS
+    from tests.test_runner import FakeClient, config as run_config
+    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
+    updates = {}
+    if dataset:
+        updates = {'request_source': 'request_pack', 'request_pack': {'version': 1, 'cases': [
+            {'fixture_id': f'case{index}', 'messages': [{'role': 'user', 'content': 'Return A'}],
+             'scorer': 'exact', 'expected': 'A'} for index in range(3)]}}
+    configured = (run_config(checks=['correctness'], **updates) if dataset else
+                  RunConfig(targets=run_config().targets, checks=list(DEFAULT_CHECKS)))
+    report = await runner.run_suite(configured)
+    counts = Counter(record.scenario for record in report.requests)
+    preview = plan(configured)
+    scenarios = {'context_first_batch': ['context'],
+                 'correctness': [f'correctness_c{configured.concurrency}'],
+                 'json': [f'json_c{configured.concurrency}'],
+                 'capacity': [name for name in counts if name.startswith('traffic_stage_')],
+                 'cancellation': ['limits', 'client_cancel', 'client_deadline', 'cancellation_probe'],
+                 'limits.stop_control': ['stop_control']}
+    for row in preview['rows']:
+        if row['kind'] == 'exact' and row['requests_per_target']:
+            assert sum(counts[name] for name in scenarios.get(row['id'], [row['id']])) == row['requests_per_target'], row
+    assert 'client_error' not in report.observations['targets']['service']
+    assert preview['known_per_target'] <= len(report.requests)
+    if dataset:
+        assert preview['planned_per_target'] == len(report.requests) == 6
+
+
+def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
+    configured = config(checks=['access', 'fairness', 'recovery'], max_requests=28,
+                        concurrency=4, samples=4)
+    preview = plan(configured)
+    assert preview['known_per_target'] <= 28 < preview['conservative_requests_per_target']
+    assert preview['adaptive_estimates']['sustained'] >= 8
+    assert any('likely to be starved' in warning for warning in preview['warnings'])

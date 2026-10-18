@@ -587,6 +587,8 @@ class RunConfig(Model):
     structured_json: bool = False
     metrics: bool = False
     metrics_interval_seconds: float = Field(default=1, ge=.1, le=60)
+    gpu_min_observation_seconds: float = Field(default=30, ge=0,
+        description="Minimum GPU observation window; match exporter refresh, independently of scrape interval. Bounded by run duration.")
     metrics_timeout_seconds: float = Field(default=2, gt=0, le=10)
     metrics_max_samples: int = Field(default=256, ge=2, le=4096)
     metrics_max_series: int = Field(default=128, ge=1, le=1024)

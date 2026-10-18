@@ -122,12 +122,12 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
             return self
         async def __aexit__(self, *args):
             pass
+        async def ready(self, deadline):
+            attempts.append("GET models")
+            return len(attempts) == 4
         async def execute(self, spec, **kwargs):
             attempts.append(spec.scenario)
-            record = await super().execute(spec, **kwargs)
-            if len(attempts) <= 3:
-                record.valid, record.status, record.http_status = False, "failed", 503
-            return record
+            return await super().execute(spec, **kwargs)
     async def restart(run, target):
         run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic()}
         return True
@@ -135,7 +135,9 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
     monkeypatch.setattr(runner, "_restart", restart)
     run = runner._Run(cfg, None, None)
     await runner._target(run, cfg.targets[0], builtin_fixtures(cfg))
-    assert len(attempts) == 4 and run.errors == 0 and run.reason is None
+    assert attempts == ["GET models"] * 4 + ["readiness"]
+    assert run.errors == run.budget_used == 0 and run.reason is None
+    assert len(run.observations["t"]["readiness_requests"]) == 1
     assert run.observations["t"]["restart"]["status"] == "ready"
     result = next(c for c in runner._checks(run, cfg.targets[0]) if c.id == "access")
     assert result.status == "pass" and result.metrics["attempted"] == 1
@@ -150,7 +152,7 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
             return self
         async def __aexit__(self, *args):
             pass
-        async def execute(self, *args, **kwargs):
+        async def ready(self, deadline):
             await asyncio.sleep(1)
     async def restart(run, target):
         run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic()}

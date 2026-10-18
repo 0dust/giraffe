@@ -155,6 +155,24 @@ class LLMClient:
             await self._client.aclose()
             self._client = None
 
+    async def ready(self, deadline: float) -> bool:
+        """Poll the advertised model route without spending an inference request."""
+        if self._client is None:
+            raise RuntimeError("Use LLMClient as an async context manager")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            async with asyncio.timeout(remaining):
+                response = await self._client.get(completion_url(self.target.url).removesuffix("/chat/completions") + "/models",
+                                                  timeout=min(5, remaining))
+                if response.status_code == 404:
+                    origin = httpx.URL(self.target.url).copy_with(path="/health")
+                    response = await self._client.get(origin, timeout=min(5, remaining))
+                return response.is_success
+        except (httpx.HTTPError, OSError, TimeoutError):
+            return False
+
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
     ) -> RequestRecord:
@@ -171,7 +189,7 @@ class LLMClient:
         )
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
-            if key not in _RESERVED_OPTIONS
+            if key not in _RESERVED_OPTIONS and value is not None
         }
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
@@ -318,6 +336,12 @@ class LLMClient:
                             record.logprob_evidence = LogprobEvidence(status="rejected" if rejected else "incomplete",
                                 reason="Logprob request field rejected." if rejected else "HTTP request failed; logprob support unverified.",
                                 requested_top_logprobs=spec.workload["top_logprobs"])
+                        if response.status_code == 400 and spec.scenario.startswith("context"):
+                            # Classify only this documented rejection; never retain
+                            # arbitrary server error text or echoed request content.
+                            body = (await _limited_body(response)).decode("utf-8", errors="replace").lower()
+                            if any(term in body for term in ("context length", "context_length", "maximum context", "too many tokens")):
+                                raise _ProtocolError("HTTP 400: context length rejection")
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):
@@ -357,6 +381,8 @@ class LLMClient:
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
+        except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            record.status, record.error = "failed", f"request failed ({type(exc).__name__})"
         except httpx.TimeoutException as exc:
             record.status, record.error = "timeout", f"request timeout ({type(exc).__name__})"
         except asyncio.CancelledError:
@@ -373,7 +399,8 @@ class LLMClient:
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
             if record.valid and record.status == "completed":
-                answer = record.output
+                from .fixtures import final_answer
+                answer, _, _ = final_answer(record.output)
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()

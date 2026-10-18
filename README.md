@@ -299,7 +299,14 @@ fixtures are used only when correctness is selected.
 `--metrics` reads the
 target's optional `metrics_url`. GPU evidence requires fresh source timestamps or
 values changing across scrapes, plus every required family per observed device.
-XID errors and active thermal/power throttle reasons fail. Missing evidence is
+New XID values or repeated hardware/thermal slowdown bits fail; historical XIDs
+and software power caps are informational. `gpu_min_observation_seconds` sets the
+minimum GPU observation window (default 30, accepts zero), independently of
+`metrics_interval_seconds`. Set it to your exporter's refresh period; for example,
+`gpu_min_observation_seconds: 1` for a one-second exporter. GPU runs wait only for
+the remaining window, bounded by the run deadline. A shorter observation window is
+inconclusive. The final `end` scrape also closes the GPU window; all scrapes share
+`metrics_max_samples`, preserving the first `start` and last `end`. Missing evidence is
 inconclusive; this is not device health certification. No node agents are installed.
 
 ### Use your own requests under traffic
@@ -363,21 +370,39 @@ including within arrays and objects. Schema validation alone checks structure.
 None of these establishes general chatbot quality.
 
 Semantic scoring and judging strip leading `<think>`, `<thinking>`, or `<reasoning>`
-blocks, case-insensitively, and save `reasoning_stripped` on the request record.
+blocks, case-insensitively, including reasoning opened in the chat template
+(output starts mid-reasoning before a closing tag), and save `reasoning_stripped` on the request record.
 Raw response evidence follows the configured retention policy. An unclosed block
 or a block with no final answer remains unscored: `reasoning without final answer`.
-When `finish_reason` is `length`, a deterministic answer that does not satisfy its
-scorer remains unscored: `truncated before a complete answer`. A full matching
+When `finish_reason` is `length`, an exact answer is unscored only if it is a strict
+normalized prefix of the expected value. A complete wrong JSON value or schema
+violation fails; JSON cut off during parsing remains unscored. Missing contains
+matches remain unscored under truncation. A full matching
 exact/contains answer or complete valid matching JSON can still be scored.
 Judges never receive truncated answers. Missing scores leave correctness coverage
 inconclusive rather than counting incomplete answers as wrong.
 
 Built-in known-answer correctness, JSON, context, short and traffic fixtures
-request `temperature: 0` unless `request_options` explicitly supplies a temperature.
+request `temperature: 0` only when neither run nor case options supply one.
+Case temperature takes precedence; None-valued payload options are omitted.
 This requests deterministic decoding; server support is not independently verified.
 Context fact positions are separated by at least 32 characters within each input
 size. Small context budgets produce fewer positions; per-request workload metadata
-`position_coverage` lists the exercised positions and marks reduced coverage.
+`position_coverage` lists the exercised positions and marks reduced coverage,
+which prevents a pass. Non-timeout HTTP/protocol failures on context prompts fail.
+
+Fairness copies 48 common short words, reserving 12 extra output tokens, and needs
+visible overlap; insufficient caps or observed truncation leave it inconclusive.
+Recovery reserves its baseline, probes and later fixed work. A consumed load
+allowance can qualify with enough requests and at least 90% time-weighted occupancy
+at the configured peak concurrency. Metrics report the completion condition.
+Recovery timing/error limits apply to probes; heavy-load timeouts are observations,
+while genuine server/protocol errors can fail. Capacity stages are exempt from
+serving/access/first-output checks; other stress traffic exempts only timeouts and
+intentional cancellation, keeping real HTTP/protocol errors visible. Setup counts
+include quiet baselines, the pack loaded pass, and stop controls; adaptive estimates
+warn about likely budget starvation. Nonstreaming cancellation is inconclusive:
+`client cancellation requires streaming`.
 
 Giraffe sends each case once quietly. With capacity selected, the same weighted
 pack supplies continuous arrivals; every case's loaded answers also enter its
@@ -545,8 +570,9 @@ giraffe cold-start --config my-test-service.yaml --restart service --output runs
 The command invokes only that hook. It does not provision deployments or reboot
 nodes. A missing hook blocks the cold-start run. After the hook completes, readiness
 retries use `readiness_timeout_seconds` (default 180 seconds), bounded by the run
-deadline and request budget. Retries back off from 0.1 to 2 seconds; readiness
-failures do not consume `stop_after_errors`. Use an isolated test service when
+deadline. GET `/v1/models` polls (or `/health` on 404) back off from 0.1 to 5
+seconds, then one inference verifies readiness. These probes are recorded separately
+and excluded from `max_requests` and `stop_after_errors`. Use an isolated test service when
 measuring restarts or load.
 
 ## Offline and container use

@@ -129,7 +129,8 @@ async def test_discovery_conflict_mid_run_change_and_client_target_separation():
             },
         )
         report = await run_suite(
-            config(endpoint, targets=[t], metrics=True, metrics_interval_seconds=0.1)
+            config(endpoint, targets=[t], metrics=True, metrics_interval_seconds=0.1,
+                   gpu_min_observation_seconds=0)
         )
     snapshot = report.observations["targets"]["local"]["deployment"]
     assert snapshot["fields"]["runtime.version"]["reported"]["value"] == "0.30.0"
@@ -161,6 +162,7 @@ async def test_periodic_serving_scrapes_cover_phases_bounded_cardinality_and_sam
                 targets=[target(endpoint)],
                 metrics=True,
                 metrics_interval_seconds=0.1,
+                gpu_min_observation_seconds=0,
                 metrics_max_samples=3,
                 metrics_max_series=2,
             )

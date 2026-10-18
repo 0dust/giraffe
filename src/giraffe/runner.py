@@ -19,7 +19,7 @@ from typing import Callable
 from .client import LLMClient
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
-                       score_response, traffic_fixtures)
+                       score_response, traffic_fixtures, deterministic_options)
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
 from .models import (
     CHECK_NAMES, CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
@@ -89,6 +89,19 @@ def _stress(scenario):
             or scenario in {"sustained", "recovery", "recovery_baseline", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
                             "cancellation_probe"})
+
+
+def _context_rejection(record):
+    return record.http_status == 400 and any(word in (record.error or "").lower()
+        for word in ("context length", "context_length", "maximum context", "too many tokens"))
+
+
+def _serving_failure(record, scenario):
+    if scenario.startswith("traffic_stage_") or record.status == "cancelled":
+        return False
+    if _stress(scenario) and (record.status == "timeout" or _context_rejection(record)):
+        return False
+    return record.status != "completed" or not record.valid
 
 
 def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSpec:
@@ -212,7 +225,7 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False):
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
@@ -224,7 +237,7 @@ class _Run:
             stopped = not admitted or self.stop.is_set() or time.monotonic() >= min(
                 self.deadline, deadline_override if deadline_override is not None else self.deadline) or (
                 self.errors >= self.config.stop_after_errors)
-            if stopped or (not budget_reserved and not self.reserve_offer(target.name)):
+            if stopped or (not budget_reserved and not budget_exempt and not self.reserve_offer(target.name)):
                 self.unfinished[target.name].update(spec.check_ids)
                 return None
             self.attempted += 1
@@ -305,9 +318,12 @@ class _Run:
                 timeout_override is not None and record.status == "timeout")
             readiness = spec.scenario == "readiness" or (
                 spec.scenario == "initial" and self.config.restart_target == target.name)
-            if (not _stress(spec.scenario) and not readiness and not intentional
-                    and record.status != "cancelled" and (record.status != "completed" or not record.valid)):
+            if _serving_failure(record, spec.scenario) and not readiness and not intentional:
                 self.errors += 1
+                record.check_ids = list(dict.fromkeys([*record.check_ids, *[
+                    name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
+            if budget_exempt:
+                self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
             # Live visualization gets measurements only, never retained response bodies.
             self.emit("request_completed", target.name, spec.scenario, status=record.status,
                       request_slot=request_slot, request=record.model_dump(mode="json", include={
@@ -404,9 +420,36 @@ def _gpu_snapshot(snapshot):
 
 async def _metrics(run, target, phase):
     from giraffe.telemetry import scrape
+    data = run.observations[target.name]["serving_telemetry"]
+    # Reserve the last slot for the final end scrape, including GPU-only runs.
+    limit = run.config.metrics_max_samples - (phase != "end")
+    if len(data["snapshots"]) >= limit:
+        data["sample_limit_reached"] = True
+        return
     snapshot = await scrape(run, target, phase, force=True)
-    run.observations[target.name]["serving_telemetry"]["snapshots"].append(snapshot)
+    data["snapshots"].append(snapshot)
     run.observations[target.name]["metrics"].append(_gpu_snapshot(snapshot))
+
+
+async def _finish_gpu_observation(run, target):
+    """Allow DCGM at least one refresh, bounded by the enclosing run deadline."""
+    data = run.observations[target.name]["serving_telemetry"]
+    first = next((snap["elapsed_seconds"] for snap in data["snapshots"]
+                  if any(sample["family"] in _GPU_FAMILIES for sample in snap.get("samples", []))), None)
+    window = run.config.gpu_min_observation_seconds
+    if first is not None and not run.stop_reason():
+        delay = min(max(0, window-(time.monotonic()-run.start-first)),
+                    max(0, run.deadline-time.monotonic()-.01))
+        if delay:
+            try:
+                await asyncio.wait_for(run.stop.wait(), delay)
+            except TimeoutError:
+                pass
+    await _metrics(run, target, "end")
+    elapsed = data["snapshots"][-1]["elapsed_seconds"] - first if first is not None else 0
+    run.observations[target.name]["gpu_observation_window"] = {
+        "required_seconds": window, "elapsed_seconds": elapsed,
+        "complete": first is not None and elapsed >= window}
 
 
 async def _fairness(run, target, client, fixtures):
@@ -418,8 +461,10 @@ async def _fairness(run, target, client, fixtures):
         return
     short_fixtures = [spec for spec in fixtures["generation"]
                       if spec.fixture_id.startswith("fairness.copy.")]
-    if config.max_output_tokens < 64:
-        observation["reason"] = "Fairness needs an output cap of at least 64 tokens for its active short stream."
+    needed = len(short_fixtures[0].expected.split()) + 12
+    observation["needed_output_tokens"] = needed
+    if config.max_output_tokens < needed:
+        observation["reason"] = f"Fairness needs an output cap of at least {needed} tokens for its active short stream."
         run.unfinished[target.name].add("fairness")
         return
     for index in range(config.samples):
@@ -502,14 +547,15 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         # GPU observations do not require an inference client or an unrelated
         # warm-up. An explicitly requested restart still needs readiness probes.
         if enabled == {"gpu"} and config.restart_target != target.name:
-            await _metrics(run, target, "before")
-            await _metrics(run, target, "after")
+            await _metrics(run, target, "start")
             return
         async with LLMClient(target, config) as client:
             client.logprob_budget = run.logprob_budget
+            if "gpu" in enabled and not config.metrics:
+                await _metrics(run, target, "start")
             if config.metrics:
                 data = run.observations[target.name]["serving_telemetry"]
-                data["snapshots"].append(await telemetry.scrape(run, target, "start"))
+                await _metrics(run, target, "start")
                 telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
             elif target.deployment.collector_url:
                 telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
@@ -524,16 +570,26 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     backoff = .1
                     initial = []
-                    while time.monotonic() < ready_deadline and run.allowed(target.name):
-                        probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
-                        record = await run.request(target, client, probe, deadline_override=ready_deadline)
-                        if record and record.valid:
-                            record.check_ids = [name for name in ("access", "serving", "first_output")
-                                                if name in enabled]
-                            initial = [record]
+                    restart["health_polls"] = []
+                    while time.monotonic() < ready_deadline and not run.stop_reason():
+                        try:
+                            async with asyncio.timeout_at(ready_deadline):
+                                ready = await client.ready(ready_deadline)
+                        except TimeoutError:
+                            ready = False
+                        restart["health_polls"].append({"elapsed_seconds": time.monotonic()-run.start,
+                                                        "ready": ready})
+                        if ready:
+                            probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
+                            record = await run.request(target, client, probe, deadline_override=ready_deadline,
+                                                       budget_exempt=True)
+                            if record and record.valid:
+                                record.check_ids = [name for name in ("access", "serving", "first_output")
+                                                    if name in enabled]
+                                initial = [record]
                             break
                         await asyncio.sleep(min(backoff, max(0, ready_deadline-time.monotonic())))
-                        backoff = min(2, backoff * 2)
+                        backoff = min(5, backoff * 2)
                     restart["status"] = "ready" if initial else "blocked"
                     restart["readiness_ms"] = round((time.monotonic()-restart.pop("started_monotonic"))*1000, 3)
                     if restart["status"] == "blocked":
@@ -625,7 +681,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                             concurrency=effective.concurrency, checks=["correctness"])
                         continue
                     effective = _check_config(config, check_id)
-                    specs = [spec.model_copy(update={"options": {"temperature": 0, **spec.options}})
+                    specs = [spec.model_copy(update={"options": deterministic_options(config, spec.options)})
                              for spec in fixtures[check_id]]
                     await run.group(target, client, specs, f"{check_id}_c{effective.concurrency}",
                                     count=max(effective.samples, len(specs)),
@@ -633,14 +689,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             if "cancellation" in enabled:
                 effective = _check_config(config, "cancellation")
                 options = config.effective_check("cancellation")
-                normal = sorted([spec.model_copy(update={"scorer": "none", "options": {
-                                     "temperature": 0, **spec.options}})
+                normal = [spec.model_copy(update={"scorer": "none", "options": deterministic_options(config, spec.options)})
                                  if spec.fixture_id.startswith("limits.stop.") else spec
-                                 for spec in fixtures["limits"] if spec.cancel_after_ms is None],
-                                key=lambda spec: not spec.fixture_id.startswith("limits.stop_control"))
+                                 for spec in fixtures["limits"] if spec.cancel_after_ms is None
+                                 and not spec.fixture_id.startswith("limits.stop_control")]
                 cancel = [spec.model_copy(update={"cancel_after_ms": None,
                                                  "cancel_after_chunks": options["cancel_after_chunks"]})
                           for spec in fixtures["limits"] if spec.cancel_after_ms is not None]
+                await run.group(target, client, [spec for spec in fixtures["limits"]
+                                if spec.fixture_id.startswith("limits.stop_control")], "stop_control",
+                                count=1, checks=["cancellation"])
                 await run.group(target, client, normal, "limits",
                                 count=max(effective.samples, len(normal)), checks=["cancellation"])
                 await run.group(target, client, cancel, "client_cancel", count=len(cancel),
@@ -667,12 +725,12 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 remaining = min(config.max_requests-run.budget_used,
                                 run.quotas[target.name]-run.budget_counts[target.name])
                 reserved = later_plan["known_per_target"] + effective.samples
-                # At most half of the remaining target quota goes to adaptive
-                # sustained traffic; fixed later work and recovery probes are reserved.
-                allowance = max(0, min(remaining // 2, remaining-reserved))
+                # Preserve later fixed work and probes; cap the remaining share
+                # only when another selected check still needs request budget.
+                allowance = max(0, min(remaining // 2 if later else remaining, remaining-reserved))
                 run.observations[target.name]["sustained_budget"] = {
                     "allowance": allowance, "reserved_later": reserved,
-                    "policy": "at most half the remaining quota; reserve fixed later work and probes"}
+                    "policy": "reserve fixed later work and probes; half quota cap only with later checks"}
                 heavy = traffic_fixtures(config)
                 heavy_specs = heavy["long_input"] + heavy["long_output"]
                 end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
@@ -691,9 +749,22 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await asyncio.gather(*(worker() for _ in range(effective.concurrency)))
                 run.emit("scenario_finished", target.name, "sustained")
                 run.observations[target.name]["sustained_batches"] = dispatched
-                run.observations[target.name]["sustained_complete"] = (
-                    time.monotonic() >= end and not exhausted
-                    and run.peak[(target.name, "sustained")] >= effective.concurrency)
+                sustained = [r for r in run.records if r.target == target.name and r.scenario == "sustained"]
+                window_ms = max((r.completed_ms for r in sustained), default=0) - min(
+                    (r.dispatch_ms for r in sustained), default=0)
+                weighted = sum(r.completed_ms-r.dispatch_ms for r in sustained) / window_ms if window_ms else 0
+                enough = len(sustained) >= max(effective.limits.min_samples, effective.concurrency*2)
+                # Dispatch/refill and drain edges make an exact time average of C
+                # impossible. Require >=90% occupancy as well as the observed peak.
+                loaded = enough and weighted >= effective.concurrency*.9 and run.peak[(target.name, "sustained")] >= effective.concurrency
+                elapsed = time.monotonic() >= end and end < run.deadline
+                complete = (elapsed and run.peak[(target.name, "sustained")] >= effective.concurrency) or (exhausted and loaded)
+                run.observations[target.name]["sustained_complete"] = complete
+                run.observations[target.name]["sustained_completion"] = {
+                    "reason": "duration elapsed" if elapsed and complete else
+                              "allowance consumed with sustained concurrency" if complete else "insufficient load evidence",
+                    "time_weighted_in_flight": weighted, "minimum_occupancy_fraction": .9,
+                    "requests": len(sustained), "required_requests": max(effective.limits.min_samples, effective.concurrency*2)}
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             await workloads.execute(run, target, client, fixtures)
@@ -710,9 +781,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             telemetry_task.cancel()
             await asyncio.gather(telemetry_task, return_exceptions=True)
         data = run.observations[target.name]["serving_telemetry"]
-        if config.metrics:
-            data["snapshots"].append(await telemetry.scrape(run, target, "end"))
-        else:
+        if "gpu" in enabled and "gpu_observation_window" not in run.observations[target.name]:
+            await _finish_gpu_observation(run, target)
+        elif config.metrics:
+            await _metrics(run, target, "end")
+        elif len(data["snapshots"]) < config.metrics_max_samples:
             data["snapshots"].append(await telemetry.scrape(run, target, "not collected"))
         telemetry.summarize(data, config.cache_pressure_threshold)
         if config.metrics:
@@ -839,7 +912,8 @@ def _pack_results(run: _Run, target: Target) -> dict:
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
-    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}]
+    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
+                or _serving_failure(r, r.scenario)]
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]
@@ -876,6 +950,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif check_id == "gpu":
             from .telemetry import assess_gpu
             metrics, status, summary = assess_gpu(observations["metrics"], config.metrics_max_age_seconds)
+            window = observations.get("gpu_observation_window")
+            metrics["observation_window"] = window
+            if window and not window["complete"] and status != "fail":
+                status, summary = "inconclusive", "GPU observation window shorter than exporter refresh."
         elif not records and check_id != "capacity":
             status, summary = "inconclusive", "No applicable requests completed within the run budget."
         elif check_id == "access":
@@ -1015,13 +1093,24 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics.update({"declared_context_limit": config.context_limit, "observed_max_input_tokens": observed_max,
                                 "near_limit_coverage": observed_max is not None and observed_max >= config.context_limit * .8,
                                 "calibration": observations.get("context_calibration")})
-            if check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and max(
+                coverage = {}
+                for record in records:
+                    if record.scenario == "context" and "position_coverage" in record.workload:
+                        size = record.fixture_id.split(".")[1]
+                        coverage[size] = record.workload["position_coverage"]
+                metrics["position_coverage"] = coverage
+                metrics["reduced_position_coverage"] = any(row["reduced"] for row in coverage.values())
+            if check_id == "context" and any(_serving_failure(r, r.scenario) for r in records):
+                status, summary = "fail", "Context prompts encountered HTTP or protocol failures."
+            elif check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and max(
                     (r.overlap for r in records if r.score is not None), default=0) < 2:
                 status, summary = "inconclusive", "Known-answer checks were not exercised concurrently."
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
+            elif check_id == "context" and metrics["reduced_position_coverage"]:
+                status, summary = "inconclusive", "reduced fact-position coverage (context_limit too small)"
             elif check_id == "context" and not metrics["near_limit_coverage"]:
                 status, summary = "inconclusive", "Recall fixtures passed at observed lengths; near-limit token context was not verified."
             else:
@@ -1066,6 +1155,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Output token usage and length finish reason missing; output cap compliance is unverified."
             else:
                 summary = "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified."
+            if not config.stream:
+                status, summary = "inconclusive", "client cancellation requires streaming"
             backend = metrics["backend_cancellation"]
             from giraffe.backend_cancellation import server_stop_result
             server_stop = server_stop_result(backend)
@@ -1102,14 +1193,20 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             ratio_failed = limits.recovery_max_ratio is not None and any(
                 ratio is not None and ratio > limits.recovery_max_ratio for ratio in (latency_ratio, first_ratio))
             windows = [sustained[i:i+config.concurrency] for i in range(0, len(sustained), config.concurrency)]
+            probe_stats = _stats(probes)
             accuracy = metrics["correct"] / metrics["scored"] if metrics["scored"] else None
+            sustained_errors = sum(_serving_failure(r, "sustained") for r in sustained)
+            sustained_error_rate = sustained_errors / len(sustained) if sustained else 0
             metrics.update({"sustained": _stats(sustained), "recovery": after,
                             "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
                             "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
-                            "unscored_completions": metrics["completed"] - metrics["scored"],
+                            "unscored_completions": probe_stats["completed"] - probe_stats["scored"],
+                            "sustained_non_timeout_error_rate": sustained_error_rate,
+                            "sustained_completion": observations.get("sustained_completion"),
                             "rolling_windows": [_stats(window) for window in windows]})
-            violations = _timing_violations(records, limits)
-            if ((metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate)
+            violations = _timing_violations(probes, limits)
+            if ((probe_stats["error_rate"] is not None and probe_stats["error_rate"] > limits.max_error_rate)
+                    or sustained_error_rate > limits.max_error_rate
                     or ((violations or ratio_failed) and not saturated)
                     or (accuracy is not None and accuracy < limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
@@ -1118,9 +1215,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
                                         limits.min_output_tokens_per_second, limits.recovery_max_ratio)):
                 status, summary = "inconclusive", "Generator saturation prevents attributing sustained and recovery timing to the endpoint."
-            elif _missing_timing(records, limits):
-                metrics["missing_timing_metrics"] = _missing_timing(records, limits)
-                status, summary = "inconclusive", "Configured sustained and recovery limits cannot be checked with available timing or token measurements."
+            elif _missing_timing(probes, limits):
+                metrics["missing_timing_metrics"] = _missing_timing(probes, limits)
+                status, summary = "inconclusive", "Configured recovery limits cannot be checked with available timing or token measurements."
             elif (not observations.get("sustained_complete") or len(probes) < config.samples
                   or len(baseline) < config.samples):
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."

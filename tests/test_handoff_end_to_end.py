@@ -77,7 +77,7 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
                 r["fixture_id"] for r in original["report"]["requests"]
             }
             if request_source == "request_pack":
-                assert len(replay["requests"]) == 6
+                assert len(replay["requests"]) == 12
                 assert replay["requests"][0]["fixture_id"] == "pack:operator-question-0"
                 assert endpoint.requests[before:][0]["messages"] == config["request_pack"]["cases"][0]["messages"]
             if compare:
