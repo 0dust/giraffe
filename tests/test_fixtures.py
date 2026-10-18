@@ -64,8 +64,8 @@ def test_context_lengths_are_bounded_and_fact_positions_vary(context_limit):
     configured = config(context_limit=context_limit)
     fixtures = builtin_fixtures(configured)
     context = fixtures["context"]
-    assert len(context) == 6
-    assert {spec.context_position for spec in context} == {"beginning", "middle", "end"}
+    assert len(context) == (2 if context_limit == 128 else 6)
+    assert {spec.context_position for spec in context} == ({"beginning"} if context_limit == 128 else {"beginning", "middle", "end"})
     assert len({spec.input_chars for spec in context}) == 2
     for spec in context + fixtures["long"]:
         text = spec.messages[0]["content"]

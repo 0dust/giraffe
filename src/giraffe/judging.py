@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack
 from typing import Callable
 
 from giraffe.client import LLMClient
+from giraffe.fixtures import REASONING_WITHOUT_ANSWER, TRUNCATED_ANSWER, final_answer
 from giraffe.models import (
     JUDGE_PROMPT_VERSION, JudgeEndpoint, JudgeVote, RequestJudgement,
     RequestRecord, RequestSpec, RunConfig, Target,
@@ -57,7 +58,7 @@ def _vote(judge: JudgeEndpoint, result: RequestRecord) -> JudgeVote:
         return _error(judge, "truncated_response" if result.finish_reason == "length"
                       else "invalid_completion", observed)
     try:
-        data = json.loads(result.output, object_pairs_hook=_unique_object)
+        data = json.loads(final_answer(result.output)[0], object_pairs_hook=_unique_object)
         if (not isinstance(data, dict) or set(data) != {"verdict", "reason"}
                 or type(data["verdict"]) is not bool or not isinstance(data["reason"], str)
                 or not data["reason"].strip() or len(data["reason"]) > 2000):
@@ -75,7 +76,7 @@ def _request(spec: RequestSpec, record: RequestRecord, config: RunConfig) -> Req
         max_tokens=config.judging.max_output_tokens,
         messages=[{"role": "system", "content": _POLICY}, {"role": "user", "content": json.dumps({
             "messages": spec.messages, "reference_answer": spec.expected,
-            "generated_answer": record.output, "rubric": spec.rubric,
+            "generated_answer": final_answer(record.output)[0], "rubric": spec.rubric,
         }, ensure_ascii=False)}],
     )
 
@@ -93,11 +94,24 @@ async def judge_records(
     start = time.monotonic()
     settings = config.judging
     by_id = {spec.fixture_id: spec for spec in specs if spec.scorer == "judge"}
-    eligible = [record for record in records if record.fixture_id in by_id
-                and record.valid and record.status == "completed"]
+    eligible = []
+    skipped = 0
+    for record in records:
+        if record.fixture_id not in by_id or not record.valid or record.status != "completed":
+            continue
+        answer, stripped, _ = final_answer(record.output)
+        record.reasoning_stripped = record.reasoning_stripped or stripped
+        reason = (REASONING_WITHOUT_ANSWER if stripped and not answer.strip() else
+                  TRUNCATED_ANSWER if record.finish_reason == "length" else None)
+        if reason:
+            record.score, record.score_message = None, reason
+            record.judgement = RequestJudgement(status="inconclusive", votes=[])
+            skipped += 1
+        else:
+            eligible.append(record)
     judges = settings.judges
     summary = dict(eligible_requests=len(eligible), scored_requests=0, passed_requests=0,
-                   failed_requests=0, inconclusive_requests=0, ties=0,
+                   failed_requests=0, inconclusive_requests=skipped, skipped_requests=skipped, ties=0,
                    judge_calls_total=len(eligible) * len(judges), judge_calls_completed=0,
                    judge_calls_errors=0, duration_seconds=0.0, stop_reason=None)
     if not eligible:

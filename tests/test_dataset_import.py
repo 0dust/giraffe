@@ -89,3 +89,13 @@ def test_try_one_preserves_explicit_retention():
     config = try_example_config(ConfigDraft.model_validate(judged_config() | {"retention": "none"}),
                                 "refund", "local")
     assert config.retention == "none"
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_dataset_preview_warns_when_exact_answer_is_in_messages(canonical):
+    text = json.dumps({"version": 1, "cases": [{"fixture_id": "echo", "scorer": "contains", "expected": "4",
+        "messages": [{"role": "user", "content": "Return 4."}]}]}) if canonical else 'question,answer\nReturn 4.,4\n'
+    result = preview_dataset(text, "json" if canonical else "csv", scorer="exact",
+                             **({} if canonical else {"input_field": "question", "expected_field": "answer"}))
+    assert result["request_pack"] and not result["errors"]
+    assert any("echo would pass" in warning for warning in result["warnings"])

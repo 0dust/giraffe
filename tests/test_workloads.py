@@ -313,7 +313,10 @@ def test_fenced_arguments_and_truncated_tool_completion_do_not_pass(arguments, f
             }
         ],
     )
-    assert score_response(request, record).score is False
+    result = score_response(request, record)
+    assert result.score is (None if finish == "length" else False)
+    if finish == "length":
+        assert result.score_message == "truncated before a complete answer"
 
 
 async def test_missing_configured_workload_timing_is_inconclusive():

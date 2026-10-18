@@ -5,6 +5,29 @@ workloads are opt-in and share the same request, duration, concurrency and
 per-request output ceilings. Use [examples/workloads.yaml](../examples/workloads.yaml)
 as a starting point, then match its settings to your server and acceptance limits.
 
+Built-in known-answer fixtures (correctness, JSON, context, short and traffic)
+request temperature zero unless the user sets `request_options.temperature`.
+Semantic scoring uses the final answer after stripping leading inline `think`,
+`thinking`, or `reasoning` blocks (case-insensitive). Request evidence records
+`reasoning_stripped`; raw outputs follow retention settings. Reasoning without a
+final answer is unscored. Nonmatching answers cut off by `finish_reason: length`
+are unscored, including incomplete JSON; complete matching exact/contains/JSON
+answers remain scorable. AI judges skip all truncated and reasoning-only outputs.
+These missing scores leave coverage inconclusive rather than count as wrong answers.
+
+Contains scoring normalizes whitespace and requires alphanumeric boundaries at
+alphanumeric ends of the expected text (`4` cannot match `14` or `40`). Exact and
+contains remain case-sensitive. Request-pack and dataset previews warn when the
+expected text already occurs verbatim in the case's messages; copy/extraction cases
+remain allowed. JSON expected-value equality is structural, including nested arrays
+and objects: numeric `3` equals `3.0`, while boolean `true` never equals numeric `1`.
+Legacy custom fixture files allow only exact, contains, JSON and no scoring.
+
+Context fixtures separate fact positions by at least 32 characters within each
+input size. If the context budget cannot fit three positions, fewer are generated;
+`workload.position_coverage` records the positions, minimum separation and reduced
+coverage. Character placement and returned token counts remain separate evidence.
+
 ## Configure and run
 
 ```sh
