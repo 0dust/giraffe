@@ -27,7 +27,8 @@ metrics_interval_seconds: 2
 metrics_max_samples: 1024
 arrivals: {mode: steady, requests: 12, requests_per_second: 0.5, max_pending: 4}
 prefix: {prefix_chars: 8192, repeats: 6, history_turns: 3}
-buckets:
+concurrent_workloads:
+  scenarios: [size_matrix, mixed_interference, streaming_fairness]
   input_chars: {short: 64, medium: 1024, long: 12288}
   output_tokens: {short: 24, medium: 64, long: 128}
   levels: [1, 2]

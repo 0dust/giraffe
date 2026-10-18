@@ -272,6 +272,33 @@ async def test_statistics_client_setup_does_not_block_inference_scheduling(monke
     assert sample["status"] == "available"
 
 
+async def test_discovery_client_setup_keeps_event_loop_responsive(monkeypatch):
+    from giraffe.deployment import snapshot
+
+    actual = httpx.AsyncClient
+    started, release = threading.Event(), threading.Event()
+
+    def slow_client(**kwargs):
+        started.set()
+        if not release.wait(timeout=1):
+            raise AssertionError("Discovery client setup blocked the event loop")
+        return actual(**kwargs, transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json={"version": "test-version"})))
+
+    monkeypatch.setattr(httpx, "AsyncClient", slow_client)
+    t = Target(name="local", url="http://local", model="test",
+               deployment={"discovery": "vllm"})
+
+    async def heartbeat():
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+
+    result, _ = await asyncio.gather(
+        snapshot(t, RunConfig(targets=[t]), time.monotonic()+5, asyncio.Event()), heartbeat())
+    assert result["fields"]["runtime.version"]["reported"]["value"] == "test-version"
+
+
 def test_counters_resets_replicas_stale_samples_and_gauge_peaks():
     settings = RunConfig(
         targets=[

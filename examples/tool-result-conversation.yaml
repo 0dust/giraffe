@@ -1,0 +1,46 @@
+targets:
+  - name: local
+    url: http://127.0.0.1:11434/v1
+    model: qwen2.5:7b-instruct
+checks: [tools]
+stream: true
+max_requests: 4
+max_duration_seconds: 120
+request_timeout_seconds: 45
+max_output_tokens: 256
+context_limit: 8192
+retention: failures
+tool_checks:
+  modes: [complete, stream]
+  conversations:
+    - fixture_id: weather-result
+      messages:
+        - role: user
+          content: >-
+            Call get_weather for Warsaw. After receiving the result, report the
+            temperature in Celsius, the conditions, and the exact observation_id
+            from the result. Use the supplied result; do not invent values.
+      tools:
+        - type: function
+          function:
+            name: get_weather
+            description: Get the current weather for a city.
+            parameters:
+              type: object
+              properties:
+                city: {type: string}
+              required: [city]
+              additionalProperties: false
+      steps:
+        - expected_calls:
+            - name: get_weather
+              arguments: {city: Warsaw}
+              result:
+                temperature_c: 15
+                conditions: sunny
+                observation_id: '{{observation_id}}'
+      final_content:
+        - {mode: contains, value: '15'}
+        - {mode: contains, value: sunny}
+        - {mode: contains, value: '{{observation_id}}'}
+      options: {temperature: 0}

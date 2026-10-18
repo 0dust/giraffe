@@ -1,6 +1,6 @@
 # Bounded workloads, deployment snapshots and serving telemetry
 
-The ten standard endpoint checks keep their existing defaults. Additional
+The public catalog has 17 checks. Concurrent workloads combines the former fairness, size/concurrency coverage and mixed-interference checks. Additional
 workloads are opt-in and share the same request, duration, concurrency and
 per-request output ceilings. Use [examples/workloads.yaml](../examples/workloads.yaml)
 as a starting point, then match its settings to your server and acceptance limits.
@@ -181,11 +181,12 @@ error allowance.
 | --- | --- | --- |
 | `arrivals` | Steady RPS or bursts, independent of the concurrency cap | Scheduled arrival, dispatch, completion, waiting and unissued counts; a bounded pending queue drops excess arrivals visibly. Seed is recorded; current schedule is deterministic and has no jitter. |
 | `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified; independent controls must report less than the reuse threshold. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
-| `buckets` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
-| `buckets.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
+| `concurrent_workloads` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
+| `concurrent_workloads.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the completed final answer after stripping inline reasoning; fixed history uses the seeded session name at every turn. Sessions refill as each conversation finishes. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
 | `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is inconclusive unless `strict: true` makes it fail; full agreement can pass. Temperature/seed support is requested, not universally verified. |
-| `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
+| `tool_calling` / `checks: [tools]` | Automatic tool selection using the built-in Delhi weather request or configured `tool_checks.fixtures` | Separate response protocol, tool-call and optional assistant-text outcomes. Calls must match the expected count, order, names, argument schemas and any exact argument values. No tool is executed. |
+| `tool_checks` | Custom tool fixtures and complete/stream response modes | Every declared expectation must pass. Empty fixtures preserve the built-in weather check; omitted modes inherit the run streaming setting. See the mixed text/tool example below. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
 Conversation fixtures, modes, generation options, schedules and seeds contribute
@@ -296,6 +297,173 @@ Default per-cell samples, mixed pairs, consistency repetitions and concurrent
 session count are five; prefix repeats are six (five measured reuses). Planning
 warns when a configured workload sample count is below `limits.min_samples`.
 Budgets, missing shape evidence and inadequate overlap can still prevent a verdict.
+
+## Concurrent workload scenarios
+
+Select `concurrency` and configure the single `concurrent_workloads` block.
+`scenarios` selects any combination of `size_matrix`, `mixed_interference`,
+`streaming_fairness` and `token_stress`. Each has a separate status, summary,
+measurements and request evidence under `metrics.scenarios`. A failed scenario
+is not hidden by another scenario with incomplete coverage. Legacy `fairness`,
+`buckets` and `mixed` selections are migrated to the corresponding scenarios;
+saved historical reports remain readable.
+
+- **Size matrix:** short/medium/long inputs crossed with output caps at each
+  `levels` value. `samples_per_bucket` and `window_seconds` bound each cell.
+  Actual lengths, achieved overlap, timing, errors and scoring remain per cell.
+- **Mixed interference:** short-only controls and long-input/long-output pairs,
+  both heavy-first and short-already-streaming. Each phase retains control/mixed
+  timing, slowdown ratio, observed overlap and sample qualification.
+- **Streaming fairness:** the former fairness workload, including baseline,
+  latency ratio, streaming-pause maximum, overlap counts, errors and correctness.
+- **Token stress:** each `stress_cases` entry runs at every configured level.
+  Defaults request 10,000 input / 50 output summary tokens and a short prompt
+  (at most 128 observed input tokens) / 10,000 output tokens. The cases, target
+  sizes and `min_output_tokens` are configurable. `input_token_tolerance` and
+  `calibration_attempts` control bounded sizing from returned usage, including
+  chat-template overhead. Calibration requests consume the same global budget.
+
+The large-token example is [concurrent-workloads.yaml](../examples/concurrent-workloads.yaml).
+The server must support the requested context/output sizes. The suite never
+silently lowers targets to fit global caps. Missing token usage, early output
+termination, insufficient overlap or incomplete budgets leave coverage
+inconclusive; request errors and incorrect scored answers remain failures.
+The summary task checks that the required box-label fact survives; it does not
+certify general summary quality. Long-generation content is unscored. These
+examples define future runs; existing small-model reports are not new 10k-token
+qualification evidence.
+
+## Assistant text alongside tool calls
+
+Use [examples/tool-content.yaml](../examples/tool-content.yaml) to require both
+assistant prose and a function call in one response:
+
+```sh
+giraffe run --config examples/tool-content.yaml --output runs/tool-content
+```
+
+Set its endpoint and model to a deployment that supports mixed assistant content
+and tool calls. This example is a configurable acceptance requirement, not a claim
+that a particular model or runtime has passed live qualification. Models that omit
+required prose fail that requirement even when they return the right call. No
+function executes: required prose is assistant content, not a tool result or an
+answer from a subsequent conversation turn.
+
+In the check catalogue, open **Tool-call correctness → Settings** to choose response
+modes and edit the fixture list as JSON. `[]` restores the built-in weather fixture.
+The advanced editor accepts the same configuration. Each custom fixture defines
+`fixture_id`, `messages`, OpenAI-compatible function `tools`, and either
+`expected_calls` or an explicit `choice` rule.
+Fixture IDs are unique, use letters, digits, underscores, hyphens or dots, start
+with a letter or digit, and have at most 128 characters. Each configuration has at
+most 16 fixtures, each with at most 16 tools and expected calls; the entire
+`tool_checks` configuration is limited to 64 KiB. `options` accepts supported
+request settings, such as temperature, without overriding the tool contract.
+
+`expected_calls` compares exact call count and order. Each call must have a call ID,
+a declared function name and valid strict JSON arguments satisfying its function's
+parameter schema. An `arguments` object additionally requires that exact value;
+`arguments: null` checks the schema without fixing the value. Numeric values compare
+by value (`1` equals `1.0`, and `-0.0` equals `0`); booleans remain distinct from
+numbers, including in nested arrays and objects.
+
+Tool parameter schemas use a bounded JSON Schema subset. Supported assertions
+are `type` (including nullable type lists), `enum`, `const`, `required`, numeric
+minimum/maximum and exclusive bounds, and string/array/object minimum and maximum
+sizes. Structural schemas support `properties`, `additionalProperties`, `items`,
+`additionalItems`, `prefixItems`, finite `anyOf`/`oneOf`/`allOf`, and acyclic local
+JSON-pointer `$ref` references through `$defs` or `definitions`. Standard descriptive
+annotations are allowed. Draft 4, 6, 7, 2019-09 and 2020-12 dialects are accepted;
+the chosen dialect's normal keyword semantics apply.
+
+Configuration rejects regex keywords, `format`, `uniqueItems`, `multipleOf`,
+conditionals, recursive references and other unsupported keywords rather than
+silently ignoring their assertions. These restrictions apply to tool schemas,
+not the separate structured-JSON scorer. They prevent model output or an operator
+schema from blocking the runner with regex backtracking or recursive combinators.
+
+Each schema and argument object is limited to 64 KiB and depth 32. Schemas may
+contain at most 2,048 JSON value nodes and expand to at most 256 schema nodes after
+following references; argument objects may contain at most 1,024 value nodes.
+The product of expanded schema nodes and argument value nodes must be at most
+4,096, which also bounds the error trees built by failing combinators. Configured
+expected arguments exceeding these limits are rejected. Generated arguments
+exceeding them produce an **inconclusive** evaluation, never a pass or an
+incorrect-answer verdict. Objects, arrays and scalar values each count as one
+node; object keys do not count as separate nodes.
+
+`expected_content` is optional. Omitting it permits tool-only responses, including
+null content. When supplied, `mode: exact` compares the entire concatenated
+assistant content, including text arriving before, between or after streamed tool
+fragments. This detects missing or duplicated text. `mode: contains` only requires
+the specified nonempty substring; it permits additional and repeated prose.
+`normalization: none` preserves whitespace; `normalization: whitespace` collapses
+whitespace runs and trims the result before comparison. These checks evaluate the
+assembled content, not whether text preceded or followed a call on the wire.
+
+`modes: [complete]`, `[stream]` or `[complete, stream]` selects the request modes.
+Omitting modes runs both when global `stream: true`, and complete responses when
+`stream: false`. Any explicit streaming mode requires global streaming to be
+turned on. Every fixture/mode combination has its own sample coverage. The review
+screen includes these combinations in its request budget.
+
+Request evidence shows separate **Response protocol**, **Assistant text** and
+**Tool calls** outcomes, the declared expectations, and retained actual calls.
+Incomplete streams remain protocol failures; a correct call cannot hide missing
+required text. Response events retain bounded metadata about arrival order without
+text or argument fragments, and disclose truncation. Response text and actual
+call bodies follow the run retention setting, while scoring remains available.
+Older reports without these outcomes remain readable.
+
+Complete and streaming requests are independent generations. Different outputs do
+not by themselves prove that a runtime dropped text. Replayed identical outputs
+can establish reconstruction correctness; live runs establish only whether the
+observed responses met the declared acceptance requirements.
+
+### Tool-choice contract checks
+
+[examples/tool-choice.yaml](../examples/tool-choice.yaml) exercises all four choices
+in complete and streaming responses. Set its endpoint and model, then run
+`giraffe run --config examples/tool-choice.yaml`. No tool executes.
+
+Add `choice` to a fixture to check the request's API rule separately from the task:
+
+| `choice.mode` | Accepted completed response |
+| --- | --- |
+| `none` | Zero structured tool calls. Prose, refusal text and tool-shaped JSON text are permitted. |
+| `required` | At least one declared function call with valid arguments. |
+| `named` | At least one call, every call to `choice.name`, with valid arguments. |
+| `auto` | Prose or declared function calls with valid arguments. |
+
+`choice.max_calls` bounds calls at 1–16 (default 16). `none` always permits zero;
+`parallel_tool_calls: false` limits every other mode to one call. Set it to true to
+explicitly allow multiple calls within `max_calls`, or omit it to leave the server
+setting unspecified. `max_calls` is a local acceptance bound, not an API field.
+The typed rule owns `tools`, `tool_choice` and `parallel_tool_calls` for this fixture,
+including overriding global request options. Sent tool options are recorded.
+Legacy forced-choice diagnostics apply only to fixtures without `choice`.
+
+`expected_calls` may be omitted or null for contract-only checks. An explicit `[]`
+asserts that the task should produce no calls. A nonempty list adds exact task
+expectations as described above. Contradictions with `choice` are rejected before
+sending traffic. For example, `auto` can pass mode compliance and fail a task that
+expected a call. Optional `expected_content` still checks assistant text separately.
+
+`choice.support: required` is the default: API rejection fails acceptance.
+`support: discover` records HTTP 400, 422 or 501 as **rejected**, leaves the verdict
+**inconclusive**. Rejections still count toward the global
+`stop_after_errors` bound. These statuses do not prove the option is unsupported; rejection can have another cause. Authentication, routing, throttling,
+server errors and transport failures remain failures. A completed response violating
+the choice rule fails even during discovery. **Observed** support means only that
+this response honored the mode; it is not a guarantee about other prompts or models.
+
+Protocol/completeness, choice compliance, argument schemas, task expectations and
+assistant text have separate outcomes in JSON, HTML and request details. Giraffe
+assembles streamed fragments before evaluation. Timeouts, truncation and early EOF
+cannot pass `none`. Every configured fixture/transport pair needs coverage; budget
+exhaustion cannot turn an incomplete matrix into a pass. Existing request, token,
+duration, concurrency and retention limits apply. Stored response bodies follow
+retention; configured expectations, sent tool options and verdicts remain available.
 
 ## Deployment metadata
 
@@ -515,3 +683,61 @@ Inference connection establishment uses an HTTPX connect timeout of
 `min(request_timeout_seconds * 0.9, 10)` seconds, strictly inside the request
 deadline. Failure to connect is transport failure (blocked access if no request
 succeeded); timeout waiting for an answer remains inference-timeout evidence.
+
+## Tool-result conversations
+
+`tool_checks.conversations` adds bounded conversations to the tool check. Run
+`giraffe run --config examples/tool-result-conversation.yaml --output runs/tool-results`
+against a running tool-capable endpoint. The example targets local Ollama; edit
+its URL and model for your server. The Tools editor accepts the same fixture JSON,
+and configuration preview, CLI export and rerun preserve it.
+
+Each fixture declares initial `messages`, `tools`, one to four `steps`, and
+`final_content` assertions. A step declares one to sixteen ordered
+`expected_calls`, each with a function `name`, exact `arguments`, an inert JSON
+`result`, and optional `outcome: success` or `error`. Giraffe validates the actual
+call IDs, functions and arguments, appends the actual assistant message, and sends
+each result with that call's actual `tool_call_id`. No tool code runs. Complete
+and streaming responses are separate sessions; streaming calls are reconstructed
+before any result is supplied. Unsupported assistant fields fail
+explicitly rather than silently dropping history.
+
+Include `{{observation_id}}` in a result and a final assertion. Each session gets a
+fresh value that is absent from its initial question. All final assertions must
+match: `exact` compares the entire answer, `contains` checks a literal substring,
+and `normalization: whitespace` optionally ignores whitespace differences. Choose
+assertions strong enough for your task: a substring such as `15` alone does not
+prove a correct temperature. The example additionally checks the conditions and
+fresh observation ID, while allowing prose formatting.
+
+Tools remain available with `tool_choice: auto` on every request. A repeat of a
+successfully supplied operation fails, even if the model changes its call ID or
+JSON key order. Fingerprints include the function and parsed arguments; numeric
+`1` and `1.0` match, but booleans and numbers do not. A different operation is
+allowed only when declared in the next step. A declared error result permits a
+retry. A step's optional `user_message` starts a new question and resets the set
+of satisfied operations; this allows deliberate later reuse of a tool. Calls
+within a step must match the declared order. Unplanned calls fail without being
+supplied results.
+
+Request and duration limits, cancellation, error-stop limits, response-size and
+output limits still apply. Histories also use the configured context ceiling,
+with a serialized UTF-8 byte admission bound for history and tool definitions.
+This is a heuristic because tokenization is endpoint-specific. A timeout, truncated answer, or exhausted budget leaves a
+conversation inconclusive; it never promotes a successful first call to a passed
+conversation. A verified repeat remains a failure even if the response later
+truncates. Protocol/API errors, unexpected calls, and final-answer mismatches have
+separate reasons. A pass establishes the configured bounded conversation, not
+absence of loops on arbitrary tasks.
+
+JSON, standalone HTML and request details include session/turn IDs, actual call
+IDs, operation fingerprints, repetition counts, supplied-result request IDs and
+final-answer checks. Dynamic history, assistant messages, result bodies and
+expanded assertions follow response retention; status and fingerprints remain.
+Fixture configuration remains in reproduction exports, so use synthetic result
+data rather than secrets. Up to sixteen conversations and sixteen single-response
+fixtures share the 64 KiB tool configuration limit. When conversations are set and
+`fixtures` is empty, the built-in weather check is skipped. Legacy forced-choice
+diagnostics apply only to single-response fixtures without explicit choice rules.
+
+The message linkage follows the [OpenAI function-calling conversation contract](https://developers.openai.com/api/docs/guides/function-calling).

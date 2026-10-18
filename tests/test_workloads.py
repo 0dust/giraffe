@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from giraffe.models import RequestRecord, RunConfig, Sessions, Target
+from giraffe.concurrent_workloads import execution_config
 from giraffe.reporting import write_report
 from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
@@ -49,6 +50,11 @@ def config(endpoint, **extra):
 
 
 def check(report, name):
+    if name in {"buckets", "mixed"}:
+        from giraffe.models import CheckResult
+        family = {"buckets": "size_matrix", "mixed": "mixed_interference"}[name]
+        merged = next(c for c in report.checks if c.id == "concurrency")
+        return CheckResult.model_validate(merged.metrics["scenarios"][family])
     return next(c for c in report.checks if c.id == name)
 
 
@@ -183,7 +189,7 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
         heavy.input_tokens = 1000
         records.append(heavy)
     run = SimpleNamespace(
-        config=settings,
+        config=execution_config(settings),
         records=records,
         max_lag_ms=0,
         observations={"local": {}},
@@ -215,7 +221,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
         ]
         for index in range(count)
     ]
-    run = SimpleNamespace(config=settings, records=records, max_lag_ms=0,
+    run = SimpleNamespace(config=execution_config(settings), records=records, max_lag_ms=0,
                           observations={"local": {}}, unfinished={"local": set()})
     outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
     mixed = next(c for c in outcome if c.id == "mixed")
@@ -335,9 +341,10 @@ def test_fenced_arguments_and_truncated_tool_completion_do_not_pass(arguments, f
         ],
     )
     result = score_response(request, record)
-    assert result.score is (None if finish == "length" else False)
+    assert result.score is False
     if finish == "length":
-        assert result.score_message == "truncated before a complete answer"
+        assert result.tool_evaluation.protocol.status == "fail"
+        assert "truncated" in result.tool_evaluation.protocol.message
 
 
 async def test_missing_configured_workload_timing_is_inconclusive():
@@ -588,7 +595,144 @@ async def test_bucket_and_mixed_workloads_can_be_selected_independently(selected
         report = await run_suite(config(endpoint, checks=[selected], buckets={
             "levels": [1], "samples_per_bucket": 2, "mixed_pairs": 1,
         }))
-    assert {check.id for check in report.checks if check.status != "skipped"} == {selected}
+    assert {check.id for check in report.checks if check.status != "skipped"} == {"concurrency"}
+    assert set(check(report, "concurrency").metrics["scenarios"]) == {{"buckets": "size_matrix", "mixed": "mixed_interference"}[selected]}
     workload_records = [record for record in report.requests if record.workload]
     assert workload_records
-    assert all(record.check_ids == [selected] for record in workload_records)
+    assert all(set(record.check_ids) == {selected, "concurrency"} for record in workload_records)
+
+
+def text_tool_fixture(identifier='weather-text'):
+    from giraffe.workloads import TOOL
+    return {
+        'fixture_id': identifier,
+        'messages': [{'role': 'user', 'content': 'Check Warsaw. Say Checking Warsaw. and Request prepared. around the call.'}],
+        'tools': [TOOL],
+        'expected_calls': [{'name': 'get_weather', 'arguments': {'city': 'Warsaw'}}],
+        'expected_content': {'mode': 'exact', 'value': 'Checking Warsaw. Request prepared.'},
+    }
+
+
+@pytest.mark.parametrize('mode,expected_status', [
+    ('tool_content', 'pass'), ('tool_content_missing', 'fail'),
+    ('tool_content_duplicate', 'fail'),
+])
+async def test_configured_tool_content_scored_independently_over_real_http(mode, expected_status):
+    with FakeEndpoint(mode=mode) as endpoint:
+        configuration = config(endpoint, checks=['tools'], tool_checks={'fixtures': [text_tool_fixture()]})
+        report = await run_suite(configuration)
+        requests = list(endpoint.requests)
+    result = check(report, 'tools')
+    assert result.status == expected_status
+    assert len(requests) == 2 and {p['stream'] for p in requests} == {False, True}
+    assert all(r.tool_evaluation.calls.status == 'pass' for r in report.requests)
+    assert all(r.tool_evaluation.content.status == expected_status for r in report.requests)
+    assert all(r.tool_evaluation.protocol.status == 'pass' for r in report.requests)
+    assert all(r.evaluation.tool_expectation.expected_calls[0].arguments == {'city': 'Warsaw'} for r in report.requests)
+    assert result.metrics['parity']['status'] == 'not_established'
+    assert result.metrics['parity']['basis'] == 'independent_generations'
+    assert len(result.metrics['outcomes']) == 2
+
+
+async def test_tool_modes_and_multiple_fixture_budget_are_planned_and_enforced():
+    from giraffe.planning import request_plan
+    with FakeEndpoint(mode='tool_content') as endpoint:
+        configuration = config(endpoint, checks=['tools'], max_requests=2,
+            tool_checks={'fixtures': [text_tool_fixture('a'), text_tool_fixture('b')], 'modes': ['complete']},
+            forced_tool_diagnostic=True)
+        plan = request_plan(configuration)
+        report = await run_suite(configuration)
+        requests = list(endpoint.requests)
+    row = next(row for row in plan['rows'] if row['id'] == 'tools')
+    assert row['requests_per_target'] == 4
+    assert len(requests) == 2 and not any(p['stream'] for p in requests)
+    assert all(p['tool_choice'] == 'auto' for p in requests)
+    assert check(report, 'tools').status == 'inconclusive'
+    assert {r.workload['tool_fixture_id'] for r in report.requests} == {'a', 'b'}
+
+
+async def test_tool_missing_fixture_cannot_be_satisfied_by_duplicate_record():
+    with FakeEndpoint(mode='tool_content') as endpoint:
+        configuration = config(endpoint, checks=['tools'],
+            tool_checks={'fixtures': [text_tool_fixture('a'), text_tool_fixture('b')], 'modes': ['complete']})
+        report = await run_suite(configuration)
+    records = [report.requests[0], report.requests[0].model_copy(update={'id': 'duplicate'})]
+    run = SimpleNamespace(config=configuration, records=records, max_lag_ms=0, unfinished={'local': set()},
+                          observations={'local': {}})
+    result = results(run, configuration.targets[0], _stats, _timing_violations, _missing_timing)
+    assert next(row for row in result if row.id == 'tools').status == 'inconclusive'
+
+
+@pytest.mark.parametrize('budget', [8, 3])
+async def test_custom_tools_keep_target_coverage_separate_with_bounded_budgets(budget):
+    from giraffe.planning import request_plan
+
+    with FakeEndpoint(mode='tool_content') as healthy, FakeEndpoint(mode='tool_content_missing') as missing:
+        configuration = config(healthy, checks=['tools'], max_requests=budget,
+            targets=[{'name': 'healthy', 'url': healthy.url, 'model': 'fake-model'},
+                     {'name': 'missing', 'url': missing.url, 'model': 'fake-model'}],
+            tool_checks={'fixtures': [text_tool_fixture('a'), text_tool_fixture('b')]})
+        report = await run_suite(configuration)
+        assert len(healthy.requests) + len(missing.requests) == budget
+    row = next(row for row in request_plan(configuration)['rows'] if row['id'] == 'tools')
+    assert row['requests_per_target'] == 4
+    assert len(report.requests) == budget
+    expected_cases = {(fixture, mode) for fixture in ('a', 'b') for mode in ('complete', 'stream')}
+    for target in ('healthy', 'missing'):
+        records = [record for record in report.requests if record.target == target]
+        result = next(result for result in report.checks if result.id == 'tools' and result.target == target)
+        observed = {(record.workload['tool_fixture_id'], record.workload['mode']) for record in records}
+        assert records and len(observed) == len(records)
+        assert all(record.tool_evaluation.calls.status == 'pass' for record in records)
+        assert all(record.score is (target == 'healthy') for record in records)
+        assert {item['request_id'] for item in result.metrics['outcomes']} == {record.id for record in records}
+        assert {(item['fixture_id'], item['mode']) for item in result.metrics['missing_cases']} == expected_cases - observed
+        if budget == 8:
+            assert observed == expected_cases
+            assert result.status == ('pass' if target == 'healthy' else 'fail')
+        else:
+            assert observed < expected_cases
+            assert result.status == ('inconclusive' if target == 'healthy' else 'fail')
+
+
+@pytest.mark.parametrize('other_outcome', ['pass', 'semantic_failure', 'protocol_failure'])
+def test_tool_evaluation_inconclusive_propagates_without_hiding_failures(other_outcome):
+    from giraffe.models import RequestSpec
+
+    configuration = config(SimpleNamespace(url='http://localhost'), checks=['tools'],
+                           tool_checks={'fixtures': [text_tool_fixture()]})
+    expectation = configuration.tool_checks.fixtures[0]
+    records = []
+    specs = []
+    for mode in ('complete', 'stream'):
+        request = RequestSpec(fixture_id=f'weather-text-{mode}', scenario=f'tools_{mode}',
+                              check_ids=['tools'], messages=[], scorer='tool',
+                              tool_expectation=expectation)
+        record = RequestRecord(id=mode, target='local', fixture_id=request.fixture_id,
+            scenario=request.scenario, check_ids=['tools'], started_at='2026-01-01',
+            status='completed', valid=True, output='Checking Warsaw. Request prepared.',
+            finish_reason='tool_calls', tool_calls=[{'type': 'function', 'function': {
+                'name': 'get_weather', 'arguments': '{"city":"Warsaw"}'}}],
+            workload={'selection': 'automatic', 'tool_fixture_id': 'weather-text', 'mode': mode})
+        specs.append(request)
+        records.append(record)
+    if other_outcome == 'semantic_failure':
+        records[1].output = 'Missing the required final sentence.'
+    elif other_outcome == 'protocol_failure':
+        records[1].valid, records[1].status = False, 'failed'
+    records[1] = score_response(specs[1], records[1])
+
+    # Valid JSON with the expected value can still exceed the safe evaluation
+    # budget. Exercise the real boundary instead of mocking a validator error.
+    records[0].tool_calls[0]['function']['arguments'] = ' ' * 65536 + '{"city":"Warsaw"}'
+    records[0] = score_response(specs[0], records[0])
+    assert records[0].score is None and records[0].evaluation_error == 'tool_evaluation_budget'
+    assert records[0].tool_evaluation.protocol.status == 'pass'
+    assert records[0].tool_evaluation.content.status == 'pass'
+    run = SimpleNamespace(config=configuration, records=records, max_lag_ms=0, unfinished={'local': set()},
+                          observations={'local': {}})
+    result = next(row for row in results(run, configuration.targets[0], _stats,
+                                        _timing_violations, _missing_timing) if row.id == 'tools')
+    assert result.metrics['missing_cases'] == []
+    assert result.metrics['outcomes'][0]['calls']['status'] == 'inconclusive'
+    assert result.status == ('inconclusive' if other_outcome == 'pass' else 'fail')

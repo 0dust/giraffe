@@ -108,23 +108,60 @@ def config(**kwargs):
     return RunConfig(**(values | kwargs))
 
 
-async def test_disabled_backend_verification_preserves_legacy_builtin_fingerprint(client):
+async def test_versioned_recovery_prompt_has_stable_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
-        "3475bee26d84f228587f5524184c5395ff9b12a3a0d45b5697c168b19a6e3541")
+        "9af0ebdc853200070007d5c0c38cd9f4e9cf8f6f259b8a4b006e504c4a8eb70c")
+
+
+@pytest.mark.parametrize("selected", [False, True])
+async def test_resolved_default_tool_fixture_changes_only_selected_identity(monkeypatch, selected):
+    from giraffe import tool_checks
+    from giraffe.reporting import _settings_reasons
+
+    settings = config(checks=["tools"] if selected else ["serving"], stream=False)
+    baseline = await runner.run_suite(settings)
+    original = tool_checks.default_tool_fixture
+
+    def changed_fixture():
+        fixture = original()
+        fixture.messages[0].content += " Explain why you select this tool."
+        return fixture
+
+    monkeypatch.setattr(tool_checks, "default_tool_fixture", changed_fixture)
+    current = await runner.run_suite(settings)
+    assert (current.manifest["fixture_pack"] != baseline.manifest["fixture_pack"]) is selected
+    assert ("Fixture pack identity differs." in _settings_reasons(current, baseline)) is selected
+
+
+async def test_resolved_tool_modes_are_part_of_workload_identity(monkeypatch):
+    from giraffe import tool_checks, workloads
+
+    settings = config(checks=["tools"])
+    baseline = await runner.run_suite(settings)
+    monkeypatch.setattr(tool_checks, "resolved_tool_modes", lambda config: ["complete"])
+    monkeypatch.setattr(workloads, "resolved_tool_modes", tool_checks.resolved_tool_modes)
+    current = await runner.run_suite(settings)
+    assert (baseline.manifest["fixture_pack"]["workload_fixture_sha256"]
+            != current.manifest["fixture_pack"]["workload_fixture_sha256"])
 
 
 def check(report, id, target="service"):
+    if id == "fairness":
+        from giraffe.models import CheckResult
+        merged = next(c for c in report.checks if c.id == "concurrency" and c.target == target)
+        return CheckResult.model_validate(merged.metrics["scenarios"]["streaming_fairness"])
     return next(c for c in report.checks if c.id == id and c.target == target)
 
 
 async def test_bucket_window_expires_while_waiting_for_shared_concurrency(client):
     from giraffe.workloads import buckets
+    from giraffe.concurrent_workloads import execution_config
 
     configuration = config(checks=["buckets"], concurrency=8,
                            buckets={"levels": [8], "samples_per_bucket": 2,
                                     "window_seconds": .01})
-    run = runner._Run(configuration, None, None)
+    run = runner._Run(execution_config(configuration), None, None)
     target = configuration.targets[0]
     for _ in range(configuration.concurrency):
         run.slots.get_nowait()
@@ -251,10 +288,13 @@ async def test_context_override_controls_declared_limit_and_fixture_sizes():
 async def test_recovery_honors_correctness_allowance_without_hiding_protocol_failure(client, monkeypatch):
     original = client.execute
 
+    wrong_probe_ids = set()
+
     async def one_wrong_probe(self, spec, **kwargs):
         record = await original(self, spec, **kwargs)
-        if spec.scenario == "recovery" and spec.fixture_id == "short.copy.v2":
+        if spec.scenario == "recovery" and not wrong_probe_ids:
             record.output = "wrong answer"
+            wrong_probe_ids.add(record.id)
         return record
 
     monkeypatch.setattr(client, "execute", one_wrong_probe)
@@ -266,9 +306,11 @@ async def test_recovery_honors_correctness_allowance_without_hiding_protocol_fai
     assert .5 <= result.metrics["accuracy"] < 1
     assert result.status == "pass"
 
+    wrong_probe_ids.clear()
+
     async def broken_probe(self, spec, **kwargs):
         record = await one_wrong_probe(self, spec, **kwargs)
-        if spec.scenario == "recovery" and spec.fixture_id == "short.copy.v2":
+        if record.id in wrong_probe_ids:
             record.valid = False
             record.status = "failed"
         return record
@@ -522,10 +564,12 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     client, monkeypatch, check_id,
 ):
     original = client.execute
+    failed_fixture = ("sustained.copy.v3" if check_id == "recovery" else
+                      "fairness.copy.v1" if check_id == "fairness" else "short.copy.v2")
 
     async def refused_copy(self, spec, **kwargs):
         result = await original(self, spec, **kwargs)
-        if spec.fixture_id == ("fairness.copy.v1" if check_id == "fairness" else "short.copy.v2"):
+        if spec.fixture_id == failed_fixture:
             result.output = "I cannot copy that sentence."
         return result
 
@@ -536,10 +580,10 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     result = check(report, check_id)
     assert result.status == "fail"
     assert "Answer checks failed" in result.summary
-    assert ("fairness.copy.v1" if check_id == "fairness" else "short.copy.v2") in result.summary
+    assert failed_fixture in result.summary
     assert "warm-up" not in result.summary
     failure = next(f for f in result.metrics["answer_failures"]
-                   if f["fixture_id"] == ("fairness.copy.v1" if check_id == "fairness" else "short.copy.v2"))
+                   if f["fixture_id"] == failed_fixture)
     assert failure["warmup_failed"] == 0
     assert failure["failed"] > 0
 
@@ -550,7 +594,7 @@ async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeyp
 
     async def refused_copy(self, spec, **kwargs):
         result = await original(self, spec, **kwargs)
-        if spec.fixture_id == "short.copy.v2":
+        if spec.fixture_id == "sustained.copy.v3":
             result.output = "I cannot copy that sentence."
         return result
 
@@ -560,7 +604,7 @@ async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeyp
     result = check(report, "recovery")
     assert result.status == "fail"
     assert "timing limits exceeded" in result.summary
-    assert "short.copy.v2" in result.summary
+    assert "sustained.copy.v3" in result.summary
 
 
 @pytest.mark.parametrize("fault,message", [
@@ -915,6 +959,7 @@ async def test_generator_saturation_makes_timing_violation_inconclusive(monkeypa
 
     async def saturated(self, tasks):
         self.max_lag_ms = 500
+        self.timing_health.windows.append({"start_ms": 0, "end_ms": 10000, "lag_ms": 500})
         await original(self, tasks)
 
     monkeypatch.setattr(runner._Run, "monitor", saturated)
@@ -926,6 +971,104 @@ async def test_generator_saturation_makes_timing_violation_inconclusive(monkeypa
         assert result.metrics["highest_acceptable_rate_rps"] is None
 
 
+async def test_delay_outside_requests_does_not_disqualify_timing(monkeypatch):
+    original = runner._checks
+
+    def delayed(self, target):
+        self.max_lag_ms = 500
+        self.timing_health.windows[:] = [{"start_ms": 10000, "end_ms": 10550, "lag_ms": 500}]
+        return original(self, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed)
+    report = await runner.run_suite(config(checks=["first_output", "generation"],
+        limits=Limits(first_output_ms=100, latency_ms=100, min_samples=2)))
+    assert check(report, "first_output").status == "pass"
+    assert check(report, "generation").status == "pass"
+    assert report.observations["generator_max_lag_ms"] == 500
+    assert not check(report, "generation").metrics["timing_quality"]["affected_request_ids"]
+
+
+async def test_delay_in_generation_does_not_disqualify_earlier_first_output(monkeypatch):
+    original = runner._checks
+
+    def delayed(self, target):
+        request = next(r for r in self.records if r.scenario == "generation")
+        self.max_lag_ms = 500
+        self.timing_health.windows[:] = [{
+            "start_ms": request.dispatch_ms + request.first_output_ms + .1,
+            "end_ms": request.completed_ms, "lag_ms": 500,
+        }]
+        return original(self, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed)
+    report = await runner.run_suite(config(checks=["first_output", "generation"],
+        limits=Limits(first_output_ms=100, latency_ms=100, min_samples=2)))
+    assert check(report, "first_output").status == "pass"
+    result = check(report, "generation")
+    assert result.status == "inconclusive"
+    assert result.metrics["timing_quality"]["affected_request_ids"]
+    assert result.metrics["completed"] == 2  # Delayed samples are retained.
+
+
+async def test_blocking_final_callback_is_captured_before_monitor_cancellation(client, monkeypatch):
+    original = client.execute
+    completed = 0
+
+    async def execute(self, spec, **kwargs):
+        nonlocal completed
+        record = await original(self, spec, **kwargs)
+        completed += 1
+        if completed == 2:
+            time.sleep(.18)
+            record.elapsed_ms += 180
+        return record
+
+    monkeypatch.setattr(client, "execute", execute)
+    report = await runner.run_suite(config(checks=["generation"], concurrency=1,
+        limits=Limits(latency_ms=1000, min_samples=2)))
+    health = report.observations["client_timing_health"]
+    assert health["delayed_sample_count"] >= 1
+    assert health["max_lag_ms"] > 100
+    assert check(report, "generation").status == "inconclusive"
+    assert len(report.requests) == 2 and report.requests[-1].elapsed_ms >= 180
+
+
+async def test_delay_on_another_target_does_not_change_completed_target(monkeypatch):
+    original = runner._checks
+
+    def delayed(self, target):
+        request = next(r for r in self.records if r.target == "second")
+        self.max_lag_ms = 500
+        self.timing_health.windows[:] = [{"start_ms": request.dispatch_ms,
+            "end_ms": request.completed_ms, "lag_ms": 500}]
+        return original(self, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed)
+    report = await runner.run_suite(config(checks=["generation"], targets=[
+        Target(name=name, model="local", url="http://localhost:1234") for name in ["service", "second"]],
+        limits=Limits(latency_ms=1000, min_samples=2)))
+    assert check(report, "generation", "service").status == "pass"
+    assert check(report, "generation", "second").status == "inconclusive"
+
+
+async def test_client_dispatch_anchor_excludes_slow_progress_callback(monkeypatch):
+    from giraffe.client import LLMClient
+    from tests.fake_endpoint import FakeEndpoint
+
+    monkeypatch.setattr(runner, "LLMClient", LLMClient)
+
+    def progress(event):
+        if event["event"] == "request_started":
+            time.sleep(.02)
+
+    with FakeEndpoint(first_token_delay=.001, chunk_delay=0) as endpoint:
+        report = await runner.run_suite(config(checks=["generation"], targets=[
+            Target(name="service", model="fake-model", url=endpoint.url)]), progress=progress)
+    assert len(report.requests) == 2
+    assert all(r.timing_start_ms - r.dispatch_ms >= 20 for r in report.requests)
+    assert all("_timing_started_monotonic" not in r.model_dump() for r in report.requests)
+
+
 @pytest.mark.parametrize("check_id", ["capacity", "fairness", "recovery"])
 async def test_generator_saturation_does_not_hide_known_answer_failure(client, monkeypatch, check_id):
     client.bad_target = "service"
@@ -933,6 +1076,7 @@ async def test_generator_saturation_does_not_hide_known_answer_failure(client, m
 
     async def saturated(self, tasks):
         self.max_lag_ms = 500
+        self.timing_health.windows.append({"start_ms": 0, "end_ms": 10000, "lag_ms": 500})
         await original(self, tasks)
 
     monkeypatch.setattr(runner._Run, "monitor", saturated)
@@ -1334,6 +1478,7 @@ async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure
 
     async def saturated(self, tasks):
         self.max_lag_ms = 500
+        self.timing_health.windows.append({"start_ms": 0, "end_ms": 10000, "lag_ms": 500})
         await original(self, tasks)
 
     async def evaluate(config, records, specs, **kwargs):

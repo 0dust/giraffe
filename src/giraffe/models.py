@@ -7,7 +7,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StrictBool, field_serializer, model_serializer, model_validator
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -25,13 +25,21 @@ CHECK_NAMES = {
     "gpu": "GPU observations",
 }
 CORE_CHECKS = tuple(CHECK_NAMES)
-DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu"})
+DEFAULT_CHECKS = tuple("concurrency" if name == "fairness" else name
+                       for name in CORE_CHECKS if name not in {"json", "gpu"})
 CHECK_NAMES.update({
     "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
     "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
     "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
     "tools": "Tool-calling capability",
 })
+# Old identifiers remain execution components and readable report/config contracts.
+# Discovery and new reports expose one configurable check instead of three.
+INTERNAL_CHECK_NAMES = {**CHECK_NAMES, "token_stress": "Token stress cases",
+                        "concurrency": "Concurrent workloads"}
+CHECK_NAMES = {("concurrency" if key == "fairness" else key):
+               ("Concurrent workloads" if key == "fairness" else title)
+               for key, title in CHECK_NAMES.items() if key not in {"buckets", "mixed"}}
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
 
@@ -52,7 +60,7 @@ class Deployment(Model):
     collected_at: str | None = None
     metadata_file: str | None = None
     launch_command: str | list[str] | None = None
-    discovery: Literal["none", "ollama", "vllm", "sglang"] = "none"
+    discovery: Literal["none", "ollama", "vllm", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "none"
     collector_url: str | None = None
     intended_change: str | None = None
 
@@ -108,7 +116,85 @@ class Buckets(Model):
         return self
 
 
+class TokenStressCase(Model):
+    name: Literal["long_input_summary", "short_input_long_output"]
+    input_tokens: int | None = Field(default=None, ge=128, le=65536)
+    max_input_tokens: int | None = Field(default=None, ge=1, le=65536)
+    output_tokens: int = Field(ge=1, le=65536)
+    min_output_tokens: int | None = Field(default=None, ge=1, le=65536)
+
+    @model_validator(mode="after")
+    def valid_lengths(self):
+        if self.name == "long_input_summary" and self.input_tokens is None:
+            raise ValueError("long_input_summary requires an input token target")
+        if self.min_output_tokens is not None and self.min_output_tokens > self.output_tokens:
+            raise ValueError("minimum observed output must not exceed the output cap")
+        if self.name == "short_input_long_output":
+            if self.input_tokens is not None:
+                raise ValueError("short_input_long_output uses max_input_tokens, not an input token target")
+            if self.max_input_tokens is None:
+                self.max_input_tokens = 128
+        return self
+
+
+class ConcurrentWorkloads(Buckets):
+    scenarios: list[Literal["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"]] = Field(
+        default_factory=lambda: ["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"],
+        min_length=1)
+    samples_per_bucket: int = Field(default=5, ge=2, le=100)
+    mixed_pairs: int = Field(default=5, ge=1, le=100)
+    input_token_tolerance: float = Field(default=.1, ge=0, lt=.5)
+    calibration_attempts: int = Field(default=3, ge=1, le=5)
+    stress_cases: list[TokenStressCase] = Field(default_factory=lambda: [
+        TokenStressCase(name="long_input_summary", input_tokens=10000, output_tokens=50),
+        TokenStressCase(name="short_input_long_output", max_input_tokens=128, output_tokens=10000)])
+
+    @model_validator(mode="after")
+    def distinct_scenarios(self):
+        if "token_stress" in self.scenarios and not self.stress_cases:
+            raise ValueError("Select at least one token stress case")
+        if len(set(self.scenarios)) != len(self.scenarios):
+            raise ValueError("concurrent workload scenarios must be distinct")
+        if len({case.name for case in self.stress_cases}) != len(self.stress_cases):
+            raise ValueError("token stress case names must be distinct")
+        return self
+
+
+class SessionWorkload(Model):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    weight: float = Field(default=1, gt=0, le=10000)
+    turns: list[str] = Field(min_length=2, max_length=32)
+    max_tokens: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def bounded_turns(self):
+        if any(not turn.strip() or len(turn) > 8192 for turn in self.turns):
+            raise ValueError("workloads need non-empty user turns of at most 8192 characters")
+        return self
+
+
+def session_workload_presets() -> list[SessionWorkload]:
+    return [
+        SessionWorkload(name="coding", turns=[
+            "Write a Python function that removes duplicates from a list while preserving order. Explain how it works.",
+            "Extend your previous solution to handle unhashable items. Explain the trade-offs.",
+            "Add tests for your previous solution, including empty input and repeated values. Explain each test.",
+        ]),
+        SessionWorkload(name="essay", turns=[
+            "Write three paragraphs explaining the benefits and drawbacks of public transport in cities.",
+            "Expand your previous discussion with a concrete example and a counterargument in three paragraphs.",
+            "Revise your argument into three paragraphs aimed at a city council. Include a practical recommendation.",
+        ]),
+        SessionWorkload(name="chat", turns=[
+            "Explain in a full paragraph how to plan a weekend picnic with friends.",
+            "Using your previous plan, explain in a full paragraph how you would adapt it for rainy weather.",
+            "Using our discussion, give a detailed checklist and explain the most important preparations.",
+        ]),
+    ]
+
+
 class Sessions(Model):
+    profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
     sessions: int = Field(default=5, ge=1, le=32)
     concurrency: int = Field(default=2, ge=1, le=32)
@@ -119,11 +205,22 @@ class Sessions(Model):
         description="Retained for config compatibility; seeded name-recall histories use the session name at every turn.")
     delay_seconds: float = Field(default=0, ge=0, le=60)
     max_tokens: int = Field(default=32, ge=1)
+    # Non-empty workloads select live performance conversations. Empty retains
+    # the existing fixed/live exact-repeat correctness test and its saved config.
+    workloads: list[SessionWorkload] = Field(default_factory=list, max_length=16)
     # Stop rather than inventing an answer or silently cropping required history.
     failure_policy: Literal["stop"] = "stop"
 
     @model_validator(mode="after")
     def valid_session(self):
+        if self.profile == "performance":
+            if not self.workloads:
+                raise ValueError("select at least one performance workload")
+            if self.modes != ["live"]:
+                raise ValueError("mixed performance workloads require modes: [live]")
+            names = [workload.name for workload in self.workloads]
+            if len(names) != len(set(names)):
+                raise ValueError("session workload names must be unique")
         if not self.modes or len(set(self.modes)) != len(self.modes):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= 32 or any(not t.strip() or len(t) > 8192 for t in self.turns):
@@ -199,7 +296,7 @@ class Target(Model):
     metrics_url: str | None = None
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
-    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang"] = "unknown"
+    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "unknown"
     metrics_runtime_version: str | None = None
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)
@@ -354,6 +451,8 @@ CHECK_LIMIT_FIELDS = {
 for _check in CHECK_NAMES.keys() - CHECK_OPTION_FIELDS.keys():
     CHECK_OPTION_FIELDS[_check] = set()
     CHECK_LIMIT_FIELDS[_check] = set()
+CHECK_OPTION_FIELDS["concurrency"] = {"samples", "context_limit"}
+CHECK_LIMIT_FIELDS["concurrency"] = _TRAFFIC_LIMITS | {"fairness_max_ratio"}
 
 
 JUDGE_PROMPT_VERSION = "reference-correctness-v1"
@@ -435,6 +534,247 @@ class RequestPackMessage(Model):
         if not self.content.strip():
             raise ValueError("message content must contain text")
         return self
+
+
+class ToolContractModel(Model):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+
+def finite_tool_json(value: Any) -> int:
+    """Validate arbitrary tool JSON without including private inputs in errors."""
+    try:
+        return len(json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8"))
+    except (ValueError, TypeError, UnicodeError, RecursionError) as error:
+        raise ValueError("tool configuration must contain finite JSON values") from error
+
+
+class ToolContentExpectation(ToolContractModel):
+    mode: Literal["exact", "contains"] = "exact"
+    value: str = Field(max_length=1_000_000)
+    normalization: Literal["none", "whitespace"] = "none"
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if self.mode == "contains" and not self.value.strip():
+            raise ValueError("contains content expectation must contain non-empty text")
+        return self
+
+
+class ExpectedToolCall(ToolContractModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    arguments: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_arguments(self):
+        finite_tool_json(self.arguments)
+        return self
+
+
+class ToolChoiceRule(ToolContractModel):
+    mode: Literal["none", "auto", "required", "named"]
+    name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    support: Literal["required", "discover"] = "required"
+    max_calls: int = Field(default=16, ge=1, le=16, strict=True)
+    parallel_tool_calls: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def named_choice(self):
+        if (self.mode == "named") != (self.name is not None):
+            raise ValueError("only named tool choice requires a function name")
+        return self
+
+    def request_options(self) -> dict[str, Any]:
+        options = {"tool_choice": {"type": "function", "function": {"name": self.name}}
+                   if self.mode == "named" else self.mode}
+        if self.parallel_tool_calls is not None:
+            options["parallel_tool_calls"] = self.parallel_tool_calls
+        return options
+
+    @property
+    def call_limit(self) -> int:
+        return 0 if self.mode == "none" else 1 if self.parallel_tool_calls is False else self.max_calls
+
+
+class ToolExpectation(ToolContractModel):
+    tools: list[dict[str, Any]] = Field(min_length=1, max_length=16)
+    expected_calls: list[ExpectedToolCall] | None = Field(default=None, max_length=16)
+    choice: ToolChoiceRule | None = None
+    expected_content: ToolContentExpectation | None = None
+
+    @model_validator(mode="after")
+    def validate_tools(self):
+        from jsonschema import ValidationError as SchemaValidationError
+        from giraffe.tool_schema import bounded_json_tree, bounded_tool_schema
+
+        finite_tool_json(self.tools)
+        schemas = {}
+        for tool in self.tools:
+            function = tool.get("function")
+            if tool.get("type") != "function" or not isinstance(function, dict):
+                raise ValueError("tools require function definitions")
+            if set(tool) - {"type", "function"} or set(function) - {"name", "description", "parameters", "strict"}:
+                raise ValueError("unsupported tool function definition fields")
+            if "description" in function and not isinstance(function["description"], str):
+                raise ValueError("tool descriptions must be text")
+            if "strict" in function and not isinstance(function["strict"], bool):
+                raise ValueError("tool strict must be a boolean")
+            name = function.get("name")
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                raise ValueError("tool function names must contain 1..64 letters, digits, underscores or hyphens")
+            if name in schemas:
+                raise ValueError("tool function names must be unique")
+            schema = function.get("parameters")
+            if not isinstance(schema, dict):
+                raise ValueError("tool function parameters require a JSON schema object")
+            bounded_tool_schema(schema)
+            schemas[name] = schema
+        if self.choice is None and not self.expected_calls:
+            raise ValueError("tool fixtures require expected_calls or an explicit choice rule")
+        if self.choice:
+            rule = self.choice
+            if rule.mode == "named" and rule.name not in schemas:
+                raise ValueError("named tool choice must reference a declared function")
+            if self.expected_calls is not None:
+                count = len(self.expected_calls)
+                if count > rule.call_limit or (rule.mode in {"required", "named"} and count == 0):
+                    raise ValueError("expected_calls contradict the tool choice count rule")
+                if rule.mode == "named" and any(call.name != rule.name for call in self.expected_calls):
+                    raise ValueError("expected_calls contradict the named tool choice")
+        for call in self.expected_calls or []:
+            if call.name not in schemas:
+                raise ValueError("every expected function must exist in tools")
+            if call.arguments is not None:
+                bounded_json_tree(call.arguments)
+                try:
+                    bounded_tool_schema(schemas[call.name], instance=call.arguments).validate(call.arguments)
+                except SchemaValidationError as error:
+                    raise ValueError("expected tool arguments do not satisfy the bounded schema") from error
+        return self
+
+
+class ToolFixture(ToolExpectation):
+    fixture_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    messages: list[RequestPackMessage] = Field(min_length=1, max_length=64)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_fixture(self):
+        if not self.fixture_id.strip():
+            raise ValueError("fixture_id must contain text")
+        if {"tools", "tool_choice"}.intersection(self.options):
+            raise ValueError("options cannot override tools/tool_choice")
+        if self.choice and "parallel_tool_calls" in self.options:
+            raise ValueError("configure parallel_tool_calls in the choice rule")
+        finite_tool_json(self.options)
+        validate_pack_options(self.options)
+        return self
+
+
+class ToolResultCall(ExpectedToolCall):
+    arguments: dict[str, Any]
+    result: Any
+    outcome: Literal["success", "error"] = "success"
+
+    @model_validator(mode="after")
+    def bounded_result(self):
+        from giraffe.tool_schema import bounded_json_tree
+        if finite_tool_json(self.result) > 65536:
+            raise ValueError("tool result must not exceed 64 KiB")
+        bounded_json_tree(self.result)
+        return self
+
+
+class ToolConversationStep(ToolContractModel):
+    expected_calls: list[ToolResultCall] = Field(min_length=1, max_length=16)
+    user_message: str | None = Field(default=None, min_length=1, max_length=16384)
+
+
+class ToolConversationFixture(ToolContractModel):
+    fixture_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    messages: list[RequestPackMessage] = Field(min_length=1, max_length=64)
+    tools: list[dict[str, Any]] = Field(min_length=1, max_length=16)
+    steps: list[ToolConversationStep] = Field(min_length=1, max_length=4)
+    final_content: list[ToolContentExpectation] = Field(min_length=1, max_length=16)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_conversation(self):
+        from giraffe.tool_schema import tool_call_fingerprint
+        satisfied = set()
+        for step in self.steps:
+            ToolExpectation(tools=self.tools, expected_calls=[
+                ExpectedToolCall(name=call.name, arguments=call.arguments) for call in step.expected_calls])
+            if step.user_message is not None:
+                if not step.user_message.strip():
+                    raise ValueError("conversation user_message must contain text")
+                satisfied = set()
+            for call in step.expected_calls:
+                fingerprint = tool_call_fingerprint(call.name, call.arguments)
+                if fingerprint in satisfied:
+                    raise ValueError("a successful operation cannot repeat without a new user_message")
+                if call.outcome == "success":
+                    satisfied.add(fingerprint)
+        if {"tools", "tool_choice", "parallel_tool_calls"}.intersection(self.options):
+            raise ValueError("conversation options cannot override tool selection")
+        finite_tool_json(self.options)
+        validate_pack_options(self.options)
+        marker = "{{observation_id}}"
+        if not any(marker in json.dumps(call.result) for step in self.steps for call in step.expected_calls):
+            raise ValueError("a conversation result must include {{observation_id}}")
+        if not any(marker in item.value for item in self.final_content):
+            raise ValueError("final_content must check {{observation_id}} from the result")
+        if marker in json.dumps([m.model_dump() for m in self.messages]) or any(
+                marker in (step.user_message or "") or marker in json.dumps(call.arguments)
+                for step in self.steps for call in step.expected_calls):
+            raise ValueError("observation marker is only allowed in results and final_content")
+        return self
+
+
+class ToolChecks(ToolContractModel):
+    fixtures: list[ToolFixture] = Field(default_factory=list, max_length=16)
+    conversations: list[ToolConversationFixture] = Field(default_factory=list, max_length=16)
+    modes: list[Literal["complete", "stream"]] | None = Field(default=None, min_length=1, max_length=2)
+
+    @model_validator(mode="before")
+    @classmethod
+    def bounded_input(cls, value):
+        if isinstance(value, dict):
+            values = dict(value)
+            if isinstance(values.get("fixtures"), list):
+                values["fixtures"] = [item.model_dump(mode="python") if isinstance(item, ToolFixture) else item
+                                      for item in values["fixtures"]]
+            if isinstance(values.get("conversations"), list):
+                values["conversations"] = [item.model_dump(mode="python") if isinstance(item, ToolConversationFixture) else item
+                                           for item in values["conversations"]]
+            if finite_tool_json(values) > 65536:
+                raise ValueError("tool_checks must not exceed 64 KiB")
+        return value
+
+    @model_validator(mode="after")
+    def validate_checks(self):
+        if finite_tool_json(self.model_dump(mode="python")) > 65536:
+            raise ValueError("tool_checks must not exceed 64 KiB")
+        ids = [fixture.fixture_id for fixture in [*self.fixtures, *self.conversations]]
+        if len(ids) != len(set(ids)):
+            raise ValueError("tool fixture IDs must be unique")
+        if self.modes is not None and len(self.modes) != len(set(self.modes)):
+            raise ValueError("tool modes must be unique")
+        return self
+
+
+class ToolCheckOutcome(ToolContractModel):
+    status: Literal["pass", "fail", "inconclusive", "not_checked"]
+    message: str
+
+
+class ToolEvaluation(ToolContractModel):
+    choice: ToolCheckOutcome | None = None
+    arguments: ToolCheckOutcome | None = None
+    task: ToolCheckOutcome | None = None
+    support: Literal["observed", "rejected", "unverified"] | None = None
+    protocol: ToolCheckOutcome
+    calls: ToolCheckOutcome
+    content: ToolCheckOutcome
 
 
 class RequestPackCase(Model):
@@ -597,11 +937,12 @@ class RunConfig(Model):
     cache_pressure_threshold: float = Field(default=.9, gt=0, le=1)
     arrivals: Arrival | None = None
     prefix: Prefix | None = None
-    buckets: Buckets | None = None
+    concurrent_workloads: ConcurrentWorkloads | None = None
     sessions: Sessions | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
+    tool_checks: ToolChecks | None = None
     metrics_max_age_seconds: float = Field(default=60, gt=0)
     overlap_models: bool = False
     stream: bool = True
@@ -618,6 +959,50 @@ class RunConfig(Model):
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     test_options: dict[str, CheckOptions] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_concurrent_workloads(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        legacy = {"fairness": "streaming_fairness", "buckets": "size_matrix",
+                  "mixed": "mixed_interference"}
+        selected = value.get("checks", [])
+        old_settings = value.pop("buckets", None)
+        if isinstance(old_settings, BaseModel):
+            old_settings = old_settings.model_dump(exclude_unset=True)
+        old_scenarios = [legacy[name] for name in selected if name in legacy]
+        if old_settings is not None and "checks" not in value:
+            old_scenarios = ["streaming_fairness", "size_matrix", "mixed_interference"]
+        if old_settings is not None or old_scenarios:
+            current = value.get("concurrent_workloads") or {}
+            if isinstance(current, BaseModel):
+                current = current.model_dump(exclude_unset=True)
+            settings = {**current, **(old_settings or {})}
+            settings.setdefault("scenarios", old_scenarios or ["size_matrix", "mixed_interference"])
+            settings.setdefault("samples_per_bucket", Buckets().samples_per_bucket)
+            settings.setdefault("mixed_pairs", Buckets().mixed_pairs)
+            value["concurrent_workloads"] = settings
+        if isinstance(value.get("concurrent_workloads"), dict):
+            settings = dict(value["concurrent_workloads"])
+            settings.setdefault("levels", [level for level in (1, 2) if level <= value.get("concurrency", 4)])
+            settings.setdefault("output_tokens", {name: min(cap, value.get("max_output_tokens", 128))
+                                                  for name, cap in Buckets().output_tokens.items()})
+            value["concurrent_workloads"] = settings
+        if "checks" in value:
+            value["checks"] = list(dict.fromkeys(
+                "concurrency" if name in legacy else name for name in selected))
+        options = dict(value.get("test_options") or {})
+        if "fairness" in options:
+            options.setdefault("concurrency", options.pop("fairness"))
+            value["test_options"] = options
+        return value
+
+    @property
+    def buckets(self):
+        """Legacy execution components share the canonical settings block."""
+        return self.concurrent_workloads
+
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
         if self.request_source == "request_pack":
@@ -629,24 +1014,26 @@ class RunConfig(Model):
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                 ("buckets", "buckets"), ("sessions", "sessions"),
-                                 ("consistency", "consistency"), ("tool_calling", "tools")):
+                                 ("concurrent_workloads", "concurrency"), ("sessions", "sessions"),
+                                 ("consistency", "consistency"), ("tool_calling", "tools"),
+                                 ("tool_checks", "tools")):
                 if getattr(self, field):
                     self.checks.append(check)
-            if self.buckets:
-                self.checks.append("mixed")
         self.validate_active_judges()
         self.checks = list(dict.fromkeys(self.checks))
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
         self.tool_calling = "tools" in self.checks
+        if (self.tool_calling and self.tool_checks and self.tool_checks.modes
+                and "stream" in self.tool_checks.modes and not self.stream):
+            raise ValueError("tool_checks stream mode requires global stream=true")
         # Selecting a workload in the UI runs its defaults. Retain unselected
         # settings for later edits without silently selecting their checks.
         if "arrivals" in self.checks and self.arrivals is None:
             self.arrivals = Arrival()
         if "prefix" in self.checks and self.prefix is None:
             self.prefix = Prefix()
-        if {"buckets", "mixed"}.intersection(self.checks) and self.buckets is None:
-            self.buckets = Buckets(
+        if "concurrency" in self.checks and self.concurrent_workloads is None:
+            self.concurrent_workloads = ConcurrentWorkloads(
                 levels=[level for level in (1, 2) if level <= self.concurrency],
                 output_tokens={name: min(value, self.max_output_tokens)
                                for name, value in Buckets().output_tokens.items()},
@@ -696,8 +1083,8 @@ class RunConfig(Model):
             proxy = urlsplit(self.proxy)
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
-        bucket_selected = bool({"buckets", "mixed"}.intersection(self.checks))
-        for selected, settings, field in ((bucket_selected, self.buckets, "buckets"),
+        bucket_selected = "concurrency" in self.checks
+        for selected, settings, field in ((bucket_selected, self.buckets, "concurrent_workloads"),
                                           ("consistency" in self.checks, self.consistency, "consistency")):
             if selected and settings and max(settings.levels) > self.concurrency:
                 raise ValueError(f"{field}.levels must not exceed concurrency ({self.concurrency}); "
@@ -707,6 +1094,9 @@ class RunConfig(Model):
                 raise ValueError("session concurrency must not exceed the global ceiling")
             if self.sessions.max_tokens > self.max_output_tokens:
                 raise ValueError("session output budget must stay within max_output_tokens")
+            if any(workload.max_tokens is not None and workload.max_tokens > self.max_output_tokens
+                   for workload in self.sessions.workloads):
+                raise ValueError("session workload output budgets must stay within max_output_tokens")
         if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
             raise ValueError("bucket output budgets must stay within max_output_tokens")
         from giraffe.deployment import sanitize
@@ -730,9 +1120,10 @@ class RunConfig(Model):
 
     def effective_check(self, check_id: str) -> dict[str, Any]:
         """Resolve sparse overrides once, retaining global safety ceilings."""
-        if check_id not in CHECK_NAMES:
+        if check_id not in INTERNAL_CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
-        options = self.test_options.get(check_id, CheckOptions())
+        options = self.test_options.get("concurrency" if check_id in {"fairness", "buckets", "mixed"}
+                                        else check_id, CheckOptions())
         special_defaults = {"backend_verification": "off", "cancel_after_ms": 100, "deadline_probe_ms": 50,
                             "cancel_after_chunks": 5, "cleanup_seconds": 5,
                             "trace_wait_seconds": 10}
@@ -791,6 +1182,7 @@ class RequestSpec(Model):
     expected: Any = None
     expected_provided: bool = False
     rubric: str | None = None
+    tool_expectation: ToolExpectation | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
     max_tokens: int | None = Field(default=None, ge=1)
     stream: bool = True
@@ -802,6 +1194,14 @@ class RequestSpec(Model):
     request_timeout_seconds: float | None = Field(default=None, gt=0)
     workload: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_tool_expectation(self):
+        if self.tool_expectation is not None and self.scorer != "tool":
+            raise ValueError("tool_expectation requires the tool scorer")
+        if self.scorer == "tool" and (self.expected is not None or self.schema_ is not None or self.rubric is not None):
+            raise ValueError("tool scoring requires tool_expectation instead of expected/schema/rubric")
+        return self
+
 
 class EvaluationEvidence(Model):
     """The actual input and answer check used for one request; never credentials."""
@@ -811,10 +1211,12 @@ class EvaluationEvidence(Model):
     expected: Any = None
     expected_provided: bool = False
     rubric: str | None = None
+    tool_expectation: ToolExpectation | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
 
 class RequestRecord(Model):
+    _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -826,6 +1228,7 @@ class RequestRecord(Model):
     error: str | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
+    client_cancelled_monotonic_ns: int | None = None
     elapsed_ms: float = 0
     first_output_ms: float | None = None
     last_output_ms: float | None = None
@@ -848,6 +1251,12 @@ class RequestRecord(Model):
     evaluation: EvaluationEvidence | None = None
     evaluation_error: str | None = None
     logprob_evidence: LogprobEvidence | None = None
+    tool_evaluation: ToolEvaluation | None = None
+    tool_request_options: dict[str, Any] | None = None
+    assistant_message: dict[str, Any] | None = None
+    tool_conversation: dict[str, Any] | None = None
+    response_events: list[dict[str, Any]] = Field(default_factory=list)
+    response_events_truncated: bool = False
     judgement: RequestJudgement | None = None
     observed_model: str | None = None
     backend_id: str | None = None
@@ -865,6 +1274,8 @@ class RequestRecord(Model):
     completed_at: str | None = None
     dispatch_ms: float | None = None
     completed_ms: float | None = None
+    timing_start_ms: float | None = None
+    client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
     overlap: int = 1

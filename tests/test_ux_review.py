@@ -189,12 +189,12 @@ syncTestControls=()=>synced++;configError=error=>{throw error;};
 nodes['#check-search']={value:'cache'};
 nodes['[data-catalogue-filter="selected"]']={focus(){focused=true;}};
 const click=()=>listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-load'}}:null}});
-state.catalogueFilter='all';state.catalogueCategory='server';state.catalogueSearch='cache';state.openTest='buckets';
+state.catalogueFilter='all';state.catalogueCategory='server';state.catalogueSearch='cache';state.openTest='concurrency';
 await click();assert.equal(step,2);assert.equal(state.catalogueFilter,'selected');assert.equal(state.catalogueCategory,'all');
 assert.equal(state.catalogueSearch,'');assert.equal(nodes['#check-search'].value,'');assert.equal(state.openTest,null);
 assert.equal(revealed.length,0);assert.equal(synced,1);assert(focused);
-config.checks=['buckets'];await click();assert.deepEqual(revealed,['buckets']);
-config.checks=['buckets','capacity'];await click();assert.deepEqual(revealed,['buckets','capacity']);
+config.checks=['concurrency'];await click();assert.deepEqual(revealed,['concurrency']);
+config.checks=['concurrency','capacity'];await click();assert.deepEqual(revealed,['concurrency','capacity']);
 """)
 
 

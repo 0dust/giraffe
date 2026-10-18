@@ -1,0 +1,134 @@
+targets:
+- name: local
+  url: http://127.0.0.1:8000/v1
+  model: your-tool-capable-model
+checks:
+- tools
+stream: true
+max_requests: 8
+max_duration_seconds: 120
+request_timeout_seconds: 30
+max_output_tokens: 128
+retention: failures
+tool_checks:
+  modes:
+  - complete
+  - stream
+  fixtures:
+  - fixture_id: none
+    messages:
+    - role: user
+      content: Use get_weather to check the weather in Delhi.
+    tools:
+    - type: function
+      function:
+        name: get_weather
+        description: Look up current weather for a city.
+        parameters:
+          type: object
+          properties:
+            city:
+              type: string
+          required:
+          - city
+          additionalProperties: false
+    - type: function
+      function:
+        name: get_time
+        description: Look up the current time.
+        parameters:
+          type: object
+          properties: {}
+          additionalProperties: false
+    choice:
+      mode: none
+    options:
+      temperature: 0
+  - fixture_id: required
+    messages:
+    - role: user
+      content: Say hello.
+    tools:
+    - type: function
+      function:
+        name: get_weather
+        description: Look up current weather for a city.
+        parameters:
+          type: object
+          properties:
+            city:
+              type: string
+          required:
+          - city
+          additionalProperties: false
+    - type: function
+      function:
+        name: get_time
+        description: Look up the current time.
+        parameters:
+          type: object
+          properties: {}
+          additionalProperties: false
+    choice:
+      mode: required
+    options:
+      temperature: 0
+  - fixture_id: named
+    messages:
+    - role: user
+      content: Use get_weather to check the weather in Delhi.
+    tools:
+    - type: function
+      function:
+        name: get_weather
+        description: Look up current weather for a city.
+        parameters:
+          type: object
+          properties:
+            city:
+              type: string
+          required:
+          - city
+          additionalProperties: false
+    - type: function
+      function:
+        name: get_time
+        description: Look up the current time.
+        parameters:
+          type: object
+          properties: {}
+          additionalProperties: false
+    choice:
+      mode: named
+      name: get_time
+    options:
+      temperature: 0
+  - fixture_id: auto
+    messages:
+    - role: user
+      content: Say hello.
+    tools:
+    - type: function
+      function:
+        name: get_weather
+        description: Look up current weather for a city.
+        parameters:
+          type: object
+          properties:
+            city:
+              type: string
+          required:
+          - city
+          additionalProperties: false
+    - type: function
+      function:
+        name: get_time
+        description: Look up the current time.
+        parameters:
+          type: object
+          properties: {}
+          additionalProperties: false
+    choice:
+      mode: auto
+    options:
+      temperature: 0

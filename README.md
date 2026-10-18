@@ -72,6 +72,37 @@ The example enables the ten standard checks; JSON and GPU checks remain optional
 A wrong answer can fail a load check even when requests complete successfully.
 Inspect the failed responses before treating the result as a vLLM server fault.
 
+## llama.cpp, TensorRT-LLM, LMDeploy and TGI
+
+Start the engine separately and connect to its OpenAI-compatible **chat** API.
+Use a text-generation model with a working chat template. All 17 checks can be
+selected for any engine; a supported connection does not guarantee that its model
+passes JSON, tool calling, exact-answer, timing, or concurrency checks.
+
+| Engine | Example | Default local API base | Optional discovery |
+| --- | --- | --- | --- |
+| [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | [llamacpp.yaml](examples/llamacpp.yaml) | `http://127.0.0.1:8080/v1` | `llamacpp`: `/props`, build, context per slot, parallel slots, chat-template hash |
+| [TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) | [tensorrt-llm.yaml](examples/tensorrt-llm.yaml) | `http://127.0.0.1:8000/v1` | `tensorrt-llm`: `/version`; use `trtllm-serve`, not a raw Triton inference URL |
+| [LMDeploy](https://lmdeploy.readthedocs.io/en/latest/llm/api_server.html) | [lmdeploy.yaml](examples/lmdeploy.yaml) | `http://127.0.0.1:23333/v1` | `lmdeploy`: matching `/v1/models` entry; version and resolved settings remain unknown |
+| [Hugging Face TGI](https://huggingface.co/docs/text-generation-inference/reference/api_reference) | [tgi.yaml](examples/tgi.yaml) | `http://127.0.0.1:8080/v1` | `tgi`: `/info`, runtime/model revision and configured input/total-token limits |
+
+Edit the example's model ID, context length, credentials and acceptance limits,
+then run `giraffe run --config examples/llamacpp.yaml --output runs/llamacpp-first`,
+or load that configuration with `giraffe ui --config examples/llamacpp.yaml`.
+Authentication uses environment-variable references, as with the other engines.
+Discovery is optional; an unavailable metadata endpoint does not disable chat tests.
+
+The `llamacpp`, `lmdeploy`, and `tgi` metrics profiles recognize their documented
+Prometheus names. llama.cpp needs `--metrics`; LMDeploy needs metrics enabled for
+its chosen backend. Missing counters, cache evidence, and GPU exporter observations
+stay unknown. TensorRT-LLM's native `/metrics` iteration JSON is not parsed as
+Prometheus; configure a separate exporter for GPU observations. Native per-request
+server cancellation verification is unavailable for these four engines: output
+caps, stop sequences, client cancellation and follow-up probes still run, but
+`backend_verification: required` remains inconclusive without a native adapter.
+
+GPU-only engines need a compatible Linux host.
+
 ## Run and compare
 
 Open **http://127.0.0.1:8765** and select **New run**. Follow **Connect → Choose
@@ -152,7 +183,7 @@ reports change, while absolute checks still evaluate the current run.
 
 ## Additional workloads and deployment evidence
 
-Opt-in arrivals, shared prefixes, input/output buckets, mixed traffic, fixed/live
+Configurable concurrent workloads, opt-in arrivals, shared prefixes, fixed/live
 conversations, repeated-request consistency and parsed tool-calling checks use the
 same global budgets. Deployment snapshots and bounded serving-metrics collection
 keep configuration changes, provenance, missing data and performance evidence
@@ -186,20 +217,40 @@ unverified.
 
 ## What runs
 
-| Check | Built-in workload / measurement |
-| --- | --- |
-| Access | Ordinary inference through the selected DNS/TLS/auth/network path |
-| Serving | Ordinary traffic: HTTP status, completion envelope, nonempty answer, stream finish |
-| First output | Ordinary traffic: first useful answer separately from reasoning and initial requests |
-| Generation | Longer-output samples, generation pace after first output, response time and stream gaps |
-| Capacity | Independent mixed arrivals; highest tested rate with every lower tested rate accepted |
-| Fairness | Interleaved matched short streams; verified long-prompt overlap, decoding slowdown and answer gaps |
-| Context | Injected known facts at different lengths and positions |
-| Correctness | Known answers, with observed concurrent overlap required when concurrency exceeds one |
-| JSON (opt-in) | Required fields, types, enums and expected content; observed overlap qualifies concurrency |
-| Limits/cancellation | Output cap, controlled server stop enforcement, mid-stream cancellation, deadlines and follow-ups |
-| Recovery | Refilled heavy worker pool, then matched pre/post light probes with configured acceptance limits |
-| GPU (opt-in) | Per-observed-device metric coverage, freshness, XID and thermal/power throttle evidence |
+| # | Check | Built-in workload / measurement |
+| --- | --- | --- |
+| 1 | Network and access | Ordinary inference through the selected DNS/TLS/auth/network path |
+| 2 | Serving success | HTTP status, completion envelope, nonempty answer and stream finish |
+| 3 | First useful output | Client-observed first answer, separately from reasoning and initial requests |
+| 4 | Generation pace | Generation rate after first output, response time and streaming pauses |
+| 5 | Arrival traffic capacity | Independent mixed arrivals; correctness, timing, local delivery limits and highest tested rate with every lower tested rate accepted |
+| 6 | Concurrent workloads | Separate configurable size/concurrency matrix, mixed interference, streaming fairness and token-stress scenarios |
+| 7 | Long-context behavior | Known facts at different positions, calibrated from actual input-token usage |
+| 8 | Known-answer correctness | Known answers with observed scored overlap required when concurrency exceeds one |
+| 9 | Structured JSON | Required fields, types and expected values under concurrency |
+| 10 | Limits and cancellation | Output caps, stop sequences, deadlines, client interruption, backend evidence and follow-ups; separate sub-results are retained |
+| 11 | Sustained load and recovery | Refilled heavy worker pool, then matched pre/post light probes with configured acceptance limits |
+| 12 | GPU observations | Existing telemetry; absent data leaves observations unverified |
+| 13 | Scheduled arrivals | Steady/burst scheduling, actual dispatch, waiting and unissued requests |
+| 14 | Shared prefixes and cache evidence | Matched independent controls, repeated history and reported cache evidence |
+| 15 | Multi-turn sessions | Fixed/live history and concurrent conversation measurements |
+| 16 | Repeated-request consistency | Answer agreement within and across sequential/concurrent levels; correctness reported separately |
+| 17 | Tool-calling capability | Parsed tool-call structure and expected arguments |
+
+The former checks 6, 15 and 16 are scenarios within **Concurrent workloads**.
+Every scenario keeps its own status, summary, all measurements and evidence IDs
+in JSON, the UI and standalone HTML. Size cells and interference comparisons
+remain separate. Existing cancellation sub-results are unchanged.
+
+Use [the large-token example](examples/concurrent-workloads.yaml) for 10,000-token
+input / 50-token output and short-input / 10,000-token output cases. Inputs are
+sized from server-reported token usage and verified on each measured request.
+Output caps alone do not establish output-length coverage. Insufficient context,
+output, time or request budgets are reported explicitly; targets are never silently
+shrunk. Summary scoring checks a required fact, not full summary quality.
+
+Arrival traffic capacity stays separate because it varies incoming requests per
+second; Concurrent workloads varies request shapes, starting order and overlap.
 
 Each result is `pass`, `fail`, `inconclusive`, `skipped`, or `blocked`. A required
 inconclusive check prevents an overall pass. Missing acceptance limits produce
@@ -298,7 +349,7 @@ environment-variable names. HTTPX honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PR
 `ca_bundle` supplies a private CA file. Nothing disables TLS verification.
 
 `--nonstream` exercises nonstreaming Chat Completions. `--checks serving,correctness`
-runs a selected subset. **Add checks** in the UI exposes all 19 checks
+runs a selected subset. **All checks** in the UI exposes all 17 checks
 with a selection checkbox and **Settings** action. Specialist settings stay in
 advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one

@@ -291,8 +291,8 @@ def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, v
 
 @pytest.mark.parametrize("field,check,value", [
     ("sessions", "sessions", {"sessions": 3}),
-    ("buckets", "mixed", {"mixed_pairs": 3}),
-    ("buckets", "buckets", {"samples_per_bucket": 3}),
+    ("concurrent_workloads", "concurrency", {"mixed_pairs": 3}),
+    ("concurrent_workloads", "concurrency", {"samples_per_bucket": 3}),
     ("forced_tool_diagnostic", "tools", True),
 ])
 def test_selected_workload_settings_still_block_comparison(field, check, value):
@@ -305,6 +305,36 @@ def test_selected_workload_settings_still_block_comparison(field, check, value):
     result = compare_baseline(current, old)
     assert result.baseline["status"] == "inconclusive"
     assert f"Run setting {field} differs." in result.baseline["targets"][0]["reasons"]
+
+
+@pytest.mark.parametrize("selected", [True, False])
+def test_tool_expectation_changes_only_block_selected_tool_comparisons(selected):
+    current, old = traffic_report(), traffic_report("baseline")
+    tool_checks = {
+        "modes": ["stream", "complete"],
+        "fixtures": [{
+            "fixture_id": "lookup",
+            "messages": [{"role": "user", "content": "Look up Delhi and say Done."}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "parameters": {
+                    "type": "object", "properties": {"city": {"type": "string"}},
+                    "required": ["city"], "additionalProperties": False,
+                },
+            }}],
+            "expected_calls": [{"name": "lookup", "arguments": {"city": "Delhi"}}],
+            "expected_content": {"mode": "exact", "value": "Done.", "normalization": "none"},
+        }],
+    }
+    for report in (current, old):
+        if selected:
+            report.manifest["config"]["checks"].append("tools")
+        report.manifest["config"]["tool_checks"] = deepcopy(tool_checks)
+        report.manifest["config"] = RunConfig.model_validate(report.manifest["config"]).model_dump()
+    current.manifest["config"]["tool_checks"]["fixtures"][0]["expected_content"]["value"] = "Finished."
+    result = compare_baseline(current, old)
+    reasons = result.baseline["targets"][0]["reasons"]
+    assert ("Run setting tool_checks differs." in reasons) == selected
+    assert result.baseline["status"] == ("inconclusive" if selected else "pass")
 
 
 @pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])

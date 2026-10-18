@@ -132,7 +132,7 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
     fixtures = builtin_fixtures(configured)
     heavy = traffic_fixtures(configured)
     answers = {tuple(m['content'] for m in spec.messages): str(spec.expected)
-               for specs in [fixtures['short'], heavy['long_input'], heavy['long_output']]
+               for specs in [fixtures['short'], fixtures['sustained'], heavy['long_input'], heavy['long_output']]
                for spec in specs}
     heavy_prompts = {tuple(m['content'] for m in spec.messages)
                      for specs in [heavy['long_input'], heavy['long_output']] for spec in specs}
@@ -173,8 +173,14 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
                       for piece in [answer[:split], answer[split:]]]
             events.append(dict(choices=[dict(delta={}, finish_reason='stop')],
                                usage={'prompt_tokens': 32, 'completion_tokens': len(answer.split())}))
-            body = ''.join('data: ' + json.dumps(event) + '\n\n' for event in events)
-            return httpx.Response(200, text=body + 'data: [DONE]\n\n',
+            class EventStream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    for event in events:
+                        await asyncio.sleep(.001)
+                        yield ('data: ' + json.dumps(event) + '\n\n').encode()
+                    yield b'data: [DONE]\n\n'
+
+            return httpx.Response(200, stream=EventStream(),
                                   headers={'content-type': 'text/event-stream'})
         finally:
             if timer is not None:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from giraffe.models import Buckets, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
+from giraffe.models import ConcurrentWorkloads, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
 
 
 def test_first_run_goals_sizes_and_confirmed_live_plan():
@@ -29,27 +29,27 @@ const context={{assert,structuredClone,...formConfig,nodes,listeners,timers,
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 context.bootstrap={json.dumps(capabilities())};
-context.config={json.dumps(RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['access','buckets'],concurrency=8,buckets={'levels':[1,4,8],'samples_per_bucket':5}).model_dump(mode='json'))};
+context.config={json.dumps(RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['access','concurrency'],concurrency=8,concurrent_workloads={'levels':[1,4,8],'samples_per_bucket':5}).model_dump(mode='json'))};
 await vm.runInNewContext(source+`
 (async()=>{{
 state.bootstrap=bootstrap;state.bootstrap.config=config;state.config=config;state.setupPreset='concurrent';state.jsonDraft=state.jsonBase='synced';
 const before=JSON.stringify(config);
-const bucket=state.bootstrap.checks.find(check=>check.id==='buckets');
+const bucket=state.bootstrap.checks.find(check=>check.id==='concurrency');
 let markup=renderTestCard(bucket,config);
-assert.match(markup,/Concurrent requests/);
+assert.match(markup,/Concurrency levels/);
 for(const size of ['short','medium','long']){{
-  assert(markup.includes('name="buckets_input_'+size+'"'));
-  assert(markup.includes('name="buckets_output_'+size+'"'));
+  assert(markup.includes('name="concurrent_input_'+size+'"'));
+  assert(markup.includes('name="concurrent_output_'+size+'"'));
 }}
 assert.equal(JSON.stringify(config),before);
-for(const name of ['buckets_levels','buckets_input_short','buckets_output_long'])assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
+for(const name of ['concurrent_levels','concurrent_input_short','concurrent_output_long'])assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
 const rate=renderTestCard(state.bootstrap.checks.find(check=>check.id==='capacity'),config);
 for(const name of ['traffic_rates','traffic_duration_seconds'])assert.equal((rate.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
 state.setupPreset='concurrent';
-config.buckets.output_tokens.long=config.max_output_tokens+1;
+config.concurrent_workloads.output_tokens.long=config.max_output_tokens+1;
 assert.match(renderLoadGuidance(config),/answer cap.*run.*cap/i);
 assert.match(renderLoadGuidance(config),/data-action="edit-output-cap"/);
-config.buckets.output_tokens.long=config.max_output_tokens;
+config.concurrent_workloads.output_tokens.long=config.max_output_tokens;
 const plan={{count_kind:'exact',planned_per_target:164,planned_total:164,known_per_target:164,known_total:164,request_limit:20,required_request_limit:164,target_quotas:{{local:20}},rows:[{{id:'initial',title:'Connection check',requests_per_target:1,kind:'exact',source:'generated examples',summary:'One generated request checks the connection.'}},{{id:'access',title:'Shared accounting',requests_per_target:0,kind:'exact',source:'generated examples',summary:'Adds no requests.'}}],bucket_cases:[{{input_chars:64,actual_input_chars:96,output_tokens:16}}],bucket_levels:[],evaluator:{{active:true,ready:true,call_upper_bound:12,judge_count:1,readiness_errors:[]}},warnings:[]}};
 config.max_requests=20;
 state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan,config}};
@@ -150,7 +150,7 @@ import * as formConfig from {json.dumps((static / 'form-config.mjs').as_uri())};
 const nodes={{}},controls=[],listeners={{}},snapshots=[];
 const decode=value=>(value || '').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
 const attr=(tag,key)=>decode(tag.match(new RegExp('(?:^|\\s)'+key+'="([^"]*)"'))?.[1]);
-const form={{elements:{{}},querySelectorAll:()=>controls.filter(input=>/^(test_|traffic_|buckets_)/.test(input.name))}};
+const form={{elements:{{}},querySelectorAll:()=>controls.filter(input=>/^(test_|traffic_|concurrent_)/.test(input.name))}};
 let html='';
 nodes['#main']={{get innerHTML(){{return html;}},set innerHTML(value){{
   html=value;controls.length=0;form.elements={{}};
@@ -185,7 +185,7 @@ const renderBounds=updateBounds;
 syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=()=>{{}};
 const savedPack=JSON.stringify(config.request_pack),savedProfile=JSON.stringify(config.prefix),savedOptions=JSON.stringify(config.test_options);
 for(const preset of ['answers','concurrent','arrival','custom']){{
-  state.config=applySetupPreset(config,preset,state.bootstrap.buckets.defaults);state.jsonDraft=state.jsonBase='synced';
+  state.config=applySetupPreset(config,preset,state.bootstrap.concurrent_workloads.defaults);state.jsonDraft=state.jsonBase='synced';
   const before=JSON.stringify(state.config);renderNew(preset);
   assert.equal(JSON.stringify(state.config),before); // Merely opening never changes selection.
   const markup=nodes['#main'].innerHTML;
@@ -199,17 +199,17 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
     if(['check','setup_goal','setup_load','request_source'].includes(name))continue;
     assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
   }}
-  assert.equal(controls.filter(input=>input.name==='check').length,19);
+  assert.equal(controls.filter(input=>input.name==='check').length,17);
   for(const name of ['max_requests','max_duration_seconds'])assert(controls.some(input=>input.name===name));
   if(preset==='concurrent'){{
     assert(!markup.includes('name="request_source"'));
     assert.equal(form.elements.concurrency.type,'number');
-    for(const size of ['short','medium','long'])assert(form.elements['buckets_input_'+size]&&form.elements['buckets_output_'+size]);
-    form.elements.buckets_levels.value='1, 4, 8';
-    for(const [index,size] of ['short','medium','long'].entries()){{form.elements['buckets_input_'+size].value=String(80+index*80);form.elements['buckets_output_'+size].value=String(8+index*8);}}
+    for(const size of ['short','medium','long'])assert(form.elements['concurrent_input_'+size]&&form.elements['concurrent_output_'+size]);
+    form.elements.concurrent_levels.value='1, 4, 8';
+    for(const [index,size] of ['short','medium','long'].entries()){{form.elements['concurrent_input_'+size].value=String(80+index*80);form.elements['concurrent_output_'+size].value=String(8+index*8);}}
   }}
   if(preset==='arrival'){{
-    const primary=markup.slice(markup.indexOf('data-test-card="capacity"'),markup.indexOf('data-test-card="buckets"'));
+    const primary=markup.slice(markup.indexOf('data-test-card="capacity"'),markup.indexOf('data-test-card="concurrency"'));
     assert(primary.includes('name="traffic_rates"'));assert(primary.includes('name="test_capacity_limit_latency_ms"'));
     assert(!primary.includes('name="limit_latency_ms"'));
     assert.equal(form.elements.test_capacity_limit_latency_ms.value,String(config.test_options.capacity.limits.latency_ms ?? ''));
@@ -223,7 +223,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   assert.equal(result.max_requests,config.max_requests);
   if(preset==='concurrent'){{
     assert.equal(result.concurrency,state.config.concurrency);
-    for(const [index,size] of ['short','medium','long'].entries()){{assert.equal(result.buckets.input_chars[size],80+index*80);assert.equal(result.buckets.output_tokens[size],8+index*8);}}
+    for(const [index,size] of ['short','medium','long'].entries()){{assert.equal(result.concurrent_workloads.input_chars[size],80+index*80);assert.equal(result.concurrent_workloads.output_tokens[size],8+index*8);}}
     assert.equal(result.max_output_tokens,config.max_output_tokens);
   }}
 }}
@@ -240,7 +240,7 @@ const rerunBefore=JSON.stringify(state.config);renderNew();
 assert.equal(state.setupPreset,'custom');assert.equal(JSON.stringify(state.config),rerunBefore);
 assert.equal(state.config.concurrency,16);assert.equal(state.prefillBaseline,'saved-baseline');
 // The primary answer-time field edits the effective capacity target, preserving shared limits.
-state.config=applySetupPreset(config,'arrival',state.bootstrap.buckets.defaults);renderNew('arrival');
+state.config=applySetupPreset(config,'arrival',state.bootstrap.concurrent_workloads.defaults);renderNew('arrival');
 for(const id of ['selection-summary','load-guidance','run-bounds'])nodes['#'+id]={{innerHTML:'',insertAdjacentHTML(position,html){{this.innerHTML+=html;}}}};
 for(const check of state.bootstrap.checks)nodes['[data-test-card="'+check.id+'"]']={{querySelector:()=>({{}})}};
 renderBounds();
@@ -274,7 +274,7 @@ assert.equal(current.limits.latency_ms,2500);assert.equal(primary.value,2500);
 assert.equal(current.test_options.capacity.limits.first_output_ms,400);
 assert(!Object.hasOwn(current.test_options.capacity.limits,'latency_ms'));
 // My questions can remain an empty saved draft while generated-only work executes.
-state.config=applySetupPreset(config,'concurrent',state.bootstrap.buckets.defaults);
+state.config=applySetupPreset(config,'concurrent',state.bootstrap.concurrent_workloads.defaults);
 state.config.request_source='request_pack';state.config.request_pack=null;renderNew('concurrent');
 toast=()=>{{}};api=async(path,options)=>{{const body=JSON.parse(options.body);snapshots.push({{path,config:body}});return {{config:body}};}};
 const editable=readForm(true).config;
@@ -288,7 +288,7 @@ for(const check of ['correctness','capacity']){{
   const consumer=await validatedSnapshot();assert.equal(consumer.config.request_source,'request_pack');
 }}
 // A successful generated-only run sends builtin, but retains the editable empty choice.
-state.config=applySetupPreset(editable,'concurrent',state.bootstrap.buckets.defaults);renderNew('concurrent');
+state.config=applySetupPreset(editable,'concurrent',state.bootstrap.concurrent_workloads.defaults);renderNew('concurrent');
 nodes['#form-error']={{hidden:true}};nodes['#start-run']={{}};nodes['#new-active-notice']={{hidden:true}};
 validateRunForm=()=>true;setActive=()=>{{}};refreshRequestPreview=async()=>{{}};
 state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan:{{}}}};
@@ -375,57 +375,60 @@ def test_bucket_controls_and_request_budget_guidance():
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {{configureBuckets, bucketCoveragePlan, sameConfig}} from {json.dumps((static / 'form-config.mjs').as_uri())};
-const defaults={json.dumps(Buckets().model_dump())};
-const source={{checks:['buckets'],concurrency:8,max_requests:20,limits:{{min_samples:5}},targets:[{{name:'a'}},{{name:'b'}}],buckets:null}};
+import {{configureConcurrentWorkloads, bucketCoveragePlan, sameConfig, optionDefault, optionValue, limitValue}} from {json.dumps((static / 'form-config.mjs').as_uri())};
+const defaults={json.dumps(ConcurrentWorkloads().model_dump())};
+const source={{checks:['concurrency'],concurrency:8,max_requests:20,limits:{{min_samples:5}},targets:[{{name:'a'}},{{name:'b'}}],concurrent_workloads:null}};
 const values=new FormData();
-values.set('buckets_levels','1, 4 8');
-values.set('buckets_samples_per_bucket','4');
-values.set('buckets_window_seconds','30');
-const build=()=>configureBuckets(source,values,defaults);
+values.set('concurrent_levels','1, 4 8');
+values.set('concurrent_samples_per_bucket','4');
+values.set('concurrent_window_seconds','30');
+const build=()=>configureConcurrentWorkloads(source,values,defaults);
 let result=build();
-assert.deepEqual(result.buckets.levels,[1,4,8]);
-assert.equal(source.buckets,null);
+assert.deepEqual(result.concurrent_workloads.levels,[1,4,8]);
+assert.equal(source.concurrent_workloads,null);
 assert.deepEqual(bucketCoveragePlan(result),{{levels:[1,4,8],peak:8,perTarget:144,total:288}});
+result.concurrent_workloads.samples_per_bucket=5;
+assert.deepEqual(bucketCoveragePlan(result),{{levels:[1,4,8],peak:8,perTarget:189,total:378}});
+result.concurrent_workloads.samples_per_bucket=4;
 assert.equal(result.max_requests,20); // Never silently raise a total traffic limit.
 result.concurrency=16;
 assert.deepEqual(bucketCoveragePlan(result),{{levels:[1,4,8],peak:8,perTarget:144,total:288}});
-result.buckets.levels=[1,16];
+result.concurrent_workloads.levels=[1,16];
 assert.equal(bucketCoveragePlan(result).total,360);
 result.checks=['mixed'];assert.equal(bucketCoveragePlan(result),null);
 result.checks=['serving'];assert.equal(bucketCoveragePlan(result),null);
 source.checks=['serving'];
-values.set('buckets_levels',defaults.levels.join(', '));
-values.set('buckets_samples_per_bucket',String(defaults.samples_per_bucket));
-assert.equal(build().buckets,null); // Ordinary edits do not activate an optional workload.
-values.set('buckets_levels','8');assert.deepEqual(build().buckets.levels,[8]);
-source.buckets={{...defaults,input_chars:{{short:20,medium:40,long:80}},mixed_pairs:7}};
-assert.deepEqual(build().buckets.input_chars,source.buckets.input_chars);
-assert.equal(build().buckets.mixed_pairs,7);
-assert.deepEqual(configureBuckets(result,new FormData(),defaults),result);
+values.set('concurrent_levels',defaults.levels.join(', '));
+values.set('concurrent_samples_per_bucket',String(defaults.samples_per_bucket));
+assert.equal(build().concurrent_workloads,null); // Ordinary edits do not activate an optional workload.
+values.set('concurrent_levels','8');assert.deepEqual(build().concurrent_workloads.levels,[8]);
+source.concurrent_workloads={{...defaults,input_chars:{{short:20,medium:40,long:80}},mixed_pairs:7}};
+assert.deepEqual(build().concurrent_workloads.input_chars,source.concurrent_workloads.input_chars);
+assert.equal(build().concurrent_workloads.mixed_pairs,7);
+assert.deepEqual(configureConcurrentWorkloads(result,new FormData(),defaults),result);
 for(const invalid of ['', '0', '2, 2', '1.5', '257', 'Infinity', 'oops']) {{
-  values.set('buckets_levels',invalid);assert.throws(build,/Concurrency levels/);
+  values.set('concurrent_levels',invalid);assert.throws(build,/Concurrency levels/);
 }}
-values.set('buckets_levels','1, oops');
-assert.doesNotThrow(()=>configureBuckets(source,values,defaults,{{allowInvalid:true}}));
+values.set('concurrent_levels','1, oops');
+assert.doesNotThrow(()=>configureConcurrentWorkloads(source,values,defaults,{{allowInvalid:true}}));
 const bootstrap={json.dumps(capabilities())};
 bootstrap.config={{traffic:bootstrap.defaults.traffic}};
 const app=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\\n/,'').replace(/\\ninit\\(\\);\\s*$/,'');
-const context={{structuredClone,sameConfig,bucketCoveragePlan,
+const context={{structuredClone,sameConfig,bucketCoveragePlan,optionDefault,optionValue,limitValue,
   document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
 vm.runInNewContext(app+`\nstate.bootstrap=${{JSON.stringify(bootstrap)}};`,context);
-const html=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='buckets'),
-  {{checks:['buckets'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},buckets:null,test_options:{{}}}})`,context);
-assert.match(html,/name="buckets_levels"/);
-assert.match(html,/name="buckets_samples_per_bucket"/);
-assert.match(html,/Concurrent requests/);
+const html=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='concurrency'),
+  {{checks:['concurrency'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},concurrent_workloads:null,test_options:{{}}}})`,context);
+assert.match(html,/name="concurrent_levels"/);
+assert.match(html,/name="concurrent_samples_per_bucket"/);
+assert.match(html,/Concurrency levels/);
 assert.doesNotMatch(html,/Customize <code>buckets<\\/code> in the JSON/);
-context.draft={{checks:['buckets'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},
-  buckets:{{...defaults,levels:['<img src=x>']}}}};
-const draftHtml=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='buckets'),draft)`,context);
+context.draft={{checks:['concurrency'],concurrency:8,max_output_tokens:128,limits:{{min_samples:5}},
+  concurrent_workloads:{{...defaults,levels:['<img src=x>']}}}};
+const draftHtml=vm.runInNewContext(`renderTestCard(state.bootstrap.checks.find(c=>c.id==='concurrency'),draft)`,context);
 assert.doesNotMatch(draftHtml,/<img src=x>/);
-context.config={{...source,checks:['buckets'],buckets:{{...defaults,levels:[1,4,8]}}}};
+context.config={{...source,checks:['concurrency'],concurrent_workloads:{{...defaults,levels:[1,4,8]}}}};
 let guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
 assert.doesNotMatch(guidance,/data-action="use-request-budget"/); // Only a confirmed full server plan may offer a budget raise.
 context.config.max_requests=288;
@@ -433,12 +436,91 @@ guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
 assert.doesNotMatch(guidance,/data-action="use-request-budget"/);
 context.config.concurrency=4;
 assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/highest tested level \\(8\\) exceeds/);
-context.config={{...source,checks:['correctness'],buckets:null,max_requests:1}};
+context.config={{...source,checks:['correctness'],concurrent_workloads:null,max_requests:1}};
 assert.doesNotMatch(vm.runInNewContext('renderLoadGuidance(config)',context),/data-action="use-request-budget"/);
 """
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
+
+
+def test_concurrent_scenarios_and_token_targets_roundtrip_through_real_form_serializer():
+    module = (Path(__file__).parents[1] / "src/giraffe/static/form-config.mjs").as_uri()
+    source = RunConfig.model_validate({
+        "targets": [{"name": "local", "url": "http://localhost:1", "model": "test"}],
+        "checks": ["concurrency"], "concurrency": 2,
+        "max_output_tokens": 10000, "context_limit": 16384,
+    }).model_dump(mode="json")
+    script = f"""
+import {{configureTests,configureConcurrentWorkloads}} from {json.dumps(module)};
+const source={json.dumps(source)},v=new FormData(),s=source.concurrent_workloads;
+v.append('check','concurrency');v.set('traffic_mode','default');
+v.set('concurrent_scenarios_rendered','1');
+v.set('concurrent_scenario_mixed_interference','on');v.set('concurrent_scenario_token_stress','on');
+v.set('concurrent_levels','1, 2');
+for(const key of ['samples_per_bucket','mixed_pairs','window_seconds','input_token_tolerance','calibration_attempts']) v.set(`concurrent_${{key}}`,s[key]);
+for(const size of ['short','medium','long']) {{v.set(`concurrent_input_${{size}}`,s.input_chars[size]);v.set(`concurrent_output_${{size}}`,s.output_tokens[size]);}}
+for(const item of s.stress_cases) {{
+ v.set(`concurrent_${{item.name}}_enabled`,'on');
+ v.set(`concurrent_${{item.name}}_input`,item.input_tokens ?? '');
+ v.set(`concurrent_${{item.name}}_output`,item.output_tokens);
+ v.set(`concurrent_${{item.name}}_minimum`,item.output_tokens);
+}}
+console.log(JSON.stringify(configureConcurrentWorkloads(configureTests(source,v,[],source.traffic),v,s)));
+"""
+    result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
+                            capture_output=True, text=True, check=True)
+    config = RunConfig.model_validate(json.loads(result.stdout))
+    assert config.concurrent_workloads.scenarios == ["mixed_interference", "token_stress"]
+    assert config.concurrent_workloads.stress_cases[0].input_tokens == 10000
+    assert config.concurrent_workloads.stress_cases[1].output_tokens == 10000
+    assert config.concurrent_workloads.stress_cases[1].max_input_tokens == 128
+
+
+def test_mixed_session_form_roundtrip_preserves_editable_tasks_and_shared_concurrency():
+    from giraffe.models import RunConfig, Sessions, session_workload_presets
+
+    module = (Path(__file__).parents[1] / "src/giraffe/static/form-config.mjs").as_uri()
+    source = {"targets": [{"name": "local", "url": "http://localhost:1", "model": "test"}],
+              "concurrency": 3, "max_output_tokens": 128, "checks": ["sessions"]}
+    defaults = Sessions().model_dump(mode="json")
+    tasks = [item.model_dump(mode="json") for item in session_workload_presets()]
+    script = f"""
+import assert from 'node:assert/strict';
+import {{configureSessions}} from {json.dumps(module)};
+const source={json.dumps(source)},defaults={json.dumps(defaults)},tasks={json.dumps(tasks)};
+const values=new FormData();
+values.set('sessions_profile','performance');values.set('sessions_count','6');
+values.set('sessions_delay','1.5');values.set('sessions_max_tokens','96');
+values.set('session_workload_count','3');
+tasks.forEach((task,i)=>{{
+  values.set(`session_enabled_${{i}}`,i===2?'off':'on');
+  values.set(`session_name_${{i}}`,task.name);values.set(`session_weight_${{i}}`,i===0?'2':'1');
+  values.set(`session_cap_${{i}}`,i===0?'64':'');
+  values.set(`session_turn_count_${{i}}`,task.turns.length);
+  task.turns.forEach((turn,j)=>values.set(`session_turn_${{i}}_${{j}}`,turn));
+}});
+values.set('session_turn_0_1','Custom follow-up with <literal> characters.');
+const result=configureSessions(source,values,defaults);
+assert.equal(result.sessions.concurrency,3);assert.equal(result.sessions.workloads.length,2);
+assert.deepEqual(result.sessions.modes,['live']);
+assert.equal(result.sessions.workloads[0].turns[1],'Custom follow-up with <literal> characters.');
+assert.equal(result.sessions.workloads[0].max_tokens,64);
+assert.equal(source.sessions,undefined);
+values.set('session_enabled_0','off');values.set('session_enabled_1','off');
+assert.throws(()=>configureSessions(source,values,defaults),/Select at least/);
+assert.equal(configureSessions(result,new FormData(),defaults).sessions.profile,'performance');
+const legacy=new FormData();legacy.set('sessions_profile','correctness');
+const bounded=configureSessions({{...source,concurrency:1,max_output_tokens:16}},legacy,defaults);
+assert.equal(bounded.sessions,undefined); // Viewing the default profile keeps null settings implicit.
+console.log(JSON.stringify(result));
+"""
+    completed = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
+                               capture_output=True, text=True, check=True)
+    normalized = RunConfig.model_validate(json.loads(completed.stdout))
+    assert normalized.sessions.workloads[0].weight == 2
+    assert normalized.sessions.delay_seconds == 1.5
+
 
 
 @pytest.mark.parametrize("scenario", [
@@ -453,7 +535,7 @@ def test_browser_configuration_behavior(scenario):
                                 {"name": "b", "url": "http://localhost:8001/v1", "model": "b"}],
                        checks=["correctness", "capacity"], limits={"latency_ms": 1000},
                        arrivals={"requests_per_second": 3}, prefix={"repeats": 7},
-                       buckets={"levels": [1]}, sessions={"sessions": 3},
+                       concurrent_workloads={"levels": [1]}, sessions={"sessions": 3},
                        consistency={"repetitions": 8},
                        test_options={"correctness": {"samples": 9},
                                      "recovery": {"sustained_seconds": 2}})
@@ -579,7 +661,7 @@ switch ({json.dumps(scenario)}) {{
     values.delete('check');values.append('check','prefix');values.append('check','tools');
     let result=build();
     assert.deepEqual(result.checks,['prefix','tools']);assert.equal(result.tool_calling,true);
-    for(const key of ['arrivals','prefix','buckets','sessions','consistency'])assert.deepEqual(result[key],source[key]);
+    for(const key of ['arrivals','prefix','concurrency','sessions','consistency'])assert.deepEqual(result[key],source[key]);
     assert.deepEqual(result.targets,source.targets);
     const next=valuesFor(result);next.delete('check');next.append('check','correctness');
     result=configureTests(result,next,checks,defaults);
@@ -686,9 +768,9 @@ import {{optionDefault, optionValue, limitValue, sameConfig}} from {json.dumps((
 const listeners={{}}, elements={{}}, cards={{}};
 const checks=[{{id:'correctness',title:'Known answers',description:'Check answers',option_fields:['samples'],limit_fields:[],defaults:{{samples:6}}}},
   {{id:'capacity',title:'Capacity',description:'Test traffic',option_fields:[],limit_fields:['latency_ms'],defaults:{{limits:{{latency_ms:null}}}}}},
-  {{id:'buckets',title:'Bucket coverage',description:'Test levels',option_fields:[],limit_fields:[],defaults:{{}}}}];
+  {{id:'concurrency',title:'Bucket coverage',description:'Test levels',option_fields:[],limit_fields:[],defaults:{{}}}}];
 const traffic={{rates:[1,2,4],arrival:'steady',duration_seconds:5,mix:{{short:.6,long_input:.2,long_output:.2}}}};
-for(const id of ['correctness','capacity','buckets']){{
+for(const id of ['correctness','capacity','concurrency']){{
   const fieldset={{disabled:true}}, selection={{checked:id==='capacity'}}, status={{textContent:''}}, draft={{hidden:true}};
   const trigger={{attributes:{{}},setAttribute(k,v){{this.attributes[k]=v;}},focus(){{this.focused=true;}}}};
   const editor={{hidden:true,querySelectorAll:()=>[fieldset]}};
@@ -705,7 +787,7 @@ function input(name,id,section,value){{
   const item={{name,value,dataset:{{inherited:'true'}},disabled:false,valid:true,
     closest(q){{if(q==='[data-test-card]')return cards[id];if(q==='fieldset')return cards[id].fieldset;
       if(q==='[data-test-settings]'&&['test','bucket'].includes(section))return {{dataset:{{testSettings:id}}}};
-      if(q==='[data-bucket-settings]'&&section==='bucket')return {{}};
+      if(q==='[data-concurrent-settings]'&&section==='bucket')return {{}};
       if(q==='[data-traffic-settings]'&&section==='traffic')return {{}};
       return null;}},checkValidity(){{return this.valid;}},reportValidity(){{this.reported=true;}}}};
   elements[name]=item;return item;
@@ -713,7 +795,7 @@ function input(name,id,section,value){{
 const samples=input('test_correctness_samples','correctness','test','6');
 const latency=input('test_capacity_limit_latency_ms','capacity','test','');
 const rates=input('traffic_rates','capacity','traffic','1, 2, 4');
-const levels=input('buckets_levels','buckets','bucket','1, 8');
+const levels=input('concurrent_levels','concurrency','bucket','1, 8');
 const form={{elements,querySelectorAll:()=>[samples,latency,rates,levels]}};
 const document={{addEventListener:(kind,fn)=>listeners[kind]=fn,querySelectorAll:()=>[],querySelector(q){{
   if(q==='#new-run-form')return form;
@@ -725,10 +807,10 @@ const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
 const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,
   document,window:{{addEventListener(){{}}}},assert,checks,traffic,cards,elements,form,samples,latency,rates,levels,listeners}};
 vm.runInNewContext(source+`
-state.bootstrap={{checks,config:{{traffic}},buckets:{{defaults:{json.dumps(Buckets().model_dump())}}},option_schema:{{properties:{{samples:{{type:'integer',minimum:1}}}}}},
+state.bootstrap={{checks,config:{{traffic}},concurrent_workloads:{{defaults:{json.dumps(ConcurrentWorkloads().model_dump())}}},option_schema:{{properties:{{samples:{{type:'integer',minimum:1}}}}}},
  limits_schema:{{properties:{{latency_ms:{{anyOf:[{{type:'number'}},{{type:'null'}}]}}}}}},
  traffic_schema:{{properties:{{rates:{{type:'array'}},arrival:{{enum:['steady','poisson']}}}},$defs:{{TrafficMix:{{properties:{{short:{{type:'number'}},long_input:{{type:'number'}},long_output:{{type:'number'}}}}}}}}}}}};
-state.config={{checks:['capacity'],targets:[{{}}],samples:6,concurrency:8,max_output_tokens:128,traffic,limits:{{latency_ms:null}},test_options:{{correctness:{{samples:9}}}}}};
+state.config={{checks:['capacity'],targets:[{{}}],samples:6,concurrency:8,max_output_tokens:128,traffic,limits:{{latency_ms:null,min_samples:5}},test_options:{{correctness:{{samples:9}}}}}};
 state.catalogueFilter='all';
 syncConfigView=()=>{{}};
 updateBounds=()=>{{}}; // The DOM mock exercises disclosure and input behavior, not report markup.
@@ -802,12 +884,12 @@ assert.equal(cards.correctness.fieldset.disabled,false);
 assert.equal(samples.reported,true);
 samples.valid=true;cards.correctness.selection.checked=false;
 levels.valid=false;
-assert.equal(elements.test_mode_buckets.value,'default');
+assert.equal(elements.test_mode_concurrency.value,'default');
 assert.equal(validateRunForm(form),true);
-cards.buckets.selection.checked=true;
+cards.concurrency.selection.checked=true;
 assert.equal(validateRunForm(form),false);
-assert.equal(state.openTest,'buckets');
-assert.equal(cards.buckets.fieldset.disabled,false);
+assert.equal(state.openTest,'concurrency');
+assert.equal(cards.concurrency.fieldset.disabled,false);
 assert.equal(levels.reported,true);
 `,context);
 """
@@ -1366,3 +1448,30 @@ assert.match(renderCancellationResults({{}}),/older report/);
 """
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_tool_profile_serializer_preserves_custom_data_and_invalid_drafts():
+    from tests.test_ux_catalogue import browser_logic
+
+    browser_logic(r"""
+config.tool_checks={fixtures:[{fixture_id:'custom',messages:[{role:'user',content:'ask'}],tools:[{custom:true}],expected_calls:[{name:'call',arguments:{x:1}}],options:{temperature:0}}],modes:['stream','complete']};
+const original=JSON.stringify(config),values=new Map();
+assert.equal(JSON.stringify(configureProfiles(config,values,{})),original);
+values.set('profile_edits_tools','["forced_tool_diagnostic"]');values.set('profile_tools_forced_tool_diagnostic','true');
+const forced=configureProfiles(config,values,{});assert.equal(JSON.stringify(forced.tool_checks),JSON.stringify(config.tool_checks));assert(forced.forced_tool_diagnostic);
+values.set('profile_edits_tools','["modes"]');values.set('profile_tools_modes','complete');
+const complete=configureProfiles(config,values,{});assert.equal(JSON.stringify(complete.tool_checks.fixtures),JSON.stringify(config.tool_checks.fixtures));assert.equal(complete.tool_checks.modes.join(','),'complete');
+values.set('profile_tools_modes','');assert.equal(configureProfiles(config,values,{}).tool_checks.modes,null);
+values.set('profile_edits_tools','["fixtures"]');values.set('profile_tools_fixtures','[{"unfinished"');
+assert.throws(()=>configureProfiles(config,values,{}),/JSON array/);
+const draft=configureProfiles(config,values,{}, {allowInvalid:true});assert.equal(draft.tool_checks.fixtures,'[{"unfinished"');
+assert.throws(()=>configureProfiles(draft,new Map(),{}),/JSON array/);
+for(const raw of ['null','{}','[null]','[[]]','[1]','[true]',JSON.stringify(Array(17).fill({})),' '.repeat(65537)]){
+  values.set('profile_tools_fixtures',raw);assert.throws(()=>configureProfiles(config,values,{}));
+}
+values.set('profile_tools_fixtures','[]');assert.equal(configureProfiles(config,values,{}).tool_checks.fixtures.length,0);
+assert.equal(JSON.stringify(config),original);
+config.tool_calling=true;config.stream=false;
+assert.throws(()=>configureProfiles(config,new Map(),{}),/Enable streaming/);
+config.tool_calling=false;assert.doesNotThrow(()=>configureProfiles(config,new Map(),{}));
+""")

@@ -17,10 +17,14 @@ from jsonschema import SchemaError, ValidationError
 from pydantic import ValidationError as ModelValidationError
 from referencing.exceptions import Unresolvable
 
-from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig, EvaluationEvidence, validated_json_schema
+from giraffe.models import (CHECK_NAMES, EvaluationEvidence, RequestRecord, RequestSpec, RunConfig,
+                           ToolCheckOutcome, ToolEvaluation, ToolExpectation, finite_tool_json,
+                           validated_json_schema)
+from giraffe.tool_schema import (MAX_TOOL_JSON_BYTES, ToolSchemaBudgetExceeded, bounded_json_tree,
+                                bounded_tool_schema)
 
-FIXTURE_VERSION = "0.2.0"
-SUITE_VERSION = "0.2.0"
+FIXTURE_VERSION = "0.3.0"
+SUITE_VERSION = "0.3.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 _CONTEXT_POSITION_SEPARATION = 32
 REASONING_WITHOUT_ANSWER = "reasoning without final answer"
@@ -33,6 +37,15 @@ def deterministic_options(config: RunConfig, options: dict | None = None) -> dic
     if "temperature" not in config.request_options and "temperature" not in options:
         options["temperature"] = 0
     return options
+
+
+GENERATION_PASSAGE = (
+    "The small boat crossed the lake early in the morning. The water was calm, "
+    "and the trees along the shore were reflected on its surface. A family watched "
+    "from the wooden pier as the boat approached. They carried a basket of bread, "
+    "apples, and fresh water for their picnic. After tying the boat to the pier, "
+    "the captain helped everyone aboard and checked that each person had a life jacket."
+)
 
 
 def _request(
@@ -194,20 +207,15 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     ]
     sustained = [
         _request(
-            "sustained.code", "sustained", ["recovery", "serving"],
-            "The box label is V5N3. Reply with the box label only.", expected="V5N3",
-            version=2,
+            "sustained.copy", "sustained", ["recovery", "serving"],
+            "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
+            expected=GENERATION_PASSAGE, max_tokens=config.max_output_tokens, version=3,
         ),
     ]
     generation = [
         _request(
             "generation.copy", "generation", ["generation", "serving"],
-            "Copy exactly, with no extra text:\n"
-            "The small boat crossed the lake early in the morning. The water was calm, "
-            "and the trees along the shore were reflected on its surface. A family watched "
-            "from the wooden pier as the boat approached. They carried a basket of bread, "
-            "apples, and fresh water for their picnic. After tying the boat to the pier, "
-            "the captain helped everyone aboard and checked that each person had a life jacket.",
+            "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
             scorer="none", expected={"purpose": "observe sustained answer generation"},
             max_tokens=config.max_output_tokens,
         ),
@@ -358,24 +366,209 @@ def _json_answer(output: str, *, allow_fence: bool = True) -> Any:
     return json.loads(answer, parse_constant=reject_constant, object_pairs_hook=unique_keys)
 
 
+def _equal_json_values(left: Any, right: Any) -> bool:
+    """JSON has one numeric category; booleans are a distinct category."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_equal_json_values(value, right[key]) for key, value in left.items())
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_equal_json_values(a, b) for a, b in zip(left, right, strict=True))
+    return left == right
+
+
+def _parsed_tool_arguments(arguments: Any, schema: dict) -> dict:
+    if not isinstance(arguments, str):
+        raise ValueError("arguments must be JSON text")
+    if len(arguments.encode("utf-8")) > MAX_TOOL_JSON_BYTES:
+        raise ToolSchemaBudgetExceeded
+    value = _json_answer(arguments, allow_fence=False)
+    finite_tool_json(value)
+    bounded_json_tree(value)
+    if not isinstance(value, dict):
+        raise ValueError("tool arguments must be an object")
+    bounded_tool_schema(schema, instance=value).validate(value)
+    return value
+
+
+def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> ToolCheckOutcome:
+    calls = record.tool_calls
+    if record.finish_reason == "length":
+        return ToolCheckOutcome(status="fail", message="Truncated tool-call completion cannot establish complete capability.")
+    if not calls:
+        return ToolCheckOutcome(status="fail", message="Missing parsed tool call; JSON answer text is not a tool call.")
+    if len(calls) != len(expectation.expected_calls):
+        return ToolCheckOutcome(status="fail", message="Wrong tool-call count: differs from the fixture.")
+    schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in expectation.tools}
+    for call, expected in zip(calls, expectation.expected_calls, strict=True):
+        function = call.get("function")
+        if not isinstance(function, dict) or function.get("name") != expected.name:
+            return ToolCheckOutcome(status="fail", message="Wrong tool function: differs from the fixture's ordered calls.")
+        if call.get("type", "function") != "function":
+            return ToolCheckOutcome(status="fail", message="Wrong tool-call type: expected a function.")
+        try:
+            value = _parsed_tool_arguments(function.get("arguments"), schemas[expected.name])
+            if expected.arguments is not None and not _equal_json_values(value, expected.arguments):
+                return ToolCheckOutcome(status="fail", message="Tool arguments differ from the fixture's expected values.")
+        except ToolSchemaBudgetExceeded:
+            return ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
+        except RecursionError:
+            return ToolCheckOutcome(status="inconclusive", message="Tool schema evaluation exceeded the recursion limit.")
+        except ValidationError:
+            return ToolCheckOutcome(status="fail", message="Tool argument schema mismatch.")
+        except (ValueError, TypeError, KeyError, Unresolvable, SchemaError):
+            return ToolCheckOutcome(status="fail", message="Malformed tool argument JSON.")
+    return ToolCheckOutcome(status="pass", message="Parsed tool call matches the fixture.")
+
+
+def _tool_choice_outcomes(expectation: ToolExpectation, record: RequestRecord):
+    rule, calls = expectation.choice, record.tool_calls
+    names = [call.get("function", {}).get("name") for call in calls]
+    schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in expectation.tools}
+    compliant = (len(calls) <= rule.call_limit
+                 and (rule.mode not in {"required", "named"} or bool(calls))
+                 and (rule.mode != "named" or all(name == rule.name for name in names)))
+    choice = ToolCheckOutcome(status="pass" if compliant else "fail",
+        message="Response honors the tool choice rule." if compliant else "Response violates the tool choice name/count rule.")
+    arguments = ToolCheckOutcome(status="not_checked", message="No calls returned; no arguments to validate.")
+    parsed = []
+    for call, name in zip(calls, names, strict=True):
+        if name not in schemas or call.get("type") != "function":
+            arguments = ToolCheckOutcome(status="fail", message="Call does not reference a declared function.")
+            break
+        try:
+            parsed.append(_parsed_tool_arguments(call["function"].get("arguments"), schemas[name]))
+        except (ToolSchemaBudgetExceeded, RecursionError):
+            arguments = ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
+            break
+        except (ValueError, TypeError, KeyError, Unresolvable, SchemaError, ValidationError):
+            arguments = ToolCheckOutcome(status="fail", message="Tool arguments are malformed or do not satisfy the declared schema.")
+            break
+        arguments = ToolCheckOutcome(status="pass", message="Returned tool arguments satisfy their declared schemas.")
+    expected = expectation.expected_calls
+    task = ToolCheckOutcome(status="not_checked", message="No task-specific call expectation configured.")
+    if expected is not None:
+        if len(expected) != len(calls) or any(e.name != name for e, name in zip(expected, names)):
+            task = ToolCheckOutcome(status="fail", message="Returned call names/count differ from the task expectation.")
+        elif arguments.status in {"fail", "inconclusive"}:
+            task = ToolCheckOutcome(status="inconclusive", message="Task arguments cannot be compared before schema validation succeeds.")
+        else:
+            matches = all(e.arguments is None or _equal_json_values(value, e.arguments)
+                          for e, value in zip(expected, parsed, strict=True))
+            task = ToolCheckOutcome(status="pass" if matches else "fail", message=
+                "Calls match the task expectation." if matches else "Tool arguments differ from the task expectation.")
+    return choice, arguments, task
+
+
+def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) -> RequestRecord:
+    expected_content = expectation.expected_content
+    answer, _, unclosed = final_answer(record.output)
+    content = ToolCheckOutcome(status="not_checked", message="No assistant content expectation configured.")
+    if record.status != "completed" or not record.valid:
+        if expectation.choice:
+            rejected = record.http_status in {400, 422, 501}
+            required = expectation.choice.support == "required"
+            pending = ToolCheckOutcome(status="inconclusive", message="Response did not complete validly; no semantic verdict.")
+            choice = ToolCheckOutcome(status="fail" if rejected and required else "inconclusive",
+                message="API rejected this request; tool-choice support is unverified." if rejected
+                        else "Tool choice cannot be assessed without a completed response.")
+            return record.model_copy(update={"score": False if rejected and required else None,
+                "score_message": choice.message, "tool_evaluation": ToolEvaluation(
+                    protocol=ToolCheckOutcome(status="fail", message="Request did not complete validly."),
+                    calls=pending, content=pending if expected_content is not None else content,
+                    choice=choice, arguments=pending, task=pending,
+                    support="rejected" if rejected else "unverified")})
+        pending = ToolCheckOutcome(status="inconclusive", message="Request did not complete validly; partial output cannot establish correctness.")
+        evaluation = ToolEvaluation(
+            protocol=ToolCheckOutcome(status="fail", message="Request did not complete validly."),
+            calls=pending, content=pending if expected_content is not None else content,
+        )
+        return record.model_copy(update={
+            "score": None, "score_message": "Answer not scored: request did not complete validly.",
+            "tool_evaluation": evaluation,
+        })
+    protocol = ToolCheckOutcome(status="pass", message="Request completed validly.")
+    if record.finish_reason == "length":
+        protocol = ToolCheckOutcome(status="fail", message="Completion was truncated by the output limit.")
+    elif expectation.choice and record.finish_reason == "tool_calls" and not record.tool_calls:
+        protocol = ToolCheckOutcome(status="fail", message="Tool-call finish reason returned without any structured calls.")
+    choice = arguments = task = None
+    if expectation.choice:
+        if protocol.status == "fail":
+            choice = arguments = task = ToolCheckOutcome(status="inconclusive", message="Incomplete or contradictory output cannot establish tool choice compliance.")
+        else:
+            choice, arguments, task = _tool_choice_outcomes(expectation, record)
+        call_outcomes = (arguments, task)
+        calls = next((outcome for status in ("fail", "inconclusive", "pass")
+                      for outcome in call_outcomes if outcome.status == status),
+                     ToolCheckOutcome(status="not_checked", message="No call arguments or task assertions to check."))
+    else:
+        calls = _tool_calls_outcome(expectation, record)
+    if expected_content is not None:
+        actual, expected = answer, expected_content.value
+        if expected_content.normalization == "whitespace":
+            actual, expected = _normalized(actual), _normalized(expected)
+        matches = actual == expected if expected_content.mode == "exact" else expected in actual
+        content = ToolCheckOutcome(
+            status="pass" if matches else "fail",
+            message=("Assistant content matches the fixture." if matches else "Assistant content differs from the fixture."),
+        )
+        if matches and expected_content.mode == "contains":
+            content.message = "Expected assistant substring found; this does not validate full content or duplication."
+    if unclosed:
+        content = ToolCheckOutcome(status="inconclusive", message=REASONING_WITHOUT_ANSWER)
+    evaluation = ToolEvaluation(protocol=protocol, calls=calls, content=content,
+        choice=choice, arguments=arguments, task=task,
+        support=("observed" if choice.status == "pass" else "unverified") if choice else None)
+    outcomes = (protocol, calls, content, *([choice] if choice else []))
+    failed = any(outcome.status == "fail" for outcome in outcomes)
+    inconclusive = any(outcome.status == "inconclusive" for outcome in outcomes)
+    score = False if failed else None if inconclusive else True
+    message = (next((outcome.message for outcome in outcomes if outcome.status in {"fail", "inconclusive"}),
+                    choice.message) if choice else calls.message)
+    if content.status == "fail":
+        message = content.message if calls.status == "pass" else f"{calls.message} {content.message}"
+    elif content.status == "inconclusive" and not failed:
+        message = content.message
+    elif score is True and expected_content is not None:
+        message = f"{calls.message} {content.message}"
+    return record.model_copy(update={
+        "score": score, "score_message": message, "tool_evaluation": evaluation,
+        **({"evaluation_error": "schema_recursion" if "recursion" in calls.message else "tool_evaluation_budget"}
+           if calls.status == "inconclusive" and protocol.status == "pass" else {}),
+    })
+
+
 def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     """Score only a valid, completed answer; return a new record.
 
     Exact checks compare the complete case-sensitive answer after whitespace
     normalization. ``contains`` is an explicit custom boundary-aware check, never
-    used by built-ins. JSON permits one complete markdown fence, but not prose
+    used by ordinary smoke fixtures. Token-stress summaries check a required fact,
+    without claiming full summary quality. JSON permits one complete markdown fence, but not prose
     surrounding an object. Reasoning content never substitutes for the answer.
     """
+    expectation = spec.tool_expectation
+    if spec.scorer == "tool" and expectation is None:
+        from giraffe.tool_checks import default_tool_fixture
+        fixture = default_tool_fixture()
+        expectation = ToolExpectation(tools=fixture.tools, expected_calls=fixture.expected_calls)
     record = record.model_copy(update={"evaluation": EvaluationEvidence(
         messages=spec.messages, scorer=spec.scorer, expected=spec.expected,
         expected_provided=spec.expected_provided or spec.expected is not None,
-        rubric=spec.rubric, schema=spec.schema_,
+        rubric=spec.rubric, schema=spec.schema_, tool_expectation=expectation,
     ).model_copy(deep=True)})
     answer, stripped, unclosed = final_answer(record.output)
     if stripped:
         record = record.model_copy(update={"reasoning_stripped": True})
     if spec.scorer == "none":
         return record.model_copy(update={"score": None, "score_message": "No semantic scorer."})
+    if spec.scorer == "tool":
+        return _score_tool_response(expectation, record)
     if record.status != "completed" or not record.valid:
         return record.model_copy(update={
             "score": None, "score_message": "Answer not scored: request did not complete validly.",
@@ -385,30 +578,6 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     if spec.scorer == "judge":
         return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER
                                          if record.finish_reason == "length" else "AI judgment pending."})
-    if spec.scorer == "tool":
-        calls = record.tool_calls
-        message = "Parsed tool call matches the fixture."
-        score = False
-        if record.finish_reason == "length":
-            return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER})
-        elif not calls:
-            message = "Missing parsed tool call; JSON answer text is not a tool call."
-        elif len(calls) != 1:
-            message = "Wrong tool-call count: expected exactly one."
-        elif calls[0].get("function", {}).get("name") != "get_weather":
-            message = "Wrong tool function: expected get_weather."
-        else:
-            try:
-                value = _json_answer(calls[0]["function"]["arguments"], allow_fence=False)
-                if not isinstance(value, dict) or set(value) != {"city"} or not isinstance(value["city"], str):
-                    message = "Tool argument schema mismatch: exactly one string city required."
-                elif value != {"city": "Delhi"}:
-                    message = "Tool arguments differ from expected city Delhi (case sensitive)."
-                else:
-                    score = True
-            except (ValueError, TypeError, KeyError):
-                message = "Malformed tool argument JSON."
-        return record.model_copy(update={"score": score, "score_message": message})
     incomplete = False
     if spec.scorer in {"exact", "contains"}:
         expected = _normalized(str(spec.expected))

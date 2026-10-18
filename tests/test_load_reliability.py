@@ -256,3 +256,32 @@ async def test_fairness_default_word_copy_passes_with_128_token_cap(endpoint):
         limits=Limits(fairness_max_ratio=10, min_samples=2)))
     assert check(report, 'fairness').status == 'pass'
     assert check(report, 'fairness').metrics['needed_output_tokens'] == 60
+
+
+@pytest.mark.parametrize('check_id,scenario,expected', [
+    ('recovery', 'recovery_baseline', 'inconclusive'),
+    ('recovery', 'recovery', 'inconclusive'),
+    ('recovery', 'sustained', 'pass'),
+    ('fairness', 'fairness_baseline', 'inconclusive'),
+])
+async def test_matched_ratio_qualifies_client_delay_in_both_controls_and_probes(
+    endpoint, monkeypatch, check_id, scenario, expected,
+):
+    original = runner._checks
+
+    def delayed(run, target):
+        record = next(row for row in run.records if row.scenario == scenario)
+        run.timing_health.windows[:] = [{
+            'start_ms': record.dispatch_ms, 'end_ms': record.completed_ms, 'lag_ms': 500,
+        }]
+        return original(run, target)
+
+    monkeypatch.setattr(runner, '_checks', delayed)
+    limits = Limits(min_samples=2, **{
+        'recovery_max_ratio' if check_id == 'recovery' else 'fairness_max_ratio': 100,
+    })
+    report = await runner.run_suite(config(checks=[check_id], limits=limits))
+    outcome = check(report, check_id)
+    assert outcome.status == expected
+    assert outcome.metrics['timing_quality']['status'] == (
+        'qualified' if expected == 'pass' else 'client_delayed')

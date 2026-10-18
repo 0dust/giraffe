@@ -5,8 +5,8 @@ from __future__ import annotations
 from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, Limits,
-    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, Buckets, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
-    MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES, RequestPack,
+    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, ConcurrentWorkloads, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES, RequestPack, session_workload_presets,
 )
 from giraffe.request_pack import INPUT_RETENTION_NOTICE
 
@@ -16,6 +16,7 @@ CHECK_DESCRIPTIONS = {
     "first_output": "How long do users wait before an answer starts?",
     "generation": "How fast do answers arrive, and how often do they pause?",
     "capacity": "How much traffic can the server handle while giving correct, timely answers?",
+    "concurrency": "Compare request sizes, mixed workloads, stream fairness and token stress at configurable loads.",
     "fairness": "Do long questions slow down a short answer already in progress?",
     "context": "Can the model recall facts from long questions?",
     "correctness": "Does the model give correct answers when requests run together?",
@@ -29,7 +30,7 @@ CHECK_DESCRIPTIONS = {
     "mixed": "Do long questions or answers slow down short requests?",
     "sessions": "Can the model handle several conversations at once?",
     "consistency": "Does the model answer consistently across repeated requests?",
-    "tools": "Does the model return the requested tool call correctly?",
+    "tools": "Does the model return the requested tool calls and required assistant text?",
 }
 
 CHECK_DETAILS = {
@@ -49,9 +50,10 @@ CHECK_DETAILS = {
     "prefix": "Runs shared-prefix repeats back to back, then independent controls and history. A pass needs enough repeats with cached tokens covering half the estimated prefix and independent controls below that threshold. Non-discriminative cache reporting is inconclusive; only a majority of repeat misses fails. Reports k of n misses; timing alone cannot prove reuse.",
     "buckets": "Refills requests for nine input/output combinations, with counts rounded up to full load groups. Per-request lifetime-average overlap must reach level minus 0.5 (level 1 always qualifies); tail IDs are excluded. Input lengths require ordered short/medium/long tokens and a sufficient token span, allowing fixed template overhead. Cell windows stop dispatch and let active requests finish.",
     "mixed": "Compares a non-repetitive known light passage of at least 64 tokens against quiet controls during long-input/output interference. Wrong light answers are reported as unqualified. Requires heavy-shape evidence and enough overlapping samples. All planned pairs send both requests; buffered answers cannot qualify active decoding. Missing fairness_max_ratio leaves measurements inconclusive without hiding coverage gaps.",
-    "sessions": "Refills a bounded conversation pool with distinct seeded names and scores recall against each session name. Live history feeds final answers after stripping inline reasoning; fixed history uses its seeded name at every turn. Fixed-only plans count character-admitted turns exactly; live history admission depends on actual answer lengths.",
+    "sessions": "Refills a bounded conversation pool with distinct seeded names and scores recall against each session name. Performance profiles run weighted coding, essay and chat conversations and retain task/turn measurements without scoring answer quality. Live history feeds final answers after stripping inline reasoning; fixed history uses its seeded name at every turn. Fixed-only plans count character-admitted turns exactly; live history admission depends on actual answer lengths.",
     "consistency": "Repeats standalone non-repetitive copy prompts within each level and against sequential modal answers. Correctness is reported independently and correctness_observed appears in summaries below 1.0; strict answer differences fail. Non-strict answer variation or probability drift beyond tolerance is inconclusive: variation observed; enable strict to enforce. Full agreement can pass. Logprobs compare level 1 with other levels using qualified lifetime overlap and report maximum cross-level delta and token divergences in the summary. Strict cross-level equality requires batch-invariant serving; default vLLM can diverge.",
-    "tools": "Checks the format, tool name and arguments in the model's requested tool call. Giraffe does not execute the tool.",
+    "concurrency": "Runs selected size, interference, fairness and token-stress scenarios with separate verdicts and measurements. Size-matrix requests refill as they finish; observed overlap and token lengths qualify coverage. Insufficient limits remain inconclusive.",
+    "tools": "Checks response protocol, configured tool names and arguments, and optional assistant text requirements separately. Giraffe does not execute tools.",
 }
 
 
@@ -84,7 +86,10 @@ def capabilities(config: RunConfig | None = None) -> dict:
         "option_schema": CheckOptions.model_json_schema(),
         "limits_schema": Limits.model_json_schema(),
         "traffic_schema": TrafficConfig.model_json_schema(),
-        "buckets": {"schema": Buckets.model_json_schema(), "defaults": Buckets().model_dump(mode="json")},
+        "concurrent_workloads": {"defaults": ConcurrentWorkloads().model_dump(mode="json"),
+                                 "schema": ConcurrentWorkloads.model_json_schema()},
+        "session_workloads": {"defaults": Sessions().model_dump(mode="json"),
+                              "presets": [item.model_dump(mode="json") for item in session_workload_presets()]},
         "judging": {"schema": JudgingConfig.model_json_schema(),
                     "defaults": JudgingConfig().model_dump(mode="json"),
                     "prompt_version": JUDGE_PROMPT_VERSION, "voting_rule": JUDGE_VOTING_RULE},

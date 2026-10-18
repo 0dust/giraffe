@@ -153,10 +153,36 @@ async def test_known_answer_fixture_temperature_reaches_endpoint_and_respects_us
     ("<think>Need the weather.", None),
 ])
 def test_parsed_tool_call_is_an_answer_after_closed_reasoning(output, score):
-    spec = fixture("tool", {"city": "Delhi"})
+    spec = fixture("tool", None)
     result = score_response(spec, record(spec, output, finish_reason="tool_calls", tool_calls=[{
         "id": "call1", "type": "function", "function": {
             "name": "get_weather", "arguments": '{"city":"Delhi"}'}}]))
     assert result.score is score
     if score is None:
         assert result.score_message == "reasoning without final answer"
+
+
+@pytest.mark.parametrize('unclosed,wrong_call,expected', [
+    (False, False, True), (True, False, None), (True, True, False),
+])
+def test_tool_content_scores_final_text_without_hiding_call_failures(unclosed, wrong_call, expected):
+    from giraffe.models import ToolExpectation
+    from giraffe.tool_checks import default_tool_fixture
+
+    fixture_config = default_tool_fixture()
+    expectation = ToolExpectation(tools=fixture_config.tools,
+        expected_calls=fixture_config.expected_calls,
+        expected_content={'mode': 'exact', 'value': 'Checking Delhi.'})
+    spec = fixture('tool', None, tool_expectation=expectation)
+    output = '<think>Need weather.' if unclosed else '<think>Need weather.</think>Checking Delhi.'
+    scored = score_response(spec, record(spec, output, finish_reason='tool_calls', tool_calls=[{
+        'id': 'call1', 'type': 'function', 'function': {'name': 'get_weather',
+        'arguments': json.dumps({'city': 'Paris' if wrong_call else 'Delhi'})}}]))
+    assert scored.score is expected
+    assert scored.output == output
+    if wrong_call:
+        assert scored.tool_evaluation.calls.status == 'fail'
+    elif unclosed:
+        assert scored.tool_evaluation.content.status == 'inconclusive'
+    else:
+        assert scored.tool_evaluation.content.status == 'pass'

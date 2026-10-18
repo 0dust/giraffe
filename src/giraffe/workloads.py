@@ -11,14 +11,16 @@ from pathlib import Path
 
 from giraffe.fixtures import final_answer
 from giraffe.logprob_workload import corpus_width, refill, sample_count
-from giraffe.models import CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec
+from giraffe.models import INTERNAL_CHECK_NAMES as CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec, ToolExpectation
+from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, resolved_tool_fixtures, resolved_tool_modes
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
     "arrivals": {"arrivals"}, "prefix": {"prefix"},
     "buckets": {"buckets", "mixed"}, "sessions": {"sessions"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
-    "forced_tool_diagnostic": {"tools"},
+    "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
+    "concurrent_workloads": {"concurrency", "token_stress"},
 }
 
 
@@ -383,23 +385,31 @@ async def buckets(run, target, client):
 
 async def sessions(run, target, client):
     settings = run.config.sessions
+    mixed = settings.profile == "performance"
     observation = {
         "failure_policy": settings.failure_policy,
         "sessions": [],
         "history_admission": "Conservative characters plus output/template reserve; actual tokens reported separately. Never crop required history.",
         "live_baseline": "Live generated inputs can differ; compare measured shape/hash evidence, not presumed identical histories.",
+        "kind": settings.profile,
+        "planned_sessions": settings.sessions * len(settings.modes),
+        "configured_concurrency": settings.concurrency,
     }
     run.observations[target.name]["sessions"] = observation
 
-    async def session(mode, index):
+    async def session(mode, index, workload=None):
         history, previous = [], None
         session_id = f"{target.name}:{mode}:{index}"
-        item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None}
+        turns = workload.turns if workload else settings.turns
+        budget = (workload.max_tokens if workload else None) or settings.max_tokens
+        item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None,
+                "task_type": workload.name if workload else "exact_repeat",
+                "planned_turns": len(turns)}
         observation["sessions"].append(item)
         value = f"Session_{index:04d}_{mode}"
         item["seeded_value"] = value
         due = time.monotonic()
-        for turn, prompt in enumerate(settings.turns):
+        for turn, prompt in enumerate(turns):
             if not run.allowed(target.name):
                 item["stop_reason"] = run.reason or "target request budget reached"
                 run.unfinished[target.name].add("sessions")
@@ -407,10 +417,11 @@ async def sessions(run, target, client):
             await asyncio.sleep(
                 max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
             )
-            prompt = session_prompt(prompt, turn, value)
+            if not workload:
+                prompt = session_prompt(prompt, turn, value)
             messages = [*history, {"role": "user", "content": prompt}]
             input_chars = sum(len(m["content"]) for m in messages)
-            if input_chars + settings.max_tokens + 32 > run.config.context_limit:
+            if input_chars + budget + 32 > run.config.context_limit:
                 item["stop_reason"] = (
                     "history admission ceiling reached; required history not cropped"
                 )
@@ -420,8 +431,9 @@ async def sessions(run, target, client):
                 prompt,
                 f"session_{mode}_turn{turn}",
                 "sessions",
-                max_tokens=settings.max_tokens,
+                max_tokens=budget,
                 session_id=session_id,
+                task_type=item["task_type"],
                 turn_id=turn,
                 mode=mode,
                 history_messages=len(history),
@@ -429,8 +441,9 @@ async def sessions(run, target, client):
                 scheduled_ms=(due - run.start) * 1000,
             )
             request.messages, request.input_chars = messages, input_chars
-            request.scorer, request.expected = "exact", value
-            request.options = deterministic_options(run.config, request.options)
+            if not workload:
+                request.scorer, request.expected = "exact", value
+                request.options = deterministic_options(run.config, request.options)
             record = await run.request(target, client, request)
             if record is None:
                 item["stop_reason"] = run.reason or "request budget reached"
@@ -440,8 +453,8 @@ async def sessions(run, target, client):
             if (
                 not record.valid
                 or record.status != "completed"
-                or record.finish_reason == "length"
-                or record.score is not True
+                or (not workload and (record.finish_reason == "length" or record.score is not True))
+                or record.score is False
             ):
                 item["stop_reason"] = (
                     "failed task/transport, cancelled or truncated turn; stopped without substitute answer"
@@ -450,7 +463,7 @@ async def sessions(run, target, client):
                 break
             if (
                 record.input_tokens is not None
-                and record.input_tokens + settings.max_tokens > run.config.context_limit
+                and record.input_tokens + budget > run.config.context_limit
             ):
                 item["stop_reason"] = "observed context budget reached"
                 run.unfinished[target.name].add("sessions")
@@ -459,7 +472,21 @@ async def sessions(run, target, client):
             history = [*messages, {"role": "assistant", "content": previous}]
             due = time.monotonic() + settings.delay_seconds
         item["completed_turns"] = len(item["turns"])
-        item["planned_turns"] = len(settings.turns)
+
+    if mixed:
+        from .session_metrics import workload_plan
+
+        pending = asyncio.Queue()
+        for index, workload in enumerate(workload_plan(settings.workloads, settings.sessions)):
+            pending.put_nowait((index, workload))
+
+        async def worker():
+            while not pending.empty():
+                index, workload = pending.get_nowait()
+                await session("live", index, workload)
+
+        await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
+        return
 
     for mode in settings.modes:
         next_index = 0
@@ -502,49 +529,61 @@ async def consistency(run, target, client, fixtures):
                 await refill(run, target, client, [base], sample_count(settings.repetitions, level), level)
 
 
-TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Return the weather for a city.",
-        "parameters": {
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-            "additionalProperties": False,
-        },
-    },
-}
+TOOL = default_tool_fixture().tools[0]
 
 
 async def tools(run, target, client):
+    fixtures = resolved_tool_fixtures(run.config)
+    modes = resolved_tool_modes(run.config)
+    custom = bool(run.config.tool_checks and run.config.tool_checks.fixtures)
+    from giraffe.tool_conversations import run_conversation
+    for fixture in run.config.tool_checks.conversations if run.config.tool_checks else []:
+        for mode in modes:
+            await run_conversation(run, target, client, fixture, mode)
+    expectations = {
+        fixture.fixture_id: ToolExpectation(
+            tools=fixture.tools, expected_calls=fixture.expected_calls,
+            expected_content=fixture.expected_content, choice=fixture.choice)
+        for fixture in fixtures
+    }
     for forced in [False, True] if run.config.forced_tool_diagnostic else [False]:
-        for stream in (False, True) if run.config.stream else (False,):
-            options = {
-                "tools": [TOOL],
-                "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
-                if forced
-                else "auto",
-            }
-            request = spec(
-                "Use get_weather to check the weather in Delhi.",
-                f"tools_{'forced' if forced else 'auto'}_{'stream' if stream else 'complete'}",
-                "tools",
-                max_tokens=run.config.max_output_tokens,
-                options=options,
-                selection="forced diagnostic" if forced else "automatic",
-                capability="required when selected",
-            )
-            request.scorer, request.stream = "tool", stream
-            request.options = deterministic_options(run.config, request.options)
-            await run.request(target, client, request)
+        for fixture in fixtures:
+            if forced and fixture.choice:
+                continue
+            for mode in modes:
+                if not run.allowed(target.name):
+                    run.unfinished[target.name].add("tools")
+                    return
+                selection = "forced diagnostic" if forced else "contract" if fixture.choice else "automatic"
+                prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
+                choice_mode = "forced" if forced else fixture.choice.mode if fixture.choice else "auto"
+                scenario = f"{prefix}_{choice_mode}_{mode}"
+                messages = [message.model_dump() for message in fixture.messages]
+                request = RequestSpec(
+                    fixture_id=f"{scenario}.v1", scenario=scenario, check_ids=["tools"],
+                    messages=messages, scorer="tool", stream=mode == "stream",
+                    input_chars=sum(len(message["content"]) for message in messages),
+                    max_tokens=run.config.max_output_tokens,
+                    options={**fixture.options, "tools": fixture.tools,
+                             **({} if fixture.choice else {
+                                 "tool_choice": {"type": "function", "function": {
+                                     "name": fixture.expected_calls[0].name}} if forced else "auto"})},
+                    tool_expectation=expectations[fixture.fixture_id],
+                    workload={"selection": selection, "capability": "required when selected",
+                              "tool_fixture_id": fixture.fixture_id, "mode": mode},
+                )
+                request.options = deterministic_options(run.config, request.options)
+                await run.request(target, client, request)
 
 
 async def execute(run, target, client, fixtures):
+    from giraffe.concurrent_workloads import token_stress
+
     for field, callback in (
         ("arrivals", arrivals),
         ("prefix", prefixes),
         ("buckets", buckets),
+        ("concurrent_workloads", token_stress),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -563,16 +602,26 @@ async def execute(run, target, client, fixtures):
 
 
 def results(run, target, stats, violations, missing_timing, *, saturated=False):
+    from .timing import configured_metrics, qualified_violations, run_quality
+
+    config = run.config
     result = []
-    selected = set(run.config.checks) - set(CORE_CHECKS)
+    selected = set(config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
+        if check in {"concurrency", "token_stress"}:
+            continue
         if check not in selected:
             continue
+        from giraffe.runner import _check_config
+        config = _check_config(run.config, "concurrency") if check in {"buckets", "mixed"} else run.config
         records = [r for r in run.records if r.target == target.name and check in r.check_ids]
         metrics = stats(records)
+        quality = run_quality(run, records, target.name, configured_metrics(config.limits, check))
+        saturated = quality["status"] == "client_delayed"
+        metrics["timing_quality"] = quality
         status = "pass"
         summary = "Bounded workload observed; untested combinations remain unverified."
-        minimum = run.config.limits.min_samples
+        minimum = config.limits.min_samples
         groups = {}
         for scenario in dict.fromkeys(r.scenario for r in records):
             items = [r for r in records if r.scenario == scenario and r.workload.get("phase") != "priming"]
@@ -591,19 +640,19 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 entry.update(
                     distinct_answer_hashes=dict(hashes),
                     agreement_rate=max(hashes.values()) / sum(hashes.values()) if hashes else None,
-                    equality=run.config.consistency.equality,
+                    equality=config.consistency.equality,
                     correctness=entry["correct"] / entry["scored"] if entry["scored"] else None,
-                    expected_samples=(run.config.consistency.repetitions * corpus_width(run.config.consistency)
-                                      if run.config.consistency.logprobs else
-                                      sample_count(run.config.consistency.repetitions, items[0].workload["level"])),
+                    expected_samples=(config.consistency.repetitions * corpus_width(config.consistency)
+                                      if config.consistency.logprobs else
+                                      sample_count(config.consistency.repetitions, items[0].workload["level"])),
                     interpretation="Run-to-run repeatability within this level.",
                 )
-                if len(hashes) > 1 and run.config.consistency.strict:
+                if len(hashes) > 1 and config.consistency.strict:
                     status, summary = (
                         "fail",
                         "Configured strict consistency violated; correctness is reported independently.",
                     )
-                if len(hashes) > 1 and not run.config.consistency.strict and status == "pass":
+                if len(hashes) > 1 and not config.consistency.strict and status == "pass":
                     status, summary = "inconclusive", "Answer variation observed; enable strict to enforce."
                 if (
                     len(items) < entry["expected_samples"]
@@ -732,6 +781,9 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 )
         if check == "sessions":
             metrics["sessions"] = run.observations[target.name].get("sessions")
+            from .session_metrics import performance
+
+            metrics["conversation_performance"] = performance(metrics["sessions"], records, stats)
             if not metrics["sessions"] or any(
                 s["stop_reason"] for s in metrics["sessions"]["sessions"]
             ):
@@ -782,12 +834,14 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             and light.completion_tokens is not None and light.completion_tokens >= 64):
                         shape_qualified.append(light)
                 observed = row["achieved_overlap"] >= 2
-                weight = run.config.buckets.heavy_weights.get(row["workload"].get("heavy_type"), 1)
+                weight = config.buckets.heavy_weights.get(row["workload"].get("heavy_type"), 1)
                 qualified = (control["completed"] >= minimum
-                             and len(shape_qualified) >= max(minimum, run.config.buckets.mixed_pairs * weight))
+                             and len(shape_qualified) >= max(minimum, config.buckets.mixed_pairs * weight))
                 qualified_stats = stats(shape_qualified)
                 ratio = (qualified_stats["p50_ms"] / control["p50_ms"]
                          if qualified_stats["p50_ms"] is not None and control["p50_ms"] else ratio)
+                comparison_quality = run_quality(run, controls + [
+                    r for r in records if r.scenario == name], target.name, ("latency_ms",))
                 comparisons.append(
                     {
                         "scenario": name,
@@ -797,6 +851,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "overlap_observed": observed,
                         "samples_and_overlap_qualified": qualified,
                         "shape_qualified_samples": len(shape_qualified),
+                        "timing_quality": comparison_quality,
                     }
                 )
                 if not qualified and status != "fail":
@@ -807,9 +862,9 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if (
                     qualified
                     and ratio is not None
-                    and run.config.limits.fairness_max_ratio
-                    and ratio > run.config.limits.fairness_max_ratio
-                    and not saturated
+                    and config.limits.fairness_max_ratio
+                    and ratio > config.limits.fairness_max_ratio
+                    and comparison_quality["status"] != "client_delayed"
                 ):
                     status, summary = (
                         "fail",
@@ -817,7 +872,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     )
             metrics["unqualified_light_samples"] = [r.id for r in records
                 if (r.scenario == "mixed_control" or r.scenario.startswith("mixed_short")) and r.score is not True]
-            if run.config.limits.fairness_max_ratio is None and status == "pass":
+            if config.limits.fairness_max_ratio is None and status == "pass":
                 status, summary = "inconclusive", "Mixed-load ratios measured; no acceptance ratio configured."
             metrics["comparisons"] = comparisons
             if not comparisons:
@@ -828,37 +883,68 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                            if run.config.concurrency < 2 else
                            "No mixed-load comparisons were exercised.")
         if check == "tools":
-            auto = [r for r in records if r.workload.get("selection") == "automatic"]
-            expected_count = 2 if run.config.stream else 1
+            auto = [r for r in records if r.workload.get("selection") in {"automatic", "contract"}]
+            expected_cases = {(fixture.fixture_id, mode)
+                              for fixture in resolved_tool_fixtures(config)
+                              for mode in resolved_tool_modes(config)}
+            conversations = run.observations[target.name].get("tool_conversations", [])
+            expected_cases.update((fixture.fixture_id, mode)
+                                  for fixture in (config.tool_checks.conversations if config.tool_checks else [])
+                                  for mode in resolved_tool_modes(config))
+            observed_cases = [(r.workload.get("tool_fixture_id"), r.workload.get("mode"))
+                              for r in auto]
+            observed_cases += [(session["fixture_id"], session["mode"]) for session in conversations
+                               if session["status"] in {"pass", "fail"}]
+            metrics["conversations"] = conversations
+            complete_coverage = (len(observed_cases) == len(expected_cases)
+                                 and set(observed_cases) == expected_cases)
             metrics["forced_diagnostic"] = [
-                {
-                    "request_id": r.id,
-                    "status": r.status,
-                    "score": r.score,
-                    "reason": r.error or r.score_message,
-                }
+                {"request_id": r.id, "status": r.status, "score": r.score,
+                 "reason": r.error or r.score_message}
+                for r in records if r.workload.get("selection") == "forced diagnostic"
+            ]
+            metrics["outcomes"] = [
+                {"request_id": r.id, "fixture_id": r.workload.get("tool_fixture_id"),
+                 "mode": r.workload.get("mode"), "selection": r.workload.get("selection"),
+                 "score": r.score,
+                 **(r.tool_evaluation.model_dump() if r.tool_evaluation else {})}
                 for r in records
-                if r.workload.get("selection") == "forced diagnostic"
+            ]
+            metrics["parity"] = {
+                "status": "not_established", "basis": "independent_generations",
+                "reason": "Each mode is checked against its fixture. Independent generations "
+                          "can differ; these outcomes do not establish parser loss or exact parity.",
+            }
+            metrics["missing_cases"] = [
+                {"fixture_id": fixture_id, "mode": mode}
+                for fixture_id, mode in sorted(expected_cases - set(observed_cases))
             ]
             metrics["capability_support"] = (
-                "observed for built-in fixture"
-                if len(auto) == expected_count and all(r.score is True for r in auto)
+                "observed for configured fixtures"
+                if complete_coverage and all(r.score is True for r in auto)
+                and all(session["status"] == "pass" for session in conversations)
                 else "rejected or unverified; see request outcomes"
             )
-            if any(r.score is not True for r in auto):
+            if any(not is_discovery_rejection(r) and
+                   (r.score is False or not r.valid or r.status != "completed") for r in auto) or any(
+                       session["status"] == "fail" for session in conversations):
                 status, summary = (
                     "fail",
-                    "Required automatic tool capability failed; parsed calls required and no tools executed.",
+                    "Required tool fixture failed; declared choice, text and calls must pass. "
+                    "No tools were executed.",
                 )
-            elif len(auto) < expected_count:
+            elif any(r.score is None for r in auto) or any(session["status"] == "inconclusive" for session in conversations):
+                status, summary = "inconclusive", "Tool fixture evaluation could not establish correctness. See component outcomes."
+            elif not complete_coverage:
                 status, summary = (
                     "inconclusive",
-                    "Automatic tool coverage unfinished. Forced selection is separate diagnostic evidence.",
+                    "Tool fixture coverage unfinished. Legacy forced selection is separate diagnostic evidence.",
                 )
         assessed = (
             records
             if check != "tools"
-            else [r for r in records if r.workload.get("selection") == "automatic"]
+            else [r for r in records if r.workload.get("selection") in {"automatic", "contract", "conversation"}
+                  and not is_discovery_rejection(r)]
         )
         if check == "consistency" and not run.config.consistency.logprobs:
             comparisons = []
@@ -893,9 +979,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         assessed_stats = stats(assessed)
         if check != "tools" and assessed_stats["completed"] < minimum and status != "fail":
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
-        errors = stats([r for r in assessed if not (check == "consistency" and r.logprob_evidence and
-                        r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
-                        run.config.consistency.logprobs.support == "discover")])["error_rate"]
+        errors = stats([r for r in assessed if not (
+            (check == "consistency" and r.logprob_evidence and
+             r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
+             run.config.consistency.logprobs.support == "discover")
+            or (r.tool_conversation and r.tool_conversation["status"] == "inconclusive")
+        )])["error_rate"]
         cap_violations = [
             r.id
             for r in assessed
@@ -908,14 +997,14 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if (
             cap_violations
             or (check not in {"consistency", "mixed"} and any(r.score is False for r in assessed))
-            or (errors is not None and errors > run.config.limits.max_error_rate)
+            or (errors is not None and errors > config.limits.max_error_rate)
         ):
             status, summary = (
                 "fail",
                 "Workload task checks or request errors violated configured limits; variation and telemetry are assessed separately.",
             )
-        timing = violations(assessed, run.config.limits)
-        missing = missing_timing(assessed, run.config.limits) if assessed else []
+        timing = violations(assessed, config.limits)
+        missing = missing_timing(assessed, config.limits) if assessed else []
         if missing:
             metrics["missing_timing_metrics"] = missing
             if check != "tools" and status != "fail":
@@ -925,10 +1014,14 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 )
         if timing:
             metrics["timing_violations"] = timing
-            if saturated and status != "fail":
+            qualified = qualified_violations(assessed, config.limits, quality)
+            if qualified:
+                metrics["qualified_timing_violations"] = qualified
+                status, summary = "fail", "Workload exceeded configured timing limits without overlapping client scheduling delay."
+            elif saturated and status != "fail":
                 status, summary = (
                     "inconclusive",
-                    "Generator saturation prevents attributing timing violations to the endpoint.",
+                    "Client scheduling delay prevents attributing timing violations to the endpoint.",
                 )
             elif not saturated:
                 status, summary = "fail", "Workload exceeded configured timing limits."
@@ -936,13 +1029,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             saturated
             and check != "tools"
             and status != "fail"
-            and any((run.config.limits.first_output_ms, run.config.limits.latency_ms,
-                     run.config.limits.stream_gap_ms,
-                     run.config.limits.min_output_tokens_per_second))
+            and any((config.limits.first_output_ms, config.limits.latency_ms,
+                     config.limits.stream_gap_ms,
+                     config.limits.min_output_tokens_per_second))
         ):
             status, summary = (
                 "inconclusive",
-                "Generator saturation prevents qualifying configured workload timing limits.",
+                "Client scheduling delay prevents qualifying configured workload timing limits.",
             )
         if (not records or check in run.unfinished[target.name]) and status == "pass":
             status, summary = (
@@ -963,6 +1056,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         f"token divergences: {probability['cross_level_token_divergences']}.")
         if check == "consistency" and (correctness := metrics.get("correctness_observed")) is not None and correctness < 1:
             summary += f" correctness_observed: {correctness}."
+        if check == "sessions" and status == "pass" and config.sessions.profile == "performance":
+            summary = "Concurrent conversation performance met configured limits. Answer quality was not assessed; capped replies are reported separately."
         result.append(
             CheckResult(
                 id=check,

@@ -124,11 +124,15 @@ def test_sample_coverage_warnings_use_each_comparison_group_not_totals():
     browser_logic(r"""
 config.limits.min_samples=5;
 const check=id=>bootstrap.checks.find(x=>x.id===id);
-config.buckets={...bootstrap.buckets.defaults,levels:[1,8],samples_per_bucket:4,mixed_pairs:2};
-assert.match(checkCoverageWarning(check('buckets'),config),/4 in a group; 5 required/);
-config.buckets.levels=[8];assert.equal(checkCoverageWarning(check('buckets'),config),'');
-assert.match(checkCoverageWarning(check('mixed'),config),/2 in a group; 5 required/);
-config.buckets.mixed_pairs=5;assert.equal(checkCoverageWarning(check('mixed'),config),'');
+config.concurrent_workloads={...bootstrap.concurrent_workloads.defaults,levels:[1,8],samples_per_bucket:4,mixed_pairs:5,scenarios:['size_matrix','mixed_interference']};
+assert.match(checkCoverageWarning(check('concurrency'),config),/4 in a group; 5 required/);
+config.concurrent_workloads.levels=[8];assert.equal(checkCoverageWarning(check('concurrency'),config),'');
+config.concurrent_workloads.mixed_pairs=2;assert.match(checkCoverageWarning(check('concurrency'),config),/2 in a group; 5 required/);
+config.concurrent_workloads.mixed_pairs=5;assert.equal(checkCoverageWarning(check('concurrency'),config),'');
+config.concurrent_workloads.mixed_pairs=2;
+config.test_options.concurrency={limits:{min_samples:2}};
+assert.equal(checkCoverageWarning(check('concurrency'),config),'');
+delete config.test_options.concurrency;
 config.consistency={...bootstrap.profile_defaults.consistency,repetitions:4,levels:[1,2],shapes:['short','long']};
 assert.match(checkCoverageWarning(check('consistency'),config),/4 in a group; 5 required/);
 config.consistency.repetitions=5;assert.equal(checkCoverageWarning(check('consistency'),config),'');
@@ -223,4 +227,39 @@ assert.equal(state.catalogueSearch,'saved browse query');assert.equal(state.open
 assert(details.open&&input.focused&&input.reported);assert.equal(input.value,'8');
 card.hidden=true;revealCatalogueCheck('correctness');assert.equal(state.catalogueFilter,'all');
 assert.equal(state.catalogueCategory,'all');assert.equal(state.catalogueSearch,'');
+""")
+
+
+def test_tool_fixture_editor_preserves_modes_and_escapes_json():
+    browser_logic(r"""
+const check=bootstrap.checks.find(x=>x.id==='tools');
+config.tool_checks={modes:['stream','complete'],fixtures:[{fixture_id:'mixed',expected_content:{mode:'exact',value:'</textarea><script>bad</script>'}}]};
+const original=JSON.stringify(config),markup=renderProfileEditor(check,config);
+assert.match(markup,/<option value="stream,complete" selected>Saved selection/);
+assert.match(markup,/name="profile_tools_fixtures"[^>]*maxlength="65536"/);
+assert.match(markup,/&lt;\/textarea&gt;&lt;script&gt;bad&lt;\/script&gt;/);
+assert.doesNotMatch(markup,/<script>/);
+assert.match(effectiveCheckSummary(check,config),/1 tool fixture.*Streaming \+ Complete.*Assistant text and calls checked/);
+assert.equal(JSON.stringify(config),original);
+config.tool_checks=null;config.stream=false;
+assert.match(effectiveCheckSummary(check,config),/Built-in weather check.*Complete/);
+assert.doesNotMatch(effectiveCheckSummary(check,config),/Streaming/);
+config.stream=true;assert.match(effectiveCheckSummary(check,config),/Complete \+ Streaming/);
+config.tool_checks={modes:null,fixtures:'[{"unfinished"'};
+assert.match(effectiveCheckSummary(check,config),/Invalid tool fixture draft/);
+assert.match(renderProfileEditor(check,config),/\[\{&quot;unfinished&quot;/);
+""")
+
+
+def test_invalid_tool_fixture_editor_shows_native_error_before_closing():
+    browser_logic(r"""
+config.tool_checks={fixtures:[],modes:null};
+const profile={dataset:{profileSettings:'tools'}},input={name:'profile_tools_fixtures',value:'[',disabled:true,
+  closest(selector){return selector==='[data-profile-settings]'?profile:null;},
+  setCustomValidity(message){this.message=message;},checkValidity(){return !this.message;},focus(){this.focused=true;},reportValidity(){this.reported=true;}};
+const form={elements:{profile_edits_tools:{value:'[]'}},querySelectorAll:()=>[input]};
+revealSetupStep=()=>{};revealCatalogueCheck=()=>{};
+assert.equal(validateProfileDrafts(form,'tools'),false);assert.match(input.message,/JSON array/);
+assert(input.focused&&input.reported);assert.equal(input.disabled,true);
+input.value='[]';assert.equal(validateProfileDrafts(form,'tools'),true);assert.equal(input.message,'');
 """)

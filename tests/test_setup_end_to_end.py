@@ -10,7 +10,7 @@ import subprocess
 import httpx
 import pytest
 
-from giraffe.models import Buckets, RunConfig
+from giraffe.models import ConcurrentWorkloads, RunConfig
 from giraffe.planning import request_plan
 from giraffe.runner import run_suite
 from giraffe.web import create_app
@@ -44,13 +44,13 @@ async def test_concurrent_setup_plan_matches_requests_with_saved_dataset_and_low
             test_options={"correctness": {"concurrency": 12}},
         ).model_dump(mode="json")
         script = f"""
-import {{applySetupPreset,configureBuckets,configureSetupLoad}} from {json.dumps(module)};
+import {{applySetupPreset,configureConcurrentWorkloads,configureSetupLoad}} from {json.dumps(module)};
 const source={json.dumps(source)};
-const defaults={json.dumps(Buckets().model_dump(mode='json'))};
+const defaults={json.dumps(ConcurrentWorkloads().model_dump(mode='json'))};
 const values=new FormData();
-values.set('buckets_levels','1, 4, 8');
+values.set('concurrent_levels','1, 4, 8');
 let config=applySetupPreset(source,'concurrent',defaults);
-config=configureBuckets(config,values,defaults);
+config=configureConcurrentWorkloads(config,values,defaults);
 config=configureSetupLoad(config,'concurrent');
 process.stdout.write(JSON.stringify(config));
 """
@@ -65,7 +65,7 @@ process.stdout.write(JSON.stringify(config));
         assert values["max_output_tokens"] == 32
         assert values["request_pack"] == source["request_pack"]
         assert values["test_options"] == source["test_options"]
-        assert values["buckets"]["output_tokens"] == {"short": 16, "medium": 32, "long": 32}
+        assert values["concurrent_workloads"]["output_tokens"] == {"short": 16, "medium": 32, "long": 32}
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(tmp_path / "runs")),

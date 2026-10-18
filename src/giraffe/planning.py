@@ -7,9 +7,11 @@ from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import corpus_width, sample_count
+from giraffe.concurrent_workloads import SCENARIOS, execution_config
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt
+from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 
 def _steady_count(rate: float, duration: float) -> int:
@@ -31,6 +33,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     fixed portions, and evaluator calls share the dataset preview's count rules.
     The optional preview avoids rebuilding request-pack schedules in the API.
     """
+    public_config = config
+    config = execution_config(config)
     selected = set(config.checks)
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -44,6 +48,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         rows.append({"id": identifier, "title": title or CHECK_NAMES.get(identifier, identifier),
                      "requests_per_target": count, "kind": kind, "source": source,
                      "summary": summary})
+
+    if "concurrency" in public_config.checks:
+        names = public_config.concurrent_workloads.scenarios
+        add("concurrency", 0, "Selected scenarios: " + "; ".join(SCENARIOS[name][1] for name in names)
+            + ". The rows below count their separate requests and controls.")
 
     # Only fixture cardinalities are needed. Keep context filler small even if
     # the operator has configured a very large context limit.
@@ -214,18 +223,45 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     "Two requests per pair in each of the before-output and active-stream trials; buffered light responses leave overlap unqualified.")
         if config.request_pack is not None:
             warnings.append("Size and mixed-load tests use generated questions. Your saved questions are kept for answer and rate tests.")
+    if "token_stress" in selected:
+        settings = config.concurrent_workloads
+        for case in settings.stress_cases:
+            required_context = (case.input_tokens or case.max_input_tokens or 128) + case.output_tokens
+            context_limit = config.effective_check("concurrency")["context_limit"]
+            title = (f"{case.input_tokens:,}-token input / {case.output_tokens:,}-token summary"
+                     if case.input_tokens else f"Short input / {case.output_tokens:,}-token output")
+            identifier = f"token_stress_{case.name}"
+            if required_context > context_limit or case.output_tokens > config.max_output_tokens:
+                add(identifier, 0, f"Needs context length {required_context:,} and output cap {case.output_tokens:,}. "
+                    "Current limits prevent this case; no smaller substitute is sent.", title=title)
+                warnings.append(f"{title}: configured limits prevent this case; length coverage will be inconclusive.")
+                continue
+            count = sum(max(settings.samples_per_bucket, level) for level in settings.levels)
+            if case.input_tokens:
+                add(identifier, None, f"Up to {settings.calibration_attempts} input-sizing requests, followed by "
+                    f"up to {count} measured requests if calibration succeeds. Actual input and output usage must verify the targets.",
+                    kind="bounded", title=title)
+            else:
+                add(identifier, count, f"{count} measured requests across concurrency levels {settings.levels}. "
+                    "Early stopping leaves output-length coverage inconclusive.", title=title)
     if "sessions" in selected:
         settings = config.sessions
-        fixed = sum(fixed_session_turns(settings, index, config.context_limit)
-                    for index in range(settings.sessions)) if "fixed" in settings.modes else 0
-        if "live" in settings.modes:
+        if settings.profile == "performance":
+            maximum = settings.sessions * max(len(workload.turns) for workload in settings.workloads)
             add("sessions", None,
-                f"{fixed} fixed-history requests and up to {settings.sessions * len(settings.turns)} live requests; actual final-answer lengths determine live history admission.",
-                source="configured session prompts and saved/live history", kind="bounded")
+                f"Up to {maximum} requests; prior responses and history admission determine whether later turns run.",
+                source="configured performance conversations and live history", kind="bounded")
         else:
-            add("sessions", fixed,
-                "Fixed seeded histories with exact character admission; failed responses or shared budgets can stop sessions early.",
-                source="configured session prompts and seeded fixed history")
+            fixed = sum(fixed_session_turns(settings, index, config.context_limit)
+                        for index in range(settings.sessions)) if "fixed" in settings.modes else 0
+            if "live" in settings.modes:
+                add("sessions", None,
+                    f"{fixed} fixed-history requests and up to {settings.sessions * len(settings.turns)} live requests; actual final-answer lengths determine live history admission.",
+                    source="configured session prompts and saved/live history", kind="bounded")
+            else:
+                add("sessions", fixed,
+                    "Fixed seeded histories with exact character admission; failed responses or shared budgets can stop sessions early.",
+                    source="configured session prompts and seeded fixed history")
     if "consistency" in selected:
         settings = config.consistency
         levels = len(set([1, *settings.levels]))
@@ -237,8 +273,14 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         else:
             add("consistency", count, f"At least {settings.repetitions} repeats of {settings.prompts_per_shape} distinct prompts per shape and level, rounded up to full load groups, including sequential controls once.")
     if "tools" in selected:
-        count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
-        add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")
+        fixtures = resolved_tool_fixtures(config)
+        count = (len(fixtures) + sum(fixture.choice is None for fixture in fixtures)
+                 * config.forced_tool_diagnostic) * len(resolved_tool_modes(config))
+        conversations = config.tool_checks.conversations if config.tool_checks else []
+        count += sum(len(fixture.steps) + 1 for fixture in conversations) * len(resolved_tool_modes(config))
+        add("tools", count, "Tool fixtures in each selected mode. Conversation counts are upper bounds: expected calls plus one final answer; invalid or repeated calls stop a conversation early. No tools execute.",
+            source="configured tool fixtures" if config.tool_checks and (config.tool_checks.fixtures or conversations) else "generated examples",
+            kind="bounded" if conversations else "exact")
 
     sample_counts = {}
     if "arrivals" in selected:
@@ -276,7 +318,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     known = sum(row["requests_per_target"] for row in rows if row["kind"] == "exact")
     unknown = any(row["requests_per_target"] is None for row in rows)
     estimated = any(row["kind"] == "estimate" for row in rows)
-    kind = "bounded" if unknown else "estimate" if estimated else "exact"
+    kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
     planned = None if unknown else sum(row["requests_per_target"] for row in rows)
     adaptive_estimates = {}
     if "context" in selected:

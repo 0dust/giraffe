@@ -14,6 +14,35 @@ def spec(**changes):
     )
 
 
+async def test_client_setup_keeps_event_loop_responsive(monkeypatch):
+    import asyncio
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    actual = httpx.AsyncClient
+
+    def slow_client(**kwargs):
+        started.set()
+        if not release.wait(timeout=1):
+            raise AssertionError("Inference client setup blocked the event loop")
+        return actual(**kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+
+    monkeypatch.setattr(httpx, "AsyncClient", slow_client)
+    target = Target(name="local", url="http://local", model="test")
+
+    async def setup():
+        async with LLMClient(target, RunConfig(targets=[target])) as client:
+            assert client._client is not None
+        assert client._client is None
+
+    async def heartbeat():
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+
+    await asyncio.gather(setup(), heartbeat())
+
+
 @pytest.mark.asyncio
 async def test_answer_stream_counts_usage_and_preserves_finish(monkeypatch):
     target = Target(name="local", url="http://local/v1", model="test")
@@ -136,7 +165,7 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
         b'"usage":{"completion_tokens":4}}\n\n',
         b'data: [DONE]\n\n',
     ])
-    timestamps = iter([0, 39, 39.25, 44, 45])
+    timestamps = iter([0, 0, 39, 39.25, 44, 44.5, 45])
     monkeypatch.setattr("giraffe.client.time", SimpleNamespace(perf_counter=lambda: next(timestamps)))
     async with client:
         result = await client.execute(spec())
@@ -146,6 +175,47 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
     assert result.elapsed_ms == 45000
     assert result.answer_chunks == 2
     assert result.generation_tokens_per_second == 12
+
+
+async def test_first_output_timestamp_precedes_json_processing(monkeypatch):
+    from types import SimpleNamespace
+    from giraffe import client as module
+
+    clock = [0.0]
+    client, _, _ = setup_client(monkeypatch, [event("42"), event(finish="stop"),
+                                           b"data: [DONE]\n\n"])
+    original = module._object
+
+    def slow_parse(payload):
+        clock[0] += .2
+        return original(payload)
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(module, "_object", slow_parse)
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.first_output_ms == 0
+    assert result.elapsed_ms == 400  # Processing remains in client completion time.
+
+
+async def test_payload_hash_preparation_is_outside_inference_timer(monkeypatch):
+    from types import SimpleNamespace
+    from giraffe import client as module
+
+    clock = [0.0]
+    client, _, _ = setup_client(monkeypatch, [event("42", finish="stop"), b"data: [DONE]\n\n"])
+    original = module.hashlib.sha256
+
+    def slow_hash(*args, **kwargs):
+        clock[0] += .25
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(module.hashlib, "sha256", slow_hash)
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.client_preparation_ms == 500
+    assert result.first_output_ms == result.elapsed_ms == 0
 
 
 @pytest.mark.parametrize("trailer", [[], [event("   ")]])
@@ -387,3 +457,208 @@ async def test_stream_request_json_error_is_not_misclassified_as_empty_sse(monke
         result = await client.execute(spec())
     assert result.status == "failed" and "API error" in result.error
     assert "secret-value" not in result.error
+
+
+def tool_event(delta, finish=None, **choice_fields):
+    return ("data: " + json.dumps({"choices": [{
+        "delta": delta, "finish_reason": finish, **choice_fields,
+    }]}, ensure_ascii=False) + "\n\n").encode()
+
+
+def tool_call(index=0, *, call_id="call-secret", name="get_weather", arguments='{"city":"Delhi"}'):
+    return {"index": index, "id": call_id, "type": "function",
+            "function": {"name": name, "arguments": arguments}}
+
+
+@pytest.mark.parametrize("stream", [True, False])
+async def test_mixed_content_and_interleaved_calls_reconstruct_identically(monkeypatch, stream):
+    expected_calls = [tool_call(), tool_call(1, call_id="second-secret", name="get_time",
+                                          arguments='{"zone":"Asia/Kolkata"}')]
+    if stream:
+        raw = b"".join([
+            tool_event({"content": "Before 🦒. "}),
+            tool_event({"content": "Between. ", "tool_calls": [
+                tool_call(1, call_id="second-secret", name="get_", arguments='{"zone":'),
+                tool_call(name="get_", arguments='{"city":'),
+            ]}),
+            tool_event({"tool_calls": [{"index": 0, "function": {
+                "name": "weather", "arguments": '"Delhi"}'}}]}),
+            tool_event({"tool_calls": [{"index": 1, "function": {
+                "name": "time", "arguments": '"Asia/Kolkata"}'}}]}),
+            tool_event({"content": "After."}, "tool_calls"), b"data: [DONE]\n\n",
+        ])
+        # Split every UTF-8 byte, SSE frame, function name, and JSON argument boundary.
+        client, _, _ = setup_client(monkeypatch, [bytes([byte]) for byte in raw])
+    else:
+        client, _, _ = setup_client(monkeypatch, stream=False, body={"choices": [{
+            "message": {"content": "Before 🦒. Between. After.", "tool_calls": expected_calls},
+            "finish_reason": "tool_calls", "index": 0,
+        }]})
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert result.valid and result.output == "Before 🦒. Between. After."
+    assert result.tool_calls == [{k: v for k, v in call.items() if k != "index"}
+                                 for call in expected_calls]
+    assert result.finish_reason == "tool_calls" and result.stream_terminated
+    assert result.response_events
+    trace = json.dumps(result.response_events)
+    for secret in ("Before", "Between", "After", "Delhi", "Kolkata", "get_", "secret"):
+        assert secret not in trace
+    content_events = [item for item in result.response_events if item["kind"] == "content"]
+    assert sum(item["length"] for item in content_events) == len(result.output)
+    if stream:
+        assert [(item["offset"], item["length"]) for item in content_events] == [(0, 10), (10, 9), (19, 6)]
+        assert [item["sequence"] for item in content_events] == [0, 1, 4]
+        tool_events = [item for item in result.response_events if item["kind"] == "tool_call"]
+        assert [item["index"] for item in tool_events] == [1, 0, 0, 1]
+        assert tool_events[0]["sequence"] == content_events[1]["sequence"]
+        assert tool_events[0]["id_present"] and not tool_events[2]["id_present"]
+
+
+@pytest.mark.parametrize("suffixes,expected", [
+    ([" trailing", " trailing"], "prefix trailing trailing"),
+    ([], "prefix"),
+])
+async def test_transport_preserves_missing_and_duplicate_content_for_scoring(monkeypatch, suffixes, expected):
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"content": "prefix", "tool_calls": [tool_call()]}),
+        *[tool_event({"content": suffix}) for suffix in suffixes],
+        tool_event({}, "tool_calls"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert result.valid and result.output == expected
+    assert sum(item["length"] for item in result.response_events if item["kind"] == "content") == len(expected)
+
+
+@pytest.mark.parametrize("terminal", ["length", "tool_calls"])
+async def test_repeated_terminal_reason_cannot_erase_truncation(monkeypatch, terminal):
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"tool_calls": [tool_call()]}, "length"),
+        tool_event({}, terminal), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert not result.valid and result.finish_reason == "length"
+    assert "repeated completion finish reason" in result.error
+    assert result.tool_calls[0]["function"]["name"] == "get_weather"
+
+
+@pytest.mark.parametrize("index", [None, True, -1, 16, "0"])
+async def test_stream_tool_index_is_required_and_bounded(monkeypatch, index):
+    call = tool_call(index)
+    if index is None:
+        del call["index"]
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"tool_calls": [call]}, "tool_calls"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert not result.valid and "invalid tool-call index" in result.error
+
+
+@pytest.mark.parametrize("index", [1, -1, True, "0", None])
+async def test_explicit_choice_index_must_be_zero(monkeypatch, index):
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"content": "42"}, "stop", index=index), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert not result.valid and "invalid completion choice index" in result.error
+
+
+@pytest.mark.parametrize("calls", [
+    [tool_call(call_id="")],
+    [tool_call(), tool_call(1)],
+    [{k: v for k, v in tool_call().items() if k != "type"}],
+])
+async def test_incomplete_or_duplicate_call_identity_fails_with_content(monkeypatch, calls):
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"content": "visible", "tool_calls": calls}, "tool_calls"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert not result.valid and "incomplete tool-call" in result.error
+    assert result.output == "visible" and result.tool_calls
+
+
+@pytest.mark.parametrize("trailer,error", [
+    ([tool_event({}, "tool_calls")], "without [DONE]"),
+    ([b"data: [DONE]\n\n"], "without a completion finish"),
+    ([tool_event({}, "tool_calls"), tool_event({"content": "late"})], "after the finish reason"),
+    ([tool_event({"tool_calls": [{"index": 0, "id": "conflicting"}]})], "conflicting tool-call"),
+])
+async def test_invalid_mixed_stream_preserves_partial_evidence(monkeypatch, trailer, error):
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"content": "before", "tool_calls": [tool_call()]}), *trailer,
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert not result.valid and error in result.error
+    assert result.output == "before" and result.tool_calls[0]["id"] == "call-secret"
+    assert result.response_events
+
+
+async def test_response_event_trace_is_bounded_without_truncating_answer(monkeypatch):
+    client, _, _ = setup_client(monkeypatch, [
+        *[tool_event({"content": "x"}) for _ in range(300)],
+        tool_event({"tool_calls": [tool_call()]}, "tool_calls"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert result.valid and result.output == "x" * 300
+    assert len(result.response_events) == 256 and result.response_events_truncated
+    assert result.tool_calls[0]["function"]["name"] == "get_weather"
+
+
+async def test_response_event_trace_is_absent_for_non_tool_scorers(monkeypatch):
+    client, _, _ = setup_client(monkeypatch, [event("42", finish="stop"), b"data: [DONE]\n\n"])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and not result.response_events and not result.response_events_truncated
+
+
+@pytest.mark.parametrize("arguments,expected", [
+    ([], '{"city":'),
+    (['"Delhi"}', '"Delhi"}'], '{"city":"Delhi"}"Delhi"}'),
+])
+async def test_transport_preserves_missing_and_duplicate_tool_fragments(monkeypatch, arguments, expected):
+    client, _, _ = setup_client(monkeypatch, [
+        tool_event({"tool_calls": [tool_call(arguments='{"city":')]}),
+        *[tool_event({"tool_calls": [{"index": 0, "function": {"arguments": part}}]})
+          for part in arguments],
+        tool_event({}, "tool_calls"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    # Structural transport validity does not pretend to establish semantic validity.
+    assert result.valid and result.tool_calls[0]["function"]["arguments"] == expected
+    assert sum(item["arguments_length"] for item in result.response_events) == len(expected)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+async def test_null_content_remains_valid_for_tool_only_responses(monkeypatch, stream):
+    content = {"content": None, "tool_calls": [tool_call()]}
+    if stream:
+        client, _, _ = setup_client(monkeypatch, [
+            tool_event(content, "tool_calls"), b"data: [DONE]\n\n",
+        ])
+    else:
+        client, _, _ = setup_client(monkeypatch, stream=False, body={"choices": [{
+            "message": content, "finish_reason": "tool_calls",
+        }]})
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert result.valid and not result.output
+    assert [item["kind"] for item in result.response_events] == ["tool_call"]
+
+
+async def test_response_trace_limit_is_not_truncation_without_an_omitted_event(monkeypatch):
+    client, _, _ = setup_client(monkeypatch, [
+        *[tool_event({"content": "x"}) for _ in range(255)],
+        tool_event({"tool_calls": [tool_call()]}, "tool_calls"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec(scorer="tool"))
+    assert result.valid and len(result.response_events) == 256
+    assert not result.response_events_truncated
