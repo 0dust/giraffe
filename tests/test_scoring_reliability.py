@@ -72,7 +72,7 @@ def test_contains_requires_alphanumeric_boundaries(expected, output, score):
 
 @pytest.mark.parametrize("scorer,expected,output", [
     ("exact", "42", "4"), ("contains", "42", "4"),
-    ("json", {"count": 42}, '{"count":'), ("json", {"count": 42}, '{"count":4}'),
+    ("json", {"count": 42}, '{"count":'),
 ])
 def test_truncated_incomplete_answer_is_unscored(scorer, expected, output):
     spec = fixture(scorer, expected, **({"schema": {}} if scorer == "json" else {}))

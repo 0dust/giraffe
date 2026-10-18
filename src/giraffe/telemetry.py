@@ -58,9 +58,9 @@ LINE = re.compile(
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
 GPU_FAMILIES = {entry[0] for entry in GPU.values()}
-# NVIDIA DCGM field constants: power cap, HW slowdown, SW/HW thermal, power brake.
+# NVIDIA DCGM adverse bits: HW slowdown, SW/HW thermal, power brake.
 # Idle/application-clock/sync-boost/display-clock reasons alone are not failures.
-GPU_THROTTLE_REASONS = {4: "software power cap", 8: "hardware slowdown",
+GPU_THROTTLE_REASONS = {8: "hardware slowdown",
                         32: "software thermal", 64: "hardware thermal", 128: "hardware power brake"}
 
 
@@ -75,6 +75,7 @@ def assess_gpu(snapshots, max_age_seconds):
     devices cannot be enumerated from this endpoint and remain outside coverage.
     """
     devices, series, alerts = {}, defaultdict(list), []
+    warnings, informational = [], []
     completed = 0
     for index, snap in enumerate(snapshots):
         samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
@@ -100,15 +101,27 @@ def assess_gpu(snapshots, max_age_seconds):
                 device["timestamped"].add(family)
             identity = (key, sample["name"], tuple(sorted(labels.items())))
             series[identity].append((index, value))
-            reasons = (["XID error"] if family == "device_errors" and value > 0 else
-                       [reason for bit, reason in GPU_THROTTLE_REASONS.items() if int(value) & bit]
-                       if family == "throttling" else [])
-            if reasons:
-                alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
-                               "value": value, "reasons": reasons, "snapshot": index})
-    for (key, _, _), values in series.items():
+            if family == "throttling" and int(value) & ~sum(GPU_THROTTLE_REASONS):
+                informational.append({"gpu": key[1], "value": value, "snapshot": index})
+    for (key, name, _), values in series.items():
         if any(a[0] != b[0] and a[1] != b[1] for a, b in zip(values, values[1:])):
             devices[key]["changing"] = True
+        family = GPU[name][0]
+        if family == "device_errors":
+            if values[0][1] > 0:
+                warnings.append({"gpu": key[1], "hostname": key[0], "historical_xid": values[0][1],
+                                 "reason": "Last XID predates observation; not an error count."})
+            for (_, previous), (index, value) in zip(values, values[1:]):
+                if value > 0 and value != previous:
+                    alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
+                                   "value": value, "reasons": ["XID changed during observation"], "snapshot": index})
+        elif family == "throttling":
+            for bit, reason in GPU_THROTTLE_REASONS.items():
+                observed = [(i, v) for i, v in values if int(v) & bit]
+                if len({i for i, _ in observed}) >= 2:
+                    alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
+                                   "value": observed[-1][1], "reasons": [reason],
+                                   "snapshots": sorted({i for i, _ in observed})})
     rows = []
     for (hostname, gpu), device in sorted(devices.items(), key=lambda item: str(item[0])):
         fresh = device["families"] if device["changing"] else device["timestamped"]
@@ -121,15 +134,16 @@ def assess_gpu(snapshots, max_age_seconds):
     unavailable = sorted({f for row in rows for f in row["missing_families"]}) if rows else sorted(GPU_FAMILIES)
     metrics = {"attempted": len(snapshots), "completed": completed, "snapshots": snapshots,
                "unavailable_families": unavailable, "devices": rows, "alerts": alerts,
+               "warnings": warnings, "informational_clock_events": informational,
                "coverage": "Published GPU labels only; devices absent from all scrapes cannot be discovered.",
                "metrics_max_age_seconds": max_age_seconds}
     qualifier = "this is not device health certification."
     if alerts:
-        return metrics, "fail", "GPU telemetry reports XID errors or active thermal/power throttling; " + qualifier
+        return metrics, "fail", "GPU telemetry reports a new XID or repeated adverse slowdown; " + qualifier
     if not rows or any(row["missing_families"] or row["unknown_freshness_families"] or
                        not row["identity_verified"] for row in rows):
         return metrics, "inconclusive", "GPU observations lack per-device coverage or freshness evidence; " + qualifier
-    return metrics, "pass", "Fresh GPU telemetry covers every observed device without reported XID or thermal/power events; " + qualifier
+    return metrics, "pass", "Fresh GPU telemetry covers every observed device without new XID or repeated adverse slowdown events; " + qualifier
 
 
 def _metrics_headers(target):

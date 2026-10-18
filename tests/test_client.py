@@ -245,8 +245,9 @@ async def test_stream_gap_measures_only_inter_answer_intervals(monkeypatch, dela
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_type", [httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout])
-async def test_httpx_timeouts_before_headers_are_timeouts(monkeypatch, error_type):
+@pytest.mark.parametrize("error_type,status", [(httpx.ConnectTimeout, "failed"),
+    (httpx.ReadTimeout, "timeout"), (httpx.PoolTimeout, "timeout")])
+async def test_httpx_timeouts_before_headers_have_transport_aware_status(monkeypatch, error_type, status):
     def handler(request):
         raise error_type("SECRET", request=request)
 
@@ -257,8 +258,9 @@ async def test_httpx_timeouts_before_headers_are_timeouts(monkeypatch, error_typ
     target = Target(name="local", url="http://local", model="test")
     async with LLMClient(target, RunConfig(targets=[target])) as client:
         result = await client.execute(spec())
-    assert result.status == "timeout" and result.http_status is None
-    assert result.error == f"request timeout ({error_type.__name__})"
+    assert result.status == status and result.http_status is None
+    category = "request failed" if status == "failed" else "request timeout"
+    assert result.error == f"{category} ({error_type.__name__})"
     assert "SECRET" not in result.error
 
 

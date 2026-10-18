@@ -6,17 +6,21 @@ per-request output ceilings. Use [examples/workloads.yaml](../examples/workloads
 as a starting point, then match its settings to your server and acceptance limits.
 
 Built-in known-answer fixtures (correctness, JSON, context, short and traffic)
-request temperature zero unless the user sets `request_options.temperature`.
+request temperature zero only when neither `request_options` nor the case options supply a temperature.
+Case options take precedence over run options. None-valued options are omitted from payloads.
 Semantic scoring uses the final answer after stripping leading inline `think`,
-`thinking`, or `reasoning` blocks (case-insensitive). Request evidence records
+`thinking`, or `reasoning` blocks (case-insensitive), including outputs that start
+inside reasoning opened by the chat template and end at a closing tag. Request evidence records
 `reasoning_stripped`; raw outputs follow retention settings. Reasoning without a
-final answer is unscored. Nonmatching answers cut off by `finish_reason: length`
-are unscored, including incomplete JSON; complete matching exact/contains/JSON
-answers remain scorable. AI judges skip all truncated and reasoning-only outputs.
+final answer is unscored. With `finish_reason: length`, exact output is unscored only if it is a strict
+normalized prefix of the expected answer; already-wrong answers fail. Incomplete
+JSON is unscored, but a complete wrong value or schema violation fails. A missing
+contains match under truncation is unscored; complete matching answers remain scorable. AI judges skip all truncated and reasoning-only outputs.
 These missing scores leave coverage inconclusive rather than count as wrong answers.
 
 Contains scoring normalizes whitespace and requires alphanumeric boundaries at
-alphanumeric ends of the expected text (`4` cannot match `14` or `40`). Exact and
+alphanumeric ends of the expected text (`4` cannot match `14` or `40`). Decimal
+and comma separators adjacent to digits also join numbers (`.5` cannot match `1.5`). Exact and
 contains remain case-sensitive. Request-pack and dataset previews warn when the
 expected text already occurs verbatim in the case's messages; copy/extraction cases
 remain allowed. JSON expected-value equality is structural, including nested arrays
@@ -26,7 +30,9 @@ Legacy custom fixture files allow only exact, contains, JSON and no scoring.
 Context fixtures separate fact positions by at least 32 characters within each
 input size. If the context budget cannot fit three positions, fewer are generated;
 `workload.position_coverage` records the positions, minimum separation and reduced
-coverage. Character placement and returned token counts remain separate evidence.
+coverage; reduced coverage prevents a context pass. Non-timeout HTTP/protocol
+failures on context prompts fail the check; documented context-length rejections
+remain incomplete coverage. Character placement and returned token counts remain separate evidence.
 
 ## Configure and run
 
@@ -79,12 +85,12 @@ question, and a token cap does not guarantee an answer reaches that length.
 
 ## Standard checks and load evidence
 
-Access, serving, first output and generation use ordinary traffic. Deliberate
-capacity overload, long-context, fairness, recovery and cancellation requests are
-judged by their own checks. Genuine connection/TLS failures and HTTP 401/403 are
-access failures; a timeout before response headers remains a timeout. Intentional
-stress failures do not consume the global `stop_after_errors` allowance; capacity
-keeps per-stage error counts. Shared request and duration limits still apply.
+Access, serving and first output exclude capacity-stage traffic entirely. Other
+stress traffic exempts timeouts and intentional cancellations, but non-timeout
+HTTP and protocol failures still enter serving checks and `stop_after_errors`.
+Documented context-length rejections remain coverage observations. ConnectTimeout
+and ConnectError are transport failures for access; a response timeout remains a
+timeout. Shared request and duration limits still apply.
 
 Capacity sends independent arrivals and reports the highest tested rate for which
 all tested rates at or below it were accepted. A higher-rate pass after a lower-rate
@@ -93,30 +99,37 @@ Answer timing ends at the last answer chunk: finish/usage messages, `[DONE]` and
 connection cleanup do not extend generation time or stream gaps.
 
 Fairness interleaves short-only and loaded samples of the same known-answer copy
-sequence (numbers 1 through 64). A long competitor starts after first output, with
+sequence (48 common short English words). A long competitor starts after first output, with
 a unique nonce at the beginning of its prompt to avoid identical-prefix reuse.
 Overlap qualifies only when the short stream emits its last answer after the
 competitor's dispatch. Buffered or insufficient overlap evidence is inconclusive
 before evaluating slowdown. `fairness_max_ratio` compares median decoding time
 from first to last answer, rather than total response latency; `stream_gap_ms`
 checks answer pauses. Missing an acceptance ratio leaves the check inconclusive.
-Output caps below 64 tokens or truncated copy answers leave fairness inconclusive.
+The fixture reserves its 48 needed word tokens plus 12 tokens of headroom; smaller
+caps or observed length-finished answers leave fairness inconclusive. The word
+sequence fits in 48 tokens with the Qwen2.5 and RoBERTa tokenizers.
 This does not establish a scheduler cause.
 
 Recovery first records light probes, then refills up to `concurrency` workers with
 a rotating, scored mix of long-input and longer-output requests. Each worker starts
 its next request as soon as its previous one completes, within the shared ceilings.
-Sustained traffic receives at most half the remaining target request quota, and
-reserves planned fixed requests of later checks plus post-load probes. This limits
-budget starvation; it does not guarantee adaptive later work will finish. Exhausting
-this allowance before the sustained duration leaves coverage incomplete. Post-load
-probes use the same fixture as the pre-load baseline. `recovery_max_ratio` limits
-both median response-time and first-output ratios; absolute timing limits remain
-available. With no applicable timing limit or ratio, the result is inconclusive:
-recovery was observed without an acceptance limit.
+Sustained traffic reserves planned fixed requests of later checks plus post-load
+probes. A half-remaining-quota cap applies only when later checks are selected.
+The phase completes when its duration elapses with observed configured concurrency,
+or its allowance is consumed after at least `max(min_samples, concurrency * 2)`
+requests with the configured peak and at least 90% time-weighted occupancy (refill
+and drain edges prevent an exact full-window average). Metrics report which
+completion condition qualified. Timing and error-rate limits apply to recovery
+probes; sustained timing and timeouts are observations. Genuine non-timeout
+sustained server/protocol errors can still fail the error-rate limit. Scored
+sustained answers still enter the correctness allowance. Post-load probes use the
+same fixture as the pre-load baseline. `recovery_max_ratio` limits median latency
+and first-output ratios. Without a timing limit or ratio, recovery is inconclusive.
 
 Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
-interrupt an active answer stream. The legacy `cancel_after_ms` setting is retained
+interrupt an active answer stream. With streaming disabled, cancellation is
+inconclusive: `client cancellation requires streaming`. The legacy `cancel_after_ms` setting is retained
 for config compatibility; it no longer schedules the disconnect, and explicit values
 produce a report warning. A disconnect before first output cannot establish
 mid-stream cancellation. The stop test first obtains a full-output control containing
@@ -136,16 +149,17 @@ Request-pack correctness scores each case's quiet answers and loaded capacity-st
 answers against `min_correctness`. Without capacity it runs a quiet pass and an
 additional pass at global concurrency, covering all cases and sending at least
 `concurrency` requests. Per-check correctness `samples` and `concurrency` overrides
-are rejected in pack mode; global `samples` never selects the case count. Legacy
-request previews omit that extra concurrent pass without capacity, so its requests
-need additional budget. Legacy previews also omit the new pre-load recovery baseline
-(`samples` extra requests). Loaded correctness still requires observed overlap when
-concurrency exceeds one.
+are rejected in pack mode; global `samples` never selects the case count. The
+planner includes this loaded pass, fairness and recovery baselines, and the
+separate stop control. Adaptive traffic estimates warn when checks may be starved.
+Loaded correctness still requires observed overlap when concurrency exceeds one.
 
-Explicit cold-start runs use `readiness_timeout_seconds` (default 180 seconds) after
-the restart hook, bounded by the global deadline and request budget. Retry delays
-back off from 0.1 to 2 seconds. Readiness failures remain recorded evidence without
-incrementing the global error counter.
+Explicit cold-start runs use `readiness_timeout_seconds` (default 180 seconds)
+after the restart hook, bounded by the global deadline. GET `/v1/models` polls
+(falling back to the origin's `/health` on 404) back off from 0.1 to 5 seconds,
+then one inference verifies readiness. Poll observations and the inference probe
+are recorded separately and consume neither the shared request budget nor the
+error allowance.
 
 ## Workload settings and evidence
 
@@ -304,10 +318,19 @@ label (and exporter `Hostname` when present) to have every family. A recent scra
 alone has unknown source freshness: evidence requires values changing across at
 least two scrapes for that device, or explicit source timestamps within
 `metrics_max_age_seconds`. Missing families, missing device labels or unknown
-freshness are inconclusive. Nonzero XID errors and active thermal/power throttle
-reasons fail, even when other evidence is incomplete. Idle or application-clock
-reasons alone do not fail. Devices absent from all scrapes remain outside coverage.
-Every verdict is telemetry evidence, not device health certification. Source references: [vLLM metrics](https://docs.vllm.ai/en/latest/design/metrics/)
+freshness are inconclusive. `gpu_min_observation_seconds` is an optional run setting
+(default 30, minimum 0), independent of `metrics_interval_seconds`. Match it to your
+exporter's refresh period, for example `gpu_min_observation_seconds: 1` for a
+one-second exporter. GPU runs wait only for the remaining time between their first
+GPU sample and the final `end` scrape, bounded by the run deadline; a shorter window
+is inconclusive. No extra GPU `after` scrape is added: start, periodic and end
+scrapes all share `metrics_max_samples`, with a slot reserved for `end`. Constant pre-existing XID values are historical warnings;
+a new nonzero XID during observation fails. Hardware slowdown (0x8), software
+thermal (0x20), hardware thermal (0x40) and hardware power brake (0x80) fail only
+when observed in at least two snapshots. Idle, application clocks, software power
+cap (0x4) and sync boost are informational. Devices absent from all scrapes remain outside coverage.
+Every verdict is telemetry evidence, not device health certification. The default
+window matches the [DCGM exporter default collection interval](https://docs.nvidia.com/datacenter/dcgm/latest/reference/command-line-reference/dcgm-exporter.html). Source references: [vLLM metrics](https://docs.vllm.ai/en/latest/design/metrics/)
 and [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md).
 
 Start/end and periodic scrapes preserve source timestamps where present, scrape

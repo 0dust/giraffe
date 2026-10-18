@@ -27,6 +27,14 @@ REASONING_WITHOUT_ANSWER = "reasoning without final answer"
 TRUNCATED_ANSWER = "truncated before a complete answer"
 
 
+def deterministic_options(config: RunConfig, options: dict | None = None) -> dict:
+    """Default known-answer sampling without overriding user or case settings."""
+    options = dict(options or {})
+    if "temperature" not in config.request_options and "temperature" not in options:
+        options["temperature"] = 0
+    return options
+
+
 def _request(
     fixture_id: str,
     scenario: str,
@@ -209,19 +217,21 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
     if "fairness" in config.checks:
-        sequence = " ".join(str(index) for index in range(1, 65))
+        # Verified as single tokens with cached Qwen2.5 and RoBERTa BPE
+        # vocabularies/merges; no numeric separator tokens are needed.
+        sequence = " ".join("red blue green white black brown gold pink gray dark light sky sun moon star rain snow wind tree leaf grass seed bird fish cat dog horse cow sheep pig fox bear wolf lion mouse house door room wall floor roof road boat ship car train book pen".split())
         fixtures["generation"].append(_request(
             "fairness.copy", "fairness", ["fairness"],
             "Copy exactly, with no extra text:\n" + sequence,
             expected=sequence, max_tokens=config.max_output_tokens,
-            options={"temperature": 0},
+            options=deterministic_options(config),
         ))
     if "cancellation" in config.checks:
         fixtures["limits"].append(_request(
             "limits.stop_control", "stop_control", ["cancellation"],
             "Copy exactly, with no extra text: blue [END] green",
             scorer="none", expected={"text": "blue [END] green"},
-            options={"temperature": 0, "stop": None},
+            options=deterministic_options(config, {"stop": None}),
         ))
     if "cancellation" in config.checks and config.effective_check("cancellation")["backend_verification"] == "required":
         chunks = config.effective_check("cancellation")["cancel_after_chunks"]
@@ -229,17 +239,17 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
             _request(
                 "limits.backend_cancel", "backend_cancel", ["cancellation"],
                 "Write the numbers from 1 to 100, one per line.", scorer="none",
-                max_tokens=128, options={"temperature": 0}, cancel_after_chunks=chunks,
+                max_tokens=128, options=deterministic_options(config), cancel_after_chunks=chunks,
             ),
             _request(
                 "limits.backend_cancel.followup", "backend_cancel_followup", ["cancellation"],
-                "Reply with just OK.", scorer="none", max_tokens=8, options={"temperature": 0},
+                "Reply with just OK.", scorer="none", max_tokens=8, options=deterministic_options(config),
             ),
         ]
     for group in fixtures.values():
         for spec in group:
-            if spec.scorer in {"exact", "contains", "json"} and "temperature" not in config.request_options:
-                spec.options.setdefault("temperature", 0)
+            if spec.scorer in {"exact", "contains", "json"}:
+                spec.options = deterministic_options(config, spec.options)
             spec.max_tokens = min(spec.max_tokens or config.max_output_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return fixtures
@@ -270,8 +280,7 @@ def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     }
     for specs in groups.values():
         for spec in specs:
-            if "temperature" not in config.request_options:
-                spec.options.setdefault("temperature", 0)
+            spec.options = deterministic_options(config, spec.options)
             spec.max_tokens = min(spec.max_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return groups
@@ -284,6 +293,9 @@ def _normalized(text: str) -> str:
 def final_answer(output: str) -> tuple[str, bool, bool]:
     """Return final text, whether reasoning was stripped, and whether it was unclosed."""
     stripped = False
+    closings = list(re.finditer(r"</(?:think|thinking|reasoning)>", output, re.IGNORECASE))
+    if closings and not re.search(r"<(?:think|thinking|reasoning)>", output[:closings[0].start()], re.IGNORECASE):
+        output, stripped = output[closings[-1].end():].lstrip(), True
     while match := re.match(r"\s*<(think|thinking|reasoning)>", output, re.IGNORECASE):
         stripped = True
         closing = re.search(rf"</{match[1]}>", output[match.end():], re.IGNORECASE)
@@ -299,6 +311,13 @@ def _contains(actual: str, expected: str) -> bool:
         end = start + len(expected)
         left = expected and expected[0].isalnum() and start and actual[start - 1].isalnum()
         right = expected and expected[-1].isalnum() and end < len(actual) and actual[end].isalnum()
+        # Decimal/group separators join adjacent digits into one numeric token.
+        if expected and (expected[0].isdigit() or expected[0] in ".,"):
+            left |= bool(start and actual[start - 1].isdigit())
+            left |= bool(start >= 2 and actual[start - 1] in ".," and actual[start - 2].isdigit())
+        if expected and (expected[-1].isdigit() or expected[-1] in ".,"):
+            right |= bool(end < len(actual) and actual[end].isdigit())
+            right |= bool(end + 1 < len(actual) and actual[end] in ".," and actual[end + 1].isdigit())
         if not left and not right:
             return True
         start = actual.find(expected, start + 1)
@@ -388,10 +407,12 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
             except (ValueError, TypeError, KeyError):
                 message = "Malformed tool argument JSON."
         return record.model_copy(update={"score": score, "score_message": message})
+    incomplete = False
     if spec.scorer in {"exact", "contains"}:
         expected = _normalized(str(spec.expected))
         actual = _normalized(answer)
         score = actual == expected if spec.scorer == "exact" else _contains(actual, expected)
+        incomplete = expected.startswith(actual) and actual != expected if spec.scorer == "exact" else not score
         message = "Answer matches the fixture." if score else "Answer differs from the fixture."
         if spec.scorer == "contains" and score:
             message = "Expected text found with alphanumeric boundaries; this check does not validate the full answer."
@@ -418,10 +439,13 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
                 path = ".".join(str(part) for part in error.absolute_path) or "<root>"
                 message = f"JSON schema violation at {path} ({error.validator})."
             elif isinstance(error, json.JSONDecodeError):
+                tail = answer.strip()[error.pos:]
+                incomplete = (error.pos >= len(answer.strip()) or error.msg.startswith("Unterminated string")
+                              or bool(tail) and any(word.startswith(tail) for word in ("true", "false", "null")))
                 message = f"Invalid JSON at line {error.lineno}, column {error.colno}."
             else:
                 message = f"Invalid JSON or schema: {error}"
-    if not score and record.finish_reason == "length":
+    if not score and incomplete and record.finish_reason == "length":
         return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER})
     return record.model_copy(update={"score": score, "score_message": message})
 

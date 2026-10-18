@@ -80,7 +80,7 @@ async def test_fairness_uses_one_long_answer_fixture_with_interleaved_controls_a
     short = [spec for spec in specs if spec.scenario != "fairness_long"]
     assert len({spec.fixture_id for spec in short}) == 1
     assert len({json.dumps(spec.messages) for spec in short}) == 1
-    assert all(spec.scorer == "exact" and len(spec.expected.split()) >= 64 for spec in short)
+    assert all(spec.scorer == "exact" and 40 <= len(spec.expected.split()) <= 48 for spec in short)
     long_prompts = [spec.messages[0]["content"] for spec in specs if spec.scenario == "fairness_long"]
     assert all(re.match(r"^[0-9a-f]{32}\n", prompt) for prompt in long_prompts)
     assert len({prompt.split("\n", 1)[0] for prompt in long_prompts}) == 3
@@ -174,7 +174,8 @@ async def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoin
 async def test_recovery_reserves_later_fixed_checks_and_caps_remaining_budget_share(endpoint, monkeypatch):
     monkeypatch.setattr(endpoint, "delay", staticmethod(lambda spec, index: .004))
     report = await runner.run_suite(config(checks=["recovery", "consistency"], max_requests=26,
-        sustained_seconds=.1, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+        sustained_seconds=.1, consistency={"shapes": ["short"], "levels": [1, 2], "repetitions": 2, "prompts_per_shape": 2},
+        limits=Limits(recovery_max_ratio=10, min_samples=2)))
     sustained = [record for record in report.requests if record.scenario == "sustained"]
     budget = check(report, "recovery").metrics["sustained_budget"]
     assert len(sustained) <= (26-2)//2
@@ -200,7 +201,7 @@ async def test_fairness_insufficient_output_budget_cannot_blame_endpoint(endpoin
     report = await runner.run_suite(config(checks=["fairness"], max_output_tokens=1,
         limits=Limits(fairness_max_ratio=2, min_samples=2)))
     assert check(report, "fairness").status == "inconclusive"
-    assert "at least 64" in check(report, "fairness").summary
+    assert "at least 60" in check(report, "fairness").summary
     assert not endpoint.calls
 
 
@@ -209,7 +210,7 @@ async def test_fairness_truncated_copy_is_insufficient_evidence(endpoint, monkey
     async def truncated(self, spec, **kwargs):
         record = await original(self, spec, **kwargs)
         if spec.scenario in {"fairness_baseline", "fairness_short"}:
-            record.output = "1 2"
+            record.output = "red blue"
             record.finish_reason = "length"
         return record
     monkeypatch.setattr(endpoint, "execute", truncated)
@@ -217,3 +218,40 @@ async def test_fairness_truncated_copy_is_insufficient_evidence(endpoint, monkey
         limits=Limits(fairness_max_ratio=2, min_samples=2)))
     assert check(report, "fairness").status == "inconclusive"
     assert "output cap" in check(report, "fairness").summary
+
+
+async def test_recovery_consumed_allowance_can_qualify_before_duration(endpoint):
+    report = await runner.run_suite(config(checks=['recovery'], max_requests=40,
+        sustained_seconds=10, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+    result = check(report, 'recovery')
+    assert result.status == 'pass'
+    assert result.metrics['sustained_budget']['allowance'] == 36
+    assert result.metrics['sustained']['attempted'] == 36
+    assert result.metrics['sustained_completion']['reason'] == 'allowance consumed with sustained concurrency'
+    assert result.metrics['sustained_completion']['time_weighted_in_flight'] >= 1.8
+
+
+@pytest.mark.parametrize('failure,status', [('timeout', 'pass'), ('failed', 'fail')])
+async def test_recovery_sustained_timeouts_are_observations_but_real_errors_fail(endpoint, monkeypatch, failure, status):
+    original = endpoint.execute
+    async def fail_load(self, spec, **kwargs):
+        result = await original(self, spec, **kwargs)
+        if spec.scenario == 'sustained':
+            result.status, result.valid = failure, False
+            result.http_status = None if failure == 'timeout' else 503
+        return result
+    monkeypatch.setattr(endpoint, 'execute', fail_load)
+    report = await runner.run_suite(config(checks=['recovery'], max_requests=40,
+        sustained_seconds=10, stop_after_errors=100, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+    result = check(report, 'recovery')
+    assert result.status == status
+    assert result.metrics['sustained']['error_rate'] == 1
+    assert result.metrics['recovery']['error_rate'] == 0
+    assert result.metrics['sustained_non_timeout_error_rate'] == (0 if failure == 'timeout' else 1)
+
+
+async def test_fairness_default_word_copy_passes_with_128_token_cap(endpoint):
+    report = await runner.run_suite(config(checks=['fairness'], max_output_tokens=128,
+        limits=Limits(fairness_max_ratio=10, min_samples=2)))
+    assert check(report, 'fairness').status == 'pass'
+    assert check(report, 'fairness').metrics['needed_output_tokens'] == 60

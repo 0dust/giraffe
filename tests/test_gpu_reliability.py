@@ -70,10 +70,11 @@ def test_gpu_one_changing_device_cannot_establish_another_devices_freshness():
     assert metrics["devices"][1]["freshness"] == "unknown"
 
 
-@pytest.mark.parametrize("xid,throttle", [(79, 0), (0, 4), (0, 8), (0, 32), (0, 64), (0, 128)])
+@pytest.mark.parametrize("xid,throttle", [(79, 0), (0, 8), (0, 32), (0, 64), (0, 128)])
 def test_gpu_frozen_adverse_values_fail(xid, throttle):
     snap = snapshot({"0": [80000, 0, 99, throttle, xid]})
-    metrics, status, summary = telemetry.assess_gpu([snap], 60)
+    before = snapshot({"0": [80000, 0, 99, throttle, 0]})
+    metrics, status, summary = telemetry.assess_gpu([before, snap], 60)
     assert status == "fail"
     assert metrics["alerts"][0]["value"] == (xid or throttle)
     assert "not device health certification" in summary
@@ -104,3 +105,29 @@ def test_gpu_unidentified_device_does_not_claim_per_device_coverage():
     for sample in snap["samples"]:
         sample["labels"] = {}
     assert telemetry.assess_gpu([snap], 60)[1] == "inconclusive"
+
+
+@pytest.mark.parametrize("reason", [1, 2, 4, 16, 1 | 2 | 4 | 16])
+def test_gpu_benign_clock_reasons_are_informational(reason):
+    snap = snapshot({"0": [100, 30, 45, reason, 0]}, timestamp=time.time()*1000)
+    metrics, status, _ = telemetry.assess_gpu([snap, snap], 60)
+    assert status == "pass" and not metrics["alerts"]
+    assert metrics["informational_clock_events"]
+
+
+def test_gpu_constant_preexisting_xid_is_historical():
+    snap = snapshot({"0": [100, 30, 45, 0, 79]}, timestamp=time.time()*1000)
+    metrics, status, _ = telemetry.assess_gpu([snap, snap], 60)
+    assert status == "pass" and not metrics["alerts"]
+    assert metrics["warnings"][0]["historical_xid"] == 79
+
+
+def test_gpu_one_adverse_throttle_snapshot_does_not_fail():
+    snap = snapshot({"0": [100, 30, 45, 8, 0]}, timestamp=time.time()*1000)
+    assert telemetry.assess_gpu([snap], 60)[1] == "pass"
+
+
+def test_gpu_xid_after_driver_reset_is_a_new_event():
+    snaps = [snapshot({'0': [100, 30, 45, 0, xid]}, timestamp=time.time()*1000)
+             for xid in (79, 0, 79)]
+    assert telemetry.assess_gpu(snaps, 60)[1] == 'fail'

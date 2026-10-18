@@ -224,7 +224,7 @@ class FakeEndpoint:
                     output = "INCORRECT"
                 elif mode == "empty":
                     output = ""
-                stop = payload.get("stop", [])
+                stop = payload.get("stop") or []
                 if isinstance(stop, str):
                     stop = [stop]
                 for marker in stop:
