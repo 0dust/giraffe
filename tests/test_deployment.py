@@ -129,7 +129,8 @@ async def test_discovery_conflict_mid_run_change_and_client_target_separation():
             },
         )
         report = await run_suite(
-            config(endpoint, targets=[t], metrics=True, metrics_interval_seconds=0.1)
+            config(endpoint, targets=[t], metrics=True, metrics_interval_seconds=0.1,
+                   gpu_min_observation_seconds=0)
         )
     snapshot = report.observations["targets"]["local"]["deployment"]
     assert snapshot["fields"]["runtime.version"]["reported"]["value"] == "0.30.0"
@@ -161,6 +162,7 @@ async def test_periodic_serving_scrapes_cover_phases_bounded_cardinality_and_sam
                 targets=[target(endpoint)],
                 metrics=True,
                 metrics_interval_seconds=0.1,
+                gpu_min_observation_seconds=0,
                 metrics_max_samples=3,
                 metrics_max_series=2,
             )
@@ -268,6 +270,33 @@ async def test_statistics_client_setup_does_not_block_inference_scheduling(monke
     sample, _ = await asyncio.gather(
         telemetry.scrape(_Run(settings, None, None), target, "load"), inference_progress())
     assert sample["status"] == "available"
+
+
+async def test_discovery_client_setup_keeps_event_loop_responsive(monkeypatch):
+    from giraffe.deployment import snapshot
+
+    actual = httpx.AsyncClient
+    started, release = threading.Event(), threading.Event()
+
+    def slow_client(**kwargs):
+        started.set()
+        if not release.wait(timeout=1):
+            raise AssertionError("Discovery client setup blocked the event loop")
+        return actual(**kwargs, transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json={"version": "test-version"})))
+
+    monkeypatch.setattr(httpx, "AsyncClient", slow_client)
+    t = Target(name="local", url="http://local", model="test",
+               deployment={"discovery": "vllm"})
+
+    async def heartbeat():
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+
+    result, _ = await asyncio.gather(
+        snapshot(t, RunConfig(targets=[t]), time.monotonic()+5, asyncio.Event()), heartbeat())
+    assert result["fields"]["runtime.version"]["reported"]["value"] == "test-version"
 
 
 def test_counters_resets_replicas_stale_samples_and_gauge_peaks():

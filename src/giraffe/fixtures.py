@@ -23,9 +23,29 @@ from giraffe.models import (CHECK_NAMES, EvaluationEvidence, RequestRecord, Requ
 from giraffe.tool_schema import (MAX_TOOL_JSON_BYTES, ToolSchemaBudgetExceeded, bounded_json_tree,
                                 bounded_tool_schema)
 
-FIXTURE_VERSION = "0.2.0"
-SUITE_VERSION = "0.2.0"
+FIXTURE_VERSION = "0.3.0"
+SUITE_VERSION = "0.3.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
+_CONTEXT_POSITION_SEPARATION = 32
+REASONING_WITHOUT_ANSWER = "reasoning without final answer"
+TRUNCATED_ANSWER = "truncated before a complete answer"
+
+
+def deterministic_options(config: RunConfig, options: dict | None = None) -> dict:
+    """Default known-answer sampling without overriding user or case settings."""
+    options = dict(options or {})
+    if "temperature" not in config.request_options and "temperature" not in options:
+        options["temperature"] = 0
+    return options
+
+
+GENERATION_PASSAGE = (
+    "The small boat crossed the lake early in the morning. The water was calm, "
+    "and the trees along the shore were reflected on its surface. A family watched "
+    "from the wooden pier as the boat approached. They carried a basket of bread, "
+    "apples, and fresh water for their picnic. After tying the boat to the pier, "
+    "the captain helped everyone aboard and checked that each person had a life jacket."
+)
 
 
 def _request(
@@ -66,8 +86,11 @@ def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec
     prefix, suffix = "Notes:\n", "\nReply with the box label only."
     fact = f"The box label is {label}."
     minimum = len(prefix + fact + suffix)
-    desired = character_budget if size == "long" else max(minimum, character_budget // 3)
+    minimum_filler = min(2, max(0, character_budget - minimum) // _CONTEXT_POSITION_SEPARATION) * _CONTEXT_POSITION_SEPARATION
+    desired = character_budget if size == "long" else max(minimum + minimum_filler, character_budget // 3)
     filler_chars = max(0, desired - minimum)
+    positions = (["beginning", "middle", "end"] if filler_chars >= 2 * _CONTEXT_POSITION_SEPARATION
+                 else ["beginning", "end"] if filler_chars >= _CONTEXT_POSITION_SEPARATION else ["beginning"])
     filler = (" The box is gray." * (filler_chars // 17 + 1))[:filler_chars]
     insertion = {"beginning": 0, "middle": len(filler) // 2, "end": len(filler)}[position]
     # Whitespace around the injected fact prevents joining it to a filler word.
@@ -86,6 +109,8 @@ def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec
         max_tokens=output_budget,
         version=2,
         context_position=position,
+        workload={"position_coverage": {"positions": positions, "reduced": len(positions) < 3,
+                                        "minimum_separation_chars": _CONTEXT_POSITION_SEPARATION}},
     )
 
 
@@ -118,8 +143,9 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         for size in ("short", "long")
         for position in ("beginning", "middle", "end")
     ]
+    context = [spec for spec in context if spec.context_position in spec.workload["position_coverage"]["positions"]]
     long = [
-        context[-2].model_copy(update={
+        next((spec for spec in context if spec.fixture_id == "context.long.middle.v2"), context[-1]).model_copy(update={
             "fixture_id": "long.prefill.v2",
             "scenario": "long",
             "check_ids": ["serving", "fairness", "capacity"],
@@ -181,20 +207,15 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     ]
     sustained = [
         _request(
-            "sustained.code", "sustained", ["recovery", "serving"],
-            "The box label is V5N3. Reply with the box label only.", expected="V5N3",
-            version=2,
+            "sustained.copy", "sustained", ["recovery", "serving"],
+            "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
+            expected=GENERATION_PASSAGE, max_tokens=config.max_output_tokens, version=3,
         ),
     ]
     generation = [
         _request(
             "generation.copy", "generation", ["generation", "serving"],
-            "Copy exactly, with no extra text:\n"
-            "The small boat crossed the lake early in the morning. The water was calm, "
-            "and the trees along the shore were reflected on its surface. A family watched "
-            "from the wooden pier as the boat approached. They carried a basket of bread, "
-            "apples, and fresh water for their picnic. After tying the boat to the pier, "
-            "the captain helped everyone aboard and checked that each person had a life jacket.",
+            "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
             scorer="none", expected={"purpose": "observe sustained answer generation"},
             max_tokens=config.max_output_tokens,
         ),
@@ -203,21 +224,40 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         "short": short, "long": long, "context": context, "correctness": correctness,
         "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
+    if "fairness" in config.checks:
+        # Verified as single tokens with cached Qwen2.5 and RoBERTa BPE
+        # vocabularies/merges; no numeric separator tokens are needed.
+        sequence = " ".join("red blue green white black brown gold pink gray dark light sky sun moon star rain snow wind tree leaf grass seed bird fish cat dog horse cow sheep pig fox bear wolf lion mouse house door room wall floor roof road boat ship car train book pen".split())
+        fixtures["generation"].append(_request(
+            "fairness.copy", "fairness", ["fairness"],
+            "Copy exactly, with no extra text:\n" + sequence,
+            expected=sequence, max_tokens=config.max_output_tokens,
+            options=deterministic_options(config),
+        ))
+    if "cancellation" in config.checks:
+        fixtures["limits"].append(_request(
+            "limits.stop_control", "stop_control", ["cancellation"],
+            "Copy exactly, with no extra text: blue [END] green",
+            scorer="none", expected={"text": "blue [END] green"},
+            options=deterministic_options(config, {"stop": None}),
+        ))
     if "cancellation" in config.checks and config.effective_check("cancellation")["backend_verification"] == "required":
         chunks = config.effective_check("cancellation")["cancel_after_chunks"]
         fixtures["backend_cancellation"] = [
             _request(
                 "limits.backend_cancel", "backend_cancel", ["cancellation"],
                 "Write the numbers from 1 to 100, one per line.", scorer="none",
-                max_tokens=128, options={"temperature": 0}, cancel_after_chunks=chunks,
+                max_tokens=128, options=deterministic_options(config), cancel_after_chunks=chunks,
             ),
             _request(
                 "limits.backend_cancel.followup", "backend_cancel_followup", ["cancellation"],
-                "Reply with just OK.", scorer="none", max_tokens=8, options={"temperature": 0},
+                "Reply with just OK.", scorer="none", max_tokens=8, options=deterministic_options(config),
             ),
         ]
     for group in fixtures.values():
         for spec in group:
+            if spec.scorer in {"exact", "contains", "json"}:
+                spec.options = deterministic_options(config, spec.options)
             spec.max_tokens = min(spec.max_tokens or config.max_output_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return fixtures
@@ -248,6 +288,7 @@ def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     }
     for specs in groups.values():
         for spec in specs:
+            spec.options = deterministic_options(config, spec.options)
             spec.max_tokens = min(spec.max_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return groups
@@ -255,6 +296,54 @@ def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
 
 def _normalized(text: str) -> str:
     return " ".join(text.split())
+
+
+def final_answer(output: str) -> tuple[str, bool, bool]:
+    """Return final text, whether reasoning was stripped, and whether it was unclosed."""
+    stripped = False
+    closings = list(re.finditer(r"</(?:think|thinking|reasoning)>", output, re.IGNORECASE))
+    if closings and not re.search(r"<(?:think|thinking|reasoning)>", output[:closings[0].start()], re.IGNORECASE):
+        output, stripped = output[closings[-1].end():].lstrip(), True
+    while match := re.search(r"<(think|thinking|reasoning)>", output, re.IGNORECASE):
+        stripped = True
+        closing = re.search(rf"</{match[1]}>", output[match.end():], re.IGNORECASE)
+        if closing is None:
+            return "", stripped, True
+        output = output[:match.start()] + output[match.end() + closing.end():]
+        if not output[:match.start()].strip():
+            output = output.lstrip()
+    return output, stripped, False
+
+
+def _contains(actual: str, expected: str) -> bool:
+    start = actual.find(expected)
+    while start >= 0:
+        end = start + len(expected)
+        left = expected and expected[0].isalnum() and start and actual[start - 1].isalnum()
+        right = expected and expected[-1].isalnum() and end < len(actual) and actual[end].isalnum()
+        # Decimal/group separators join adjacent digits into one numeric token.
+        if expected and (expected[0].isdigit() or expected[0] in ".,"):
+            left |= bool(start and actual[start - 1].isdigit())
+            left |= bool(start >= 2 and actual[start - 1] in ".," and actual[start - 2].isdigit())
+        if expected and (expected[-1].isdigit() or expected[-1] in ".,"):
+            right |= bool(end < len(actual) and actual[end].isdigit())
+            right |= bool(end + 1 < len(actual) and actual[end] in ".," and actual[end + 1].isdigit())
+        if not left and not right:
+            return True
+        start = actual.find(expected, start + 1)
+    return False
+
+
+def _json_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) in {int, float} and type(expected) in {int, float}:
+        return actual == expected
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, dict):
+        return actual.keys() == expected.keys() and all(_json_equal(value, expected[key]) for key, value in actual.items())
+    if isinstance(actual, list):
+        return len(actual) == len(expected) and all(_json_equal(a, e) for a, e in zip(actual, expected))
+    return actual == expected
 
 
 def _json_answer(output: str, *, allow_fence: bool = True) -> Any:
@@ -377,6 +466,7 @@ def _tool_choice_outcomes(expectation: ToolExpectation, record: RequestRecord):
 
 def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) -> RequestRecord:
     expected_content = expectation.expected_content
+    answer, _, unclosed = final_answer(record.output)
     content = ToolCheckOutcome(status="not_checked", message="No assistant content expectation configured.")
     if record.status != "completed" or not record.valid:
         if expectation.choice:
@@ -419,7 +509,7 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
     else:
         calls = _tool_calls_outcome(expectation, record)
     if expected_content is not None:
-        actual, expected = record.output, expected_content.value
+        actual, expected = answer, expected_content.value
         if expected_content.normalization == "whitespace":
             actual, expected = _normalized(actual), _normalized(expected)
         matches = actual == expected if expected_content.mode == "exact" else expected in actual
@@ -429,6 +519,8 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
         )
         if matches and expected_content.mode == "contains":
             content.message = "Expected assistant substring found; this does not validate full content or duplication."
+    if unclosed:
+        content = ToolCheckOutcome(status="inconclusive", message=REASONING_WITHOUT_ANSWER)
     evaluation = ToolEvaluation(protocol=protocol, calls=calls, content=content,
         choice=choice, arguments=arguments, task=task,
         support=("observed" if choice.status == "pass" else "unverified") if choice else None)
@@ -440,6 +532,8 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
                     choice.message) if choice else calls.message)
     if content.status == "fail":
         message = content.message if calls.status == "pass" else f"{calls.message} {content.message}"
+    elif content.status == "inconclusive" and not failed:
+        message = content.message
     elif score is True and expected_content is not None:
         message = f"{calls.message} {content.message}"
     return record.model_copy(update={
@@ -453,8 +547,9 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     """Score only a valid, completed answer; return a new record.
 
     Exact checks compare the complete case-sensitive answer after whitespace
-    normalization. ``contains`` is an explicit custom substring check, never
-    used by built-ins. JSON permits one complete markdown fence, but not prose
+    normalization. ``contains`` is an explicit custom boundary-aware check, never
+    used by ordinary smoke fixtures. Token-stress summaries check a required fact,
+    without claiming full summary quality. JSON permits one complete markdown fence, but not prose
     surrounding an object. Reasoning content never substitutes for the answer.
     """
     expectation = spec.tool_expectation
@@ -467,6 +562,9 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         expected_provided=spec.expected_provided or spec.expected is not None,
         rubric=spec.rubric, schema=spec.schema_, tool_expectation=expectation,
     ).model_copy(deep=True)})
+    answer, stripped, unclosed = final_answer(record.output)
+    if stripped:
+        record = record.model_copy(update={"reasoning_stripped": True})
     if spec.scorer == "none":
         return record.model_copy(update={"score": None, "score_message": "No semantic scorer."})
     if spec.scorer == "tool":
@@ -475,25 +573,28 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         return record.model_copy(update={
             "score": None, "score_message": "Answer not scored: request did not complete validly.",
         })
+    if unclosed or (stripped and not answer.strip() and spec.scorer != "tool"):
+        return record.model_copy(update={"score": None, "score_message": REASONING_WITHOUT_ANSWER})
     if spec.scorer == "judge":
-        return record.model_copy(update={"score": None, "score_message": "AI judgment pending."})
+        return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER
+                                         if record.finish_reason == "length" else "AI judgment pending."})
+    incomplete = False
     if spec.scorer in {"exact", "contains"}:
         expected = _normalized(str(spec.expected))
-        actual = _normalized(record.output)
-        score = actual == expected if spec.scorer == "exact" else expected in actual
+        actual = _normalized(answer)
+        score = actual == expected if spec.scorer == "exact" else _contains(actual, expected)
+        incomplete = expected.startswith(actual) and actual != expected if spec.scorer == "exact" else not score
         message = "Answer matches the fixture." if score else "Answer differs from the fixture."
         if spec.scorer == "contains" and score:
-            message = "Expected substring found; this check does not validate the full answer."
+            message = "Expected text found with alphanumeric boundaries; this check does not validate the full answer."
     else:
         try:
             if spec.schema_ is None:
                 raise ValueError("JSON scorer requires a schema")
             validator = validated_json_schema(spec.schema_)
-            value = _json_answer(record.output)
+            value = _json_answer(answer)
             validator.validate(value)
-            if (spec.expected_provided or spec.expected is not None) and json.dumps(value, sort_keys=True) != json.dumps(
-                spec.expected, sort_keys=True
-            ):
+            if (spec.expected_provided or spec.expected is not None) and not _json_equal(value, spec.expected):
                 score, message = False, "JSON is valid but differs from the expected answer."
             else:
                 score, message = True, "JSON matches the required schema and expected values."
@@ -509,9 +610,14 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
                 path = ".".join(str(part) for part in error.absolute_path) or "<root>"
                 message = f"JSON schema violation at {path} ({error.validator})."
             elif isinstance(error, json.JSONDecodeError):
+                tail = answer.strip()[error.pos:]
+                incomplete = (error.pos >= len(answer.strip()) or error.msg.startswith("Unterminated string")
+                              or bool(tail) and any(word.startswith(tail) for word in ("true", "false", "null")))
                 message = f"Invalid JSON at line {error.lineno}, column {error.colno}."
             else:
                 message = f"Invalid JSON or schema: {error}"
+    if not score and incomplete and record.finish_reason == "length":
+        return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER})
     return record.model_copy(update={"score": score, "score_message": message})
 
 
@@ -538,8 +644,9 @@ def load_custom_fixtures(path: str) -> list[RequestSpec]:
                 raise ValueError("each fixture must be an object")
             if "scorer" not in entry:
                 raise ValueError("scorer is required (exact, contains, json or none)")
-            if entry["scorer"] == "judge":
-                raise ValueError("judge scoring requires a request pack and configured AI judges")
+            if entry["scorer"] not in ("exact", "contains", "json", "none"):
+                raise ValueError("Allowed scorers: exact, contains, json, none. "
+                                 "Use a request pack and configured AI judges for judge scoring; tool scoring is built-in only.")
             values = {"scenario": "custom", "check_ids": ["correctness"], **entry}
             spec = RequestSpec.model_validate(values)
             if not spec.fixture_id.strip() or spec.fixture_id in ids:

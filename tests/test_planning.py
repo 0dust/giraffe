@@ -20,7 +20,7 @@ def plan(configuration):
 
 @pytest.mark.parametrize("checks,expected", [
     (["access", "correctness"], 7),
-    (["access", "buckets"], 73),
+    (["access", "buckets"], 100),
     (["access", "correctness", "capacity"], 42),
 ])
 def test_basic_presets_have_complete_counts_before_caps(checks, expected):
@@ -38,12 +38,12 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     ("generation", {"test_options": {"generation": {"samples": 3}}}, 3),
     ("correctness", {"test_options": {"correctness": {"samples": 1}}}, 3),
     ("json", {}, 6),
-    ("cancellation", {}, 14),
-    ("recovery", {"sustained_seconds": 0}, 6),
+    ("cancellation", {}, 15),
+    ("recovery", {"sustained_seconds": 0}, 12),
     ("gpu", {}, 0),
     ("arrivals", {}, 8),
-    ("prefix", {}, 11),
-    ("consistency", {"consistency": {"levels": [1, 2]}}, 16),
+    ("prefix", {}, 15),
+    ("consistency", {"consistency": {"levels": [1, 2]}}, 66),
     ("tools", {"forced_tool_diagnostic": True}, 4),
 ])
 def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, updates, expected):
@@ -53,8 +53,8 @@ def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, upda
 
 
 @pytest.mark.parametrize("stream,concurrency,kind,known", [
-    (False, 2, "exact", 6),
-    (True, 1, "exact", 6),
+    (False, 2, "exact", 0),
+    (True, 1, "exact", 0),
     (True, 2, "bounded", 12),
 ])
 def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, concurrency, kind, known):
@@ -65,7 +65,7 @@ def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, con
     assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
 
 
-@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 2), (2, "bounded", 14)])
+@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 5), (2, "exact", 45)])
 def test_mixed_plan_only_includes_interference_work_when_concurrency_allows_it(concurrency, kind, known):
     result = plan(config(checks=["mixed"], concurrency=concurrency))
     assert result["count_kind"] == kind
@@ -85,8 +85,8 @@ def test_bucket_plan_covers_nine_real_prompts_and_full_batches():
         {"concurrency": 8, "requests_per_case": 8, "requests_per_target": 72},
     ]
     assert result["bucket_cases"] == [
-        {"input_chars": chars, "actual_input_chars": chars + extra, "output_tokens": cap}
-        for chars in (64, 256, 512)
+        {"input_chars": chars, "actual_input_chars": min(chars, 11808) + extra, "output_tokens": cap}
+        for chars in (64, 1024, 12288)
         for cap, extra in ((16, 0), (48, 32), (96, 32))
     ]
     assert configuration.max_requests == 160
@@ -134,7 +134,7 @@ def test_saved_dataset_does_not_replace_generated_buckets_or_activate_judges():
             "scorer": "judge", "expected": "Answer"}]},
     })
     result = plan(configuration)
-    assert result["planned_per_target"] == 73
+    assert result["planned_per_target"] == 100
     assert next(row for row in result["rows"] if row["id"] == "buckets")["source"] == "generated examples"
     assert result["evaluator"] == {"active": False, "call_upper_bound": 0, "judge_count": 0,
                                    "ready": True, "readiness_errors": []}
@@ -187,7 +187,7 @@ def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
 
 
 @pytest.mark.parametrize("updates,known", [
-    ({"checks": ["access", "recovery"]}, 7),
+    ({"checks": ["access", "recovery"]}, 13),
     ({"checks": ["access", "context"]}, 7),
     ({"checks": ["access"], "restart_target": "local"}, 1),
     ({"checks": ["access", "correctness"], "custom_fixtures": "/unread/questions.json"}, 1),
@@ -220,6 +220,30 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     assert set(CHECK_NAMES) <= rows.keys()
     assert all(row["source"] and row["summary"] for row in rows.values())
     assert result["count_kind"] == "bounded"
+
+
+@pytest.mark.parametrize("case,output_cap,kind,count", [
+    ({"name": "short_input_long_output", "output_tokens": 10000}, 10000, "exact", 4),
+    ({"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50}, 10000, "bounded", None),
+    ({"name": "short_input_long_output", "output_tokens": 10000}, 128, "exact", 0),
+])
+def test_token_stress_planning_preserves_targets_and_calibration_uncertainty(case, output_cap, kind, count):
+    configuration = config(checks=["concurrency"], context_limit=16384,
+                           max_output_tokens=output_cap,
+                           concurrent_workloads={"scenarios": ["token_stress"],
+                               "levels": [1, 2], "samples_per_bucket": 2, "stress_cases": [case]})
+    result = plan(configuration)
+    assert result["count_kind"] == kind
+    assert result["planned_per_target"] == count
+    rows = {row["id"]: row for row in result["rows"]}
+    assert rows["concurrency"]["requests_per_target"] == 0
+    case_row = rows[f"token_stress_{case['name']}"]
+    assert case_row["requests_per_target"] == count
+    if count is None:
+        assert "input-sizing" in case_row["summary"]
+    if count == 0:
+        assert "no smaller substitute" in case_row["summary"]
+        assert any("inconclusive" in warning for warning in result["warnings"])
 
 
 def test_empty_dataset_and_blank_model_remain_editable_with_unknown_active_count():
@@ -276,3 +300,46 @@ async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview
     assert response.status_code == 200, response.text
     assert response.json()["request_plan"] == expected
     assert schedule_calls == [0, 1]
+
+
+@pytest.mark.parametrize('dataset', [False, True])
+async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch, dataset):
+    from collections import Counter
+    from giraffe import runner
+    from giraffe.models import DEFAULT_CHECKS
+    from tests.test_runner import FakeClient, config as run_config
+    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
+    updates = {}
+    if dataset:
+        updates = {'request_source': 'request_pack', 'request_pack': {'version': 1, 'cases': [
+            {'fixture_id': f'case{index}', 'messages': [{'role': 'user', 'content': 'Return A'}],
+             'scorer': 'exact', 'expected': 'A'} for index in range(3)]}}
+    configured = (run_config(checks=['correctness'], **updates) if dataset else
+                  RunConfig(targets=run_config().targets, checks=list(DEFAULT_CHECKS), max_requests=1000))
+    report = await runner.run_suite(configured)
+    counts = Counter(record.scenario for record in report.requests)
+    preview = plan(configured)
+    scenarios = {'context_first_batch': ['context'],
+                 'correctness': [f'correctness_c{configured.concurrency}'],
+                 'json': [f'json_c{configured.concurrency}'],
+                 'capacity': [name for name in counts if name.startswith('traffic_stage_')],
+                 'cancellation': ['limits', 'client_cancel', 'client_deadline', 'cancellation_probe'],
+                 'limits.stop_control': ['stop_control'],
+                 'buckets': [name for name in counts if name.startswith('bucket_c')],
+                 'mixed': [name for name in counts if name.startswith('mixed_') and name != 'mixed_control']}
+    for row in preview['rows']:
+        if row['kind'] == 'exact' and row['requests_per_target']:
+            assert sum(counts[name] for name in scenarios.get(row['id'], [row['id']])) == row['requests_per_target'], row
+    assert 'client_error' not in report.observations['targets']['service']
+    assert preview['known_per_target'] <= len(report.requests)
+    if dataset:
+        assert preview['planned_per_target'] == len(report.requests) == 6
+
+
+def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
+    configured = config(checks=['access', 'fairness', 'recovery'], max_requests=28,
+                        concurrency=4, samples=4)
+    preview = plan(configured)
+    assert preview['known_per_target'] <= 28 < preview['conservative_requests_per_target']
+    assert preview['adaptive_estimates']['sustained'] >= 8
+    assert any('likely to be starved' in warning for warning in preview['warnings'])

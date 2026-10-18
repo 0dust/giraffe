@@ -39,9 +39,9 @@ def test_builtins_repeatable_versioned_and_json_opt_in():
     assert first["json"] == []
     specs = [spec for group in first.values() for spec in group]
     assert len({spec.fixture_id for spec in specs}) == len(specs)
-    assert all(spec.fixture_id.endswith((".v1", ".v2")) and spec.check_ids for spec in specs)
+    assert all(spec.fixture_id.endswith((".v1", ".v2", ".v3")) and spec.check_ids for spec in specs)
     assert all(spec.expected is not None for spec in specs)
-    assert FIXTURE_VERSION == "0.2.0"
+    assert FIXTURE_VERSION == "0.3.0"
     assert builtin_fixtures(config(structured_json=True))["json"]
 
 
@@ -64,8 +64,8 @@ def test_context_lengths_are_bounded_and_fact_positions_vary(context_limit):
     configured = config(context_limit=context_limit)
     fixtures = builtin_fixtures(configured)
     context = fixtures["context"]
-    assert len(context) == 6
-    assert {spec.context_position for spec in context} == {"beginning", "middle", "end"}
+    assert len(context) == (2 if context_limit == 128 else 6)
+    assert {spec.context_position for spec in context} == ({"beginning"} if context_limit == 128 else {"beginning", "middle", "end"})
     assert len({spec.input_chars for spec in context}) == 2
     for spec in context + fixtures["long"]:
         text = spec.messages[0]["content"]
@@ -112,7 +112,7 @@ def test_reworded_fixtures_still_reject_refusals_and_extra_text():
     specs = (fixtures["short"] + fixtures["long"] + fixtures["context"]
              + [fixtures["correctness"][0]] + fixtures["sustained"])
     for spec in specs:
-        assert spec.fixture_id.endswith(".v2")
+        assert spec.fixture_id.endswith(".v3" if spec.scenario == "sustained" else ".v2")
         assert score_response(spec, record(spec, spec.expected)).score is True
         for output in ("I can't fulfill this request.", f"The answer is {spec.expected}"):
             assert score_response(spec, record(spec, output)).score is False

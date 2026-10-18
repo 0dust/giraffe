@@ -26,6 +26,7 @@ limits:
   latency_ms: 15000
   stream_gap_ms: 3000
   fairness_max_ratio: 3
+  recovery_max_ratio: 2
   max_error_rate: 0
   min_correctness: 1
   regression_percent: 20

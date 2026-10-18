@@ -291,8 +291,8 @@ def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, v
 
 @pytest.mark.parametrize("field,check,value", [
     ("sessions", "sessions", {"sessions": 3}),
-    ("buckets", "mixed", {"mixed_pairs": 3}),
-    ("buckets", "buckets", {"samples_per_bucket": 3}),
+    ("concurrent_workloads", "concurrency", {"mixed_pairs": 3}),
+    ("concurrent_workloads", "concurrency", {"samples_per_bucket": 3}),
     ("forced_tool_diagnostic", "tools", True),
 ])
 def test_selected_workload_settings_still_block_comparison(field, check, value):
@@ -338,19 +338,14 @@ def test_tool_expectation_changes_only_block_selected_tool_comparisons(selected)
 
 
 @pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])
-async def test_executed_pack_ignores_inactive_correctness_sample_and_concurrency_settings(monkeypatch, checks):
+async def test_executed_pack_rejects_unsupported_correctness_overrides(monkeypatch, checks):
     from giraffe import runner
-    from giraffe.reporting import _settings_reasons
     from tests.test_runner import FakeClient, pack_config
 
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    old = await runner.run_suite(pack_config(checks=checks))
-    current = await runner.run_suite(pack_config(checks=checks,
-        test_options={"correctness": {"samples": 9, "concurrency": 1}}))
-    assert current.manifest["request_pack"] == old.manifest["request_pack"]
-    assert [(record.fixture_id, record.scenario) for record in current.requests] == [
-        (record.fixture_id, record.scenario) for record in old.requests]
-    assert _settings_reasons(current, old) == []
+    with pytest.raises(ValueError, match="samples/concurrency overrides are unsupported"):
+        await runner.run_suite(pack_config(checks=checks,
+            test_options={"correctness": {"samples": 9, "concurrency": 1}}))
 
 
 @pytest.mark.parametrize("field,value", [("samples", 9), ("context_limit", 1024), ("sustained_seconds", .1)])

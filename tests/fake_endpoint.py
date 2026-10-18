@@ -25,7 +25,9 @@ class FakeEndpoint:
         chunk_delay: float = 0.002,
         fault_contains: str | None = None,
         service_slots: int | None = None,
+        cached_tokens: int | None = None,
     ):
+        self.cached_tokens = cached_tokens
         self.mode = mode
         self.first_token_delay = first_token_delay
         self.chunk_delay = chunk_delay
@@ -330,6 +332,11 @@ class FakeEndpoint:
                     output = "Bakery_" + uuid.uuid4().hex
                 if payload["messages"][-1]["content"].startswith(("Repeat exactly the bakery name", "Repeat exactly the above answer.")):
                     output = next(m["content"] for m in reversed(payload["messages"]) if m["role"]=="assistant")
+                if "Use this exact bakery name for this session:" in prompt:
+                    values = re.findall(r"Use this exact bakery name for this session: (\w+)", prompt)
+                    output = values[0]
+                    if mode == "session_mix" and len(payload["messages"]) > 1:
+                        output = "Session_9999_live"
                 if mode == "overlap_variation" and endpoint.active>1:
                     output += " "  # Whitespace changes byte equality but keeps the exact task correct.
                 if mode == "variable_correct":
@@ -350,7 +357,7 @@ class FakeEndpoint:
                     output = "INCORRECT"
                 elif mode == "empty":
                     output = ""
-                stop = payload.get("stop", [])
+                stop = payload.get("stop") or []
                 if isinstance(stop, str):
                     stop = [stop]
                 for marker in stop:
@@ -361,6 +368,8 @@ class FakeEndpoint:
                 pieces = pieces[:budget]
                 output = "".join(pieces)
                 usage = {"prompt_tokens": len(prompt.split()) + 8, "completion_tokens": len(pieces)}
+                if endpoint.cached_tokens is not None:
+                    usage["prompt_tokens_details"] = {"cached_tokens": endpoint.cached_tokens}
                 endpoint._stop.wait(endpoint.first_token_delay)
                 if not payload.get("stream"):
                     self._json(200, {
@@ -418,6 +427,10 @@ class FakeEndpoint:
 
     @staticmethod
     def _answer(prompt: str) -> str:
+        if "Instead, copy this text exactly:\n" in prompt:
+            return prompt.split("Instead, copy this text exactly:\n")[-1]
+        if "Copy the following text exactly, with no extra text:\n" in prompt:
+            return prompt.split("Copy the following text exactly, with no extra text:\n")[-1]
         if "JSON object" in prompt:
             return '{"label":"J6Q2","count":3,"ready":true}'
         if "17 cards" in prompt and "8 cards" in prompt:

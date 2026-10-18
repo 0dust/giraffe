@@ -329,3 +329,13 @@ def test_pack_summary_matches_full_preview_counts_and_evaluator_bounds(arrival, 
     assert summary["judging"]["planned_call_upper_bound"] == judged * 2 * (2 if active else 0)
     assert summary["judging"]["quota_call_upper_bound"] == (min(judged, 2) + min(judged, 1)) * (2 if active else 0)
     assert summary["judging"]["ready"] == (ready or not active)
+
+
+@pytest.mark.parametrize("scorer", ["exact", "contains"])
+def test_pack_preview_warns_about_expected_text_in_own_messages_without_rejecting(scorer):
+    configured = config([case("echo", scorer=scorer, expected="4", messages=[
+        {"role": "system", "content": "Return 4."}, {"role": "user", "content": "Copy the number."}])])
+    warnings = pack_preview(configured)["warnings"]
+    assert any("echo" in warning and "echo would pass" in warning for warning in warnings)
+    safe = config([case("safe", scorer=scorer, expected="4", messages=[{"role": "user", "content": "Two plus two?"}])])
+    assert not any("echo would pass" in warning for warning in pack_preview(safe)["warnings"])

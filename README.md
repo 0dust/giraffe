@@ -72,6 +72,37 @@ The example enables the ten standard checks; JSON and GPU checks remain optional
 A wrong answer can fail a load check even when requests complete successfully.
 Inspect the failed responses before treating the result as a vLLM server fault.
 
+## llama.cpp, TensorRT-LLM, LMDeploy and TGI
+
+Start the engine separately and connect to its OpenAI-compatible **chat** API.
+Use a text-generation model with a working chat template. All 17 checks can be
+selected for any engine; a supported connection does not guarantee that its model
+passes JSON, tool calling, exact-answer, timing, or concurrency checks.
+
+| Engine | Example | Default local API base | Optional discovery |
+| --- | --- | --- | --- |
+| [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | [llamacpp.yaml](examples/llamacpp.yaml) | `http://127.0.0.1:8080/v1` | `llamacpp`: `/props`, build, context per slot, parallel slots, chat-template hash |
+| [TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) | [tensorrt-llm.yaml](examples/tensorrt-llm.yaml) | `http://127.0.0.1:8000/v1` | `tensorrt-llm`: `/version`; use `trtllm-serve`, not a raw Triton inference URL |
+| [LMDeploy](https://lmdeploy.readthedocs.io/en/latest/llm/api_server.html) | [lmdeploy.yaml](examples/lmdeploy.yaml) | `http://127.0.0.1:23333/v1` | `lmdeploy`: matching `/v1/models` entry; version and resolved settings remain unknown |
+| [Hugging Face TGI](https://huggingface.co/docs/text-generation-inference/reference/api_reference) | [tgi.yaml](examples/tgi.yaml) | `http://127.0.0.1:8080/v1` | `tgi`: `/info`, runtime/model revision and configured input/total-token limits |
+
+Edit the example's model ID, context length, credentials and acceptance limits,
+then run `giraffe run --config examples/llamacpp.yaml --output runs/llamacpp-first`,
+or load that configuration with `giraffe ui --config examples/llamacpp.yaml`.
+Authentication uses environment-variable references, as with the other engines.
+Discovery is optional; an unavailable metadata endpoint does not disable chat tests.
+
+The `llamacpp`, `lmdeploy`, and `tgi` metrics profiles recognize their documented
+Prometheus names. llama.cpp needs `--metrics`; LMDeploy needs metrics enabled for
+its chosen backend. Missing counters, cache evidence, and GPU exporter observations
+stay unknown. TensorRT-LLM's native `/metrics` iteration JSON is not parsed as
+Prometheus; configure a separate exporter for GPU observations. Native per-request
+server cancellation verification is unavailable for these four engines: output
+caps, stop sequences, client cancellation and follow-up probes still run, but
+`backend_verification: required` remains inconclusive without a native adapter.
+
+GPU-only engines need a compatible Linux host.
+
 ## Run and compare
 
 Open **http://127.0.0.1:8765** and select **New run**. Follow **Connect → Choose
@@ -152,12 +183,30 @@ reports change, while absolute checks still evaluate the current run.
 
 ## Additional workloads and deployment evidence
 
-Opt-in arrivals, shared prefixes, input/output buckets, mixed traffic, fixed/live
+Configurable concurrent workloads, opt-in arrivals, shared prefixes, fixed/live
 conversations, repeated-request consistency and parsed tool-calling checks use the
 same global budgets. Deployment snapshots and bounded serving-metrics collection
 keep configuration changes, provenance, missing data and performance evidence
 alongside an explicit baseline. The CLI, local UI, HTML and JSON expose the same
-configuration and evidence.
+configuration and evidence. `arrivals.max_client_wait_ms` sets the dispatch-wait
+tolerance (default 50 ms); exceeding it leaves the scheduled arrival rate unqualified.
+Prefix acceptance requires substantial cached-token reuse on enough repeats and
+independent controls below the reuse threshold; a majority of repeat misses fails.
+Size cells qualify each request's time-weighted overlap and reported length range;
+cell windows stop dispatch without cancelling requests. Text and optional logprob
+consistency compare concurrent levels with sequential controls; strict mode fails
+answer or comparable token divergence. Non-strict variation or logprob drift beyond
+tolerance is inconclusive (not certified); full agreement can pass. Correctness is
+reported independently, including `correctness_observed` in summaries below 1.0.
+Logprob summaries show the maximum cross-level delta and token divergence count.
+Strict cross-level equality requires batch-invariant serving; default vLLM serving
+can diverge. Sessions refill a conversation pool and recall unique seeded facts,
+feeding final answers without inline reasoning into live history. Mixed-load
+acceptance requires exercised long competitors, a non-repetitive known light
+passage of at least 64 tokens, and an explicit slowdown ratio. Wrong light answers
+are unqualified samples. Missing evidence leaves these checks inconclusive; see
+[workload evidence](docs/workloads.md).
+
 
 Read [the workload and telemetry guide](docs/workloads.md) and use
 [the expanded example](examples/workloads.yaml). Export a sanitized reproduction
@@ -168,24 +217,48 @@ unverified.
 
 ## What runs
 
-| Check | Built-in workload / measurement |
-| --- | --- |
-| Access | Real inference request through the selected DNS/TLS/auth/network path |
-| Serving | HTTP status, completion envelope, nonempty answer, stream finish |
-| First output | First useful answer separately from reasoning and initial requests |
-| Generation | Longer-output samples, generation pace after first output, response time and stream gaps |
-| Capacity | Independently arriving mixed requests at chosen rates; correct, timely answers and highest acceptable tested rate |
-| Fairness | Long prompts added while a short response is streaming |
-| Context | Injected known facts at different lengths and positions |
-| Correctness | Extraction, arithmetic, and classification, including under load |
-| JSON (opt-in) | Required fields, types, enums, expected content under concurrency |
-| Limits/cancellation | Output cap, stop sequence, deadline/disconnect, recovery probes |
-| Recovery | Repeated bounded traffic followed by light-load probes |
-| GPU (opt-in) | Existing Prometheus telemetry when available |
+| # | Check | Built-in workload / measurement |
+| --- | --- | --- |
+| 1 | Network and access | Ordinary inference through the selected DNS/TLS/auth/network path |
+| 2 | Serving success | HTTP status, completion envelope, nonempty answer and stream finish |
+| 3 | First useful output | Client-observed first answer, separately from reasoning and initial requests |
+| 4 | Generation pace | Generation rate after first output, response time and streaming pauses |
+| 5 | Arrival traffic capacity | Independent mixed arrivals; correctness, timing, local delivery limits and highest tested rate with every lower tested rate accepted |
+| 6 | Concurrent workloads | Separate configurable size/concurrency matrix, mixed interference, streaming fairness and token-stress scenarios |
+| 7 | Long-context behavior | Known facts at different positions, calibrated from actual input-token usage |
+| 8 | Known-answer correctness | Known answers with observed scored overlap required when concurrency exceeds one |
+| 9 | Structured JSON | Required fields, types and expected values under concurrency |
+| 10 | Limits and cancellation | Output caps, stop sequences, deadlines, client interruption, backend evidence and follow-ups; separate sub-results are retained |
+| 11 | Sustained load and recovery | Refilled heavy worker pool, then matched pre/post light probes with configured acceptance limits |
+| 12 | GPU observations | Existing telemetry; absent data leaves observations unverified |
+| 13 | Scheduled arrivals | Steady/burst scheduling, actual dispatch, waiting and unissued requests |
+| 14 | Shared prefixes and cache evidence | Matched independent controls, repeated history and reported cache evidence |
+| 15 | Multi-turn sessions | Fixed/live history and concurrent conversation measurements |
+| 16 | Repeated-request consistency | Answer agreement within and across sequential/concurrent levels; correctness reported separately |
+| 17 | Tool-calling capability | Parsed tool-call structure and expected arguments |
+
+The former checks 6, 15 and 16 are scenarios within **Concurrent workloads**.
+Every scenario keeps its own status, summary, all measurements and evidence IDs
+in JSON, the UI and standalone HTML. Size cells and interference comparisons
+remain separate. Existing cancellation sub-results are unchanged.
+
+Use [the large-token example](examples/concurrent-workloads.yaml) for 10,000-token
+input / 50-token output and short-input / 10,000-token output cases. Inputs are
+sized from server-reported token usage and verified on each measured request.
+Output caps alone do not establish output-length coverage. Insufficient context,
+output, time or request budgets are reported explicitly; targets are never silently
+shrunk. Summary scoring checks a required fact, not full summary quality.
+
+Arrival traffic capacity stays separate because it varies incoming requests per
+second; Concurrent workloads varies request shapes, starting order and overlap.
 
 Each result is `pass`, `fail`, `inconclusive`, `skipped`, or `blocked`. A required
 inconclusive check prevents an overall pass. Missing acceptance limits produce
-measurements without certifying performance. Small or incomparable samples cannot
+measurements without certifying performance. Deliberate stress traffic is judged by its
+own checks, independently of ordinary access, serving, first-output and generation
+verdicts. Capacity and other deliberate overload errors do not consume the global
+`stop_after_errors` allowance. Connection/TLS failures and HTTP 401/403 establish
+access failures; a pre-header timeout remains a timeout. Small or incomparable samples cannot
 establish a regression. Latency percentiles always accompany request/error counts.
 
 The suite checks a small, versioned set of observable serving behaviors. It is not
@@ -197,7 +270,10 @@ measurement. The report preserves these limits.
 
 Generation pace is a client-observed estimate: `(output tokens - 1) / seconds from
 first useful answer chunk to last answer chunk`. Prompt waiting and trailing
-usage/finish messages are excluded. This follows the first-token exclusion used
+usage/finish messages are excluded. For a streamed single-chunk answer with reported `completion_tokens <= 2`, an
+inter-chunk gap is not applicable. Longer or unknown-length single-chunk answers
+keep missing timing evidence. Stream gaps likewise measure only intervals
+between answer chunks, excluding the wait after the final answer. This follows the first-token exclusion used
 by [vLLM's per-request TPOT](https://docs.vllm.ai/en/latest/design/metrics/), using
 the last observed answer instead of protocol cleanup as the endpoint. A chunk may
 contain multiple tokens, and network buffering can distort arrival times; this
@@ -256,6 +332,13 @@ limits:
   fairness_max_ratio: 2
 ```
 
+Set `limits.recovery_max_ratio` (the shipped examples use `2`) to catch post-load
+slowdowns even when probes stay within absolute latency limits. An absolute-only
+recovery pass reports the measured probe/baseline ratios and states that no ratio
+limit was configured. Sustained timeouts and errors count against recovery
+`max_error_rate`, and load qualification requires at least `min_samples` successful
+sustained requests. These load outcomes stay outside serving/first-output checks.
+
 These are example limits, not recommendations for a model or GPU. Declared runtime,
 image, topology, and quantization are recorded separately from observed identity.
 Give each model/route a distinct target name. Include the service URL when supplying
@@ -266,7 +349,7 @@ environment-variable names. HTTPX honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PR
 `ca_bundle` supplies a private CA file. Nothing disables TLS verification.
 
 `--nonstream` exercises nonstreaming Chat Completions. `--checks serving,correctness`
-runs a selected subset. **Add checks** in the UI exposes all 19 checks
+runs a selected subset. **All checks** in the UI exposes all 17 checks
 with a selection checkbox and **Settings** action. Specialist settings stay in
 advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one
@@ -283,8 +366,25 @@ When reusing an older manifest whose `checks` list included disabled optional
 tests, remove `json` or `gpu` from that list to keep them deselected. Saved custom
 fixtures are used only when correctness is selected.
 `--metrics` reads the
-target's optional `metrics_url`; missing or stale samples cannot produce a healthy
-GPU verdict. No node agents are installed.
+target's optional `metrics_url`. GPU evidence requires fresh source timestamps or
+values changing across scrapes, plus every required family per observed device.
+Fewer observed devices than `targets[].deployment.hardware.gpu_count` declares
+leaves GPU coverage inconclusive. Set `limits.gpu_max_temperature_c` to fail when
+any device exceeds that temperature in at least two snapshots. Without that limit,
+`max_temperature_c` is a measurement only. New XID values or repeated
+hardware/thermal slowdown bits fail; historical XIDs
+and software power caps are informational. `gpu_min_observation_seconds` sets the
+minimum GPU observation window (default 30, accepts zero), independently of
+`metrics_interval_seconds`. Set it to your exporter's refresh period; for example,
+`gpu_min_observation_seconds: 1` for a one-second exporter. GPU runs wait only for
+the remaining window, bounded by the run deadline. A shorter observation window is
+inconclusive. The final `end` scrape also closes the GPU window; all scrapes share
+`metrics_max_samples`, preserving the first `start` and last `end`. Missing evidence is
+inconclusive; this is not device health certification. No node agents are installed.
+
+Connection establishment uses an HTTPX connect timeout of
+`min(request_timeout_seconds * 0.9, 10)` seconds, inside the total request deadline.
+A connect timeout is a transport failure; a response deadline remains a timeout.
 
 ### Use your own requests under traffic
 
@@ -335,15 +435,65 @@ giraffe run --manifest runs/pack-before/report.json --baseline baselines/pack.js
 Each case has a unique `fixture_id`, text `messages`, a positive `weight` (default 1),
 and an explicit `scorer`: `exact`, `contains`, `json`, `judge`, or `none`. Exact and contains
 need an `expected` string; JSON needs a local `schema` and can include expected JSON.
-Exact normalizes whitespace; contains only checks for the specified text; schema
-validation alone checks structure. None of these establishes general chatbot quality.
+Exact compares the whole answer after normalizing whitespace. Contains checks for
+case-sensitive text with alphanumeric boundaries: expected `4` matches `(4)` but
+not `14` or `40`. It does not validate the whole answer. Pack and dataset previews
+warn when an exact/contains expected value appears verbatim in that case's own
+messages: copying that value can pass without demonstrating the intended task.
+This is a warning; extraction and copy tasks can intentionally include the answer.
+JSON validates the schema and compares supplied expected values structurally,
+treating `3` and `3.0` as equal while keeping booleans distinct from numbers,
+including within arrays and objects. Schema validation alone checks structure.
+None of these establishes general chatbot quality.
 
-Giraffe sends each case once quietly, then uses the same weighted pack for continuous
-arrivals. It allocates each finite stage before dispatch; dropped requests are not
-replaced. Every scored case needs quiet and loaded coverage for a full-pack rate
-claim. An unscored case prevents that claim, though throughput and latency remain
-available. A quiet failure never removes a case from load. Requests repeat and may
-benefit caches, so this measures a warmed workload.
+Semantic scoring and judging strip closed `<think>`, `<thinking>`, or `<reasoning>`
+blocks anywhere in the output, case-insensitively, including reasoning opened in the chat template
+(output starts mid-reasoning before a closing tag), and save `reasoning_stripped` on the request record.
+Raw response evidence follows the configured retention policy. An unclosed block
+or a block with no final answer remains unscored: `reasoning without final answer`.
+When `finish_reason` is `length`, an exact answer is unscored only if it is a strict
+normalized prefix of the expected value. A complete wrong JSON value or schema
+violation fails; JSON cut off during parsing remains unscored. Missing contains
+matches remain unscored under truncation. A full matching
+exact/contains answer or complete valid matching JSON can still be scored.
+Judges never receive truncated answers. Missing scores leave correctness coverage
+inconclusive rather than counting incomplete answers as wrong.
+
+Built-in known-answer correctness, JSON, context, short and traffic fixtures
+request `temperature: 0` only when neither run nor case options supply one.
+Case temperature takes precedence; None-valued payload options are omitted.
+This requests deterministic decoding; server support is not independently verified.
+Context fact positions are separated by at least 32 characters within each input
+size. Small context budgets produce fewer positions; per-request workload metadata
+`position_coverage` lists the exercised positions and marks reduced coverage,
+which prevents a pass. Non-timeout HTTP/protocol failures on context prompts fail.
+
+Fairness copies 48 common short words, reserving 12 extra output tokens, and needs
+visible overlap; insufficient caps or observed truncation leave it inconclusive.
+Recovery reserves its baseline, probes and later fixed work. A consumed load
+allowance can qualify with enough requests and at least 90% time-weighted occupancy
+at the configured peak concurrency. Metrics report the completion condition.
+Recovery timing/error limits apply to probes; heavy-load timeouts are observations,
+while genuine server/protocol errors can fail. Capacity stages are exempt from
+serving/access/first-output checks; other stress traffic exempts only timeouts and
+intentional cancellation, keeping real HTTP/protocol errors visible. Setup counts
+include quiet baselines, the pack loaded pass, and stop controls; adaptive estimates
+warn about likely budget starvation. Nonstreaming cancellation is inconclusive:
+`client cancellation requires streaming`.
+
+Giraffe sends each case once quietly. With capacity selected, the same weighted
+pack supplies continuous arrivals; every case's loaded answers also enter its
+correctness verdict against `min_correctness`. Each finite stage is allocated before
+dispatch; dropped requests are not replaced. Without capacity, correctness runs a
+second pass at global concurrency, sending at least that many requests and covering
+every case. Concurrency above one requires observed overlap for a loaded verdict.
+Per-check correctness `samples` or `concurrency` overrides are rejected in pack mode;
+global `samples` does not choose case count. Legacy request previews omit the extra
+concurrent pass when capacity is disabled, so allow for its additional request budget.
+Every scored case needs quiet and loaded coverage for a full-pack rate claim. An
+unscored case prevents that claim, though throughput and latency remain available.
+A quiet failure never removes a case from load. Requests repeat and may benefit
+caches, so this measures a warmed workload.
 
 **Requests and expected answers are saved with the run.** Response retention only
 controls generated outputs. Imports are limited to 1 MiB and 1,000 cases. Export,
@@ -389,7 +539,8 @@ judges tie. A tie, timeout, malformed verdict or unavailable judge leaves the an
 unscored and prevents accepted capacity; missing votes never reduce the panel size.
 Each judge's vote and short explanation appear in request evidence.
 
-Giraffe judges every valid completed answer from a judged case, including repeated
+Giraffe judges every valid completed final answer from a judged case, excluding
+truncated and reasoning-only outputs and including repeated
 quiet and loaded answers, **after all measured traffic and telemetry finish**.
 Judge calls use separate limits and never enter deployment latency or traffic counts.
 Preview shows a call upper bound; no model is contacted during preview. There are no
@@ -442,7 +593,7 @@ test_options:
 
 The traffic editor exposes this profile before the run. Each other test exposes
 only applicable settings, such as context length, sample count, cancellation
-delay, recovery duration, telemetry freshness, or acceptance limits. **Reset to defaults**
+answer-chunk count, recovery duration, telemetry freshness, or acceptance limits. **Reset to defaults**
 removes that test's overrides. The JSON view, saved manifests and the CLI use the
 same validated configuration. Per-test concurrency, output and deadline settings
 remain bounded by the run's global ceilings. Overrides above those ceilings are
@@ -464,8 +615,10 @@ The good fraction uses all planned arrivals, including unsent ones. A stage need
 sufficient samples and a first-output or total-response latency limit to qualify;
 stream-gap or generation-speed limits alone do not bound user waiting time.
 
-The result is the **highest acceptable tested arrival rate**, not a discovered
-maximum. Baseline comparison matches the planned profile, seed, tests and acceptance
+The result is the **highest acceptable tested arrival rate** for which every
+tested rate at or below it was accepted, not a discovered maximum. A failure at a
+lower rate followed by a pass at a higher rate is flagged as non-monotonic and
+does not raise this boundary. Baseline comparison matches the planned profile, seed, tests and acceptance
 criteria, and reports lost previously acceptable rates. Dropped or failed requests
 remain outcomes, even if they change the observed request mix. Incomplete or
 generator-limited evidence cannot establish an exact capacity decrease. Older
@@ -475,7 +628,9 @@ concurrency sweep with this arrival-rate definition.
 Response retention is `failures` by default. Use `all` to keep every response, or
 `none` to discard all output/reasoning text after scoring. Aggregate metrics and
 request statuses remain. Prompts are deterministic built-ins; optional custom
-fixtures are a local JSON list of `RequestSpec` objects. Custom fixture files must
+fixtures are a local JSON list of `RequestSpec` objects. Legacy `--fixtures` accepts
+only `exact`, `contains`, `json`, and `none` scorers; AI judges require a request
+pack, and tool scoring is reserved for built-in tool checks. Custom fixture files must
 remain available to reproduce a run.
 
 ```sh
@@ -490,7 +645,11 @@ giraffe cold-start --config my-test-service.yaml --restart service --output runs
 ```
 
 The command invokes only that hook. It does not provision deployments or reboot
-nodes. A missing hook blocks the cold-start run. Use an isolated test service when
+nodes. A missing hook blocks the cold-start run. After the hook completes, readiness
+retries use `readiness_timeout_seconds` (default 180 seconds), bounded by the run
+deadline. GET `/v1/models` polls (or `/health` on 404) back off from 0.1 to 5
+seconds, then one inference verifies readiness. These probes are recorded separately
+and excluded from `max_requests` and `stop_after_errors`. Use an isolated test service when
 measuring restarts or load.
 
 ## Offline and container use
@@ -572,6 +731,12 @@ pip install -e '.[dev]'
 pytest -q
 ruff check src tests
 ```
+
+When verifying a separate worktree with an environment installed from another
+checkout, use `PYTHONPATH="$PWD/src" python -m pytest -q`. Python's `-I` ignores
+`PYTHONPATH`, so omit it for this invocation. Confirm the source with
+`PYTHONPATH="$PWD/src" python -c 'import giraffe.runner; print(giraffe.runner.__file__)'`
+before running an external verifier against worktree changes.
 
 Integration tests use a real local HTTP server to inject empty/truncated successful
 responses, wrong answers, timeouts, and timing regressions. They require loopback

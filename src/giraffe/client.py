@@ -11,6 +11,7 @@ import re
 import ssl
 import time
 import uuid
+from time import monotonic
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -67,7 +68,7 @@ async def _limited_body(response: httpx.Response) -> bytes:
     return bytes(body)
 
 
-async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str, float]]:
     """Decode SSE independently of TCP boundaries, including CRLF and multiline data."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     buffer = ""
@@ -81,6 +82,7 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]
         yield b"", True
 
     async for chunk, final in chunks_with_eof():
+        observed_at = time.perf_counter()
         consumed += len(chunk)
         if consumed > _MAX_RESPONSE_BYTES:
             raise _ProtocolError("response exceeded the 4 MiB safety limit")
@@ -94,7 +96,7 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]
             line, buffer = buffer[:end], buffer[end + width:]
             if not line:
                 if data:
-                    yield event_type, "\n".join(data)
+                    yield event_type, "\n".join(data), observed_at
                 data, event_type = [], "message"
             elif not line.startswith(":"):
                 field, _, value = line.partition(":")
@@ -139,16 +141,23 @@ class LLMClient:
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | None = None
 
-    async def __aenter__(self) -> LLMClient:
+    def _create_client(self) -> httpx.AsyncClient:
+        # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
+        # synchronous setup away from concurrent inference and the heartbeat.
         headers = _headers(self.target)
         verify: bool | ssl.SSLContext = True
         if self.config.ca_bundle:
             verify = ssl.create_default_context(cafile=self.config.ca_bundle)
-        self._client = httpx.AsyncClient(
-            headers=headers, timeout=None, verify=verify, proxy=self.config.proxy,
+        return httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(None, connect=min(self.config.request_timeout_seconds * .9, 10)),
+            verify=verify, proxy=self.config.proxy,
             trust_env=True, follow_redirects=False,
             limits=httpx.Limits(max_connections=self.config.concurrency),
         )
+
+    async def __aenter__(self) -> LLMClient:
+        self._client = await asyncio.to_thread(self._create_client)
         return self
 
     async def __aexit__(self, *_: Any) -> None:
@@ -156,12 +165,30 @@ class LLMClient:
             await self._client.aclose()
             self._client = None
 
+    async def ready(self, deadline: float) -> bool:
+        """Poll the advertised model route without spending an inference request."""
+        if self._client is None:
+            raise RuntimeError("Use LLMClient as an async context manager")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            async with asyncio.timeout(remaining):
+                response = await self._client.get(completion_url(self.target.url).removesuffix("/chat/completions") + "/models",
+                                                  timeout=min(5, remaining))
+                if response.status_code == 404:
+                    origin = httpx.URL(self.target.url).copy_with(path="/health")
+                    response = await self._client.get(origin, timeout=min(5, remaining))
+                return response.is_success
+        except (httpx.HTTPError, OSError, TimeoutError):
+            return False
+
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
-        start = time.perf_counter()
+        preparation_start = time.perf_counter()
         stream = self.config.stream and spec.stream
         budget = min(spec.max_tokens or self.config.max_output_tokens, self.config.max_output_tokens)
         record = RequestRecord(
@@ -172,7 +199,7 @@ class LLMClient:
         )
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
-            if key not in _RESERVED_OPTIONS
+            if key not in _RESERVED_OPTIONS and value is not None
         }
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
@@ -190,6 +217,9 @@ class LLMClient:
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
         }, sort_keys=True).encode()).hexdigest()
         record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
+        start = time.perf_counter()
+        record._timing_started_monotonic = monotonic()
+        record.client_preparation_ms = (start - preparation_start) * 1000
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
         response_sequence = -1
@@ -208,7 +238,7 @@ class LLMClient:
                 return
             record.response_events.append({"sequence": response_sequence, "kind": kind, **metadata})
 
-        def receive(data: dict[str, Any], *, streaming: bool) -> None:
+        def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
             nonlocal last_answer, response_sequence, assistant_content_present
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
@@ -274,7 +304,7 @@ class LLMClient:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
-            now = time.perf_counter()
+            now = observed_at
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > 16:
@@ -345,15 +375,18 @@ class LLMClient:
                     raise _ProtocolError("repeated completion finish reason")
                 record.finish_reason = finish
 
+        request_timeout = min(self.config.request_timeout_seconds,
+                              spec.request_timeout_seconds or self.config.request_timeout_seconds)
         intentional = spec.cancel_after_ms is not None and (
-            spec.cancel_after_ms / 1000 < self.config.request_timeout_seconds
+            spec.cancel_after_ms / 1000 < request_timeout
         )
-        timeout = min(self.config.request_timeout_seconds,
+        timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
         try:
             async with asyncio.timeout(timeout):
                 async with self._client.stream("POST", completion_url(self.target.url),
-                                               json=payload) as response:
+                                               json=payload, timeout=httpx.Timeout(
+                                                   None, connect=min(request_timeout * .9, 10))) as response:
                     record.http_status = response.status_code
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
@@ -370,27 +403,36 @@ class LLMClient:
                             record.logprob_evidence = LogprobEvidence(status="rejected" if rejected else "incomplete",
                                 reason="Logprob request field rejected." if rejected else "HTTP request failed; logprob support unverified.",
                                 requested_top_logprobs=spec.workload["top_logprobs"])
+                        if response.status_code == 400 and spec.scenario.startswith("context"):
+                            # Classify only this documented rejection; never retain
+                            # arbitrary server error text or echoed request content.
+                            body = (await _limited_body(response)).decode("utf-8", errors="replace").lower()
+                            if any(term in body for term in ("context length", "context_length", "maximum context", "too many tokens")):
+                                raise _ProtocolError("HTTP 400: context length rejection")
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):
                             _object(await _limited_body(response))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        async for event_type, event in _sse_events(response):
+                        async for event_type, event, observed_at in _sse_events(response):
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
                                 record.stream_terminated = True
                                 break
-                            receive(_object(event), streaming=True)
+                            receive(_object(event), streaming=True, observed_at=observed_at)
                             if (spec.cancel_after_chunks is not None
                                     and record.answer_chunks >= spec.cancel_after_chunks
                                     and record.finish_reason is None):
                                 record.client_cancelled_at_ns = time.time_ns()
+                                record.client_cancelled_monotonic_ns = time.monotonic_ns()
                                 raise _IntentionalCancellation
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
-                        receive(_object(await _limited_body(response)), streaming=False)
+                        body = await _limited_body(response)
+                        observed_at = time.perf_counter()
+                        receive(_object(body), streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
@@ -415,6 +457,10 @@ class LLMClient:
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
+        except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            record.status, record.error = "failed", f"request failed ({type(exc).__name__})"
+        except httpx.TimeoutException as exc:
+            record.status, record.error = "timeout", f"request timeout ({type(exc).__name__})"
         except asyncio.CancelledError:
             record.status, record.error = "cancelled", "run cancelled"
         except _ProtocolError as exc:
@@ -429,12 +475,9 @@ class LLMClient:
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
             if record.valid and record.status == "completed":
-                answer = record.output
+                from .fixtures import final_answer
+                answer, _, _ = final_answer(record.output)
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
-            if stream and last_answer is not None:
-                record.max_stream_gap_ms = max(
-                    record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
-                )
         return record

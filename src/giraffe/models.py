@@ -7,7 +7,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StrictBool, field_serializer, model_serializer, model_validator
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -25,13 +25,21 @@ CHECK_NAMES = {
     "gpu": "GPU observations",
 }
 CORE_CHECKS = tuple(CHECK_NAMES)
-DEFAULT_CHECKS = tuple(name for name in CORE_CHECKS if name not in {"json", "gpu"})
+DEFAULT_CHECKS = tuple("concurrency" if name == "fairness" else name
+                       for name in CORE_CHECKS if name not in {"json", "gpu"})
 CHECK_NAMES.update({
     "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
     "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
     "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
     "tools": "Tool-calling capability",
 })
+# Old identifiers remain execution components and readable report/config contracts.
+# Discovery and new reports expose one configurable check instead of three.
+INTERNAL_CHECK_NAMES = {**CHECK_NAMES, "token_stress": "Token stress cases",
+                        "concurrency": "Concurrent workloads"}
+CHECK_NAMES = {("concurrency" if key == "fairness" else key):
+               ("Concurrent workloads" if key == "fairness" else title)
+               for key, title in CHECK_NAMES.items() if key not in {"buckets", "mixed"}}
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
 
@@ -52,7 +60,7 @@ class Deployment(Model):
     collected_at: str | None = None
     metadata_file: str | None = None
     launch_command: str | list[str] | None = None
-    discovery: Literal["none", "ollama", "vllm", "sglang"] = "none"
+    discovery: Literal["none", "ollama", "vllm", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "none"
     collector_url: str | None = None
     intended_change: str | None = None
 
@@ -64,27 +72,28 @@ class Arrival(Model):
     burst_size: int = Field(default=2, ge=1, le=256)
     interval_seconds: float = Field(default=1, gt=0)
     max_pending: int = Field(default=4, ge=1, le=256)
+    max_client_wait_ms: float = Field(default=50, ge=0)
     seed: int = 0
 
 
 class Prefix(Model):
-    prefix_chars: int = Field(default=256, ge=32, le=65536)
-    repeats: int = Field(default=4, ge=2, le=100)
+    prefix_chars: int = Field(default=8192, ge=32, le=65536)
+    repeats: int = Field(default=6, ge=2, le=100)
     history_turns: int = Field(default=3, ge=2, le=32)
 
 
 class Buckets(Model):
     input_chars: dict[str, int] = Field(default_factory=lambda: {
-        "short": 64, "medium": 256, "long": 512})
+        "short": 64, "medium": 1024, "long": 12288})
     output_tokens: dict[str, int] = Field(default_factory=lambda: {
         "short": 16, "medium": 48, "long": 96})
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     samples_per_bucket: int = Field(
-        default=4, ge=2, le=100,
-        description="Minimum requests per input/output pair at each level. Each level sends at least one full concurrent batch.",
+        default=5, ge=2, le=100,
+        description="Minimum requests per input/output pair at each level, rounded up to full load groups. Requests refill as soon as a slot is free.",
     )
     window_seconds: float = Field(default=30, gt=0)
-    mixed_pairs: int = Field(default=2, ge=1, le=100)
+    mixed_pairs: int = Field(default=5, ge=1, le=100)
     heavy_weights: dict[str, int] = Field(default_factory=lambda: {
         "long_input": 1, "long_output": 1})
 
@@ -107,27 +116,115 @@ class Buckets(Model):
         return self
 
 
+class TokenStressCase(Model):
+    name: Literal["long_input_summary", "short_input_long_output"]
+    input_tokens: int | None = Field(default=None, ge=128, le=65536)
+    max_input_tokens: int | None = Field(default=None, ge=1, le=65536)
+    output_tokens: int = Field(ge=1, le=65536)
+    min_output_tokens: int | None = Field(default=None, ge=1, le=65536)
+
+    @model_validator(mode="after")
+    def valid_lengths(self):
+        if self.name == "long_input_summary" and self.input_tokens is None:
+            raise ValueError("long_input_summary requires an input token target")
+        if self.min_output_tokens is not None and self.min_output_tokens > self.output_tokens:
+            raise ValueError("minimum observed output must not exceed the output cap")
+        if self.name == "short_input_long_output":
+            if self.input_tokens is not None:
+                raise ValueError("short_input_long_output uses max_input_tokens, not an input token target")
+            if self.max_input_tokens is None:
+                self.max_input_tokens = 128
+        return self
+
+
+class ConcurrentWorkloads(Buckets):
+    scenarios: list[Literal["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"]] = Field(
+        default_factory=lambda: ["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"],
+        min_length=1)
+    samples_per_bucket: int = Field(default=5, ge=2, le=100)
+    mixed_pairs: int = Field(default=5, ge=1, le=100)
+    input_token_tolerance: float = Field(default=.1, ge=0, lt=.5)
+    calibration_attempts: int = Field(default=3, ge=1, le=5)
+    stress_cases: list[TokenStressCase] = Field(default_factory=lambda: [
+        TokenStressCase(name="long_input_summary", input_tokens=10000, output_tokens=50),
+        TokenStressCase(name="short_input_long_output", max_input_tokens=128, output_tokens=10000)])
+
+    @model_validator(mode="after")
+    def distinct_scenarios(self):
+        if "token_stress" in self.scenarios and not self.stress_cases:
+            raise ValueError("Select at least one token stress case")
+        if len(set(self.scenarios)) != len(self.scenarios):
+            raise ValueError("concurrent workload scenarios must be distinct")
+        if len({case.name for case in self.stress_cases}) != len(self.stress_cases):
+            raise ValueError("token stress case names must be distinct")
+        return self
+
+
+class SessionWorkload(Model):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    weight: float = Field(default=1, gt=0, le=10000)
+    turns: list[str] = Field(min_length=2, max_length=32)
+    max_tokens: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def bounded_turns(self):
+        if any(not turn.strip() or len(turn) > 8192 for turn in self.turns):
+            raise ValueError("workloads need non-empty user turns of at most 8192 characters")
+        return self
+
+
+def session_workload_presets() -> list[SessionWorkload]:
+    return [
+        SessionWorkload(name="coding", turns=[
+            "Write a Python function that removes duplicates from a list while preserving order. Explain how it works.",
+            "Extend your previous solution to handle unhashable items. Explain the trade-offs.",
+            "Add tests for your previous solution, including empty input and repeated values. Explain each test.",
+        ]),
+        SessionWorkload(name="essay", turns=[
+            "Write three paragraphs explaining the benefits and drawbacks of public transport in cities.",
+            "Expand your previous discussion with a concrete example and a counterargument in three paragraphs.",
+            "Revise your argument into three paragraphs aimed at a city council. Include a practical recommendation.",
+        ]),
+        SessionWorkload(name="chat", turns=[
+            "Explain in a full paragraph how to plan a weekend picnic with friends.",
+            "Using your previous plan, explain in a full paragraph how you would adapt it for rainy weather.",
+            "Using our discussion, give a detailed checklist and explain the most important preparations.",
+        ]),
+    ]
+
+
 class Sessions(Model):
+    profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
-    sessions: int = Field(default=2, ge=1, le=32)
+    sessions: int = Field(default=5, ge=1, le=32)
     concurrency: int = Field(default=2, ge=1, le=32)
     turns: list[str] = Field(default_factory=lambda: [
         "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop.",
         SESSION_REPEAT_PROMPT])
-    saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"])
+    saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"],
+        description="Retained for config compatibility; seeded name-recall histories use the session name at every turn.")
     delay_seconds: float = Field(default=0, ge=0, le=60)
     max_tokens: int = Field(default=32, ge=1)
+    # Non-empty workloads select live performance conversations. Empty retains
+    # the existing fixed/live exact-repeat correctness test and its saved config.
+    workloads: list[SessionWorkload] = Field(default_factory=list, max_length=16)
     # Stop rather than inventing an answer or silently cropping required history.
     failure_policy: Literal["stop"] = "stop"
 
     @model_validator(mode="after")
     def valid_session(self):
+        if self.profile == "performance":
+            if not self.workloads:
+                raise ValueError("select at least one performance workload")
+            if self.modes != ["live"]:
+                raise ValueError("mixed performance workloads require modes: [live]")
+            names = [workload.name for workload in self.workloads]
+            if len(names) != len(set(names)):
+                raise ValueError("session workload names must be unique")
         if not self.modes or len(set(self.modes)) != len(self.modes):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= 32 or any(not t.strip() or len(t) > 8192 for t in self.turns):
             raise ValueError("sessions need 2..32 non-empty bounded user turns")
-        if "fixed" in self.modes and len(self.saved_answers) < len(self.turns) - 1:
-            raise ValueError("fixed history needs a saved assistant answer for each prior turn")
         return self
 
 
@@ -138,7 +235,7 @@ class LogprobConsistency(Model):
     tolerance: float | None = Field(default=None, ge=0)
     support: Literal["discover", "required"] = "discover"
     priming_rounds: int = Field(default=0, ge=0, le=2)
-    compare_levels: bool = False
+    compare_levels: bool = True
 
     @model_validator(mode="after")
     def strict_tolerance(self):
@@ -168,9 +265,11 @@ class LogprobEvidence(Model):
 
 class Consistency(Model):
     logprobs: LogprobConsistency | None = None
-    repetitions: int = Field(default=4, ge=2, le=100)
+    repetitions: int = Field(default=5, ge=2, le=100,
+        description="Text repetitions round up to full load groups; logprob mode uses exactly this many measured rounds.")
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     shapes: list[Literal["short", "long"]] = Field(default_factory=lambda: ["short", "long"])
+    prompts_per_shape: int = Field(default=3, ge=2, le=16)
     temperature: float = Field(default=0, ge=0, le=2)
     seed: int | None = None
     equality: Literal["bytes", "whitespace"] = "bytes"
@@ -197,7 +296,7 @@ class Target(Model):
     metrics_url: str | None = None
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
-    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang"] = "unknown"
+    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "unknown"
     metrics_runtime_version: str | None = None
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)
@@ -246,6 +345,8 @@ class Limits(Model):
     max_error_rate: float = Field(default=0, ge=0, le=1)
     min_correctness: float = Field(default=1, ge=0, le=1)
     fairness_max_ratio: float | None = Field(default=None, gt=1)
+    recovery_max_ratio: float | None = Field(default=None, gt=1)
+    gpu_max_temperature_c: float | None = Field(default=None, gt=0)
     regression_percent: float = Field(default=20, ge=0)
     min_samples: int = Field(default=5, ge=2)
 
@@ -343,13 +444,15 @@ CHECK_LIMIT_FIELDS = {
     "fairness": {"fairness_max_ratio", "stream_gap_ms", "min_correctness"},
     "context": {"min_correctness"}, "correctness": {"min_correctness"},
     "json": {"min_correctness"}, "cancellation": set(),
-    "recovery": _TRAFFIC_LIMITS - {"min_samples"}, "gpu": set(),
+    "recovery": (_TRAFFIC_LIMITS - {"min_samples"}) | {"recovery_max_ratio"}, "gpu": {"gpu_max_temperature_c"},
 }
 
 # Extended workloads have dedicated top-level configuration blocks.
 for _check in CHECK_NAMES.keys() - CHECK_OPTION_FIELDS.keys():
     CHECK_OPTION_FIELDS[_check] = set()
     CHECK_LIMIT_FIELDS[_check] = set()
+CHECK_OPTION_FIELDS["concurrency"] = {"samples", "context_limit"}
+CHECK_LIMIT_FIELDS["concurrency"] = _TRAFFIC_LIMITS | {"fairness_max_ratio"}
 
 
 JUDGE_PROMPT_VERSION = "reference-correctness-v1"
@@ -816,6 +919,7 @@ class RunConfig(Model):
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)
+    readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
     context_limit: int = Field(default=4096, ge=128)
     samples: int = Field(default=6, ge=1)
@@ -825,13 +929,15 @@ class RunConfig(Model):
     structured_json: bool = False
     metrics: bool = False
     metrics_interval_seconds: float = Field(default=1, ge=.1, le=60)
+    gpu_min_observation_seconds: float = Field(default=30, ge=0,
+        description="Minimum GPU observation window; match exporter refresh, independently of scrape interval. Bounded by run duration.")
     metrics_timeout_seconds: float = Field(default=2, gt=0, le=10)
     metrics_max_samples: int = Field(default=256, ge=2, le=4096)
     metrics_max_series: int = Field(default=128, ge=1, le=1024)
     cache_pressure_threshold: float = Field(default=.9, gt=0, le=1)
     arrivals: Arrival | None = None
     prefix: Prefix | None = None
-    buckets: Buckets | None = None
+    concurrent_workloads: ConcurrentWorkloads | None = None
     sessions: Sessions | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
@@ -853,6 +959,50 @@ class RunConfig(Model):
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     test_options: dict[str, CheckOptions] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_concurrent_workloads(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        legacy = {"fairness": "streaming_fairness", "buckets": "size_matrix",
+                  "mixed": "mixed_interference"}
+        selected = value.get("checks", [])
+        old_settings = value.pop("buckets", None)
+        if isinstance(old_settings, BaseModel):
+            old_settings = old_settings.model_dump(exclude_unset=True)
+        old_scenarios = [legacy[name] for name in selected if name in legacy]
+        if old_settings is not None and "checks" not in value:
+            old_scenarios = ["streaming_fairness", "size_matrix", "mixed_interference"]
+        if old_settings is not None or old_scenarios:
+            current = value.get("concurrent_workloads") or {}
+            if isinstance(current, BaseModel):
+                current = current.model_dump(exclude_unset=True)
+            settings = {**current, **(old_settings or {})}
+            settings.setdefault("scenarios", old_scenarios or ["size_matrix", "mixed_interference"])
+            settings.setdefault("samples_per_bucket", Buckets().samples_per_bucket)
+            settings.setdefault("mixed_pairs", Buckets().mixed_pairs)
+            value["concurrent_workloads"] = settings
+        if isinstance(value.get("concurrent_workloads"), dict):
+            settings = dict(value["concurrent_workloads"])
+            settings.setdefault("levels", [level for level in (1, 2) if level <= value.get("concurrency", 4)])
+            settings.setdefault("output_tokens", {name: min(cap, value.get("max_output_tokens", 128))
+                                                  for name, cap in Buckets().output_tokens.items()})
+            value["concurrent_workloads"] = settings
+        if "checks" in value:
+            value["checks"] = list(dict.fromkeys(
+                "concurrency" if name in legacy else name for name in selected))
+        options = dict(value.get("test_options") or {})
+        if "fairness" in options:
+            options.setdefault("concurrency", options.pop("fairness"))
+            value["test_options"] = options
+        return value
+
+    @property
+    def buckets(self):
+        """Legacy execution components share the canonical settings block."""
+        return self.concurrent_workloads
+
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
         if self.request_source == "request_pack":
@@ -864,13 +1014,11 @@ class RunConfig(Model):
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                 ("buckets", "buckets"), ("sessions", "sessions"),
+                                 ("concurrent_workloads", "concurrency"), ("sessions", "sessions"),
                                  ("consistency", "consistency"), ("tool_calling", "tools"),
                                  ("tool_checks", "tools")):
                 if getattr(self, field):
                     self.checks.append(check)
-            if self.buckets:
-                self.checks.append("mixed")
         self.validate_active_judges()
         self.checks = list(dict.fromkeys(self.checks))
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
@@ -884,8 +1032,8 @@ class RunConfig(Model):
             self.arrivals = Arrival()
         if "prefix" in self.checks and self.prefix is None:
             self.prefix = Prefix()
-        if {"buckets", "mixed"}.intersection(self.checks) and self.buckets is None:
-            self.buckets = Buckets(
+        if "concurrency" in self.checks and self.concurrent_workloads is None:
+            self.concurrent_workloads = ConcurrentWorkloads(
                 levels=[level for level in (1, 2) if level <= self.concurrency],
                 output_tokens={name: min(value, self.max_output_tokens)
                                for name, value in Buckets().output_tokens.items()},
@@ -935,8 +1083,8 @@ class RunConfig(Model):
             proxy = urlsplit(self.proxy)
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
-        bucket_selected = bool({"buckets", "mixed"}.intersection(self.checks))
-        for selected, settings, field in ((bucket_selected, self.buckets, "buckets"),
+        bucket_selected = "concurrency" in self.checks
+        for selected, settings, field in ((bucket_selected, self.buckets, "concurrent_workloads"),
                                           ("consistency" in self.checks, self.consistency, "consistency")):
             if selected and settings and max(settings.levels) > self.concurrency:
                 raise ValueError(f"{field}.levels must not exceed concurrency ({self.concurrency}); "
@@ -946,6 +1094,9 @@ class RunConfig(Model):
                 raise ValueError("session concurrency must not exceed the global ceiling")
             if self.sessions.max_tokens > self.max_output_tokens:
                 raise ValueError("session output budget must stay within max_output_tokens")
+            if any(workload.max_tokens is not None and workload.max_tokens > self.max_output_tokens
+                   for workload in self.sessions.workloads):
+                raise ValueError("session workload output budgets must stay within max_output_tokens")
         if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
             raise ValueError("bucket output budgets must stay within max_output_tokens")
         from giraffe.deployment import sanitize
@@ -969,9 +1120,10 @@ class RunConfig(Model):
 
     def effective_check(self, check_id: str) -> dict[str, Any]:
         """Resolve sparse overrides once, retaining global safety ceilings."""
-        if check_id not in CHECK_NAMES:
+        if check_id not in INTERNAL_CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
-        options = self.test_options.get(check_id, CheckOptions())
+        options = self.test_options.get("concurrency" if check_id in {"fairness", "buckets", "mixed"}
+                                        else check_id, CheckOptions())
         special_defaults = {"backend_verification": "off", "cancel_after_ms": 100, "deadline_probe_ms": 50,
                             "cancel_after_chunks": 5, "cleanup_seconds": 5,
                             "trace_wait_seconds": 10}
@@ -1064,6 +1216,7 @@ class EvaluationEvidence(Model):
 
 
 class RequestRecord(Model):
+    _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -1075,6 +1228,7 @@ class RequestRecord(Model):
     error: str | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
+    client_cancelled_monotonic_ns: int | None = None
     elapsed_ms: float = 0
     first_output_ms: float | None = None
     last_output_ms: float | None = None
@@ -1087,6 +1241,7 @@ class RequestRecord(Model):
     output_chars: int = 0
     output: str = ""
     reasoning: str = ""
+    reasoning_stripped: bool = False
     chunks: int = 0
     stream_terminated: bool = False
     finish_reason: str | None = None
@@ -1119,6 +1274,8 @@ class RequestRecord(Model):
     completed_at: str | None = None
     dispatch_ms: float | None = None
     completed_ms: float | None = None
+    timing_start_ms: float | None = None
+    client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
     overlap: int = 1
@@ -1129,6 +1286,10 @@ class RequestRecord(Model):
     cached_prompt_tokens: int | None = None
     cache_source: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+    @property
+    def stream_gap_applicable(self) -> bool:
+        return not (self.stream and self.answer_chunks == 1 and self.completion_tokens in (1, 2))
 
     @property
     def generation_tokens_per_second(self) -> float | None:

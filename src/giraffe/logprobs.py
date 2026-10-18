@@ -239,8 +239,10 @@ def compare_samples(records, *, cross=False, prefix_cache=None):
 
 
 def comparison_status(summary, settings, complete):
-    if settings.strict and summary['max_absolute_delta'] is not None and summary['max_absolute_delta'] > settings.tolerance:
+    if settings.strict and summary['token_divergences']:
         return 'fail'
+    if summary['max_absolute_delta'] is not None and summary['max_absolute_delta'] > (settings.tolerance or 0):
+        return 'fail' if settings.strict else 'inconclusive'
     if not complete or summary['comparison_limit'] or summary['identity_mismatches'] or not summary['compared_token_pairs'] or any(
             summary[key] for key in ('token_divergences', 'top_k_membership_changes', 'unknown_values')):
         return 'inconclusive'

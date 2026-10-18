@@ -14,3 +14,6 @@ research/
 docs/plans/
 docs/reviews/
 .brooks-lint-history.json
+
+# Local engine-validation notebooks and tooling.
+/examples/colab/

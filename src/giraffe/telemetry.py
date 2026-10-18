@@ -44,6 +44,34 @@ SGLANG = {
 }
 # Exact metric contracts from the source used for the live Apple Silicon run.
 SGLANG_REFERENCE = "SGLang 44bc47886 srt/observability/metrics_collector.py"
+LLAMACPP = {
+    "llamacpp:requests_processing": ("running", "gauge", "requests"),
+    "llamacpp:requests_deferred": ("waiting", "gauge", "requests"),
+    "llamacpp:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
+    "llamacpp:tokens_predicted_total": ("generated_tokens", "counter", "tokens"),
+}
+LMDEPLOY = {
+    "lmdeploy:num_requests_running": ("running", "gauge", "requests"),
+    "lmdeploy:num_requests_waiting": ("waiting", "gauge", "requests"),
+    "lmdeploy:gpu_cache_usage_perc": ("cache_occupancy", "gauge", "fraction"),
+    "lmdeploy:prefix_cache_hit_rate": ("prefix_hit_rate", "gauge", "fraction"),
+    "lmdeploy:cached_tokens_total": ("cached_tokens", "counter", "tokens"),
+    "lmdeploy:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
+    "lmdeploy:generation_tokens_total": ("generated_tokens", "counter", "tokens"),
+}
+TGI = {
+    "tgi_request_queue_duration_sum": ("server_queue_sum", "counter", "seconds"),
+    "tgi_request_queue_duration_count": ("server_queue_count", "counter", "requests"),
+    "tgi_request_inference_duration_sum": ("server_inference_sum", "counter", "seconds"),
+    "tgi_request_inference_duration_count": ("server_inference_count", "counter", "requests"),
+}
+ENGINE_METRICS = {"llamacpp": LLAMACPP, "lmdeploy": LMDEPLOY, "tgi": TGI}
+ENGINE_METRIC_REFERENCES = {
+    "llamacpp": "llama.cpp tools/server/README.md /metrics contract (b11696)",
+    "lmdeploy": "LMDeploy lmdeploy/metrics/loggers.py; runtime/version qualification required",
+    "tgi": "TGI router/src/server.rs duration histograms in seconds; runtime/version qualification required",
+    "tensorrt-llm": "Native /metrics iteration JSON is not a Prometheus contract; use a separate Prometheus exporter for GPU observations.",
+}
 GPU = {
     "DCGM_FI_DEV_FB_USED": ("memory", "gauge", "MiB"),
     "DCGM_FI_DEV_GPU_UTIL": ("utilization", "gauge", "percent"),
@@ -57,10 +85,109 @@ LINE = re.compile(
 )
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
+GPU_FAMILIES = {entry[0] for entry in GPU.values()}
+# NVIDIA DCGM adverse bits: HW slowdown, SW/HW thermal, power brake.
+# Idle/application-clock/sync-boost/display-clock reasons alone are not failures.
+GPU_THROTTLE_REASONS = {8: "hardware slowdown",
+                        32: "software thermal", 64: "hardware thermal", 128: "hardware power brake"}
 
 
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperature_c=None):
+    """Assess published GPU devices; an advancing scrape alone proves no freshness.
+
+    Value changes establish freshness for that device, not for other GPUs. Unseen
+    devices cannot be enumerated from this endpoint; declared counts bound coverage.
+    """
+    devices, series, alerts = {}, defaultdict(list), []
+    temperatures = defaultdict(dict)
+    warnings, informational = [], []
+    completed = 0
+    for index, snap in enumerate(snapshots):
+        samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
+        completed += bool(samples)
+        for sample in samples:
+            labels, family, value = sample.get("labels", {}), sample["family"], sample["value"]
+            # Hostname disambiguates identical GPU indices on multiple exporter hosts.
+            key = (labels.get("Hostname", ""), labels.get("gpu"))
+            device = devices.setdefault(key, {"families": set(), "timestamped": set(),
+                                               "changing": False, "unknown_identity": key[1] is None})
+            timestamp = sample.get("sample_timestamp_ms")
+            age = sample.get("age_seconds")
+            if timestamp is not None and age is None:
+                collected = snap.get("collected_at")
+                observed = datetime.fromisoformat(collected).timestamp() if collected else time.time()
+                age = observed - timestamp / 1000
+            stale = timestamp is not None and (age > max_age_seconds or age < -5)
+            # DCGM's int64 blank/error sentinels are not measurements.
+            if stale or not math.isfinite(value) or value < 0 or value >= 2**63 - 1024:
+                continue
+            device["families"].add(family)
+            if family == "temperature":
+                temperatures[key][index] = max(temperatures[key].get(index, value), value)
+            if timestamp is not None:
+                device["timestamped"].add(family)
+            identity = (key, sample["name"], tuple(sorted(labels.items())))
+            series[identity].append((index, value))
+            if family == "throttling" and int(value) & ~sum(GPU_THROTTLE_REASONS):
+                informational.append({"gpu": key[1], "value": value, "snapshot": index})
+    for (key, name, _), values in series.items():
+        if any(a[0] != b[0] and a[1] != b[1] for a, b in zip(values, values[1:])):
+            devices[key]["changing"] = True
+        family = GPU[name][0]
+        if family == "device_errors":
+            if values[0][1] > 0:
+                warnings.append({"gpu": key[1], "hostname": key[0], "historical_xid": values[0][1],
+                                 "reason": "Last XID predates observation; not an error count."})
+            for (_, previous), (index, value) in zip(values, values[1:]):
+                if value > 0 and value != previous:
+                    alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
+                                   "value": value, "reasons": ["XID changed during observation"], "snapshot": index})
+        elif family == "throttling":
+            for bit, reason in GPU_THROTTLE_REASONS.items():
+                observed = [(i, v) for i, v in values if int(v) & bit]
+                if len({i for i, _ in observed}) >= 2:
+                    alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
+                                   "value": observed[-1][1], "reasons": [reason],
+                                   "snapshots": sorted({i for i, _ in observed})})
+    if gpu_max_temperature_c is not None:
+        for (hostname, gpu), values in temperatures.items():
+            above = sorted(index for index, value in values.items() if value > gpu_max_temperature_c)
+            if len(above) >= 2:
+                alerts.append({"gpu": gpu, "hostname": hostname, "family": "temperature",
+                               "value": max(values.values()), "snapshots": above,
+                               "reasons": ["temperature exceeded configured limit in repeated snapshots"]})
+    rows = []
+    for (hostname, gpu), device in sorted(devices.items(), key=lambda item: str(item[0])):
+        fresh = device["families"] if device["changing"] else device["timestamped"]
+        missing = sorted(GPU_FAMILIES - device["families"])
+        unknown = sorted(device["families"] - fresh)
+        rows.append({"gpu": gpu, "hostname": hostname, "missing_families": missing,
+                     "unknown_freshness_families": unknown, "identity_verified": not device["unknown_identity"],
+                     "freshness": "values changed across scrapes" if device["changing"] else
+                     "source timestamps" if not unknown else "unknown"})
+    unavailable = sorted({f for row in rows for f in row["missing_families"]}) if rows else sorted(GPU_FAMILIES)
+    metrics = {"attempted": len(snapshots), "completed": completed, "snapshots": snapshots,
+               "unavailable_families": unavailable, "devices": rows, "alerts": alerts,
+               "warnings": warnings, "informational_clock_events": informational,
+               "coverage": "Published GPU labels only; devices absent from all scrapes cannot be discovered.",
+               "metrics_max_age_seconds": max_age_seconds}
+    observed_count = sum(row["identity_verified"] for row in rows)
+    metrics.update({"declared_gpu_count": gpu_count, "observed_gpu_count": observed_count,
+                    "max_temperature_c": max((v for values in temperatures.values() for v in values.values()), default=None),
+                    "gpu_max_temperature_c": gpu_max_temperature_c})
+    qualifier = "this is not device health certification."
+    if alerts:
+        return metrics, "fail", "GPU telemetry reports a new XID, repeated adverse slowdown or configured temperature violation; " + qualifier
+    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and observed_count < gpu_count:
+        return metrics, "inconclusive", f"GPU telemetry covers {observed_count} devices, fewer than the declared {gpu_count}; " + qualifier
+    if not rows or any(row["missing_families"] or row["unknown_freshness_families"] or
+                       not row["identity_verified"] for row in rows):
+        return metrics, "inconclusive", "GPU observations lack per-device coverage or freshness evidence; " + qualifier
+    return metrics, "pass", "Fresh GPU telemetry covers every observed device without new XID, repeated adverse slowdown or configured temperature violations; " + qualifier
 
 
 def _metrics_headers(target):
@@ -89,7 +216,7 @@ def parse(body, target, config):
         if target.metrics_profile == "vllm-legacy"
         else SGLANG
         if target.metrics_profile == "sglang"
-        else {}
+        else ENGINE_METRICS.get(target.metrics_profile, {})
     )
     mapping = profile | GPU
     samples, recognized, truncated = [], 0, False
@@ -164,7 +291,7 @@ def parse(body, target, config):
         if target.metrics_profile == "sglang"
         else "explicit legacy metric-name contract; runtime/version qualification required"
         if target.metrics_profile == "vllm-legacy"
-        else "No serving metric-name contract selected.",
+        else ENGINE_METRIC_REFERENCES.get(target.metrics_profile, "No serving metric-name contract selected."),
         "runtime_version": target.metrics_runtime_version,
         "version_verification": "user-supplied profile/version; verify with recorded deployment discovery",
         "instrumentation": target.instrumentation,

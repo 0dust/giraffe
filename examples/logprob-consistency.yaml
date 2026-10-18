@@ -10,11 +10,11 @@ max_requests: 64
 max_duration_seconds: 600
 request_timeout_seconds: 90
 retention: all
-limits: {min_samples: 2}
+limits: {min_samples: 5}
 consistency:
   levels: [1, 4]
   shapes: [short]
-  repetitions: 4
+  repetitions: 5
   temperature: 0
   seed: 17
   strict: false
@@ -24,4 +24,7 @@ consistency:
     priming_rounds: 1
     compare_levels: true
     support: discover
+    # Strict cross-level equality needs batch-invariant serving. Default vLLM can
+    # diverge even at temperature zero; qualify VLLM_BATCH_INVARIANT=1 first.
+    # Diagnostic summaries still show the maximum delta and token divergence count.
     strict: false

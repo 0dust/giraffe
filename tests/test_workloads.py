@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from giraffe.models import RequestRecord, RunConfig, Sessions, Target
+from giraffe.concurrent_workloads import execution_config
 from giraffe.reporting import write_report
 from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
@@ -49,6 +50,11 @@ def config(endpoint, **extra):
 
 
 def check(report, name):
+    if name in {"buckets", "mixed"}:
+        from giraffe.models import CheckResult
+        family = {"buckets": "size_matrix", "mixed": "mixed_interference"}[name]
+        merged = next(c for c in report.checks if c.id == "concurrency")
+        return CheckResult.model_validate(merged.metrics["scenarios"][family])
     return next(c for c in report.checks if c.id == name)
 
 
@@ -65,20 +71,15 @@ async def test_concurrent_session_history_exact_marker_and_no_cross_contaminatio
                          if p["messages"][0]["content"].startswith("Suggest a name for a bakery")]
     followups = [p for p in session_calls if p["messages"][-1]["content"].startswith("Repeat")]
     assert len(followups) == 2
-    if not legacy:
-        assert session_calls[0]["messages"][0]["content"] == (
-            "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop."
-        )
-        assert all(p["messages"][-1]["content"] == "Repeat exactly the above answer." for p in followups)
+    assert all("Use this exact bakery name for this session:" in p["messages"][0]["content"]
+               for p in session_calls)
+    assert all("original session bakery name" in p["messages"][-1]["content"] for p in followups)
     histories = [p["messages"][1]["content"] for p in followups]
     first_records = [r for r in report.requests if r.scenario == f"session_{mode}_turn0"]
     assert len({r.output for r in first_records}) == 2
-    if mode == "live":
-        assert set(histories) == {r.output for r in first_records}
-        assert len(set(histories)) == 2
-    else:
-        assert histories == ["Golden Crust", "Golden Crust"]
-        assert all(r.output != "Golden Crust" for r in first_records)
+    assert set(histories) == {r.output for r in first_records}
+    assert len(set(histories)) == 2
+    assert all(p["messages"][1]["content"] in p["messages"][0]["content"] for p in followups)
     assert check(report, "sessions").status == "pass"
     turns = [r for r in report.requests if r.scenario == f"session_{mode}_turn1"]
     assert len(turns) == 2 and all(r.score is True for r in turns)
@@ -163,7 +164,7 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
             status="completed",
             valid=True,
             elapsed_ms=elapsed,
-            overlap=overlap,
+            overlap=overlap, score=True,
         )
         for name, elapsed, overlap in [
             ("mixed_control", 10, 1),
@@ -173,8 +174,22 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
             ("mixed_short_unobserved", 10, 1),
         ]
     ]
+    for control in records:
+        if control.scenario == "mixed_control":
+            control.completion_tokens = 96
+            control.requested_max_tokens = 128
+    lights = [r for r in records if r.scenario.startswith("mixed_short")]
+    for index, light in enumerate(lights):
+        light.workload = {"pair": index, "observed_overlap": light.overlap}
+        light.completion_tokens, light.input_tokens, light.requested_max_tokens = 96, 100, 128
+        heavy = light.model_copy(deep=True)
+        heavy.id = f"heavy-{index}"
+        heavy.scenario = light.scenario.replace("mixed_short", "mixed_heavy")
+        heavy.workload.update(heavy_type="long_input")
+        heavy.input_tokens = 1000
+        records.append(heavy)
     run = SimpleNamespace(
-        config=settings,
+        config=execution_config(settings),
         records=records,
         max_lag_ms=0,
         observations={"local": {}},
@@ -198,6 +213,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
             id=f"{scenario}-{index}", target="local", fixture_id=scenario,
             scenario=scenario, check_ids=["mixed"], started_at="2026-10-08T00:00:00Z",
             status="completed", valid=True, elapsed_ms=elapsed, overlap=achieved,
+            completion_tokens=96, input_tokens=100, requested_max_tokens=128, score=True,
         )
         for scenario, count, elapsed, achieved in [
             ("mixed_control", control_samples, 10, 1),
@@ -205,7 +221,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
         ]
         for index in range(count)
     ]
-    run = SimpleNamespace(config=settings, records=records, max_lag_ms=0,
+    run = SimpleNamespace(config=execution_config(settings), records=records, max_lag_ms=0,
                           observations={"local": {}}, unfinished={"local": set()})
     outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
     mixed = next(c for c in outcome if c.id == "mixed")
@@ -223,7 +239,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
 def test_workload_timing_uses_core_generator_qualification(lag, warm_first, correct, expected):
     settings = RunConfig(
         targets=[Target(name="local", url="http://localhost:1", model="m")],
-        checks=["serving", "prefix"], prefix={"repeats": 2},
+        checks=["serving", "prefix"], prefix={"repeats": 3},
         limits={"min_samples": 2, "latency_ms": 1000},
     )
     records = [
@@ -237,9 +253,20 @@ def test_workload_timing_uses_core_generator_qualification(lag, warm_first, corr
                 id=f"prefix-{index}", target="local", fixture_id="prefix",
                 scenario="prefix_shared", check_ids=["prefix"],
                 started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
-                elapsed_ms=100, first_output_ms=20, score=correct,
+                elapsed_ms=100, first_output_ms=20, score=correct, input_chars=512,
+                input_tokens=128, cached_prompt_tokens=128, workload={"shared_prefix_chars": 512},
             )
-            for index in range(2)
+            for index in range(3)
+        ],
+        *[
+            RequestRecord(
+                id=f"control-{index}", target="local", fixture_id="control",
+                scenario="prefix_independent", check_ids=["prefix"],
+                started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
+                elapsed_ms=100, first_output_ms=20, score=True, input_chars=512,
+                input_tokens=128, cached_prompt_tokens=0, workload={"shared_prefix_chars": 512},
+            )
+            for index in range(3)
         ],
     ]
     run = SimpleNamespace(config=settings, records=records, max_lag_ms=lag, pack_specs=[],
@@ -263,8 +290,8 @@ async def test_independent_prefix_controls_use_reproducible_matched_prose():
     assert comparison["shared_repeats"]["attempted"] == 2
     assert comparison["independent_controls"]["attempted"] == 3
     assert "not proof" in comparison["interpretation"]
-    assert len({prompt[:256] for prompt in first[1::2]}) == 3
-    for shared, independent in zip(first[::2], first[1::2]):
+    assert len({prompt[:256] for prompt in first[3:]}) == 3
+    for shared, independent in zip(first[:3], first[3:]):
         assert len(shared) == len(independent)
         assert "The rock is gray." in shared and " The " in independent
         assert "Reply with the box label only." in independent
@@ -313,7 +340,11 @@ def test_fenced_arguments_and_truncated_tool_completion_do_not_pass(arguments, f
             }
         ],
     )
-    assert score_response(request, record).score is False
+    result = score_response(request, record)
+    assert result.score is False
+    if finish == "length":
+        assert result.tool_evaluation.protocol.status == "fail"
+        assert "truncated" in result.tool_evaluation.protocol.message
 
 
 async def test_missing_configured_workload_timing_is_inconclusive():
@@ -409,26 +440,31 @@ async def test_cancellation_stops_arrival_scheduler_and_saves_partial_evidence()
 async def test_consistency_hashes_before_retention_and_separates_task_correctness(tmp_path, mode):
     with FakeEndpoint(mode=mode, first_token_delay=0.02) as endpoint:
         report = await run_suite(
-            config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]}, retention="none")
+            config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]},
+                   retention="none", stop_after_errors=100)
         )
         calls = [
-            p for p in endpoint.requests if p["messages"][-1]["content"].startswith("The box label")
+            p for p in endpoint.requests if p["messages"][-1]["content"].startswith("Copy the following text exactly")
         ]
     result = check(report, "consistency")
     buckets = result.metrics["buckets"]
-    assert len(buckets) == 2
+    assert len(buckets) == 6
     assert all(len(p["messages"]) == 1 for p in calls)
-    if mode in {"wrong", "http_error"}:
+    if mode == "http_error":
         assert result.status == "fail"
+    elif mode == "wrong":
+        assert result.status == "pass"
+        assert result.metrics["correctness_observed"] == 0
+        assert "correctness_observed: 0" in result.summary
     elif mode == "healthy":
         assert all(b["agreement_rate"] == 1 for b in buckets.values())
     elif mode == "variable_correct":
         assert all(b["agreement_rate"] < 1 and b["correctness"] == 1 for b in buckets.values())
-        assert result.status == "pass"
+        assert result.status == "inconclusive"
     else:
-        assert buckets["consistency_c1_short"]["agreement_rate"] == 1
-        assert buckets["consistency_c2_short"]["agreement_rate"] < 1
-        assert result.status == "pass"
+        assert buckets["consistency_c1_short_p0"]["agreement_rate"] == 1
+        assert buckets["consistency_c2_short_p0"]["agreement_rate"] < 1
+        assert result.status == "inconclusive"
     write_report(report, tmp_path)
     saved = json.loads((tmp_path / "report.json").read_text())
     assert all(not r["output"] for r in saved["requests"])
@@ -559,10 +595,11 @@ async def test_bucket_and_mixed_workloads_can_be_selected_independently(selected
         report = await run_suite(config(endpoint, checks=[selected], buckets={
             "levels": [1], "samples_per_bucket": 2, "mixed_pairs": 1,
         }))
-    assert {check.id for check in report.checks if check.status != "skipped"} == {selected}
+    assert {check.id for check in report.checks if check.status != "skipped"} == {"concurrency"}
+    assert set(check(report, "concurrency").metrics["scenarios"]) == {{"buckets": "size_matrix", "mixed": "mixed_interference"}[selected]}
     workload_records = [record for record in report.requests if record.workload]
     assert workload_records
-    assert all(record.check_ids == [selected] for record in workload_records)
+    assert all(set(record.check_ids) == {selected, "concurrency"} for record in workload_records)
 
 
 def text_tool_fixture(identifier='weather-text'):
@@ -620,7 +657,7 @@ async def test_tool_missing_fixture_cannot_be_satisfied_by_duplicate_record():
             tool_checks={'fixtures': [text_tool_fixture('a'), text_tool_fixture('b')], 'modes': ['complete']})
         report = await run_suite(configuration)
     records = [report.requests[0], report.requests[0].model_copy(update={'id': 'duplicate'})]
-    run = SimpleNamespace(config=configuration, records=records, unfinished={'local': set()},
+    run = SimpleNamespace(config=configuration, records=records, max_lag_ms=0, unfinished={'local': set()},
                           observations={'local': {}})
     result = results(run, configuration.targets[0], _stats, _timing_violations, _missing_timing)
     assert next(row for row in result if row.id == 'tools').status == 'inconclusive'
@@ -692,7 +729,7 @@ def test_tool_evaluation_inconclusive_propagates_without_hiding_failures(other_o
     assert records[0].score is None and records[0].evaluation_error == 'tool_evaluation_budget'
     assert records[0].tool_evaluation.protocol.status == 'pass'
     assert records[0].tool_evaluation.content.status == 'pass'
-    run = SimpleNamespace(config=configuration, records=records, unfinished={'local': set()},
+    run = SimpleNamespace(config=configuration, records=records, max_lag_ms=0, unfinished={'local': set()},
                           observations={'local': {}})
     result = next(row for row in results(run, configuration.targets[0], _stats,
                                         _timing_violations, _missing_timing) if row.id == 'tools')

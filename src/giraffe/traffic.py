@@ -55,7 +55,8 @@ def _timing(record: RequestRecord, limits: Limits) -> tuple[bool, bool]:
     measured = (
         (limits.first_output_ms, record.arrival_first_output_ms, False),
         (limits.latency_ms, record.arrival_elapsed_ms, False),
-        (limits.stream_gap_ms, record.max_stream_gap_ms if record.stream else None, False),
+        (limits.stream_gap_ms if record.stream_gap_applicable else None,
+         record.max_stream_gap_ms if record.stream else None, False),
         (limits.min_output_tokens_per_second, record.generation_tokens_per_second, True),
     )
     violated = missing = False
