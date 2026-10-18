@@ -84,7 +84,7 @@ async def test_known_answer_runner_preserves_user_and_case_temperature(monkeypat
     assert deterministic_options(configured, {'temperature': .3}) == {'temperature': .3}
 
 
-@pytest.mark.parametrize('scenario', ['context', 'fairness_long', 'sustained', 'client_cancel', 'cancellation_probe'])
+@pytest.mark.parametrize('scenario', ['context', 'fairness_long', 'client_cancel', 'cancellation_probe'])
 @pytest.mark.parametrize('failure', ['http', 'protocol', 'timeout'])
 @pytest.mark.asyncio
 async def test_real_stress_failures_reach_serving_and_error_stop(scenario, failure):

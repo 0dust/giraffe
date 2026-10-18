@@ -144,7 +144,9 @@ class LLMClient:
         if self.config.ca_bundle:
             verify = ssl.create_default_context(cafile=self.config.ca_bundle)
         self._client = httpx.AsyncClient(
-            headers=headers, timeout=None, verify=verify, proxy=self.config.proxy,
+            headers=headers,
+            timeout=httpx.Timeout(None, connect=min(self.config.request_timeout_seconds * .9, 10)),
+            verify=verify, proxy=self.config.proxy,
             trust_env=True, follow_redirects=False,
             limits=httpx.Limits(max_connections=self.config.concurrency),
         )
@@ -311,15 +313,18 @@ class LLMClient:
                     raise _ProtocolError("invalid completion finish reason")
                 record.finish_reason = finish
 
+        request_timeout = min(self.config.request_timeout_seconds,
+                              spec.request_timeout_seconds or self.config.request_timeout_seconds)
         intentional = spec.cancel_after_ms is not None and (
-            spec.cancel_after_ms / 1000 < self.config.request_timeout_seconds
+            spec.cancel_after_ms / 1000 < request_timeout
         )
-        timeout = min(self.config.request_timeout_seconds,
+        timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
         try:
             async with asyncio.timeout(timeout):
                 async with self._client.stream("POST", completion_url(self.target.url),
-                                               json=payload) as response:
+                                               json=payload, timeout=httpx.Timeout(
+                                                   None, connect=min(request_timeout * .9, 10))) as response:
                     record.http_status = response.status_code
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",

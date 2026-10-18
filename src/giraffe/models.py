@@ -64,6 +64,7 @@ class Arrival(Model):
     burst_size: int = Field(default=2, ge=1, le=256)
     interval_seconds: float = Field(default=1, gt=0)
     max_pending: int = Field(default=4, ge=1, le=256)
+    max_client_wait_ms: float = Field(default=50, ge=0)
     seed: int = 0
 
 
@@ -248,6 +249,7 @@ class Limits(Model):
     min_correctness: float = Field(default=1, ge=0, le=1)
     fairness_max_ratio: float | None = Field(default=None, gt=1)
     recovery_max_ratio: float | None = Field(default=None, gt=1)
+    gpu_max_temperature_c: float | None = Field(default=None, gt=0)
     regression_percent: float = Field(default=20, ge=0)
     min_samples: int = Field(default=5, ge=2)
 
@@ -345,7 +347,7 @@ CHECK_LIMIT_FIELDS = {
     "fairness": {"fairness_max_ratio", "stream_gap_ms", "min_correctness"},
     "context": {"min_correctness"}, "correctness": {"min_correctness"},
     "json": {"min_correctness"}, "cancellation": set(),
-    "recovery": (_TRAFFIC_LIMITS - {"min_samples"}) | {"recovery_max_ratio"}, "gpu": set(),
+    "recovery": (_TRAFFIC_LIMITS - {"min_samples"}) | {"recovery_max_ratio"}, "gpu": {"gpu_max_temperature_c"},
 }
 
 # Extended workloads have dedicated top-level configuration blocks.
@@ -873,6 +875,10 @@ class RequestRecord(Model):
     cached_prompt_tokens: int | None = None
     cache_source: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+    @property
+    def stream_gap_applicable(self) -> bool:
+        return not (self.stream and self.answer_chunks == 1 and self.completion_tokens in (1, 2))
 
     @property
     def generation_tokens_per_second(self) -> float | None:

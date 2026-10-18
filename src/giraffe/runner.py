@@ -97,7 +97,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if scenario.startswith("traffic_stage_") or record.status == "cancelled":
+    if scenario == "sustained" or scenario.startswith("traffic_stage_") or record.status == "cancelled":
         return False
     if _stress(scenario) and (record.status == "timeout" or _context_rejection(record)):
         return False
@@ -758,13 +758,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 # impossible. Require >=90% occupancy as well as the observed peak.
                 loaded = enough and weighted >= effective.concurrency*.9 and run.peak[(target.name, "sustained")] >= effective.concurrency
                 elapsed = time.monotonic() >= end and end < run.deadline
-                complete = (elapsed and run.peak[(target.name, "sustained")] >= effective.concurrency) or (exhausted and loaded)
+                successful = sum(r.status == "completed" and r.valid for r in sustained)
+                complete = successful >= effective.limits.min_samples and (
+                    (elapsed and run.peak[(target.name, "sustained")] >= effective.concurrency) or (exhausted and loaded))
                 run.observations[target.name]["sustained_complete"] = complete
                 run.observations[target.name]["sustained_completion"] = {
                     "reason": "duration elapsed" if elapsed and complete else
                               "allowance consumed with sustained concurrency" if complete else "insufficient load evidence",
                     "time_weighted_in_flight": weighted, "minimum_occupancy_fraction": .9,
-                    "requests": len(sustained), "required_requests": max(effective.limits.min_samples, effective.concurrency*2)}
+                    "requests": len(sustained), "required_requests": max(effective.limits.min_samples, effective.concurrency*2),
+                    "successful_requests": successful, "required_successful_requests": effective.limits.min_samples}
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             await workloads.execute(run, target, client, fixtures)
@@ -841,7 +844,8 @@ def _missing_timing(records, limits):
             continue
         if limits.first_output_ms is not None and record.first_output_ms is None:
             missing.add("first_output_ms")
-        if limits.stream_gap_ms is not None and (not record.stream or record.max_stream_gap_ms is None):
+        if (limits.stream_gap_ms is not None and record.stream_gap_applicable
+                and (not record.stream or record.max_stream_gap_ms is None)):
             missing.add("stream_gap_ms")
         if (limits.min_output_tokens_per_second is not None
                 and record.output_tokens != 1 and record.generation_tokens_per_second is None):
@@ -949,7 +953,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             status, summary = "inconclusive", observations["fairness"]["reason"]
         elif check_id == "gpu":
             from .telemetry import assess_gpu
-            metrics, status, summary = assess_gpu(observations["metrics"], config.metrics_max_age_seconds)
+            metrics, status, summary = assess_gpu(observations["metrics"], config.metrics_max_age_seconds,
+                gpu_count=target.deployment.hardware.get("gpu_count"),
+                gpu_max_temperature_c=limits.gpu_max_temperature_c)
             window = observations.get("gpu_observation_window")
             metrics["observation_window"] = window
             if window and not window["complete"] and status != "fail":
@@ -1195,13 +1201,15 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             windows = [sustained[i:i+config.concurrency] for i in range(0, len(sustained), config.concurrency)]
             probe_stats = _stats(probes)
             accuracy = metrics["correct"] / metrics["scored"] if metrics["scored"] else None
-            sustained_errors = sum(_serving_failure(r, "sustained") for r in sustained)
+            sustained_errors = sum(r.status != "completed" or not r.valid for r in sustained)
             sustained_error_rate = sustained_errors / len(sustained) if sustained else 0
             metrics.update({"sustained": _stats(sustained), "recovery": after,
                             "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
                             "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
                             "unscored_completions": probe_stats["completed"] - probe_stats["scored"],
-                            "sustained_non_timeout_error_rate": sustained_error_rate,
+                            "sustained_error_rate": sustained_error_rate,
+                            "sustained_non_timeout_error_rate": sum(r.status not in {"completed", "timeout", "cancelled"}
+                                or (r.status == "completed" and not r.valid) for r in sustained) / len(sustained) if sustained else 0,
                             "sustained_completion": observations.get("sustained_completion"),
                             "rolling_windows": [_stats(window) for window in windows]})
             violations = _timing_violations(probes, limits)
@@ -1218,7 +1226,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif _missing_timing(probes, limits):
                 metrics["missing_timing_metrics"] = _missing_timing(probes, limits)
                 status, summary = "inconclusive", "Configured recovery limits cannot be checked with available timing or token measurements."
-            elif (not observations.get("sustained_complete") or len(probes) < config.samples
+            elif (not observations.get("sustained_complete") or metrics["sustained"]["completed"] < limits.min_samples
+                  or len(probes) < config.samples
                   or len(baseline) < config.samples):
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."
             elif limits.recovery_max_ratio is not None and (latency_ratio is None or first_ratio is None):
@@ -1228,6 +1237,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Recovery observed; no acceptance limit configured."
             else:
                 summary = "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified."
+                if limits.recovery_max_ratio is None:
+                    summary += (f" Probe/baseline median ratios: latency {latency_ratio}, first output {first_ratio}; "
+                                "no ratio limit configured.")
         if run.pack_specs and check_id in {"capacity", "correctness"} and check_id in run.config.checks:
             pack = _pack_results(run, target)
             metrics["request_pack"] = pack

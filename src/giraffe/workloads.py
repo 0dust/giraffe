@@ -192,7 +192,8 @@ async def arrivals(run, target, client, fixtures):
             observation["unissued"].append(
                 {"count": missing, "reason": "queued request not dispatched before stop/budget"}
             )
-        observation["delayed"] = sum((r.client_wait_ms or 0) > 10 for r in records)
+        observation["client_wait_threshold_ms"] = settings.max_client_wait_ms
+        observation["delayed"] = sum((r.client_wait_ms or 0) > settings.max_client_wait_ms for r in records)
         observation["max_client_wait_ms"] = max(
             (r.client_wait_ms or 0 for r in records), default=None
         )
@@ -603,7 +604,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "Configured strict consistency violated; correctness is reported independently.",
                     )
                 if len(hashes) > 1 and not run.config.consistency.strict and status == "pass":
-                    summary = "Answer variation observed; variation alone is diagnostic, not a correctness failure."
+                    status, summary = "inconclusive", "Answer variation observed; enable strict to enforce."
                 if (
                     len(items) < entry["expected_samples"]
                     or sum(hashes.values()) < minimum
@@ -877,7 +878,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     if run.config.consistency.strict:
                         status, summary = "fail", "Strict cross-level answer consistency violated against level-1 modal answer."
                     elif status == "pass":
-                        summary = "Cross-level answer variation observed; diagnostic without strict mode."
+                        status, summary = "inconclusive", "Cross-level answer variation observed; enable strict to enforce."
                 if agreement is None and status != "fail":
                     status, summary = "inconclusive", "Missing comparable level-1 answer baseline."
             metrics["cross_level"] = comparisons
@@ -950,9 +951,18 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             )
         if check == "consistency" and run.config.consistency.logprobs:
             probability = metrics["logprobs"]
+            if not probability["strict"] and any(
+                row["token_divergences"] or row["top_k_membership_changes"] or
+                (row["max_absolute_delta"] is not None and
+                 row["max_absolute_delta"] > (probability["tolerance"] or 0))
+                for row in probability["conditions"] + probability["cross_conditions"]
+            ):
+                summary += " Probability variation observed; enable strict to enforce."
             delta = probability["max_cross_level_delta"]
             summary += (f" Maximum cross-level delta: {delta if delta is not None else 'unavailable'}; "
                         f"token divergences: {probability['cross_level_token_divergences']}.")
+        if check == "consistency" and (correctness := metrics.get("correctness_observed")) is not None and correctness < 1:
+            summary += f" correctness_observed: {correctness}."
         result.append(
             CheckResult(
                 id=check,

@@ -231,8 +231,8 @@ async def test_recovery_consumed_allowance_can_qualify_before_duration(endpoint)
     assert result.metrics['sustained_completion']['time_weighted_in_flight'] >= 1.8
 
 
-@pytest.mark.parametrize('failure,status', [('timeout', 'pass'), ('failed', 'fail')])
-async def test_recovery_sustained_timeouts_are_observations_but_real_errors_fail(endpoint, monkeypatch, failure, status):
+@pytest.mark.parametrize('failure,status', [('timeout', 'fail'), ('failed', 'fail')])
+async def test_recovery_sustained_timeouts_and_errors_fail(endpoint, monkeypatch, failure, status):
     original = endpoint.execute
     async def fail_load(self, spec, **kwargs):
         result = await original(self, spec, **kwargs)
@@ -246,6 +246,7 @@ async def test_recovery_sustained_timeouts_are_observations_but_real_errors_fail
     result = check(report, 'recovery')
     assert result.status == status
     assert result.metrics['sustained']['error_rate'] == 1
+    assert result.metrics['sustained_error_rate'] == 1
     assert result.metrics['recovery']['error_rate'] == 0
     assert result.metrics['sustained_non_timeout_error_rate'] == (0 if failure == 'timeout' else 1)
 
