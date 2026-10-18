@@ -297,7 +297,7 @@ export function parseToolFixtures(raw) {
   if (raw.length > 65536) throw new Error('Tool fixtures must fit within 65,536 characters.');
   let fixtures;
   try { fixtures = JSON.parse(raw); }
-  catch { throw new Error('Tool fixtures must be a JSON array. Use [] for the built-in weather check.'); }
+  catch { throw new Error('Tool fixtures must be a JSON array. Use [] for an empty list.'); }
   if (!Array.isArray(fixtures) || fixtures.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
     throw new Error('Tool fixtures must be a JSON array of fixture objects.');
   }
@@ -318,7 +318,7 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
       if (edits.includes('forced_tool_diagnostic')) {
         config.forced_tool_diagnostic = values.get('profile_tools_forced_tool_diagnostic') === 'true';
       }
-      if (edits.includes('modes') || edits.includes('fixtures')) {
+      if (edits.some(name => ['modes', 'fixtures', 'conversations'].includes(name))) {
         const profile = structuredClone(config.tool_checks || {fixtures: [], modes: null});
         if (edits.includes('modes')) {
           const raw = String(values.get('profile_tools_modes') || '');
@@ -327,12 +327,13 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
           }
           profile.modes = raw ? raw.split(',') : null;
         }
-        if (edits.includes('fixtures')) {
-          const raw = String(values.get('profile_tools_fixtures') ?? '[]');
-          try { profile.fixtures = parseToolFixtures(raw); }
+        for (const name of ['fixtures', 'conversations']) {
+          if (!edits.includes(name)) continue;
+          const raw = String(values.get(`profile_tools_${name}`) ?? '[]');
+          try { profile[name] = parseToolFixtures(raw); }
           catch (error) {
             if (!allowInvalid) throw error;
-            profile.fixtures = raw;
+            profile[name] = raw;
           }
         }
         config.tool_checks = profile;
@@ -358,8 +359,10 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
     config[key] = profile;
   }
   if (!allowInvalid && typeof config.consistency?.logprobs === 'string') config.consistency.logprobs = parseLogprobSettings(config.consistency.logprobs);
-  if (!allowInvalid && typeof config.tool_checks?.fixtures === 'string') {
-    config.tool_checks.fixtures = parseToolFixtures(config.tool_checks.fixtures);
+  for (const name of ['fixtures', 'conversations']) {
+    if (!allowInvalid && typeof config.tool_checks?.[name] === 'string') {
+      config.tool_checks[name] = parseToolFixtures(config.tool_checks[name]);
+    }
   }
   if (!allowInvalid && config.tool_calling && config.tool_checks?.modes?.includes('stream') && !config.stream) {
     throw new Error('Enable streaming in Run limits or choose complete tool requests.');

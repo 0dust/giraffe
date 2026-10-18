@@ -446,6 +446,10 @@ async def tools(run, target, client):
     fixtures = resolved_tool_fixtures(run.config)
     modes = resolved_tool_modes(run.config)
     custom = bool(run.config.tool_checks and run.config.tool_checks.fixtures)
+    from giraffe.tool_conversations import run_conversation
+    for fixture in run.config.tool_checks.conversations if run.config.tool_checks else []:
+        for mode in modes:
+            await run_conversation(run, target, client, fixture, mode)
     expectations = {
         fixture.fixture_id: ToolExpectation(
             tools=fixture.tools, expected_calls=fixture.expected_calls,
@@ -673,8 +677,15 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             expected_cases = {(fixture.fixture_id, mode)
                               for fixture in resolved_tool_fixtures(run.config)
                               for mode in resolved_tool_modes(run.config)}
+            conversations = run.observations[target.name].get("tool_conversations", [])
+            expected_cases.update((fixture.fixture_id, mode)
+                                  for fixture in (run.config.tool_checks.conversations if run.config.tool_checks else [])
+                                  for mode in resolved_tool_modes(run.config))
             observed_cases = [(r.workload.get("tool_fixture_id"), r.workload.get("mode"))
                               for r in auto]
+            observed_cases += [(session["fixture_id"], session["mode"]) for session in conversations
+                               if session["status"] in {"pass", "fail"}]
+            metrics["conversations"] = conversations
             complete_coverage = (len(observed_cases) == len(expected_cases)
                                  and set(observed_cases) == expected_cases)
             metrics["forced_diagnostic"] = [
@@ -701,16 +712,18 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             metrics["capability_support"] = (
                 "observed for configured fixtures"
                 if complete_coverage and all(r.score is True for r in auto)
+                and all(session["status"] == "pass" for session in conversations)
                 else "rejected or unverified; see request outcomes"
             )
             if any(not is_discovery_rejection(r) and
-                   (r.score is False or not r.valid or r.status != "completed") for r in auto):
+                   (r.score is False or not r.valid or r.status != "completed") for r in auto) or any(
+                       session["status"] == "fail" for session in conversations):
                 status, summary = (
                     "fail",
                     "Required tool fixture failed; declared choice, text and calls must pass. "
                     "No tools were executed.",
                 )
-            elif any(r.score is None for r in auto):
+            elif any(r.score is None for r in auto) or any(session["status"] == "inconclusive" for session in conversations):
                 status, summary = "inconclusive", "Tool fixture evaluation could not establish correctness. See component outcomes."
             elif not complete_coverage:
                 status, summary = (
@@ -720,7 +733,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         assessed = (
             records
             if check != "tools"
-            else [r for r in records if r.workload.get("selection") in {"automatic", "contract"}
+            else [r for r in records if r.workload.get("selection") in {"automatic", "contract", "conversation"}
                   and not is_discovery_rejection(r)]
         )
         if check == "consistency" and run.config.consistency.logprobs:
@@ -734,9 +747,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         assessed_stats = stats(assessed)
         if check != "tools" and assessed_stats["completed"] < minimum and status != "fail":
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
-        errors = stats([r for r in assessed if not (check == "consistency" and r.logprob_evidence and
-                        r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
-                        run.config.consistency.logprobs.support == "discover")])["error_rate"]
+        errors = stats([r for r in assessed if not (
+            (check == "consistency" and r.logprob_evidence and
+             r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
+             run.config.consistency.logprobs.support == "discover")
+            or (r.tool_conversation and r.tool_conversation["status"] == "inconclusive")
+        )])["error_rate"]
         cap_violations = [
             r.id
             for r in assessed
