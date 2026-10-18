@@ -32,7 +32,7 @@ def record(name, tokens=None, *, level=2, slot=0, repeat=0, **extra):
     return RequestRecord(id=name, target='local', fixture_id=f'fixture{slot}', scenario=f'consistency_c{level}_short',
         check_ids=['consistency'], started_at='2026-10-17T00:00:00Z', status='completed', valid=True,
         finish_reason='stop', overlap=level, request_hash='same', observed_model='m', backend_id='b',
-        workload={'level': level, 'corpus_index': slot, 'round': repeat, 'phase': 'measured', 'input_bucket': 'short'},
+        workload={'level': level, 'corpus_index': slot, 'round': repeat, 'phase': 'measured', 'input_bucket': 'short', 'observed_overlap': level, 'load_qualified': True},
         logprob_evidence=evidence(tokens, 0), **extra)
 
 
@@ -134,7 +134,7 @@ def test_no_probability_comparison_after_history_diverges_even_if_text_reconverg
     result = compare_samples(records)
     assert result['token_divergences'] == 1
     assert result['compared_token_pairs'] == 1 and result['max_chosen_delta'] == 0
-    assert comparison_status(result, LogprobConsistency(strict=True, tolerance=0), True) == 'inconclusive'
+    assert comparison_status(result, LogprobConsistency(strict=True, tolerance=0), True) == 'fail'
     records[1].logprob_evidence = evidence([token('a')], 0)
     assert compare_samples(records)['token_divergences'] == 1
 
@@ -238,7 +238,7 @@ async def test_rounds_priming_and_budget_coverage_are_explicit():
     modified = copy.deepcopy(report.requests)
     for r in modified:
         if r.workload['level'] == 2 and r.workload['round'] == 1:
-            r.overlap = 1
+            r.workload["load_qualified"] = False
     assert summarize_logprobs(modified, configuration.consistency)['status'] == 'inconclusive'
 
 
@@ -247,7 +247,7 @@ async def test_disabled_mode_preserves_existing_request_count_and_wire_contract(
         configuration = run_config(endpoint)
         configuration.consistency.logprobs = None
         report = await run_suite(configuration)
-        assert len(endpoint.requests) == 6
+        assert len(endpoint.requests) == 18
         assert all('logprobs' not in p and 'top_logprobs' not in p for p in endpoint.requests)
     assert all(r.logprob_evidence is None for r in report.requests)
     assert 'logprobs' not in check(report, 'consistency').metrics
@@ -397,7 +397,7 @@ async def test_api_preview_export_execution_retention_and_rerun(tmp_path):
 def test_cli_example_and_execution(tmp_path, capsys):
     from giraffe.cli import configuration, main, parser
     example = configuration(parser().parse_args(['run', '--config', 'examples/logprob-consistency.yaml']))
-    assert request_plan(example)['planned_per_target'] == 40
+    assert request_plan(example)['planned_per_target'] == 48
     with FakeEndpoint(mode='logprob_variable') as endpoint:
         values = run_config(endpoint, options={'strict': True, 'tolerance': .04}).model_dump(mode='json')
         path = tmp_path/'config.json'

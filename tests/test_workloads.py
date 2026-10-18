@@ -65,20 +65,15 @@ async def test_concurrent_session_history_exact_marker_and_no_cross_contaminatio
                          if p["messages"][0]["content"].startswith("Suggest a name for a bakery")]
     followups = [p for p in session_calls if p["messages"][-1]["content"].startswith("Repeat")]
     assert len(followups) == 2
-    if not legacy:
-        assert session_calls[0]["messages"][0]["content"] == (
-            "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop."
-        )
-        assert all(p["messages"][-1]["content"] == "Repeat exactly the above answer." for p in followups)
+    assert all("Use this exact bakery name for this session:" in p["messages"][0]["content"]
+               for p in session_calls)
+    assert all("original session bakery name" in p["messages"][-1]["content"] for p in followups)
     histories = [p["messages"][1]["content"] for p in followups]
     first_records = [r for r in report.requests if r.scenario == f"session_{mode}_turn0"]
     assert len({r.output for r in first_records}) == 2
-    if mode == "live":
-        assert set(histories) == {r.output for r in first_records}
-        assert len(set(histories)) == 2
-    else:
-        assert histories == ["Golden Crust", "Golden Crust"]
-        assert all(r.output != "Golden Crust" for r in first_records)
+    assert set(histories) == {r.output for r in first_records}
+    assert len(set(histories)) == 2
+    assert all(p["messages"][1]["content"] in p["messages"][0]["content"] for p in followups)
     assert check(report, "sessions").status == "pass"
     turns = [r for r in report.requests if r.scenario == f"session_{mode}_turn1"]
     assert len(turns) == 2 and all(r.score is True for r in turns)
@@ -173,6 +168,20 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
             ("mixed_short_unobserved", 10, 1),
         ]
     ]
+    for control in records:
+        if control.scenario == "mixed_control":
+            control.completion_tokens = 96
+            control.requested_max_tokens = 128
+    lights = [r for r in records if r.scenario.startswith("mixed_short")]
+    for index, light in enumerate(lights):
+        light.workload = {"pair": index, "observed_overlap": light.overlap}
+        light.completion_tokens, light.input_tokens, light.requested_max_tokens = 96, 100, 128
+        heavy = light.model_copy(deep=True)
+        heavy.id = f"heavy-{index}"
+        heavy.scenario = light.scenario.replace("mixed_short", "mixed_heavy")
+        heavy.workload.update(heavy_type="long_input")
+        heavy.input_tokens = 1000
+        records.append(heavy)
     run = SimpleNamespace(
         config=settings,
         records=records,
@@ -198,6 +207,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
             id=f"{scenario}-{index}", target="local", fixture_id=scenario,
             scenario=scenario, check_ids=["mixed"], started_at="2026-10-08T00:00:00Z",
             status="completed", valid=True, elapsed_ms=elapsed, overlap=achieved,
+            completion_tokens=96, input_tokens=100, requested_max_tokens=128,
         )
         for scenario, count, elapsed, achieved in [
             ("mixed_control", control_samples, 10, 1),
@@ -223,7 +233,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
 def test_workload_timing_uses_core_generator_qualification(lag, warm_first, correct, expected):
     settings = RunConfig(
         targets=[Target(name="local", url="http://localhost:1", model="m")],
-        checks=["serving", "prefix"], prefix={"repeats": 2},
+        checks=["serving", "prefix"], prefix={"repeats": 3},
         limits={"min_samples": 2, "latency_ms": 1000},
     )
     records = [
@@ -237,9 +247,10 @@ def test_workload_timing_uses_core_generator_qualification(lag, warm_first, corr
                 id=f"prefix-{index}", target="local", fixture_id="prefix",
                 scenario="prefix_shared", check_ids=["prefix"],
                 started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
-                elapsed_ms=100, first_output_ms=20, score=correct,
+                elapsed_ms=100, first_output_ms=20, score=correct, input_chars=512,
+                input_tokens=128, cached_prompt_tokens=128, workload={"shared_prefix_chars": 512},
             )
-            for index in range(2)
+            for index in range(3)
         ],
     ]
     run = SimpleNamespace(config=settings, records=records, max_lag_ms=lag, pack_specs=[],
@@ -263,8 +274,8 @@ async def test_independent_prefix_controls_use_reproducible_matched_prose():
     assert comparison["shared_repeats"]["attempted"] == 2
     assert comparison["independent_controls"]["attempted"] == 3
     assert "not proof" in comparison["interpretation"]
-    assert len({prompt[:256] for prompt in first[1::2]}) == 3
-    for shared, independent in zip(first[::2], first[1::2]):
+    assert len({prompt[:256] for prompt in first[3:]}) == 3
+    for shared, independent in zip(first[:3], first[3:]):
         assert len(shared) == len(independent)
         assert "The rock is gray." in shared and " The " in independent
         assert "Reply with the box label only." in independent
@@ -409,14 +420,15 @@ async def test_cancellation_stops_arrival_scheduler_and_saves_partial_evidence()
 async def test_consistency_hashes_before_retention_and_separates_task_correctness(tmp_path, mode):
     with FakeEndpoint(mode=mode, first_token_delay=0.02) as endpoint:
         report = await run_suite(
-            config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]}, retention="none")
+            config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]},
+                   retention="none", stop_after_errors=100)
         )
         calls = [
             p for p in endpoint.requests if p["messages"][-1]["content"].startswith("The box label")
         ]
     result = check(report, "consistency")
     buckets = result.metrics["buckets"]
-    assert len(buckets) == 2
+    assert len(buckets) == 6
     assert all(len(p["messages"]) == 1 for p in calls)
     if mode in {"wrong", "http_error"}:
         assert result.status == "fail"
@@ -426,8 +438,8 @@ async def test_consistency_hashes_before_retention_and_separates_task_correctnes
         assert all(b["agreement_rate"] < 1 and b["correctness"] == 1 for b in buckets.values())
         assert result.status == "pass"
     else:
-        assert buckets["consistency_c1_short"]["agreement_rate"] == 1
-        assert buckets["consistency_c2_short"]["agreement_rate"] < 1
+        assert buckets["consistency_c1_short_p0"]["agreement_rate"] == 1
+        assert buckets["consistency_c2_short_p0"]["agreement_rate"] < 1
         assert result.status == "pass"
     write_report(report, tmp_path)
     saved = json.loads((tmp_path / "report.json").read_text())

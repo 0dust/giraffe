@@ -20,7 +20,7 @@ def plan(configuration):
 
 @pytest.mark.parametrize("checks,expected", [
     (["access", "correctness"], 7),
-    (["access", "buckets"], 73),
+    (["access", "buckets"], 91),
     (["access", "correctness", "capacity"], 42),
 ])
 def test_basic_presets_have_complete_counts_before_caps(checks, expected):
@@ -42,8 +42,8 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     ("recovery", {"sustained_seconds": 0}, 6),
     ("gpu", {}, 0),
     ("arrivals", {}, 8),
-    ("prefix", {}, 11),
-    ("consistency", {"consistency": {"levels": [1, 2]}}, 16),
+    ("prefix", {}, 15),
+    ("consistency", {"consistency": {"levels": [1, 2]}}, 60),
     ("tools", {"forced_tool_diagnostic": True}, 4),
 ])
 def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, updates, expected):
@@ -65,7 +65,7 @@ def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, con
     assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
 
 
-@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 2), (2, "bounded", 14)])
+@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 5), (2, "bounded", 35)])
 def test_mixed_plan_only_includes_interference_work_when_concurrency_allows_it(concurrency, kind, known):
     result = plan(config(checks=["mixed"], concurrency=concurrency))
     assert result["count_kind"] == kind
@@ -85,8 +85,8 @@ def test_bucket_plan_covers_nine_real_prompts_and_full_batches():
         {"concurrency": 8, "requests_per_case": 8, "requests_per_target": 72},
     ]
     assert result["bucket_cases"] == [
-        {"input_chars": chars, "actual_input_chars": chars + extra, "output_tokens": cap}
-        for chars in (64, 256, 512)
+        {"input_chars": chars, "actual_input_chars": min(chars, 11808) + extra, "output_tokens": cap}
+        for chars in (64, 1024, 12288)
         for cap, extra in ((16, 0), (48, 32), (96, 32))
     ]
     assert configuration.max_requests == 160
@@ -134,7 +134,7 @@ def test_saved_dataset_does_not_replace_generated_buckets_or_activate_judges():
             "scorer": "judge", "expected": "Answer"}]},
     })
     result = plan(configuration)
-    assert result["planned_per_target"] == 73
+    assert result["planned_per_target"] == 91
     assert next(row for row in result["rows"] if row["id"] == "buckets")["source"] == "generated examples"
     assert result["evaluator"] == {"active": False, "call_upper_bound": 0, "judge_count": 0,
                                    "ready": True, "readiness_errors": []}

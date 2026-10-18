@@ -68,23 +68,23 @@ class Arrival(Model):
 
 
 class Prefix(Model):
-    prefix_chars: int = Field(default=256, ge=32, le=65536)
-    repeats: int = Field(default=4, ge=2, le=100)
+    prefix_chars: int = Field(default=8192, ge=32, le=65536)
+    repeats: int = Field(default=6, ge=2, le=100)
     history_turns: int = Field(default=3, ge=2, le=32)
 
 
 class Buckets(Model):
     input_chars: dict[str, int] = Field(default_factory=lambda: {
-        "short": 64, "medium": 256, "long": 512})
+        "short": 64, "medium": 1024, "long": 12288})
     output_tokens: dict[str, int] = Field(default_factory=lambda: {
         "short": 16, "medium": 48, "long": 96})
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     samples_per_bucket: int = Field(
-        default=4, ge=2, le=100,
-        description="Minimum requests per input/output pair at each level. Each level sends at least one full concurrent batch.",
+        default=5, ge=2, le=100,
+        description="Minimum requests per input/output pair at each level. Requests refill as soon as a slot is free.",
     )
     window_seconds: float = Field(default=30, gt=0)
-    mixed_pairs: int = Field(default=2, ge=1, le=100)
+    mixed_pairs: int = Field(default=5, ge=1, le=100)
     heavy_weights: dict[str, int] = Field(default_factory=lambda: {
         "long_input": 1, "long_output": 1})
 
@@ -109,7 +109,7 @@ class Buckets(Model):
 
 class Sessions(Model):
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
-    sessions: int = Field(default=2, ge=1, le=32)
+    sessions: int = Field(default=5, ge=1, le=32)
     concurrency: int = Field(default=2, ge=1, le=32)
     turns: list[str] = Field(default_factory=lambda: [
         "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop.",
@@ -138,7 +138,7 @@ class LogprobConsistency(Model):
     tolerance: float | None = Field(default=None, ge=0)
     support: Literal["discover", "required"] = "discover"
     priming_rounds: int = Field(default=0, ge=0, le=2)
-    compare_levels: bool = False
+    compare_levels: bool = True
 
     @model_validator(mode="after")
     def strict_tolerance(self):
@@ -168,9 +168,10 @@ class LogprobEvidence(Model):
 
 class Consistency(Model):
     logprobs: LogprobConsistency | None = None
-    repetitions: int = Field(default=4, ge=2, le=100)
+    repetitions: int = Field(default=5, ge=2, le=100)
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     shapes: list[Literal["short", "long"]] = Field(default_factory=lambda: ["short", "long"])
+    prompts_per_shape: int = Field(default=3, ge=2, le=16)
     temperature: float = Field(default=0, ge=0, le=2)
     seed: int | None = None
     equality: Literal["bytes", "whitespace"] = "bytes"

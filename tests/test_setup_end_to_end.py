@@ -69,17 +69,17 @@ process.stdout.write(JSON.stringify(config));
             assert preview.status_code == 200, preview.text
             plan = preview.json()["request_plan"]
             assert plan["count_kind"] == "exact"
-            assert plan["planned_total"] == 145
-            assert plan["required_request_limit"] == 145
+            assert plan["planned_total"] == 163
+            assert plan["required_request_limit"] == 163
             assert len(plan["bucket_cases"]) == 9
             assert plan["evaluator"]["call_upper_bound"] == 0
             assert endpoint.requests == []  # Neither validation nor planning sends inference.
 
         report = await run_suite(RunConfig.model_validate(preview.json()["config"]))
         assert report.abort_reason is None
-        assert len(report.requests) == len(endpoint.requests) == 145
+        assert len(report.requests) == len(endpoint.requests) == 163
         bucket_requests = [item for item in report.requests if item.scenario.startswith("bucket_c")]
-        assert Counter(item.workload["level"] for item in bucket_requests) == {1: 36, 4: 36, 8: 72}
+        assert Counter(item.workload["level"] for item in bucket_requests) == {1: 45, 4: 45, 8: 72}
         assert all(item.valid for item in report.requests)
         assert all(call["max_tokens"] <= 32 for call in endpoint.requests)
         assert all("SAVED_QUESTION_MUST_NOT_BE_SENT" not in json.dumps(call)

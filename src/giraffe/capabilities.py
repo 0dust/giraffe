@@ -45,12 +45,12 @@ CHECK_DETAILS = {
     "cancellation": "Tests answer caps, stop text, short deadlines and deliberate cancellation, then sends follow-up requests. Optional server logs or traces can verify that cancelled work actually stopped; a client disconnect alone cannot prove this.",
     "recovery": "Sends sustained traffic, then reduces the load and checks whether the server can answer normally again. Shared request and time limits can shorten the test.",
     "gpu": "Reads an existing metrics endpoint. Missing or stale measurements remain unknown; they do not count as healthy hardware. Giraffe does not install monitoring tools.",
-    "arrivals": "Sends requests on a steady schedule or in bursts. Measures when requests actually start and how long they wait, within the configured run limits.",
-    "prefix": "Repeats shared opening text and conversation history, then looks for evidence of cache reuse. Faster responses alone do not prove that the server used a cache.",
-    "buckets": "Each concurrency level means requests running at the same time. Giraffe repeats each level with nine combinations of short, medium and long questions and answers. The minimum request count and time limit apply to each combination at each level.",
-    "mixed": "Runs short requests alongside requests with long questions or long answers, then measures how much the short requests slow down. Request sizes and the mix can be changed in JSON.",
-    "sessions": "Runs several conversations at once. Later turns use either prepared history or actual earlier answers, depending on the JSON settings.",
-    "consistency": "Repeats questions with different request shapes and numbers of requests at a time, then compares the answers. It checks consistency for these examples, not every possible question.",
+    "arrivals": "Sends steady or burst arrivals independently of completion. max_pending bounds queued requests only; the global concurrency limit bounds in-flight requests. Reports dispatch, waiting and unissued arrivals.",
+    "prefix": "Runs shared-prefix repeats back to back, then independent controls and history. A pass requires cached tokens covering at least half the estimated shared prefix on enough repeats. Missing cache usage is inconclusive; zero or insufficient reuse fails. Timing alone cannot prove reuse.",
+    "buckets": "Refills requests as each completes for nine input/output combinations at each concurrency level. Qualifies per-sample overlap and reported input/output lengths, flags tail samples and reports time-weighted in-flight. The per-cell window stops dispatch and lets active requests finish under normal timeouts.",
+    "mixed": "Compares a known light passage of at least 64 tokens with quiet controls while long-input or long-output competitors overlap. Requires reported heavy-shape coverage and enough overlapping samples. Without fairness_max_ratio the effect is inconclusive.",
+    "sessions": "Runs conversations with distinct seeded session names and scores later recall against each session’s own name. Live history preserves actual answers; fixed history uses a seeded first answer and later saved answers.",
+    "consistency": "Repeats several distinct prompts per shape, including known multi-sentence answers. Reports agreement within each level and against its sequential modal answer. Strict differences fail. Optional logprobs always compare level 1 with other levels; strict comparable token divergence fails.",
     "tools": "Checks the format, tool name and arguments in the model's requested tool call. Giraffe does not execute the tool.",
 }
 

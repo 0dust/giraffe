@@ -176,7 +176,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         settings = config.buckets
         for input_shape in ("short", "medium", "long"):
             for output_shape in ("short", "medium", "long"):
-                request = bucket_spec(settings, input_shape, output_shape, "preview", "buckets", 1)
+                request = bucket_spec(settings, input_shape, output_shape, "preview", "buckets", 1, config.context_limit)
                 bucket_cases.append({"input_chars": settings.input_chars[input_shape],
                                      "actual_input_chars": request.input_chars,
                                      "output_tokens": request.max_tokens})
@@ -188,7 +188,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             add("buckets", sum(level["requests_per_target"] for level in bucket_levels),
                 "Tries every question length with every answer cap at each selected load. Each combination sends enough requests to reach that load.",
                 title="Question and answer size tests")
-        if "mixed" in selected:
+        if "mixed" in selected and config.max_output_tokens < 96:
+            add("mixed", 0, "Requires an output cap of at least 96 tokens for the known light passage.")
+            warnings.append("Mixed workload cannot qualify: max_output_tokens must be at least 96.")
+        elif "mixed" in selected:
             add("mixed_control", settings.mixed_pairs, "Quiet short controls for mixed-load comparisons.",
                 title="Mixed-load controls")
             if config.concurrency < 2:
@@ -211,15 +214,32 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "consistency" in selected:
         settings = config.consistency
         levels = len(set([1, *settings.levels]))
-        count = len(settings.shapes) * levels * settings.repetitions
+        count = len(settings.shapes) * levels * settings.repetitions * settings.prompts_per_shape
         if settings.logprobs:
             count = len(settings.shapes) * levels * corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
             add("consistency", count, f"{settings.repetitions} measured rounds plus {settings.logprobs.priming_rounds} priming rounds per shape and level; {corpus_width(settings)} fixed corpus requests per round. Complete responses with logprobs enabled; client overlap does not prove server batching.")
         else:
-            add("consistency", count, f"{settings.repetitions} repeated requests per shape and level, including sequential controls once.")
+            add("consistency", count, f"{settings.repetitions} repeats of {settings.prompts_per_shape} distinct prompts per shape and level, including sequential controls once.")
     if "tools" in selected:
         count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
         add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")
+
+    sample_counts = {}
+    if "arrivals" in selected:
+        sample_counts["arrivals.requests"] = config.arrivals.requests
+    if "prefix" in selected:
+        sample_counts["prefix.repeats (excluding first use)"] = config.prefix.repeats - 1
+    if "buckets" in selected:
+        sample_counts["buckets.samples_per_bucket"] = config.buckets.samples_per_bucket
+    if "mixed" in selected:
+        sample_counts["buckets.mixed_pairs"] = config.buckets.mixed_pairs
+    if "consistency" in selected:
+        sample_counts["consistency.repetitions"] = config.consistency.repetitions
+    if "sessions" in selected:
+        sample_counts["sessions.sessions"] = config.sessions.sessions
+    for name, count in sample_counts.items():
+        if count < config.limits.min_samples:
+            warnings.append(f"{name}={count} is below min_samples={config.limits.min_samples}; this check cannot qualify.")
 
     judging = details["judging"] if details else None
     evaluator = {"active": bool(judging and judging["active"]),
