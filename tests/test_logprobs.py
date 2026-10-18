@@ -106,7 +106,7 @@ def test_extrema_cover_later_pairs_and_compare_raw_unrounded_values():
     assert result['sample_pairs'] == result['compared_token_pairs'] == 3
     assert result['max_chosen_delta'] == .06
     assert result['examples'][0]['request_ids'] == ['1', '2']
-    assert comparison_status(result, LogprobConsistency(tolerance=0), True) == 'diagnostic'
+    assert comparison_status(result, LogprobConsistency(tolerance=0), True) == 'inconclusive'
     assert comparison_status(result, LogprobConsistency(strict=True, tolerance=.04), True) == 'fail'
     assert comparison_status(result, LogprobConsistency(strict=True, tolerance=.06), True) == 'pass'
     tiny = compare_samples([record('x', [token(probability=-.00001)]), record('y', [token(probability=-.0000100001)])])
@@ -187,7 +187,7 @@ def test_extrema_match_brute_force_pairs_across_corpora_and_history_prefixes():
         assert result['max_absolute_delta'] == max(deltas)
 
 
-@pytest.mark.parametrize('strict,expected', [(False, 'pass'), (True, 'fail')])
+@pytest.mark.parametrize('strict,expected', [(False, 'inconclusive'), (True, 'fail')])
 async def test_identical_answers_with_probability_drift_are_detected_through_http(strict, expected):
     with FakeEndpoint(mode='logprob_variable', first_token_delay=.02) as endpoint:
         configuration = run_config(endpoint, options={'strict': strict, 'tolerance': .04, 'compare_levels': True})

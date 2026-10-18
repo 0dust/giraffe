@@ -8,8 +8,8 @@ as a starting point, then match its settings to your server and acceptance limit
 Built-in known-answer fixtures (correctness, JSON, context, short and traffic)
 request temperature zero only when neither `request_options` nor the case options supply a temperature.
 Case options take precedence over run options. None-valued options are omitted from payloads.
-Semantic scoring uses the final answer after stripping leading inline `think`,
-`thinking`, or `reasoning` blocks (case-insensitive), including outputs that start
+Semantic scoring uses the final answer after stripping closed inline `think`,
+`thinking`, or `reasoning` blocks anywhere in the output (case-insensitive), including outputs that start
 inside reasoning opened by the chat template and end at a closing tag. Request evidence records
 `reasoning_stripped`; raw outputs follow retention settings. Reasoning without a
 final answer is unscored. With `finish_reason: length`, exact output is unscored only if it is a strict
@@ -85,7 +85,7 @@ question, and a token cap does not guarantee an answer reaches that length.
 
 ## Standard checks and load evidence
 
-Access, serving and first output exclude capacity-stage traffic entirely. Other
+Access, serving and first output exclude capacity-stage and sustained traffic entirely. Other
 stress traffic exempts timeouts and intentional cancellations, but non-timeout
 HTTP and protocol failures still enter serving checks and `stop_after_errors`.
 Documented context-length rejections remain coverage observations. ConnectTimeout
@@ -96,7 +96,10 @@ Capacity sends independent arrivals and reports the highest tested rate for whic
 all tested rates at or below it were accepted. A higher-rate pass after a lower-rate
 failure is flagged in `non_monotonic_results` and does not raise that boundary.
 Answer timing ends at the last answer chunk: finish/usage messages, `[DONE]` and
-connection cleanup do not extend generation time or stream gaps.
+connection cleanup do not extend generation time or stream gaps. A streamed
+single-chunk answer with reported `completion_tokens <= 2` has no possible
+inter-chunk gap and is exempt from missing-gap evidence. Longer or unknown-length
+single-chunk answers still lack timing evidence (they may have been buffered).
 
 Fairness interleaves short-only and loaded samples of the same known-answer copy
 sequence (48 common short English words). A long competitor starts after first output, with
@@ -120,12 +123,23 @@ The phase completes when its duration elapses with observed configured concurren
 or its allowance is consumed after at least `max(min_samples, concurrency * 2)`
 requests with the configured peak and at least 90% time-weighted occupancy (refill
 and drain edges prevent an exact full-window average). Metrics report which
-completion condition qualified. Timing and error-rate limits apply to recovery
-probes; sustained timing and timeouts are observations. Genuine non-timeout
-sustained server/protocol errors can still fail the error-rate limit. Scored
+completion condition qualified. Both completion paths require at least
+`limits.min_samples` successful sustained requests; fewer is inconclusive. Sustained
+requests already dispatched drain under their request deadlines after the dispatch
+window ends. Cancelled or unfinished sustained requests remain in recovery evidence
+and count as errors, including cancellation at phase end; they cannot disappear
+from the denominator or qualify as successful load samples. Sustained
+load uses configured concurrency, so its timeouts and errors count against recovery
+`max_error_rate` (including when duration elapsed). `sustained_error_rate` includes
+those failures; the legacy `sustained_non_timeout_error_rate` remains a narrower
+diagnostic. Sustained timing is observational; timing limits apply to recovery
+probes. Sustained outcomes stay outside serving/first-output checks. Scored
 sustained answers still enter the correctness allowance. Post-load probes use the
 same fixture as the pre-load baseline. `recovery_max_ratio` limits median latency
-and first-output ratios. Without a timing limit or ratio, recovery is inconclusive.
+and first-output ratios. Set it even when absolute timing limits are configured
+(the examples use `2`): a large slowdown can remain inside an absolute limit. An
+absolute-only pass states both measured probe/baseline ratios and that no ratio
+limit was configured. Without a timing limit or ratio, recovery is inconclusive.
 
 Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
 interrupt an active answer stream. With streaming disabled, cancellation is
@@ -170,7 +184,7 @@ error allowance.
 | `buckets` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
 | `buckets.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the completed final answer after stripping inline reasoning; fixed history uses the seeded session name at every turn. Sessions refill as each conversation finishes. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
-| `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is diagnostic unless `strict: true`. Temperature/seed support is requested, not universally verified. |
+| `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is inconclusive unless `strict: true` makes it fail; full agreement can pass. Temperature/seed support is requested, not universally verified. |
 | `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
@@ -221,6 +235,11 @@ bounded because actual final-answer lengths determine later history admission.
 
 `arrivals.max_pending` bounds only queued, undispatched arrivals. In-flight
 requests use the global `concurrency` ceiling and do not occupy queue capacity.
+`arrivals.max_client_wait_ms` sets the tolerated scheduled-to-dispatch delay,
+defaulting to 50 ms to allow ordinary local dispatch overhead. Delays above the
+threshold leave the configured rate unqualified/inconclusive. Reports retain
+`client_wait_threshold_ms`, `max_client_wait_ms` and the delayed count; set a tighter
+or looser threshold to match your generator and arrival requirements.
 
 Shared-prefix repeats run back to back, followed by a separate independent-control
 block so single-slot caches can retain the shared prefix. The default shared
@@ -268,8 +287,9 @@ shape/prompt identity gets a level-1 modal-answer baseline under the configured
 byte/whitespace equality. Reports separate within-level repeatability agreement
 from agreement with that baseline at every level. With `consistency.strict: true`,
 any within-level or cross-level answer difference fails. Without strict mode,
-variation is diagnostic. Wrong answers are reported in `correctness_observed`
-and never independently fail consistency. Text repetition counts round up to full
+variation is diagnostic and makes the check inconclusive with “variation observed;
+enable strict to enforce”; full agreement can pass. Wrong answers are reported in `correctness_observed`
+and in the summary when below 1.0; they never independently fail consistency. Text repetition counts round up to full
 load groups at each level, matching the request plan.
 
 Default per-cell samples, mixed pairs, consistency repetitions and concurrent
@@ -353,7 +373,12 @@ scrapes all share `metrics_max_samples`, with a slot reserved for `end`. Constan
 a new nonzero XID during observation fails. Hardware slowdown (0x8), software
 thermal (0x20), hardware thermal (0x40) and hardware power brake (0x80) fail only
 when observed in at least two snapshots. Idle, application clocks, software power
-cap (0x4) and sync boost are informational. Devices absent from all scrapes remain outside coverage.
+cap (0x4) and sync boost are informational. If `targets[].deployment.hardware.gpu_count`
+declares more devices than observed, coverage is inconclusive.
+`limits.gpu_max_temperature_c` optionally fails a device above the limit in at
+least two snapshots (not twice within one snapshot); stale/invalid samples do not
+count. Without a limit, `max_temperature_c` is a measurement only. Unpublished
+devices cannot be discovered when no device count is declared.
 Every verdict is telemetry evidence, not device health certification. The default
 window matches the [DCGM exporter default collection interval](https://docs.nvidia.com/datacenter/dcgm/latest/reference/command-line-reference/dcgm-exporter.html). Source references: [vLLM metrics](https://docs.vllm.ai/en/latest/design/metrics/)
 and [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md).
@@ -440,7 +465,9 @@ Probability values use natural-log units. Non-finite or malformed values are
 invalid evidence. The OpenAI `-9999.0` sentinel and absent requested alternatives
 are unknown. Raw precision is retained for comparisons and exports; display
 rounding does not set tolerance. With `strict: false` the probability result is
-`diagnostic`, even when differences exist. Set both `strict: true` and an explicit
+`diagnostic` only when comparable evidence agrees within tolerance. Numeric drift
+beyond `tolerance` (zero when omitted), token divergence or changed top-k membership
+is inconclusive and cannot certify the consistency check. Set both `strict: true` and an explicit
 nonnegative `tolerance` to enforce numeric equality within that absolute tolerance.
 The summary always states the maximum cross-level delta and token divergence
 count, including diagnostic runs. Strict cross-level equality requires a
@@ -483,3 +510,8 @@ hardware, versions and concurrency. Later comments report clean runs after an
 runtime/model/hardware and test the workload on your deployment; the original
 reported concurrency threshold is not a universal trigger. The token evidence
 contract follows the [Chat Completions API](https://developers.openai.com/api/reference/resources/chat).
+
+Inference connection establishment uses an HTTPX connect timeout of
+`min(request_timeout_seconds * 0.9, 10)` seconds, strictly inside the request
+deadline. Failure to connect is transport failure (blocked access if no request
+succeeded); timeout waiting for an answer remains inference-timeout evidence.

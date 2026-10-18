@@ -296,12 +296,14 @@ def final_answer(output: str) -> tuple[str, bool, bool]:
     closings = list(re.finditer(r"</(?:think|thinking|reasoning)>", output, re.IGNORECASE))
     if closings and not re.search(r"<(?:think|thinking|reasoning)>", output[:closings[0].start()], re.IGNORECASE):
         output, stripped = output[closings[-1].end():].lstrip(), True
-    while match := re.match(r"\s*<(think|thinking|reasoning)>", output, re.IGNORECASE):
+    while match := re.search(r"<(think|thinking|reasoning)>", output, re.IGNORECASE):
         stripped = True
         closing = re.search(rf"</{match[1]}>", output[match.end():], re.IGNORECASE)
         if closing is None:
             return "", stripped, True
-        output = output[match.end() + closing.end():].lstrip()
+        output = output[:match.start()] + output[match.end() + closing.end():]
+        if not output[:match.start()].strip():
+            output = output.lstrip()
     return output, stripped, False
 
 

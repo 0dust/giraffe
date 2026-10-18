@@ -448,15 +448,16 @@ async def test_consistency_hashes_before_retention_and_separates_task_correctnes
     elif mode == "wrong":
         assert result.status == "pass"
         assert result.metrics["correctness_observed"] == 0
+        assert "correctness_observed: 0" in result.summary
     elif mode == "healthy":
         assert all(b["agreement_rate"] == 1 for b in buckets.values())
     elif mode == "variable_correct":
         assert all(b["agreement_rate"] < 1 and b["correctness"] == 1 for b in buckets.values())
-        assert result.status == "pass"
+        assert result.status == "inconclusive"
     else:
         assert buckets["consistency_c1_short_p0"]["agreement_rate"] == 1
         assert buckets["consistency_c2_short_p0"]["agreement_rate"] < 1
-        assert result.status == "pass"
+        assert result.status == "inconclusive"
     write_report(report, tmp_path)
     saved = json.loads((tmp_path / "report.json").read_text())
     assert all(not r["output"] for r in saved["requests"])

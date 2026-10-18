@@ -157,13 +157,16 @@ conversations, repeated-request consistency and parsed tool-calling checks use t
 same global budgets. Deployment snapshots and bounded serving-metrics collection
 keep configuration changes, provenance, missing data and performance evidence
 alongside an explicit baseline. The CLI, local UI, HTML and JSON expose the same
-configuration and evidence.
+configuration and evidence. `arrivals.max_client_wait_ms` sets the dispatch-wait
+tolerance (default 50 ms); exceeding it leaves the scheduled arrival rate unqualified.
 Prefix acceptance requires substantial cached-token reuse on enough repeats and
 independent controls below the reuse threshold; a majority of repeat misses fails.
 Size cells qualify each request's time-weighted overlap and reported length range;
 cell windows stop dispatch without cancelling requests. Text and optional logprob
 consistency compare concurrent levels with sequential controls; strict mode fails
-answer or comparable token divergence, while correctness is reported independently.
+answer or comparable token divergence. Non-strict variation or logprob drift beyond
+tolerance is inconclusive (not certified); full agreement can pass. Correctness is
+reported independently, including `correctness_observed` in summaries below 1.0.
 Logprob summaries show the maximum cross-level delta and token divergence count.
 Strict cross-level equality requires batch-invariant serving; default vLLM serving
 can diverge. Sessions refill a conversation pool and recall unique seeded facts,
@@ -216,7 +219,9 @@ measurement. The report preserves these limits.
 
 Generation pace is a client-observed estimate: `(output tokens - 1) / seconds from
 first useful answer chunk to last answer chunk`. Prompt waiting and trailing
-usage/finish messages are excluded. Stream gaps likewise measure only intervals
+usage/finish messages are excluded. For a streamed single-chunk answer with reported `completion_tokens <= 2`, an
+inter-chunk gap is not applicable. Longer or unknown-length single-chunk answers
+keep missing timing evidence. Stream gaps likewise measure only intervals
 between answer chunks, excluding the wait after the final answer. This follows the first-token exclusion used
 by [vLLM's per-request TPOT](https://docs.vllm.ai/en/latest/design/metrics/), using
 the last observed answer instead of protocol cleanup as the endpoint. A chunk may
@@ -276,6 +281,13 @@ limits:
   fairness_max_ratio: 2
 ```
 
+Set `limits.recovery_max_ratio` (the shipped examples use `2`) to catch post-load
+slowdowns even when probes stay within absolute latency limits. An absolute-only
+recovery pass reports the measured probe/baseline ratios and states that no ratio
+limit was configured. Sustained timeouts and errors count against recovery
+`max_error_rate`, and load qualification requires at least `min_samples` successful
+sustained requests. These load outcomes stay outside serving/first-output checks.
+
 These are example limits, not recommendations for a model or GPU. Declared runtime,
 image, topology, and quantization are recorded separately from observed identity.
 Give each model/route a distinct target name. Include the service URL when supplying
@@ -305,7 +317,11 @@ fixtures are used only when correctness is selected.
 `--metrics` reads the
 target's optional `metrics_url`. GPU evidence requires fresh source timestamps or
 values changing across scrapes, plus every required family per observed device.
-New XID values or repeated hardware/thermal slowdown bits fail; historical XIDs
+Fewer observed devices than `targets[].deployment.hardware.gpu_count` declares
+leaves GPU coverage inconclusive. Set `limits.gpu_max_temperature_c` to fail when
+any device exceeds that temperature in at least two snapshots. Without that limit,
+`max_temperature_c` is a measurement only. New XID values or repeated
+hardware/thermal slowdown bits fail; historical XIDs
 and software power caps are informational. `gpu_min_observation_seconds` sets the
 minimum GPU observation window (default 30, accepts zero), independently of
 `metrics_interval_seconds`. Set it to your exporter's refresh period; for example,
@@ -314,6 +330,10 @@ the remaining window, bounded by the run deadline. A shorter observation window 
 inconclusive. The final `end` scrape also closes the GPU window; all scrapes share
 `metrics_max_samples`, preserving the first `start` and last `end`. Missing evidence is
 inconclusive; this is not device health certification. No node agents are installed.
+
+Connection establishment uses an HTTPX connect timeout of
+`min(request_timeout_seconds * 0.9, 10)` seconds, inside the total request deadline.
+A connect timeout is a transport failure; a response deadline remains a timeout.
 
 ### Use your own requests under traffic
 
@@ -375,8 +395,8 @@ treating `3` and `3.0` as equal while keeping booleans distinct from numbers,
 including within arrays and objects. Schema validation alone checks structure.
 None of these establishes general chatbot quality.
 
-Semantic scoring and judging strip leading `<think>`, `<thinking>`, or `<reasoning>`
-blocks, case-insensitively, including reasoning opened in the chat template
+Semantic scoring and judging strip closed `<think>`, `<thinking>`, or `<reasoning>`
+blocks anywhere in the output, case-insensitively, including reasoning opened in the chat template
 (output starts mid-reasoning before a closing tag), and save `reasoning_stripped` on the request record.
 Raw response evidence follows the configured retention policy. An unclosed block
 or a block with no final answer remains unscored: `reasoning without final answer`.
@@ -660,6 +680,12 @@ pip install -e '.[dev]'
 pytest -q
 ruff check src tests
 ```
+
+When verifying a separate worktree with an environment installed from another
+checkout, use `PYTHONPATH="$PWD/src" python -m pytest -q`. Python's `-I` ignores
+`PYTHONPATH`, so omit it for this invocation. Confirm the source with
+`PYTHONPATH="$PWD/src" python -c 'import giraffe.runner; print(giraffe.runner.__file__)'`
+before running an external verifier against worktree changes.
 
 Integration tests use a real local HTTP server to inject empty/truncated successful
 responses, wrong answers, timeouts, and timing regressions. They require loopback

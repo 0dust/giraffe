@@ -68,13 +68,14 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def assess_gpu(snapshots, max_age_seconds):
+def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperature_c=None):
     """Assess published GPU devices; an advancing scrape alone proves no freshness.
 
     Value changes establish freshness for that device, not for other GPUs. Unseen
-    devices cannot be enumerated from this endpoint and remain outside coverage.
+    devices cannot be enumerated from this endpoint; declared counts bound coverage.
     """
     devices, series, alerts = {}, defaultdict(list), []
+    temperatures = defaultdict(dict)
     warnings, informational = [], []
     completed = 0
     for index, snap in enumerate(snapshots):
@@ -97,6 +98,8 @@ def assess_gpu(snapshots, max_age_seconds):
             if stale or not math.isfinite(value) or value < 0 or value >= 2**63 - 1024:
                 continue
             device["families"].add(family)
+            if family == "temperature":
+                temperatures[key][index] = max(temperatures[key].get(index, value), value)
             if timestamp is not None:
                 device["timestamped"].add(family)
             identity = (key, sample["name"], tuple(sorted(labels.items())))
@@ -122,6 +125,13 @@ def assess_gpu(snapshots, max_age_seconds):
                     alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
                                    "value": observed[-1][1], "reasons": [reason],
                                    "snapshots": sorted({i for i, _ in observed})})
+    if gpu_max_temperature_c is not None:
+        for (hostname, gpu), values in temperatures.items():
+            above = sorted(index for index, value in values.items() if value > gpu_max_temperature_c)
+            if len(above) >= 2:
+                alerts.append({"gpu": gpu, "hostname": hostname, "family": "temperature",
+                               "value": max(values.values()), "snapshots": above,
+                               "reasons": ["temperature exceeded configured limit in repeated snapshots"]})
     rows = []
     for (hostname, gpu), device in sorted(devices.items(), key=lambda item: str(item[0])):
         fresh = device["families"] if device["changing"] else device["timestamped"]
@@ -137,13 +147,19 @@ def assess_gpu(snapshots, max_age_seconds):
                "warnings": warnings, "informational_clock_events": informational,
                "coverage": "Published GPU labels only; devices absent from all scrapes cannot be discovered.",
                "metrics_max_age_seconds": max_age_seconds}
+    observed_count = sum(row["identity_verified"] for row in rows)
+    metrics.update({"declared_gpu_count": gpu_count, "observed_gpu_count": observed_count,
+                    "max_temperature_c": max((v for values in temperatures.values() for v in values.values()), default=None),
+                    "gpu_max_temperature_c": gpu_max_temperature_c})
     qualifier = "this is not device health certification."
     if alerts:
-        return metrics, "fail", "GPU telemetry reports a new XID or repeated adverse slowdown; " + qualifier
+        return metrics, "fail", "GPU telemetry reports a new XID, repeated adverse slowdown or configured temperature violation; " + qualifier
+    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and observed_count < gpu_count:
+        return metrics, "inconclusive", f"GPU telemetry covers {observed_count} devices, fewer than the declared {gpu_count}; " + qualifier
     if not rows or any(row["missing_families"] or row["unknown_freshness_families"] or
                        not row["identity_verified"] for row in rows):
         return metrics, "inconclusive", "GPU observations lack per-device coverage or freshness evidence; " + qualifier
-    return metrics, "pass", "Fresh GPU telemetry covers every observed device without new XID or repeated adverse slowdown events; " + qualifier
+    return metrics, "pass", "Fresh GPU telemetry covers every observed device without new XID, repeated adverse slowdown or configured temperature violations; " + qualifier
 
 
 def _metrics_headers(target):

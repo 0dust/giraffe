@@ -52,9 +52,9 @@ def test_reasoning_without_final_answer_is_unscored(output, scorer):
     assert scored.reasoning_stripped
 
 
-def test_only_leading_reasoning_is_removed_and_consecutive_blocks_are_stripped():
+def test_reasoning_anywhere_is_removed_and_consecutive_blocks_are_stripped():
     spec = fixture()
-    assert score_response(spec, record(spec, "4<think>extra</think>")).score is False
+    assert score_response(spec, record(spec, "4<think>extra</think>")).score is True
     assert score_response(spec, record(spec, "<think>one</think> <reasoning>two</reasoning>4")).score is True
 
 
