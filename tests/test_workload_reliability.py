@@ -48,13 +48,22 @@ class MemoryEndpoint:
         loaded = self.active > 1
         if self.mode == 'text_drift' and loaded:
             answer += ' '
+        if self.mode == 'wrong_copy' and 'Copy the following' in prompt:
+            answer = 'A different answer appears here. ' * 20
+        if self.mode == 'reasoning' and 'Use this exact bakery' in prompt:
+            answer = '<think>Consider the session carefully.</think>' + answer
         count = len(answer.split())
         usage = {'prompt_tokens': 32 if self.mode == 'flat_input' else max(1, len(prompt) // 4),
                  'completion_tokens': count}
         if 'then list the numbers' in prompt:
             usage['completion_tokens'] = 1 if self.mode == 'early_eos' else payload['max_tokens']
+        if self.mode == 'template_overhead':
+            usage['prompt_tokens'] += 96
+        if self.mode == 'compressed_input':
+            usage['prompt_tokens'] = 96 + len(prompt) // 1000
         if self.cached is not None:
-            usage['prompt_tokens_details'] = {'cached_tokens': self.cached}
+            cached = self.cached(payload, usage) if callable(self.cached) else self.cached
+            usage['prompt_tokens_details'] = {'cached_tokens': cached}
         logprobs = None
         if payload.get('logprobs'):
             if self.mode == 'token_drift' and loaded:
@@ -72,8 +81,17 @@ class MemoryEndpoint:
         endpoint = self
 
         class Stream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.counted = False
+
+            async def aclose(self):
+                if self.counted:
+                    self.counted = False
+                    endpoint.active -= 1
+
             async def __aiter__(self):
                 endpoint.active += 1
+                self.counted = True
                 try:
                     for piece in re.findall(r'\S+\s*', answer):
                         await asyncio.sleep(.001)
@@ -82,7 +100,7 @@ class MemoryEndpoint:
                     data = {'choices': [{'delta': {}, 'finish_reason': 'stop'}], 'usage': usage}
                     yield ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode()
                 finally:
-                    endpoint.active -= 1
+                    await self.aclose()
         return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=Stream())
 
 
@@ -110,10 +128,10 @@ async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypa
     assert len(endpoint.requests) == request_plan(settings)['planned_per_target'] == 24
     assert len({json.dumps(p['messages']) for p in endpoint.requests}) == 3
     assert all(p['temperature'] == 0 for p in endpoint.requests)
-    assert any('item 5 is ready.' in p['messages'][0]['content'] for p in endpoint.requests)
+    assert all('Instead' not in p['messages'][0]['content'] for p in endpoint.requests)
 
 
-@pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'fail'), (16, 'fail'), (1024, 'pass')])
+@pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'fail'), (16, 'fail'), (1024, 'inconclusive')])
 async def test_w3_prefix_requires_substantial_cached_tokens_and_separate_blocks(monkeypatch, cached, status):
     endpoint = MemoryEndpoint(monkeypatch, cached=cached)
     settings = config(endpoint, checks=['prefix'], prefix={'repeats': 3, 'history_turns': 2})
@@ -167,14 +185,15 @@ async def test_w6_pool_refills_immediately_and_flags_tail_samples():
         index = len(starts)
         starts.append(time.monotonic())
         on_start()
-        await asyncio.sleep(.06 if index == 0 else .005)
+        await asyncio.sleep(.2 if index == 0 else .005)
         ends.append(time.monotonic())
         return SimpleNamespace(workload={})
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2)
     assert starts[2] < ends[-1] - .03
-    assert len(rows) == 6 and all(r.workload['load_qualified'] for r in rows)
-    assert 1 < rows[0].workload['time_weighted_inflight'] < 2
+    assert len(rows) == 6
+    assert sum(r.workload['load_qualified'] for r in rows) == 5
+    assert 1 < rows[-1].workload['time_weighted_inflight'] < 1.5
 
     starts.clear()
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2)
@@ -223,7 +242,7 @@ async def test_l3_mixed_needs_limit_long_light_and_exercised_heavy(monkeypatch, 
     result = check(report, 'mixed')
     assert result.status == status
     if ratio is None:
-        assert result.summary == 'effect observed; no acceptance ratio configured'
+        assert result.summary == 'Mixed-load ratios measured; no acceptance ratio configured.'
     lights = [r for r in report.requests if r.scenario.startswith('mixed_short')]
     assert all(r.completion_tokens >= 64 for r in lights)
     assert len(report.requests) == 18
@@ -323,7 +342,7 @@ async def test_w6_bucket_and_logprob_dispatch_refills_a_slow_round(monkeypatch, 
             index = len(self.begins)
             self.begins.append(time.monotonic())
             if index % width == 0:
-                await asyncio.sleep(.04)
+                await asyncio.sleep(.08)
             response = await super().handle(request)
             self.ends[index] = time.monotonic()
             return response
@@ -342,11 +361,235 @@ async def test_w6_bucket_and_logprob_dispatch_refills_a_slow_round(monkeypatch, 
     assert len(report.requests) == request_plan(settings)['planned_per_target']
     if kind == 'buckets':
         cells = check(report, 'buckets').metrics['buckets']
-        assert all(c['qualified_samples'] == 6 and 1 < c['time_weighted_inflight'] < 2
+        assert all(c['qualified_samples'] == 5 and len(c['tail_samples']) == 1
+                   and 1 < c['time_weighted_inflight'] < 2
                    for c in cells.values())
     else:
         conditions = check(report, 'consistency').metrics['logprobs']['conditions']
         loaded = next(c for c in conditions if c['level'] == 2)
         assert loaded['coverage_complete']
-        assert all(r['qualified_samples'] == 3 and r['time_weighted_inflight'] > 1
+        assert all(r['qualified_samples'] == 2 and len(r['tail_samples']) == 1
+                   and r['time_weighted_inflight'] > 1
                    for r in loaded['rounds'])
+
+
+@pytest.mark.parametrize('workload', ['mixed', 'consistency', 'logprobs', 'prefix', 'buckets', 'sessions'])
+async def test_round2_workload_temperature_preserves_user_option(monkeypatch, workload):
+    endpoint = MemoryEndpoint(monkeypatch)
+    selected = 'consistency' if workload == 'logprobs' else workload
+    extra = {'consistency': {'shapes': ['short'], 'repetitions': 2}}
+    if workload == 'logprobs':
+        extra['consistency']['logprobs'] = {'top_logprobs': 0}
+    settings = config(endpoint, checks=[selected], request_options={'temperature': .7},
+        buckets={'levels': [1], 'samples_per_bucket': 2, 'mixed_pairs': 1},
+        sessions={'sessions': 1}, prefix={'repeats': 3}, **extra)
+    await run_suite(settings)
+    assert endpoint.requests and all(p['temperature'] == .7 for p in endpoint.requests)
+
+
+async def test_round2_consistency_copy_prompts_and_wrong_answers_are_independent(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch, mode='wrong_copy')
+    settings = config(endpoint, checks=['consistency'], stream=False,
+        consistency={'shapes': ['short'], 'repetitions': 4, 'strict': True})
+    result = check(await run_suite(settings), 'consistency')
+    assert result.status == 'pass'
+    assert result.metrics['correctness_observed'] == 0
+    for payload in endpoint.requests:
+        prompt = payload['messages'][0]['content']
+        assert 'Copy the following' in prompt and 'box label' not in prompt and 'Instead' not in prompt
+        sentences = prompt.split('\n')[-1].split('. ')
+        assert len(sentences) >= 3 and len(set(sentences)) == len(sentences)
+
+
+async def test_round2_mixed_wrong_light_is_unqualified_not_failed(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch, mode='wrong_copy')
+    result = check(await run_suite(config(endpoint, checks=['mixed'], buckets={'mixed_pairs': 2},
+        limits={'min_samples': 2, 'fairness_max_ratio': 100})), 'mixed')
+    assert result.status == 'inconclusive'
+    assert result.metrics['correctness_observed'] < 1
+    assert result.metrics['unqualified_light_samples']
+    assert all(c['shape_qualified_samples'] == 0 for c in result.metrics['comparisons'])
+
+
+@pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'fail')])
+async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, misses, status):
+    seen = 0
+    def cached(payload, usage):
+        nonlocal seen
+        prompt = payload['messages'][0]['content']
+        if not prompt.startswith(' The rock'):
+            return 16
+        seen += 1
+        return 0 if 1 < seen <= 1 + misses else usage['prompt_tokens']
+    endpoint = MemoryEndpoint(monkeypatch, cached=cached)
+    result = check(await run_suite(config(endpoint, checks=['prefix'], prefix={'repeats': 4})), 'prefix')
+    assert result.status == status
+    assert result.metrics['cache_repeat_misses'] == {'misses': misses, 'observed': 3, 'planned': 3}
+    assert f'{misses} of 3 repeat misses' in result.summary
+
+
+async def test_round2_prefix_all_cached_is_not_discriminative(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch, cached=lambda p, u: u['prompt_tokens'])
+    result = check(await run_suite(config(endpoint, checks=['prefix'])), 'prefix')
+    assert result.status == 'inconclusive'
+    assert 'cache reporting not discriminative' in result.summary
+
+
+@pytest.mark.parametrize('mode,status', [('template_overhead', 'pass'), ('compressed_input', 'inconclusive')])
+async def test_round2_buckets_allow_template_overhead_but_require_length_range(monkeypatch, mode, status):
+    endpoint = MemoryEndpoint(monkeypatch, mode=mode)
+    result = check(await run_suite(config(endpoint, checks=['buckets'], stream=False,
+        buckets={'levels': [1], 'samples_per_bucket': 2})), 'buckets')
+    assert result.status == status
+
+
+async def test_round2_live_session_history_strips_reasoning_and_fixed_keeps_seed(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch, mode='reasoning')
+    report = await run_suite(config(endpoint, checks=['sessions'], sessions={
+        'sessions': 2, 'turns': ['Choose a name.', 'Recall it.', 'Recall it again.']}))
+    assert check(report, 'sessions').status == 'pass'
+    for payload in endpoint.requests:
+        value = re.search(r'Use this exact bakery name for this session: (\w+)', payload['messages'][0]['content'])[1]
+        assistants = [m['content'] for m in payload['messages'] if m['role'] == 'assistant']
+        assert all(answer == value for answer in assistants)
+
+
+async def test_round2_session_pool_refills_without_waiting_for_slowest(monkeypatch):
+    class Jitter(MemoryEndpoint):
+        async def handle(self, request):
+            payload = json.loads(request.content)
+            if 'Session_0000' in payload['messages'][0]['content']:
+                await asyncio.sleep(.06)
+            return await super().handle(request)
+    endpoint = Jitter(monkeypatch)
+    await run_suite(config(endpoint, checks=['sessions'], sessions={
+        'modes': ['fixed'], 'sessions': 3, 'concurrency': 2}))
+    values = [re.search(r'Use this exact bakery name for this session: (\w+)', p['messages'][0]['content'])[1]
+              for p in endpoint.requests]
+    assert values.index('Session_0002_fixed') < values.index('Session_0000_fixed')
+
+
+@pytest.mark.parametrize('mode', ['logprob_drift', 'token_drift'])
+async def test_round2_nonstrict_logprob_summary_shows_cross_level_drift(monkeypatch, mode):
+    endpoint = MemoryEndpoint(monkeypatch, mode=mode)
+    result = check(await run_suite(config(endpoint, checks=['consistency'], stream=False, consistency={
+        'shapes': ['short'], 'repetitions': 3, 'logprobs': {'top_logprobs': 0}})), 'consistency')
+    assert 'maximum cross-level delta' in result.summary.lower()
+    assert ('0.25' in result.summary if mode == 'logprob_drift' else 'divergences: 0' not in result.summary)
+    assert 'token divergences:' in result.summary
+
+
+async def test_round2_nonstrict_variation_preserves_coverage_reason(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch, mode='text_drift')
+    result = check(await run_suite(config(endpoint, checks=['consistency'], consistency={
+        'shapes': ['short'], 'repetitions': 2}, limits={'min_samples': 3})), 'consistency')
+    assert result.status == 'inconclusive'
+    assert 'coverage' in result.summary.lower() or 'Too few' in result.summary
+
+
+async def test_round2_mixed_missing_ratio_preserves_shape_reason(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch, mode='early_eos')
+    result = check(await run_suite(config(endpoint, checks=['mixed'], buckets={'mixed_pairs': 2})), 'mixed')
+    assert result.status == 'inconclusive'
+    assert 'shapes' in result.summary
+    assert 'effect observed' not in result.summary
+
+
+@pytest.mark.parametrize('workload', ['arrivals', 'prefix', 'buckets', 'mixed', 'sessions', 'consistency', 'logprobs'])
+async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workload):
+    endpoint = MemoryEndpoint(monkeypatch)
+    selected = 'consistency' if workload == 'logprobs' else workload
+    settings = config(endpoint, checks=[selected], stream=False, sessions={'modes': ['fixed'], 'sessions': 3},
+        arrivals={'requests': 3, 'requests_per_second': 100},
+        buckets={'levels': [1, 2], 'samples_per_bucket': 2, 'mixed_pairs': 1},
+        prefix={'repeats': 3}, consistency={'shapes': ['short'], 'repetitions': 2,
+            **({'logprobs': {'top_logprobs': 0}} if workload == 'logprobs' else {})})
+    report = await run_suite(settings)
+    planned = request_plan(settings)
+    assert planned['count_kind'] == 'exact'
+    assert planned['planned_per_target'] == len(endpoint.requests) == len(report.requests)
+
+
+async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkeypatch):
+    from types import SimpleNamespace
+    import giraffe.logprob_workload as workload
+    from giraffe.workloads import spec
+    now = 0
+    started = []
+    gates = [asyncio.Event() for _ in range(3)]
+
+    async def request(target, client, request, on_start):
+        index = len(started)
+        started.append(index)
+        on_start()
+        await gates[index].wait()
+        return SimpleNamespace(id=str(index), workload={})
+
+    monkeypatch.setattr(workload, 'time', SimpleNamespace(monotonic=lambda: now))
+    run = SimpleNamespace(allowed=lambda _: True, request=request)
+    task = asyncio.create_task(workload.refill(run, SimpleNamespace(name='local'), None,
+        [spec('p', 's', 'buckets')], 3, 3))
+    while len(started) < 3:
+        await asyncio.sleep(0)
+    for index, finish in enumerate((1, 2, 4)):
+        now = finish
+        gates[index].set()
+        await asyncio.sleep(0)
+    rows = await task
+    assert [r.workload['observed_overlap'] for r in rows] == [3, 3, 3]
+    assert [r.workload['time_weighted_inflight'] for r in rows] == [3, 2.5, 1.75]
+    assert [r.workload['load_qualified'] for r in rows] == [True, True, False]
+
+
+@pytest.mark.parametrize('location', ['repeat', 'control', 'input_usage'])
+async def test_round2_prefix_missing_evidence_is_inconclusive(monkeypatch, location):
+    class Missing(MemoryEndpoint):
+        async def handle(self, request):
+            response = await super().handle(request)
+            payload = json.loads(request.content)
+            prompt = payload['messages'][0]['content']
+            if ((location != 'control' and prompt.startswith(' The rock') and 'Trial 0002' in prompt)
+                    or (location == 'control' and prompt.startswith('Control 0002'))):
+                data = json.loads(response.content)
+                if location == 'input_usage':
+                    data['usage'].pop('prompt_tokens')
+                else:
+                    data['usage'].pop('prompt_tokens_details')
+                return httpx.Response(200, json=data)
+            return response
+    endpoint = Missing(monkeypatch, cached=lambda p, u: 0 if p['messages'][0]['content'].startswith('Control') else u['prompt_tokens'])
+    result = check(await run_suite(config(endpoint, checks=['prefix'], stream=False)), 'prefix')
+    assert result.status == 'inconclusive'
+    assert 'missing' in result.summary.lower()
+
+
+@pytest.mark.parametrize('run_options,spec_options,expected', [
+    ({}, {}, {'temperature': 0}),
+    ({'temperature': .7}, {}, {}),
+    ({'temperature': .7}, {'temperature': .2}, {'temperature': .2}),
+])
+def test_round2_deterministic_options_respects_both_option_sources(run_options, spec_options, expected):
+    from types import SimpleNamespace
+    from giraffe.workloads import deterministic_options
+    assert deterministic_options(SimpleNamespace(request_options=run_options), spec_options) == expected
+
+
+async def test_round2_explicit_consistency_temperature_is_preserved(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch)
+    await run_suite(config(endpoint, checks=['consistency'], stream=False,
+        request_options={'temperature': .7}, consistency={
+            'shapes': ['short'], 'temperature': .2, 'repetitions': 2}))
+    assert endpoint.requests and all(p['temperature'] == .2 for p in endpoint.requests)
+
+
+async def test_round2_fixed_session_plan_counts_admitted_turns_without_saved_answers(monkeypatch):
+    endpoint = MemoryEndpoint(monkeypatch)
+    settings = config(endpoint, checks=['sessions'], stream=False, context_limit=512, sessions={
+        'modes': ['fixed'], 'sessions': 2, 'saved_answers': [],
+        'turns': ['Choose a name.', 'Recall it.', 'Recall it again.', 'Recall it once more.']})
+    report = await run_suite(settings)
+    assert request_plan(settings)['planned_per_target'] == len(report.requests) == 8
+    assert check(report, 'sessions').status == 'pass'
+    limited = settings.model_copy(update={'context_limit': 256})
+    report = await run_suite(limited)
+    assert request_plan(limited)['planned_per_target'] == len(report.requests) == 4

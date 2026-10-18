@@ -61,8 +61,8 @@ total traffic. AI evaluator calls use separate limits.
 `buckets.levels` selects the simultaneous request counts to test. In the simple
 concurrent-load form, these counts also determine the run's concurrency ceiling;
 custom configurations retain their independently configured ceiling. Each of the
-nine input/output size pairs sends `max(samples_per_bucket, level)` requests at every
-level, using a refilling worker pool. Completed requests immediately free a slot for the next request. For levels `[1, 4, 8]` and
+nine input/output size pairs sends at least `max(samples_per_bucket, level)` requests at every
+level, rounded up to a multiple of that level, using a refilling worker pool. Completed requests immediately free a slot for the next request. For levels `[1, 4, 8]` and
 a sample minimum of 4, bucket coverage needs `9 × (4 + 4 + 8) = 144` requests per
 target. The review includes other selected tests in its plan and flags
 insufficient request limits as you edit, with an explicit action to raise the
@@ -152,10 +152,10 @@ incrementing the global error counter.
 | Setting | Behavior | Evidence and limitations |
 | --- | --- | --- |
 | `arrivals` | Steady RPS or bursts, independent of the concurrency cap | Scheduled arrival, dispatch, completion, waiting and unissued counts; a bounded pending queue drops excess arrivals visibly. Seed is recorded; current schedule is deterministic and has no jitter. |
-| `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
+| `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified; independent controls must report less than the reuse threshold. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
 | `buckets` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
 | `buckets.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
-| `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the exact completed answer from that session; fixed history uses saved answers. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
+| `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the completed final answer after stripping inline reasoning; fixed history uses the seeded session name at every turn. Sessions refill as each conversation finishes. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
 | `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is diagnostic unless `strict: true`. Temperature/seed support is requested, not universally verified. |
 | `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
@@ -194,6 +194,17 @@ number of exercised pairs per shape/phase. Each qualifying light response must r
 requested cap, and long-input competitors must report at least twice the light
 input tokens and at least 128 additional tokens. Missing usage is inconclusive.
 
+Mixed light requests copy a non-repetitive passage. Only correct, completed light
+answers with at least 64 reported completion tokens qualify timing comparisons;
+wrong light answers are reported as unqualified, rather than failing mixed traffic.
+Every planned pair sends both requests, including a heavy request after a buffered
+light response; those trials cannot qualify active-stream overlap. The exact count
+is `mixed_pairs + 4 × mixed_pairs × sum(heavy_weights)` when concurrency is at least
+two and the output cap is at least 96. Missing acceptance ratios are described as
+measurements without a limit; insufficient shape/overlap reasons take precedence.
+Fixed-only session plans count character-admitted turns exactly. Live plans remain
+bounded because actual final-answer lengths determine later history admission.
+
 `arrivals.max_pending` bounds only queued, undispatched arrivals. In-flight
 requests use the global `concurrency` ceiling and do not occupy queue capacity.
 
@@ -204,34 +215,48 @@ Independent controls have different leading text. Prefix acceptance requires at
 least `limits.min_samples` successful repeats after the first use, each reporting
 cached tokens covering at least half the estimated shared-prefix tokens, rounded
 down to a 16-token block boundary (minimum one token). The estimate scales reported
-prompt tokens by the shared-prefix character fraction. Missing token/cache usage
-is inconclusive ("cache reuse unverified"); reported zero or insufficient cached
-tokens fails ("no prefix reuse observed"). Timing improvement alone cannot pass.
+prompt tokens by the shared-prefix character fraction. Independent controls must
+all stay below that same per-request reuse threshold; otherwise the result is
+inconclusive ("cache reporting not discriminative"). Missing token/cache usage
+is inconclusive ("cache reuse unverified"). Reports show k of n repeat misses;
+only a majority of the planned repeats missing reuse fails ("no prefix reuse
+observed"). At least `min_samples` reuses are required to pass. Timing improvement
+alone cannot pass.
 
 Bucket windows limit dispatch, not request duration. Requests dispatched before
 the cutoff drain under their normal server timeout; the window cannot create an
 error. Too few samples is unfinished/inconclusive. Genuine request timeouts still
-count as errors. Each cell reports time-weighted average in-flight and flags tail
-samples that never overlap the requested number of requests. These samples cannot
-qualify load or length coverage. Input usage must increase short < medium < long
-within each level/output shape and be within a broad tokenizer allowance of the
-requested size (characters / 10 through characters / 1.5 + 32 tokens); otherwise
-"input length not exercised" is inconclusive.
+count as errors. Each request records in-flight overlap integrated over its own
+lifetime, from dispatch to completion. Level 1 always qualifies; higher levels
+require a lifetime average of at least `level - 0.5`. Peak overlap remains diagnostic.
+Cells report their overall time-weighted in-flight average and excluded tail IDs;
+at least `min_samples` qualified requests are needed. No uncounted fillers run.
+Input usage must increase short < medium < long within each level/output shape.
+The long-minus-short median token span must be at least one tenth of the requested
+character span. A fixed chat-template preamble cancels in that difference; no
+absolute upper bound rejects a healthy template. Missing or compressed length
+evidence leaves "input length not exercised" inconclusive.
 
 Sessions seed a distinct index-derived bakery name in turn zero and score each
 turn against that session's original value. This detects mixed histories even
 when every session follows the same turn template. Live history preserves its own
-actual answers. Fixed history uses the seeded first answer and configured saved
-answers thereafter. The session name recall instruction is added to configured
+final answers after stripping inline reasoning. Fixed history uses the seeded name
+at every turn; legacy `saved_answers` fields are retained for compatibility and
+do not inject contradictory names. The session worker pool refills immediately
+when a conversation finishes. The session name recall instruction is added to configured
 turns; saved configurations retain their fields.
 
 Text consistency uses `prompts_per_shape: 3` distinct prompts by default, including
-known multi-sentence copy tasks, at temperature zero unless overridden. Every
+standalone non-contradictory, non-repetitive multi-sentence copy tasks. Temperature
+defaults to zero only when neither run request options nor an explicit workload
+option sets it. An explicit `consistency.temperature` takes precedence. Every
 shape/prompt identity gets a level-1 modal-answer baseline under the configured
 byte/whitespace equality. Reports separate within-level repeatability agreement
 from agreement with that baseline at every level. With `consistency.strict: true`,
 any within-level or cross-level answer difference fails. Without strict mode,
-variation is diagnostic and task correctness remains separate.
+variation is diagnostic. Wrong answers are reported in `correctness_observed`
+and never independently fail consistency. Text repetition counts round up to full
+load groups at each level, matching the request plan.
 
 Default per-cell samples, mixed pairs, consistency repetitions and concurrent
 session count are five; prefix repeats are six (five measured reuses). Planning
@@ -368,8 +393,10 @@ The example sends 48 requests. Preview shows this count before a run. Requested
 concurrency, per-round client overlap, issued/completed/missing requests and
 usable samples remain visible. Client overlap does not prove which requests the
 server batched together. Rounds use a refilling worker pool. Each request records workload-local overlap;
-tail requests that never reach the requested level cannot qualify coverage.
-Each round also reports time-weighted average in-flight.
+tail requests whose lifetime average is below `level - 0.5` are listed and
+excluded from probability comparisons (level 1 always qualifies). Each condition
+needs at least `min_samples` qualified usable samples and comparable repeat pairs.
+Each round also reports its overall time-weighted average in-flight.
 Request, duration, cancellation, context and error limits
 still apply; unfinished rounds or inadequate overlap make coverage inconclusive.
 
@@ -392,14 +419,20 @@ are unknown. Raw precision is retained for comparisons and exports; display
 rounding does not set tolerance. With `strict: false` the probability result is
 `diagnostic`, even when differences exist. Set both `strict: true` and an explicit
 nonnegative `tolerance` to enforce numeric equality within that absolute tolerance.
-The independent outer `consistency.strict` continues to govern answer equality.
+The summary always states the maximum cross-level delta and token divergence
+count, including diagnostic runs. Strict cross-level equality requires a
+[batch-invariant serving configuration](https://docs.vllm.ai/en/stable/features/batch_invariance/).
+vLLM is not batch-invariant by default; strict token-divergence failures are
+expected in that default mode, even at temperature zero. Enable and qualify its
+`VLLM_BATCH_INVARIANT=1` mode before interpreting strict equality as an acceptance
+requirement. The independent outer `consistency.strict` governs answer equality.
 A known numeric violation fails even if some other samples are incomplete.
 
 Unsupported, missing, malformed, truncated, misaligned or incomplete evidence
 cannot produce a probability pass. `support: discover` leaves an explicit
 logprob-field rejection or missing logprobs inconclusive; `support: required`
-fails those capability expectations. Unrelated HTTP errors and wrong answers
-still use ordinary acceptance limits. Under strict logprob mode, token or length divergence between comparable
+fails those capability expectations. Unrelated HTTP errors still use ordinary
+acceptance limits; answer correctness is reported independently. Under strict logprob mode, token or length divergence between comparable
 identities fails, even without a comparable numeric difference. Changed alternative
 membership or unknown probabilities remains inconclusive unless a comparable
 numeric pair already proves a violation.

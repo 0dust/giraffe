@@ -211,7 +211,7 @@ async def test_identical_answers_with_probability_drift_are_detected_through_htt
     ('missing', 'discover', 'inconclusive'), ('missing', 'required', 'fail'),
     ('rejected', 'discover', 'inconclusive'), ('rejected', 'required', 'fail'),
     ('sentinel', 'discover', 'inconclusive'), ('malformed', 'required', 'inconclusive'),
-    ('length', 'discover', 'inconclusive'), ('http_error', 'discover', 'fail'), ('wrong', 'discover', 'fail'),
+    ('length', 'discover', 'inconclusive'), ('http_error', 'discover', 'fail'), ('wrong', 'discover', 'inconclusive'),
 ])
 async def test_unsupported_invalid_and_failed_completions_never_pass(mode, support, expected):
     with FakeEndpoint(mode=f'logprob_{mode}') as endpoint:
@@ -239,15 +239,19 @@ async def test_rounds_priming_and_budget_coverage_are_explicit():
     for r in modified:
         if r.workload['level'] == 2 and r.workload['round'] == 1:
             r.workload["load_qualified"] = False
+    assert summarize_logprobs(modified, configuration.consistency)['status'] == 'pass'
+    for r in modified:
+        if r.workload['level'] == 2:
+            r.workload['load_qualified'] = False
     assert summarize_logprobs(modified, configuration.consistency)['status'] == 'inconclusive'
 
 
-async def test_disabled_mode_preserves_existing_request_count_and_wire_contract():
+async def test_disabled_mode_uses_text_workload_count_and_wire_contract():
     with FakeEndpoint() as endpoint:
         configuration = run_config(endpoint)
         configuration.consistency.logprobs = None
         report = await run_suite(configuration)
-        assert len(endpoint.requests) == 18
+        assert len(endpoint.requests) == 21
         assert all('logprobs' not in p and 'top_logprobs' not in p for p in endpoint.requests)
     assert all(r.logprob_evidence is None for r in report.requests)
     assert 'logprobs' not in check(report, 'consistency').metrics
@@ -448,3 +452,35 @@ def test_comparison_work_limit_is_inconclusive_with_partial_measurements(monkeyp
     result = compare_samples([record('a'), record('b')])
     assert result['comparison_limit']
     assert comparison_status(result, LogprobConsistency(strict=True, tolerance=0), True) == 'inconclusive'
+
+
+
+def test_round2_logprob_tail_exclusion_and_qualified_sample_minimum():
+    options = settings(strict=True, tolerance=0, top_logprobs=0)
+    rows = [record(f'{level}-{repeat}-{slot}', [token(probability=-4 if level == 2 and slot else -.05)],
+                   level=level, repeat=repeat, slot=slot)
+            for level in (1, 2) for repeat in range(3) for slot in range(2)]
+    for row in rows:
+        if row.workload['level'] == 2 and row.workload['corpus_index'] == 1:
+            row.workload['load_qualified'] = False
+    result = summarize_logprobs(rows, options, min_samples=3)
+    loaded = next(c for c in result['conditions'] if c['level'] == 2)
+    assert result['status'] == 'pass'
+    assert result['max_cross_level_delta'] == 0
+    assert loaded['qualified_samples'] == 3 and len(loaded['tail_samples']) == 3
+    assert all(len(r['tail_samples']) == 1 and r['qualified_samples'] == 1 for r in loaded['rounds'])
+    for row in rows:
+        if row.workload['level'] == 2 and row.workload['round'] == 2:
+            row.workload['load_qualified'] = False
+    result = summarize_logprobs(rows, options, min_samples=3)
+    assert result['status'] == 'inconclusive'
+    assert result['conditions'][1]['qualified_samples'] == 2
+
+
+def test_round2_logprob_minimum_counts_qualified_requests_across_rounds():
+    options = settings(strict=True, tolerance=0, top_logprobs=0)
+    rows = [record(f'{level}-{repeat}-{slot}', level=level, repeat=repeat, slot=slot)
+            for level in (1, 2) for repeat in range(3) for slot in range(2)]
+    result = summarize_logprobs(rows, options, min_samples=5)
+    assert result['status'] == 'pass'
+    assert all(c['qualified_samples'] == 6 and c['coverage_complete'] for c in result['conditions'])

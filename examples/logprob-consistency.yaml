@@ -24,4 +24,7 @@ consistency:
     priming_rounds: 1
     compare_levels: true
     support: discover
+    # Strict cross-level equality needs batch-invariant serving. Default vLLM can
+    # diverge even at temperature zero; qualify VLLM_BATCH_INVARIANT=1 first.
+    # Diagnostic summaries still show the maximum delta and token divergence count.
     strict: false
