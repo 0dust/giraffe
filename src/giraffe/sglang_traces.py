@@ -15,6 +15,9 @@ MAX_LINE_BYTES = 16 * 1024
 
 
 def terminal_spans(body: bytes) -> list[dict]:
+    # The complete export body has arrived. This bounds termination independently
+    # of SGLang's cached monotonic-to-wall-clock conversion and exporter delay.
+    received_monotonic_ns, received_at_ns = time.monotonic_ns(), time.time_ns()
     # Keep protobuf optional: ordinary Giraffe runs do not need tracing packages.
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 
@@ -45,7 +48,8 @@ def terminal_spans(body: bytes) -> list[dict]:
                     "trace_id": span.trace_id.hex(),
                     "started_at_ns": span.start_time_unix_nano,
                     "finished_at_ns": span.end_time_unix_nano,
-                    "received_at_ns": time.time_ns(),
+                    "received_at_ns": received_at_ns,
+                    "received_monotonic_ns": received_monotonic_ns,
                 })
     return rows
 

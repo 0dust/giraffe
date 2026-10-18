@@ -291,8 +291,8 @@ def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, v
 
 @pytest.mark.parametrize("field,check,value", [
     ("sessions", "sessions", {"sessions": 3}),
-    ("buckets", "mixed", {"mixed_pairs": 3}),
-    ("buckets", "buckets", {"samples_per_bucket": 3}),
+    ("concurrent_workloads", "concurrency", {"mixed_pairs": 3}),
+    ("concurrent_workloads", "concurrency", {"samples_per_bucket": 3}),
     ("forced_tool_diagnostic", "tools", True),
 ])
 def test_selected_workload_settings_still_block_comparison(field, check, value):

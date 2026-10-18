@@ -44,11 +44,41 @@ def evaluate(record: RequestRecord, trace: dict, started_at_ns: int, cleanup_sec
     received = trace.get("received_at_ns")
     if any(type(value) is not int for value in (start, end, received)):
         return None
+    if not 0 < start <= end or received <= 0:
+        return None
     cancelled = record.client_cancelled_at_ns
-    if not cancelled or not started_at_ns <= start <= cancelled <= end <= received:
+    if not cancelled:
         return None
     reasons = trace.get("finish_reasons")
     if reasons not in (["abort"], ["stop"], ["length"]):
+        return None
+    if runtime == "sglang":
+        # SGLang converts perf_counter timestamps with a cached wall-clock
+        # offset. Even on one host those values need not align with our clock.
+        # The loopback receiver and client share the system monotonic clock;
+        # receiving a terminal abort bounds when termination could have occurred.
+        cancel_mono = record.client_cancelled_monotonic_ns
+        receive_mono = trace.get("received_monotonic_ns")
+        result = {"status": "inconclusive", "termination_ms": None, "trace": trace,
+                  "evidence_kind": "terminal_abort" if reasons == ["abort"] else "natural_completion",
+                  "timing_basis": "unavailable",
+                  "reason": "Local monotonic receipt timing is unavailable; runtime clock alignment is unverified."}
+        if cancel_mono is None or receive_mono is None:
+            return result
+        if (type(cancel_mono) is not int or type(receive_mono) is not int
+                or not 0 < cancel_mono <= receive_mono):
+            return None
+        upper_bound = (receive_mono - cancel_mono) / 1e9
+        result.update(timing_basis="local_monotonic_receipt",
+                      termination_upper_bound_ms=upper_bound * 1000)
+        if reasons != ["abort"]:
+            result["reason"] = "Natural completion raced with client cancellation."
+        elif upper_bound <= cleanup_seconds:
+            result.update(status="pass", reason="Matching native abort was received within the cleanup deadline; receipt bounds termination.")
+        else:
+            result["reason"] = "Native abort observed, but trace receipt exceeded the cleanup deadline; exporter delay prevents determining termination time."
+        return result
+    if not started_at_ns <= start <= cancelled <= end <= received:
         return None
     delay = (end - cancelled) / 1e9
     if delay > cleanup_seconds:
@@ -81,6 +111,9 @@ async def exercise(run, target, client, fixtures) -> None:
             declarations.add({"vllm-v1": "vllm", "vllm-legacy": "vllm"}.get(value, value))
     runtime = next(iter(declarations)) if len(declarations) == 1 else None
     evidence["runtime"] = runtime
+    if runtime in {"llamacpp", "tensorrt-llm", "lmdeploy", "tgi"}:
+        evidence.update(summary=f"Native per-request termination verification is unavailable for {runtime}; client close and follow-up health do not prove server termination.")
+        return
     if runtime not in {"sglang", "vllm", "ollama"} or urlsplit(target.url).hostname not in {"localhost", "127.0.0.1", "::1"}:
         evidence.update(status="blocked", summary="Requires unambiguous runtime metadata and a same-host target (shared clock).")
         return

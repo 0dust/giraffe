@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
+from giraffe.concurrent_workloads import SCENARIOS, execution_config
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, label_prompt
@@ -30,6 +31,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     fixed portions, and evaluator calls share the dataset preview's count rules.
     The optional preview avoids rebuilding request-pack schedules in the API.
     """
+    public_config = config
+    config = execution_config(config)
     selected = set(config.checks)
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -43,6 +46,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         rows.append({"id": identifier, "title": title or CHECK_NAMES.get(identifier, identifier),
                      "requests_per_target": count, "kind": kind, "source": source,
                      "summary": summary})
+
+    if "concurrency" in public_config.checks:
+        names = public_config.concurrent_workloads.scenarios
+        add("concurrency", 0, "Selected scenarios: " + "; ".join(SCENARIOS[name][1] for name in names)
+            + ". The rows below count their separate requests and controls.")
 
     # Only fixture cardinalities are needed. Keep context filler small even if
     # the operator has configured a very large context limit.
@@ -201,9 +209,32 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     kind="bounded")
         if config.request_pack is not None:
             warnings.append("Size and mixed-load tests use generated questions. Your saved questions are kept for answer and rate tests.")
+    if "token_stress" in selected:
+        settings = config.concurrent_workloads
+        for case in settings.stress_cases:
+            required_context = (case.input_tokens or case.max_input_tokens or 128) + case.output_tokens
+            context_limit = config.effective_check("concurrency")["context_limit"]
+            title = (f"{case.input_tokens:,}-token input / {case.output_tokens:,}-token summary"
+                     if case.input_tokens else f"Short input / {case.output_tokens:,}-token output")
+            identifier = f"token_stress_{case.name}"
+            if required_context > context_limit or case.output_tokens > config.max_output_tokens:
+                add(identifier, 0, f"Needs context length {required_context:,} and output cap {case.output_tokens:,}. "
+                    "Current limits prevent this case; no smaller substitute is sent.", title=title)
+                warnings.append(f"{title}: configured limits prevent this case; length coverage will be inconclusive.")
+                continue
+            count = sum(max(settings.samples_per_bucket, level) for level in settings.levels)
+            if case.input_tokens:
+                add(identifier, None, f"Up to {settings.calibration_attempts} input-sizing requests, followed by "
+                    f"up to {count} measured requests if calibration succeeds. Actual input and output usage must verify the targets.",
+                    kind="bounded", title=title)
+            else:
+                add(identifier, count, f"{count} measured requests across concurrency levels {settings.levels}. "
+                    "Early stopping leaves output-length coverage inconclusive.", title=title)
     if "sessions" in selected:
         settings = config.sessions
-        maximum = len(settings.modes) * settings.sessions * len(settings.turns)
+        maximum = (settings.sessions * max(len(workload.turns) for workload in settings.workloads)
+                   if settings.profile == "performance" else
+                   len(settings.modes) * settings.sessions * len(settings.turns))
         add("sessions", None,
             f"Up to {maximum} requests; prior responses and history admission determine whether later turns run.",
             source="configured session prompts and saved/live history", kind="bounded")

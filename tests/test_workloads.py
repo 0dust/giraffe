@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from giraffe.models import RequestRecord, RunConfig, Sessions, Target
+from giraffe.concurrent_workloads import execution_config
 from giraffe.reporting import write_report
 from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
@@ -49,6 +50,11 @@ def config(endpoint, **extra):
 
 
 def check(report, name):
+    if name in {"buckets", "mixed"}:
+        from giraffe.models import CheckResult
+        family = {"buckets": "size_matrix", "mixed": "mixed_interference"}[name]
+        merged = next(c for c in report.checks if c.id == "concurrency")
+        return CheckResult.model_validate(merged.metrics["scenarios"][family])
     return next(c for c in report.checks if c.id == name)
 
 
@@ -174,7 +180,7 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
         ]
     ]
     run = SimpleNamespace(
-        config=settings,
+        config=execution_config(settings),
         records=records,
         max_lag_ms=0,
         observations={"local": {}},
@@ -205,7 +211,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
         ]
         for index in range(count)
     ]
-    run = SimpleNamespace(config=settings, records=records, max_lag_ms=0,
+    run = SimpleNamespace(config=execution_config(settings), records=records, max_lag_ms=0,
                           observations={"local": {}}, unfinished={"local": set()})
     outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
     mixed = next(c for c in outcome if c.id == "mixed")
@@ -559,7 +565,8 @@ async def test_bucket_and_mixed_workloads_can_be_selected_independently(selected
         report = await run_suite(config(endpoint, checks=[selected], buckets={
             "levels": [1], "samples_per_bucket": 2, "mixed_pairs": 1,
         }))
-    assert {check.id for check in report.checks if check.status != "skipped"} == {selected}
+    assert {check.id for check in report.checks if check.status != "skipped"} == {"concurrency"}
+    assert set(check(report, "concurrency").metrics["scenarios"]) == {{"buckets": "size_matrix", "mixed": "mixed_interference"}[selected]}
     workload_records = [record for record in report.requests if record.workload]
     assert workload_records
-    assert all(record.check_ids == [selected] for record in workload_records)
+    assert all(set(record.check_ids) == {selected, "concurrency"} for record in workload_records)

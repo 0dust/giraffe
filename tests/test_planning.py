@@ -222,6 +222,30 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     assert result["count_kind"] == "bounded"
 
 
+@pytest.mark.parametrize("case,output_cap,kind,count", [
+    ({"name": "short_input_long_output", "output_tokens": 10000}, 10000, "exact", 4),
+    ({"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50}, 10000, "bounded", None),
+    ({"name": "short_input_long_output", "output_tokens": 10000}, 128, "exact", 0),
+])
+def test_token_stress_planning_preserves_targets_and_calibration_uncertainty(case, output_cap, kind, count):
+    configuration = config(checks=["concurrency"], context_limit=16384,
+                           max_output_tokens=output_cap,
+                           concurrent_workloads={"scenarios": ["token_stress"],
+                               "levels": [1, 2], "samples_per_bucket": 2, "stress_cases": [case]})
+    result = plan(configuration)
+    assert result["count_kind"] == kind
+    assert result["planned_per_target"] == count
+    rows = {row["id"]: row for row in result["rows"]}
+    assert rows["concurrency"]["requests_per_target"] == 0
+    case_row = rows[f"token_stress_{case['name']}"]
+    assert case_row["requests_per_target"] == count
+    if count is None:
+        assert "input-sizing" in case_row["summary"]
+    if count == 0:
+        assert "no smaller substitute" in case_row["summary"]
+        assert any("inconclusive" in warning for warning in result["warnings"])
+
+
 def test_empty_dataset_and_blank_model_remain_editable_with_unknown_active_count():
     draft = ConfigDraft.model_validate(config().model_dump() | {
         "targets": [{"name": "local", "url": "http://localhost", "model": ""}],

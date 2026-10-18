@@ -1,6 +1,6 @@
 # Bounded workloads, deployment snapshots and serving telemetry
 
-The ten standard endpoint checks keep their existing defaults. Additional
+The public catalog has 17 checks. Concurrent workloads combines the former fairness, size/concurrency coverage and mixed-interference checks. Additional
 workloads are opt-in and share the same request, duration, concurrency and
 per-request output ceilings. Use [examples/workloads.yaml](../examples/workloads.yaml)
 as a starting point, then match its settings to your server and acceptance limits.
@@ -60,8 +60,8 @@ question, and a token cap does not guarantee an answer reaches that length.
 | --- | --- | --- |
 | `arrivals` | Steady RPS or bursts, independent of the concurrency cap | Scheduled arrival, dispatch, completion, waiting and unissued counts; a bounded pending queue drops excess arrivals visibly. Seed is recorded; current schedule is deterministic and has no jitter. |
 | `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
-| `buckets` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
-| `buckets.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
+| `concurrent_workloads` | Short/medium/long inputs crossed with short/medium/long outputs at explicit levels | Each shape/level has its own sample target and maximum measurement window, overlap, correctness where applicable, timing, token distributions and finish reasons. Missing token usage stays unknown. Early EOS or a large cap alone does not exercise long output. |
+| `concurrent_workloads.heavy_weights` | A bounded mixture of long-input and long-output competitors | Matched short-only controls; competitors start before short dispatch or after its first visible output. Reports show achieved overlap, heavy outcomes, short latency and stream gaps. Unobserved overlap is inconclusive. Ratios and telemetry do not identify a scheduler cause. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the exact completed answer from that session; fixed history uses saved answers. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
 | `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is diagnostic unless `strict: true`. Temperature/seed support is requested, not universally verified. |
 | `tool_calling` | A real automatic `get_weather` function definition for Delhi | Complete and reconstructed streamed calls must have one function call, a call ID, the expected name and strict JSON arguments `{"city":"Delhi"}`. Rejections, missing calls, malformed JSON, wrong functions, schema errors and incomplete streams remain distinct request evidence. No generated tool is executed. |
@@ -89,6 +89,41 @@ and additional workloads. If the generator cannot keep up, configured timing
 limits remain inconclusive; observed task/protocol failures remain failures.
 Mixed-load latency ratios require enough successful control/load samples and
 actual overlap before they can fail the interference check.
+
+## Concurrent workload scenarios
+
+Select `concurrency` and configure the single `concurrent_workloads` block.
+`scenarios` selects any combination of `size_matrix`, `mixed_interference`,
+`streaming_fairness` and `token_stress`. Each has a separate status, summary,
+measurements and request evidence under `metrics.scenarios`. A failed scenario
+is not hidden by another scenario with incomplete coverage. Legacy `fairness`,
+`buckets` and `mixed` selections are migrated to the corresponding scenarios;
+saved historical reports remain readable.
+
+- **Size matrix:** short/medium/long inputs crossed with output caps at each
+  `levels` value. `samples_per_bucket` and `window_seconds` bound each cell.
+  Actual lengths, achieved overlap, timing, errors and scoring remain per cell.
+- **Mixed interference:** short-only controls and long-input/long-output pairs,
+  both heavy-first and short-already-streaming. Each phase retains control/mixed
+  timing, slowdown ratio, observed overlap and sample qualification.
+- **Streaming fairness:** the former fairness workload, including baseline,
+  latency ratio, streaming-pause maximum, overlap counts, errors and correctness.
+- **Token stress:** each `stress_cases` entry runs at every configured level.
+  Defaults request 10,000 input / 50 output summary tokens and a short prompt
+  (at most 128 observed input tokens) / 10,000 output tokens. The cases, target
+  sizes and `min_output_tokens` are configurable. `input_token_tolerance` and
+  `calibration_attempts` control bounded sizing from returned usage, including
+  chat-template overhead. Calibration requests consume the same global budget.
+
+The large-token example is [concurrent-workloads.yaml](../examples/concurrent-workloads.yaml).
+The server must support the requested context/output sizes. The suite never
+silently lowers targets to fit global caps. Missing token usage, early output
+termination, insufficient overlap or incomplete budgets leave coverage
+inconclusive; request errors and incorrect scored answers remain failures.
+The summary task checks that the required box-label fact survives; it does not
+certify general summary quality. Long-generation content is unscored. These
+examples define future runs; existing small-model reports are not new 10k-token
+qualification evidence.
 
 ## Deployment metadata
 

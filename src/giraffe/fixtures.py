@@ -19,9 +19,18 @@ from referencing.exceptions import Unresolvable
 
 from giraffe.models import CHECK_NAMES, RequestRecord, RequestSpec, RunConfig, EvaluationEvidence, validated_json_schema
 
-FIXTURE_VERSION = "0.2.0"
-SUITE_VERSION = "0.2.0"
+FIXTURE_VERSION = "0.3.0"
+SUITE_VERSION = "0.3.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
+
+
+GENERATION_PASSAGE = (
+    "The small boat crossed the lake early in the morning. The water was calm, "
+    "and the trees along the shore were reflected on its surface. A family watched "
+    "from the wooden pier as the boat approached. They carried a basket of bread, "
+    "apples, and fresh water for their picnic. After tying the boat to the pier, "
+    "the captain helped everyone aboard and checked that each person had a life jacket."
+)
 
 
 def _request(
@@ -177,20 +186,15 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     ]
     sustained = [
         _request(
-            "sustained.code", "sustained", ["recovery", "serving"],
-            "The box label is V5N3. Reply with the box label only.", expected="V5N3",
-            version=2,
+            "sustained.copy", "sustained", ["recovery", "serving"],
+            "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
+            expected=GENERATION_PASSAGE, max_tokens=config.max_output_tokens, version=3,
         ),
     ]
     generation = [
         _request(
             "generation.copy", "generation", ["generation", "serving"],
-            "Copy exactly, with no extra text:\n"
-            "The small boat crossed the lake early in the morning. The water was calm, "
-            "and the trees along the shore were reflected on its surface. A family watched "
-            "from the wooden pier as the boat approached. They carried a basket of bread, "
-            "apples, and fresh water for their picnic. After tying the boat to the pier, "
-            "the captain helped everyone aboard and checked that each person had a life jacket.",
+            "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
             scorer="none", expected={"purpose": "observe sustained answer generation"},
             max_tokens=config.max_output_tokens,
         ),
@@ -278,7 +282,8 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
 
     Exact checks compare the complete case-sensitive answer after whitespace
     normalization. ``contains`` is an explicit custom substring check, never
-    used by built-ins. JSON permits one complete markdown fence, but not prose
+    used by ordinary smoke fixtures. Token-stress summaries check a required fact,
+    without claiming full summary quality. JSON permits one complete markdown fence, but not prose
     surrounding an object. Reasoning content never substitutes for the answer.
     """
     record = record.model_copy(update={"evaluation": EvaluationEvidence(

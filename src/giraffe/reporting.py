@@ -16,6 +16,7 @@ from typing import Any
 from .deployment import deployment_diff, safe_config, sanitize
 from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status
 from .workloads import WORKLOAD_CHECKS
+from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
@@ -181,11 +182,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
 
 def _generator_saturated(report: RunReport, target: str) -> bool:
-    warm_first = [r.first_output_ms for r in report.requests if r.target == target
-                  and r.scenario == "warm" and r.status == "completed" and r.valid
-                  and r.first_output_ms is not None]
-    threshold = max(100, (_percentile(warm_first, .5) or 0) * .1)
-    return report.observations.get("generator_max_lag_ms", 0) > threshold
+    records = [r for r in report.requests if r.target == target]
+    return _timing_quality(report, target, records, TIMING_METRICS)["status"] == "client_delayed"
+
+
+def _timing_quality(report, target, records, metrics):
+    return qualify(records, report.observations.get("client_timing_health"),
+                   timing_threshold([r for r in report.requests if r.target == target]), metrics,
+                   legacy_max_lag_ms=report.observations.get("generator_max_lag_ms", 0))
 
 
 def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
@@ -291,6 +295,9 @@ def _compare_traffic(
         "method": "Matched planned arrival cohorts and acceptance criteria. Stage acceptance "
                   "changes are observed qualification results, not statistical capacity estimates.",
     }
+    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
+        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline before comparing traffic acceptance."
+        return result
     for label, metrics in (("current", current), ("baseline", old)):
         pack = (metrics or {}).get("request_pack")
         if pack and pack.get("control_status") != "pass":
@@ -466,9 +473,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         row.update(status="inconclusive", reason="Actual generated output lengths differ "
                                    "materially; these performance samples are not like-for-like.")
-                    if saturated_runs and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
-                        row.update(status="inconclusive", reason=" / ".join(saturated_runs) +
-                                   " generator scheduling lag prevents a reliable timing/rate comparison.")
+                    if metric in TIMING_METRICS:
+                        quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
+                                   "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
+                        delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
+                        row["timing_quality"] = quality
+                        if delayed_runs:
+                            row.update(status="inconclusive", reason=" / ".join(delayed_runs) +
+                                       " client scheduling delay overlaps these metric samples; endpoint timing attribution is uncertain.")
+                        if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
+                            row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
                                evidence_ids=[record.id for record in current_records])
@@ -498,7 +512,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             elif missing_measurements:
                 summary = "Some metrics lost measurement coverage or have undefined baseline values."
             elif saturated_runs:
-                summary = "Generator scheduling lag prevents a reliable timing/rate comparison."
+                summary = "Overlapping client scheduling delay prevents a reliable timing/rate comparison."
             else:
                 summary = "Sample variation or changed output lengths prevent a clear material-regression decision."
         else:
@@ -510,6 +524,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         if excluded:
             summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
         entry = {"target": name, "status": status, "reasons": target_reasons,
+                 "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,
                  "consistency_changes": consistency_changes,
@@ -663,6 +678,32 @@ def _traffic_table(check: CheckResult) -> str:
     return "".join(parts)
 
 
+def _session_performance_html(data: dict[str, Any]) -> str:
+    headline = (f'<p><strong>Average generation speed per user: '
+                f'{_number(data["mean_user_generation_tokens_per_second"])} tok/s</strong> '
+                f'({_e(data["users_with_measured_generation"])} measured users). '
+                f'{_e(data["completed_conversations"])} / {_e(data["planned_conversations"])} '
+                f'conversations completed; {_e(data["achieved_request_overlap"])} / '
+                f'{_e(data["configured_concurrency"])} concurrent requests observed/configured.</p>'
+                f'<p class="muted">{_e(data["interpretation"])}</p>')
+    rows = []
+    for row in data["turns"]:
+        rows.append(f'<tr><td>{_e(row["task_type"])} / {_e(row["mode"])} / turn {_e(row["turn"])}</td>'
+                    f'<td>{_e(row["completed"])} / {_e(row["attempted"])}</td>'
+                    f'<td>{_number(row["generation_tokens_per_second_mean"])} / '
+                    f'{_number(row["generation_tokens_per_second_p50"])} / '
+                    f'{_number(row["generation_tokens_per_second_p10"])}</td>'
+                    f'<td>{_number(row["first_output_p95_ms"])}</td>'
+                    f'<td>{_number(row["p95_ms"])}</td>'
+                    f'<td>{_e(row["unmeasured_generation_requests"])} / '
+                    f'{_e(row["capped_responses"])}</td></tr>')
+    return (headline + '<details><summary>Conversation performance by task and turn</summary>'
+            '<div class="table"><table><tr><th>Task / mode / turn</th><th>Completed / sent</th>'
+            '<th>Generation mean / median / p10 tok/s</th><th>First output p95 ms</th>'
+            '<th>Response p95 ms</th><th>Unmeasured rate / capped replies</th></tr>'
+            + ''.join(rows) + '</table></div></details>')
+
+
 def _traffic_baseline_html(target: dict[str, Any]) -> str:
     traffic = target["traffic_capacity"]
     delta = traffic.get("delta_rps")
@@ -748,6 +789,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "sessions" and check.metrics.get("conversation_performance"):
+            metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(check.title)}</strong>'
                      f'<br>{"Required" if check.required else "Optional"}</td>'
                      f'<td>{_badge(check.status)}</td><td>{_e(check.summary)}'
@@ -756,6 +799,18 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<tr><td>{_e(check.target)}<br>{_e(outcome["title"])}</td>'
                          f'<td>{_badge(outcome["status"])}</td>'
                          f'<td>{_e(outcome["summary"])}</td></tr>')
+        for scenario in check.metrics.get("scenarios", {}).values():
+            parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(scenario["title"])}</strong></td>'
+                         f'<td>{_badge(scenario["status"])}</td><td>{_e(scenario["summary"])}'
+                         f'<details><summary>Scenario measurements and evidence</summary>'
+                         f'<pre>{_json(scenario)}</pre></details></td></tr>')
+            for case in scenario.get("metrics", {}).get("cases", {}).values():
+                parts.append(f'<tr><td>{_e(case["title"])}</td><td>{_badge(case["status"])}</td>'
+                             f'<td>Requested input/output tokens: {_e(case["requested_input_tokens"])} / '
+                             f'{_e(case["requested_output_tokens"])}. '
+                             f'Observed input: {_e(case["actual_input_tokens"])}; '
+                             f'output: {_e(case["actual_output_tokens"])}. '
+                             f'{_e("; ".join(case["coverage_gaps"]))}</td></tr>')
     # A partially selected suite must not look like complete coverage.
     seen = {check.id for check in report.checks}
     absent = [title for check_id, title in CHECK_NAMES.items() if check_id not in seen]
