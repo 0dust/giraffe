@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from giraffe.models import RunConfig, ToolFixture
+from giraffe.models import RequestRecord, RunConfig, ToolFixture
 
 
 def default_tool_fixture() -> ToolFixture:
@@ -31,3 +31,9 @@ def resolved_tool_modes(config: RunConfig) -> list[str]:
     if config.tool_checks and config.tool_checks.modes is not None:
         return config.tool_checks.modes
     return ["complete", "stream"] if config.stream else ["complete"]
+
+
+def is_discovery_rejection(record: RequestRecord) -> bool:
+    expectation = record.evaluation.tool_expectation if record.evaluation else None
+    return bool(expectation and expectation.choice and expectation.choice.support == "discover"
+                and record.tool_evaluation and record.tool_evaluation.support == "rejected")

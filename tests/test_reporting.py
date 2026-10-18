@@ -403,8 +403,10 @@ def test_tool_evidence_retention_and_html(policy, content_status, tmp_path):
     json_path, html_path = write_report(report, tmp_path)
     saved = RunReport.model_validate_json(json_path.read_text()).requests[0]
     retained = policy == "all" or (policy == "failures" and content_status == "fail")
-    assert saved.tool_evaluation.model_dump() == outcomes
-    assert saved.evaluation.tool_expectation.model_dump() == expectation
+    assert saved.tool_evaluation.model_dump() == outcomes | {
+        "choice": None, "arguments": None, "task": None, "support": None,
+    }
+    assert saved.evaluation.tool_expectation.model_dump() == expectation | {"choice": None}
     assert bool(saved.output) == retained
     assert bool(saved.reasoning) == retained
     assert saved.tool_calls == (actual_calls if retained else [])

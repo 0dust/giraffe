@@ -467,9 +467,35 @@ class ExpectedToolCall(ToolContractModel):
         return self
 
 
+class ToolChoiceRule(ToolContractModel):
+    mode: Literal["none", "auto", "required", "named"]
+    name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    support: Literal["required", "discover"] = "required"
+    max_calls: int = Field(default=16, ge=1, le=16, strict=True)
+    parallel_tool_calls: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def named_choice(self):
+        if (self.mode == "named") != (self.name is not None):
+            raise ValueError("only named tool choice requires a function name")
+        return self
+
+    def request_options(self) -> dict[str, Any]:
+        options = {"tool_choice": {"type": "function", "function": {"name": self.name}}
+                   if self.mode == "named" else self.mode}
+        if self.parallel_tool_calls is not None:
+            options["parallel_tool_calls"] = self.parallel_tool_calls
+        return options
+
+    @property
+    def call_limit(self) -> int:
+        return 0 if self.mode == "none" else 1 if self.parallel_tool_calls is False else self.max_calls
+
+
 class ToolExpectation(ToolContractModel):
     tools: list[dict[str, Any]] = Field(min_length=1, max_length=16)
-    expected_calls: list[ExpectedToolCall] = Field(min_length=1, max_length=16)
+    expected_calls: list[ExpectedToolCall] | None = Field(default=None, max_length=16)
+    choice: ToolChoiceRule | None = None
     expected_content: ToolContentExpectation | None = None
 
     @model_validator(mode="after")
@@ -499,7 +525,19 @@ class ToolExpectation(ToolContractModel):
                 raise ValueError("tool function parameters require a JSON schema object")
             bounded_tool_schema(schema)
             schemas[name] = schema
-        for call in self.expected_calls:
+        if self.choice is None and not self.expected_calls:
+            raise ValueError("tool fixtures require expected_calls or an explicit choice rule")
+        if self.choice:
+            rule = self.choice
+            if rule.mode == "named" and rule.name not in schemas:
+                raise ValueError("named tool choice must reference a declared function")
+            if self.expected_calls is not None:
+                count = len(self.expected_calls)
+                if count > rule.call_limit or (rule.mode in {"required", "named"} and count == 0):
+                    raise ValueError("expected_calls contradict the tool choice count rule")
+                if rule.mode == "named" and any(call.name != rule.name for call in self.expected_calls):
+                    raise ValueError("expected_calls contradict the named tool choice")
+        for call in self.expected_calls or []:
             if call.name not in schemas:
                 raise ValueError("every expected function must exist in tools")
             if call.arguments is not None:
@@ -522,6 +560,8 @@ class ToolFixture(ToolExpectation):
             raise ValueError("fixture_id must contain text")
         if {"tools", "tool_choice"}.intersection(self.options):
             raise ValueError("options cannot override tools/tool_choice")
+        if self.choice and "parallel_tool_calls" in self.options:
+            raise ValueError("configure parallel_tool_calls in the choice rule")
         finite_tool_json(self.options)
         validate_pack_options(self.options)
         return self
@@ -561,6 +601,10 @@ class ToolCheckOutcome(ToolContractModel):
 
 
 class ToolEvaluation(ToolContractModel):
+    choice: ToolCheckOutcome | None = None
+    arguments: ToolCheckOutcome | None = None
+    task: ToolCheckOutcome | None = None
+    support: Literal["observed", "rejected", "unverified"] | None = None
     protocol: ToolCheckOutcome
     calls: ToolCheckOutcome
     content: ToolCheckOutcome
@@ -989,6 +1033,7 @@ class RequestRecord(Model):
     evaluation_error: str | None = None
     logprob_evidence: LogprobEvidence | None = None
     tool_evaluation: ToolEvaluation | None = None
+    tool_request_options: dict[str, Any] | None = None
     response_events: list[dict[str, Any]] = Field(default_factory=list)
     response_events_truncated: bool = False
     judgement: RequestJudgement | None = None

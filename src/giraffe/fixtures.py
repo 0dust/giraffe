@@ -292,6 +292,20 @@ def _equal_json_values(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _parsed_tool_arguments(arguments: Any, schema: dict) -> dict:
+    if not isinstance(arguments, str):
+        raise ValueError("arguments must be JSON text")
+    if len(arguments.encode("utf-8")) > MAX_TOOL_JSON_BYTES:
+        raise ToolSchemaBudgetExceeded
+    value = _json_answer(arguments, allow_fence=False)
+    finite_tool_json(value)
+    bounded_json_tree(value)
+    if not isinstance(value, dict):
+        raise ValueError("tool arguments must be an object")
+    bounded_tool_schema(schema, instance=value).validate(value)
+    return value
+
+
 def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> ToolCheckOutcome:
     calls = record.tool_calls
     if record.finish_reason == "length":
@@ -308,18 +322,7 @@ def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> 
         if call.get("type", "function") != "function":
             return ToolCheckOutcome(status="fail", message="Wrong tool-call type: expected a function.")
         try:
-            arguments = function.get("arguments")
-            if not isinstance(arguments, str):
-                raise ValueError("arguments must be JSON text")
-            if len(arguments.encode("utf-8")) > MAX_TOOL_JSON_BYTES:
-                raise ToolSchemaBudgetExceeded
-            value = _json_answer(arguments, allow_fence=False)
-            finite_tool_json(value)
-            bounded_json_tree(value)
-            if not isinstance(value, dict):
-                return ToolCheckOutcome(status="fail", message="Tool argument schema mismatch: expected an object.")
-            validator = bounded_tool_schema(schemas[expected.name], instance=value)
-            validator.validate(value)
+            value = _parsed_tool_arguments(function.get("arguments"), schemas[expected.name])
             if expected.arguments is not None and not _equal_json_values(value, expected.arguments):
                 return ToolCheckOutcome(status="fail", message="Tool arguments differ from the fixture's expected values.")
         except ToolSchemaBudgetExceeded:
@@ -333,10 +336,62 @@ def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> 
     return ToolCheckOutcome(status="pass", message="Parsed tool call matches the fixture.")
 
 
+def _tool_choice_outcomes(expectation: ToolExpectation, record: RequestRecord):
+    rule, calls = expectation.choice, record.tool_calls
+    names = [call.get("function", {}).get("name") for call in calls]
+    schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in expectation.tools}
+    compliant = (len(calls) <= rule.call_limit
+                 and (rule.mode not in {"required", "named"} or bool(calls))
+                 and (rule.mode != "named" or all(name == rule.name for name in names)))
+    choice = ToolCheckOutcome(status="pass" if compliant else "fail",
+        message="Response honors the tool choice rule." if compliant else "Response violates the tool choice name/count rule.")
+    arguments = ToolCheckOutcome(status="not_checked", message="No calls returned; no arguments to validate.")
+    parsed = []
+    for call, name in zip(calls, names, strict=True):
+        if name not in schemas or call.get("type") != "function":
+            arguments = ToolCheckOutcome(status="fail", message="Call does not reference a declared function.")
+            break
+        try:
+            parsed.append(_parsed_tool_arguments(call["function"].get("arguments"), schemas[name]))
+        except (ToolSchemaBudgetExceeded, RecursionError):
+            arguments = ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
+            break
+        except (ValueError, TypeError, KeyError, Unresolvable, SchemaError, ValidationError):
+            arguments = ToolCheckOutcome(status="fail", message="Tool arguments are malformed or do not satisfy the declared schema.")
+            break
+        arguments = ToolCheckOutcome(status="pass", message="Returned tool arguments satisfy their declared schemas.")
+    expected = expectation.expected_calls
+    task = ToolCheckOutcome(status="not_checked", message="No task-specific call expectation configured.")
+    if expected is not None:
+        if len(expected) != len(calls) or any(e.name != name for e, name in zip(expected, names)):
+            task = ToolCheckOutcome(status="fail", message="Returned call names/count differ from the task expectation.")
+        elif arguments.status in {"fail", "inconclusive"}:
+            task = ToolCheckOutcome(status="inconclusive", message="Task arguments cannot be compared before schema validation succeeds.")
+        else:
+            matches = all(e.arguments is None or _equal_json_values(value, e.arguments)
+                          for e, value in zip(expected, parsed, strict=True))
+            task = ToolCheckOutcome(status="pass" if matches else "fail", message=
+                "Calls match the task expectation." if matches else "Tool arguments differ from the task expectation.")
+    return choice, arguments, task
+
+
 def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) -> RequestRecord:
     expected_content = expectation.expected_content
     content = ToolCheckOutcome(status="not_checked", message="No assistant content expectation configured.")
     if record.status != "completed" or not record.valid:
+        if expectation.choice:
+            rejected = record.http_status in {400, 422, 501}
+            required = expectation.choice.support == "required"
+            pending = ToolCheckOutcome(status="inconclusive", message="Response did not complete validly; no semantic verdict.")
+            choice = ToolCheckOutcome(status="fail" if rejected and required else "inconclusive",
+                message="API rejected this request; tool-choice support is unverified." if rejected
+                        else "Tool choice cannot be assessed without a completed response.")
+            return record.model_copy(update={"score": False if rejected and required else None,
+                "score_message": choice.message, "tool_evaluation": ToolEvaluation(
+                    protocol=ToolCheckOutcome(status="fail", message="Request did not complete validly."),
+                    calls=pending, content=pending if expected_content is not None else content,
+                    choice=choice, arguments=pending, task=pending,
+                    support="rejected" if rejected else "unverified")})
         pending = ToolCheckOutcome(status="inconclusive", message="Request did not complete validly; partial output cannot establish correctness.")
         evaluation = ToolEvaluation(
             protocol=ToolCheckOutcome(status="fail", message="Request did not complete validly."),
@@ -349,7 +404,20 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
     protocol = ToolCheckOutcome(status="pass", message="Request completed validly.")
     if record.finish_reason == "length":
         protocol = ToolCheckOutcome(status="fail", message="Completion was truncated by the output limit.")
-    calls = _tool_calls_outcome(expectation, record)
+    elif expectation.choice and record.finish_reason == "tool_calls" and not record.tool_calls:
+        protocol = ToolCheckOutcome(status="fail", message="Tool-call finish reason returned without any structured calls.")
+    choice = arguments = task = None
+    if expectation.choice:
+        if protocol.status == "fail":
+            choice = arguments = task = ToolCheckOutcome(status="inconclusive", message="Incomplete or contradictory output cannot establish tool choice compliance.")
+        else:
+            choice, arguments, task = _tool_choice_outcomes(expectation, record)
+        call_outcomes = (arguments, task)
+        calls = next((outcome for status in ("fail", "inconclusive", "pass")
+                      for outcome in call_outcomes if outcome.status == status),
+                     ToolCheckOutcome(status="not_checked", message="No call arguments or task assertions to check."))
+    else:
+        calls = _tool_calls_outcome(expectation, record)
     if expected_content is not None:
         actual, expected = record.output, expected_content.value
         if expected_content.normalization == "whitespace":
@@ -361,12 +429,15 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
         )
         if matches and expected_content.mode == "contains":
             content.message = "Expected assistant substring found; this does not validate full content or duplication."
-    evaluation = ToolEvaluation(protocol=protocol, calls=calls, content=content)
-    outcomes = (protocol, calls, content)
+    evaluation = ToolEvaluation(protocol=protocol, calls=calls, content=content,
+        choice=choice, arguments=arguments, task=task,
+        support=("observed" if choice.status == "pass" else "unverified") if choice else None)
+    outcomes = (protocol, calls, content, *([choice] if choice else []))
     failed = any(outcome.status == "fail" for outcome in outcomes)
     inconclusive = any(outcome.status == "inconclusive" for outcome in outcomes)
     score = False if failed else None if inconclusive else True
-    message = calls.message
+    message = (next((outcome.message for outcome in outcomes if outcome.status in {"fail", "inconclusive"}),
+                    choice.message) if choice else calls.message)
     if content.status == "fail":
         message = content.message if calls.status == "pass" else f"{calls.message} {content.message}"
     elif score is True and expected_content is not None:
@@ -374,7 +445,7 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
     return record.model_copy(update={
         "score": score, "score_message": message, "tool_evaluation": evaluation,
         **({"evaluation_error": "schema_recursion" if "recursion" in calls.message else "tool_evaluation_budget"}
-           if calls.status == "inconclusive" else {}),
+           if calls.status == "inconclusive" and protocol.status == "pass" else {}),
     })
 
 
