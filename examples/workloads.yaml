@@ -26,9 +26,9 @@ metrics: true
 metrics_interval_seconds: 2
 metrics_max_samples: 1024
 arrivals: {mode: steady, requests: 12, requests_per_second: 0.5, max_pending: 4}
-prefix: {prefix_chars: 256, repeats: 6, history_turns: 3}
+prefix: {prefix_chars: 8192, repeats: 6, history_turns: 3}
 buckets:
-  input_chars: {short: 64, medium: 256, long: 512}
+  input_chars: {short: 64, medium: 1024, long: 12288}
   output_tokens: {short: 24, medium: 64, long: 128}
   levels: [1, 2]
   samples_per_bucket: 6
@@ -37,11 +37,12 @@ buckets:
   heavy_weights: {long_input: 1, long_output: 1}
 sessions:
   modes: [fixed, live]
-  sessions: 2
+  sessions: 5
   concurrency: 2
   max_tokens: 64
   delay_seconds: 0.05
 consistency:
+  prompts_per_shape: 3
   repetitions: 6
   shapes: [short, long]
   levels: [1, 2]

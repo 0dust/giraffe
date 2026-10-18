@@ -1,8 +1,67 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from itertools import combinations
 
 from giraffe.logprobs import compare_samples, comparison_status
+
+
+async def refill(run, target, client, specs, count, level, *, end=None):
+    active, records = {}, []
+    issued = 0
+    area, last, begin = 0., None, None
+
+    def tick():
+        nonlocal area, last, begin
+        now = time.monotonic()
+        if last is not None:
+            area += len(active) * (now - last)
+        else:
+            begin = now
+        last = now
+
+    async def worker():
+        nonlocal issued
+        while issued < count and run.allowed(target.name) and (end is None or time.monotonic() < end):
+            index = issued
+            issued += 1
+            request = specs[index % len(specs)].model_copy(deep=True)
+            evidence = {'peak': 0}
+
+            def started():
+                tick()
+                active[index] = evidence
+                for item in active.values():
+                    item['peak'] = max(item['peak'], len(active))
+
+            try:
+                if end is None:
+                    record = await run.request(target, client, request, on_start=started)
+                else:
+                    async with run.slot(False, end) as admitted:
+                        if not admitted or time.monotonic() >= end:
+                            break
+                        record = await run.request(target, client, request, on_start=started,
+                                                   slot_reserved=True)
+            finally:
+                if index in active:
+                    tick()
+                    active.pop(index)
+            if record is not None:
+                record.workload.update(observed_overlap=evidence['peak'],
+                                       load_qualified=evidence['peak'] >= level)
+                records.append(record)
+            else:
+                break
+
+    await asyncio.gather(*(worker() for _ in range(min(level, count))))
+    average = area / (last - begin) if begin is not None and last > begin else 0
+    for record in records:
+        record.workload['time_weighted_inflight'] = average
+    if len(records) < count:
+        run.unfinished[target.name].update(check for spec in specs for check in spec.check_ids)
+    return records
 
 
 def corpus_width(settings):
@@ -37,11 +96,10 @@ async def run_logprob_consistency(run, target, client, fixtures):
                                          'corpus_size': width, 'response_mode': 'complete',
                                          'option_support': 'requested; runtime enforcement unverified'}
                         specs.append(spec)
-                    await run.group(target, client, specs, scenario, count=width, concurrency=level,
-                                    checks=['consistency'])
+                    await refill(run, target, client, specs, width, level)
 
 
-def summarize_logprobs(records, settings):
+def summarize_logprobs(records, settings, *, min_samples=2):
     options = settings.logprobs
     width = corpus_width(settings)
     conditions = []
@@ -60,14 +118,16 @@ def summarize_logprobs(records, settings):
             observed = [(r.workload['round'], r.workload['corpus_index']) for r in samples]
             rounds = [{'round': repeat, 'issued': len(batch := [r for r in samples if r.workload['round'] == repeat]),
                        'completed': sum(r.valid and r.status == 'completed' for r in batch),
-                       'achieved_overlap': max((r.overlap for r in batch), default=0)}
+                       'achieved_overlap': max((r.workload.get('observed_overlap', 0) for r in batch), default=0),
+                       'qualified_samples': sum(r.workload.get('load_qualified', False) for r in batch),
+                       'time_weighted_inflight': batch[0].workload.get('time_weighted_inflight') if batch else None}
                       for repeat in range(settings.repetitions)]
             available = [r for r in samples if usable(r)]
             comparison = compare_samples(available, prefix_cache=prefix_cache)
-            complete = (len(observed) == planned and set(observed) == expected
+            complete = (settings.repetitions >= min_samples and len(observed) == planned and set(observed) == expected
                         and len(priming) == width * options.priming_rounds
                         and all(usable(r) and r.logprob_evidence.status == 'available' for r in cohort)
-                        and all(item['achieved_overlap'] >= level for item in rounds))
+                        and all(item['qualified_samples'] == width for item in rounds))
             status = comparison_status(comparison, options, complete)
             if options.support == 'required' and any(r.logprob_evidence and
                     r.logprob_evidence.status in {'missing', 'rejected'} for r in cohort):
@@ -84,9 +144,9 @@ def summarize_logprobs(records, settings):
                     'response_status': r.status, 'finish_reason': r.finish_reason, 'usable': usable(r)} for r in cohort],
                 **comparison})
     cross_conditions = []
-    if options.compare_levels:
-        for shape in settings.shapes:
-            for left, right in combinations(dict.fromkeys([1, *settings.levels]), 2):
+    for shape in settings.shapes:
+        for left, right in combinations(dict.fromkeys([1, *settings.levels]), 2):
+            if options.compare_levels or left == 1:
                 samples = [r for r in measured if r.workload['input_bucket'] == shape and r.workload['level'] in {left, right} and usable(r)]
                 comparison = compare_samples(samples, cross=True, prefix_cache=prefix_cache)
                 complete = all(c['coverage_complete'] for c in conditions if c['shape'] == shape and c['level'] in {left, right})
@@ -98,4 +158,5 @@ def summarize_logprobs(records, settings):
             'top_logprobs': options.top_logprobs, 'support': options.support,
             'response_mode': 'complete', 'corpus_size': width, 'repetitions': settings.repetitions,
             'priming_rounds': options.priming_rounds, 'conditions': conditions, 'cross_conditions': cross_conditions,
+            'within_level_interpretation': 'Run-to-run repeatability; cross_conditions compare concurrency against level 1.',
             'interpretation': 'Natural-log probability differences, not throughput or correctness. Client overlap does not establish server batch membership. Unknown alternatives are not probability zero.'}

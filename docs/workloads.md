@@ -62,7 +62,7 @@ total traffic. AI evaluator calls use separate limits.
 concurrent-load form, these counts also determine the run's concurrency ceiling;
 custom configurations retain their independently configured ceiling. Each of the
 nine input/output size pairs sends `max(samples_per_bucket, level)` requests at every
-level, enough for at least one full concurrent batch. For levels `[1, 4, 8]` and
+level, using a refilling worker pool. Completed requests immediately free a slot for the next request. For levels `[1, 4, 8]` and
 a sample minimum of 4, bucket coverage needs `9 × (4 + 4 + 8) = 144` requests per
 target. The review includes other selected tests in its plan and flags
 insufficient request limits as you edit, with an explicit action to raise the
@@ -71,8 +71,8 @@ and built-in random arrival counts as estimates. Time limits, errors and cancell
 leave coverage incomplete. In custom configurations, changing the global in-flight
 limit does not change the tested levels.
 
-The built-in question length targets are 64, 256 and 512 characters; answer caps
-are 16, 48 and 96 tokens. These are editable presets, not categories of question
+The built-in question length targets are 64, 1,024 and 12,288 characters (roughly 3k tokens for the long input); answer caps
+are 16, 48 and 96 tokens. Inputs are bounded by a conservative estimate of `context_limit`, output reserve and template overhead. These are editable presets, not categories of question
 difficulty. The generator pairs every question target with every answer cap,
 giving three times three cases. Answer instructions can add characters to the
 question, and a token cap does not guarantee an answer reaches that length.
@@ -180,8 +180,63 @@ server TTFT statistics.
 Timing acceptance uses the same generator scheduling-lag qualification for core
 and additional workloads. If the generator cannot keep up, configured timing
 limits remain inconclusive; observed task/protocol failures remain failures.
-Mixed-load latency ratios require enough successful control/load samples and
-actual overlap before they can fail the interference check.
+Mixed-load latency ratios require enough successful control/load samples, actual
+overlap and exercised shapes before they can fail the interference check.
+Without `limits.fairness_max_ratio`, mixed results are inconclusive: "effect
+observed; no acceptance ratio configured". The matched light request copies a
+known passage of at least 64 tokens (requires `max_output_tokens >= 96`; otherwise
+no mixed requests are dispatched and the check is inconclusive). The active-stream competitor starts after
+its first visible output and requires further visible light output after heavy
+dispatch; buffered answers followed only by protocol trailers do not qualify.
+Weighted repetitions use distinct pair identities and require the full configured
+number of exercised pairs per shape/phase. Each qualifying light response must report at least
+64 completion tokens; long-output competitors must report at least half their
+requested cap, and long-input competitors must report at least twice the light
+input tokens and at least 128 additional tokens. Missing usage is inconclusive.
+
+`arrivals.max_pending` bounds only queued, undispatched arrivals. In-flight
+requests use the global `concurrency` ceiling and do not occupy queue capacity.
+
+Shared-prefix repeats run back to back, followed by a separate independent-control
+block so single-slot caches can retain the shared prefix. The default shared
+prefix is 8,192 characters (at least roughly 1k tokens with ordinary prose).
+Independent controls have different leading text. Prefix acceptance requires at
+least `limits.min_samples` successful repeats after the first use, each reporting
+cached tokens covering at least half the estimated shared-prefix tokens, rounded
+down to a 16-token block boundary (minimum one token). The estimate scales reported
+prompt tokens by the shared-prefix character fraction. Missing token/cache usage
+is inconclusive ("cache reuse unverified"); reported zero or insufficient cached
+tokens fails ("no prefix reuse observed"). Timing improvement alone cannot pass.
+
+Bucket windows limit dispatch, not request duration. Requests dispatched before
+the cutoff drain under their normal server timeout; the window cannot create an
+error. Too few samples is unfinished/inconclusive. Genuine request timeouts still
+count as errors. Each cell reports time-weighted average in-flight and flags tail
+samples that never overlap the requested number of requests. These samples cannot
+qualify load or length coverage. Input usage must increase short < medium < long
+within each level/output shape and be within a broad tokenizer allowance of the
+requested size (characters / 10 through characters / 1.5 + 32 tokens); otherwise
+"input length not exercised" is inconclusive.
+
+Sessions seed a distinct index-derived bakery name in turn zero and score each
+turn against that session's original value. This detects mixed histories even
+when every session follows the same turn template. Live history preserves its own
+actual answers. Fixed history uses the seeded first answer and configured saved
+answers thereafter. The session name recall instruction is added to configured
+turns; saved configurations retain their fields.
+
+Text consistency uses `prompts_per_shape: 3` distinct prompts by default, including
+known multi-sentence copy tasks, at temperature zero unless overridden. Every
+shape/prompt identity gets a level-1 modal-answer baseline under the configured
+byte/whitespace equality. Reports separate within-level repeatability agreement
+from agreement with that baseline at every level. With `consistency.strict: true`,
+any within-level or cross-level answer difference fails. Without strict mode,
+variation is diagnostic and task correctness remains separate.
+
+Default per-cell samples, mixed pairs, consistency repetitions and concurrent
+session count are five; prefix repeats are six (five measured reuses). Planning
+warns when a configured workload sample count is below `limits.min_samples`.
+Budgets, missing shape evidence and inadequate overlap can still prevent a verdict.
 
 ## Deployment metadata
 
@@ -309,18 +364,21 @@ possible ordering effects.
 
 The request count per target is
 `shapes × distinct([1, *levels]) × max(levels) × (repetitions + priming_rounds)`.
-The example sends 40 requests. Preview shows this count before a run. Requested
+The example sends 48 requests. Preview shows this count before a run. Requested
 concurrency, per-round client overlap, issued/completed/missing requests and
 usable samples remain visible. Client overlap does not prove which requests the
-server batched together. Rounds run in bounded batches; a final batch may be
-smaller than the requested level. Each request records its own observed overlap.
+server batched together. Rounds use a refilling worker pool. Each request records workload-local overlap;
+tail requests that never reach the requested level cannot qualify coverage.
+Each round also reports time-weighted average in-flight.
 Request, duration, cancellation, context and error limits
 still apply; unfinished rounds or inadequate overlap make coverage inconclusive.
 
 For each corpus slot, the comparator groups matching effective request hashes,
 observed model/backend identities and preceding token histories. At each aligned
 position, min/max ranges cover all pairs, including later-versus-later variation.
-`compare_levels: true` additionally compares each pair of concurrency levels.
+Level 1 is always compared with every other level. `compare_levels: true`
+(the default) additionally compares all pairs of concurrency levels. Within-level
+comparisons alone describe run-to-run repeatability.
 Token identity uses token IDs when provided, otherwise bytes, otherwise token
 text. A token or length divergence is reported separately; probabilities after
 diverging histories are never compared. Alternative tokens are matched by
@@ -341,9 +399,10 @@ Unsupported, missing, malformed, truncated, misaligned or incomplete evidence
 cannot produce a probability pass. `support: discover` leaves an explicit
 logprob-field rejection or missing logprobs inconclusive; `support: required`
 fails those capability expectations. Unrelated HTTP errors and wrong answers
-still use ordinary acceptance limits. A strict result with token divergence,
-changed alternative membership or unknown probabilities remains inconclusive
-unless a comparable numeric pair already proves a violation.
+still use ordinary acceptance limits. Under strict logprob mode, token or length divergence between comparable
+identities fails, even without a comparable numeric difference. Changed alternative
+membership or unknown probabilities remains inconclusive unless a comparable
+numeric pair already proves a violation.
 
 Per-response evidence is bounded to 4,096 content tokens, 16,384 total chosen and
 alternative entries, and 512 KiB of token text/bytes. Each run admits at most

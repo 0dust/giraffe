@@ -396,6 +396,7 @@ result.checks=['mixed'];assert.equal(bucketCoveragePlan(result),null);
 result.checks=['serving'];assert.equal(bucketCoveragePlan(result),null);
 source.checks=['serving'];
 values.set('buckets_levels',defaults.levels.join(', '));
+values.set('buckets_samples_per_bucket',String(defaults.samples_per_bucket));
 assert.equal(build().buckets,null); // Ordinary edits do not activate an optional workload.
 values.set('buckets_levels','8');assert.deepEqual(build().buckets.levels,[8]);
 source.buckets={{...defaults,input_chars:{{short:20,medium:40,long:80}},mixed_pairs:7}};

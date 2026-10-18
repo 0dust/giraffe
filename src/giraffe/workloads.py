@@ -9,8 +9,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from giraffe.logprob_workload import corpus_width
-from giraffe.models import CHECK_NAMES, CORE_CHECKS, SESSION_REPEAT_PROMPT, CheckResult, RequestSpec
+from giraffe.logprob_workload import corpus_width, refill
+from giraffe.models import CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
@@ -62,6 +62,14 @@ async def arrivals(run, target, client, fixtures):
     run.observations[target.name]["arrivals"] = observation
     start = time.monotonic()
     pending = set()
+    queued = set()
+
+    async def dispatch(index, request):
+        try:
+            return await run.request(target, client, request, on_start=lambda: queued.discard(index))
+        finally:
+            queued.discard(index)
+
     try:
         for index in range(settings.requests):
             offset = (
@@ -92,7 +100,7 @@ async def arrivals(run, target, client, fixtures):
                     }
                 )
                 break
-            if len(pending) >= settings.max_pending:
+            if len(queued) >= settings.max_pending:
                 observation["unissued"].append(
                     {
                         "index": index,
@@ -110,7 +118,9 @@ async def arrivals(run, target, client, fixtures):
                     }
                 }
             )
-            pending.add(asyncio.create_task(run.request(target, client, request)))
+            queued.add(index)
+            pending.add(asyncio.create_task(dispatch(index, request)))
+            await asyncio.sleep(0)
         if pending:
             await asyncio.gather(*pending)
     finally:
@@ -147,16 +157,17 @@ async def arrivals(run, target, client, fixtures):
 
 async def prefixes(run, target, client):
     settings = run.config.prefix
-    prefix = (" The rock is gray." * (settings.prefix_chars // 18 + 1))[: settings.prefix_chars]
-    for index in range(settings.repeats):
-        for kind in ("shared", "independent"):
+    prefix = (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
+    for kind in ("shared", "independent"):
+        for index in range(settings.repeats):
             # Deterministic controls of equal character length; observed token counts stay separate.
             rng = random.Random(index)
-            matched = "".join(
+            matched = f"Control {index:04d}: " + "".join(
                 f" The {rng.choice(('tree', 'bird', 'boat', 'rock'))} is "
                 f"{rng.choice(('blue', 'gray', 'pink', 'gold'))}."
                 for _ in range(len(prefix) // 18 + 1)
-            )[: len(prefix)]
+            )
+            matched = matched[:len(prefix)]
             prompt = label_prompt(len(prefix) + 80, prefix if kind == "shared" else matched)
             prompt += f"\nTrial {index:04d}."
             request = spec(
@@ -165,6 +176,7 @@ async def prefixes(run, target, client):
                 "prefix",
                 expected="K7P4",
                 prefix_group=kind,
+                shared_prefix_chars=len(prefix),
                 order=index,
                 cache_state="first unique use is not proof of empty server cache",
             )
@@ -188,8 +200,12 @@ async def prefixes(run, target, client):
         history = [*messages, {"role": "assistant", "content": "K7P4"}]
 
 
-def bucket_spec(settings, input_shape, output_shape, scenario, check, level):
+def bucket_spec(settings, input_shape, output_shape, scenario, check, level, context_limit=None):
     chars = settings.input_chars[input_shape]
+    if context_limit is not None:
+        context_char_ceiling = max(64, (context_limit - max(settings.output_tokens.values()) - 64) * 3)
+        chars = min(chars, max(64, context_char_ceiling * {"short": 1 / 16, "medium": 1 / 4, "long": 1}[input_shape]))
+        chars = int(chars)
     cap = settings.output_tokens[output_shape]
     if output_shape == "short":
         prompt, expected = label_prompt(chars), "K7P4"
@@ -223,40 +239,25 @@ async def buckets(run, target, client):
                 for output_shape in ("short", "medium", "long"):
                     scenario = f"bucket_c{level}_{input_shape}_{output_shape}"
                     request = bucket_spec(
-                        settings, input_shape, output_shape, scenario, "buckets", level
+                        settings, input_shape, output_shape, scenario, "buckets", level, run.config.context_limit
                     )
                     end = min(run.deadline, time.monotonic() + settings.window_seconds)
-                    count = 0
-                    while (
-                        count < samples
-                        and time.monotonic() < end
-                        and run.allowed(target.name)
-                    ):
-                        batch = min(level, samples - count)
-                        results = await asyncio.gather(
-                            *(
-                                run.request(
-                                    target,
-                                    client,
-                                    request,
-                                    deadline_override=end,
-                                )
-                                for _ in range(batch)
-                            )
-                        )
-                        count += sum(r is not None for r in results)
-                    if count < samples:
-                        run.unfinished[target.name].add("buckets")
+                    await refill(run, target, client, [request], samples, level, end=end)
     if "mixed" not in run.config.checks:
         return
-    # Controls use precisely the same short request as every mixed pair.
-    short = bucket_spec(settings, "short", "short", "mixed_control", "mixed", 1)
+    if run.config.max_output_tokens < 96:
+        run.unfinished[target.name].add("mixed")
+        return
+    answer = " ".join(["The calm river flows past green fields."] * 10)
+    short = spec(f"Copy the following text exactly, with no extra text:\n{answer}",
+                 "mixed_control", "mixed", expected=answer,
+                 max_tokens=min(192, run.config.max_output_tokens), options={"temperature": 0})
     await run.group(target, client, [short], "mixed_control", count=settings.mixed_pairs)
     if run.config.concurrency < 2:
         run.unfinished[target.name].add("mixed")
         return
     heavy_shapes = [kind for kind, weight in settings.heavy_weights.items() for _ in range(weight)]
-    for kind in heavy_shapes:
+    for block, kind in enumerate(heavy_shapes):
         for phase in ("before_output", "active_stream"):
             for index in range(settings.mixed_pairs):
                 if not run.allowed(target.name):
@@ -269,10 +270,13 @@ async def buckets(run, target, client):
                     f"mixed_heavy_{kind}_{phase}",
                     "mixed",
                     2,
+                    run.config.context_limit,
                 )
+                pair = block * settings.mixed_pairs + index
+                heavy.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
                 light = short.model_copy(deep=True)
                 light.scenario = f"mixed_short_{kind}_{phase}"
-                light.workload.update(pair=index, heavy_type=kind, interference_phase=phase)
+                light.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
                 event = asyncio.Event()
                 if phase == "before_output":
                     started = asyncio.Event()
@@ -285,8 +289,14 @@ async def buckets(run, target, client):
                         light.workload["heavy_active_at_dispatch"] = (
                             not first.done() and started.is_set()
                         )
-                        await run.request(target, client, light)
-                        await first
+                        def light_started():
+                            light.workload["heavy_active_at_dispatch"] = not first.done()
+                        light_row = await run.request(target, client, light, on_start=light_started)
+                        heavy_row = await first
+                        if light_row is not None:
+                            light_row.workload["observed_overlap"] = 2 if light.workload["heavy_active_at_dispatch"] else 1
+                        if heavy_row is not None:
+                            heavy_row.workload["observed_overlap"] = 2 if light.workload["heavy_active_at_dispatch"] else 1
                     finally:
                         waiter.cancel()
                         if not first.done():
@@ -299,10 +309,16 @@ async def buckets(run, target, client):
                         await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
                         if event.is_set() and not first.done():
                             heavy.workload["short_stream_active_at_dispatch"] = True
-                            await run.request(target, client, heavy)
+                            def heavy_started():
+                                heavy.workload["short_stream_active_at_dispatch"] = not first.done()
+                            heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
+                            if heavy_row is not None:
+                                heavy_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
                         else:
                             run.unfinished[target.name].add("mixed")
-                        await first
+                        light_row = await first
+                        if light_row is not None:
+                            light_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
                     finally:
                         waiter.cancel()
                         if not first.done():
@@ -325,6 +341,8 @@ async def sessions(run, target, client):
         session_id = f"{target.name}:{mode}:{index}"
         item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None}
         observation["sessions"].append(item)
+        value = f"Session_{index:04d}_{mode}"
+        item["seeded_value"] = value
         due = time.monotonic()
         for turn, prompt in enumerate(settings.turns):
             if not run.allowed(target.name):
@@ -334,6 +352,8 @@ async def sessions(run, target, client):
             await asyncio.sleep(
                 max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
             )
+            prompt += (f"\nUse this exact bakery name for this session: {value}. Reply with that name only."
+                       if turn == 0 else "\nReply with the original session bakery name only.")
             messages = [*history, {"role": "user", "content": prompt}]
             input_chars = sum(len(m["content"]) for m in messages)
             if input_chars + settings.max_tokens + 32 > run.config.context_limit:
@@ -355,15 +375,7 @@ async def sessions(run, target, client):
                 scheduled_ms=(due - run.start) * 1000,
             )
             request.messages, request.input_chars = messages, input_chars
-            # Keep saved configurations using the original follow-up scored too.
-            if (
-                turn
-                and prompt in {
-                    SESSION_REPEAT_PROMPT,
-                    "Repeat exactly the bakery name you just suggested, with no extra text.",
-                }
-            ):
-                request.scorer, request.expected = "exact", previous
+            request.scorer, request.expected = "exact", value
             record = await run.request(target, client, request)
             if record is None:
                 item["stop_reason"] = run.reason or "request budget reached"
@@ -388,13 +400,14 @@ async def sessions(run, target, client):
                 item["stop_reason"] = "observed context budget reached"
                 run.unfinished[target.name].add("sessions")
                 break
-            previous = (
-                record.output
-                if mode == "live"
-                else settings.saved_answers[turn]
-                if turn < len(settings.saved_answers)
-                else ""
-            )
+            if mode == "live":
+                previous = record.output
+            elif turn == 0:
+                previous = value
+            elif turn < len(settings.saved_answers):
+                previous = settings.saved_answers[turn]
+            else:
+                previous = ""
             history = [*messages, {"role": "assistant", "content": previous}]
             due = time.monotonic() + settings.delay_seconds
         item["completed_turns"] = len(item["turns"])
@@ -416,25 +429,25 @@ async def consistency(run, target, client, fixtures):
         from giraffe.logprob_workload import run_logprob_consistency
         await run_logprob_consistency(run, target, client, fixtures)
         return
-    # Always sequential first, then selected concurrent levels, using independent identical requests.
     for shape in settings.shapes:
-        base = fixtures[shape][0].model_copy(deep=True)
-        base.options.update(temperature=settings.temperature)
-        if settings.seed is not None:
-            base.options["seed"] = settings.seed
-        for level in dict.fromkeys([1, *settings.levels]):
-            base.scenario, base.check_ids = f"consistency_c{level}_{shape}", ["consistency"]
-            base.workload = {
-                "level": level,
-                "input_bucket": shape,
-                "equality": settings.equality,
-                "temperature": settings.temperature,
-                "seed": settings.seed,
-                "option_support": "requested; runtime enforcement unverified",
-            }
-            await run.group(
-                target, client, [base], base.scenario, count=settings.repetitions, concurrency=level
-            )
+        for prompt_index in range(settings.prompts_per_shape):
+            base = fixtures[shape][0].model_copy(deep=True)
+            if prompt_index:
+                answer = " ".join(f"The numbered item {i} is ready." for i in range(1, 5 + prompt_index))
+                prompt = base.messages[0]["content"] + f"\nInstead, copy this text exactly:\n{answer}"
+                base.messages = [{"role": "user", "content": prompt}]
+                base.input_chars, base.expected, base.scorer = len(prompt), answer, "exact"
+                base.max_tokens = min(128, run.config.max_output_tokens)
+            base.options.update(temperature=settings.temperature)
+            if settings.seed is not None:
+                base.options["seed"] = settings.seed
+            for level in dict.fromkeys([1, *settings.levels]):
+                base.scenario = f"consistency_c{level}_{shape}_p{prompt_index}"
+                base.check_ids = ["consistency"]
+                base.workload = {"level": level, "input_bucket": shape, "prompt_index": prompt_index,
+                                 "equality": settings.equality, "temperature": settings.temperature,
+                                 "seed": settings.seed, "option_support": "requested; runtime enforcement unverified"}
+                await refill(run, target, client, [base], settings.repetitions, level)
 
 
 TOOL = {
@@ -513,7 +526,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if not items:
                 continue
             entry = stats(items)
-            entry["achieved_overlap"] = max((r.overlap for r in items), default=0)
+            entry["achieved_overlap"] = max((r.workload.get("observed_overlap", 0) for r in items), default=0)
             entry["workload"] = items[0].workload
             if check == "consistency":
                 hashes = Counter(
@@ -527,6 +540,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     equality=run.config.consistency.equality,
                     correctness=entry["correct"] / entry["scored"] if entry["scored"] else None,
                     expected_samples=run.config.consistency.repetitions * (corpus_width(run.config.consistency) if run.config.consistency.logprobs else 1),
+                    interpretation="Run-to-run repeatability within this level.",
                 )
                 if len(hashes) > 1 and run.config.consistency.strict:
                     status, summary = (
@@ -538,7 +552,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if (
                     len(items) < entry["expected_samples"]
                     or entry["completed"] < minimum
-                    or entry["achieved_overlap"] < items[0].workload["level"]
+                    or sum(r.workload.get("load_qualified", False) for r in items) < minimum
                 ):
                     if status != "fail":
                         status, summary = (
@@ -549,26 +563,44 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 level = items[0].workload["level"]
                 expected = items[0].workload["requested_output_tokens"]
                 entry["output_length_exercised"] = sum(
-                    r.output_tokens is not None and r.output_tokens >= expected * 0.5 for r in items
+                    r.valid and r.status == "completed" and r.workload.get("load_qualified", False)
+                    and r.output_tokens is not None and r.output_tokens >= expected * 0.5 for r in items
                 )
-                entry["input_length_verified"] = sum(r.input_tokens is not None for r in items)
+                requested = items[0].workload["requested_input_chars"]
+                siblings = {shape: [r.input_tokens for r in records if r.valid
+                            and r.workload.get("load_qualified", False) and r.status == "completed" and r.input_tokens is not None
+                            and r.workload.get("level") == level
+                            and r.workload.get("output_bucket") == items[0].workload["output_bucket"]
+                            and r.workload.get("input_bucket") == shape]
+                            for shape in ("short", "medium", "long")}
+                medians = [sorted(values)[len(values) // 2] if values else None for values in siblings.values()]
+                ordered = all(value is not None for value in medians) and medians[0] < medians[1] < medians[2]
+                entry["input_length_verified"] = sum(ordered and r.valid and r.status == "completed"
+                    and r.workload.get("load_qualified", False) and r.input_tokens is not None
+                    and requested / 10 <= r.input_tokens <= requested / 1.5 + 32 for r in items)
+                entry["qualified_samples"] = sum(r.valid and r.status == "completed"
+                                                  and r.workload.get("load_qualified", False) for r in items)
+                entry["tail_samples"] = [r.id for r in items if not r.workload.get("load_qualified", False)]
+                entry["time_weighted_inflight"] = items[0].workload.get("time_weighted_inflight")
                 gaps = []
                 entry["expected_samples"] = max(run.config.buckets.samples_per_bucket, level)
                 if len(items) < entry["expected_samples"] or entry["completed"] < minimum:
                     gaps.append("Insufficient requested or successful samples.")
-                if entry["achieved_overlap"] < level:
-                    gaps.append("Requested concurrency was not observed.")
+                if entry["qualified_samples"] < minimum:
+                    gaps.append("Requested concurrency lacks sufficient qualified samples; tail samples excluded.")
                 if (items[0].workload["output_bucket"] != "short"
                         and entry["output_length_exercised"] < minimum):
                     gaps.append("Requested output length was not sufficiently exercised; a cap alone is not coverage.")
-                if not entry["input_length_verified"]:
-                    gaps.append("Actual input token lengths are unknown.")
+                if entry["input_length_verified"] < minimum:
+                    gaps.append("input length not exercised: require short < medium < long and tokens close to requested sizes.")
                 entry["coverage_gaps"] = gaps
                 if gaps:
                     if status != "fail":
                         status, summary = (
                             "inconclusive",
-                            "Some length/load cells lack sufficient samples, achieved overlap or observed lengths; see per-cell coverage gaps.",
+                            ("input length not exercised; see per-cell coverage gaps."
+                             if entry["input_length_verified"] < minimum else
+                             "Some length/load cells lack sufficient samples, achieved overlap or observed lengths; see per-cell coverage gaps."),
                         )
             if check == "prefix":
                 entry["cache_observations"] = [
@@ -587,6 +619,19 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             shared = [r for r in records if r.scenario == "prefix_shared"]
             independent = [r for r in records if r.scenario == "prefix_independent"]
             first, repeat = stats(shared[:1]), stats(shared[1:])
+            observed = [r for r in shared[1:] if r.valid and r.status == "completed"
+                        and r.cached_prompt_tokens is not None]
+            verified = []
+            for r in observed:
+                prefix_fraction = r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
+                threshold = max(1, int((r.input_tokens or 0) * prefix_fraction * .5) // 16 * 16)
+                if r.input_tokens and prefix_fraction and r.cached_prompt_tokens >= threshold:
+                    verified.append(r)
+            metrics["cache_reuse_samples"] = len(verified)
+            if observed and any(r.cached_prompt_tokens == 0 or (r.input_tokens and r not in verified) for r in observed):
+                status, summary = "fail", "no prefix reuse observed: repeated cached tokens do not cover half the shared prefix."
+            elif len(verified) < minimum or len(observed) != len(shared[1:]):
+                status, summary = "inconclusive", "cache reuse unverified: missing cached_tokens evidence or insufficient repeated samples."
             metrics["first_repeat"] = {
                 "shared_first": first,
                 "shared_repeats": repeat,
@@ -614,8 +659,16 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     "inconclusive",
                     "Sessions stopped at a failure or budget; complete conversation coverage not established.",
                 )
+            completed_sessions = {mode: sum(s["mode"] == mode and not s["stop_reason"]
+                and s["completed_turns"] == s["planned_turns"]
+                for s in (metrics["sessions"] or {}).get("sessions", []))
+                for mode in run.config.sessions.modes}
+            metrics["completed_sessions_per_mode"] = completed_sessions
+            if any(count < minimum for count in completed_sessions.values()) and status != "fail":
+                status, summary = "inconclusive", "Insufficient completed independent sessions per mode."
         if check == "mixed":
-            controls = [r for r in records if r.scenario == "mixed_control"]
+            controls = [r for r in records if r.scenario == "mixed_control"
+                        and r.completion_tokens is not None and r.completion_tokens >= 64]
             control = stats(controls)
             comparisons = []
             for name, row in groups.items():
@@ -626,12 +679,35 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     if row["p50_ms"] is not None and control["p50_ms"]
                     else None
                 )
+                light_rows = [r for r in records if r.scenario == name]
+                heavy_rows = [r for r in records if r.scenario == name.replace("mixed_short", "mixed_heavy")]
+                shape_qualified = []
+                heavy_by_pair = {}
+                for heavy in heavy_rows:
+                    heavy_by_pair.setdefault(heavy.workload.get("pair"), []).append(heavy)
+                for light in light_rows:
+                    matches = heavy_by_pair.get(light.workload.get("pair"), [])
+                    exercised = any(r.valid and r.status == "completed" and (
+                        r.completion_tokens is not None and r.completion_tokens >= .5 * r.requested_max_tokens
+                        if r.workload.get("heavy_type") == "long_output" else
+                        r.input_tokens is not None and light.input_tokens is not None
+                        and r.input_tokens >= max(light.input_tokens * 2, light.input_tokens + 128)
+                    ) and r.workload.get("observed_overlap", 0) >= 2 for r in matches)
+                    if light.workload.get("interference_phase") == "active_stream":
+                        exercised = exercised and any(light.last_output_ms is not None
+                            and light.dispatch_ms is not None and r.dispatch_ms is not None
+                            and light.dispatch_ms + light.last_output_ms > r.dispatch_ms for r in matches)
+                    if (exercised and light.valid and light.status == "completed"
+                            and light.workload.get("observed_overlap", 0) >= 2
+                            and light.completion_tokens is not None and light.completion_tokens >= 64):
+                        shape_qualified.append(light)
                 observed = row["achieved_overlap"] >= 2
-                qualified = (
-                    observed
-                    and control["completed"] >= minimum
-                    and row["completed"] >= max(minimum, run.config.buckets.mixed_pairs)
-                )
+                weight = run.config.buckets.heavy_weights.get(row["workload"].get("heavy_type"), 1)
+                qualified = (control["completed"] >= minimum
+                             and len(shape_qualified) >= max(minimum, run.config.buckets.mixed_pairs * weight))
+                qualified_stats = stats(shape_qualified)
+                ratio = (qualified_stats["p50_ms"] / control["p50_ms"]
+                         if qualified_stats["p50_ms"] is not None and control["p50_ms"] else ratio)
                 comparisons.append(
                     {
                         "scenario": name,
@@ -640,12 +716,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "latency_ratio": ratio,
                         "overlap_observed": observed,
                         "samples_and_overlap_qualified": qualified,
+                        "shape_qualified_samples": len(shape_qualified),
                     }
                 )
                 if not qualified and status != "fail":
                     status, summary = (
                         "inconclusive",
-                        "Mixed-load comparison lacks sufficient control/load samples or observed overlap.",
+                        "Mixed-load comparison lacks sufficient samples, observed overlap or exercised light/heavy shapes.",
                     )
                 if (
                     qualified
@@ -658,6 +735,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "fail",
                         "Short-request latency exceeded the configured mixed-load ratio.",
                     )
+            if run.config.limits.fairness_max_ratio is None and status != "fail":
+                status, summary = "inconclusive", "effect observed; no acceptance ratio configured"
             metrics["comparisons"] = comparisons
             if not comparisons:
                 status = "inconclusive"
@@ -694,9 +773,30 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if check != "tools"
             else [r for r in records if r.workload.get("selection") == "automatic"]
         )
+        if check == "consistency" and not run.config.consistency.logprobs:
+            comparisons = []
+            for name, entry in groups.items():
+                identity = entry["workload"]
+                baseline = next((v for v in groups.values() if v["workload"].get("level") == 1
+                    and v["workload"].get("input_bucket") == identity.get("input_bucket")
+                    and v["workload"].get("prompt_index") == identity.get("prompt_index")), None)
+                hashes = entry["distinct_answer_hashes"]
+                control_hashes = baseline["distinct_answer_hashes"] if baseline else {}
+                modal = max(control_hashes, key=control_hashes.get) if control_hashes else None
+                agreement = hashes.get(modal, 0) / sum(hashes.values()) if hashes and modal else None
+                entry["level1_agreement_rate"] = agreement
+                comparisons.append({"scenario": name, "level": identity["level"],
+                                    "level1_modal_hash": modal, "agreement_rate": agreement})
+                if identity["level"] != 1 and agreement is not None and agreement < 1:
+                    status, summary = (("fail", "Strict cross-level answer consistency violated against level-1 modal answer.")
+                        if run.config.consistency.strict else
+                        (status, "Cross-level answer variation observed; diagnostic without strict mode."))
+                if agreement is None and status != "fail":
+                    status, summary = "inconclusive", "Missing comparable level-1 answer baseline."
+            metrics["cross_level"] = comparisons
         if check == "consistency" and run.config.consistency.logprobs:
             from giraffe.logprob_workload import summarize_logprobs
-            metrics["logprobs"] = summarize_logprobs(records, run.config.consistency)
+            metrics["logprobs"] = summarize_logprobs(records, run.config.consistency, min_samples=minimum)
             probability_status = metrics["logprobs"]["status"]
             if probability_status == "fail" or (probability_status == "inconclusive" and status != "fail"):
                 status, summary = probability_status, "Token probability consistency or capability expectation is not satisfied; see independent probability outcomes."

@@ -10,11 +10,11 @@ max_requests: 64
 max_duration_seconds: 600
 request_timeout_seconds: 90
 retention: all
-limits: {min_samples: 2}
+limits: {min_samples: 5}
 consistency:
   levels: [1, 4]
   shapes: [short]
-  repetitions: 4
+  repetitions: 5
   temperature: 0
   seed: 17
   strict: false
