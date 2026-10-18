@@ -433,6 +433,139 @@ class RequestPackMessage(Model):
         return self
 
 
+class ToolContractModel(Model):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+
+def finite_tool_json(value: Any) -> int:
+    """Validate arbitrary tool JSON without including private inputs in errors."""
+    try:
+        return len(json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8"))
+    except (ValueError, TypeError, UnicodeError, RecursionError) as error:
+        raise ValueError("tool configuration must contain finite JSON values") from error
+
+
+class ToolContentExpectation(ToolContractModel):
+    mode: Literal["exact", "contains"] = "exact"
+    value: str = Field(max_length=1_000_000)
+    normalization: Literal["none", "whitespace"] = "none"
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if self.mode == "contains" and not self.value.strip():
+            raise ValueError("contains content expectation must contain non-empty text")
+        return self
+
+
+class ExpectedToolCall(ToolContractModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    arguments: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_arguments(self):
+        finite_tool_json(self.arguments)
+        return self
+
+
+class ToolExpectation(ToolContractModel):
+    tools: list[dict[str, Any]] = Field(min_length=1, max_length=16)
+    expected_calls: list[ExpectedToolCall] = Field(min_length=1, max_length=16)
+    expected_content: ToolContentExpectation | None = None
+
+    @model_validator(mode="after")
+    def validate_tools(self):
+        from jsonschema import ValidationError as SchemaValidationError
+        from giraffe.tool_schema import bounded_json_tree, bounded_tool_schema
+
+        finite_tool_json(self.tools)
+        schemas = {}
+        for tool in self.tools:
+            function = tool.get("function")
+            if tool.get("type") != "function" or not isinstance(function, dict):
+                raise ValueError("tools require function definitions")
+            if set(tool) - {"type", "function"} or set(function) - {"name", "description", "parameters", "strict"}:
+                raise ValueError("unsupported tool function definition fields")
+            if "description" in function and not isinstance(function["description"], str):
+                raise ValueError("tool descriptions must be text")
+            if "strict" in function and not isinstance(function["strict"], bool):
+                raise ValueError("tool strict must be a boolean")
+            name = function.get("name")
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                raise ValueError("tool function names must contain 1..64 letters, digits, underscores or hyphens")
+            if name in schemas:
+                raise ValueError("tool function names must be unique")
+            schema = function.get("parameters")
+            if not isinstance(schema, dict):
+                raise ValueError("tool function parameters require a JSON schema object")
+            bounded_tool_schema(schema)
+            schemas[name] = schema
+        for call in self.expected_calls:
+            if call.name not in schemas:
+                raise ValueError("every expected function must exist in tools")
+            if call.arguments is not None:
+                bounded_json_tree(call.arguments)
+                try:
+                    bounded_tool_schema(schemas[call.name], instance=call.arguments).validate(call.arguments)
+                except SchemaValidationError as error:
+                    raise ValueError("expected tool arguments do not satisfy the bounded schema") from error
+        return self
+
+
+class ToolFixture(ToolExpectation):
+    fixture_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    messages: list[RequestPackMessage] = Field(min_length=1, max_length=64)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_fixture(self):
+        if not self.fixture_id.strip():
+            raise ValueError("fixture_id must contain text")
+        if {"tools", "tool_choice"}.intersection(self.options):
+            raise ValueError("options cannot override tools/tool_choice")
+        finite_tool_json(self.options)
+        validate_pack_options(self.options)
+        return self
+
+
+class ToolChecks(ToolContractModel):
+    fixtures: list[ToolFixture] = Field(default_factory=list, max_length=16)
+    modes: list[Literal["complete", "stream"]] | None = Field(default=None, min_length=1, max_length=2)
+
+    @model_validator(mode="before")
+    @classmethod
+    def bounded_input(cls, value):
+        if isinstance(value, dict):
+            values = dict(value)
+            if isinstance(values.get("fixtures"), list):
+                values["fixtures"] = [item.model_dump(mode="python") if isinstance(item, ToolFixture) else item
+                                      for item in values["fixtures"]]
+            if finite_tool_json(values) > 65536:
+                raise ValueError("tool_checks must not exceed 64 KiB")
+        return value
+
+    @model_validator(mode="after")
+    def validate_checks(self):
+        if finite_tool_json(self.model_dump(mode="python")) > 65536:
+            raise ValueError("tool_checks must not exceed 64 KiB")
+        ids = [fixture.fixture_id for fixture in self.fixtures]
+        if len(ids) != len(set(ids)):
+            raise ValueError("tool fixture IDs must be unique")
+        if self.modes is not None and len(self.modes) != len(set(self.modes)):
+            raise ValueError("tool modes must be unique")
+        return self
+
+
+class ToolCheckOutcome(ToolContractModel):
+    status: Literal["pass", "fail", "inconclusive", "not_checked"]
+    message: str
+
+
+class ToolEvaluation(ToolContractModel):
+    protocol: ToolCheckOutcome
+    calls: ToolCheckOutcome
+    content: ToolCheckOutcome
+
+
 class RequestPackCase(Model):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True,
                               serialize_by_alias=True)
@@ -595,6 +728,7 @@ class RunConfig(Model):
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
+    tool_checks: ToolChecks | None = None
     metrics_max_age_seconds: float = Field(default=60, gt=0)
     overlap_models: bool = False
     stream: bool = True
@@ -623,7 +757,8 @@ class RunConfig(Model):
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
                                  ("buckets", "buckets"), ("sessions", "sessions"),
-                                 ("consistency", "consistency"), ("tool_calling", "tools")):
+                                 ("consistency", "consistency"), ("tool_calling", "tools"),
+                                 ("tool_checks", "tools")):
                 if getattr(self, field):
                     self.checks.append(check)
             if self.buckets:
@@ -632,6 +767,9 @@ class RunConfig(Model):
         self.checks = list(dict.fromkeys(self.checks))
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
         self.tool_calling = "tools" in self.checks
+        if (self.tool_calling and self.tool_checks and self.tool_checks.modes
+                and "stream" in self.tool_checks.modes and not self.stream):
+            raise ValueError("tool_checks stream mode requires global stream=true")
         # Selecting a workload in the UI runs its defaults. Retain unselected
         # settings for later edits without silently selecting their checks.
         if "arrivals" in self.checks and self.arrivals is None:
@@ -784,6 +922,7 @@ class RequestSpec(Model):
     expected: Any = None
     expected_provided: bool = False
     rubric: str | None = None
+    tool_expectation: ToolExpectation | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
     max_tokens: int | None = Field(default=None, ge=1)
     stream: bool = True
@@ -795,6 +934,14 @@ class RequestSpec(Model):
     request_timeout_seconds: float | None = Field(default=None, gt=0)
     workload: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_tool_expectation(self):
+        if self.tool_expectation is not None and self.scorer != "tool":
+            raise ValueError("tool_expectation requires the tool scorer")
+        if self.scorer == "tool" and (self.expected is not None or self.schema_ is not None or self.rubric is not None):
+            raise ValueError("tool scoring requires tool_expectation instead of expected/schema/rubric")
+        return self
+
 
 class EvaluationEvidence(Model):
     """The actual input and answer check used for one request; never credentials."""
@@ -804,6 +951,7 @@ class EvaluationEvidence(Model):
     expected: Any = None
     expected_provided: bool = False
     rubric: str | None = None
+    tool_expectation: ToolExpectation | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
 
@@ -840,6 +988,9 @@ class RequestRecord(Model):
     evaluation: EvaluationEvidence | None = None
     evaluation_error: str | None = None
     logprob_evidence: LogprobEvidence | None = None
+    tool_evaluation: ToolEvaluation | None = None
+    response_events: list[dict[str, Any]] = Field(default_factory=list)
+    response_events_truncated: bool = False
     judgement: RequestJudgement | None = None
     observed_model: str | None = None
     backend_id: str | None = None

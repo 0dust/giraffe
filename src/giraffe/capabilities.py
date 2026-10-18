@@ -29,7 +29,7 @@ CHECK_DESCRIPTIONS = {
     "mixed": "Do long questions or answers slow down short requests?",
     "sessions": "Can the model handle several conversations at once?",
     "consistency": "Does the model answer consistently across repeated requests?",
-    "tools": "Does the model return the requested tool call correctly?",
+    "tools": "Does the model return the requested tool calls and required assistant text?",
 }
 
 CHECK_DETAILS = {
@@ -51,7 +51,7 @@ CHECK_DETAILS = {
     "mixed": "Runs short requests alongside requests with long questions or long answers, then measures how much the short requests slow down. Request sizes and the mix can be changed in JSON.",
     "sessions": "Runs several conversations at once. Later turns use either prepared history or actual earlier answers, depending on the JSON settings.",
     "consistency": "Repeats questions with different request shapes and numbers of requests at a time, then compares the answers. It checks consistency for these examples, not every possible question.",
-    "tools": "Checks the format, tool name and arguments in the model's requested tool call. Giraffe does not execute the tool.",
+    "tools": "Checks response protocol, configured tool names and arguments, and optional assistant text requirements separately. Giraffe does not execute tools.",
 }
 
 

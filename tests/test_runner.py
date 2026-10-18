@@ -108,6 +108,38 @@ async def test_disabled_backend_verification_preserves_legacy_builtin_fingerprin
         "ab9fb04ee49e79b9e10690fdcf03fc840164dd7962f4cee9b47d53214860598b")
 
 
+@pytest.mark.parametrize("selected", [False, True])
+async def test_resolved_default_tool_fixture_changes_only_selected_identity(monkeypatch, selected):
+    from giraffe import tool_checks
+    from giraffe.reporting import _settings_reasons
+
+    settings = config(checks=["tools"] if selected else ["serving"], stream=False)
+    baseline = await runner.run_suite(settings)
+    original = tool_checks.default_tool_fixture
+
+    def changed_fixture():
+        fixture = original()
+        fixture.messages[0].content += " Explain why you select this tool."
+        return fixture
+
+    monkeypatch.setattr(tool_checks, "default_tool_fixture", changed_fixture)
+    current = await runner.run_suite(settings)
+    assert (current.manifest["fixture_pack"] != baseline.manifest["fixture_pack"]) is selected
+    assert ("Fixture pack identity differs." in _settings_reasons(current, baseline)) is selected
+
+
+async def test_resolved_tool_modes_are_part_of_workload_identity(monkeypatch):
+    from giraffe import tool_checks, workloads
+
+    settings = config(checks=["tools"])
+    baseline = await runner.run_suite(settings)
+    monkeypatch.setattr(tool_checks, "resolved_tool_modes", lambda config: ["complete"])
+    monkeypatch.setattr(workloads, "resolved_tool_modes", tool_checks.resolved_tool_modes)
+    current = await runner.run_suite(settings)
+    assert (baseline.manifest["fixture_pack"]["workload_fixture_sha256"]
+            != current.manifest["fixture_pack"]["workload_fixture_sha256"])
+
+
 def check(report, id, target="service"):
     return next(c for c in report.checks if c.id == id and c.target == target)
 
