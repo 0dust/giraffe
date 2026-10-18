@@ -31,11 +31,13 @@ buckets:
   input_chars: {short: 64, medium: 1024, long: 12288}
   output_tokens: {short: 24, medium: 64, long: 128}
   levels: [1, 2]
+  # Rounded up to a multiple of each level; lifetime overlap qualifies each sample.
   samples_per_bucket: 6
   window_seconds: 120
   mixed_pairs: 6
   heavy_weights: {long_input: 1, long_output: 1}
 sessions:
+  # Fixed history uses the seeded session name; live history feeds final answers only.
   modes: [fixed, live]
   sessions: 5
   concurrency: 2
@@ -43,6 +45,7 @@ sessions:
   delay_seconds: 0.05
 consistency:
   prompts_per_shape: 3
+  # Text repetitions also round up to a multiple of each level.
   repetitions: 6
   shapes: [short, long]
   levels: [1, 2]

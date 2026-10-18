@@ -158,14 +158,20 @@ same global budgets. Deployment snapshots and bounded serving-metrics collection
 keep configuration changes, provenance, missing data and performance evidence
 alongside an explicit baseline. The CLI, local UI, HTML and JSON expose the same
 configuration and evidence.
-Prefix acceptance requires substantial reported cached-token reuse. Size cells use
-refilling concurrency pools and qualify actual token lengths and per-sample overlap;
+Prefix acceptance requires substantial cached-token reuse on enough repeats and
+independent controls below the reuse threshold; a majority of repeat misses fails.
+Size cells qualify each request's time-weighted overlap and reported length range;
 cell windows stop dispatch without cancelling requests. Text and optional logprob
 consistency compare concurrent levels with sequential controls; strict mode fails
-cross-level answer or comparable token divergence. Sessions recall unique seeded
-facts. Mixed-load acceptance requires exercised long competitors, a known light
-passage of at least 64 tokens, and an explicit slowdown ratio. Missing evidence
-leaves these checks inconclusive; see [workload evidence](docs/workloads.md).
+answer or comparable token divergence, while correctness is reported independently.
+Logprob summaries show the maximum cross-level delta and token divergence count.
+Strict cross-level equality requires batch-invariant serving; default vLLM serving
+can diverge. Sessions refill a conversation pool and recall unique seeded facts,
+feeding final answers without inline reasoning into live history. Mixed-load
+acceptance requires exercised long competitors, a non-repetitive known light
+passage of at least 64 tokens, and an explicit slowdown ratio. Wrong light answers
+are unqualified samples. Missing evidence leaves these checks inconclusive; see
+[workload evidence](docs/workloads.md).
 
 
 Read [the workload and telemetry guide](docs/workloads.md) and use

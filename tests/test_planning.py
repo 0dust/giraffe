@@ -20,7 +20,7 @@ def plan(configuration):
 
 @pytest.mark.parametrize("checks,expected", [
     (["access", "correctness"], 7),
-    (["access", "buckets"], 91),
+    (["access", "buckets"], 100),
     (["access", "correctness", "capacity"], 42),
 ])
 def test_basic_presets_have_complete_counts_before_caps(checks, expected):
@@ -43,7 +43,7 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     ("gpu", {}, 0),
     ("arrivals", {}, 8),
     ("prefix", {}, 15),
-    ("consistency", {"consistency": {"levels": [1, 2]}}, 60),
+    ("consistency", {"consistency": {"levels": [1, 2]}}, 66),
     ("tools", {"forced_tool_diagnostic": True}, 4),
 ])
 def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, updates, expected):
@@ -65,7 +65,7 @@ def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, con
     assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
 
 
-@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 5), (2, "bounded", 35)])
+@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 5), (2, "exact", 45)])
 def test_mixed_plan_only_includes_interference_work_when_concurrency_allows_it(concurrency, kind, known):
     result = plan(config(checks=["mixed"], concurrency=concurrency))
     assert result["count_kind"] == kind
@@ -134,7 +134,7 @@ def test_saved_dataset_does_not_replace_generated_buckets_or_activate_judges():
             "scorer": "judge", "expected": "Answer"}]},
     })
     result = plan(configuration)
-    assert result["planned_per_target"] == 91
+    assert result["planned_per_target"] == 100
     assert next(row for row in result["rows"] if row["id"] == "buckets")["source"] == "generated examples"
     assert result["evaluator"] == {"active": False, "call_upper_bound": 0, "judge_count": 0,
                                    "ready": True, "readiness_errors": []}

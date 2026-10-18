@@ -81,7 +81,7 @@ class Buckets(Model):
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     samples_per_bucket: int = Field(
         default=5, ge=2, le=100,
-        description="Minimum requests per input/output pair at each level. Requests refill as soon as a slot is free.",
+        description="Minimum requests per input/output pair at each level, rounded up to full load groups. Requests refill as soon as a slot is free.",
     )
     window_seconds: float = Field(default=30, gt=0)
     mixed_pairs: int = Field(default=5, ge=1, le=100)
@@ -114,7 +114,8 @@ class Sessions(Model):
     turns: list[str] = Field(default_factory=lambda: [
         "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop.",
         SESSION_REPEAT_PROMPT])
-    saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"])
+    saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"],
+        description="Retained for config compatibility; seeded name-recall histories use the session name at every turn.")
     delay_seconds: float = Field(default=0, ge=0, le=60)
     max_tokens: int = Field(default=32, ge=1)
     # Stop rather than inventing an answer or silently cropping required history.
@@ -126,8 +127,6 @@ class Sessions(Model):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= 32 or any(not t.strip() or len(t) > 8192 for t in self.turns):
             raise ValueError("sessions need 2..32 non-empty bounded user turns")
-        if "fixed" in self.modes and len(self.saved_answers) < len(self.turns) - 1:
-            raise ValueError("fixed history needs a saved assistant answer for each prior turn")
         return self
 
 
@@ -168,7 +167,8 @@ class LogprobEvidence(Model):
 
 class Consistency(Model):
     logprobs: LogprobConsistency | None = None
-    repetitions: int = Field(default=5, ge=2, le=100)
+    repetitions: int = Field(default=5, ge=2, le=100,
+        description="Text repetitions round up to full load groups; logprob mode uses exactly this many measured rounds.")
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     shapes: list[Literal["short", "long"]] = Field(default_factory=lambda: ["short", "long"])
     prompts_per_shape: int = Field(default=3, ge=2, le=16)

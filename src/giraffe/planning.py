@@ -6,10 +6,10 @@ import math
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
-from giraffe.logprob_workload import corpus_width
+from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
-from giraffe.workloads import bucket_spec, label_prompt
+from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt
 
 
 def _steady_count(rate: float, duration: float) -> int:
@@ -194,8 +194,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                                      "output_tokens": request.max_tokens})
         if "buckets" in selected:
             bucket_levels = [{"concurrency": level,
-                              "requests_per_case": max(settings.samples_per_bucket, level),
-                              "requests_per_target": 9 * max(settings.samples_per_bucket, level)}
+                              "requests_per_case": sample_count(settings.samples_per_bucket, level),
+                              "requests_per_target": 9 * sample_count(settings.samples_per_bucket, level)}
                              for level in settings.levels]
             add("buckets", sum(level["requests_per_target"] for level in bucket_levels),
                 "Tries every question length with every answer cap at each selected load. Each combination sends enough requests to reach that load.",
@@ -210,28 +210,32 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 add("mixed", 0, "Requires concurrency of at least two; only quiet controls run.")
             else:
                 pairs = sum(settings.heavy_weights.values()) * settings.mixed_pairs
-                add("mixed_fixed", 3 * pairs,
-                    "Two requests per before-output pair and the short request of each active-stream pair.",
-                    title="Fixed mixed-load requests")
-                add("mixed", None, f"Up to {pairs} heavy requests start only while a short response is streaming.",
-                    kind="bounded")
+                add("mixed", 4 * pairs,
+                    "Two requests per pair in each of the before-output and active-stream trials; buffered light responses leave overlap unqualified.")
         if config.request_pack is not None:
             warnings.append("Size and mixed-load tests use generated questions. Your saved questions are kept for answer and rate tests.")
     if "sessions" in selected:
         settings = config.sessions
-        maximum = len(settings.modes) * settings.sessions * len(settings.turns)
-        add("sessions", None,
-            f"Up to {maximum} requests; prior responses and history admission determine whether later turns run.",
-            source="configured session prompts and saved/live history", kind="bounded")
+        fixed = sum(fixed_session_turns(settings, index, config.context_limit)
+                    for index in range(settings.sessions)) if "fixed" in settings.modes else 0
+        if "live" in settings.modes:
+            add("sessions", None,
+                f"{fixed} fixed-history requests and up to {settings.sessions * len(settings.turns)} live requests; actual final-answer lengths determine live history admission.",
+                source="configured session prompts and saved/live history", kind="bounded")
+        else:
+            add("sessions", fixed,
+                "Fixed seeded histories with exact character admission; failed responses or shared budgets can stop sessions early.",
+                source="configured session prompts and seeded fixed history")
     if "consistency" in selected:
         settings = config.consistency
         levels = len(set([1, *settings.levels]))
-        count = len(settings.shapes) * levels * settings.repetitions * settings.prompts_per_shape
+        count = len(settings.shapes) * settings.prompts_per_shape * sum(
+            sample_count(settings.repetitions, level) for level in set([1, *settings.levels]))
         if settings.logprobs:
             count = len(settings.shapes) * levels * corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
             add("consistency", count, f"{settings.repetitions} measured rounds plus {settings.logprobs.priming_rounds} priming rounds per shape and level; {corpus_width(settings)} fixed corpus requests per round. Complete responses with logprobs enabled; client overlap does not prove server batching.")
         else:
-            add("consistency", count, f"{settings.repetitions} repeats of {settings.prompts_per_shape} distinct prompts per shape and level, including sequential controls once.")
+            add("consistency", count, f"At least {settings.repetitions} repeats of {settings.prompts_per_shape} distinct prompts per shape and level, rounded up to full load groups, including sequential controls once.")
     if "tools" in selected:
         count = (2 if config.forced_tool_diagnostic else 1) * (2 if config.stream else 1)
         add("tools", count, "Generated weather-tool requests for each selected automatic/forced and streaming/completed mode.")
@@ -246,7 +250,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "mixed" in selected:
         sample_counts["buckets.mixed_pairs"] = config.buckets.mixed_pairs
     if "consistency" in selected:
-        sample_counts["consistency.repetitions"] = config.consistency.repetitions
+        if config.consistency.logprobs:
+            sample_counts["consistency.logprob measured samples"] = config.consistency.repetitions * corpus_width(config.consistency)
+        else:
+            sample_counts["consistency.repetitions"] = config.consistency.repetitions
     if "sessions" in selected:
         sample_counts["sessions.sessions"] = config.sessions.sessions
     for name, count in sample_counts.items():

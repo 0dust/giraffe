@@ -158,7 +158,7 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
             status="completed",
             valid=True,
             elapsed_ms=elapsed,
-            overlap=overlap,
+            overlap=overlap, score=True,
         )
         for name, elapsed, overlap in [
             ("mixed_control", 10, 1),
@@ -207,7 +207,7 @@ def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
             id=f"{scenario}-{index}", target="local", fixture_id=scenario,
             scenario=scenario, check_ids=["mixed"], started_at="2026-10-08T00:00:00Z",
             status="completed", valid=True, elapsed_ms=elapsed, overlap=achieved,
-            completion_tokens=96, input_tokens=100, requested_max_tokens=128,
+            completion_tokens=96, input_tokens=100, requested_max_tokens=128, score=True,
         )
         for scenario, count, elapsed, achieved in [
             ("mixed_control", control_samples, 10, 1),
@@ -249,6 +249,16 @@ def test_workload_timing_uses_core_generator_qualification(lag, warm_first, corr
                 started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
                 elapsed_ms=100, first_output_ms=20, score=correct, input_chars=512,
                 input_tokens=128, cached_prompt_tokens=128, workload={"shared_prefix_chars": 512},
+            )
+            for index in range(3)
+        ],
+        *[
+            RequestRecord(
+                id=f"control-{index}", target="local", fixture_id="control",
+                scenario="prefix_independent", check_ids=["prefix"],
+                started_at="2026-10-08T00:00:00Z", status="completed", valid=True,
+                elapsed_ms=100, first_output_ms=20, score=True, input_chars=512,
+                input_tokens=128, cached_prompt_tokens=0, workload={"shared_prefix_chars": 512},
             )
             for index in range(3)
         ],
@@ -427,14 +437,17 @@ async def test_consistency_hashes_before_retention_and_separates_task_correctnes
                    retention="none", stop_after_errors=100)
         )
         calls = [
-            p for p in endpoint.requests if p["messages"][-1]["content"].startswith("The box label")
+            p for p in endpoint.requests if p["messages"][-1]["content"].startswith("Copy the following text exactly")
         ]
     result = check(report, "consistency")
     buckets = result.metrics["buckets"]
     assert len(buckets) == 6
     assert all(len(p["messages"]) == 1 for p in calls)
-    if mode in {"wrong", "http_error"}:
+    if mode == "http_error":
         assert result.status == "fail"
+    elif mode == "wrong":
+        assert result.status == "pass"
+        assert result.metrics["correctness_observed"] == 0
     elif mode == "healthy":
         assert all(b["agreement_rate"] == 1 for b in buckets.values())
     elif mode == "variable_correct":

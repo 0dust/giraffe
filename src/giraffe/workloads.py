@@ -9,7 +9,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from giraffe.logprob_workload import corpus_width, refill
+from giraffe.fixtures import final_answer
+from giraffe.logprob_workload import corpus_width, refill, sample_count
 from giraffe.models import CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec
 
 # One settings block can drive multiple selectable workloads.
@@ -40,10 +41,62 @@ def spec(prompt, scenario, check, *, expected=None, max_tokens=24, options=None,
     )
 
 
+def deterministic_options(config, options=None):
+    options = dict(options or {})
+    if "temperature" not in config.request_options:
+        options.setdefault("temperature", 0)
+    return options
+
+
+def consistency_options(config, options=None):
+    options = dict(options or {})
+    settings = config.consistency
+    if "temperature" in settings.model_fields_set:
+        options["temperature"] = settings.temperature
+    if settings.seed is not None:
+        options["seed"] = settings.seed
+    return deterministic_options(config, options)
+
+
+COPY_PASSAGES = (
+    "At sunrise, Mira opened the garden gate and placed a blue notebook beside the fountain. "
+    "A small brown bird landed on the fence while her neighbor carried fresh bread across the square. "
+    "By noon, the clouds had cleared, and three children were drawing a map beneath the old oak tree. "
+    "Before leaving, she watered the roses, closed the wooden shutters, and left a note for the evening caretaker.",
+    "The museum keeper found a brass key inside an empty ceramic bowl. "
+    "Outside, a bicycle rested against the stone wall beside a basket of oranges. "
+    "Later that afternoon, a visitor returned a borrowed book with a pressed fern between its pages.",
+    "On Tuesday, the harbor bell rang just before the first ferry arrived. "
+    "An engineer checked the red signal lamp while a baker delivered six warm rolls to the ticket office. "
+    "As the rain stopped, a traveler unfolded a green umbrella and walked toward the eastern pier.",
+)
+
+
+def session_prompt(prompt, turn, value):
+    return prompt + (f"\nUse this exact bakery name for this session: {value}. Reply with that name only."
+                     if turn == 0 else "\nReply with the original session bakery name only.")
+
+
+def fixed_session_turns(settings, index, context_limit):
+    value = f"Session_{index:04d}_fixed"
+    history_chars = 0
+    for turn, prompt in enumerate(settings.turns):
+        chars = len(session_prompt(prompt, turn, value))
+        if history_chars + chars + settings.max_tokens + 32 > context_limit:
+            return turn
+        history_chars += chars + len(value)
+    return len(settings.turns)
+
+
+LABEL_INSTRUCTION = "\nThe box label is K7P4. Reply with the box label only."
+
+
+def label_context(chars, prefix=""):
+    return (" The box is gray." * (chars // 17 + 1))[: max(0, chars - len(prefix + LABEL_INSTRUCTION))]
+
+
 def label_prompt(chars, prefix=""):
-    final = "\nThe box label is K7P4. Reply with the box label only."
-    filler = (" The box is gray." * (chars // 17 + 1))[: max(0, chars - len(prefix + final))]
-    return prefix + filler + final
+    return prefix + label_context(chars, prefix) + LABEL_INSTRUCTION
 
 
 async def arrivals(run, target, client, fixtures):
@@ -180,6 +233,7 @@ async def prefixes(run, target, client):
                 order=index,
                 cache_state="first unique use is not proof of empty server cache",
             )
+            request.options = deterministic_options(run.config, request.options)
             if not await run.request(target, client, request):
                 return
     history = []
@@ -195,6 +249,7 @@ async def prefixes(run, target, client):
                 "Conservative character admission ceiling reached; no history cropped."
             )
             break
+        request.options = deterministic_options(run.config, request.options)
         if not await run.request(target, client, request):
             break
         history = [*messages, {"role": "assistant", "content": "K7P4"}]
@@ -234,13 +289,14 @@ async def buckets(run, target, client):
     settings = run.config.buckets
     if "buckets" in run.config.checks:
         for level in settings.levels:
-            samples = max(settings.samples_per_bucket, level)
+            samples = sample_count(settings.samples_per_bucket, level)
             for input_shape in ("short", "medium", "long"):
                 for output_shape in ("short", "medium", "long"):
                     scenario = f"bucket_c{level}_{input_shape}_{output_shape}"
                     request = bucket_spec(
                         settings, input_shape, output_shape, scenario, "buckets", level, run.config.context_limit
                     )
+                    request.options = deterministic_options(run.config, request.options)
                     end = min(run.deadline, time.monotonic() + settings.window_seconds)
                     await refill(run, target, client, [request], samples, level, end=end)
     if "mixed" not in run.config.checks:
@@ -248,10 +304,10 @@ async def buckets(run, target, client):
     if run.config.max_output_tokens < 96:
         run.unfinished[target.name].add("mixed")
         return
-    answer = " ".join(["The calm river flows past green fields."] * 10)
+    answer = COPY_PASSAGES[0]
     short = spec(f"Copy the following text exactly, with no extra text:\n{answer}",
                  "mixed_control", "mixed", expected=answer,
-                 max_tokens=min(192, run.config.max_output_tokens), options={"temperature": 0})
+                 max_tokens=min(192, run.config.max_output_tokens), options=deterministic_options(run.config))
     await run.group(target, client, [short], "mixed_control", count=settings.mixed_pairs)
     if run.config.concurrency < 2:
         run.unfinished[target.name].add("mixed")
@@ -272,6 +328,7 @@ async def buckets(run, target, client):
                     2,
                     run.config.context_limit,
                 )
+                heavy.options = deterministic_options(run.config, heavy.options)
                 pair = block * settings.mixed_pairs + index
                 heavy.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
                 light = short.model_copy(deep=True)
@@ -307,15 +364,12 @@ async def buckets(run, target, client):
                     waiter = asyncio.create_task(event.wait())
                     try:
                         await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
-                        if event.is_set() and not first.done():
-                            heavy.workload["short_stream_active_at_dispatch"] = True
-                            def heavy_started():
-                                heavy.workload["short_stream_active_at_dispatch"] = not first.done()
-                            heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
-                            if heavy_row is not None:
-                                heavy_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
-                        else:
-                            run.unfinished[target.name].add("mixed")
+                        heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
+                        def heavy_started():
+                            heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
+                        heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
+                        if heavy_row is not None:
+                            heavy_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
                         light_row = await first
                         if light_row is not None:
                             light_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
@@ -352,8 +406,7 @@ async def sessions(run, target, client):
             await asyncio.sleep(
                 max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
             )
-            prompt += (f"\nUse this exact bakery name for this session: {value}. Reply with that name only."
-                       if turn == 0 else "\nReply with the original session bakery name only.")
+            prompt = session_prompt(prompt, turn, value)
             messages = [*history, {"role": "user", "content": prompt}]
             input_chars = sum(len(m["content"]) for m in messages)
             if input_chars + settings.max_tokens + 32 > run.config.context_limit:
@@ -376,6 +429,7 @@ async def sessions(run, target, client):
             )
             request.messages, request.input_chars = messages, input_chars
             request.scorer, request.expected = "exact", value
+            request.options = deterministic_options(run.config, request.options)
             record = await run.request(target, client, request)
             if record is None:
                 item["stop_reason"] = run.reason or "request budget reached"
@@ -386,7 +440,7 @@ async def sessions(run, target, client):
                 not record.valid
                 or record.status != "completed"
                 or record.finish_reason == "length"
-                or record.score is False
+                or record.score is not True
             ):
                 item["stop_reason"] = (
                     "failed task/transport, cancelled or truncated turn; stopped without substitute answer"
@@ -400,27 +454,23 @@ async def sessions(run, target, client):
                 item["stop_reason"] = "observed context budget reached"
                 run.unfinished[target.name].add("sessions")
                 break
-            if mode == "live":
-                previous = record.output
-            elif turn == 0:
-                previous = value
-            elif turn < len(settings.saved_answers):
-                previous = settings.saved_answers[turn]
-            else:
-                previous = ""
+            previous = final_answer(record.output)[0] if mode == "live" else value
             history = [*messages, {"role": "assistant", "content": previous}]
             due = time.monotonic() + settings.delay_seconds
         item["completed_turns"] = len(item["turns"])
         item["planned_turns"] = len(settings.turns)
 
     for mode in settings.modes:
-        for start in range(0, settings.sessions, settings.concurrency):
-            await asyncio.gather(
-                *(
-                    session(mode, index)
-                    for index in range(start, min(start + settings.concurrency, settings.sessions))
-                )
-            )
+        next_index = 0
+
+        async def worker():
+            nonlocal next_index
+            while next_index < settings.sessions:
+                index = next_index
+                next_index += 1
+                await session(mode, index)
+
+        await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
 
 
 async def consistency(run, target, client, fixtures):
@@ -431,23 +481,24 @@ async def consistency(run, target, client, fixtures):
         return
     for shape in settings.shapes:
         for prompt_index in range(settings.prompts_per_shape):
-            base = fixtures[shape][0].model_copy(deep=True)
-            if prompt_index:
-                answer = " ".join(f"The numbered item {i} is ready." for i in range(1, 5 + prompt_index))
-                prompt = base.messages[0]["content"] + f"\nInstead, copy this text exactly:\n{answer}"
-                base.messages = [{"role": "user", "content": prompt}]
-                base.input_chars, base.expected, base.scorer = len(prompt), answer, "exact"
-                base.max_tokens = min(128, run.config.max_output_tokens)
-            base.options.update(temperature=settings.temperature)
-            if settings.seed is not None:
-                base.options["seed"] = settings.seed
+            answer = COPY_PASSAGES[prompt_index % len(COPY_PASSAGES)]
+            if prompt_index >= len(COPY_PASSAGES):
+                answer += f" The parcel tag reads R{prompt_index:04d}."
+            context = ""
+            if shape == "long":
+                context = label_context(max(64, (run.config.context_limit - 256) * 2))
+                context += "\nThe background above is context only.\n"
+            prompt = context + f"Copy the following text exactly, with no extra text:\n{answer}"
+            base = spec(prompt, "consistency", "consistency", expected=answer,
+                        max_tokens=min(192, run.config.max_output_tokens),
+                        options=consistency_options(run.config))
             for level in dict.fromkeys([1, *settings.levels]):
                 base.scenario = f"consistency_c{level}_{shape}_p{prompt_index}"
                 base.check_ids = ["consistency"]
                 base.workload = {"level": level, "input_bucket": shape, "prompt_index": prompt_index,
-                                 "equality": settings.equality, "temperature": settings.temperature,
+                                 "equality": settings.equality, "temperature": (run.config.request_options | base.options).get("temperature"),
                                  "seed": settings.seed, "option_support": "requested; runtime enforcement unverified"}
-                await refill(run, target, client, [base], settings.repetitions, level)
+                await refill(run, target, client, [base], sample_count(settings.repetitions, level), level)
 
 
 TOOL = {
@@ -484,6 +535,7 @@ async def tools(run, target, client):
                 capability="required when selected",
             )
             request.scorer, request.stream = "tool", stream
+            request.options = deterministic_options(run.config, request.options)
             await run.request(target, client, request)
 
 
@@ -532,14 +584,17 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 hashes = Counter(
                     r.answer_hash
                     for r in items
-                    if r.valid and r.status == "completed" and r.answer_hash
+                    if r.valid and r.status == "completed" and r.finish_reason != "length"
+                    and final_answer(r.output)[0].strip() and r.answer_hash
                 )
                 entry.update(
                     distinct_answer_hashes=dict(hashes),
                     agreement_rate=max(hashes.values()) / sum(hashes.values()) if hashes else None,
                     equality=run.config.consistency.equality,
                     correctness=entry["correct"] / entry["scored"] if entry["scored"] else None,
-                    expected_samples=run.config.consistency.repetitions * (corpus_width(run.config.consistency) if run.config.consistency.logprobs else 1),
+                    expected_samples=(run.config.consistency.repetitions * corpus_width(run.config.consistency)
+                                      if run.config.consistency.logprobs else
+                                      sample_count(run.config.consistency.repetitions, items[0].workload["level"])),
                     interpretation="Run-to-run repeatability within this level.",
                 )
                 if len(hashes) > 1 and run.config.consistency.strict:
@@ -547,12 +602,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "fail",
                         "Configured strict consistency violated; correctness is reported independently.",
                     )
-                if len(hashes) > 1 and not run.config.consistency.strict:
+                if len(hashes) > 1 and not run.config.consistency.strict and status == "pass":
                     summary = "Answer variation observed; variation alone is diagnostic, not a correctness failure."
                 if (
                     len(items) < entry["expected_samples"]
-                    or entry["completed"] < minimum
-                    or sum(r.workload.get("load_qualified", False) for r in items) < minimum
+                    or sum(hashes.values()) < minimum
+                    or sum(r.valid and r.status == "completed" and r.finish_reason != "length"
+                           and r.workload.get("load_qualified", False) for r in items) < minimum
                 ):
                     if status != "fail":
                         status, summary = (
@@ -566,7 +622,6 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     r.valid and r.status == "completed" and r.workload.get("load_qualified", False)
                     and r.output_tokens is not None and r.output_tokens >= expected * 0.5 for r in items
                 )
-                requested = items[0].workload["requested_input_chars"]
                 siblings = {shape: [r.input_tokens for r in records if r.valid
                             and r.workload.get("load_qualified", False) and r.status == "completed" and r.input_tokens is not None
                             and r.workload.get("level") == level
@@ -575,15 +630,23 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             for shape in ("short", "medium", "long")}
                 medians = [sorted(values)[len(values) // 2] if values else None for values in siblings.values()]
                 ordered = all(value is not None for value in medians) and medians[0] < medians[1] < medians[2]
-                entry["input_length_verified"] = sum(ordered and r.valid and r.status == "completed"
-                    and r.workload.get("load_qualified", False) and r.input_tokens is not None
-                    and requested / 10 <= r.input_tokens <= requested / 1.5 + 32 for r in items)
+                requested_sizes = [next((r.workload["requested_input_chars"] for r in records
+                    if r.workload.get("level") == level and r.workload.get("input_bucket") == shape
+                    and r.workload.get("output_bucket") == items[0].workload["output_bucket"]), 0)
+                    for shape in ("short", "medium", "long")]
+                observed_token_span = medians[2] - medians[0] if ordered else 0
+                requested_character_span = requested_sizes[2] - requested_sizes[0]
+                span_verified = (ordered and requested_character_span > 0
+                                 and observed_token_span >= requested_character_span / 10)
+                entry["input_token_medians"] = dict(zip(siblings, medians))
+                entry["input_length_verified"] = sum(span_verified and r.valid and r.status == "completed"
+                    and r.workload.get("load_qualified", False) and r.input_tokens is not None for r in items)
                 entry["qualified_samples"] = sum(r.valid and r.status == "completed"
                                                   and r.workload.get("load_qualified", False) for r in items)
                 entry["tail_samples"] = [r.id for r in items if not r.workload.get("load_qualified", False)]
-                entry["time_weighted_inflight"] = items[0].workload.get("time_weighted_inflight")
+                entry["time_weighted_inflight"] = items[0].workload.get("cell_time_weighted_inflight")
                 gaps = []
-                entry["expected_samples"] = max(run.config.buckets.samples_per_bucket, level)
+                entry["expected_samples"] = sample_count(run.config.buckets.samples_per_bucket, level)
                 if len(items) < entry["expected_samples"] or entry["completed"] < minimum:
                     gaps.append("Insufficient requested or successful samples.")
                 if entry["qualified_samples"] < minimum:
@@ -592,7 +655,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         and entry["output_length_exercised"] < minimum):
                     gaps.append("Requested output length was not sufficiently exercised; a cap alone is not coverage.")
                 if entry["input_length_verified"] < minimum:
-                    gaps.append("input length not exercised: require short < medium < long and tokens close to requested sizes.")
+                    gaps.append("input length not exercised: require short < medium < long and a token span of at least the character span / 10.")
                 entry["coverage_gaps"] = gaps
                 if gaps:
                     if status != "fail":
@@ -620,18 +683,34 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             independent = [r for r in records if r.scenario == "prefix_independent"]
             first, repeat = stats(shared[:1]), stats(shared[1:])
             observed = [r for r in shared[1:] if r.valid and r.status == "completed"
-                        and r.cached_prompt_tokens is not None]
-            verified = []
-            for r in observed:
+                        and r.cached_prompt_tokens is not None and r.input_tokens]
+            def reused(r):
                 prefix_fraction = r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
                 threshold = max(1, int((r.input_tokens or 0) * prefix_fraction * .5) // 16 * 16)
-                if r.input_tokens and prefix_fraction and r.cached_prompt_tokens >= threshold:
-                    verified.append(r)
+                return bool(r.input_tokens and prefix_fraction and r.cached_prompt_tokens is not None
+                            and r.cached_prompt_tokens >= threshold)
+
+            verified = [r for r in observed if reused(r)]
+            controls = [r for r in independent if r.valid and r.status == "completed"
+                        and r.cached_prompt_tokens is not None and r.input_tokens]
+            misses = len(observed) - len(verified)
             metrics["cache_reuse_samples"] = len(verified)
-            if observed and any(r.cached_prompt_tokens == 0 or (r.input_tokens and r not in verified) for r in observed):
-                status, summary = "fail", "no prefix reuse observed: repeated cached tokens do not cover half the shared prefix."
-            elif len(verified) < minimum or len(observed) != len(shared[1:]):
-                status, summary = "inconclusive", "cache reuse unverified: missing cached_tokens evidence or insufficient repeated samples."
+            metrics["cache_repeat_misses"] = {"misses": misses, "observed": len(observed),
+                                              "planned": run.config.prefix.repeats - 1}
+            metrics["cache_controls_discriminative"] = bool(controls) and not any(reused(r) for r in controls)
+            counts = f"{misses} of {len(observed)} repeat misses."
+            if any(reused(r) for r in controls):
+                status, summary = "inconclusive", "cache reporting not discriminative: independent controls also report reuse; " + counts
+            elif len(controls) < minimum or len(controls) != run.config.prefix.repeats:
+                status, summary = "inconclusive", "cache reuse unverified: missing independent-control cache evidence; " + counts
+            elif misses > (run.config.prefix.repeats - 1) / 2:
+                status, summary = "fail", "no prefix reuse observed on a majority of repeats; " + counts
+            elif len(observed) < run.config.prefix.repeats - 1:
+                status, summary = "inconclusive", "cache reuse unverified: missing repeated cache/token evidence; " + counts
+            elif len(verified) < minimum:
+                status, summary = "inconclusive", "cache reuse unverified: insufficient repeats with substantial reuse; " + counts
+            else:
+                summary = "Prefix reuse observed with discriminative independent controls; " + counts
             metrics["first_repeat"] = {
                 "shared_first": first,
                 "shared_repeats": repeat,
@@ -667,7 +746,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if any(count < minimum for count in completed_sessions.values()) and status != "fail":
                 status, summary = "inconclusive", "Insufficient completed independent sessions per mode."
         if check == "mixed":
-            controls = [r for r in records if r.scenario == "mixed_control"
+            controls = [r for r in records if r.scenario == "mixed_control" and r.score is True
                         and r.completion_tokens is not None and r.completion_tokens >= 64]
             control = stats(controls)
             comparisons = []
@@ -697,7 +776,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         exercised = exercised and any(light.last_output_ms is not None
                             and light.dispatch_ms is not None and r.dispatch_ms is not None
                             and light.dispatch_ms + light.last_output_ms > r.dispatch_ms for r in matches)
-                    if (exercised and light.valid and light.status == "completed"
+                    if (exercised and light.valid and light.status == "completed" and light.score is True
                             and light.workload.get("observed_overlap", 0) >= 2
                             and light.completion_tokens is not None and light.completion_tokens >= 64):
                         shape_qualified.append(light)
@@ -735,11 +814,18 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         "fail",
                         "Short-request latency exceeded the configured mixed-load ratio.",
                     )
-            if run.config.limits.fairness_max_ratio is None and status != "fail":
-                status, summary = "inconclusive", "effect observed; no acceptance ratio configured"
+            metrics["unqualified_light_samples"] = [r.id for r in records
+                if (r.scenario == "mixed_control" or r.scenario.startswith("mixed_short")) and r.score is not True]
+            if run.config.limits.fairness_max_ratio is None and status == "pass":
+                status, summary = "inconclusive", "Mixed-load ratios measured; no acceptance ratio configured."
             metrics["comparisons"] = comparisons
             if not comparisons:
                 status = "inconclusive"
+                summary = ("Mixed workload requires an output cap of at least 96 tokens."
+                           if run.config.max_output_tokens < 96 else
+                           "Mixed workload requires concurrency of at least two."
+                           if run.config.concurrency < 2 else
+                           "No mixed-load comparisons were exercised.")
         if check == "tools":
             auto = [r for r in records if r.workload.get("selection") == "automatic"]
             expected_count = 2 if run.config.stream else 1
@@ -788,9 +874,10 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 comparisons.append({"scenario": name, "level": identity["level"],
                                     "level1_modal_hash": modal, "agreement_rate": agreement})
                 if identity["level"] != 1 and agreement is not None and agreement < 1:
-                    status, summary = (("fail", "Strict cross-level answer consistency violated against level-1 modal answer.")
-                        if run.config.consistency.strict else
-                        (status, "Cross-level answer variation observed; diagnostic without strict mode."))
+                    if run.config.consistency.strict:
+                        status, summary = "fail", "Strict cross-level answer consistency violated against level-1 modal answer."
+                    elif status == "pass":
+                        summary = "Cross-level answer variation observed; diagnostic without strict mode."
                 if agreement is None and status != "fail":
                     status, summary = "inconclusive", "Missing comparable level-1 answer baseline."
             metrics["cross_level"] = comparisons
@@ -798,7 +885,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             from giraffe.logprob_workload import summarize_logprobs
             metrics["logprobs"] = summarize_logprobs(records, run.config.consistency, min_samples=minimum)
             probability_status = metrics["logprobs"]["status"]
-            if probability_status == "fail" or (probability_status == "inconclusive" and status != "fail"):
+            if probability_status == "fail" or (probability_status == "inconclusive" and status == "pass"):
                 status, summary = probability_status, "Token probability consistency or capability expectation is not satisfied; see independent probability outcomes."
             elif status == "pass":
                 summary = "Token probability comparison completed (" + probability_status + "); answer correctness is separate."
@@ -814,9 +901,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if r.completion_tokens is not None and r.completion_tokens > r.requested_max_tokens
         ]
         metrics["output_cap_violations"] = cap_violations
+        if check in {"consistency", "mixed"}:
+            metrics["correctness_observed"] = (assessed_stats["correct"] / assessed_stats["scored"]
+                                                if assessed_stats["scored"] else None)
         if (
             cap_violations
-            or any(r.score is False for r in assessed)
+            or (check not in {"consistency", "mixed"} and any(r.score is False for r in assessed))
             or (errors is not None and errors > run.config.limits.max_error_rate)
         ):
             status, summary = (
@@ -853,11 +943,16 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 "inconclusive",
                 "Generator saturation prevents qualifying configured workload timing limits.",
             )
-        if not records or (check in run.unfinished[target.name] and status != "fail"):
+        if (not records or check in run.unfinished[target.name]) and status == "pass":
             status, summary = (
                 "inconclusive",
                 "Requested workload coverage unfinished within shared budgets.",
             )
+        if check == "consistency" and run.config.consistency.logprobs:
+            probability = metrics["logprobs"]
+            delta = probability["max_cross_level_delta"]
+            summary += (f" Maximum cross-level delta: {delta if delta is not None else 'unavailable'}; "
+                        f"token divergences: {probability['cross_level_token_divergences']}.")
         result.append(
             CheckResult(
                 id=check,
