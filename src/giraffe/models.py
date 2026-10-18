@@ -131,7 +131,43 @@ class Sessions(Model):
         return self
 
 
+class LogprobConsistency(Model):
+    response_mode: Literal["complete"] = "complete"
+    top_logprobs: int = Field(default=5, ge=0, le=20)
+    strict: bool = False
+    tolerance: float | None = Field(default=None, ge=0)
+    support: Literal["discover", "required"] = "discover"
+    priming_rounds: int = Field(default=0, ge=0, le=2)
+    compare_levels: bool = False
+
+    @model_validator(mode="after")
+    def strict_tolerance(self):
+        if self.strict and self.tolerance is None:
+            raise ValueError("strict logprob consistency requires an explicit tolerance in logprob units")
+        return self
+
+
+class LogprobAlternative(Model):
+    token: str
+    bytes: list[int] | None
+    token_id: int | None = None
+    logprob: float
+
+
+class LogprobToken(LogprobAlternative):
+    position: int
+    top_logprobs: list[LogprobAlternative]
+
+
+class LogprobEvidence(Model):
+    status: Literal["available", "missing", "invalid", "incomplete", "rejected"]
+    reason: str
+    requested_top_logprobs: int
+    tokens: list[LogprobToken] = Field(default_factory=list)
+
+
 class Consistency(Model):
+    logprobs: LogprobConsistency | None = None
     repetitions: int = Field(default=4, ge=2, le=100)
     levels: list[int] = Field(default_factory=lambda: [1, 2])
     shapes: list[Literal["short", "long"]] = Field(default_factory=lambda: ["short", "long"])
@@ -803,6 +839,7 @@ class RequestRecord(Model):
     score_message: str | None = None
     evaluation: EvaluationEvidence | None = None
     evaluation_error: str | None = None
+    logprob_evidence: LogprobEvidence | None = None
     judgement: RequestJudgement | None = None
     observed_model: str | None = None
     backend_id: str | None = None

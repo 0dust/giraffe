@@ -157,6 +157,37 @@ class FakeEndpoint:
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
 
+            def _logprobs(self, payload, mode, output):
+                with endpoint._lock:
+                    index = getattr(endpoint, "logprob_index", 0)
+                    endpoint.logprob_index = index + 1
+                endpoint._stop.wait(endpoint.first_token_delay)
+                if mode in {"logprob_rejected", "logprob_http_error"}:
+                    self._json(400 if mode == "logprob_rejected" else 503,
+                               {"error": {"param": "logprobs" if mode == "logprob_rejected" else None}})
+                    return
+                probability = -.05
+                if mode == "logprob_variable" and index >= 6:
+                    probability = [-.05, -.08, -.02][((index - 6) // 2) % 3]
+                chosen = {"token": output, "bytes": list(output.encode()), "logprob": probability}
+                alternatives = [chosen.copy(), {"token": "ALT_ONLY_SECRET", "bytes": list(b"ALT_ONLY_SECRET"), "logprob": -2.0}]
+                token = {**chosen, "top_logprobs": alternatives[:payload["top_logprobs"]]}
+                evidence = {"content": [token]}
+                if mode == "logprob_missing":
+                    evidence = None
+                elif mode == "logprob_sentinel":
+                    token["logprob"] = -9999.0
+                    token["top_logprobs"] = []
+                elif mode == "logprob_malformed":
+                    token["logprob"] = float("nan")
+                elif mode == "logprob_wrong":
+                    output = "WRONG"
+                    token.update(token=output, bytes=list(output.encode()), top_logprobs=[])
+                self._json(200, {"model": payload["model"], "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": output},
+                    "finish_reason": "length" if mode == "logprob_length" else "stop",
+                    "logprobs": evidence}], "usage": {"prompt_tokens": 32, "completion_tokens": 1}})
+
             def _completion(self, payload: dict[str, Any]) -> None:
                 prompt = "\n".join(message["content"] for message in payload["messages"])
                 applies = endpoint.fault_contains is None or endpoint.fault_contains in prompt
@@ -165,6 +196,9 @@ class FakeEndpoint:
                     self._json(503, {"error": {"message": "seeded unavailable response"}})
                     return
                 output = endpoint._answer(prompt)
+                if mode.startswith("logprob_") and payload.get("logprobs"):
+                    self._logprobs(payload, mode, output)
+                    return
                 if payload["messages"][-1]["content"].startswith("Suggest a name for a bakery"):
                     output = "Bakery_" + uuid.uuid4().hex
                 if payload["messages"][-1]["content"].startswith(("Repeat exactly the bakery name", "Repeat exactly the above answer.")):

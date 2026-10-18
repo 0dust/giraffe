@@ -617,3 +617,7 @@ A wheel was built and installed offline from cached dependencies. Other runtimes
 real multi-replica deployments, GPU exporters, Linux, and the Docker image still
 need live qualification; their supported paths have local automated coverage where
 applicable. Exported HTML report rendering was not separately visually verified.
+
+For optional token probability comparisons under concurrency, see the
+[logprob consistency guide](docs/workloads.md#token-probability-consistency) and
+[runnable vLLM configuration](examples/logprob-consistency.yaml).

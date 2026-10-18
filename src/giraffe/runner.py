@@ -113,6 +113,8 @@ class _Run:
         for _ in range(config.concurrency):
             self.slots.put_nowait(None)
         self.records: list[RequestRecord] = []
+        from giraffe.logprobs import LogprobBudget
+        self.logprob_budget = LogprobBudget()
         self.attempted = 0
         self.budget_used = 0
         self.budget_counts = Counter()
@@ -474,6 +476,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             await _metrics(run, target, "after")
             return
         async with LLMClient(target, config) as client:
+            client.logprob_budget = run.logprob_budget
             if config.metrics:
                 data = run.observations[target.name]["serving_telemetry"]
                 data["snapshots"].append(await telemetry.scrape(run, target, "start"))
@@ -1134,6 +1137,15 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     config_values = config.model_dump(mode="json")
     workload_settings = {key: config_values[key] for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
+    workload_identity = {
+        "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
+        "settings": workload_settings,
+    }
+    if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
+        from giraffe import logprobs, logprob_workload
+        workload_identity["logprob_source_sha256"] = hashlib.sha256(
+            Path(logprobs.__file__).read_bytes() + Path(logprob_workload.__file__).read_bytes()
+        ).hexdigest()
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
@@ -1153,9 +1165,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"capacity", "correctness"}
                                                     else fixture_hash(fixture_values)),
-                                 "workload_fixture_sha256": fixture_hash({
-                                     "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
-                                     "settings": workload_settings})},
+                                 "workload_fixture_sha256": fixture_hash(workload_identity)},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),
                                  "machine": platform.machine(), "python": platform.python_version()},
                 "load_shape": {**({"arrival_rates_rps": config.traffic.rates,

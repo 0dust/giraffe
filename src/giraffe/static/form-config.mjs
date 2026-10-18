@@ -285,6 +285,14 @@ export function effectiveProfileDefaults(config, defaults, key) {
   return profile;
 }
 
+export function parseLogprobSettings(raw) {
+  if (raw.length > 4096) throw new Error('Logprob settings must fit within 4096 characters.');
+  let value;
+  try { value = JSON.parse(raw); } catch { throw new Error('Logprob settings must be a JSON object or null.'); }
+  if (value !== null && (typeof value !== 'object' || Array.isArray(value))) throw new Error('Logprob settings must be a JSON object or null.');
+  return value;
+}
+
 // Catalog profile forms patch only fields the operator edited. Viewing a null
 // profile or filtering a check must not materialize defaults or erase JSON data.
 export function configureProfiles(source, values, defaults, {allowInvalid=false}={}) {
@@ -304,7 +312,10 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
     for (const name of edits) {
       if (!Object.hasOwn(defaults[key], name)) continue;
       const raw = values.get(`profile_${key}_${name}`);
-      if (arrayFields.has(name)) {
+      if (key === 'consistency' && name === 'logprobs') {
+        try { profile[name] = parseLogprobSettings(String(raw || 'null')); }
+        catch (error) { if (!allowInvalid) throw error; profile[name] = String(raw); }
+      } else if (arrayFields.has(name)) {
         profile[name] = String(raw || '').split(',').map(value => value.trim()).filter(Boolean);
         if (name === 'levels') profile[name] = profile[name].map(value => numeric(value, 'Concurrency levels', allowInvalid));
       } else if (name === 'turns' || name === 'saved_answers') {
@@ -315,5 +326,6 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
     }
     config[key] = profile;
   }
+  if (!allowInvalid && typeof config.consistency?.logprobs === 'string') config.consistency.logprobs = parseLogprobSettings(config.consistency.logprobs);
   return config;
 }

@@ -1,0 +1,27 @@
+targets:
+  - name: vllm
+    url: http://127.0.0.1:8000/v1
+    model: your-served-model
+    identity: {runtime: vllm}
+checks: [consistency]
+context_limit: 4096
+max_output_tokens: 64
+max_requests: 64
+max_duration_seconds: 600
+request_timeout_seconds: 90
+retention: all
+limits: {min_samples: 2}
+consistency:
+  levels: [1, 4]
+  shapes: [short]
+  repetitions: 4
+  temperature: 0
+  seed: 17
+  strict: false
+  logprobs:
+    response_mode: complete
+    top_logprobs: 5
+    priming_rounds: 1
+    compare_levels: true
+    support: discover
+    strict: false

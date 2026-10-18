@@ -553,6 +553,8 @@ def _retained(report: RunReport) -> RunReport:
             record.output = ""
             record.reasoning = ""
             record.tool_calls = []
+            if record.logprob_evidence:
+                record.logprob_evidence.tokens = []
             if record.judgement:
                 for vote in record.judgement.votes:
                     vote.reason = None
@@ -744,6 +746,15 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     parts.append('<section id="checks"><h2>Checks</h2><div class="table"><table>'
                  '<tr><th>Target / check</th><th>Outcome</th><th>Finding and evidence</th></tr>')
     for check in report.checks:
+        probability = check.metrics.get("logprobs")
+        if probability:
+            parts.append('<tr><td>Token probability consistency</td><td>' + _e(probability['status']) + '</td><td>'
+                         + _e(probability['interpretation']) + '<br>Tolerance: ' + _e(probability['tolerance']) + '</td></tr>')
+            for cohort in probability['conditions'] + probability['cross_conditions']:
+                for example in cohort['examples']:
+                    links = ' '.join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>' for rid in example['request_ids'] if rid in anchors)
+                    parts.append('<tr><td>' + _e(example['kind']) + '</td><td>Position ' + str(example['position'])
+                                 + '</td><td>' + links + ' · absolute logprob difference: ' + _e(example['absolute_delta']) + '</td></tr>')
         evidence = " ".join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>'
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
@@ -836,6 +847,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                 parts.append(f'<h3>Judge rubric</h3><pre>{_e(evidence.rubric)}</pre>')
             if evidence.schema_ is not None:
                 parts.append(f'<h3>JSON schema</h3><pre>{_json(evidence.schema_)}</pre>')
+        if record.logprob_evidence:
+            parts.append('<h3>Token log probabilities</h3><pre>' + _json(record.logprob_evidence.model_dump()) + '</pre>')
         parts.append(_judgement_table(record))
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_e(record.output)}</pre>')
