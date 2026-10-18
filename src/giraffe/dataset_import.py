@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from giraffe.models import (MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
                             ConfigDraft, RequestPack, RunConfig)
+from giraffe.request_pack import pack_warnings
 
 
 def read_dataset(path: Path) -> str:
@@ -37,7 +38,7 @@ def preview_dataset(text: str, format: str, *, input_field: str | None = None,
                     expected_field: str | None = None, scorer: str = "judge") -> dict:
     result = {"columns": [], "preview_rows": [], "suggested_mapping": {
         "input_field": None, "expected_field": None}, "request_pack": None,
-        "errors": [], "needs_mapping": False}
+        "errors": [], "warnings": [], "needs_mapping": False}
 
     def error(field, message, row=None):
         result["errors"].append({"row": row, "field": field, "message": message})
@@ -66,6 +67,7 @@ def preview_dataset(text: str, format: str, *, input_field: str | None = None,
                         error(field, item["msg"], row)
                     return result
                 result["request_pack"] = pack.model_dump(mode="json")
+                result["warnings"] = pack_warnings(pack)
                 result["preview_rows"] = result["request_pack"]["cases"][:5]
                 return result
             if not isinstance(parsed, list):
@@ -118,7 +120,9 @@ def preview_dataset(text: str, format: str, *, input_field: str | None = None,
                               "messages": [{"role": "user", "content": row[input_field]}],
                               "scorer": scorer, "expected": row[expected_field]})
         if not result["errors"]:
-            result["request_pack"] = RequestPack(version=1, cases=cases).model_dump(mode="json")
+            pack = RequestPack(version=1, cases=cases)
+            result["request_pack"] = pack.model_dump(mode="json")
+            result["warnings"] = pack_warnings(pack)
     except (ValueError, UnicodeError, csv.Error, RecursionError) as exc:
         message = "Invalid JSON; check the file syntax" if isinstance(exc, json.JSONDecodeError) else str(exc)
         error("dataset", message)

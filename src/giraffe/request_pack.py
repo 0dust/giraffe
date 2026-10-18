@@ -34,6 +34,13 @@ def load_request_pack(path: str | Path) -> RequestPack:
     return RequestPack.model_validate(value)
 
 
+def pack_warnings(pack: RequestPack) -> list[str]:
+    """Flag weak answer evidence without rejecting intentional copy/extraction cases."""
+    return [f"Case {case.fixture_id!r}: expected text appears verbatim in its messages; an echo would pass."
+            for case in pack.cases if case.scorer in {"exact", "contains"}
+            and any(case.expected in message.content for message in case.messages)]
+
+
 def active_pack(config: RunConfig) -> bool:
     return (config.request_source == "request_pack" and config.request_pack is not None
             and bool({"capacity", "correctness"}.intersection(config.checks)))
@@ -201,7 +208,7 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
     planned = summary["planned_requests_per_target"]
     quotas = summary["per_target_request_quota"]
     judging = summary["judging"] | {"identity": judging_identity(config)}
-    warnings = []
+    warnings = pack_warnings(config.request_pack) if config.request_pack else []
     if config.request_source == "request_pack" and not active:
         warnings.append("Request pack is inactive: select correctness or capacity to exercise it.")
     if active:

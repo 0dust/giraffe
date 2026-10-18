@@ -108,7 +108,7 @@ def config(**kwargs):
 async def test_disabled_backend_verification_preserves_legacy_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
-        "ab9fb04ee49e79b9e10690fdcf03fc840164dd7962f4cee9b47d53214860598b")
+        "3475bee26d84f228587f5524184c5395ff9b12a3a0d45b5697c168b19a6e3541")
 
 
 def check(report, id, target="service"):

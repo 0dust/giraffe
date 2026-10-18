@@ -342,8 +342,33 @@ giraffe run --manifest runs/pack-before/report.json --baseline baselines/pack.js
 Each case has a unique `fixture_id`, text `messages`, a positive `weight` (default 1),
 and an explicit `scorer`: `exact`, `contains`, `json`, `judge`, or `none`. Exact and contains
 need an `expected` string; JSON needs a local `schema` and can include expected JSON.
-Exact normalizes whitespace; contains only checks for the specified text; schema
-validation alone checks structure. None of these establishes general chatbot quality.
+Exact compares the whole answer after normalizing whitespace. Contains checks for
+case-sensitive text with alphanumeric boundaries: expected `4` matches `(4)` but
+not `14` or `40`. It does not validate the whole answer. Pack and dataset previews
+warn when an exact/contains expected value appears verbatim in that case's own
+messages: copying that value can pass without demonstrating the intended task.
+This is a warning; extraction and copy tasks can intentionally include the answer.
+JSON validates the schema and compares supplied expected values structurally,
+treating `3` and `3.0` as equal while keeping booleans distinct from numbers,
+including within arrays and objects. Schema validation alone checks structure.
+None of these establishes general chatbot quality.
+
+Semantic scoring and judging strip leading `<think>`, `<thinking>`, or `<reasoning>`
+blocks, case-insensitively, and save `reasoning_stripped` on the request record.
+Raw response evidence follows the configured retention policy. An unclosed block
+or a block with no final answer remains unscored: `reasoning without final answer`.
+When `finish_reason` is `length`, a deterministic answer that does not satisfy its
+scorer remains unscored: `truncated before a complete answer`. A full matching
+exact/contains answer or complete valid matching JSON can still be scored.
+Judges never receive truncated answers. Missing scores leave correctness coverage
+inconclusive rather than counting incomplete answers as wrong.
+
+Built-in known-answer correctness, JSON, context, short and traffic fixtures
+request `temperature: 0` unless `request_options` explicitly supplies a temperature.
+This requests deterministic decoding; server support is not independently verified.
+Context fact positions are separated by at least 32 characters within each input
+size. Small context budgets produce fewer positions; per-request workload metadata
+`position_coverage` lists the exercised positions and marks reduced coverage.
 
 Giraffe sends each case once quietly. With capacity selected, the same weighted
 pack supplies continuous arrivals; every case's loaded answers also enter its
@@ -403,7 +428,8 @@ judges tie. A tie, timeout, malformed verdict or unavailable judge leaves the an
 unscored and prevents accepted capacity; missing votes never reduce the panel size.
 Each judge's vote and short explanation appear in request evidence.
 
-Giraffe judges every valid completed answer from a judged case, including repeated
+Giraffe judges every valid completed final answer from a judged case, excluding
+truncated and reasoning-only outputs and including repeated
 quiet and loaded answers, **after all measured traffic and telemetry finish**.
 Judge calls use separate limits and never enter deployment latency or traffic counts.
 Preview shows a call upper bound; no model is contacted during preview. There are no
@@ -491,7 +517,9 @@ concurrency sweep with this arrival-rate definition.
 Response retention is `failures` by default. Use `all` to keep every response, or
 `none` to discard all output/reasoning text after scoring. Aggregate metrics and
 request statuses remain. Prompts are deterministic built-ins; optional custom
-fixtures are a local JSON list of `RequestSpec` objects. Custom fixture files must
+fixtures are a local JSON list of `RequestSpec` objects. Legacy `--fixtures` accepts
+only `exact`, `contains`, `json`, and `none` scorers; AI judges require a request
+pack, and tool scoring is reserved for built-in tool checks. Custom fixture files must
 remain available to reproduce a run.
 
 ```sh

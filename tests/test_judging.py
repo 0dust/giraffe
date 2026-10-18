@@ -312,3 +312,43 @@ async def test_deterministic_and_failed_requests_do_not_trigger_judging(monkeypa
     item = record()
     summary = await judge_records(configuration(), [item], [deterministic])
     assert summary["judge_calls_total"] == 0 and item.judgement is None
+
+
+@pytest.mark.asyncio
+async def test_judges_receive_only_final_answer_and_skip_reasoning_only_and_truncation(monkeypatch):
+    seen = []
+
+    def handler(request):
+        data = json.loads(json.loads(request.content)["messages"][1]["content"])
+        seen.append(data["generated_answer"])
+        return response('<think>Evaluate carefully.</think>{"verdict":true,"reason":"Correct."}')
+
+    transport(monkeypatch, handler)
+    records = [record(0, output=" \n<THINKING>Within 5 days</thinking>Within 30 days, with a receipt."),
+               record(1, output="<reasoning>Within 30 days"),
+               record(2, output="Within 30 days, with a receipt.", finish_reason="length"),
+               record(3, output="<think>Within 30 days</think> ")]
+    summary = await judge_records(configuration(), records, [fixture()])
+    assert seen == ["Within 30 days, with a receipt."]
+    assert records[0].score is True and records[0].reasoning_stripped
+    assert records[0].output.startswith(" \n<THINKING>")
+    for index in (1, 3):
+        assert records[index].score is None and records[index].reasoning_stripped
+        assert records[index].score_message == "reasoning without final answer"
+    assert records[2].score is None and records[2].score_message == "truncated before a complete answer"
+    assert all(item.judgement.status == "inconclusive" and item.judgement.votes == [] for item in records[1:])
+    assert summary["judge_calls_total"] == summary["judge_calls_completed"] == 1
+    assert summary["eligible_requests"] == 1 and summary["inconclusive_requests"] == 3
+
+
+@pytest.mark.asyncio
+async def test_only_unjudgeable_answers_make_no_judge_calls(monkeypatch):
+    def handler(request):
+        pytest.fail("A truncated answer must never be sent to a judge")
+
+    clients = transport(monkeypatch, handler)
+    item = record(finish_reason="length")
+    summary = await judge_records(configuration(), [item], [fixture()])
+    assert not clients and summary["judge_calls_total"] == 0
+    assert summary["inconclusive_requests"] == 1
+    assert item.score is None and item.score_message == "truncated before a complete answer"

@@ -833,6 +833,7 @@ class RequestRecord(Model):
     output_chars: int = 0
     output: str = ""
     reasoning: str = ""
+    reasoning_stripped: bool = False
     chunks: int = 0
     stream_terminated: bool = False
     finish_reason: str | None = None
