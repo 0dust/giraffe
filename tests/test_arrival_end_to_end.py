@@ -161,7 +161,7 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
     assert high["scored_subset_correct_goodput_rps"] < high["valid_throughput_rps"]
     assert all(record.valid for record in report.requests)
     assert len(report.requests) == len(payloads) == 20
-    assert next(check for check in report.checks if check.id == "correctness").status == "pass"
+    assert next(check for check in report.checks if check.id == "correctness").status == "fail"
     for first in payloads[:2]:
         repeated = [payload for payload in payloads if payload["messages"] == first["messages"]]
         assert all(payload == first for payload in repeated)
@@ -221,7 +221,7 @@ async def test_reference_judging_runs_after_http_traffic_without_extending_measu
     assert all(window["correct"] == 0 for window in stage["windows"])
     assert stage["status"] == result.status == "fail"
     assert result.metrics["request_pack"]["control_status"] == "pass"
-    assert next(check for check in report.checks if check.id == "correctness").status == "pass"
+    assert next(check for check in report.checks if check.id == "correctness").status == "fail"
     assert report.abort_reason is None
     assert report.observations["request_budget_used"] == 4
     assert all(record.valid and record.judgement for record in report.requests)

@@ -49,7 +49,7 @@ class FakeClient:
                 await asyncio.sleep(1)
             else:
                 await asyncio.sleep(cls.delay / 2)
-            if spec.cancel_after_ms is not None:
+            if spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None:
                 status = "cancelled"
         except asyncio.CancelledError:
             # Mirrors the real transport, preserving partial evidence on close.
@@ -58,7 +58,8 @@ class FakeClient:
             cls.active -= 1
         output = json.dumps(spec.expected) if spec.scorer == "json" else str(spec.expected or "answer")
         if spec.scorer == "none":
-            output = "1 2"
+            output = ("blue [END] green" if spec.fixture_id.startswith("limits.stop_control")
+                      else "blue" if spec.fixture_id.startswith("limits.stop.") else "1 2")
         if cls.bad_target == self.target.name and spec.scorer != "none":
             output = "wrong"
         elapsed = (time.monotonic()-started)*1000
@@ -74,9 +75,11 @@ class FakeClient:
             input_tokens=max(1, spec.input_chars//4) if cls.input_usage else None,
             input_chars=spec.input_chars, elapsed_ms=elapsed,
             first_output_ms=first_output, last_output_ms=first_output + 2,
-            answer_chunks=2 if spec.stream else 0,
+            answer_chunks=(spec.cancel_after_chunks or 2) if spec.stream else 0,
             chunks=2, stream=spec.stream, stream_terminated=True,
-            finish_reason="stop", requested_max_tokens=spec.max_tokens or 128,
+            finish_reason=None if status == "cancelled" else "stop",
+            client_cancelled_at_ns=time.time_ns() if spec.cancel_after_chunks and status == "cancelled" else None,
+            requested_max_tokens=spec.max_tokens or 128,
             max_stream_gap_ms=500 if cls.bad_mixed_gap and spec.scenario == "fairness_short" else 2,
         )
 
@@ -253,7 +256,7 @@ async def test_recovery_honors_correctness_allowance_without_hiding_protocol_fai
 
     monkeypatch.setattr(client, "execute", one_wrong_probe)
     configured = config(checks=["recovery"], test_options={
-        "recovery": {"limits": {"min_correctness": .5}},
+        "recovery": {"limits": {"min_correctness": .5, "latency_ms": 1000}},
     })
     report = await runner.run_suite(configured)
     result = check(report, "recovery")
@@ -262,7 +265,7 @@ async def test_recovery_honors_correctness_allowance_without_hiding_protocol_fai
 
     async def broken_probe(self, spec, **kwargs):
         record = await one_wrong_probe(self, spec, **kwargs)
-        if spec.scenario == "recovery" and spec.fixture_id == "short.code.v2":
+        if spec.scenario == "recovery" and spec.fixture_id == "short.copy.v2":
             record.valid = False
             record.status = "failed"
         return record
@@ -519,7 +522,7 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
 
     async def refused_copy(self, spec, **kwargs):
         result = await original(self, spec, **kwargs)
-        if spec.fixture_id == "short.copy.v2":
+        if spec.fixture_id == ("fairness.copy.v1" if check_id == "fairness" else "short.copy.v2"):
             result.output = "I cannot copy that sentence."
         return result
 
@@ -530,11 +533,11 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     result = check(report, check_id)
     assert result.status == "fail"
     assert "Answer checks failed" in result.summary
-    assert "short.copy.v2" in result.summary
-    assert ("warm-up" in result.summary) == (check_id == "fairness")
+    assert ("fairness.copy.v1" if check_id == "fairness" else "short.copy.v2") in result.summary
+    assert "warm-up" not in result.summary
     failure = next(f for f in result.metrics["answer_failures"]
-                   if f["fixture_id"] == "short.copy.v2")
-    assert failure["warmup_failed"] == (1 if check_id == "fairness" else 0)
+                   if f["fixture_id"] == ("fairness.copy.v1" if check_id == "fairness" else "short.copy.v2"))
+    assert failure["warmup_failed"] == 0
     assert failure["failed"] > 0
 
 
@@ -651,13 +654,13 @@ async def test_failed_limit_response_cannot_pass_cancellation(client, monkeypatc
     report = await runner.run_suite(config(checks=["cancellation"]))
     result = check(report, "cancellation")
     assert result.status == "fail"
-    assert len(result.metrics["failed_limit_requests"]) == 2
+    assert len(result.metrics["failed_limit_requests"]) == 3
 
 
 async def test_one_sample_still_exercises_both_output_and_stop_limits():
     report = await runner.run_suite(config(checks=["cancellation"], samples=1))
     assert {r.fixture_id for r in report.requests if r.scenario == "limits"} == {
-        "limits.output_cap.v1", "limits.stop.v1"}
+        "limits.output_cap.v1", "limits.stop.v1", "limits.stop_control.v1"}
     assert check(report, "cancellation").status == "pass"
 
 
@@ -862,7 +865,7 @@ async def test_mixed_and_capacity_semantic_failures_are_not_acceptable_load(
         assert result.metrics["highest_acceptable_rate_rps"] == 20
         assert result.metrics["traffic_stages"][1]["correctness"] == 0
     else:
-        assert result.metrics["accuracy"] == .5
+        assert result.metrics["accuracy"] == pytest.approx(2/3)
 
 
 @pytest.mark.parametrize("check_id", ["capacity", "fairness"])
@@ -998,7 +1001,7 @@ async def test_gpu_freshness_override_survives_shared_telemetry_collection(monke
     strict = await runner.run_suite(config(targets=[target], checks=["gpu"],
         test_options={"gpu": {"metrics_max_age_seconds": 5}}))
     assert not baseline.requests and not strict.requests
-    assert check(baseline, "gpu").status == "pass"
+    assert check(baseline, "gpu").status == "fail"
     assert check(strict, "gpu").status == "inconclusive"
     assert len(check(strict, "gpu").metrics["unavailable_families"]) == 5
     assert strict.observations["targets"]["service"]["serving_telemetry"]["snapshots"]
@@ -1065,7 +1068,7 @@ async def test_pack_control_is_serial_and_reused_for_correctness(client, monkeyp
     assert len(quiet) == 2 and len(loaded) == 4
     assert all(r.overlap == 1 for r in quiet)
     assert all(r.requested_max_tokens == 7 for r in quiet + loaded)
-    assert check(report, "correctness").metrics["attempted"] == 2
+    assert check(report, "correctness").metrics["attempted"] == 6
     assert check(report, "capacity").metrics["request_pack"]["control_status"] == "pass"
     assert report.manifest["request_pack"]
     assert {r.fixture_id for r in report.requests} == {"pack:alpha", "pack:beta"}
@@ -1091,11 +1094,11 @@ async def test_quiet_wrong_answer_does_not_filter_pack_or_stop_load(client, monk
     assert report.abort_reason is None
 
 
-async def test_correctness_only_pack_uses_one_pass_and_case_coverage_floor():
+async def test_correctness_only_pack_uses_quiet_and_concurrent_pass_and_case_coverage_floor():
     report = await runner.run_suite(pack_config(checks=["correctness"], samples=20,
                                                limits=Limits(min_samples=5)))
     result = check(report, "correctness")
-    assert len(report.requests) == 2 and result.status == "pass"
+    assert len(report.requests) == 4 and result.status == "pass"
     assert not result.metrics.get("low_confidence", False)
     assert result.metrics["request_pack"]["coverage_complete"]
 
@@ -1228,7 +1231,7 @@ async def test_judging_waits_for_every_target_telemetry_and_monitor(client, monk
         assert stage["case_counts"]["reference"]["scored"] == 4
         assert stage["case_counts"]["reference"]["correct"] == 0
         assert stage["scored_subset_correct_goodput_rps"] == 0 < stage["valid_throughput_rps"]
-        assert check(report, "correctness", target).status == "pass"
+        assert check(report, "correctness", target).status == "fail"
     kinds = [event["event"] for event in events]
     assert max(i for i, kind in enumerate(kinds) if kind == "request_completed") < kinds.index("judging_started")
     assert kinds[-1] == "run_finished"
@@ -1313,7 +1316,7 @@ async def test_cancelling_evaluation_preserves_partial_report(monkeypatch, exter
     assert stopped.is_set() and report.abort_reason == "cancelled by user"
     assert report.observations["judging"]["scored_requests"] == 1
     assert report.observations["judging"]["inconclusive_requests"] == 4
-    assert check(report, "correctness").status == "pass"
+    assert check(report, "correctness").status == "inconclusive"
     assert not check(report, "capacity").metrics["traffic_stages"][0]["accepted"]
 
 
@@ -1362,8 +1365,9 @@ async def test_recursive_schema_does_not_abort_remaining_examples(client):
                              "scorer": "exact", "expected": "Paris"},
                         ]})
     report = await runner.run_suite(configured)
-    assert len(report.requests) == 2
-    first, second = sorted(report.requests, key=lambda record: record.fixture_id)
+    assert len(report.requests) == 4
+    first, second = sorted((r for r in report.requests if r.scenario == "pack_control"),
+                           key=lambda record: record.fixture_id)
     assert first.valid and first.output == "null" and first.score is None
     assert first.evaluation_error == "schema_recursion"
     assert second.score is True

@@ -170,22 +170,26 @@ unverified.
 
 | Check | Built-in workload / measurement |
 | --- | --- |
-| Access | Real inference request through the selected DNS/TLS/auth/network path |
-| Serving | HTTP status, completion envelope, nonempty answer, stream finish |
-| First output | First useful answer separately from reasoning and initial requests |
+| Access | Ordinary inference through the selected DNS/TLS/auth/network path |
+| Serving | Ordinary traffic: HTTP status, completion envelope, nonempty answer, stream finish |
+| First output | Ordinary traffic: first useful answer separately from reasoning and initial requests |
 | Generation | Longer-output samples, generation pace after first output, response time and stream gaps |
-| Capacity | Independently arriving mixed requests at chosen rates; correct, timely answers and highest acceptable tested rate |
-| Fairness | Long prompts added while a short response is streaming |
+| Capacity | Independent mixed arrivals; highest tested rate with every lower tested rate accepted |
+| Fairness | Interleaved matched short streams; verified long-prompt overlap, decoding slowdown and answer gaps |
 | Context | Injected known facts at different lengths and positions |
-| Correctness | Extraction, arithmetic, and classification, including under load |
-| JSON (opt-in) | Required fields, types, enums, expected content under concurrency |
-| Limits/cancellation | Output cap, stop sequence, deadline/disconnect, recovery probes |
-| Recovery | Repeated bounded traffic followed by light-load probes |
-| GPU (opt-in) | Existing Prometheus telemetry when available |
+| Correctness | Known answers, with observed concurrent overlap required when concurrency exceeds one |
+| JSON (opt-in) | Required fields, types, enums and expected content; observed overlap qualifies concurrency |
+| Limits/cancellation | Output cap, controlled server stop enforcement, mid-stream cancellation, deadlines and follow-ups |
+| Recovery | Refilled heavy worker pool, then matched pre/post light probes with configured acceptance limits |
+| GPU (opt-in) | Per-observed-device metric coverage, freshness, XID and thermal/power throttle evidence |
 
 Each result is `pass`, `fail`, `inconclusive`, `skipped`, or `blocked`. A required
 inconclusive check prevents an overall pass. Missing acceptance limits produce
-measurements without certifying performance. Small or incomparable samples cannot
+measurements without certifying performance. Deliberate stress traffic is judged by its
+own checks, independently of ordinary access, serving, first-output and generation
+verdicts. Capacity and other deliberate overload errors do not consume the global
+`stop_after_errors` allowance. Connection/TLS failures and HTTP 401/403 establish
+access failures; a pre-header timeout remains a timeout. Small or incomparable samples cannot
 establish a regression. Latency percentiles always accompany request/error counts.
 
 The suite checks a small, versioned set of observable serving behaviors. It is not
@@ -197,7 +201,8 @@ measurement. The report preserves these limits.
 
 Generation pace is a client-observed estimate: `(output tokens - 1) / seconds from
 first useful answer chunk to last answer chunk`. Prompt waiting and trailing
-usage/finish messages are excluded. This follows the first-token exclusion used
+usage/finish messages are excluded. Stream gaps likewise measure only intervals
+between answer chunks, excluding the wait after the final answer. This follows the first-token exclusion used
 by [vLLM's per-request TPOT](https://docs.vllm.ai/en/latest/design/metrics/), using
 the last observed answer instead of protocol cleanup as the endpoint. A chunk may
 contain multiple tokens, and network buffering can distort arrival times; this
@@ -283,8 +288,10 @@ When reusing an older manifest whose `checks` list included disabled optional
 tests, remove `json` or `gpu` from that list to keep them deselected. Saved custom
 fixtures are used only when correctness is selected.
 `--metrics` reads the
-target's optional `metrics_url`; missing or stale samples cannot produce a healthy
-GPU verdict. No node agents are installed.
+target's optional `metrics_url`. GPU evidence requires fresh source timestamps or
+values changing across scrapes, plus every required family per observed device.
+XID errors and active thermal/power throttle reasons fail. Missing evidence is
+inconclusive; this is not device health certification. No node agents are installed.
 
 ### Use your own requests under traffic
 
@@ -338,12 +345,19 @@ need an `expected` string; JSON needs a local `schema` and can include expected 
 Exact normalizes whitespace; contains only checks for the specified text; schema
 validation alone checks structure. None of these establishes general chatbot quality.
 
-Giraffe sends each case once quietly, then uses the same weighted pack for continuous
-arrivals. It allocates each finite stage before dispatch; dropped requests are not
-replaced. Every scored case needs quiet and loaded coverage for a full-pack rate
-claim. An unscored case prevents that claim, though throughput and latency remain
-available. A quiet failure never removes a case from load. Requests repeat and may
-benefit caches, so this measures a warmed workload.
+Giraffe sends each case once quietly. With capacity selected, the same weighted
+pack supplies continuous arrivals; every case's loaded answers also enter its
+correctness verdict against `min_correctness`. Each finite stage is allocated before
+dispatch; dropped requests are not replaced. Without capacity, correctness runs a
+second pass at global concurrency, sending at least that many requests and covering
+every case. Concurrency above one requires observed overlap for a loaded verdict.
+Per-check correctness `samples` or `concurrency` overrides are rejected in pack mode;
+global `samples` does not choose case count. Legacy request previews omit the extra
+concurrent pass when capacity is disabled, so allow for its additional request budget.
+Every scored case needs quiet and loaded coverage for a full-pack rate claim. An
+unscored case prevents that claim, though throughput and latency remain available.
+A quiet failure never removes a case from load. Requests repeat and may benefit
+caches, so this measures a warmed workload.
 
 **Requests and expected answers are saved with the run.** Response retention only
 controls generated outputs. Imports are limited to 1 MiB and 1,000 cases. Export,
@@ -442,7 +456,7 @@ test_options:
 
 The traffic editor exposes this profile before the run. Each other test exposes
 only applicable settings, such as context length, sample count, cancellation
-delay, recovery duration, telemetry freshness, or acceptance limits. **Reset to defaults**
+answer-chunk count, recovery duration, telemetry freshness, or acceptance limits. **Reset to defaults**
 removes that test's overrides. The JSON view, saved manifests and the CLI use the
 same validated configuration. Per-test concurrency, output and deadline settings
 remain bounded by the run's global ceilings. Overrides above those ceilings are
@@ -464,8 +478,10 @@ The good fraction uses all planned arrivals, including unsent ones. A stage need
 sufficient samples and a first-output or total-response latency limit to qualify;
 stream-gap or generation-speed limits alone do not bound user waiting time.
 
-The result is the **highest acceptable tested arrival rate**, not a discovered
-maximum. Baseline comparison matches the planned profile, seed, tests and acceptance
+The result is the **highest acceptable tested arrival rate** for which every
+tested rate at or below it was accepted, not a discovered maximum. A failure at a
+lower rate followed by a pass at a higher rate is flagged as non-monotonic and
+does not raise this boundary. Baseline comparison matches the planned profile, seed, tests and acceptance
 criteria, and reports lost previously acceptable rates. Dropped or failed requests
 remain outcomes, even if they change the observed request mix. Incomplete or
 generator-limited evidence cannot establish an exact capacity decrease. Older
@@ -490,7 +506,10 @@ giraffe cold-start --config my-test-service.yaml --restart service --output runs
 ```
 
 The command invokes only that hook. It does not provision deployments or reboot
-nodes. A missing hook blocks the cold-start run. Use an isolated test service when
+nodes. A missing hook blocks the cold-start run. After the hook completes, readiness
+retries use `readiness_timeout_seconds` (default 180 seconds), bounded by the run
+deadline and request budget. Retries back off from 0.1 to 2 seconds; readiness
+failures do not consume `stop_after_errors`. Use an isolated test service when
 measuring restarts or load.
 
 ## Offline and container use

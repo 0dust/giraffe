@@ -54,6 +54,76 @@ difficulty. The generator pairs every question target with every answer cap,
 giving three times three cases. Answer instructions can add characters to the
 question, and a token cap does not guarantee an answer reaches that length.
 
+## Standard checks and load evidence
+
+Access, serving, first output and generation use ordinary traffic. Deliberate
+capacity overload, long-context, fairness, recovery and cancellation requests are
+judged by their own checks. Genuine connection/TLS failures and HTTP 401/403 are
+access failures; a timeout before response headers remains a timeout. Intentional
+stress failures do not consume the global `stop_after_errors` allowance; capacity
+keeps per-stage error counts. Shared request and duration limits still apply.
+
+Capacity sends independent arrivals and reports the highest tested rate for which
+all tested rates at or below it were accepted. A higher-rate pass after a lower-rate
+failure is flagged in `non_monotonic_results` and does not raise that boundary.
+Answer timing ends at the last answer chunk: finish/usage messages, `[DONE]` and
+connection cleanup do not extend generation time or stream gaps.
+
+Fairness interleaves short-only and loaded samples of the same known-answer copy
+sequence (numbers 1 through 64). A long competitor starts after first output, with
+a unique nonce at the beginning of its prompt to avoid identical-prefix reuse.
+Overlap qualifies only when the short stream emits its last answer after the
+competitor's dispatch. Buffered or insufficient overlap evidence is inconclusive
+before evaluating slowdown. `fairness_max_ratio` compares median decoding time
+from first to last answer, rather than total response latency; `stream_gap_ms`
+checks answer pauses. Missing an acceptance ratio leaves the check inconclusive.
+Output caps below 64 tokens or truncated copy answers leave fairness inconclusive.
+This does not establish a scheduler cause.
+
+Recovery first records light probes, then refills up to `concurrency` workers with
+a rotating, scored mix of long-input and longer-output requests. Each worker starts
+its next request as soon as its previous one completes, within the shared ceilings.
+Sustained traffic receives at most half the remaining target request quota, and
+reserves planned fixed requests of later checks plus post-load probes. This limits
+budget starvation; it does not guarantee adaptive later work will finish. Exhausting
+this allowance before the sustained duration leaves coverage incomplete. Post-load
+probes use the same fixture as the pre-load baseline. `recovery_max_ratio` limits
+both median response-time and first-output ratios; absolute timing limits remain
+available. With no applicable timing limit or ratio, the result is inconclusive:
+recovery was observed without an acceptance limit.
+
+Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
+interrupt an active answer stream. The legacy `cancel_after_ms` setting is retained
+for config compatibility; it no longer schedules the disconnect, and explicit values
+produce a report warning. A disconnect before first output cannot establish
+mid-stream cancellation. The stop test first obtains a full-output control containing
+`blue [END] green`, then requests the same text with `[END]` as the stop sequence.
+Enforcement needs the control to reach the marker, an answer of `blue` without the
+marker or following text, and `finish_reason: stop`. Missing control/finish evidence
+is inconclusive; an emitted marker or suffix fails. Output caps check reported token
+usage when available, including consistency with `finish_reason: length`; a length
+finish reason also provides cap evidence when usage is absent. Follow-up requests
+check continued inference. Client disconnect still does not prove backend work
+stopped; the optional log/trace verification supplies separate evidence.
+
+Built-in correctness and JSON with configured concurrency above one require
+observed overlap of at least two scored requests; otherwise they are inconclusive
+("not exercised concurrently"). Configured concurrency one measures serial behavior.
+Request-pack correctness scores each case's quiet answers and loaded capacity-stage
+answers against `min_correctness`. Without capacity it runs a quiet pass and an
+additional pass at global concurrency, covering all cases and sending at least
+`concurrency` requests. Per-check correctness `samples` and `concurrency` overrides
+are rejected in pack mode; global `samples` never selects the case count. Legacy
+request previews omit that extra concurrent pass without capacity, so its requests
+need additional budget. Legacy previews also omit the new pre-load recovery baseline
+(`samples` extra requests). Loaded correctness still requires observed overlap when
+concurrency exceeds one.
+
+Explicit cold-start runs use `readiness_timeout_seconds` (default 180 seconds) after
+the restart hook, bounded by the global deadline and request budget. Retry delays
+back off from 0.1 to 2 seconds. Readiness failures remain recorded evidence without
+incrementing the global error counter.
+
 ## Workload settings and evidence
 
 | Setting | Behavior | Evidence and limitations |
@@ -151,8 +221,15 @@ Explicit profiles map exact metric names and units:
   scheduler or KV-cache counters.
 
 Published DCGM memory, utilization, temperature, throttle and device-error families
-remain available alongside serving series. Missing or stale GPU data is not device
-health certification. Source references: [vLLM metrics](https://docs.vllm.ai/en/latest/design/metrics/)
+remain available alongside serving series. GPU checks require each observed `gpu`
+label (and exporter `Hostname` when present) to have every family. A recent scrape
+alone has unknown source freshness: evidence requires values changing across at
+least two scrapes for that device, or explicit source timestamps within
+`metrics_max_age_seconds`. Missing families, missing device labels or unknown
+freshness are inconclusive. Nonzero XID errors and active thermal/power throttle
+reasons fail, even when other evidence is incomplete. Idle or application-clock
+reasons alone do not fail. Devices absent from all scrapes remain outside coverage.
+Every verdict is telemetry evidence, not device health certification. Source references: [vLLM metrics](https://docs.vllm.ai/en/latest/design/metrics/)
 and [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md).
 
 Start/end and periodic scrapes preserve source timestamps where present, scrape

@@ -199,6 +199,21 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         "short": short, "long": long, "context": context, "correctness": correctness,
         "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
+    if "fairness" in config.checks:
+        sequence = " ".join(str(index) for index in range(1, 65))
+        fixtures["generation"].append(_request(
+            "fairness.copy", "fairness", ["fairness"],
+            "Copy exactly, with no extra text:\n" + sequence,
+            expected=sequence, max_tokens=config.max_output_tokens,
+            options={"temperature": 0},
+        ))
+    if "cancellation" in config.checks:
+        fixtures["limits"].append(_request(
+            "limits.stop_control", "stop_control", ["cancellation"],
+            "Copy exactly, with no extra text: blue [END] green",
+            scorer="none", expected={"text": "blue [END] green"},
+            options={"temperature": 0, "stop": None},
+        ))
     if "cancellation" in config.checks and config.effective_check("cancellation")["backend_verification"] == "required":
         chunks = config.effective_check("cancellation")["cancel_after_chunks"]
         fixtures["backend_cancellation"] = [

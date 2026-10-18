@@ -107,7 +107,7 @@ async def test_sse_handles_fragmented_utf8_crlf_and_multiline_json(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_answer_waits_for_reasoning_and_counts_trailing_stall(monkeypatch):
+async def test_first_answer_waits_for_reasoning_and_excludes_trailing_stall(monkeypatch):
     import asyncio
 
     client, _, _ = setup_client(monkeypatch, [
@@ -123,7 +123,7 @@ async def test_first_answer_waits_for_reasoning_and_counts_trailing_stall(monkey
     assert signal.is_set()
     assert result.first_output_ms >= 35
     assert result.first_reasoning_ms < result.first_output_ms
-    assert result.max_stream_gap_ms >= 55
+    assert result.max_stream_gap_ms is None
     assert result.output == "42" and result.reasoning == "thinking"
 
 
@@ -193,7 +193,7 @@ async def test_entire_request_deadline_closes_stalled_stream_with_partial_output
     assert result.status == "timeout" and not result.valid
     assert result.output == "42"
     assert 30 <= result.elapsed_ms < 150
-    assert result.max_stream_gap_ms >= 30
+    assert result.max_stream_gap_ms is None
     assert response.closed
 
 
@@ -214,6 +214,68 @@ async def test_deadline_includes_wait_for_http_headers(monkeypatch):
         result = await client.execute(spec())
     assert result.status == "timeout" and result.http_status is None
     assert result.elapsed_ms < 150
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delayed", ["finish", "usage", "done", "close"])
+async def test_stream_gap_measures_only_inter_answer_intervals(monkeypatch, delayed):
+    import asyncio
+
+    tail = [
+        ("finish", event(finish="stop")),
+        ("usage", b'data: {"choices":[],"usage":{"completion_tokens":2}}\n\n'),
+        ("done", b"data: [DONE]\n\n"),
+    ]
+    chunks = [event("4"), event("2")]
+    for name, chunk in tail:
+        if delayed == name:
+            chunks.append(0.04)
+        chunks.append(chunk)
+    client, response, _ = setup_client(monkeypatch, chunks)
+    if delayed == "close":
+        async def close():
+            await asyncio.sleep(0.04)
+            response.closed = True
+        response.aclose = close
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.answer_chunks == 2
+    assert result.elapsed_ms - result.last_output_ms >= 35
+    assert result.max_stream_gap_ms == pytest.approx(result.last_output_ms - result.first_output_ms)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout])
+async def test_httpx_timeouts_before_headers_are_timeouts(monkeypatch, error_type):
+    def handler(request):
+        raise error_type("SECRET", request=request)
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs,
+    ))
+    target = Target(name="local", url="http://local", model="test")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        result = await client.execute(spec())
+    assert result.status == "timeout" and result.http_status is None
+    assert result.error == f"request timeout ({error_type.__name__})"
+    assert "SECRET" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_remains_distinct_from_timeout_and_sanitized(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("SECRET TLS connection failed", request=request)
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs,
+    ))
+    target = Target(name="local", url="http://local", model="test")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        result = await client.execute(spec())
+    assert result.status == "failed" and result.http_status is None
+    assert result.error == "request failed (ConnectError)"
 
 
 @pytest.mark.asyncio

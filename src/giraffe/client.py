@@ -357,6 +357,8 @@ class LLMClient:
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
+        except httpx.TimeoutException as exc:
+            record.status, record.error = "timeout", f"request timeout ({type(exc).__name__})"
         except asyncio.CancelledError:
             record.status, record.error = "cancelled", "run cancelled"
         except _ProtocolError as exc:
@@ -375,8 +377,4 @@ class LLMClient:
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
-            if stream and last_answer is not None:
-                record.max_stream_gap_ms = max(
-                    record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
-                )
         return record
