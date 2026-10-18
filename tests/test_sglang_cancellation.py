@@ -215,10 +215,17 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
         async def execute(self, spec, **kwargs):
             if spec.scenario not in {"backend_cancel", "backend_cancel_followup"}:
                 status = "cancelled" if spec.scenario == "client_cancel" else "timeout" if spec.scenario == "client_deadline" else "completed"
+                output = ("blue [END] green" if spec.fixture_id.startswith("limits.stop_control")
+                          else "blue" if spec.fixture_id == "limits.stop.v1"
+                          else str(spec.expected or "answer") if spec.scorer != "none" else "1 2")
+                if mode == "answer_mismatch" and spec.scenario == "cancellation_probe":
+                    output = "Wrong follow-up answer"
                 return RequestRecord(id=spec.fixture_id, fixture_id=spec.fixture_id, scenario=spec.scenario,
                     check_ids=spec.check_ids, target="local", started_at=datetime.now(timezone.utc).isoformat(),
-                    status=status, valid=status == "completed", output=("Blue" if mode == "answer_mismatch" and spec.fixture_id == "limits.stop.v1"
-                            else str(spec.expected or "answer") if spec.scorer != "none" else "1 2"), output_tokens=1)
+                    status=status, valid=status == "completed", output=output, output_tokens=1,
+                    first_output_ms=1, answer_chunks=spec.cancel_after_chunks or 1,
+                    finish_reason=None if status == "cancelled" else "stop",
+                    client_cancelled_at_ns=time.time_ns() if spec.scenario == "client_cancel" else None)
             now = time.time_ns()
             if spec.cancel_after_chunks:
                 if mode in {"generation_error", "generation_timeout"}:
@@ -257,7 +264,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
     monkeypatch.setattr(runner, "LLMClient", Client)
     config = RunConfig(targets=[Target(name="local", url="http://localhost", model="tiny",
                                      metrics_profile="sglang")], checks=["cancellation"],
-                       max_requests=6 if mode in {"budget", "late_budget"} else 20, max_duration_seconds=2,
+                       max_requests=7 if mode in {"budget", "late_budget"} else 20, max_duration_seconds=2,
                        test_options={"cancellation": {"backend_verification": "required", "samples": 1, "trace_file": str(path),
                            "cleanup_seconds": .001 if mode in {"late", "late_budget"} else 1, "trace_wait_seconds": .02}})
     report = await runner.run_suite(config)

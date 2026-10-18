@@ -84,12 +84,20 @@ def _stats(records: list[RequestRecord]) -> dict:
     return result
 
 
+def _stress(scenario):
+    return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival"))
+            or scenario in {"sustained", "recovery", "recovery_baseline", "limits",
+                            "stop_control", "client_cancel", "client_deadline", "backend_cancel",
+                            "cancellation_probe"})
+
+
 def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSpec:
-    return spec.model_copy(update={
-        "scenario": scenario,
-        "check_ids": list(dict.fromkeys([*spec.check_ids, *checks, "access", "serving",
-                                          "first_output", "generation"])),
-    })
+    ids = list(dict.fromkeys([*spec.check_ids, *checks]))
+    if _stress(scenario):
+        ids = [name for name in ids if name not in {"access", "serving", "first_output", "generation"}]
+    else:
+        ids = list(dict.fromkeys([*ids, "access", "serving", "first_output", "generation"]))
+    return spec.model_copy(update={"scenario": scenario, "check_ids": ids})
 
 
 def _check_config(config: RunConfig, check_id: str) -> RunConfig:
@@ -130,7 +138,7 @@ class _Run:
         self.active = Counter()
         self.peak = Counter()
         self.max_lag_ms = 0.0
-        self.inflight = []
+        self.inflight = {}
         for observation in self.observations.values():
             observation.update(deployment=None, deployment_history=[], phase_boundaries=[],
                 serving_telemetry={"snapshots": [], "sample_limit_reached": False,
@@ -206,6 +214,7 @@ class _Run:
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None):
         check_ids = [name for name in spec.check_ids if name in self.config.checks
+                     and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
@@ -224,18 +233,20 @@ class _Run:
             key = (target.name, spec.scenario)
             self.active[key] += 1
             self.peak[key] = max(self.peak[key], self.active[key])
+            global_deadline = False
             started, started_at = time.monotonic(), _now()
             slot = {"target": target.name, "peak": 1}
-            self.inflight.append(slot)
-            concurrent = sum(item["target"]==target.name for item in self.inflight)
-            for item in self.inflight:
+            token = object()
+            self.inflight[token] = slot
+            concurrent = sum(item["target"]==target.name for item in self.inflight.values())
+            for item in self.inflight.values():
                 if item["target"]==target.name:
                     item["peak"] = max(item["peak"], concurrent)
-            if on_start:
-                on_start()
-            self.emit("request_started", target.name, spec.scenario,
-                      request_slot=request_slot, fixture_id=spec.fixture_id)
             try:
+                if on_start:
+                    on_start()
+                self.emit("request_started", target.name, spec.scenario,
+                          request_slot=request_slot, fixture_id=spec.fixture_id)
                 if deadline_override is not None:
                     timeout_override = min(timeout_override or self.config.request_timeout_seconds,
                                            deadline_override - time.monotonic())
@@ -274,7 +285,7 @@ class _Run:
                 )
             finally:
                 self.active[key] -= 1
-                self.inflight.remove(slot)
+                self.inflight.pop(token, None)
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
@@ -285,11 +296,17 @@ class _Run:
             record.scheduled_ms = spec.workload.get("scheduled_ms")
             record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
             record.overlap = slot["peak"]
-            record = score_response(spec, record)
-            self.records.append(record)
-            intentional = (spec.cancel_after_ms is not None and record.status == "cancelled") or (
+            try:
+                record = score_response(spec, record)
+            finally:
+                self.records.append(record)
+            intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
+                           and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
-            if not intentional and record.status != "cancelled" and (record.status != "completed" or not record.valid):
+            readiness = spec.scenario == "readiness" or (
+                spec.scenario == "initial" and self.config.restart_target == target.name)
+            if (not _stress(spec.scenario) and not readiness and not intentional
+                    and record.status != "cancelled" and (record.status != "completed" or not record.valid)):
                 self.errors += 1
             # Live visualization gets measurements only, never retained response bodies.
             self.emit("request_completed", target.name, spec.scenario, status=record.status,
@@ -399,28 +416,41 @@ async def _fairness(run, target, client, fixtures):
         observation["reason"] = "Requires observable streaming and concurrency of at least two"
         run.unfinished[target.name].add("fairness")
         return
+    short_fixtures = [spec for spec in fixtures["generation"]
+                      if spec.fixture_id.startswith("fairness.copy.")]
+    if config.max_output_tokens < 64:
+        observation["reason"] = "Fairness needs an output cap of at least 64 tokens for its active short stream."
+        run.unfinished[target.name].add("fairness")
+        return
     for index in range(config.samples):
         if not run.allowed(target.name):
             run.unfinished[target.name].add("fairness")
             break
+        await run.group(target, client, short_fixtures, "fairness_baseline",
+                        count=1, checks=["fairness"])
         event = asyncio.Event()
-        short = _spec(fixtures["short"][index % len(fixtures["short"])],
-                      "fairness_short", ["fairness"])
+        short = _spec(short_fixtures[0], "fairness_short", ["fairness"])
         task = asyncio.create_task(run.request(target, client, short, event))
         waiter = asyncio.create_task(event.wait())
+        dispatched = None
         try:
             await asyncio.wait([task, waiter], return_when=asyncio.FIRST_COMPLETED)
             observation["pairs"] += 1
             if event.is_set() and not task.done():
                 def on_start():
-                    if not task.done():
-                        observation["overlaps"] += 1
-                await run.request(target, client,
-                                  _spec(fixtures["long"][index % len(fixtures["long"])],
-                                        "fairness_long", ["fairness"]), on_start=on_start)
-            else:
-                run.unfinished[target.name].add("fairness")
-            await task
+                    nonlocal dispatched
+                    dispatched = (time.monotonic()-run.start)*1000
+                competitor = _spec(fixtures["long"][index % len(fixtures["long"])],
+                                   "fairness_long", ["fairness"])
+                messages = [dict(message) for message in competitor.messages]
+                messages[0]["content"] = uuid.uuid4().hex + "\n" + messages[0]["content"]
+                await run.request(target, client, competitor.model_copy(update={"messages": messages}),
+                                  on_start=on_start)
+            record = await task
+            if (record and dispatched is not None and record.dispatch_ms is not None
+                    and record.last_output_ms is not None and record.answer_chunks >= 2
+                    and record.dispatch_ms + record.last_output_ms > dispatched):
+                observation["overlaps"] += 1
         finally:
             waiter.cancel()
             if not task.done():
@@ -490,19 +520,29 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 initial_specs = [spec.model_copy(update={"request_timeout_seconds":
                     initial_timeout})
                     for spec in fixtures["short"]]
-                initial = await run.group(target, client, initial_specs, "initial", count=1)
                 if restart and restart["status"] == "hook_completed":
-                    while not any(r.valid for r in initial) and run.allowed(target.name):
-                        await asyncio.sleep(min(.1, max(0, run.deadline-time.monotonic())))
-                        initial = await run.group(target, client, initial_specs, "readiness", count=1)
-                    restart["status"] = "ready" if any(r.valid for r in initial) else "blocked"
+                    ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
+                    backoff = .1
+                    initial = []
+                    while time.monotonic() < ready_deadline and run.allowed(target.name):
+                        probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
+                        record = await run.request(target, client, probe, deadline_override=ready_deadline)
+                        if record and record.valid:
+                            record.check_ids = [name for name in ("access", "serving", "first_output")
+                                                if name in enabled]
+                            initial = [record]
+                            break
+                        await asyncio.sleep(min(backoff, max(0, ready_deadline-time.monotonic())))
+                        backoff = min(2, backoff * 2)
+                    restart["status"] = "ready" if initial else "blocked"
                     restart["readiness_ms"] = round((time.monotonic()-restart.pop("started_monotonic"))*1000, 3)
                     if restart["status"] == "blocked":
                         restart["reason"] = "No successful inference within readiness budget"
                         return
-            if enabled & {"serving", "first_output", "fairness"}:
-                warm_count = max(config.samples if enabled & {"serving", "first_output"} else 0,
-                                 config.effective_check("fairness")["samples"] if "fairness" in enabled else 0)
+                else:
+                    await run.group(target, client, initial_specs, "initial", count=1)
+            if enabled & {"serving", "first_output"}:
+                warm_count = config.samples
                 await run.group(target, client, fixtures["short"], "warm", count=warm_count)
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
@@ -579,24 +619,34 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         if "capacity" not in enabled:
                             await run.group(target, client, run.pack_specs, "pack_control",
                                             count=len(run.pack_specs), checks=["correctness"])
+                            effective = _check_config(config, "correctness")
+                            await run.group(target, client, run.pack_specs, "pack_loaded",
+                                            count=max(len(run.pack_specs), effective.concurrency),
+                                            concurrency=effective.concurrency, checks=["correctness"])
                         continue
                     effective = _check_config(config, check_id)
-                    specs = fixtures[check_id]
+                    specs = [spec.model_copy(update={"options": {"temperature": 0, **spec.options}})
+                             for spec in fixtures[check_id]]
                     await run.group(target, client, specs, f"{check_id}_c{effective.concurrency}",
                                     count=max(effective.samples, len(specs)),
                                     concurrency=effective.concurrency, checks=[check_id])
             if "cancellation" in enabled:
                 effective = _check_config(config, "cancellation")
                 options = config.effective_check("cancellation")
-                normal = [spec for spec in fixtures["limits"] if spec.cancel_after_ms is None]
-                cancel = [spec.model_copy(update={"cancel_after_ms": options["cancel_after_ms"]})
+                normal = sorted([spec.model_copy(update={"scorer": "none", "options": {
+                                     "temperature": 0, **spec.options}})
+                                 if spec.fixture_id.startswith("limits.stop.") else spec
+                                 for spec in fixtures["limits"] if spec.cancel_after_ms is None],
+                                key=lambda spec: not spec.fixture_id.startswith("limits.stop_control"))
+                cancel = [spec.model_copy(update={"cancel_after_ms": None,
+                                                 "cancel_after_chunks": options["cancel_after_chunks"]})
                           for spec in fixtures["limits"] if spec.cancel_after_ms is not None]
                 await run.group(target, client, normal, "limits",
                                 count=max(effective.samples, len(normal)), checks=["cancellation"])
                 await run.group(target, client, cancel, "client_cancel", count=len(cancel),
                                 checks=["cancellation"])
                 if cancel:
-                    deadline_spec = _spec(cancel[0].model_copy(update={"cancel_after_ms": None}),
+                    deadline_spec = _spec(cancel[0].model_copy(update={"cancel_after_ms": None, "cancel_after_chunks": None}),
                                           "client_deadline", ["cancellation"])
                     probe_timeout = min(options["deadline_probe_ms"] / 1000, config.request_timeout_seconds)
                     run.observations[target.name]["deadline_probe_ms"] = probe_timeout * 1000
@@ -608,20 +658,43 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await exercise(run, target, client, fixtures)
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
-                end = time.monotonic() + effective.sustained_seconds
-                batches = 0
-                while time.monotonic() < end and run.allowed(target.name):
-                    remaining = run.quotas[target.name] - run.budget_counts[target.name] - effective.samples
-                    if remaining <= 0:
-                        run.unfinished[target.name].add("recovery")
-                        break
-                    await run.group(target, client, fixtures["sustained"], "sustained",
-                                    count=min(effective.concurrency, remaining),
-                                    concurrency=effective.concurrency, checks=["recovery"])
-                    batches += 1
-                run.observations[target.name]["sustained_batches"] = batches
-                run.observations[target.name]["sustained_complete"] = time.monotonic() >= end and batches > 0
-                await run.group(target, client, fixtures["short"], "recovery",
+                probe_specs = [fixtures["short"][-1]]
+                await run.group(target, client, probe_specs, "recovery_baseline",
+                                count=effective.samples, checks=["recovery"])
+                from .planning import request_plan
+                later = [name for name in config.checks if name not in CORE_CHECKS]
+                later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+                remaining = min(config.max_requests-run.budget_used,
+                                run.quotas[target.name]-run.budget_counts[target.name])
+                reserved = later_plan["known_per_target"] + effective.samples
+                # At most half of the remaining target quota goes to adaptive
+                # sustained traffic; fixed later work and recovery probes are reserved.
+                allowance = max(0, min(remaining // 2, remaining-reserved))
+                run.observations[target.name]["sustained_budget"] = {
+                    "allowance": allowance, "reserved_later": reserved,
+                    "policy": "at most half the remaining quota; reserve fixed later work and probes"}
+                heavy = traffic_fixtures(config)
+                heavy_specs = heavy["long_input"] + heavy["long_output"]
+                end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
+                dispatched, exhausted = 0, False
+                async def worker():
+                    nonlocal dispatched, exhausted
+                    while time.monotonic() < end:
+                        if dispatched >= allowance or not run.allowed(target.name):
+                            exhausted = True
+                            return
+                        index = dispatched
+                        dispatched += 1
+                        spec = _spec(heavy_specs[index % len(heavy_specs)], "sustained", ["recovery"])
+                        await run.request(target, client, spec)
+                run.emit("scenario_started", target.name, "sustained")
+                await asyncio.gather(*(worker() for _ in range(effective.concurrency)))
+                run.emit("scenario_finished", target.name, "sustained")
+                run.observations[target.name]["sustained_batches"] = dispatched
+                run.observations[target.name]["sustained_complete"] = (
+                    time.monotonic() >= end and not exhausted
+                    and run.peak[(target.name, "sustained")] >= effective.concurrency)
+                await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             await workloads.execute(run, target, client, fixtures)
     except asyncio.CancelledError:
@@ -737,12 +810,26 @@ def _pack_results(run: _Run, target: Target) -> dict:
             "correct": sum(record.score is True for record in scored), "status": status,
         }, "stages": [{"stage_index": stage["stage_index"], "rate_rps": stage["rate_rps"],
                         **stage["case_counts"][case_id]} for stage in stages]})
+    limits = _check_config(run.config, "correctness").limits
+    for case, spec in zip(cases, run.pack_specs, strict=True):
+        loaded = [r for r in run.records if r.target == target.name and r.fixture_id == spec.fixture_id
+                  and (r.traffic_stage is not None or r.scenario == "pack_loaded")]
+        stats = _stats(loaded)
+        accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
+        failed = accuracy is not None and accuracy < limits.min_correctness
+        observed = bool(loaded) and all(r.valid and r.score is not None for r in loaded)
+        concurrent = run.config.concurrency == 1 or max((r.overlap for r in loaded), default=0) >= 2
+        case["loaded"] = {**stats, "accuracy": accuracy,
+                          "status": "fail" if failed else "pass" if observed and concurrent else "inconclusive"}
     coverage = bool(cases) and all(case["quiet"]["scored"] >= 1 for case in cases)
     all_scored = all(spec.scorer != "none" for spec in run.pack_specs)
     control_status = ("fail" if any(case["quiet"]["status"] == "fail" for case in cases)
                       else "pass" if coverage and all_scored else "inconclusive")
     preview = pack_preview(run.config)
-    return {"control_status": control_status, "coverage_complete": coverage,
+    loaded_status = ("fail" if any(case["loaded"]["status"] == "fail" for case in cases)
+                     else "pass" if cases and all(case["loaded"]["status"] == "pass" for case in cases)
+                     else "inconclusive")
+    return {"control_status": control_status, "loaded_status": loaded_status, "coverage_complete": coverage,
             "all_cases_scored": all_scored, "cases": cases,
             "workload_note": "Repeated, warmed workload; quiet controls and traffic repeat requests and may benefit caches.",
             "unique_effective_requests": preview["unique_effective_requests"],
@@ -764,12 +851,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         optional = check_id == "gpu"
         records = [r for r in ordinary if check_id in r.check_ids]
         if check_id == "correctness" and run.pack_specs:
-            records = [r for r in records if r.scenario == "pack_control"]
+            records = [r for r in all_records if r.scenario in {"pack_control", "pack_loaded"}
+                       or r.traffic_stage is not None]
             limits = limits.model_copy(update={"min_samples": 1})
         if check_id == "capacity":
             records = [r for r in records if r.traffic_stage is not None]
         if check_id == "fairness":
-            records = [r for r in records if r.scenario in {"fairness_short", "fairness_long"}]
+            records = [r for r in records if r.scenario in {"fairness_baseline", "fairness_short", "fairness_long"}]
         if check_id == "cancellation":
             records = [r for r in all_records if check_id in r.check_ids]
         if check_id in {"first_output", "generation"}:
@@ -783,23 +871,23 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             status, summary = "blocked", observations["restart"].get("reason", "Restart readiness unavailable")
         elif observations.get("client_error"):
             status, summary = "blocked", observations["client_error"]
+        elif check_id == "fairness" and observations["fairness"].get("reason"):
+            status, summary = "inconclusive", observations["fairness"]["reason"]
         elif check_id == "gpu":
-            snapshots = observations["metrics"]
-            missing = sorted({family for snap in snapshots for family in snap["unavailable"]})
-            metrics = {"attempted": len(snapshots), "completed": sum(bool(s["samples"]) for s in snapshots),
-                       "snapshots": snapshots, "unavailable_families": missing}
-            status = "inconclusive" if missing or not snapshots else "pass"
-            summary = "Existing GPU telemetry observed; this is not device health certification."
-            if missing or not snapshots:
-                summary = "GPU observations are missing or stale; unavailable does not mean healthy."
+            from .telemetry import assess_gpu
+            metrics, status, summary = assess_gpu(observations["metrics"], config.metrics_max_age_seconds)
         elif not records and check_id != "capacity":
             status, summary = "inconclusive", "No applicable requests completed within the run budget."
         elif check_id == "access":
             denied = [r for r in records if r.http_status in {401, 403}]
-            disconnected = [r for r in records if r.http_status is None and r.status in {"failed", "timeout"}]
+            disconnected = [r for r in records if r.http_status is None and r.status == "failed"
+                            and any(name in (r.error or "") for name in
+                                    ("ConnectError", "ConnectTimeout", "SSLError", "ConnectionError"))]
             if denied or disconnected:
                 status = "blocked" if not any(r.valid for r in records) else "fail"
                 summary = "Authentication or transport continuity failed on the configured route."
+            elif not any(r.valid for r in records):
+                status, summary = "inconclusive", "No valid access response; timeout or inference failure observed."
             else:
                 summary = "Configured route accepted requests; TLS trust is enforced for HTTPS."
             metrics["tls"] = "verified by transport" if target.url.startswith("https:") else "not applicable (HTTP)"
@@ -854,10 +942,21 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     if not independent_failure:
                         stage["status"] = "inconclusive"
                     stage["reasons"].append("Run-wide generator scheduling lag prevents timing attribution.")
-            accepted = [stage["rate_rps"] for stage in stages if stage["accepted"]]
+            highest = None
+            rejected = False
+            non_monotonic = False
+            for rate in config.traffic.rates:
+                stage = next((stage for stage in stages if stage["rate_rps"] == rate), None)
+                if not stage or not stage["accepted"]:
+                    rejected = True
+                elif rejected:
+                    non_monotonic = True
+                else:
+                    highest = rate
             metrics["traffic_stages"] = stages
-            metrics["highest_acceptable_rate_rps"] = max(accepted, default=None)
+            metrics["highest_acceptable_rate_rps"] = highest
             metrics["configured_rates_rps"] = config.traffic.rates
+            metrics["non_monotonic_results"] = non_monotonic
             metrics["scope"] = "Highest tested incoming rate for this scored canary mix; internal server queue time is unobserved."
             if any(stage["status"] == "fail" for stage in stages):
                 status, summary = "fail", "Some incoming rates exceeded known-answer, error or timing limits."
@@ -866,28 +965,38 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             else:
                 summary = "Reported highest tested acceptable incoming rate; maximum deployment capacity is unknown."
         elif check_id == "fairness":
-            baseline = _stats(warm)
+            baseline_records = [r for r in records if r.scenario == "fairness_baseline"]
+            baseline = _stats(baseline_records)
             mixed_records = [r for r in records if r.scenario == "fairness_short"]
             mixed = _stats(mixed_records)
             missing_gap = _missing_timing(mixed_records, limits.model_copy(update={
                 "first_output_ms": None, "latency_ms": None, "min_output_tokens_per_second": None}))
-            ratio = mixed["p50_ms"] / baseline["p50_ms"] if mixed["p50_ms"] is not None and baseline["p50_ms"] else None
+            def decode_p50(rows):
+                return _percentile([r.last_output_ms-r.first_output_ms for r in rows
+                    if r.valid and r.answer_chunks >= 2 and r.last_output_ms is not None
+                    and r.first_output_ms is not None and r.last_output_ms > r.first_output_ms], .5)
+            base_decode, loaded_decode = decode_p50(baseline_records), decode_p50(mixed_records)
+            ratio = loaded_decode / base_decode if loaded_decode is not None and base_decode else None
             accuracy = metrics["correct"] / metrics["scored"] if metrics["scored"] else None
             metrics.update({"short_only": baseline, "mixed_short": mixed, "latency_ratio": ratio,
+                            "decode_p50_ms": {"baseline": base_decode, "loaded": loaded_decode},
                             "accuracy": accuracy, "unscored_completions": metrics["completed"] - metrics["scored"],
                             **observations["fairness"]})
             if any(r.status != "cancelled" and (not r.valid or r.status != "completed") for r in records):
                 status, summary = "fail", "Mixed-load requests failed; short and long traffic did not both complete successfully."
+            elif any(r.finish_reason == "length" for r in records):
+                status, summary = "inconclusive", "Fairness answers reached their output cap; complete matched stream evidence is unavailable."
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Mixed short/long traffic failed the configured known-answer correctness limit."
             elif saturated:
                 status, summary = "inconclusive", "Generator saturation prevents attributing mixed-traffic timing effects to the endpoint."
+            elif (observations["fairness"]["overlaps"] < config.samples or ratio is None
+                  or len(baseline_records) < config.samples):
+                status, summary = "inconclusive", "Long prefill did not observably overlap every active short stream, or timing is noisy."
             elif limits.stream_gap_ms and mixed["max_stream_gap_ms"] is not None and mixed["max_stream_gap_ms"] > limits.stream_gap_ms:
                 status, summary = "fail", "Active short-stream pauses exceeded the configured stream-gap limit under mixed traffic."
             elif ratio is not None and limits.fairness_max_ratio and ratio > limits.fairness_max_ratio:
-                status, summary = "fail", "Short-stream latency increased beyond the configured mixed-traffic ratio."
-            elif observations["fairness"]["overlaps"] < config.samples or ratio is None or saturated:
-                status, summary = "inconclusive", "Long prefill did not observably overlap every active short stream, or timing is noisy."
+                status, summary = "fail", "Short-stream decoding time increased beyond the configured mixed-traffic ratio."
             elif accuracy is None or metrics["unscored_completions"]:
                 status, summary = "inconclusive", "Some mixed-load completions lack a local correctness score."
             elif missing_gap:
@@ -906,14 +1015,19 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics.update({"declared_context_limit": config.context_limit, "observed_max_input_tokens": observed_max,
                                 "near_limit_coverage": observed_max is not None and observed_max >= config.context_limit * .8,
                                 "calibration": observations.get("context_calibration")})
-            if accuracy is not None and accuracy < limits.min_correctness:
+            if check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and max(
+                    (r.overlap for r in records if r.score is not None), default=0) < 2:
+                status, summary = "inconclusive", "Known-answer checks were not exercised concurrently."
+            elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
             elif check_id == "context" and not metrics["near_limit_coverage"]:
                 status, summary = "inconclusive", "Recall fixtures passed at observed lengths; near-limit token context was not verified."
             else:
-                summary = "Built-in deterministic checks passed for the recorded fixtures and load."
+                summary = ("Built-in deterministic checks passed under observed concurrency."
+                           if check_id in {"correctness", "json"} and config.concurrency > 1
+                           else "Built-in deterministic checks passed for the recorded fixtures.")
         elif check_id == "cancellation":
             cancelled = [r for r in all_records if r.scenario == "client_cancel"]
             deadlines = [r for r in all_records if r.scenario == "client_deadline"]
@@ -924,16 +1038,32 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                             "deadline_probe_ms": observations.get("deadline_probe_ms"),
                             "deadline_probes": _stats(deadlines)})
             cap_usage = {r.id: r.completion_tokens if r.completion_tokens is not None else r.output_tokens for r in records}
-            bad_caps = [r.id for r in records if cap_usage[r.id] is not None and r.requested_max_tokens and cap_usage[r.id] > r.requested_max_tokens]
+            caps = [r for r in records if r.fixture_id.startswith("limits.output_cap")]
+            bad_caps = [r.id for r in caps if cap_usage[r.id] is not None and r.requested_max_tokens
+                        and (cap_usage[r.id] > r.requested_max_tokens
+                             or (r.finish_reason == "length" and cap_usage[r.id] != r.requested_max_tokens))]
+            controls = [r for r in records if r.fixture_id.startswith("limits.stop_control")]
+            stops = [r for r in records if r.fixture_id.startswith("limits.stop.")]
+            reached = any(r.valid and r.output.strip() == "blue [END] green" for r in controls)
+            stop_failed = any("[END]" in r.output or (reached and "green" in r.output) for r in stops)
+            stop_observed = reached and bool(stops) and all(
+                r.valid and r.output.strip() == "blue" and r.finish_reason == "stop" for r in stops)
+            metrics["stop_enforcement"] = {"control_reached_stop": reached,
+                "status": "fail" if stop_failed else "pass" if stop_observed else "inconclusive"}
+            metrics["output_cap_finish_reasons"] = [r.finish_reason for r in caps]
             failed_limits = [r.id for r in records if r.scenario == "limits" and not r.valid and r.status != "cancelled"]
-            if bad_caps or failed_limits or any(r.score is False for r in records) or any(not r.valid and r.status != "cancelled" for r in probes):
+            if bad_caps or failed_limits or stop_failed or any(r.score is False for r in records) or any(not r.valid and r.status != "cancelled" for r in probes):
                 status, summary = "fail", "Output/stop limits or inference after client cancellation failed."
                 metrics["output_cap_violations"] = bad_caps
                 metrics["failed_limit_requests"] = failed_limits
-            elif not cancelled or not all(r.status == "cancelled" for r in cancelled) or not probes or not deadlines or not all(r.status == "timeout" for r in deadlines):
+            elif not cancelled or not all(r.status == "cancelled" and r.first_output_ms is not None
+                                              and r.client_cancelled_at_ns is not None and r.finish_reason is None
+                                              and r.answer_chunks >= run.config.effective_check("cancellation")["cancel_after_chunks"] for r in cancelled) or not probes or not deadlines or not all(r.status == "timeout" for r in deadlines):
                 status, summary = "inconclusive", "Client disconnect, request deadline or follow-up inference could not be exercised."
-            elif any(cap_usage[r.id] is None for r in records if r.scenario == "limits"):
-                status, summary = "inconclusive", "Output token usage missing; exact output cap compliance is unverified."
+            elif not stop_observed:
+                status, summary = "inconclusive", "Server stop enforcement lacks a matching full-output control or stop finish reason."
+            elif any(cap_usage[r.id] is None and r.finish_reason != "length" for r in caps):
+                status, summary = "inconclusive", "Output token usage and length finish reason missing; output cap compliance is unverified."
             else:
                 summary = "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified."
             backend = metrics["backend_cancellation"]
@@ -941,8 +1071,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             server_stop = server_stop_result(backend)
             answers = [r for r in records
                        if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
-                       and (r.scenario == "cancellation_probe"
-                            or r.fixture_id.startswith("limits.stop.") or r.score is not None)]
+                       and (r.scenario == "cancellation_probe" or r.score is not None)]
             scored = [r for r in answers if r.score is not None]
             answer_status = "fail" if any(r.score is False for r in scored) else (
                 "pass" if scored and len(scored) == len(answers) else "inconclusive")
@@ -966,26 +1095,40 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif check_id == "recovery":
             sustained = [r for r in records if r.scenario == "sustained"]
             probes = [r for r in records if r.scenario == "recovery"]
+            baseline = [r for r in records if r.scenario == "recovery_baseline"]
+            before, after = _stats(baseline), _stats(probes)
+            latency_ratio = after["p50_ms"] / before["p50_ms"] if after["p50_ms"] is not None and before["p50_ms"] else None
+            first_ratio = after["first_output_p50_ms"] / before["first_output_p50_ms"] if after["first_output_p50_ms"] is not None and before["first_output_p50_ms"] else None
+            ratio_failed = limits.recovery_max_ratio is not None and any(
+                ratio is not None and ratio > limits.recovery_max_ratio for ratio in (latency_ratio, first_ratio))
             windows = [sustained[i:i+config.concurrency] for i in range(0, len(sustained), config.concurrency)]
             accuracy = metrics["correct"] / metrics["scored"] if metrics["scored"] else None
-            metrics.update({"sustained": _stats(sustained), "recovery": _stats(probes),
-                            "accuracy": accuracy,
+            metrics.update({"sustained": _stats(sustained), "recovery": after,
+                            "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
+                            "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
                             "unscored_completions": metrics["completed"] - metrics["scored"],
                             "rolling_windows": [_stats(window) for window in windows]})
             violations = _timing_violations(records, limits)
             if ((metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate)
-                    or (violations and not saturated)
+                    or ((violations or ratio_failed) and not saturated)
                     or (accuracy is not None and accuracy < limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
             elif accuracy is None or metrics["unscored_completions"]:
                 status, summary = "inconclusive", "Some sustained or recovery completions lack a local correctness score."
-            elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms, limits.min_output_tokens_per_second)):
+            elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
+                                        limits.min_output_tokens_per_second, limits.recovery_max_ratio)):
                 status, summary = "inconclusive", "Generator saturation prevents attributing sustained and recovery timing to the endpoint."
             elif _missing_timing(records, limits):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits)
                 status, summary = "inconclusive", "Configured sustained and recovery limits cannot be checked with available timing or token measurements."
-            elif not observations.get("sustained_complete") or len(probes) < config.samples:
+            elif (not observations.get("sustained_complete") or len(probes) < config.samples
+                  or len(baseline) < config.samples):
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."
+            elif limits.recovery_max_ratio is not None and (latency_ratio is None or first_ratio is None):
+                status, summary = "inconclusive", "Recovery ratio requires matching latency and first-output baseline evidence."
+            elif not any((limits.recovery_max_ratio, limits.first_output_ms, limits.latency_ms,
+                          limits.stream_gap_ms, limits.min_output_tokens_per_second)):
+                status, summary = "inconclusive", "Recovery observed; no acceptance limit configured."
             else:
                 summary = "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified."
         if run.pack_specs and check_id in {"capacity", "correctness"} and check_id in run.config.checks:
@@ -999,8 +1142,14 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "fail", "Quiet request-pack checks failed; loaded-stage outcomes are reported separately."
             elif pack["control_status"] != "pass" and status == "pass":
                 status, summary = "inconclusive", "Quiet request-pack coverage is incomplete or includes unscored cases."
-            elif check_id == "correctness" and status == "pass":
-                summary = "Every request-pack case completed its quiet scored check."
+            elif check_id == "correctness":
+                if pack["loaded_status"] == "fail":
+                    status, summary = "fail", "Loaded request-pack answers failed the per-case correctness limit."
+                elif pack["loaded_status"] != "pass" and status == "pass":
+                    status, summary = "inconclusive", "Request-pack cases lack complete scored concurrent evidence."
+                elif status == "pass":
+                    summary = ("Every request-pack case passed quiet and loaded scoring."
+                               if config.concurrency > 1 else "Every request-pack case passed quiet and serial scoring.")
         if status == "fail" and check_id in {"capacity", "fairness", "cancellation", "recovery"}:
             answer_failures = _answer_failures(records, warm)
             if check_id == "recovery" and metrics["accuracy"] is not None and metrics["accuracy"] >= limits.min_correctness:
@@ -1054,6 +1203,11 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                     stop_event: asyncio.Event | None = None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     config = config.model_copy(deep=True)
+    if config.request_source == "request_pack" and "correctness" in config.checks:
+        options = config.test_options.get("correctness")
+        if options and options.model_fields_set & {"samples", "concurrency"}:
+            raise ValueError("Request-pack correctness uses every case and the global concurrency; "
+                             "per-check samples/concurrency overrides are unsupported.")
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     fixtures = builtin_fixtures(config)
@@ -1122,8 +1276,16 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         warnings.append("Generator scheduling lag was observed; affected timing checks are inconclusive.")
     if run.budget_used >= config.max_requests:
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
+    cancellation_options = config.test_options.get("cancellation")
+    if ("cancellation" in config.checks and cancellation_options
+            and cancellation_options.cancel_after_ms is not None):
+        warnings.append("Legacy cancellation.cancel_after_ms does not schedule the disconnect; "
+                        "cancel_after_chunks controls cancellation after useful answer chunks.")
     if run.pack_specs:
         warnings.append("Repeated, warmed workload: quiet controls and traffic repeat the same requests and may benefit caches.")
+        warnings.append("Request-pack correctness covers every case; global samples does not select case count. "
+                        "Without capacity, one quiet pass and a concurrent pass of at least global concurrency run. "
+                        "Legacy request previews omit this extra concurrent pass.")
     observations = {"targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
                     "request_budget_used": run.budget_used,
                     "inference_duration_seconds": inference_duration,
@@ -1174,7 +1336,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                                "target_request_quotas": run.quotas},
                 "prerequisites": {name: scenarios for name, scenarios in {
                     "access": ["initial"], "serving": ["warm"],
-                    "first_output": ["initial", "warm"], "fairness": ["warm"],
+                    "first_output": ["initial", "warm"], "fairness": ["fairness_baseline"],
                 }.items() if name in config.checks},
                 "scenario_counts": dict(counts),
                 "measurement_definitions": {
@@ -1183,7 +1345,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                     "aggregate": "valid completions or known output tokens / seconds from first dispatch to last completion within each scenario; includes errors in window",
                     "latency_ms": "client dispatch through protocol completion",
                     "workload_sizes": "character sizing is requested shape; server token usage is observed length",
-                    "warmup": "initial and warm short requests only when required by selected checks or restart readiness"}}
+                    "warmup": "initial and warm short requests only when required by selected checks or restart readiness; fairness and recovery use their own matched baselines"}}
     run.emit("run_finished", abort_reason=run.reason)
     return RunReport(run_id=run_id, suite_version=SUITE_VERSION,
                      started_at=started_at, finished_at=_now(),

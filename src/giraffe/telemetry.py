@@ -57,10 +57,79 @@ LINE = re.compile(
 )
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
+GPU_FAMILIES = {entry[0] for entry in GPU.values()}
+# NVIDIA DCGM field constants: power cap, HW slowdown, SW/HW thermal, power brake.
+# Idle/application-clock/sync-boost/display-clock reasons alone are not failures.
+GPU_THROTTLE_REASONS = {4: "software power cap", 8: "hardware slowdown",
+                        32: "software thermal", 64: "hardware thermal", 128: "hardware power brake"}
 
 
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def assess_gpu(snapshots, max_age_seconds):
+    """Assess published GPU devices; an advancing scrape alone proves no freshness.
+
+    Value changes establish freshness for that device, not for other GPUs. Unseen
+    devices cannot be enumerated from this endpoint and remain outside coverage.
+    """
+    devices, series, alerts = {}, defaultdict(list), []
+    completed = 0
+    for index, snap in enumerate(snapshots):
+        samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
+        completed += bool(samples)
+        for sample in samples:
+            labels, family, value = sample.get("labels", {}), sample["family"], sample["value"]
+            # Hostname disambiguates identical GPU indices on multiple exporter hosts.
+            key = (labels.get("Hostname", ""), labels.get("gpu"))
+            device = devices.setdefault(key, {"families": set(), "timestamped": set(),
+                                               "changing": False, "unknown_identity": key[1] is None})
+            timestamp = sample.get("sample_timestamp_ms")
+            age = sample.get("age_seconds")
+            if timestamp is not None and age is None:
+                collected = snap.get("collected_at")
+                observed = datetime.fromisoformat(collected).timestamp() if collected else time.time()
+                age = observed - timestamp / 1000
+            stale = timestamp is not None and (age > max_age_seconds or age < -5)
+            # DCGM's int64 blank/error sentinels are not measurements.
+            if stale or not math.isfinite(value) or value < 0 or value >= 2**63 - 1024:
+                continue
+            device["families"].add(family)
+            if timestamp is not None:
+                device["timestamped"].add(family)
+            identity = (key, sample["name"], tuple(sorted(labels.items())))
+            series[identity].append((index, value))
+            reasons = (["XID error"] if family == "device_errors" and value > 0 else
+                       [reason for bit, reason in GPU_THROTTLE_REASONS.items() if int(value) & bit]
+                       if family == "throttling" else [])
+            if reasons:
+                alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
+                               "value": value, "reasons": reasons, "snapshot": index})
+    for (key, _, _), values in series.items():
+        if any(a[0] != b[0] and a[1] != b[1] for a, b in zip(values, values[1:])):
+            devices[key]["changing"] = True
+    rows = []
+    for (hostname, gpu), device in sorted(devices.items(), key=lambda item: str(item[0])):
+        fresh = device["families"] if device["changing"] else device["timestamped"]
+        missing = sorted(GPU_FAMILIES - device["families"])
+        unknown = sorted(device["families"] - fresh)
+        rows.append({"gpu": gpu, "hostname": hostname, "missing_families": missing,
+                     "unknown_freshness_families": unknown, "identity_verified": not device["unknown_identity"],
+                     "freshness": "values changed across scrapes" if device["changing"] else
+                     "source timestamps" if not unknown else "unknown"})
+    unavailable = sorted({f for row in rows for f in row["missing_families"]}) if rows else sorted(GPU_FAMILIES)
+    metrics = {"attempted": len(snapshots), "completed": completed, "snapshots": snapshots,
+               "unavailable_families": unavailable, "devices": rows, "alerts": alerts,
+               "coverage": "Published GPU labels only; devices absent from all scrapes cannot be discovered.",
+               "metrics_max_age_seconds": max_age_seconds}
+    qualifier = "this is not device health certification."
+    if alerts:
+        return metrics, "fail", "GPU telemetry reports XID errors or active thermal/power throttling; " + qualifier
+    if not rows or any(row["missing_families"] or row["unknown_freshness_families"] or
+                       not row["identity_verified"] for row in rows):
+        return metrics, "inconclusive", "GPU observations lack per-device coverage or freshness evidence; " + qualifier
+    return metrics, "pass", "Fresh GPU telemetry covers every observed device without reported XID or thermal/power events; " + qualifier
 
 
 def _metrics_headers(target):

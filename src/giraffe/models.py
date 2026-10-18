@@ -246,6 +246,7 @@ class Limits(Model):
     max_error_rate: float = Field(default=0, ge=0, le=1)
     min_correctness: float = Field(default=1, ge=0, le=1)
     fairness_max_ratio: float | None = Field(default=None, gt=1)
+    recovery_max_ratio: float | None = Field(default=None, gt=1)
     regression_percent: float = Field(default=20, ge=0)
     min_samples: int = Field(default=5, ge=2)
 
@@ -343,7 +344,7 @@ CHECK_LIMIT_FIELDS = {
     "fairness": {"fairness_max_ratio", "stream_gap_ms", "min_correctness"},
     "context": {"min_correctness"}, "correctness": {"min_correctness"},
     "json": {"min_correctness"}, "cancellation": set(),
-    "recovery": _TRAFFIC_LIMITS - {"min_samples"}, "gpu": set(),
+    "recovery": (_TRAFFIC_LIMITS - {"min_samples"}) | {"recovery_max_ratio"}, "gpu": set(),
 }
 
 # Extended workloads have dedicated top-level configuration blocks.
@@ -575,6 +576,7 @@ class RunConfig(Model):
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)
+    readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
     context_limit: int = Field(default=4096, ge=128)
     samples: int = Field(default=6, ge=1)
