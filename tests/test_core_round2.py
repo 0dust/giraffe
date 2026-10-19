@@ -123,7 +123,8 @@ def test_context_reduced_position_coverage_cannot_pass():
         run.records.append(score_response(spec, result))
     result = next(c for c in runner._checks(run, configured.targets[0]) if c.id == 'context')
     assert result.status == 'inconclusive'
-    assert result.summary == 'reduced fact-position coverage (context_limit too small)'
+    assert result.summary.startswith('reduced fact-position coverage (context_limit too small)')
+    assert "currently 128" in result.summary and "rerun all fact positions" in result.summary
     assert result.metrics['reduced_position_coverage']
 
 

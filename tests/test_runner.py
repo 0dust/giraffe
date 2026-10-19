@@ -109,6 +109,252 @@ def config(**kwargs):
     return RunConfig(**(values | kwargs))
 
 
+async def test_overlap_verdict_explains_plain_reason_and_rerun_settings(client):
+    report = await runner.run_suite(config(checks=["correctness"], stream=False))
+    check = next(c for c in report.checks if c.id == "correctness")
+    assert check.status == "inconclusive"
+    assert "streaming was disabled" in check.summary
+    assert "could not be checked under concurrent load" in check.summary
+    assert "OLLAMA_NUM_PARALLEL" in check.summary and "--concurrency 1" in check.summary
+    assert "sequentially" in check.summary
+    assert "--concurrency 2" not in check.summary and "--samples" not in check.summary
+
+
+@pytest.mark.parametrize("check_id", ["correctness", "json"])
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+async def test_serialized_server_overlap_remedy_preserves_sequential_scope(client, monkeypatch, check_id, concurrency):
+    original, lock = client.execute, asyncio.Lock()
+
+    async def serialized(self, spec, **kwargs):
+        queued = time.monotonic()
+        async with lock:
+            waited = (time.monotonic() - queued) * 1000
+            record = await original(self, spec, **kwargs)
+            return record.model_copy(update={field: getattr(record, field) + waited
+                for field in ("elapsed_ms", "first_output_ms", "last_output_ms", "stream_end_ms")})
+
+    monkeypatch.setattr(client, "execute", serialized)
+    report = await runner.run_suite(config(checks=[check_id], structured_json=True, concurrency=concurrency))
+    check = next(c for c in report.checks if c.id == check_id)
+    assert check.status == ("pass" if concurrency == 1 else "inconclusive")
+    assert all(r.score is True for r in report.requests)
+    if concurrency > 1:
+        assert "could not be checked under concurrent load" in check.summary
+        assert "one request at a time" in check.summary
+        assert "OLLAMA_NUM_PARALLEL" in check.summary
+        assert "--concurrency 1" in check.summary and "sequentially" in check.summary
+        assert "--concurrency 2" not in check.summary and "--samples" not in check.summary
+
+
+@pytest.mark.parametrize("check_id", ["first_output", "generation"])
+async def test_serial_timing_sample_remedy_changes_the_serial_sample_count(client, check_id):
+    report = await runner.run_suite(config(checks=[check_id], samples=2,
+        limits=Limits(min_samples=5, first_output_ms=1000, latency_ms=1000)))
+    check = next(c for c in report.checks if c.id == check_id)
+    assert check.status == "inconclusive"
+    assert "--samples" in check.summary and "at least 5" in check.summary
+    assert "idle load-generator" not in check.summary
+    assert "concurrency of at least 2" not in check.summary
+    if check_id == "first_output":
+        assert "test_options.first_output.samples" not in check.summary
+    else:
+        assert "test_options.generation.samples" in check.summary
+    enough = await runner.run_suite(config(checks=[check_id], samples=5,
+        limits=Limits(min_samples=5, first_output_ms=1000, latency_ms=1000)))
+    assert next(c for c in enough.checks if c.id == check_id).status == "pass"
+
+
+async def test_serial_generation_measurement_remedy_does_not_raise_concurrency(client):
+    report = await runner.run_suite(config(checks=["generation"], stream=False,
+        limits=Limits(min_samples=2, stream_gap_ms=1000)))
+    check = next(c for c in report.checks if c.id == "generation")
+    assert check.status == "inconclusive"
+    assert "stream: true" in check.summary and "buffering" in check.summary
+    assert "concurrency of at least 2" not in check.summary
+
+
+async def test_fixed_fixture_output_budget_remedy_does_not_raise_ineffective_ceiling(client, monkeypatch):
+    original = client.execute
+
+    async def reasoning_only(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        return record.model_copy(update={"output": "", "reasoning": "still thinking",
+            "reasoning_tokens": spec.max_tokens, "completion_tokens": spec.max_tokens,
+            "valid": False, "finish_reason": "length",
+            "error": "reasoning exhausted the output budget before an answer"})
+
+    monkeypatch.setattr(client, "execute", reasoning_only)
+    report = await runner.run_suite(config(checks=["serving"], max_output_tokens=128))
+    check = next(c for c in report.checks if c.id == "serving")
+    assert check.status == "inconclusive"
+    assert "increasing max_output_tokens alone will not" in check.summary
+    assert "above 128" not in check.summary
+
+
+async def test_missing_cap_usage_remedy_does_not_raise_output_budget(client, monkeypatch):
+    original = client.execute
+
+    async def no_cap_usage(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        if spec.fixture_id.startswith("limits.output_cap"):
+            record.output_tokens = record.completion_tokens = None
+        return record
+
+    monkeypatch.setattr(client, "execute", no_cap_usage)
+    report = await runner.run_suite(config(checks=["cancellation"]))
+    check = next(c for c in report.checks if c.id == "cancellation")
+    assert check.status == "inconclusive"
+    assert "Output token usage" in check.summary
+    assert "completion token usage" in check.summary
+    assert "raise max_output_tokens" not in check.summary
+
+
+async def test_fairness_overlap_remedy_targets_server_parallelism(client, monkeypatch):
+    original, lock = client.execute, asyncio.Lock()
+
+    async def serialized(self, spec, **kwargs):
+        queued = time.monotonic()
+        async with lock:
+            waited = (time.monotonic() - queued) * 1000
+            record = await original(self, spec, **kwargs)
+            return record.model_copy(update={field: getattr(record, field) + waited
+                for field in ("elapsed_ms", "first_output_ms", "last_output_ms", "stream_end_ms")})
+
+    monkeypatch.setattr(client, "execute", serialized)
+    report = await runner.run_suite(config(checks=["concurrency"],
+        concurrent_workloads={"scenarios": ["streaming_fairness"]},
+        limits=Limits(min_samples=2, fairness_max_ratio=3)))
+    check = next(c for c in report.checks if c.id == "concurrency")
+    assert check.status == "inconclusive"
+    assert "enable parallel serving on the server" in check.summary
+    assert "raising client concurrency alone cannot" in check.summary
+    assert "--concurrency 1" not in check.summary
+
+
+async def test_budget_verdict_has_real_plan_minimum(client):
+    from giraffe.planning import request_plan
+
+    configured = config(checks=["access", "serving", "correctness"], max_requests=1)
+    report = await runner.run_suite(configured)
+    minimum = request_plan(configured)["known_total"]
+    check = next(c for c in report.checks if c.id == "correctness")
+    assert check.status == "inconclusive"
+    assert f"max_requests (or --max-requests) to at least {minimum}" in check.summary
+    assert "select fewer checks" in check.summary
+
+
+async def test_fairness_failure_cause_survives_public_summary(client):
+    client.bad_mixed_gap = True
+    report = await runner.run_suite(config(checks=["concurrency"],
+        concurrent_workloads={"scenarios": ["streaming_fairness"]},
+        limits=Limits(min_samples=2, stream_gap_ms=50, fairness_max_ratio=3)))
+    check = next(c for c in report.checks if c.id == "concurrency")
+    assert check.status == "fail"
+    assert "stream gap 500 ms > allowed 50 ms" in check.summary
+    assert "To conclude," in check.summary
+
+
+async def test_sustained_verdict_names_required_duration(client):
+    client.delay = .03
+    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.5,
+        max_duration_seconds=.12, limits=Limits(min_samples=2, recovery_max_ratio=3)))
+    check = next(c for c in report.checks if c.id == "recovery")
+    assert check.status == "inconclusive"
+    assert "0.5 seconds" in check.summary
+    assert "2 successful" in check.summary
+
+
+async def test_dead_endpoint_keeps_verdicts_and_reports_connection_cause(client, monkeypatch):
+    async def disconnected(self, spec, **kwargs):
+        return RequestRecord(id=uuid.uuid4().hex, target=self.target.name,
+            fixture_id=spec.fixture_id, scenario=spec.scenario, check_ids=spec.check_ids,
+            started_at="2026-10-19T00:00:00Z", status="failed", error="request failed (ConnectError)")
+
+    monkeypatch.setattr(client, "execute", disconnected)
+    report = await runner.run_suite(config(checks=["access", "serving", "capacity"]))
+    assert report.overall == "fail"
+    expected = "Could not connect to http://localhost:1234 (ConnectError); no checks could run"
+    assert report.observations["summary"] == expected
+    assert expected in next(c for c in report.checks if c.id == "capacity").summary
+    assert next(c for c in report.checks if c.id == "access").status == "blocked"
+
+
+async def test_timing_failure_summary_names_observed_limit_and_server_remedy(client):
+    report = await runner.run_suite(config(checks=["first_output"], limits=Limits(min_samples=2, first_output_ms=1)))
+    check = next(c for c in report.checks if c.id == "first_output")
+    assert check.status == "fail"
+    assert "first output 2 ms > allowed 1 ms" in check.summary
+    assert "fix the first-output delay" in check.summary
+
+
+async def test_serving_failure_summary_names_error_rate(client, monkeypatch):
+    async def invalid(self, spec, **kwargs):
+        return RequestRecord(id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
+            scenario=spec.scenario, check_ids=spec.check_ids, started_at="2026-10-19T00:00:00Z",
+            status="failed", http_status=503, error="HTTP 503")
+
+    monkeypatch.setattr(client, "execute", invalid)
+    report = await runner.run_suite(config(checks=["serving"]))
+    check = next(c for c in report.checks if c.id == "serving")
+    assert check.status == "fail"
+    assert "error rate 100.0% > allowed 0.0%" in check.summary
+    assert "Could not connect" not in check.summary
+
+
+async def test_wrong_answer_summary_has_expected_and_received(client):
+    client.bad_target = "service"
+    report = await runner.run_suite(config(checks=["correctness"]))
+    check = next(c for c in report.checks if c.id == "correctness")
+    assert check.status == "fail"
+    assert "Expected:" in check.summary and 'received: "wrong"' in check.summary
+    assert "correctness 0.0% < allowed 100.0%" in check.summary
+    assert "fix the mismatch" in check.summary
+
+
+async def test_all_unfinished_default_verdicts_offer_a_remedy(client):
+    report = await runner.run_suite(config(checks=RunConfig.model_fields["checks"].get_default(call_default_factory=True),
+        max_requests=1))
+    assert all("To conclude," in check.summary for check in report.checks
+               if check.status in {"fail", "inconclusive"})
+
+
+def test_fairness_ratio_failure_names_metric_values():
+    from giraffe.concurrent_workloads import consolidate_checks, execution_config
+
+    configured = config(checks=["concurrency"], concurrent_workloads={"scenarios": ["streaming_fairness"]},
+        limits=Limits(min_samples=2, fairness_max_ratio=3))
+    state = runner._Run(execution_config(configured), None, None)
+    state.observations["service"]["fairness"].update(pairs=2, overlaps=2)
+    for scenario in ("fairness_baseline", "fairness_short", "fairness_long"):
+        for index in range(2):
+            state.records.append(RequestRecord(id=f"{scenario}-{index}", target="service",
+                fixture_id="fairness", scenario=scenario, check_ids=["fairness"],
+                started_at="2026-10-19T00:00:00Z", status="completed", valid=True, score=True,
+                elapsed_ms=20, first_output_ms=2, last_output_ms=10 if scenario == "fairness_short" else 4,
+                answer_chunks=2, stream_end_ms=20))
+    checks = consolidate_checks(state, configured, runner._checks(state, configured.targets[0]))
+    check = next(c for c in checks if c.id == "concurrency")
+    assert check.status == "fail"
+    assert "short-stream decoding ratio 4 > allowed 3" in check.summary
+    assert "address the slowdown" in check.summary
+
+
+async def test_capacity_guidance_uses_duration_and_real_sample_gate(client):
+    report = await runner.run_suite(config(checks=["capacity"], limits=Limits(min_samples=5, latency_ms=100)))
+    check = next(c for c in report.checks if c.id == "capacity")
+    assert check.status == "inconclusive"
+    assert "traffic.duration_seconds of at least 0.25 seconds per rate" in check.summary
+    assert "at least 5 scored completions" in check.summary
+
+
+async def test_fairness_output_budget_names_actual_required_cap(client):
+    report = await runner.run_suite(config(checks=["concurrency"], max_output_tokens=8,
+        concurrent_workloads={"scenarios": ["streaming_fairness"]}))
+    check = next(c for c in report.checks if c.id == "concurrency")
+    assert check.status == "inconclusive"
+    assert "max_output_tokens (or --max-output-tokens) to at least 60" in check.summary
+
+
 async def test_versioned_recovery_prompt_has_stable_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
@@ -1268,6 +1514,8 @@ async def test_pack_quiet_budget_shortfall_prevents_capacity_claim():
     assert result.status == "inconclusive"
     assert result.metrics["highest_acceptable_rate_rps"] is None
     assert not result.metrics["request_pack"]["coverage_complete"]
+    assert "every request-pack case" in result.summary
+    assert "--samples" not in result.summary
 
 
 @pytest.mark.parametrize("scorer", ["exact", "none"])

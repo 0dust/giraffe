@@ -1030,6 +1030,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             status, summary = "blocked", observations["client_error"]
         elif check_id == "fairness" and observations["fairness"].get("reason"):
             status, summary = "inconclusive", observations["fairness"]["reason"]
+            if "needed_output_tokens" in observations["fairness"]:
+                metrics["needed_output_tokens"] = observations["fairness"]["needed_output_tokens"]
         elif check_id == "gpu":
             from .telemetry import assess_gpu
             metrics, status, summary = assess_gpu(observations["metrics"], config.metrics_max_age_seconds,
@@ -1061,7 +1063,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             if metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate:
                 status, summary = "fail", "Invalid completions, errors or timeouts exceeded the configured allowance."
             elif metrics["reasoning_budget_exhausted"]:
-                status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer; raise max_output_tokens."
+                status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
             else:
                 summary = "Valid non-empty responses and required stream termination observed."
         elif check_id in {"first_output", "generation"}:
@@ -1093,7 +1095,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif saturated or metrics["completed"] < limits.min_samples:
                 status, summary = "inconclusive", "Timing has too few successful samples or overlapping client scheduling delay."
             elif metrics["reasoning_budget_exhausted"]:
-                status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer; raise max_output_tokens."
+                status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
             elif check_id == "first_output" and any(r.valid and r.first_output_ms is None for r in records):
                 status, summary = "inconclusive", "Useful first-output timing unavailable for some responses."
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
@@ -1521,7 +1523,206 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             reasons = dict.fromkeys(reason for row in check.metrics["logprobs"]["conditions"] for reason in row["coverage_reasons"])
             check.summary += "".join(" " + reason[:1].upper() + reason[1:].rstrip(".") + "."
                                      for reason in reasons if reason.lower().rstrip(".") not in check.summary.lower())
+    from .reporting import connection_summary
+    budget = getattr(run, "verdict_budget_guidance", None) or _budget_guidance(run.config)
+    disconnected = connection_summary(all_records, target.url)
+    for check in result + workload_results:
+        if check.status not in {"fail", "inconclusive", "blocked"}:
+            continue
+        config = (_check_config(run.config, "concurrency" if check.id in {"buckets", "mixed"} else check.id)
+                  if check.id in CORE_CHECKS or check.id in {"buckets", "mixed"} else run.config)
+        evidence = set(check.evidence_ids)
+        records = [r for r in all_records if r.id in evidence]
+        check.summary = _verdict_summary(check, config, records, budget)
+        if disconnected:
+            check.summary = (f"{disconnected}. {check.summary} "
+                             "Start the server and verify the target URL, port, proxy and TLS settings, then rerun.")
     return result + workload_results
+
+
+def _budget_guidance(config):
+    from .planning import request_plan
+    plan = request_plan(config)
+    planned = plan["required_request_limit"] or max(
+        plan["known_total"], plan["conservative_requests_per_target"] * len(config.targets))
+    amount = f"to at least {planned}" if planned > config.max_requests else f"above {config.max_requests} if exhausted"
+    return (f"Raise max_requests (or --max-requests) {amount}, "
+            f"or select fewer checks. The plan needs at least {plan['known_total']} fixed requests; adaptive traffic may need more.")
+
+
+def _output_budget_guidance(config, records):
+    capped = [r for r in records if _reasoning_budget(r) or r.finish_reason == "length"]
+    if capped and all(r.requested_max_tokens < config.max_output_tokens for r in capped):
+        caps = ", ".join(str(value) for value in sorted({r.requested_max_tokens for r in capped}))
+        return (f"the affected fixtures request {caps} tokens below the current ceiling; increasing max_output_tokens alone will not "
+                "change those requests. Configure the model to return the final fixture answer without extra reasoning within its requested cap, then rerun")
+    return (f"raise max_output_tokens (or --max-output-tokens) above {config.max_output_tokens} for fixtures capped by that ceiling, "
+            "or configure the model to produce the final answer within its requested cap, then rerun")
+
+
+def _verdict_summary(check, config, records, budget):
+    summary, metrics, limits = check.summary, check.metrics, config.limits
+    text = summary.lower() if check.status != "fail" else ""
+    if check.status == "fail":
+        details = []
+        for stage in metrics.get("traffic_stages", []):
+            if stage["status"] != "fail":
+                continue
+            prefix = f"at {stage['rate_rps']:g} requests/s, "
+            if stage.get("error_rate") is not None and stage["error_rate"] > limits.max_error_rate:
+                details.append(f"{prefix}error rate {stage['error_rate']:.1%} > allowed {limits.max_error_rate:.1%}")
+            if stage.get("correctness") is not None and stage["correctness"] < limits.min_correctness:
+                details.append(f"{prefix}correctness {stage['correctness']:.1%} < allowed {limits.min_correctness:.1%}")
+            if not details:
+                details.append(prefix + "; ".join(stage.get("reasons", ["stage did not meet configured acceptance limits"])))
+            break
+        if check.id == "gpu":
+            for alert in metrics.get("alerts", [])[:2]:
+                detail = f"GPU {alert['gpu']}: {', '.join(alert['reasons'])}"
+                if alert["family"] == "temperature":
+                    detail += f" ({alert['value']:g} °C > allowed {limits.gpu_max_temperature_c:g} °C)"
+                elif alert.get("value") is not None:
+                    detail += f" (value {alert['value']})"
+                details.append(detail)
+        if check.id == "consistency":
+            agreements = [row["agreement_rate"] for row in metrics.get("cross_level", [])
+                          if row.get("agreement_rate") is not None]
+            if agreements and min(agreements) < 1:
+                details.append(f"answer agreement {min(agreements):.1%} < required 100.0% under strict consistency")
+        rates = [("error rate", metrics.get("error_rate"), limits.max_error_rate, False),
+                 ("correctness", metrics.get("accuracy", metrics.get("correctness_observed")), limits.min_correctness, True)]
+        if check.id == "recovery":
+            rates.extend((name, metrics.get(key), limits.max_error_rate, False) for name, key in (
+                ("sustained error rate", "sustained_error_rate"),
+                ("baseline error rate", "baseline_non_timeout_error_rate")))
+        for name, value, allowed, minimum in rates:
+            if value is not None and (value < allowed if minimum else value > allowed):
+                details.append(f"{name} {value:.1%} {'<' if minimum else '>'} allowed {allowed:.1%}")
+        measured = records
+        if check.id == "fairness":
+            measured = [r for r in records if r.scenario == "fairness_short"]
+        elif check.id == "recovery":
+            measured = [r for r in records if r.scenario == "recovery"]
+        quality = metrics.get("timing_quality", {})
+        if quality.get("status") == "client_delayed":
+            ids = qualified_violations(measured, limits, quality, unfinished=True)
+            measured = [r for r in measured if r.id in ids]
+        timing = [("stream gap", "max_stream_gap_ms", limits.stream_gap_ms, "ms", False),
+                  ("latency", "elapsed_ms", limits.latency_ms, "ms", False),
+                  ("first output", "first_output_ms", limits.first_output_ms, "ms", False),
+                  ("generation pace", "generation_tokens_per_second", limits.min_output_tokens_per_second, "tokens/s", True)]
+        for name, field, allowed, unit, minimum in timing:
+            if allowed is None or (check.id == "first_output" and field != "first_output_ms") or (
+                    check.id == "generation" and field == "first_output_ms") or (
+                    check.id == "fairness" and field != "max_stream_gap_ms"):
+                continue
+            values = [value for r in measured if (value := getattr(r, field)) is not None
+                      and (r.valid or field in exceeded_unfinished(r, limits))]
+            value = (min(values) if minimum else max(values)) if values else None
+            if value is not None and (value < allowed if minimum else value > allowed):
+                details.append(f"{name} {value:g} {unit} {'<' if minimum else '>'} allowed {allowed:g} {unit}")
+        if quality.get("status") != "client_delayed":
+            for key in ("latency_ratio", "first_output_ratio"):
+                allowed = limits.fairness_max_ratio if check.id == "fairness" else limits.recovery_max_ratio
+                value = metrics.get(key)
+                if allowed and value is not None and value > allowed:
+                    name = "short-stream decoding ratio" if check.id == "fairness" else key.replace("_", " ")
+                    details.append(f"{name} {value:.3g} > allowed {allowed:g}")
+        for record in records:
+            if record.id in metrics.get("output_cap_violations", []):
+                value = record.completion_tokens if record.completion_tokens is not None else record.output_tokens
+                details.append(f"output cap violated: {value if value is not None else 'token lower bound'} tokens; requested {record.requested_max_tokens}")
+                break
+        if metrics.get("stop_enforcement", {}).get("status") == "fail":
+            details.append("stop output contained text at or after the configured [END] stop string")
+        if not details:
+            failed = next((r for r in records if r.status in {"failed", "timeout"} or not r.valid), None)
+            if failed:
+                details.append(f"{failed.fixture_id}: {failed.error or ('HTTP ' + str(failed.http_status) if failed.http_status else 'invalid or unfinished response')}")
+        if details:
+            summary += " Observed: " + "; ".join(details[:4]) + "."
+        mismatch = next((r for r in records if r.score is False and r.evaluation
+                         and r.evaluation.expected_provided), None)
+        if mismatch:
+            from .fixtures import answer_difference, final_answer
+            summary += answer_difference(mismatch.evaluation.expected, final_answer(mismatch.output)[0])
+
+    samples = max(2, config.samples, limits.min_samples)
+    if "not exercised concurrently" in text:
+        summary += (" Plain words: answers could not be checked under concurrent load. The server appears to handle one request at a time, "
+                    "or the recorded streaming/client timing did not expose overlapping answers."
+                    if config.stream else " Plain words: streaming was disabled, so answers could not be checked under concurrent load; server parallelism is unverified.")
+        remedy = ("enable parallel serving on the server (for example OLLAMA_NUM_PARALLEL=2 for Ollama, or the engine's equivalent), "
+                  "restart the server to apply the configuration and rerun with streaming (stream: true, omit --nonstream); "
+                  "or rerun with --concurrency 1 to check answers sequentially, which does not test concurrent load")
+    elif "scheduling delay" in text and metrics.get("timing_quality", {}).get("status") == "client_delayed":
+        remedy = "rerun from an idle load-generator machine and reduce competing client work so streaming timing can be measured"
+    elif check.status == "inconclusive" and metrics.get("reasoning_budget_exhausted"):
+        remedy = _output_budget_guidance(config, records)
+    elif check.id in {"first_output", "generation"} and "too few successful samples" in text:
+        setting = "samples (or --samples)" + (" and any test_options.generation.samples override" if check.id == "generation" else "")
+        remedy = (f"set {setting} to at least {limits.min_samples}, "
+                  "then allow those serial requests to complete within the request and time budgets")
+    elif "no acceptance" in text:
+        option = {"fairness": "limits.fairness_max_ratio", "mixed": "limits.fairness_max_ratio",
+                  "recovery": "limits.recovery_max_ratio", "first_output": "limits.first_output_ms"}.get(
+                      check.id, "limits.latency_ms, limits.stream_gap_ms or limits.min_output_tokens_per_second")
+        remedy = f"set {option} to your service's acceptance target and rerun"
+    elif metrics.get("request_pack") and check.status == "inconclusive" and (
+            not metrics["request_pack"]["coverage_complete"] or not metrics["request_pack"]["all_cases_scored"]):
+        remedy = ("finish quiet and loaded scoring for every request-pack case and inspect any evaluator errors or unfinished answers; "
+                  f"global samples does not select the case count. {budget}")
+    elif check.id == "capacity" and check.status == "inconclusive":
+        stages = metrics.get("traffic_stages", [])
+        needed = max(limits.min_samples, 80 if any(stage.get("stability_unverified") for stage in stages) else 0)
+        duration = max(config.traffic.duration_seconds, needed / min(config.traffic.rates))
+        remedy = (f"allow traffic.duration_seconds of at least {duration:g} seconds per rate for at least {needed} scored completions; "
+                  "set limits.first_output_ms or limits.latency_ms, enable stream/token measurements, "
+                  f"and allow the whole rate plan to finish. {budget}")
+    elif check.id == "fairness" and metrics.get("needed_output_tokens", 0) > config.max_output_tokens:
+        remedy = f"set max_output_tokens (or --max-output-tokens) to at least {metrics['needed_output_tokens']} and rerun the streaming trials"
+    elif ("exhausted" in text and "output budget" in text) or (check.id == "fairness" and "reached their output cap" in text):
+        remedy = _output_budget_guidance(config, records)
+    elif check.id == "context":
+        remedy = (f"set context_limit to the server's actual token window (currently {config.context_limit}), "
+                  "enable prompt token usage reporting and rerun all fact positions with enough output tokens for complete answers")
+    elif check.id == "recovery" and "not fully observed" in text:
+        remedy = (f"allow {config.sustained_seconds:g} seconds of sustained traffic with at least {limits.min_samples} successful sustained requests "
+                  f"and {config.samples} successful requests in each baseline and recovery batch; "
+                  f"raise max_duration_seconds (or --max-duration) above {config.max_duration_seconds:g} if the deadline stops the run. {budget}")
+    elif any(word in text for word in ("run budget", "budgets", "run deadline", "unfinished", "no applicable")):
+        remedy = f"{budget} Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
+    elif any(word in text for word in ("overlap", "concurrent")) and check.status == "inconclusive":
+        prerequisite = "set concurrency to at least 2 and " if check.id == "fairness" and config.concurrency < 2 else ""
+        remedy = (prerequisite + "enable parallel serving on the server and streaming (stream: true, omit --nonstream), "
+                  "disable response buffering along the route, and rerun the same workload; raising client concurrency alone cannot make a serial server process requests in parallel")
+    elif check.id == "cancellation" and not config.stream:
+        remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"
+    elif any(word in text for word in ("stream", "timing", "measurable", "measured", "token measurements", "first-output baseline")) and check.status == "inconclusive":
+        remedy = (f"enable streaming (stream: true, omit --nonstream), disable response buffering along the route and enable completion token usage reporting; "
+                  f"collect at least {limits.min_samples} responses with the required timing measurements, then rerun the same workload")
+    elif "sample" in text or "score" in text or "scor" in text:
+        remedy = (f"collect at least {samples} complete scored answers per tested condition; "
+                  "check the fixture's expected answer and evaluator errors, increase the output budget for truncated answers, then rerun")
+    else:
+        remedy = {
+            "access": "verify server availability, target URL, credentials, proxy and TLS trust, then rerun",
+            "serving": "inspect the failed request's HTTP/protocol error, fix the server response or timeout cause, then rerun",
+            "first_output": "inspect slow requests and server load, fix the first-output delay, then rerun against the same timing limit",
+            "generation": "inspect slow or buffered streams and server load, fix generation delays, then rerun against the same limits",
+            "correctness": "compare the expected and received answer, check the prompt and model's answer format, fix the mismatch, then rerun the same fixtures",
+            "json": "compare the expected and received JSON and the schema violation, fix the model's structured output, then rerun the same fixtures",
+            "capacity": "inspect the failing traffic stage and request errors, address server overload or wrong answers, then rerun the same rate plan",
+            "fairness": "inspect short-stream pauses and long-request interference on the server, address the slowdown, then rerun the same mixed traffic",
+            "cancellation": "enable streaming and completion token usage, verify server stop and cancellation support, then rerun the control and follow-up probes",
+            "recovery": "inspect sustained-load errors and slow recovery probes, address the server issue, then rerun the same sustained workload",
+            "gpu": f"configure a reachable GPU metrics exporter with fresh per-device samples and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; inspect reported device errors before rerunning",
+            "prefix": "enable cached-token usage reporting, check the server's prefix-cache configuration and rerun the repeat and independent controls",
+            "sessions": "complete each configured session mode with at least two overlapping streamed conversations and inspect any wrong recall answers",
+            "consistency": "inspect differing answers and token probabilities, verify deterministic serving settings and rerun the same shapes and concurrency levels",
+            "tools": "inspect the tool protocol and argument outcomes, enable the server's tool parser and correct the configured tool contract, then rerun",
+        }.get(check.id, "inspect the failed request and coverage details, correct the reported server or workload issue, then rerun the same workload")
+    return summary.rstrip(".") + ". To conclude, " + remedy.rstrip(".") + "."
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
@@ -1599,6 +1800,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                     finalize_stage(evidence, limits) | {
                         "timing_interval_ms": stages[index]["timing_interval_ms"]}
                     for index, evidence in enumerate(run.stage_evidence[target.name])]
+    run.verdict_budget_guidance = _budget_guidance(config)
     checks = [check for target in config.targets for check in _checks(run, target)]
     checks = consolidate_checks(run, public_config, checks)
     counts = defaultdict(dict)
@@ -1633,6 +1835,11 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
+    from .reporting import connection_summary
+    connection_failures = [message for target in config.targets if (message := connection_summary(
+        [r for r in run.records if r.target == target.name], target.url))]
+    if connection_failures:
+        observations["summary"] = "; ".join(connection_failures)
     from giraffe.workloads import FIXTURE_SOURCE_SHA256, WORKLOAD_CHECKS
     config_values = public_config.model_dump(mode="json")
     workload_settings = {key: (getattr(config, key).model_dump(mode="json")

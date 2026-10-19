@@ -195,7 +195,8 @@ async def test_arrivals_need_timing_limit_and_preserve_real_failures(endpoint, l
     if limits.min_output_tokens_per_second is not None:
         assert "generation_tokens_per_second" in result.metrics["missing_timing_metrics"]
     elif not limits.latency_ms and status == "inconclusive":
-        assert result.summary == "Arrivals observed; no acceptance limit configured."
+        assert result.summary.startswith("Arrivals observed; no acceptance limit configured.")
+        assert "To conclude, set limits.latency_ms" in result.summary
 
 async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
     with FakeEndpoint(first_token_delay=.4) as server:
@@ -217,7 +218,9 @@ async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one(
             request_timeout_seconds=10, limits=Limits(latency_ms=5000, min_samples=2),
             arrivals={"requests": 4, "requests_per_second": 20}))
     result = check(unlimited, "arrivals", target="local")
-    assert (result.status, result.summary) == ("inconclusive", "Arrivals observed; no acceptance limit configured.")
+    assert result.status == "inconclusive"
+    assert result.summary.startswith("Arrivals observed; no acceptance limit configured.")
+    assert "To conclude, set limits.latency_ms" in result.summary
     assert check(limited, "arrivals", target="local").status == "pass"
 
 

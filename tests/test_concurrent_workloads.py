@@ -41,6 +41,36 @@ def test_one_public_check_and_legacy_configuration_migration():
     assert typed.concurrent_workloads.scenarios == ["size_matrix"]
 
 
+def test_unreached_scenario_summary_has_budget_remedy():
+    from types import SimpleNamespace
+    from giraffe.concurrent_workloads import consolidate_checks, execution_config
+    from giraffe.runner import _Run
+
+    config = configuration(SimpleNamespace(url="http://localhost:1"), scenarios=["size_matrix"])
+    run = _Run(execution_config(config), None, None)
+    check = consolidate_checks(run, config, [])[0]
+    assert check.status == "inconclusive"
+    assert "Scenario was not reached" in check.summary
+    assert "To conclude," in check.summary and "max_requests" in check.summary
+
+
+def test_public_failure_summary_ends_with_primary_cause_and_remedy():
+    from types import SimpleNamespace
+    from giraffe.concurrent_workloads import consolidate_checks, execution_config
+    from giraffe.models import CheckResult
+    from giraffe.runner import _Run
+
+    config = configuration(SimpleNamespace(url="http://localhost:1"), scenarios=["streaming_fairness", "size_matrix"])
+    run = _Run(execution_config(config), None, None)
+    checks = [CheckResult(id="fairness", target="local", title="Fairness", status="fail",
+        summary="Stream gap 500 ms > allowed 50 ms. To conclude, address server pauses and rerun."),
+        CheckResult(id="buckets", target="local", title="Size matrix", status="pass", summary="Passed.")]
+    check = consolidate_checks(run, config, checks)[0]
+    assert check.status == "fail"
+    assert "Stream gap 500 ms > allowed 50 ms" in check.summary
+    assert check.summary.endswith("To conclude, address server pauses and rerun.")
+
+
 async def test_merged_result_retains_each_scenario_and_measurement(tmp_path):
     with FakeEndpoint(first_token_delay=.02, chunk_delay=.015) as endpoint:
         report = await run_suite(configuration(endpoint, scenarios=[
