@@ -23,7 +23,7 @@ from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.models import ConfigDraft, Model, RunConfig, RunReport
 from giraffe.planning import request_plan
-from giraffe.preflight import ConnectionTest, ModelDiscovery, PreflightError
+from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from giraffe.request_pack import pack_preview
@@ -34,7 +34,30 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
 _SHUTDOWN_SECONDS = 5
 
 
-class StartRun(Model):
+class TargetAPIKey(APIKeyInput):
+    target: str
+    url: str
+
+
+class SessionCredentials(Model):
+    api_keys: list[TargetAPIKey] = Field(default_factory=list, exclude=True, repr=False,
+                                       max_length=64)
+
+    def attach_api_keys(self, config: RunConfig | ConfigDraft) -> None:
+        seen = set()
+        for credential in self.api_keys:
+            target = next((t for t in config.targets
+                           if t.name == credential.target and t.url == credential.url), None)
+            if target is None or credential.target in seen:
+                raise HTTPException(422, "Each session API key must match one configured target and URL.")
+            seen.add(credential.target)
+            try:
+                attach_api_key(target, credential.api_key)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+
+
+class StartRun(SessionCredentials):
     config: RunConfig
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
@@ -49,7 +72,7 @@ class DatasetPreview(Model):
     scorer: Literal["judge", "exact"] = "judge"
 
 
-class TryExample(Model):
+class TryExample(SessionCredentials):
     config: ConfigDraft
     fixture_id: str
     target_name: str
@@ -357,13 +380,15 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     async def try_example(body: TryExample):
         from giraffe.dataset_import import try_example_config
 
+        body.attach_api_keys(body.config)
         try:
             config = try_example_config(body.config, body.fixture_id, body.target_name)
         except (ValidationError, ValueError) as exc:
             message = str(exc) if not isinstance(exc, ValidationError) else "; ".join(
                 ".".join(map(str, item["loc"])) + ": " + item["msg"] for item in exc.errors())
             raise HTTPException(422, message) from exc
-        return await start_run(StartRun(config=config))
+        return await start_run(StartRun(config=config, api_keys=[credential for credential
+                               in body.api_keys if credential.target == body.target_name]))
 
     @app.get("/api/runs")
     async def list_runs():
@@ -381,6 +406,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     def prepare_run(body: StartRun) -> tuple[RunConfig, RunReport | None]:
         """Resolve the same execution intent for Start and Copy CLI."""
         config = body.config
+        body.attach_api_keys(config)
         if body.mode == "normal":
             if config.restart_target or body.restart_target:
                 raise HTTPException(422, "Restart requires explicit cold-start mode and target")

@@ -49,7 +49,9 @@ def completion_url(url: str) -> str:
 
 def _headers(target: Target) -> dict[str, str]:
     headers = {"Accept": "application/json, text/event-stream"}
-    if target.api_key_env:
+    if target._api_key is not None:
+        headers["Authorization"] = f"Bearer {target._api_key.get_secret_value()}"
+    elif target.api_key_env:
         value = os.environ.get(target.api_key_env)
         if not value:
             raise ValueError(f"Missing API key environment variable: {target.api_key_env}")
