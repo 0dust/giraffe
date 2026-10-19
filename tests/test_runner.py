@@ -299,7 +299,7 @@ async def test_recovery_honors_correctness_allowance_without_hiding_protocol_fai
         return record
 
     monkeypatch.setattr(client, "execute", one_wrong_probe)
-    configured = config(checks=["recovery"], test_options={
+    configured = config(checks=["recovery"], sustained_seconds=.1, test_options={
         "recovery": {"limits": {"min_correctness": .5, "latency_ms": 1000}},
     })
     report = await runner.run_suite(configured)

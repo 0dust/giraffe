@@ -225,8 +225,9 @@ async def test_recovery_consumed_allowance_can_qualify_before_duration(endpoint)
         sustained_seconds=10, limits=Limits(recovery_max_ratio=10, min_samples=2)))
     result = check(report, 'recovery')
     assert result.status == 'pass'
-    assert result.metrics['sustained_budget']['allowance'] == 36
-    assert result.metrics['sustained']['attempted'] == 36
+    assert result.metrics['sustained_budget']['allowance'] == 35
+    assert result.metrics['sustained']['attempted'] == 35
+    assert len([r for r in report.requests if r.scenario == 'recovery_prime']) == 1
     assert result.metrics['sustained_completion']['reason'] == 'allowance consumed with sustained concurrency'
     assert result.metrics['sustained_completion']['time_weighted_in_flight'] >= 1.8
 

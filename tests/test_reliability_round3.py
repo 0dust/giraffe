@@ -201,13 +201,13 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
         assert len(sustained) >= 5 and all(r.status == 'completed' and r.valid for r in sustained)
         assert outcome.metrics['sustained']['error_rate'] == 0
         return
-    assert outcome.status == report.overall == 'fail'
+    assert outcome.status == report.overall == ('inconclusive' if mode == 'phase_cancel' else 'fail')
     assert heavy_started == 3 and hangs == 2
     assert sum(r.status == 'completed' and r.valid for r in sustained) == 1
     assert completion['requests'] < completion['required_requests'] == 5
     assert completion['reason'] == 'insufficient load evidence'
     assert completion['successful_requests'] < completion['required_successful_requests'] == 5
-    assert outcome.metrics['sustained_error_rate'] == pytest.approx(2 / 3)
+    assert outcome.metrics['sustained_error_rate'] == pytest.approx(0 if mode == 'phase_cancel' else 2 / 3)
     if mode == 'phase_cancel':
         assert interrupted == 2
         assert sum(r.status == 'cancelled' for r in sustained) == 2

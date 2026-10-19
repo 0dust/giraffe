@@ -757,11 +757,20 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 probe_specs = fixtures["sustained"]
-                await run.group(target, client, probe_specs, "recovery_baseline",
-                                count=effective.samples, checks=["recovery"])
                 from .planning import request_plan
                 later = [name for name in config.checks if name not in CORE_CHECKS]
                 later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+                if "cancellation" in enabled:
+                    cleanup = config.effective_check("cancellation")["cleanup_seconds"]
+                    await asyncio.sleep(max(0, min(5, cleanup, run.deadline - time.monotonic())))
+                if min(config.max_requests-run.budget_used, run.quotas[target.name]-run.budget_counts[target.name]) > (
+                        later_plan["known_per_target"] + 2 * effective.samples
+                        + max(effective.limits.min_samples, effective.concurrency*2)):
+                    # Uncounted warm-up so the baseline is not the probe fixture's cold first use.
+                    await run.request(target, client, probe_specs[0].model_copy(update={
+                        "scenario": "recovery_prime", "check_ids": []}))
+                await run.group(target, client, probe_specs, "recovery_baseline",
+                                count=effective.samples, checks=["recovery"])
                 remaining = min(config.max_requests-run.budget_used,
                                 run.quotas[target.name]-run.budget_counts[target.name])
                 reserved = later_plan["known_per_target"] + effective.samples
@@ -799,8 +808,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 loaded = enough and weighted >= effective.concurrency*.9 and run.peak[(target.name, "sustained")] >= effective.concurrency
                 elapsed = time.monotonic() >= end and end < run.deadline
                 successful = sum(r.status == "completed" and r.valid for r in sustained)
-                complete = successful >= effective.limits.min_samples and (
-                    (elapsed and run.peak[(target.name, "sustained")] >= effective.concurrency) or (exhausted and loaded))
+                occupied = weighted >= effective.concurrency*.9 and run.peak[(target.name, "sustained")] >= effective.concurrency
+                complete = successful >= effective.limits.min_samples and ((elapsed and occupied) or (exhausted and loaded))
                 run.observations[target.name]["sustained_complete"] = complete
                 run.observations[target.name]["sustained_completion"] = {
                     "reason": "duration elapsed" if elapsed and complete else
@@ -1319,12 +1328,23 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             windows = [sustained[i:i+config.concurrency] for i in range(0, len(sustained), config.concurrency)]
             probe_stats = _stats(probes)
             accuracy = metrics["correct"] / metrics["scored"] if metrics["scored"] else None
-            sustained_errors = sum(r.status != "completed" or not r.valid for r in sustained)
-            sustained_error_rate = sustained_errors / len(sustained) if sustained else 0
-            metrics.update({"sustained": _stats(sustained), "recovery": after,
+            # Deadline/stop cancellations are unfinished evidence, not endpoint errors.
+            evaluated = [r for r in sustained if r.status != "cancelled"]
+            sustained_errors = sum(r.status != "completed" or not r.valid for r in evaluated)
+            sustained_error_rate = sustained_errors / len(evaluated) if evaluated else 0
+            sustained_stats = _stats(sustained)
+            # Light-load failures before any sustained traffic are endpoint failures;
+            # timeouts and cancellations there only leave the baseline incomplete.
+            baseline_evaluated = [r for r in baseline if r.status != "cancelled"]
+            baseline_error_rate = (sum(r.status == "failed" or (r.status == "completed" and not r.valid)
+                                       for r in baseline_evaluated) / len(baseline_evaluated)
+                                   if baseline_evaluated else None)
+            metrics.update({"sustained": sustained_stats, "recovery": after,
                             "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
                             "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
-                            "unscored_completions": probe_stats["completed"] - probe_stats["scored"],
+                            "unscored_completions": sum(r.status == "completed" and r.valid and r.score is None
+                                                        for r in probes + sustained),
+                            "baseline_non_timeout_error_rate": baseline_error_rate,
                             "sustained_error_rate": sustained_error_rate,
                             "sustained_non_timeout_error_rate": sum(r.status not in {"completed", "timeout", "cancelled"}
                                 or (r.status == "completed" and not r.valid) for r in sustained) / len(sustained) if sustained else 0,
@@ -1332,9 +1352,14 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                             "rolling_windows": [_stats(window) for window in windows]})
             if ((probe_stats["error_rate"] is not None and probe_stats["error_rate"] > limits.max_error_rate)
                     or sustained_error_rate > limits.max_error_rate
+                    or (baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate)
                     or (qualified_violations(probes, limits, quality) or (ratio_failed and not saturated))
                     or (accuracy is not None and accuracy < limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
+                if baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate:
+                    summary = "Light-load baseline requests failed before sustained traffic; repeated traffic or recovery limits were not met."
+            elif metrics["cancelled"]:
+                status, summary = "inconclusive", "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."
             elif accuracy is None or metrics["unscored_completions"]:
                 status, summary = "inconclusive", "Some sustained or recovery completions lack a local correctness score."
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
@@ -1344,8 +1369,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics["missing_timing_metrics"] = _missing_timing(probes, limits)
                 status, summary = "inconclusive", "Configured recovery limits cannot be checked with available timing or token measurements."
             elif (not observations.get("sustained_complete") or metrics["sustained"]["completed"] < limits.min_samples
-                  or len(probes) < config.samples
-                  or len(baseline) < config.samples):
+                  or after["completed"] < config.samples
+                  or before["completed"] < config.samples):
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."
             elif limits.recovery_max_ratio is not None and (latency_ratio is None or first_ratio is None):
                 status, summary = "inconclusive", "Recovery ratio requires matching latency and first-output baseline evidence."

@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, TrafficConfig
+from .timing import qualify, qualified_violations
 
 
 def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int = 0):
@@ -28,17 +29,24 @@ def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int =
     for key in classes:
         total += weights[key]
         cumulative.append(total)
+    # Condition Poisson arrivals on N so a seeded draw cannot under-offer a rate.
+    count = (round(rate_rps * traffic.duration_seconds) if traffic.arrival == "poisson"
+             else math.ceil(rate_rps * traffic.duration_seconds))
+    if traffic.arrival == "steady":
+        while count > 0 and (count - 1) / rate_rps >= traffic.duration_seconds:
+            count -= 1
+        while count / rate_rps < traffic.duration_seconds:
+            count += 1
+    overflow = count > MAX_PLANNED_ARRIVALS
+    count = min(count, MAX_PLANNED_ARRIVALS)
+    offsets = (sorted(arrivals.random() * traffic.duration_seconds for _ in range(count))
+               if traffic.arrival == "poisson" else None)
     schedule = []
-    offset = 0.0 if traffic.arrival == "steady" else arrivals.expovariate(rate_rps)
-    while offset < traffic.duration_seconds:
-        if len(schedule) == MAX_PLANNED_ARRIVALS:
-            return schedule, True
+    for index in range(count):
         choice = choices.random() * total
         kind = next(key for key, bound in zip(classes, cumulative, strict=True) if choice < bound)
-        schedule.append((offset, kind))
-        offset = (len(schedule) / rate_rps if traffic.arrival == "steady" else
-                  offset + arrivals.expovariate(rate_rps))
-    return schedule, False
+        schedule.append((index / rate_rps if offsets is None else offsets[index], kind))
+    return schedule, overflow
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -124,6 +132,7 @@ class StageEvidence:
     interrupted: bool
     drain_expired: bool
     case_scorers: tuple[tuple[str, str], ...] | None
+    stalls: tuple[tuple[float, float], ...] = ()
 
 
 async def run_stage(
@@ -172,6 +181,7 @@ async def run_stage(
     peak = 0
     execution_errors = 0
     discard_through = -1.0
+    stalls: list[tuple[float, float]] = []
     interrupted = overflow
     drain_expired = False
     if overflow:
@@ -195,6 +205,7 @@ async def run_stage(
             # arrivals within the explicit tolerance are legitimate clusters;
             # the next random gap is not a scheduler lateness threshold.
             discard_through = max(discard_through, now - started_at)
+            stalls.append((offset, now - started_at))
         return offset <= discard_through
 
     async def dispatch(index: int, kind: str, offset: float):
@@ -315,7 +326,7 @@ async def run_stage(
         schedule=tuple(schedule), outcomes=tuple(outcomes), records=tuple(records),
         lifetimes=tuple(lifetimes.values()), reasons=tuple(reasons), peak=peak,
         execution_errors=execution_errors, overflow=overflow, interrupted=interrupted,
-        drain_expired=drain_expired, case_scorers=case_scorers,
+        drain_expired=drain_expired, case_scorers=case_scorers, stalls=tuple(stalls),
     )
     result = finalize_stage(evidence, limits)
     if capture_evidence is not None:
@@ -345,7 +356,22 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     )
     answer_failure = (best_possible_correctness is not None
                       and best_possible_correctness < limits.min_correctness)
-    timing_failure = bool(stats["timing_violations"] and not counts["dropped_late"])
+    timing_failure = bool(stats["timing_violations"])
+    if timing_failure and evidence.stalls:
+        # Express records and discarded windows on the same stage-relative clock.
+        timing_records = [record.model_copy(update={
+            "dispatch_ms": schedule[index][0] * 1000 + (record.dispatch_lag_ms or 0),
+            "timing_start_ms": schedule[index][0] * 1000 + (record.dispatch_lag_ms or 0),
+            "scheduled_ms": schedule[index][0] * 1000,
+            "completed_ms": schedule[index][0] * 1000 + (
+                record.arrival_elapsed_ms if record.arrival_elapsed_ms is not None else record.elapsed_ms),
+        }) for index, record in records]
+        quality = qualify(timing_records, {"schema_version": 1, "windows": [
+            {"start_ms": low * 1000, "end_ms": high * 1000, "lag_ms": (high-low) * 1000}
+            for low, high in evidence.stalls]}, 0)
+        timing_failure = any(_timing(record, limits)[0] and qualified_violations(
+            [record], limits if record.stream_gap_applicable else limits.model_copy(update={"stream_gap_ms": None}),
+            quality, arrival=True) for record in timing_records)
     if service_failure:
         reasons.append("Service failures exceeded the error limit.")
     if answer_failure:
@@ -399,7 +425,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         if not all_cases_scored:
             reasons.append("An active unscored case prevents a full-pack correct-capacity claim.")
     failed = service_failure or answer_failure or timing_failure
-    accepted = bool(not failed and fully_offered and enough_samples and latency_configured
+    passed = bool(not failed and fully_offered and enough_samples and latency_configured
                     and not evidence.drain_expired and not stats["missing_timing"]
                     and not stats["unscored_completions"] and not stats["cancelled"]
                     and coverage_complete and all_cases_scored)
@@ -418,10 +444,25 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
             "dropped_late": window_counts["dropped_late"],
             "not_offered": window_counts["not_offered"] + window_counts["dispatching"],
             "pending_at_end": sum(begin <= upper < end for begin, end in evidence.lifetimes),
+            "time_weighted_in_flight": sum(max(0, min(end, upper)-max(begin, lower))
+                                           for begin, end in evidence.lifetimes) / (upper-lower),
             "error_rate": ((window_stats["failed"] + window_stats["timed_out"]) / window_started
                            if window_started else None),
             **window_stats,
         })
+    # A drained server can absorb an unsustainable rate for a short stage before
+    # any limit is crossed. Arrival latency still rising through the second half,
+    # well above the first window, with excess work still pending is queue growth.
+    trend = [w["arrival_latency_p50_ms"] for w in windows if w["arrival_latency_p50_ms"] is not None]
+    queue_growth = bool(len(trend) >= 3 and trend[-1] > 1.5 * trend[0]
+                        and all(right >= left - .05 * trend[0] for left, right in zip(trend, trend[1:]))
+                        and trend[-1] - trend[len(trend) // 2] >= .25 * (trend[-1] - trend[0])
+                        and windows[-1]["pending_at_end"]
+                        and max(windows[-1]["pending_at_end"], windows[-1]["time_weighted_in_flight"])
+                            > evidence.rate_rps * (stats["arrival_latency_p50_ms"] or 0) / 1000)
+    if queue_growth:
+        reasons.append("Queue grew throughout the stage; rate not sustained.")
+    accepted = passed and not queue_growth
     return {
         "stage_index": evidence.stage_index, "rate_rps": evidence.rate_rps,
         "duration_seconds": evidence.duration_seconds,
@@ -439,7 +480,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         "good_fraction": stats["good"] / len(schedule) if schedule else None,
         "error_rate": error_rate, "peak_in_flight": evidence.peak,
         "fully_offered": fully_offered, "generator_limited": generator_limited,
-        "drain_expired": evidence.drain_expired, "accepted": accepted,
+        "drain_expired": evidence.drain_expired, "accepted": accepted, "queue_growth": queue_growth,
         "status": "fail" if failed else "pass" if accepted else "inconclusive",
         "reasons": list(dict.fromkeys(reasons)), "windows": windows,
         "planned_mix": dict(Counter(kind for _, kind in schedule)),
