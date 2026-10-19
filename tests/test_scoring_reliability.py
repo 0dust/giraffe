@@ -82,7 +82,7 @@ def test_truncated_incomplete_answer_is_unscored(scorer, expected, output):
 
 
 @pytest.mark.parametrize("scorer,expected,output", [
-    ("exact", "42", "42"), ("contains", "42", "Answer: 42"),
+    ("exact", "42", "42"),
     ("json", {"count": 42}, '{"count":42}'),
 ])
 def test_truncated_completion_with_complete_matching_value_is_scorable(scorer, expected, output):

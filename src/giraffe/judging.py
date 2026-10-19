@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import AsyncExitStack
 from typing import Callable
@@ -58,7 +59,10 @@ def _vote(judge: JudgeEndpoint, result: RequestRecord) -> JudgeVote:
         return _error(judge, "truncated_response" if result.finish_reason == "length"
                       else "invalid_completion", observed)
     try:
-        data = json.loads(final_answer(result.output)[0], object_pairs_hook=_unique_object)
+        answer = final_answer(result.output)[0].strip()
+        # Accept one complete markdown fence around the verdict object.
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", answer, re.DOTALL | re.IGNORECASE)
+        data = json.loads(fenced[1] if fenced else answer, object_pairs_hook=_unique_object)
         if (not isinstance(data, dict) or set(data) != {"verdict", "reason"}
                 or type(data["verdict"]) is not bool or not isinstance(data["reason"], str)
                 or not data["reason"].strip() or len(data["reason"]) > 2000):

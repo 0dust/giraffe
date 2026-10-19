@@ -6,10 +6,11 @@ import asyncio
 import hashlib
 import random
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
 
-from giraffe.fixtures import final_answer
+from giraffe.fixtures import final_answer, reasoning_budget
 from giraffe.logprob_workload import corpus_width, refill, sample_count
 from giraffe.models import INTERNAL_CHECK_NAMES as CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec, ToolExpectation
 from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, resolved_tool_fixtures, resolved_tool_modes
@@ -211,19 +212,25 @@ async def arrivals(run, target, client, fixtures):
         )
 
 
+def prefix_admitted(input_chars, max_tokens, context_limit):
+    # Generated ASCII prose: estimate four characters per token plus a template reserve.
+    return (input_chars + 3) // 4 + max_tokens + 32 <= context_limit
+
+
 async def prefixes(run, target, client):
     settings = run.config.prefix
-    prefix = (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
+    nonce = uuid.uuid4().hex + "\n"
+    prefix = nonce + (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
     for kind in ("shared", "independent"):
         for index in range(settings.repeats):
-            # Deterministic controls of equal character length; observed token counts stay separate.
+            # Unique initial nonces keep warm-cache controls independent across runs and targets.
             rng = random.Random(index)
             matched = f"Control {index:04d}: " + "".join(
                 f" The {rng.choice(('tree', 'bird', 'boat', 'rock'))} is "
                 f"{rng.choice(('blue', 'gray', 'pink', 'gold'))}."
                 for _ in range(len(prefix) // 18 + 1)
             )
-            matched = matched[:len(prefix)]
+            matched = (uuid.uuid4().hex + "\n" + matched)[:len(prefix)]
             prompt = label_prompt(len(prefix) + 80, prefix if kind == "shared" else matched)
             prompt += f"\nTrial {index:04d}."
             request = spec(
@@ -236,6 +243,10 @@ async def prefixes(run, target, client):
                 order=index,
                 cache_state="first unique use is not proof of empty server cache",
             )
+            if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
+                run.unfinished[target.name].add("prefix")
+                run.observations[target.name]["prefix_stop"] = "Estimated token admission ceiling reached."
+                return
             request.options = deterministic_options(run.config, request.options)
             if not await run.request(target, client, request):
                 return
@@ -246,10 +257,10 @@ async def prefixes(run, target, client):
         request = spec(prompt, "prefix_history", "prefix", expected="K7P4", turn=turn, mode="fixed")
         request.messages = messages
         request.input_chars = sum(len(m["content"]) for m in messages)
-        if request.input_chars + request.max_tokens + 32 > run.config.context_limit:
+        if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
             run.unfinished[target.name].add("prefix")
             run.observations[target.name]["prefix_history_stop"] = (
-                "Conservative character admission ceiling reached; no history cropped."
+                "Estimated token admission ceiling reached; no history cropped."
             )
             break
         request.options = deterministic_options(run.config, request.options)
@@ -450,6 +461,10 @@ async def sessions(run, target, client):
                 run.unfinished[target.name].add("sessions")
                 break
             item["turns"].append(record.id)
+            if reasoning_budget(record):
+                item["stop_reason"] = "reasoning exhausted the output budget before an answer; session recall unverified"
+                run.unfinished[target.name].add("sessions")
+                break
             if (
                 not record.valid
                 or record.status != "completed"
@@ -732,7 +747,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             shared = [r for r in records if r.scenario == "prefix_shared"]
             independent = [r for r in records if r.scenario == "prefix_independent"]
             first, repeat = stats(shared[:1]), stats(shared[1:])
-            observed = [r for r in shared[1:] if r.valid and r.status == "completed"
+            observed = [r for r in shared[1:] if (r.valid and r.status == "completed" or reasoning_budget(r))
                         and r.cached_prompt_tokens is not None and r.input_tokens]
             def reused(r):
                 prefix_fraction = r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
@@ -741,7 +756,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             and r.cached_prompt_tokens >= threshold)
 
             verified = [r for r in observed if reused(r)]
-            controls = [r for r in independent if r.valid and r.status == "completed"
+            controls = [r for r in independent if (r.valid and r.status == "completed" or reasoning_budget(r))
                         and r.cached_prompt_tokens is not None and r.input_tokens]
             misses = len(observed) - len(verified)
             metrics["cache_reuse_samples"] = len(verified)
@@ -754,7 +769,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             elif len(controls) < minimum or len(controls) != run.config.prefix.repeats:
                 status, summary = "inconclusive", "cache reuse unverified: missing independent-control cache evidence; " + counts
             elif misses > (run.config.prefix.repeats - 1) / 2:
-                status, summary = "fail", "no prefix reuse observed on a majority of repeats; " + counts
+                prefix_tokens = [r.input_tokens * r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
+                                 for r in observed]
+                if prefix_tokens and max(prefix_tokens) < 512:
+                    status, summary = "inconclusive", "Prefix is estimated below 512 tokens; cache misses do not establish failed reuse; " + counts
+                else:
+                    status, summary = "fail", "no prefix reuse observed on a majority of repeats; " + counts
             elif len(observed) < run.config.prefix.repeats - 1:
                 status, summary = "inconclusive", "cache reuse unverified: missing repeated cache/token evidence; " + counts
             elif len(verified) < minimum:
@@ -926,7 +946,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 else "rejected or unverified; see request outcomes"
             )
             if any(not is_discovery_rejection(r) and
-                   (r.score is False or not r.valid or r.status != "completed") for r in auto) or any(
+                   (r.score is False or (not r.valid or r.status != "completed") and not reasoning_budget(r)) for r in auto) or any(
                        session["status"] == "fail" for session in conversations):
                 status, summary = (
                     "fail",
@@ -977,14 +997,22 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             elif status == "pass":
                 summary = "Token probability comparison completed (" + probability_status + "); answer correctness is separate."
         assessed_stats = stats(assessed)
-        if check != "tools" and assessed_stats["completed"] < minimum and status != "fail":
+        budget_records = [r for r in assessed if check in {"prefix", "sessions", "tools"} and reasoning_budget(r)]
+        if check in {"prefix", "sessions", "tools"}:
+            metrics["reasoning_budget_unscored"] = len(budget_records)
+        successful = assessed_stats["completed"] + (len(budget_records) if check == "prefix" else 0)
+        if check != "tools" and successful < minimum and status != "fail":
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
         errors = stats([r for r in assessed if not (
             (check == "consistency" and r.logprob_evidence and
              r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
              run.config.consistency.logprobs.support == "discover")
             or (r.tool_conversation and r.tool_conversation["status"] == "inconclusive")
+            or (check in {"prefix", "sessions", "tools"} and reasoning_budget(r))
         )])["error_rate"]
+        if budget_records:
+            metrics["failed"] -= len(budget_records)
+            metrics["error_rate"] = errors
         cap_violations = [
             r.id
             for r in assessed
