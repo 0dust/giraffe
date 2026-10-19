@@ -65,8 +65,7 @@ async def test_pack_preview_matches_cli_and_preserves_blank_model_draft(tmp_path
             assert (await client.post(endpoint, json={"config": normalized})).status_code == 422
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
         assert main(["preview", "--config", "-"]) == 0
-        assert json.loads(capsys.readouterr().out) == {
-            key: value for key, value in response.json().items() if key != "request_plan"}
+        assert json.loads(capsys.readouterr().out) == response.json()
         assert (await client.get("/api/runs")).json()["runs"] == []
 
 

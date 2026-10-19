@@ -50,8 +50,9 @@ def parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
     validate.add_argument("--output-format", choices=["text", "json"], default="text")
     validate.add_argument("--show-config", action="store_true", help="Print the normalized configuration in text mode")
-    preview = commands.add_parser("preview", help="Preview a draft configuration as JSON without traffic")
+    preview = commands.add_parser("preview", help="Preview a draft configuration without traffic")
     preview.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
+    preview.add_argument("--output-format", choices=["text", "json"], default="json")
     importer = commands.add_parser("import-dataset", help="Preview CSV or JSON dataset import as JSON without traffic")
     importer.add_argument("--file", required=True, type=Path)
     importer.add_argument("--input-field")
@@ -253,6 +254,10 @@ def main(argv: list[str] | None = None) -> int:
     json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or any(value == "--output-format=json" or (
         value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "json"
     ) for index, value in enumerate(arguments))
+    if arguments and arguments[0] == "preview" and any(value == "--output-format=text" or (
+        value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "text"
+    ) for index, value in enumerate(arguments)):
+        json_output = False
     kind = arguments[0] if arguments else "usage"
 
     def emit(outcome: str, exit_code: int, **details) -> None:
@@ -299,10 +304,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "preview":
             from giraffe.request_pack import pack_preview
+            from giraffe.planning import request_plan
 
             config = ConfigDraft.model_validate(load_configuration(args.config))
-            print(json.dumps({"config": config.model_dump(mode="json"),
-                              "request_pack_preview": pack_preview(config)}, allow_nan=False))
+            preview = pack_preview(config)
+            plan = request_plan(config, pack_details=preview)
+            if args.output_format == "json":
+                print(json.dumps({"config": config.model_dump(mode="json"),
+                                  "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
+            else:
+                print("Configuration preview. No traffic was sent.")
+                print("Targets: " + ", ".join(target.name for target in config.targets))
+                print("Checks: " + ", ".join(config.checks))
+                print(f"Known requests per target: {plan['known_per_target']}")
+                print(f"max_requests: {config.max_requests}")
+                for warning in plan["warnings"]:
+                    print(f"Warning: {warning}")
             return 0
         if args.command == "import-dataset":
             from giraffe.dataset_import import preview_dataset, read_dataset
