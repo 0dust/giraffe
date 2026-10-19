@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 
 from giraffe.capabilities import capabilities
 from giraffe.client import LLMClient, _headers, completion_url
@@ -35,7 +35,56 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
 _SHUTDOWN_SECONDS = 5
 
 
-class StartRun(Model):
+class APIKeyInput(Model):
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def validate_api_key(cls, value):
+        if value is None:
+            return None
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw, str):
+            raise ValueError("API key must be text")
+        raw = raw.strip()
+        if not raw:
+            return None
+        if len(raw) > 8192 or any(ord(c) < 33 or ord(c) > 126 for c in raw):
+            raise ValueError("API key must contain printable ASCII characters without whitespace")
+        return raw
+
+
+def _attach_api_key(target: Target, key: SecretStr | None) -> None:
+    if key is None:
+        return
+    if any(header.lower() == "authorization" for header in target.headers_env):
+        raise HTTPException(422, "Use either a pasted API key or a custom Authorization header.")
+    target._api_key = key
+    # Export a usable reference, never silently turn an authenticated setup into an open one.
+    target.api_key_env = target.api_key_env or "GIRAFFE_API_KEY"
+
+
+class TargetAPIKey(APIKeyInput):
+    target: str
+    url: str
+
+
+class SessionCredentials(Model):
+    api_keys: list[TargetAPIKey] = Field(default_factory=list, exclude=True, repr=False,
+                                       max_length=64)
+
+    def attach_api_keys(self, config: RunConfig | ConfigDraft) -> None:
+        seen = set()
+        for credential in self.api_keys:
+            target = next((t for t in config.targets
+                           if t.name == credential.target and t.url == credential.url), None)
+            if target is None or credential.target in seen:
+                raise HTTPException(422, "Each session API key must match one configured target and URL.")
+            seen.add(credential.target)
+            _attach_api_key(target, credential.api_key)
+
+
+class StartRun(SessionCredentials):
     config: RunConfig
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
@@ -50,7 +99,7 @@ class DatasetPreview(Model):
     scorer: Literal["judge", "exact"] = "judge"
 
 
-class TryExample(Model):
+class TryExample(SessionCredentials):
     config: ConfigDraft
     fixture_id: str
     target_name: str
@@ -62,7 +111,7 @@ class SaveBaseline(Model):
     replace: bool = False
 
 
-class ModelDiscovery(Model):
+class ModelDiscovery(APIKeyInput):
     url: str
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
@@ -70,8 +119,10 @@ class ModelDiscovery(Model):
     proxy: str | None = None
 
     def target(self, model: str = "discovery") -> Target:
-        return Target(name="connection", model=model, url=self.url.strip(),
-                      api_key_env=self.api_key_env, headers_env=self.headers_env)
+        target = Target(name="connection", model=model, url=self.url.strip(),
+                        api_key_env=self.api_key_env, headers_env=self.headers_env)
+        _attach_api_key(target, self.api_key)
+        return target
 
     def configuration(self, model: str, *, request_options: dict | None = None) -> RunConfig:
         return RunConfig(targets=[self.target(model)], checks=["access"], concurrency=1,
@@ -125,8 +176,8 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False) -
         async with asyncio.timeout(8), client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code in {401, 403}:
-                    raise HTTPException(422, "Server denied access. Check the authentication "
-                                        "environment variable in the API key section.")
+                    raise HTTPException(422, "Server denied access. Check your authentication: "
+                                        "the API key or environment variable in the API key section.")
                 if response.status_code != 200:
                     if allow_manual:
                         return {"models": [], "message": "The server does not provide a model list. "
@@ -199,8 +250,8 @@ async def check_connection(body: ConnectionTest) -> dict:
         raise HTTPException(422, "Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.")
     if record.http_status in {401, 403}:
-        raise HTTPException(422, "Server denied access. Check the authentication environment "
-                            "variable and header settings.")
+        raise HTTPException(422, "Server denied access. Check your authentication: the API key, "
+                            "environment variable and header settings.")
     if not record.valid:
         if record.http_status is None:
             message = "Could not reach the model. Check the endpoint, TLS trust and proxy settings."
@@ -495,13 +546,15 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     async def try_example(body: TryExample):
         from giraffe.dataset_import import try_example_config
 
+        body.attach_api_keys(body.config)
         try:
             config = try_example_config(body.config, body.fixture_id, body.target_name)
         except (ValidationError, ValueError) as exc:
             message = str(exc) if not isinstance(exc, ValidationError) else "; ".join(
                 ".".join(map(str, item["loc"])) + ": " + item["msg"] for item in exc.errors())
             raise HTTPException(422, message) from exc
-        return await start_run(StartRun(config=config))
+        return await start_run(StartRun(config=config, api_keys=[credential for credential
+                               in body.api_keys if credential.target == body.target_name]))
 
     @app.get("/api/runs")
     async def list_runs():
@@ -519,6 +572,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     def prepare_run(body: StartRun) -> tuple[RunConfig, RunReport | None]:
         """Resolve the same execution intent for Start and Copy CLI."""
         config = body.config
+        body.attach_api_keys(config)
         if body.mode == "normal":
             if config.restart_target or body.restart_target:
                 raise HTTPException(422, "Restart requires explicit cold-start mode and target")

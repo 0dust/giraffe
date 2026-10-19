@@ -7,7 +7,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StrictBool, field_serializer, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, field_serializer, model_serializer, model_validator
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -285,6 +285,8 @@ class Consistency(Model):
 
 
 class Target(Model):
+    # Supplied separately by the local UI; never part of config/schema/report serialization.
+    _api_key: SecretStr | None = PrivateAttr(default=None)
     name: str = Field(min_length=1)
     url: str
     model: str = Field(min_length=1)

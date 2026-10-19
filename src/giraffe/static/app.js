@@ -4,6 +4,27 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = (value) => structuredClone(value);
+// Credentials live only in this tab, outside config, exports and browser storage.
+let sessionAPIKey = null;
+function apiKeyFor(url) {
+  return sessionAPIKey && sessionAPIKey.url === url?.trim() ? sessionAPIKey.key : '';
+}
+function sessionAPIKeys(config) {
+  const target=config.targets?.[0],key=apiKeyFor(target?.url);
+  return key ? [{target:target.name,url:target.url,api_key:key}] : [];
+}
+function clearAPIKey() {
+  sessionAPIKey=null;
+  const input=$('#new-run-form')?.elements.api_key;
+  if(input)input.value='';
+}
+function updateAPIKeySummary() {
+  const form=$('#new-run-form'),summary=$('#connection-auth > summary');
+  if(!form||!summary)return;
+  const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
+  $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not needed for most local servers';
+  $('.row-action',summary).textContent=key||ref?'Change':'Add';
+}
 const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
 const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Not run',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',inconclusive:'?',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
@@ -1179,7 +1200,7 @@ async function tryDatasetExample(event) {
     const config=readForm(true).config,target_name=$('#dataset-try-form').elements.try_target.value;
     config.retention=$('#dataset-try-form').elements.save_try_output.checked?'all':'none';
     state.submitting=true;
-    const result=await api('/api/runs/try-example',{method:'POST',body:JSON.stringify({config,fixture_id:draft.fixture_id,target_name})});
+    const result=await api('/api/runs/try-example',{method:'POST',body:JSON.stringify({config,fixture_id:draft.fixture_id,target_name,api_keys:sessionAPIKeys(config)})});
     setActive(result.id);closeDatasetDialog();if(draft.route===state.routeVersion)location.hash=linkRun(result.id);else toast('Example run started. Open the active run to inspect it.');
   }catch(error){datasetError(error.message);}finally{state.submitting=false;}
 }
@@ -1399,6 +1420,7 @@ function useRuntimeShortcut(runtime) {
     assertAppliedConfig();const form=$('#new-run-form');
     if(form.elements.url.value.trim()===urls[runtime])return;
     form.elements.url.value=urls[runtime];form.elements.url.setCustomValidity('');
+    clearAPIKey();
     if(state.autoModel&&form.elements.model.value===state.autoModel)form.elements.model.value='';
     state.autoModel=null;invalidateModelDiscovery();captureFormDraft();configChanged();updateBounds();
     form.elements.url.focus();
@@ -1445,7 +1467,8 @@ async function testConnection() {
   const key=modelDiscoveryKey(),sequence=++state.modelDiscoverySequence,route=state.routeVersion;
   state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
   try{
-    const result=await api('/api/targets/test-connection',{method:'POST',body:key});
+    const api_key=apiKeyFor(url.value);
+    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
     if(result.status==='connected'){
       if(!JSON.parse(key).model)state.autoModel=result.model;
@@ -1487,6 +1510,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
+  if(sessionAPIKey && !apiKeyFor(target.url))clearAPIKey();
   $('#main').innerHTML=`${renderHeroCoat()}<div class="page-heading setup-page-heading"><div><h1 id="setup-title">Test your endpoint</h1><p class="setup-lede" id="setup-lede"></p></div><button type="button" class="text-button setup-import" data-action="import-config">Load saved setup</button></div>
   <div class="notice" id="new-active-notice" ${state.active?'':'hidden'}><strong>A run is already active.</strong> <a href="${state.active?linkRun(state.active):'#runs'}">Inspect or stop it</a> before starting another.</div>
   <form id="new-run-form" novalidate>
@@ -1498,7 +1522,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   <div class="start-from"><div class="start-row"><span class="start-label">Quick fill</span><div class="runtime-shortcuts">${['Ollama','vLLM','SGLang','LM Studio','llama.cpp'].map(runtime=>`<button type="button" data-action="runtime-shortcut" data-runtime="${runtime}">${runtime}</button>`).join('')}</div></div>${renderRecentEndpoints()}<div class="start-row"><span class="start-label">Saved setup</span><div><button type="button" class="button small start-file" data-action="import-config"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 13V3.5M6.5 7 10 3.5 13.5 7M4 12.5v3A1.5 1.5 0 0 0 5.5 17h9a1.5 1.5 0 0 0 1.5-1.5v-3"/></svg>Load from file…</button></div></div></div>
   <div class="connection-details" id="connection-options">
   <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model || '',{required:true,placeholder:'Found when you connect',hint:''})}</div><p class="hint" id="model-options-label"></p></div></div>
-  <details class="connection-row connection-auth" id="connection-auth" ${target.api_key_env?'open':''}><summary><span class="row-label">API key</span><span class="row-value">${target.api_key_env?`<code>${escape(target.api_key_env)}</code>`:'Not needed for most local servers'}</span><span class="row-action">${target.api_key_env?'Change':'Add'}</span></summary><div class="row-control">${field('api_key_env','API key variable',target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Enter the variable name, not the secret key. Set it on the machine running Giraffe before starting the UI.'})}</div></details>
+  <details class="connection-row connection-auth" id="connection-auth" ${target.api_key_env||apiKeyFor(target.url)?'open':''}><summary><span class="row-label">API key</span><span class="row-value">${apiKeyFor(target.url)?'Set for this tab':target.api_key_env?`<code>${escape(target.api_key_env)}</code>`:'Not needed for most local servers'}</span><span class="row-action">${target.api_key_env||apiKeyFor(target.url)?'Change':'Add'}</span></summary><div class="row-control">${field('api_key','API key','',{type:'password',placeholder:'Paste your API key',hint:'Kept in memory for this tab. Never included in saved setups or reports. Paste it again after reloading. Leave blank for an open endpoint.'})}<button type="button" class="text-button" data-action="clear-api-key">Clear key</button><details><summary>Use an environment variable instead</summary>${field('api_key_env','Environment variable name',apiKeyFor(target.url)?'':target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Advanced: use a variable already set on the machine running Giraffe. Saved setups and terminal commands require this variable or a freshly pasted key.'})}</details></div></details>
   </div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
   </div></section></div>
@@ -1522,6 +1546,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
     for(const name of check.limit_fields)$('#new-run-form').elements[`test_${check.id}_limit_${name}`].dataset.inherited=String(!Object.hasOwn(options.limits || {},name));
   }
   const form=$('#new-run-form');form.elements.mode.value=state.formMode;
+  if(form.elements.api_key)form.elements.api_key.value=apiKeyFor(target.url);
   if(state.formRestartTarget&&c.targets.some(t=>t.name===state.formRestartTarget))form.elements.restart_target.value=state.formRestartTarget;
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
   syncTestControls();updateBounds();updateRestart();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();
@@ -1532,7 +1557,7 @@ function readForm(allowEmpty=false) {
   for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea'))data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);
   if(!config.targets?.length)throw new Error('Configuration must contain at least one target.');
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
-  if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || null;
+  if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
   first.metrics_url=form.elements.metrics_url.value.trim() || null;
   for(const [key] of numericFields)config[key]=data.get(key)===''?null:Number(data.get(key));
   config.limits ||= {};
@@ -1607,7 +1632,7 @@ async function startRun(event) {
     if(payload.mode==='cold-start'&&!payload.config.targets.find(t=>t.name===payload.restart_target)?.restart_command?.length)throw new Error('Cold start requires a configured restart_command for the selected target.');
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Starting suite…';
-    const result=await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});state.config=clone(payload.config);
+    const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','capacity'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
   }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Launch ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
@@ -2018,6 +2043,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='setup-next'){navigateSetup(state.returnToReview?3:state.setupStep+1);return;}
   if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
   if(action==='test-connection'){await testConnection();return;}
+  if(action==='clear-api-key'){clearAPIKey();invalidateModelDiscovery();captureFormDraft();configChanged();renderNew();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
   if(configure){toggleTestEditor(configure);return;}
   if(state.openTest&&event.target.id==='new-run-form'&&window.matchMedia?.('(min-width: 1180px)').matches){toggleTestEditor(state.openTest,true);return;}
@@ -2113,9 +2139,16 @@ document.addEventListener('input',event=>{
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
   if(['url','model','name'].includes(event.target.name))event.target.setCustomValidity?.('');
-  if(['url','api_key_env'].includes(event.target.name)&&state.autoModel&&$('#new-run-form').elements.model.value===state.autoModel){$('#new-run-form').elements.model.value='';state.autoModel=null;}
+  if(['url','api_key_env'].includes(event.target.name))clearAPIKey();
+  if(event.target.name==='api_key'){
+    const form=$('#new-run-form'),key=event.target.value.trim();
+    sessionAPIKey=key?{url:form.elements.url.value.trim(),key}:null;
+    if(key&&form.elements.api_key_env)form.elements.api_key_env.value='';
+  }
+  if(['url','api_key_env','api_key'].includes(event.target.name))updateAPIKeySummary();
+  if(['url','api_key_env','api_key'].includes(event.target.name)&&state.autoModel&&$('#new-run-form').elements.model.value===state.autoModel){$('#new-run-form').elements.model.value='';state.autoModel=null;}
   if(event.target.name==='model')state.autoModel=null;
-  if(['url','model','api_key_env'].includes(event.target.name))invalidateModelDiscovery();
+  if(['url','model','api_key_env','api_key'].includes(event.target.name))invalidateModelDiscovery();
   if(event.target.id==='config-editor')state.jsonDraft=event.target.value;
   configChanged();$('#cli-fallback').hidden=true;
   if(event.target.id==='config-editor'){syncConfigView();return;}
