@@ -14,7 +14,9 @@ from giraffe.models import Model, RequestSpec, RunConfig, Target
 
 
 class PreflightError(Exception):
-    pass
+    def __init__(self, message: str, *, blocking: bool = True):
+        super().__init__(message)
+        self.blocking = blocking
 
 
 class _PreflightClient(LLMClient):
@@ -165,30 +167,41 @@ async def check_target(target: Target, config: RunConfig) -> dict:
                     messages=[{"role": "user", "content": "Reply with OK."}],
                     max_tokens=32, stream=False,
                 ))
-    except TimeoutError:
+    except (TimeoutError, httpx.TimeoutException):
         raise PreflightError("Connection test timed out after 15 seconds. "
-                            "Check that the model is loaded, then try again.") from None
+                            "Check that the model is loaded, then try again.", blocking=False) from None
     except OSError:
         raise PreflightError("Could not load the TLS trust file. "
                             "Check ca_bundle on the machine running Giraffe.") from None
-    except (ValueError, ImportError, httpx.HTTPError, httpx.InvalidURL):
+    except (ValueError, ImportError, httpx.InvalidURL):
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.") from None
+    except httpx.HTTPError as error:
+        raise PreflightError("Could not connect. Check the endpoint, authentication, "
+                            "TLS trust and proxy settings.",
+                            blocking=isinstance(error, (httpx.ConnectError, httpx.UnsupportedProtocol))) from None
     if record.status in {"timeout", "cancelled"}:
         raise PreflightError("Connection test timed out after 15 seconds. "
-                            "Check that the model is loaded, then try again.")
+                            "Check that the model is loaded, then try again.", blocking=False)
     if record.http_status in {401, 403}:
         raise PreflightError("Server denied access. Check the authentication environment "
                             "variable and header settings.")
     if not record.valid:
+        blocking = record.http_status == 404
         if record.http_status is None:
-            message = "Could not reach the model. Check the endpoint, TLS trust and proxy settings."
+            error = record.error or ""
+            timeout = "Timeout" in error
+            blocking = not timeout and any(name in error for name in (
+                "ConnectError", "SSLError", "ConnectionError", "ConnectionRefusedError",
+                "ProxyError", "UnsupportedProtocol", "InvalidURL"))
+            message = ("Connection test timed out after 15 seconds. Check that the model is loaded, then try again."
+                       if timeout else "Could not reach the model. Check the endpoint, TLS trust and proxy settings.")
         elif not 200 <= record.http_status < 300:
             message = (f"The server returned HTTP {record.http_status}. "
                        "Check the model name and OpenAI-compatible endpoint.")
         else:
             message = ("The server responded but did not return a usable answer within the "
                        "32-token test. Check the model's settings or continue with its name.")
-        raise PreflightError(message)
+        raise PreflightError(message, blocking=blocking)
     return {"status": "connected", "model": target.model, "latency_ms": round(record.elapsed_ms, 1),
             "message": "The model returned an answer. Your endpoint is ready for checks."}

@@ -262,3 +262,18 @@ async def test_invalid_proxy_is_connection_error_not_manual_model_prompt(model):
         await check_connection(ConnectionTest(url="http://server", model=model,
                                              proxy="invalid://proxy"))
     assert error.value.status_code == 422 and "proxy" in error.value.detail
+
+
+@pytest.mark.parametrize("status", [429, 500, 503, "timeout"])
+async def test_ui_keeps_rejecting_advisory_cli_probe_failures(monkeypatch, status):
+    def respond(request):
+        if status == "timeout":
+            raise httpx.ReadTimeout("private timeout", request=request)
+        return httpx.Response(status, text="private server body")
+
+    requests, _ = endpoint(monkeypatch, respond)
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server", model="model"))
+    assert error.value.status_code == 422
+    assert "private" not in error.value.detail
+    assert len(requests) == 1

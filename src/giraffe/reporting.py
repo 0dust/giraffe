@@ -834,8 +834,12 @@ def _traffic_baseline_html(target: dict[str, Any]) -> str:
 
 
 def _render(report: RunReport) -> str:
-    detailed = sorted(report.requests, key=lambda r: not (
-        r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error))[:25]
+    evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
+                for rid in check.evidence_ids}
+    ordered = sorted(report.requests, key=lambda r: (
+        r.id not in evidence,
+        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error)))
+    detailed = ordered[:max(25, sum(r.id in evidence for r in report.requests))]
     anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
     disconnected = {target["name"]: summary for target in config.get("targets", [])

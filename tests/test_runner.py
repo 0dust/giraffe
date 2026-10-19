@@ -1802,3 +1802,60 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         assert set(record) == {"id", "target", "fixture_id", "scenario", "status", "valid",
                                "score", "elapsed_ms", "first_output_ms", "check_ids"}
         assert event["budget_used"] >= event["attempted"]
+
+
+@pytest.mark.parametrize("stream,concurrency", [(True, 1), (False, 1), (False, 2)])
+async def test_fairness_prerequisite_remedy_names_missing_configuration(client, stream, concurrency):
+    report = await runner.run_suite(config(checks=["fairness"], stream=stream, concurrency=concurrency))
+    result = check(report, "fairness")
+    assert result.status == "inconclusive"
+    remedy = result.summary.split("To conclude, ")[-1]
+    assert ("--concurrency 2 or more" in remedy) == (concurrency < 2)
+    assert ("stream: true" in remedy) == (not stream)
+    assert "completion token usage" not in remedy and "max_requests" not in remedy
+
+
+@pytest.mark.parametrize("check_id,summary,options", [
+    ("first_output", "Timing observed; no acceptance limit configured.", ["first_output_ms"]),
+    ("generation", "Timing observed; no acceptance limit configured.",
+     ["latency_ms", "stream_gap_ms", "min_output_tokens_per_second"]),
+    ("fairness", "Mixed-traffic effect observed; no acceptance ratio configured.", ["fairness_max_ratio"]),
+    ("mixed", "Mixed-load ratios measured; no acceptance ratio configured.", ["fairness_max_ratio"]),
+    ("recovery", "Recovery observed; no acceptance limit configured.",
+     ["recovery_max_ratio", "first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second"]),
+    ("arrivals", "Arrivals observed; no acceptance limit configured.",
+     ["latency_ms", "first_output_ms", "stream_gap_ms", "min_output_tokens_per_second"]),
+])
+def test_no_acceptance_limit_remedy_only_names_limits_the_check_reads(check_id, summary, options):
+    import re
+    from giraffe.models import CheckResult
+
+    result = CheckResult(id=check_id, target="service", title=check_id,
+                         status="inconclusive", summary=summary, metrics={} if check_id in {"arrivals", "mixed"}
+                         else {"reason_code": "missing_acceptance_limit"})
+    summary = runner._verdict_summary(result, config(), [], "Raise max_requests")
+    assert set(re.findall(r"limits\.([a-z_]+)", summary)) == set(options)
+
+
+def test_timing_client_delay_remedy_uses_quality_instead_of_summary_wording():
+    from giraffe.models import CheckResult
+
+    result = CheckResult(id="generation", target="service", title="Generation", status="inconclusive",
+                         summary="Timing attribution is uncertain.",
+                         metrics={"reason_code": "client_delayed", "timing_quality": {"status": "client_delayed"}})
+    summary = runner._verdict_summary(result, config(), [], "Raise max_requests")
+    assert "idle load-generator" in summary
+    assert "enable streaming" not in summary
+
+
+@pytest.mark.parametrize("reason,remedy", [
+    ("missing_acceptance_limit", "set limits.latency_ms"),
+    ("insufficient_timing_samples", "set samples (or --samples)"),
+])
+def test_timing_remedy_uses_reason_code_with_reworded_summary(reason, remedy):
+    from giraffe.models import CheckResult
+
+    result = CheckResult(id="generation", target="service", title="Generation", status="inconclusive",
+                         summary="Streaming evidence is inconclusive.", metrics={"reason_code": reason,
+                                  "timing_quality": {"status": "client_delayed"}})
+    assert remedy in runner._verdict_summary(result, config(), [], "Raise max_requests")

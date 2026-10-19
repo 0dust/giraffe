@@ -108,6 +108,9 @@ def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch
         def __exit__(self, *args):
             pass
 
+        def setsockopt(self, *args):
+            pass
+
         def bind(self, address):
             assert "Giraffe UI:" not in capsys.readouterr().out
             captured["bound"] = address
