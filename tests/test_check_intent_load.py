@@ -90,7 +90,8 @@ async def test_short_stage_above_service_rate_is_not_accepted_while_queue_grows(
     result = check(report, "capacity")
     stages = {stage["rate_rps"]: stage for stage in result.metrics["traffic_stages"]}
     assert stages[14]["scheduled_rps"] == 14
-    assert not stages[14]["accepted"] and stages[14]["queue_growth"] and stages[14]["status"] == "inconclusive"
+    assert not stages[14]["accepted"] and (stages[14]["queue_growth"] or stages[14]["stability_unverified"])
+    assert stages[14]["status"] == "inconclusive"
     assert "Queue grew" in " ".join(stages[14]["reasons"])
     assert result.metrics["highest_acceptable_rate_rps"] != 14 and result.status != "pass"
 
@@ -129,8 +130,8 @@ def _evidence(stalls, slow_index):
 
 def test_one_late_drop_only_excuses_violations_overlapping_the_stall():
     limits = Limits(latency_ms=1000, min_samples=2)
-    stall = ((0.0, .03),)
-    assert traffic.finalize_stage(_evidence(stall, slow_index=4), limits)["status"] == "fail"
+    stall = ((0.0, .6),)
+    assert traffic.finalize_stage(_evidence(((0.0, .03),), slow_index=4), limits)["status"] == "fail"
     excused = traffic.finalize_stage(_evidence(stall, slow_index=1), limits)
     assert excused["status"] == "inconclusive" and not excused["accepted"]
     assert "excessive scheduler lateness" in " ".join(excused["reasons"])

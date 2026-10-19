@@ -10,6 +10,7 @@ import asyncio
 import math
 import random
 import time
+from statistics import mean, median
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -133,6 +134,7 @@ class StageEvidence:
     drain_expired: bool
     case_scorers: tuple[tuple[str, str], ...] | None
     stalls: tuple[tuple[float, float], ...] = ()
+    arrival: str = "steady"
 
 
 async def run_stage(
@@ -327,6 +329,7 @@ async def run_stage(
         lifetimes=tuple(lifetimes.values()), reasons=tuple(reasons), peak=peak,
         execution_errors=execution_errors, overflow=overflow, interrupted=interrupted,
         drain_expired=drain_expired, case_scorers=case_scorers, stalls=tuple(stalls),
+        arrival=traffic.arrival,
     )
     result = finalize_stage(evidence, limits)
     if capture_evidence is not None:
@@ -366,9 +369,23 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
             "completed_ms": schedule[index][0] * 1000 + (
                 record.arrival_elapsed_ms if record.arrival_elapsed_ms is not None else record.elapsed_ms),
         }) for index, record in records]
-        quality = qualify(timing_records, {"schema_version": 1, "windows": [
+        health = {"schema_version": 1, "windows": [
             {"start_ms": low * 1000, "end_ms": high * 1000, "lag_ms": (high-low) * 1000}
-            for low, high in evidence.stalls]}, 0)
+            for low, high in evidence.stalls]}
+        quality = qualify(timing_records, health, 0)
+        for record in timing_records:
+            span = (record.last_output_ms or 0) - (record.first_output_ms or 0)
+            speed = record.generation_tokens_per_second
+            overages = {"latency_ms": (record.arrival_elapsed_ms or 0) - (limits.latency_ms or math.inf),
+                        "first_output_ms": (record.arrival_first_output_ms or 0) - (limits.first_output_ms or math.inf),
+                        "max_stream_gap_ms": (record.max_stream_gap_ms or 0) - (limits.stream_gap_ms or math.inf),
+                        "generation_tokens_per_second": span * (1 - speed / limits.min_output_tokens_per_second)
+                            if speed is not None and limits.min_output_tokens_per_second else 0}
+            for metric, overage in overages.items():
+                # A brief overlapping stall cannot explain a large overage.
+                if overage > 0 and record.id in quality["affected_metrics"][metric] and record.id not in qualify(
+                        [record], health, max(0, overage * .5 - 1e-9), metrics=(metric,))["affected_metrics"][metric]:
+                    quality["affected_metrics"][metric].remove(record.id)
         timing_failure = any(_timing(record, limits)[0] and qualified_violations(
             [record], limits if record.stream_gap_applicable else limits.model_copy(update={"stream_gap_ms": None}),
             quality, arrival=True) for record in timing_records)
@@ -450,19 +467,42 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
                            if window_started else None),
             **window_stats,
         })
-    # A drained server can absorb an unsustainable rate for a short stage before
-    # any limit is crossed. Arrival latency still rising through the second half,
-    # well above the first window, with excess work still pending is queue growth.
-    trend = [w["arrival_latency_p50_ms"] for w in windows if w["arrival_latency_p50_ms"] is not None]
-    queue_growth = bool(len(trend) >= 3 and trend[-1] > 1.5 * trend[0]
-                        and all(right >= left - .05 * trend[0] for left, right in zip(trend, trend[1:]))
-                        and trend[-1] - trend[len(trend) // 2] >= .25 * (trend[-1] - trend[0])
-                        and windows[-1]["pending_at_end"]
-                        and max(windows[-1]["pending_at_end"], windows[-1]["time_weighted_in_flight"])
-                            > evidence.rate_rps * (stats["arrival_latency_p50_ms"] or 0) / 1000)
+    # Theil-Sen on at most 64 evenly sampled requests bounds pairwise work.
+    # Calibrated: 2,000 seeds, conditioned Poisson, FIFO 0.5 s mean service with
+    # lognormal sigma=.3, 60 s stages. Slope > .08 s/s, rise > .5 * early mean,
+    # end backlog/last-window occupancy > 1.3 * rate * early mean: 99.45/100%
+    # rejected at 120/150% load; 0/.45% flagged at 60/80%. Below 80 Poisson
+    # samples, require slope > .6 to flag growth; slope > .02 with
+    # p90-p10 > max(.25*p10, .01*T) leaves stability unverified instead.
+    # At 10/20 s this rejects >=95% of overload seeds while flagging <=2% of
+    # healthy seeds (see regression).
+    latencies = sorted((schedule[index][0], record.arrival_elapsed_ms / 1000)
+                       for index, record in records if record.valid and record.status == "completed"
+                       and record.arrival_elapsed_ms is not None)
+    queue_growth = stability_unverified = False
+    short_poisson = evidence.arrival == "poisson" and len(latencies) < 80
+    if short_poisson and latencies:
+        values = sorted(value for _, value in latencies)
+        low, high = (values[int(q * (len(values) - 1))] for q in (.1, .9))
+        stability_unverified = high > max(1.25 * low, low + .01 * evidence.duration_seconds)
+    if len(latencies) >= 6:
+        sampled = latencies[::max(1, math.ceil(len(latencies) / 64))]
+        slopes = [(y2-y1) / (x2-x1) for i, (x1, y1) in enumerate(sampled)
+                  for x2, y2 in sampled[i+1:] if x2 > x1]
+        early = [value for offset, value in latencies if offset < evidence.duration_seconds / 5]
+        early_mean = mean(early or [value for _, value in latencies[:max(1, len(latencies) // 5)]])
+        slope = median(slopes) if slopes else 0
+        stability_unverified = stability_unverified and slope > .02
+        queue_growth = bool(slope > (.6 if short_poisson else .08)
+                            and slope * evidence.duration_seconds > .5 * early_mean
+                            and windows[-1]["pending_at_end"]
+                            and max(windows[-1]["pending_at_end"], windows[-1]["time_weighted_in_flight"])
+                                > 1.3 * evidence.rate_rps * early_mean)
     if queue_growth:
         reasons.append("Queue grew throughout the stage; rate not sustained.")
-    accepted = passed and not queue_growth
+    if stability_unverified:
+        reasons.append("Too few variable-latency Poisson samples to distinguish transient bursts from unsustainable load (need 80).")
+    accepted = passed and not queue_growth and not stability_unverified
     return {
         "stage_index": evidence.stage_index, "rate_rps": evidence.rate_rps,
         "duration_seconds": evidence.duration_seconds,
@@ -481,6 +521,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         "error_rate": error_rate, "peak_in_flight": evidence.peak,
         "fully_offered": fully_offered, "generator_limited": generator_limited,
         "drain_expired": evidence.drain_expired, "accepted": accepted, "queue_growth": queue_growth,
+        "stability_unverified": stability_unverified,
         "status": "fail" if failed else "pass" if accepted else "inconclusive",
         "reasons": list(dict.fromkeys(reasons)), "windows": windows,
         "planned_mix": dict(Counter(kind for _, kind in schedule)),

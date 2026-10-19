@@ -156,21 +156,21 @@ async def test_inline_reasoning_is_not_stop_answer_evidence(client, monkeypatch)
     assert result.status == "inconclusive"
 
 
-def test_gpu_device_disappearing_then_returning_fails():
+def test_gpu_device_transient_absence_warns():
     first = snapshot({"0": [100, 30, 45, 0, 0], "1": [100, 30, 45, 0, 0]}, timestamp=time.time()*1000)
     metrics, status, summary = telemetry.assess_gpu([first, snapshot(timestamp=time.time()*1000), first], 60)
-    assert status == "fail"
-    assert "GPU device disappeared during the run" in summary
-    assert metrics["observed_gpu_count"] == 1
+    assert status == "pass"
+    assert any("transiently absent" in w.get("reason", "") for w in metrics["warnings"])
+    assert metrics["observed_gpu_count"] == 2
 
 
-def test_gpu_successful_scrape_without_any_devices_fails():
+def test_gpu_successful_scrape_without_gpu_families_is_ignored():
     first = snapshot(timestamp=time.time()*1000)
     empty = first | {"status": "available", "samples": []}
     metrics, status, summary = telemetry.assess_gpu([first, empty], 60)
-    assert status == "fail"
-    assert "GPU device disappeared during the run" in summary
-    assert metrics["observed_gpu_count"] == 0
+    assert status == "pass"
+    assert metrics["completed"] == 1
+    assert metrics["observed_gpu_count"] == 1
 
 
 @pytest.mark.parametrize("boundary", ["first", "last"])
