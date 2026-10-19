@@ -1086,14 +1086,17 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics["violations"] = qualified
             elif violations and saturated:
                 status, summary = "inconclusive", "Client scheduling delay prevents attributing observed timing violations to the endpoint."
+                metrics["reason_code"] = "client_delayed"
                 metrics["unattributed_timing_violations"] = violations
             elif violations:
                 status, summary = "fail", "Observed request timing exceeded a configured limit."
                 metrics["violations"] = violations
             elif not thresholds:
                 status, summary = "inconclusive", "Timing observed; no acceptance limit configured."
+                metrics["reason_code"] = "missing_acceptance_limit"
             elif saturated or metrics["completed"] < limits.min_samples:
                 status, summary = "inconclusive", "Timing has too few successful samples or overlapping client scheduling delay."
+                metrics["reason_code"] = "client_delayed" if saturated else "insufficient_timing_samples"
             elif metrics["reasoning_budget_exhausted"]:
                 status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
             elif check_id == "first_output" and any(r.valid and r.first_output_ms is None for r in records):
@@ -1189,6 +1192,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Fairness answers reached their output cap; complete matched stream evidence is unavailable."
             elif saturated:
                 status, summary = "inconclusive", "Client scheduling delay prevents attributing mixed-traffic timing effects to the endpoint."
+                metrics["reason_code"] = "client_delayed"
             elif (observations["fairness"]["overlaps"] < config.samples or ratio is None
                   or len(baseline_records) < config.samples):
                 status, summary = "inconclusive", "Long prefill did not observably overlap every active short stream (long-request output inside the short output window), or timing is noisy."
@@ -1203,6 +1207,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Configured mixed-traffic gap limit cannot be checked without visible stream-gap measurements."
             elif limits.fairness_max_ratio is None:
                 status, summary = "inconclusive", "Mixed-traffic effect observed; no acceptance ratio configured."
+                metrics["reason_code"] = "missing_acceptance_limit"
             else:
                 summary = "Observed mixed-traffic effect met the limit; this does not identify a scheduler cause."
         elif check_id in {"context", "correctness", "json"}:
@@ -1263,6 +1268,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
             elif check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and metrics["evidenced_overlap"] < 2:
+                metrics["reason_code"] = "missing_concurrent_answers"
                 status, summary = "inconclusive", ("Known-answer checks were not exercised concurrently: no scored answer's streamed response "
                     "overlapped another outside recorded client scheduling delays" + (f"; {NEEDS_STREAM}." if not config.stream else
                                                              " (client overlap alone does not show server concurrency)."))
@@ -1436,6 +1442,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
                                         limits.min_output_tokens_per_second, limits.recovery_max_ratio)):
                 status, summary = "inconclusive", "Client scheduling delay prevents attributing sustained and recovery timing to the endpoint."
+                metrics["reason_code"] = "client_delayed"
             elif _missing_timing(probes, limits):
                 metrics["missing_timing_metrics"] = _missing_timing(probes, limits)
                 status, summary = "inconclusive", "Configured recovery limits cannot be checked with available timing or token measurements."
@@ -1448,6 +1455,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif not any((limits.recovery_max_ratio, limits.first_output_ms, limits.latency_ms,
                           limits.stream_gap_ms, limits.min_output_tokens_per_second)):
                 status, summary = "inconclusive", "Recovery observed; no acceptance limit configured."
+                metrics["reason_code"] = "missing_acceptance_limit"
             else:
                 summary = "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified."
                 if limits.recovery_max_ratio is None:
@@ -1562,6 +1570,7 @@ def _output_budget_guidance(config, records):
 
 def _verdict_summary(check, config, records, budget):
     summary, metrics, limits = check.summary, check.metrics, config.limits
+    reason = metrics.get("reason_code")
     text = summary.lower() if check.status != "fail" else ""
     if check.status == "fail":
         details = []
@@ -1648,25 +1657,40 @@ def _verdict_summary(check, config, records, budget):
             summary += answer_difference(mismatch.evaluation.expected, final_answer(mismatch.output)[0])
 
     samples = max(2, config.samples, limits.min_samples)
-    if "not exercised concurrently" in text:
+    if check.id == "fairness" and check.status == "inconclusive" and (config.concurrency < 2 or not config.stream):
+        prerequisites = []
+        if config.concurrency < 2:
+            prerequisites.append("set --concurrency 2 or more")
+        if not config.stream:
+            prerequisites.append("enable streaming (stream: true, omit --nonstream)")
+        remedy = " and ".join(prerequisites) + ", then rerun fairness"
+    elif reason == "missing_concurrent_answers":
         summary += (" Plain words: answers could not be checked under concurrent load. The server appears to handle one request at a time, "
                     "or the recorded streaming/client timing did not expose overlapping answers."
                     if config.stream else " Plain words: streaming was disabled, so answers could not be checked under concurrent load; server parallelism is unverified.")
         remedy = ("enable parallel serving on the server (for example OLLAMA_NUM_PARALLEL=2 for Ollama, or the engine's equivalent), "
                   "restart the server to apply the configuration and rerun with streaming (stream: true, omit --nonstream); "
                   "or rerun with --concurrency 1 to check answers sequentially, which does not test concurrent load")
-    elif "scheduling delay" in text and metrics.get("timing_quality", {}).get("status") == "client_delayed":
+    elif check.status == "inconclusive" and (reason == "client_delayed" or (
+            reason is None and "scheduling delay" in text and metrics.get("timing_quality", {}).get("status") == "client_delayed")):
         remedy = "rerun from an idle load-generator machine and reduce competing client work so streaming timing can be measured"
     elif check.status == "inconclusive" and metrics.get("reasoning_budget_exhausted"):
         remedy = _output_budget_guidance(config, records)
-    elif check.id in {"first_output", "generation"} and "too few successful samples" in text:
+    elif reason == "insufficient_timing_samples":
         setting = "samples (or --samples)" + (" and any test_options.generation.samples override" if check.id == "generation" else "")
         remedy = (f"set {setting} to at least {limits.min_samples}, "
                   "then allow those serial requests to complete within the request and time budgets")
-    elif "no acceptance" in text:
-        option = {"fairness": "limits.fairness_max_ratio", "mixed": "limits.fairness_max_ratio",
-                  "recovery": "limits.recovery_max_ratio", "first_output": "limits.first_output_ms"}.get(
-                      check.id, "limits.latency_ms, limits.stream_gap_ms or limits.min_output_tokens_per_second")
+    elif check.status == "inconclusive" and (reason == "missing_acceptance_limit" or (check.id, summary) in {
+            ("mixed", "Mixed-load ratios measured; no acceptance ratio configured."),
+            ("arrivals", "Arrivals observed; no acceptance limit configured.")}):
+        options = {
+            "fairness": ("fairness_max_ratio",), "mixed": ("fairness_max_ratio",),
+            "first_output": ("first_output_ms",),
+            "generation": ("latency_ms", "stream_gap_ms", "min_output_tokens_per_second"),
+            "arrivals": ("latency_ms", "first_output_ms", "stream_gap_ms", "min_output_tokens_per_second"),
+            "recovery": ("recovery_max_ratio", "first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second"),
+        }[check.id]
+        option = " or ".join(f"limits.{name}" for name in options)
         remedy = f"set {option} to your service's acceptance target and rerun"
     elif metrics.get("request_pack") and check.status == "inconclusive" and (
             not metrics["request_pack"]["coverage_complete"] or not metrics["request_pack"]["all_cases_scored"]):
@@ -1681,20 +1705,22 @@ def _verdict_summary(check, config, records, budget):
                   f"and allow the whole rate plan to finish. {budget}")
     elif check.id == "fairness" and metrics.get("needed_output_tokens", 0) > config.max_output_tokens:
         remedy = f"set max_output_tokens (or --max-output-tokens) to at least {metrics['needed_output_tokens']} and rerun the streaming trials"
-    elif ("exhausted" in text and "output budget" in text) or (check.id == "fairness" and "reached their output cap" in text):
+    elif check.status == "inconclusive" and (any(_reasoning_budget(r) for r in records)
+            or (check.id == "fairness" and any(r.finish_reason == "length" for r in records))):
         remedy = _output_budget_guidance(config, records)
     elif check.id == "context":
         remedy = (f"set context_limit to the server's actual token window (currently {config.context_limit}), "
                   "enable prompt token usage reporting and rerun all fact positions with enough output tokens for complete answers")
-    elif check.id == "recovery" and "not fully observed" in text:
+    elif check.id == "recovery" and summary in {
+            "Sustained duration or light-load recovery was not fully observed.",
+            "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."}:
         remedy = (f"allow {config.sustained_seconds:g} seconds of sustained traffic with at least {limits.min_samples} successful sustained requests "
                   f"and {config.samples} successful requests in each baseline and recovery batch; "
                   f"raise max_duration_seconds (or --max-duration) above {config.max_duration_seconds:g} if the deadline stops the run. {budget}")
-    elif any(word in text for word in ("run budget", "budgets", "run deadline", "unfinished", "no applicable")):
+    elif any(word in text for word in ("run budget", "run deadline", "no applicable")):
         remedy = f"{budget} Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
     elif any(word in text for word in ("overlap", "concurrent")) and check.status == "inconclusive":
-        prerequisite = "set concurrency to at least 2 and " if check.id == "fairness" and config.concurrency < 2 else ""
-        remedy = (prerequisite + "enable parallel serving on the server and streaming (stream: true, omit --nonstream), "
+        remedy = ("enable parallel serving on the server and streaming (stream: true, omit --nonstream), "
                   "disable response buffering along the route, and rerun the same workload; raising client concurrency alone cannot make a serial server process requests in parallel")
     elif check.id == "cancellation" and not config.stream:
         remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"

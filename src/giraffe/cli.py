@@ -342,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             from giraffe.web import create_app
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     listener.bind(("127.0.0.1", args.port))
                     listener.listen(128)
@@ -405,7 +406,11 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         await check_target(target, config)
                     except PreflightError as error:
-                        return target.name, str(error)
+                        if error.blocking:
+                            return target.name, str(error) + " Use --skip-preflight to run anyway."
+                        warning = f"preflight for {target.name}: {error}; continuing."
+                        warnings.append(warning)
+                        print(f"Warning: {warning}", file=sys.stderr)
                 return None
 
             blocked = asyncio.run(preflight())
@@ -420,12 +425,13 @@ def main(argv: list[str] | None = None) -> int:
               f"{config.concurrency} in flight, {config.max_duration_seconds:g}s total, "
               f"{config.request_timeout_seconds:g}s/request, {config.max_output_tokens} output "
               "tokens/request. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
-        from giraffe.reporting import compare_baseline, write_report
+        from giraffe.reporting import _retained, compare_baseline, write_report
 
         report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
         if baseline:
             report = compare_baseline(report, baseline)
         json_path, html_path = write_report(report, directory)
+        report = _retained(report)
         exit_code = {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
         summary = report.observations.get("summary")
         if json_output:

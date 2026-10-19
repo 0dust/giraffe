@@ -741,3 +741,33 @@ def test_schema_evaluation_error_cannot_produce_passing_comparison(side):
     result = compare_baseline(current, baseline)
     assert result.baseline["status"] == "inconclusive"
     assert "answer evaluation failed" in str(result.baseline)
+
+
+@pytest.mark.parametrize("status", ["fail", "inconclusive", "blocked"])
+@pytest.mark.parametrize("evidence_count", [3, 30])
+def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evidence_count, tmp_path):
+    import re
+
+    report = make_report(count=80)
+    evidence = report.requests[-evidence_count:]
+    for index, record in enumerate(evidence):
+        record.score = None
+        record.valid = index % 3 != 0
+        record.elapsed_ms = 1000
+    for record in report.requests[:30]:
+        record.score = False
+    report.checks = [CheckResult(id=name, target="local", title=name, status=status,
+                                summary="Measured evidence", evidence_ids=[r.id for r in evidence] + ["missing"])
+                     for name in ["generation", "first_output", "serving"]]
+    _, path = write_report(report, tmp_path)
+    html = path.read_text()
+    for index, record in enumerate(evidence):
+        assert f'href="#request-{index}"' in html
+        assert f'<details id="request-{index}">' in html
+        assert f'Request {record.id} ' in html
+    links = re.findall(r'href="#(request-[^"]+)"', html)
+    assert links and all(f'id="{anchor}"' in html for anchor in links)
+    assert len(re.findall(r'<details id="request-', html)) == max(25, evidence_count)
+    if evidence_count < 25:
+        assert 'Request current-0 ' in html
+    assert 'Request current-30 ' not in html
