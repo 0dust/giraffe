@@ -915,7 +915,7 @@ class RunConfig(Model):
     targets: list[Target] = Field(min_length=1)
     concurrency: int = Field(default=4, ge=1, le=256,
                              description="Maximum simultaneous target requests across the run, chosen by the user; not detected hardware capacity.")
-    max_requests: int = Field(default=160, ge=1,
+    max_requests: int = Field(default=300, ge=1,
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)

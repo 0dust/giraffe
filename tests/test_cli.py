@@ -20,6 +20,31 @@ def test_cli_one_command_has_builtin_suite():
     assert config.limits.latency_ms == 5000
 
 
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_default_cli_budget_covers_default_preview(output_format, tmp_path, monkeypatch, capsys):
+    config = configuration(parser().parse_args([
+        "run", "--url", "http://127.0.0.1:11434/v1", "--model", "llama3.2:3b",
+    ]))
+    assert config.max_requests == 300
+    assert (config.max_duration_seconds, config.request_timeout_seconds, config.max_output_tokens) == (300, 30, 128)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"targets": [target.model_dump(mode="json") for target in config.targets]}))
+    monkeypatch.setattr("giraffe.preflight.check_target", lambda *a: pytest.fail("Preview probed"))
+    monkeypatch.setattr("giraffe.cli._run", lambda *a: pytest.fail("Preview sent traffic"))
+    assert main(["preview", "--config", str(path), "--output-format", output_format]) == 0
+    captured = capsys.readouterr()
+    if output_format == "json":
+        result = json.loads(captured.out)
+        assert result["config"]["checks"] == config.checks
+        assert result["config"]["max_requests"] == result["request_plan"]["request_limit"] == 300
+        warnings = result["request_plan"]["warnings"]
+    else:
+        assert "max_requests: 300" in captured.out
+        warnings = captured.out.splitlines()
+    assert not any("share of the run limit" in warning for warning in warnings)
+    assert not captured.err
+
+
 def test_cli_optional_flags_extend_saved_selection_but_explicit_checks_win(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({

@@ -89,7 +89,7 @@ def test_bucket_plan_covers_nine_real_prompts_and_full_batches():
         for chars in (64, 1024, 12288)
         for cap, extra in ((16, 0), (48, 32), (96, 32))
     ]
-    assert configuration.max_requests == 160
+    assert configuration.max_requests == 300
 
 
 def test_target_quotas_warn_for_the_smaller_share():

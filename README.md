@@ -37,9 +37,9 @@ use `pip install giraffe-check`; the command is still `giraffe`.
 
 ## What your first run looks like
 
-The CLI prints planning warnings before any traffic, then sends one bounded
-connection/model probe per target before starting the suite. Each probe allows
-at most 32 output tokens and 15 seconds, uses your connection settings, and is
+The CLI sends one bounded connection/model probe per target, then prints planning
+warnings before starting the suite. Each probe allows at most 32 output tokens
+and 15 seconds, uses your connection settings, and is
 separate from the suite request count and budget. `--skip-preflight` skips these
 probes. A preflight failure prints a remedy and exits as blocked without creating
 a run directory or report.
@@ -48,7 +48,7 @@ The quick run above prints limits and live progress, followed by output shaped
 like this (summaries and paths vary):
 
 ```text
-Giraffe: 1 target(s), at most 160 requests, 1 in flight, 300s total, 30s/request, 128 output tokens/request. Ctrl-C saves a partial report.
+Giraffe: 1 target(s), at most 300 requests, 1 in flight, 300s total, 30s/request, 128 output tokens/request. Ctrl-C saves a partial report.
 ...
 PASS: 13 requests
   local / access: pass — ...
