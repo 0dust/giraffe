@@ -13,6 +13,40 @@ SCENARIOS = {
 }
 
 
+def remedy_conditions(check, config, records):
+    if check.id not in {item[0] for item in SCENARIOS.values()} or check.status not in {"fail", "inconclusive"}:
+        return False, False
+    metrics, limits = check.metrics, config.limits
+    answers = bool(metrics.get("answer_failures")) or any(record.score is False for record in records)
+    if check.id == "fairness" and metrics.get("accuracy") is not None:
+        answers = metrics["accuracy"] < limits.min_correctness
+    rows = ([row for case in metrics.get("cases", {}).values() for row in case.get("levels", {}).values()]
+            if check.id == "token_stress" else [metrics])
+    timing = any(row.get("qualified_timing_violations") or (row.get("timing_violations")
+        and row.get("timing_quality", {}).get("status") != "client_delayed") for row in rows)
+    if check.id == "fairness":
+        from giraffe.timing import qualified_violations
+
+        quality = {"affected_metrics": {}, **metrics.get("timing_quality", {})}
+        short = [record for record in records if record.scenario == "fairness_short"]
+        gap_limits = limits.model_copy(update={"first_output_ms": None, "latency_ms": None,
+                                               "min_output_tokens_per_second": None})
+        ratio = metrics.get("latency_ratio")
+        timing = bool(qualified_violations(short, gap_limits, quality)) or bool(
+            quality.get("status") != "client_delayed" and limits.fairness_max_ratio
+            and metrics.get("overlaps", 0) >= config.samples
+            and metrics.get("short_only", {}).get("attempted", 0) >= config.samples
+            and not metrics.get("reasoning_budget_exhausted")
+            and not any(record.finish_reason == "length" for record in records)
+            and ratio is not None and ratio > limits.fairness_max_ratio)
+    elif check.id == "mixed":
+        timing |= any(row.get("samples_and_overlap_qualified") and row.get("latency_ratio") is not None
+            and limits.fairness_max_ratio and row["latency_ratio"] > limits.fairness_max_ratio
+            and row.get("timing_quality", {}).get("status") != "client_delayed"
+            for row in metrics.get("comparisons", []))
+    return answers, timing
+
+
 def execution_config(config):
     """Expand the public selection only inside execution, never in saved config."""
     selected = []
@@ -26,7 +60,7 @@ def execution_config(config):
 
 
 def consolidate_checks(run, config, checks):
-    from giraffe.runner import _stats
+    from giraffe.runner import _stats, _budget_guidance
 
     component_ids = {item[0] for item in SCENARIOS.values()}
     retained = [check for check in checks if check.id not in component_ids]
@@ -41,7 +75,9 @@ def consolidate_checks(run, config, checks):
                 if check is None:
                     check = CheckResult(id=component, target=target.name, title=title,
                                         status="inconclusive", required=True,
-                                        summary="Scenario was not reached within the shared run budget.")
+                                        summary=("Scenario was not reached within the shared run budget. To conclude, "
+                                            + (getattr(run, "verdict_budget_guidance", None) or _budget_guidance(run.config))
+                                            + " Allow more max_duration_seconds if the deadline stopped the run."))
                 scenarios[scenario] = {**check.model_dump(mode="json"), "title": title}
         evidence = list(dict.fromkeys(rid for item in scenarios.values()
                                       for rid in item["evidence_ids"]))
@@ -50,11 +86,14 @@ def consolidate_checks(run, config, checks):
         status = overall_status([CheckResult.model_validate(item) for item in scenarios.values()], None)
         if not scenarios:
             status = "skipped"
+        problems = sorted((item for item in scenarios.values() if item["status"] in {"fail", "inconclusive", "blocked"}),
+                          key=lambda item: item["status"] != "fail")
         merged = CheckResult(
             id="concurrency", target=target.name, title=CHECK_NAMES["concurrency"],
             required="concurrency" in config.checks, status=status,
             summary=("Scenario results: " + "; ".join(
                 f"{item['title']}: {item['status']}" for item in scenarios.values())
+                + (f". {problems[0]['title']}: {problems[0]['summary']}" if problems else "")
                 if scenarios else "Concurrent workloads were not selected."),
             metrics={**_stats(records), "scenarios": scenarios}, evidence_ids=evidence)
         # Keep the merged check at the old fairness position in the public list.
@@ -211,7 +250,7 @@ async def token_stress(run, target, client):
 
 
 def stress_result(run, target):
-    from giraffe.runner import _stats
+    from giraffe.runner import _stats, _verdict_summary, _budget_guidance, _check_config
 
     observed = run.observations[target.name].get("token_stress", {}).get("cases", {})
     cases = {}
@@ -225,7 +264,13 @@ def stress_result(run, target):
     records = [record for record in run.records if record.id in evidence_set]
     statuses = [case["status"] for case in cases.values()]
     status = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
-    return CheckResult(id="token_stress", target=target.name, title="Token stress cases",
+    result = CheckResult(id="token_stress", target=target.name, title="Token stress cases",
                        required=True, status=status,
-                       summary="; ".join(f"{name}: {case['status']}" for name, case in cases.items()),
+                       summary="; ".join(f"{name}: {case['status']}" + (
+                           " — " + "; ".join(case["coverage_gaps"][:3]) if case["coverage_gaps"] else "")
+                           for name, case in cases.items()),
                        metrics={**_stats(records), "cases": cases}, evidence_ids=evidence)
+    if status in {"fail", "inconclusive"}:
+        result.summary = _verdict_summary(result, _check_config(run.config, "concurrency"),
+            records, getattr(run, "verdict_budget_guidance", None) or _budget_guidance(run.config))
+    return result

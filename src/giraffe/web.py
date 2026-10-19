@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import ssl
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -13,19 +12,19 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, ValidationError
 
 from giraffe.capabilities import capabilities
-from giraffe.client import LLMClient, _headers, completion_url
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
-from giraffe.models import ConfigDraft, Model, RequestSpec, RunConfig, RunReport, Target
+from giraffe.models import ConfigDraft, Model, RunConfig, RunReport
 from giraffe.planning import request_plan
+from giraffe.preflight import ConnectionTest, ModelDiscovery, PreflightError
+from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from giraffe.request_pack import pack_preview
 from giraffe.runner import run_suite
@@ -62,157 +61,18 @@ class SaveBaseline(Model):
     replace: bool = False
 
 
-class ModelDiscovery(Model):
-    url: str
-    api_key_env: str | None = None
-    headers_env: dict[str, str] = Field(default_factory=dict)
-    ca_bundle: str | None = None
-    proxy: str | None = None
-
-    def target(self, model: str = "discovery") -> Target:
-        return Target(name="connection", model=model, url=self.url.strip(),
-                      api_key_env=self.api_key_env, headers_env=self.headers_env)
-
-    def configuration(self, model: str, *, request_options: dict | None = None) -> RunConfig:
-        return RunConfig(targets=[self.target(model)], checks=["access"], concurrency=1,
-                         max_requests=1, max_duration_seconds=15, request_timeout_seconds=15,
-                         max_output_tokens=32, samples=1, stream=False,
-                         ca_bundle=self.ca_bundle, proxy=self.proxy,
-                         request_options=request_options or {})
-
-    @model_validator(mode="after")
-    def validate_endpoint(self) -> ModelDiscovery:
-        self.configuration("discovery")
-        return self
-
-
-class ConnectionTest(ModelDiscovery):
-    model: str | None = None
-    request_options: dict = Field(default_factory=dict)
-
-    @field_validator("model", "api_key_env", mode="before")
-    @classmethod
-    def trim_optional(cls, value):
-        return value.strip() or None if isinstance(value, str) else value
-
-    @model_validator(mode="after")
-    def validate_request_options(self) -> ConnectionTest:
-        self.configuration(self.model or "connection", request_options=self.request_options)
-        return self
-
-
 async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False) -> dict:
-    """Read model IDs on explicit request; never send a completion or follow redirects."""
-    target = body.target()
     try:
-        headers = _headers(target)
-    except ValueError:
-        raise HTTPException(422, "An authentication environment variable is not set. "
-                            "Set it before starting Giraffe, then check the API key section.") from None
-    url = completion_url(target.url).removesuffix("/chat/completions") + "/models"
-    try:
-        verify = ssl.create_default_context(cafile=body.ca_bundle) if body.ca_bundle else True
-        client = httpx.AsyncClient(
-            timeout=6, follow_redirects=False, verify=verify, proxy=body.proxy, trust_env=True,
-        )
-    except OSError:
-        raise HTTPException(422, "Could not load the TLS trust file. Check ca_bundle "
-                            "on the machine running Giraffe.") from None
-    except (ValueError, ImportError, httpx.InvalidURL):
-        raise HTTPException(422, "Could not use the connection settings. "
-                            "Check the endpoint and proxy configuration.") from None
-    try:
-        async with asyncio.timeout(8), client:
-            async with client.stream("GET", url, headers=headers) as response:
-                if response.status_code in {401, 403}:
-                    raise HTTPException(422, "Server denied access. Check the authentication "
-                                        "environment variable in the API key section.")
-                if response.status_code != 200:
-                    if allow_manual:
-                        return {"models": [], "message": "The server does not provide a model list. "
-                                "Enter its model name to test the connection."}
-                    raise HTTPException(422, "This server did not return a model list. "
-                                        "Check the endpoint or enter the model name manually.")
-                content = bytearray()
-                async for chunk in response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > 1_048_576:
-                        if allow_manual:
-                            return {"models": [], "message": "The model list is too large. "
-                                    "Enter the model name to test the connection."}
-                        raise HTTPException(422, "The model list is too large. Enter the model name manually.")
-        payload = json.loads(content)
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, list):
-            raise ValueError("Unexpected model list")
-        models = list(dict.fromkeys(item["id"] for item in data if isinstance(item, dict)
-                                   and isinstance(item.get("id"), str) and item["id"].strip()))
-    except (httpx.HTTPError, httpx.InvalidURL, TimeoutError):
-        raise HTTPException(422, "Could not reach the model list. Check that the server is running "
-                            "and check the address, TLS trust and proxy settings.") from None
-    except (ValueError, UnicodeError):
-        if allow_manual:
-            return {"models": [], "message": "The server's model list could not be read. "
-                    "Enter the model name to test the connection."}
-        raise HTTPException(422, "The server returned an unreadable model list. "
-                            "You can still enter the model name manually.") from None
-    return {"models": models, "message": "Model list received. No inference requests were sent."
-            if models else "The server returned no models. Enter an installed model name manually."}
+        return await _discover_models(body, allow_manual=allow_manual)
+    except PreflightError as error:
+        raise HTTPException(422, str(error)) from None
 
 
 async def check_connection(body: ConnectionTest) -> dict:
-    """Resolve a model, then send at most one bounded inference without saving a run."""
-    model = body.model
     try:
-        async with asyncio.timeout(15):
-            if not model:
-                discovered = await discover_models(body, allow_manual=True)
-                models = discovered["models"]
-                if len(models) != 1:
-                    return {"status": "needs_model", "models": models,
-                            "message": "Choose a model, then test its connection."
-                            if models else discovered["message"]}
-                model = models[0]
-            config = body.configuration(model, request_options=body.request_options)
-            target = config.targets[0]
-            try:
-                _headers(target)
-            except ValueError:
-                raise HTTPException(422, "An authentication environment variable is not set. "
-                                    "Set it before starting Giraffe.") from None
-            async with LLMClient(target, config) as client:
-                record = await client.execute(RequestSpec(
-                    fixture_id="connection", scenario="connection", check_ids=["access"],
-                    messages=[{"role": "user", "content": "Reply with OK."}],
-                    max_tokens=32, stream=False,
-                ))
-    except TimeoutError:
-        raise HTTPException(422, "Connection test timed out after 15 seconds. "
-                            "Check that the model is loaded, then try again.") from None
-    except OSError:
-        raise HTTPException(422, "Could not load the TLS trust file. "
-                            "Check ca_bundle on the machine running Giraffe.") from None
-    except (ValueError, ImportError, httpx.HTTPError, httpx.InvalidURL):
-        raise HTTPException(422, "Could not connect. Check the endpoint, authentication, "
-                            "TLS trust and proxy settings.") from None
-    if record.status in {"timeout", "cancelled"}:
-        raise HTTPException(422, "Connection test timed out after 15 seconds. "
-                            "Check that the model is loaded, then try again.")
-    if record.http_status in {401, 403}:
-        raise HTTPException(422, "Server denied access. Check the authentication environment "
-                            "variable and header settings.")
-    if not record.valid:
-        if record.http_status is None:
-            message = "Could not reach the model. Check the endpoint, TLS trust and proxy settings."
-        elif not 200 <= record.http_status < 300:
-            message = (f"The server returned HTTP {record.http_status}. "
-                       "Check the model name and OpenAI-compatible endpoint.")
-        else:
-            message = ("The server responded but did not return a usable answer within the "
-                       "32-token test. Check the model's settings or continue with its name.")
-        raise HTTPException(422, message)
-    return {"status": "connected", "model": model, "latency_ms": round(record.elapsed_ms, 1),
-            "message": "The model returned an answer. Your endpoint is ready for checks."}
+        return await _check_connection(body)
+    except PreflightError as error:
+        raise HTTPException(422, str(error)) from None
 
 
 def _now() -> str:
@@ -270,11 +130,9 @@ def _bootstrap_config(defaults: dict | None) -> dict:
 
 def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> FastAPI:
     root = Path(runs_dir).resolve()
-    root.mkdir(parents=True, exist_ok=True)
     baseline_root = root / ".baselines"
     if baseline_root.is_symlink():
         raise ValueError("Baseline directory cannot be a symlink")
-    baseline_root.mkdir(exist_ok=True)
     active: dict = {}
     connection_pending = False
     unsaved_metadata: dict[str, dict] = {}
@@ -288,6 +146,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             return {}
 
     def recover_interrupted() -> None:
+        if not root.exists():
+            return
         for directory in root.iterdir():
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
@@ -378,6 +238,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             detail["progress"].get("completed", 0)}
 
     def saved_baselines() -> list[dict]:
+        if not baseline_root.exists():
+            return []
         rows = []
         for directory in baseline_root.iterdir():
             if directory.is_symlink() or not directory.is_dir():
@@ -506,7 +368,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.get("/api/runs")
     async def list_runs():
         rows = []
-        for directory in root.iterdir():
+        for directory in (root.iterdir() if root.exists() else ()):
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
             try:
@@ -558,7 +420,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         config, baseline = prepare_run(body)
         identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         directory = _directory(root, identifier)
-        directory.mkdir()
+        directory.mkdir(parents=True)
         meta = {"id": identifier, "state": "running", "started_at": _now(),
                 "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
         _write(directory / ".web.json", meta)
@@ -627,7 +489,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             raise HTTPException(409, "That baseline name exists; explicitly replace it or use another name")
         identifier = existing["id"] if existing else uuid.uuid4().hex
         directory = _directory(baseline_root, identifier)
-        directory.mkdir(exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True)
         summary = {"id": identifier, "name": name, "run_id": body.run_id,
                    "saved_at": _now(), "overall": detail["report"]["overall"],
                    "targets": _targets(detail["config"])}

@@ -235,7 +235,12 @@ async function api(path, options={}) {
       error.status=response.status;throw error;
     }
     const detail = body.detail || body.errors || body.error || `Request failed (${response.status}).`;
-    const message = Array.isArray(detail) ? detail.map(e => typeof e === 'string' ? e : `${(e.loc || []).join('.')}: ${e.msg || JSON.stringify(e)}`).join('\n') : typeof detail === 'string' ? detail : JSON.stringify(detail);
+    const clean = message => message.replace(/^body:\s*/,'').replace(/^Value error,\s*/,'');
+    const message = Array.isArray(detail) ? detail.map(e => {
+      if(typeof e==='string')return clean(e);
+      const location=(e.loc || []).filter((part,i)=>i!==0||part!=='body').join('.');
+      return `${location?location+': ':''}${clean(e.msg || JSON.stringify(e))}`;
+    }).join('\n') : clean(typeof detail === 'string' ? detail : JSON.stringify(detail));
     const error = new Error(message); error.status = response.status; throw error;
   }
   return body;
@@ -308,6 +313,7 @@ async function route() {
     if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();enterRoute();schedulePoll(pollNew,version,3000);return; }
     if (hash.startsWith('#runs/')) {
       const id=decodeURIComponent(hash.slice(6));updateNav('runs','Run detail');
+      state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
       state.detail=detail;state.mosaicPage=0;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();enterRoute();
@@ -316,7 +322,14 @@ async function route() {
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
     await refreshRuns();if(version!==state.routeVersion)return;
     renderRuns();enterRoute();schedulePoll(pollRuns,version,3000);
-  } catch(error) { if(version===state.routeVersion) $('#main').innerHTML=`<div class="page-heading"><h1>Could not open this view</h1></div>${notice(error.message,'error')}<button class="button" data-action="retry">Try again</button>`; }
+  } catch(error) {
+    if(version!==state.routeVersion)return;
+    if(hash.startsWith('#runs/')&&error.status===404){
+      updateNav('runs','Run not found');
+      $('#main').innerHTML='<div class="page-heading"><h1>Run not found</h1><p>This run is not available in the current run directory.</p></div><a class="button" href="#runs">Back to runs</a>';return;
+    }
+    $('#main').innerHTML=`<div class="page-heading"><h1>Could not open this view</h1></div>${notice(error.message,'error')}<button class="button" data-action="retry">Try again</button>`;
+  }
 }
 async function pollRuns(version) {
   try { const previous=JSON.stringify(state.runs),active=state.active;await refreshRuns();if(version!==state.routeVersion)return;connectionError();if(previous!==JSON.stringify(state.runs)||active!==state.active)renderRuns(); }
@@ -1625,7 +1638,9 @@ async function startRun(event) {
   }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Launch ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
 }
 function reportConfig(report){return report?.manifest?.config || state.detail?.config || {};}
+function reportSummary(report){const summary=report.observations?.summary;return typeof summary==='string'?summary.trim():'';}
 function mainFinding(report) {
+  const summary=reportSummary(report);if(summary)return summary;
   const checks=report.checks.filter(c=>c.id!=='baseline'),failed=checks.find(c=>c.status==='fail');
   if(!checks.length)return 'No checks ran';
   if(failed){if(failed.metrics?.scored&&failed.metrics.correct<failed.metrics.scored)return `${checkGuide[failed.id]?.name || failed.title}: ${failed.metrics.correct} of ${failed.metrics.scored} correct`;return `${checkGuide[failed.id]?.name || failed.title} failed`;}
@@ -1645,6 +1660,7 @@ function unselectedCheck(check,report) {
   return Array.isArray(configured)?!configured.includes(check.id):/^Not selected for this run\.?$/i.test(check.summary || '');
 }
 function resultGuidance(report) {
+  if(reportSummary(report))return 'Inspect the check results and recorded evidence below.';
   const checks=report.checks.filter(c=>c.id!=='baseline'),problem=checks.find(c=>c.status==='fail') || checks.find(c=>['blocked','inconclusive'].includes(c.status));
   if(problem){const scored=problem.metrics?.scored,correct=problem.metrics?.correct;return scored&&correct<scored?`${scored-correct} of ${scored} scored answers did not meet the correctness requirement. Inspect the returned answers to understand the failure.`:`${problem.summary || 'This check needs a closer look.'} Inspect the recorded evidence for this check.`;}
   if(report.abort_reason)return 'The evidence collected so far is saved below. Review the stopping reason and request limits before trying again.';
@@ -1896,6 +1912,18 @@ function captureFormDraft() {
   state.prefillBaseline=form.elements.baseline_id.value;
   state.formMode=form.elements.mode.value;state.formRestartTarget=form.elements.restart_target.value;
   try{state.config=readForm(true).config;}catch{}
+}
+function restoreDraft() {
+  try{
+    const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
+    if(draft&&sameConfig(draft.bootstrap,state.bootstrap.config)&&draft.config?.targets?.length)state.config=draft.config;
+    else sessionStorage.removeItem('giraffe-draft-v1');
+  }catch{}
+}
+function saveDraft() {
+  if(!state.bootstrap||!state.config)return;
+  captureFormDraft();
+  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config}));}catch{}
 }
 function syncConfigView() {
   const dirty=hasJsonChanges();
@@ -2169,6 +2197,10 @@ document.addEventListener('keydown',event=>{
     items[(current+(event.key==='ArrowDown'?1:-1)+items.length)%items.length]?.focus();return;
   }
   if(document.querySelector('dialog[open]'))return;
+  if(event.key==='Enter'&&!event.metaKey&&!event.ctrlKey&&!event.altKey&&['url','model'].includes(event.target.name)&&event.target.closest('#new-run-form')){
+    event.preventDefault();const button=$('[data-action="test-connection"]');
+    if(button&&!button.disabled&&!event.repeat)button.click();return;
+  }
   if(event.key==='Escape'&&state.openTest&&event.target.closest?.('[data-test-editor]')&&!document.querySelector?.(':popover-open')){toggleTestEditor(state.openTest,true);return;}
   const spot=event.target.closest('.request-spot, .swarm-dot');
   if(spot&&['Enter',' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)){
@@ -2206,6 +2238,7 @@ document.addEventListener('pointermove',event=>{
   const bounds=coat.getBoundingClientRect();
   coat.style.setProperty('--mx',`${event.clientX-bounds.left}px`);coat.style.setProperty('--my',`${event.clientY-bounds.top}px`);
 },{passive:true});
-window.addEventListener('hashchange',route);
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.suite_version || '0.1.0'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';await refreshRuns().catch(()=>{});await route();}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
+window.addEventListener('hashchange',()=>{if(state.bootstrap)return route();});
+window.addEventListener('pagehide',saveDraft);
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);restoreDraft();state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
 init();

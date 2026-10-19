@@ -93,7 +93,7 @@ def test_try_example_cli_projects_configuration(tmp_path, monkeypatch, capsys):
     path.write_text(json.dumps(values))
     captured = []
 
-    async def run(config):
+    async def run(config, **kwargs):
         captured.append(config)
         return report(config)
 
