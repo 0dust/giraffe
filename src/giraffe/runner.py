@@ -19,7 +19,7 @@ from typing import Callable
 from .client import REASONING_BUDGET_ERROR, LLMClient
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
-                       score_response, traffic_fixtures, deterministic_options)
+                       score_response, traffic_fixtures, deterministic_options, reasoning_budget)
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
 from .timing import TimingHealth, configured_metrics, exceeded_unfinished, qualified_violations, run_quality
 from .models import (
@@ -104,8 +104,9 @@ def _stress(scenario):
 
 
 def _context_rejection(record):
-    return record.http_status == 400 and any(word in (record.error or "").lower()
-        for word in ("context length", "context_length", "maximum context", "too many tokens"))
+    return record.http_status in {400, 413, 422} and any(word in (record.error or "").lower()
+        for word in ("context length", "context_length", "maximum context", "too many tokens",
+                     "context size", "context window", "max_model_len"))
 
 
 def _serving_failure(record, scenario):
@@ -342,7 +343,8 @@ class _Run:
                     self.unfinished[target.name].update(spec.check_ids)
             readiness = spec.scenario == "readiness" or (
                 spec.scenario == "initial" and self.config.restart_target == target.name)
-            if _serving_failure(record, spec.scenario) and not readiness and not intentional:
+            budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
+            if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
                 self.errors += 1
                 record.check_ids = list(dict.fromkeys([*record.check_ids, *[
                     name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
@@ -566,7 +568,11 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
         previous.setdefault("adjustments", []).append(calibration)
     else:
         run.observations[target.name]["context_calibration"] = calibration
-    return builtin_fixtures(config.model_copy(update={"context_limit": fixture_context_limit}))["context"]
+    specs = builtin_fixtures(config.model_copy(update={"context_limit": fixture_context_limit}))["context"]
+    for spec in specs:
+        # Calibrated size estimate from observed usage; a rejection at this size disproves the declared limit.
+        spec.workload["calibrated_input_tokens"] = int(spec.input_chars * source.input_tokens / source.input_chars)
+    return specs
 
 
 async def _target(run: _Run, target: Target, fixtures: dict):
@@ -1197,19 +1203,58 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                         coverage[size] = record.workload["position_coverage"]
                 metrics["position_coverage"] = coverage
                 metrics["reduced_position_coverage"] = any(row["reduced"] for row in coverage.values())
+                rejected = [r for r in records if _context_rejection(r)]
+                disproving = sorted(r.workload["calibrated_input_tokens"] for r in rejected
+                                    if r.workload.get("calibrated_input_tokens") is not None
+                                    and r.workload["calibrated_input_tokens"] <= config.context_limit * .85)
+                metrics["context_rejections"] = {"rejected": len(rejected), "calibrated_rejected_input_tokens": disproving}
+                # Require every position at each observed near-limit size; probes cannot supply recall evidence.
+                recall = [r for r in records if r.scenario in {"context", "context_calibration"}
+                          and r.fixture_id.startswith("context.") and len(r.fixture_id.split(".")) >= 3]
+                near_sizes = {(r.fixture_id.split(".")[1], r.input_chars) for r in recall
+                              if r.input_tokens is not None and r.input_tokens >= config.context_limit * .8}
+                near_positions, near_missed, near_unverified = {}, [], []
+                for size, chars in sorted(near_sizes):
+                    items = [r for r in recall if (r.fixture_id.split(".")[1], r.input_chars) == (size, chars)]
+                    required = {position for r in items for position in
+                                r.workload.get("position_coverage", {}).get("positions", ["beginning", "middle", "end"])}
+                    positions = {}
+                    for position in sorted(required):
+                        samples = [r for r in items if r.fixture_id.split(".")[2] == position]
+                        row = {"attempted": len(samples), "scored": sum(r.score is not None for r in samples),
+                               "correct": sum(r.score is True for r in samples)}
+                        positions[position] = row
+                        label = f"{size}/{chars} chars/{position}"
+                        if row["scored"] > row["correct"]:
+                            near_missed.append(label)
+                        if not samples or row["scored"] < len(samples):
+                            near_unverified.append(label)
+                    near_positions[f"{size}:{chars}"] = positions
+                metrics["near_limit_positions"] = near_positions
+                metrics["near_limit_coverage"] = bool(near_sizes)
             if check_id == "context" and any(_serving_failure(r, r.scenario) for r in records):
                 status, summary = "fail", "Context prompts encountered HTTP or protocol failures."
+            elif check_id == "context" and disproving:
+                status, summary = "fail", (f"server rejected an {disproving[0]}-token prompt (<= 85% of declared "
+                                           f"context_limit {config.context_limit}); the declared context length is not served.")
             elif check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and max(
                     (r.overlap for r in records if r.score is not None), default=0) < 2:
                 status, summary = "inconclusive", "Known-answer checks were not exercised concurrently."
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
+            elif check_id == "context" and near_missed:
+                status, summary = "fail", f"Near-limit recall missed the fact at position(s): {', '.join(near_missed)}."
+            elif check_id == "context" and rejected:
+                status, summary = "inconclusive", ("server rejected a context prompt whose size was not calibrated to <= 85% of the "
+                                                   "declared context_limit; the declared limit remains unverified.")
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
             elif check_id == "context" and metrics["reduced_position_coverage"]:
                 status, summary = "inconclusive", "reduced fact-position coverage (context_limit too small)"
             elif check_id == "context" and not metrics["near_limit_coverage"]:
                 status, summary = "inconclusive", "Recall fixtures passed at observed lengths; near-limit token context was not verified."
+            elif check_id == "context" and near_unverified:
+                status, summary = "inconclusive", f"Near-limit recall was not verified at position(s): {', '.join(near_unverified)}."
             else:
                 summary = ("Built-in deterministic checks passed under observed concurrency."
                            if check_id in {"correctness", "json"} and config.concurrency > 1

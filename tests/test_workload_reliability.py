@@ -134,13 +134,13 @@ async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypa
 @pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'fail'), (16, 'fail'), (1024, 'inconclusive')])
 async def test_w3_prefix_requires_substantial_cached_tokens_and_separate_blocks(monkeypatch, cached, status):
     endpoint = MemoryEndpoint(monkeypatch, cached=cached)
-    settings = config(endpoint, checks=['prefix'], prefix={'repeats': 3, 'history_turns': 2})
+    settings = config(endpoint, checks=['prefix'], context_limit=16384, prefix={'repeats': 3, 'history_turns': 2})
     report = await run_suite(settings)
     assert check(report, 'prefix').status == status
     assert len(endpoint.requests) == request_plan(settings)['planned_per_target']
     prompts = [p['messages'][0]['content'] for p in endpoint.requests[:6]]
-    assert all(p.startswith(' The rock') for p in prompts[:3])
-    assert all(p.startswith('Control') for p in prompts[3:])
+    assert all(p.split('\n', 1)[1].startswith(' The rock') for p in prompts[:3])
+    assert all(p.split('\n', 1)[1].startswith('Control') for p in prompts[3:])
     assert len(prompts[0]) > 8192
 
 
@@ -380,7 +380,7 @@ async def test_round2_workload_temperature_preserves_user_option(monkeypatch, wo
     extra = {'consistency': {'shapes': ['short'], 'repetitions': 2}}
     if workload == 'logprobs':
         extra['consistency']['logprobs'] = {'top_logprobs': 0}
-    settings = config(endpoint, checks=[selected], request_options={'temperature': .7},
+    settings = config(endpoint, checks=[selected], context_limit=16384 if selected == 'prefix' else 2048, request_options={'temperature': .7},
         buckets={'levels': [1], 'samples_per_bucket': 2, 'mixed_pairs': 1},
         sessions={'sessions': 1}, prefix={'repeats': 3}, **extra)
     await run_suite(settings)
@@ -417,12 +417,12 @@ async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, m
     def cached(payload, usage):
         nonlocal seen
         prompt = payload['messages'][0]['content']
-        if not prompt.startswith(' The rock'):
+        if not prompt.split('\n', 1)[-1].startswith(' The rock'):
             return 16
         seen += 1
         return 0 if 1 < seen <= 1 + misses else usage['prompt_tokens']
     endpoint = MemoryEndpoint(monkeypatch, cached=cached)
-    result = check(await run_suite(config(endpoint, checks=['prefix'], prefix={'repeats': 4})), 'prefix')
+    result = check(await run_suite(config(endpoint, checks=['prefix'], context_limit=16384, prefix={'repeats': 4})), 'prefix')
     assert result.status == status
     assert result.metrics['cache_repeat_misses'] == {'misses': misses, 'observed': 3, 'planned': 3}
     assert f'{misses} of 3 repeat misses' in result.summary
@@ -430,7 +430,7 @@ async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, m
 
 async def test_round2_prefix_all_cached_is_not_discriminative(monkeypatch):
     endpoint = MemoryEndpoint(monkeypatch, cached=lambda p, u: u['prompt_tokens'])
-    result = check(await run_suite(config(endpoint, checks=['prefix'])), 'prefix')
+    result = check(await run_suite(config(endpoint, checks=['prefix'], context_limit=16384)), 'prefix')
     assert result.status == 'inconclusive'
     assert 'cache reporting not discriminative' in result.summary
 
@@ -499,7 +499,7 @@ async def test_round2_mixed_missing_ratio_preserves_shape_reason(monkeypatch):
 async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workload):
     endpoint = MemoryEndpoint(monkeypatch)
     selected = 'consistency' if workload == 'logprobs' else workload
-    settings = config(endpoint, checks=[selected], stream=False, sessions={'modes': ['fixed'], 'sessions': 3},
+    settings = config(endpoint, checks=[selected], context_limit=16384 if selected == 'prefix' else 2048, stream=False, sessions={'modes': ['fixed'], 'sessions': 3},
         arrivals={'requests': 3, 'requests_per_second': 100},
         buckets={'levels': [1, 2], 'samples_per_bucket': 2, 'mixed_pairs': 1},
         prefix={'repeats': 3}, consistency={'shapes': ['short'], 'repetitions': 2,
@@ -548,8 +548,8 @@ async def test_round2_prefix_missing_evidence_is_inconclusive(monkeypatch, locat
             response = await super().handle(request)
             payload = json.loads(request.content)
             prompt = payload['messages'][0]['content']
-            if ((location != 'control' and prompt.startswith(' The rock') and 'Trial 0002' in prompt)
-                    or (location == 'control' and prompt.startswith('Control 0002'))):
+            if ((location != 'control' and prompt.split('\n', 1)[-1].startswith(' The rock') and 'Trial 0002' in prompt)
+                    or (location == 'control' and prompt.split('\n', 1)[-1].startswith('Control 0002'))):
                 data = json.loads(response.content)
                 if location == 'input_usage':
                     data['usage'].pop('prompt_tokens')
@@ -557,8 +557,8 @@ async def test_round2_prefix_missing_evidence_is_inconclusive(monkeypatch, locat
                     data['usage'].pop('prompt_tokens_details')
                 return httpx.Response(200, json=data)
             return response
-    endpoint = Missing(monkeypatch, cached=lambda p, u: 0 if p['messages'][0]['content'].startswith('Control') else u['prompt_tokens'])
-    result = check(await run_suite(config(endpoint, checks=['prefix'], stream=False)), 'prefix')
+    endpoint = Missing(monkeypatch, cached=lambda p, u: 0 if p['messages'][0]['content'].split('\n', 1)[-1].startswith('Control') else u['prompt_tokens'])
+    result = check(await run_suite(config(endpoint, checks=['prefix'], context_limit=16384, stream=False)), 'prefix')
     assert result.status == 'inconclusive'
     assert 'missing' in result.summary.lower()
 

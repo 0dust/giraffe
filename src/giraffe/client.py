@@ -442,12 +442,15 @@ class LLMClient:
                             record.logprob_evidence = LogprobEvidence(status="rejected" if rejected else "incomplete",
                                 reason="Logprob request field rejected." if rejected else "HTTP request failed; logprob support unverified.",
                                 requested_top_logprobs=spec.workload["top_logprobs"])
-                        if response.status_code == 400 and spec.scenario.startswith("context"):
-                            # Classify only this documented rejection; never retain
-                            # arbitrary server error text or echoed request content.
+                        if response.status_code in {400, 413, 422} and spec.scenario.startswith("context"):
+                            # Classify only documented engine rejections (vLLM/SGLang, TGI, llama.cpp);
+                            # never retain arbitrary server error text or echoed request content.
                             body = (await _limited_body(response)).decode("utf-8", errors="replace").lower()
-                            if any(term in body for term in ("context length", "context_length", "maximum context", "too many tokens")):
-                                raise _ProtocolError("HTTP 400: context length rejection")
+                            if any(term in body for term in (
+                                    "context length", "context_length", "maximum context", "too many tokens",
+                                    "context size", "context window", "max_model_len",
+                                    "inputs` tokens + `max_new_tokens`", "inputs` must have less than")):
+                                raise _ProtocolError(f"HTTP {response.status_code}: context length rejection")
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):

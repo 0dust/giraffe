@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,10 @@ _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completio
 _CONTEXT_POSITION_SEPARATION = 32
 REASONING_WITHOUT_ANSWER = "reasoning without final answer"
 TRUNCATED_ANSWER = "truncated before a complete answer"
+# Built-in exact fixtures tolerate one trailing period and one layer of emphasis/code/quote
+# wrapping. User request packs and custom fixtures (marked by request_source) stay strict.
+STRICT_EXACT_SOURCES = {"request_pack", "custom_fixtures"}
+_WRAPPERS = (("**", "**"), ("`", "`"), ('"', '"'), ("'", "'"), ("\u201c", "\u201d"))
 
 
 def deterministic_options(config: RunConfig, options: dict | None = None) -> dict:
@@ -299,20 +304,55 @@ def _normalized(text: str) -> str:
 
 
 def final_answer(output: str) -> tuple[str, bool, bool]:
-    """Return final text, whether reasoning was stripped, and whether it was unclosed."""
-    stripped = False
-    closings = list(re.finditer(r"</(?:think|thinking|reasoning)>", output, re.IGNORECASE))
-    if closings and not re.search(r"<(?:think|thinking|reasoning)>", output[:closings[0].start()], re.IGNORECASE):
-        output, stripped = output[closings[-1].end():].lstrip(), True
-    while match := re.search(r"<(think|thinking|reasoning)>", output, re.IGNORECASE):
-        stripped = True
-        closing = re.search(rf"</{match[1]}>", output[match.end():], re.IGNORECASE)
-        if closing is None:
-            return "", stripped, True
-        output = output[:match.start()] + output[match.end() + closing.end():]
-        if not output[:match.start()].strip():
-            output = output.lstrip()
-    return output, stripped, False
+    """Return final text, whether reasoning was stripped, and whether it was unclosed.
+
+    Tags are matched by name and depth, so nested blocks strip completely. A closing tag at
+    depth zero ends prompt-opened reasoning and discards everything before it.
+    """
+    tags = list(re.finditer(r"<(/?)(think|thinking|reasoning)>", output, re.IGNORECASE))
+    if not tags:
+        return output, False, False
+    parts: list[str] = []
+    stack: list[str] = []
+    cursor = 0
+    for tag in tags:
+        name = tag[2].lower()
+        if not tag[1]:
+            if not stack:
+                parts.append(output[cursor:tag.start()])
+            stack.append(name)
+        elif stack:
+            # A mismatched closing tag stays inside the open block.
+            if stack[-1] == name:
+                stack.pop()
+                cursor = cursor if stack else tag.end()
+        else:
+            parts, cursor = [], tag.end()
+    if stack:
+        return "", True, True
+    before = "".join(parts)
+    return (before + output[cursor:]).lstrip() if not before.strip() else before + output[cursor:], True, False
+
+
+def lenient_exact(text: str) -> str:
+    """Remove one trailing period and one layer of surrounding emphasis, code or quotes."""
+    text = text.strip()
+    period = text.endswith(".")
+    text = text[:-1].rstrip() if period else text
+    for opening, closing in _WRAPPERS:
+        if len(text) > len(opening) + len(closing) and text.startswith(opening) and text.endswith(closing):
+            text = text[len(opening):-len(closing)].strip()
+            break
+    return text[:-1].rstrip() if not period and text.endswith(".") else text
+
+
+def exact_matches(actual: str, expected: str, workload: dict | None = None) -> tuple[bool, bool]:
+    """Return (matches, matched only after lenient built-in normalization)."""
+    actual, expected = _normalized(actual), _normalized(expected)
+    if actual == expected:
+        return True, False
+    lenient = (workload or {}).get("request_source") not in STRICT_EXACT_SOURCES
+    return (True, True) if lenient and lenient_exact(actual) == expected else (False, False)
 
 
 def _contains(actual: str, expected: str) -> bool:
@@ -324,6 +364,7 @@ def _contains(actual: str, expected: str) -> bool:
         # Decimal/group separators join adjacent digits into one numeric token.
         if expected and (expected[0].isdigit() or expected[0] in ".,"):
             left |= bool(start and actual[start - 1].isdigit())
+            left |= bool(start and actual[start - 1] in "+-")
             left |= bool(start >= 2 and actual[start - 1] in ".," and actual[start - 2].isdigit())
         if expected and (expected[-1].isdigit() or expected[-1] in ".,"):
             right |= bool(end < len(actual) and actual[end].isdigit())
@@ -348,7 +389,7 @@ def _json_equal(actual: Any, expected: Any) -> bool:
 
 def _json_answer(output: str, *, allow_fence: bool = True) -> Any:
     answer = output.strip()
-    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n\s*```", answer, re.DOTALL | re.IGNORECASE)
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", answer, re.DOTALL | re.IGNORECASE)
     if fenced and allow_fence:
         answer = fenced[1]
 
@@ -364,6 +405,27 @@ def _json_answer(output: str, *, allow_fence: bool = True) -> Any:
         return result
 
     return json.loads(answer, parse_constant=reject_constant, object_pairs_hook=unique_keys)
+
+
+def _incomplete_json(answer: str) -> bool:
+    """Whether unparseable answer text is a prefix of JSON, inside an unclosed opening fence or not."""
+    text = answer.strip()
+    if text.startswith("```") and not re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE):
+        text = re.sub(r"\A```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        try:
+            json.loads(text)
+            return True  # Complete JSON whose closing fence was cut off.
+        except (ValueError, RecursionError):
+            pass
+    try:
+        json.loads(text)
+        return False
+    except json.JSONDecodeError as error:
+        tail = text[error.pos:]
+        return (error.pos >= len(text) or error.msg.startswith("Unterminated string")
+                or bool(tail) and any(word.startswith(tail) for word in ("true", "false", "null")))
+    except (ValueError, RecursionError):
+        return False
 
 
 def _equal_json_values(left: Any, right: Any) -> bool:
@@ -384,6 +446,9 @@ def _equal_json_values(left: Any, right: Any) -> bool:
 def _parsed_tool_arguments(arguments: Any, schema: dict) -> dict:
     if not isinstance(arguments, str):
         raise ValueError("arguments must be JSON text")
+    if not arguments.strip():
+        # Some servers send "" for a no-argument call; treat it as the empty object.
+        arguments = "{}"
     if len(arguments.encode("utf-8")) > MAX_TOOL_JSON_BYTES:
         raise ToolSchemaBudgetExceeded
     value = _json_answer(arguments, allow_fence=False)
@@ -395,25 +460,54 @@ def _parsed_tool_arguments(arguments: Any, schema: dict) -> dict:
     return value
 
 
+def reasoning_budget(record: RequestRecord) -> bool:
+    return (not record.valid and record.finish_reason == "length" and (
+        record.status == "completed" and record.error == "reasoning exhausted the output budget before an answer"
+        or record.status == "failed" and record.error == "response contained no useful answer output"))
+
+
+def matched_calls(expected: list, names: list, values: list) -> list[int] | None:
+    """Map each expected call to a distinct returned call, or None.
+
+    Parallel calls are unordered: calls match as a multiset by name and canonical
+    arguments; expectations without arguments match any remaining call by name.
+    """
+    if len(expected) != len(names):
+        return None
+    free, assignment = list(range(len(names))), [0] * len(expected)
+    for wildcard in (False, True):
+        for index, item in enumerate(expected):
+            if (item.arguments is None) is not wildcard:
+                continue
+            match = next((j for j in free if names[j] == item.name and (
+                wildcard or _equal_json_values(values[j], item.arguments))), None)
+            if match is None:
+                return None
+            free.remove(match)
+            assignment[index] = match
+    return assignment
+
+
 def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> ToolCheckOutcome:
-    calls = record.tool_calls
-    if record.finish_reason == "length":
-        return ToolCheckOutcome(status="fail", message="Truncated tool-call completion cannot establish complete capability.")
+    calls, expected_calls = record.tool_calls, expectation.expected_calls
+    truncated = record.finish_reason == "length"
+    unverified = ToolCheckOutcome(status="inconclusive", message="Truncated tool-call completion cannot establish complete capability.")
     if not calls:
-        return ToolCheckOutcome(status="fail", message="Missing parsed tool call; JSON answer text is not a tool call.")
-    if len(calls) != len(expectation.expected_calls):
+        return unverified if truncated else ToolCheckOutcome(status="fail", message="Missing parsed tool call; JSON answer text is not a tool call.")
+    if len(calls) > len(expected_calls) or len(calls) < len(expected_calls) and not truncated:
         return ToolCheckOutcome(status="fail", message="Wrong tool-call count: differs from the fixture.")
     schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in expectation.tools}
-    for call, expected in zip(calls, expectation.expected_calls, strict=True):
-        function = call.get("function")
-        if not isinstance(function, dict) or function.get("name") != expected.name:
-            return ToolCheckOutcome(status="fail", message="Wrong tool function: differs from the fixture's ordered calls.")
+    names = [call["function"].get("name") if isinstance(call.get("function"), dict) else None for call in calls]
+    remaining = Counter(item.name for item in expected_calls)
+    remaining.subtract(names)
+    if any(count < 0 for count in remaining.values()):
+        return ToolCheckOutcome(status="fail", message="Wrong tool function: differs from the fixture's calls.")
+    values, pending = [], list(expected_calls)
+    for index, (call, name) in enumerate(zip(calls, names, strict=True)):
         if call.get("type", "function") != "function":
             return ToolCheckOutcome(status="fail", message="Wrong tool-call type: expected a function.")
         try:
-            value = _parsed_tool_arguments(function.get("arguments"), schemas[expected.name])
-            if expected.arguments is not None and not _equal_json_values(value, expected.arguments):
-                return ToolCheckOutcome(status="fail", message="Tool arguments differ from the fixture's expected values.")
+            values.append(_parsed_tool_arguments(call["function"].get("arguments"), schemas[name]))
         except ToolSchemaBudgetExceeded:
             return ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
         except RecursionError:
@@ -421,22 +515,38 @@ def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> 
         except ValidationError:
             return ToolCheckOutcome(status="fail", message="Tool argument schema mismatch.")
         except (ValueError, TypeError, KeyError, Unresolvable, SchemaError):
+            if truncated and index == len(calls) - 1 and isinstance(call["function"].get("arguments"), str) and _incomplete_json(call["function"]["arguments"]):
+                return unverified  # The output cap may have cut the last call's arguments.
             return ToolCheckOutcome(status="fail", message="Malformed tool argument JSON.")
+        if truncated:
+            value = values[-1]
+            item = next((item for item in pending if item.name == name and item.arguments is not None
+                         and _equal_json_values(value, item.arguments)), None) or next(
+                (item for item in pending if item.name == name and item.arguments is None), None)
+            if item is None:
+                return ToolCheckOutcome(status="fail", message="Tool arguments differ from the fixture's expected values.")
+            pending.remove(item)
+    if truncated:
+        return unverified
+    if matched_calls(expected_calls, names, values) is None:
+        return ToolCheckOutcome(status="fail", message="Tool arguments differ from the fixture's expected values.")
     return ToolCheckOutcome(status="pass", message="Parsed tool call matches the fixture.")
 
 
 def _tool_choice_outcomes(expectation: ToolExpectation, record: RequestRecord):
     rule, calls = expectation.choice, record.tool_calls
+    truncated = record.finish_reason == "length"
     names = [call.get("function", {}).get("name") for call in calls]
     schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in expectation.tools}
     compliant = (len(calls) <= rule.call_limit
-                 and (rule.mode not in {"required", "named"} or bool(calls))
+                 and (rule.mode not in {"required", "named"} or bool(calls) or truncated)
                  and (rule.mode != "named" or all(name == rule.name for name in names)))
-    choice = ToolCheckOutcome(status="pass" if compliant else "fail",
-        message="Response honors the tool choice rule." if compliant else "Response violates the tool choice name/count rule.")
+    choice = ToolCheckOutcome(status="inconclusive" if compliant and truncated else "pass" if compliant else "fail",
+        message="Truncated output cannot establish complete tool choice compliance." if compliant and truncated else
+                "Response honors the tool choice rule." if compliant else "Response violates the tool choice name/count rule.")
     arguments = ToolCheckOutcome(status="not_checked", message="No calls returned; no arguments to validate.")
     parsed = []
-    for call, name in zip(calls, names, strict=True):
+    for index, (call, name) in enumerate(zip(calls, names, strict=True)):
         if name not in schemas or call.get("type") != "function":
             arguments = ToolCheckOutcome(status="fail", message="Call does not reference a declared function.")
             break
@@ -445,20 +555,24 @@ def _tool_choice_outcomes(expectation: ToolExpectation, record: RequestRecord):
         except (ToolSchemaBudgetExceeded, RecursionError):
             arguments = ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
             break
-        except (ValueError, TypeError, KeyError, Unresolvable, SchemaError, ValidationError):
-            arguments = ToolCheckOutcome(status="fail", message="Tool arguments are malformed or do not satisfy the declared schema.")
+        except (ValueError, TypeError, KeyError, Unresolvable, SchemaError, ValidationError) as error:
+            partial = (truncated and index == len(calls) - 1 and isinstance(error, json.JSONDecodeError)
+                       and _incomplete_json(call["function"]["arguments"]))
+            arguments = ToolCheckOutcome(status="inconclusive" if partial else "fail", message=
+                "Tool arguments were truncated." if partial else "Tool arguments are malformed or do not satisfy the declared schema.")
             break
         arguments = ToolCheckOutcome(status="pass", message="Returned tool arguments satisfy their declared schemas.")
     expected = expectation.expected_calls
     task = ToolCheckOutcome(status="not_checked", message="No task-specific call expectation configured.")
     if expected is not None:
-        if len(expected) != len(calls) or any(e.name != name for e, name in zip(expected, names)):
+        if truncated:
+            task = _tool_calls_outcome(expectation, record)
+        elif Counter(e.name for e in expected) != Counter(names):
             task = ToolCheckOutcome(status="fail", message="Returned call names/count differ from the task expectation.")
         elif arguments.status in {"fail", "inconclusive"}:
             task = ToolCheckOutcome(status="inconclusive", message="Task arguments cannot be compared before schema validation succeeds.")
         else:
-            matches = all(e.arguments is None or _equal_json_values(value, e.arguments)
-                          for e, value in zip(expected, parsed, strict=True))
+            matches = matched_calls(expected, names, parsed) is not None
             task = ToolCheckOutcome(status="pass" if matches else "fail", message=
                 "Calls match the task expectation." if matches else "Tool arguments differ from the task expectation.")
     return choice, arguments, task
@@ -468,7 +582,7 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
     expected_content = expectation.expected_content
     answer, _, unclosed = final_answer(record.output)
     content = ToolCheckOutcome(status="not_checked", message="No assistant content expectation configured.")
-    if record.status != "completed" or not record.valid:
+    if (record.status != "completed" or not record.valid) and not reasoning_budget(record):
         if expectation.choice:
             rejected = record.http_status in {400, 422, 501}
             required = expectation.choice.support == "required"
@@ -492,8 +606,10 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
             "tool_evaluation": evaluation,
         })
     protocol = ToolCheckOutcome(status="pass", message="Request completed validly.")
-    if record.finish_reason == "length":
-        protocol = ToolCheckOutcome(status="fail", message="Completion was truncated by the output limit.")
+    truncated = record.finish_reason == "length"
+    if truncated:
+        # Giraffe's own output cap can stop a reasoning model before any call: unverified, not failed.
+        protocol = ToolCheckOutcome(status="inconclusive", message="Completion was truncated by the output limit.")
     elif expectation.choice and record.finish_reason == "tool_calls" and not record.tool_calls:
         protocol = ToolCheckOutcome(status="fail", message="Tool-call finish reason returned without any structured calls.")
     choice = arguments = task = None
@@ -519,6 +635,8 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
         )
         if matches and expected_content.mode == "contains":
             content.message = "Expected assistant substring found; this does not validate full content or duplication."
+        if truncated and not matches:
+            content = ToolCheckOutcome(status="inconclusive", message="Assistant content was truncated before it could be compared.")
     if unclosed:
         content = ToolCheckOutcome(status="inconclusive", message=REASONING_WITHOUT_ANSWER)
     evaluation = ToolEvaluation(protocol=protocol, calls=calls, content=content,
@@ -579,12 +697,21 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER
                                          if record.finish_reason == "length" else "AI judgment pending."})
     incomplete = False
+    if spec.scorer == "contains" and record.finish_reason == "length":
+        # Truncated text may be tag-less (prompt-opened) reasoning; a found substring proves nothing.
+        return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER})
     if spec.scorer in {"exact", "contains"}:
         expected = _normalized(str(spec.expected))
         actual = _normalized(answer)
-        score = actual == expected if spec.scorer == "exact" else _contains(actual, expected)
+        lenient = False
+        if spec.scorer == "exact":
+            score, lenient = exact_matches(actual, expected, spec.workload)
+        else:
+            score = _contains(actual, expected)
         incomplete = expected.startswith(actual) and actual != expected if spec.scorer == "exact" else not score
         message = "Answer matches the fixture." if score else "Answer differs from the fixture."
+        if lenient:
+            message = "Answer matches the fixture after removing a trailing period or surrounding markup."
         if spec.scorer == "contains" and score:
             message = "Expected text found with alphanumeric boundaries; this check does not validate the full answer."
     else:
@@ -610,9 +737,7 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
                 path = ".".join(str(part) for part in error.absolute_path) or "<root>"
                 message = f"JSON schema violation at {path} ({error.validator})."
             elif isinstance(error, json.JSONDecodeError):
-                tail = answer.strip()[error.pos:]
-                incomplete = (error.pos >= len(answer.strip()) or error.msg.startswith("Unterminated string")
-                              or bool(tail) and any(word.startswith(tail) for word in ("true", "false", "null")))
+                incomplete = _incomplete_json(answer)
                 message = f"Invalid JSON at line {error.lineno}, column {error.colno}."
             else:
                 message = f"Invalid JSON or schema: {error}"
@@ -673,6 +798,7 @@ def load_custom_fixtures(path: str) -> list[RequestSpec]:
             if spec.schema_ is not None:
                 validated_json_schema(spec.schema_)
             spec.input_chars = sum(len(message["content"]) for message in spec.messages)
+            spec.workload = {**spec.workload, "request_source": "custom_fixtures"}
             ids.add(spec.fixture_id)
             fixtures.append(spec)
         except (ValueError, TypeError, SchemaError, ModelValidationError) as error:

@@ -276,7 +276,7 @@ def test_workload_timing_uses_core_generator_qualification(lag, warm_first, corr
     assert next(c for c in outcome if c.id == "prefix").status == expected
 
 
-async def test_independent_prefix_controls_use_reproducible_matched_prose():
+async def test_independent_prefix_controls_use_fresh_nonces_and_matched_prose():
     with FakeEndpoint() as endpoint:
         settings = config(endpoint, prefix={"prefix_chars": 256, "repeats": 3, "history_turns": 2})
         report = await run_suite(settings)
@@ -284,7 +284,8 @@ async def test_independent_prefix_controls_use_reproducible_matched_prose():
         endpoint.requests.clear()
         await run_suite(settings)
         second = [p["messages"][0]["content"] for p in endpoint.requests if "Trial" in p["messages"][0]["content"]]
-    assert first == second and len(first) == 6
+    assert len(first) == len(second) == 6 and first != second
+    assert [p.split("\n", 1)[1] for p in first] == [p.split("\n", 1)[1] for p in second]
     comparison = check(report, "prefix").metrics["first_repeat"]
     assert comparison["shared_first"]["attempted"] == 1
     assert comparison["shared_repeats"]["attempted"] == 2
@@ -341,9 +342,9 @@ def test_fenced_arguments_and_truncated_tool_completion_do_not_pass(arguments, f
         ],
     )
     result = score_response(request, record)
-    assert result.score is False
+    assert result.score is (None if finish == "length" else False)
     if finish == "length":
-        assert result.tool_evaluation.protocol.status == "fail"
+        assert result.tool_evaluation.protocol.status == "inconclusive"
         assert "truncated" in result.tool_evaluation.protocol.message
 
 
@@ -353,6 +354,7 @@ async def test_missing_configured_workload_timing_is_inconclusive():
             config(
                 endpoint,
                 stream=False,
+                context_limit=16384,
                 prefix={"repeats": 2},
                 limits={"min_samples": 2, "min_output_tokens_per_second": 1},
             )

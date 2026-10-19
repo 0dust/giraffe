@@ -180,7 +180,7 @@ async def test_http_success_cannot_hide_contract_or_completeness_failures(endpoi
     from tests.fake_endpoint import FakeEndpoint
     with FakeEndpoint(mode=endpoint_mode) as endpoint:
         report = await run_suite(run_config(endpoint, [configured]))
-    assert report.overall == 'fail'
+    assert report.overall == ('inconclusive' if endpoint_mode == 'tool_choice_truncated' else 'fail')
     assert any(r.score is not True for r in report.requests)
     assert all(r.http_status == 200 for r in report.requests)
 
@@ -261,7 +261,8 @@ async def test_http_failure_identifies_the_specific_component(endpoint_mode, con
         if endpoint_mode == 'tool_choice_eof' and not record.stream:
             assert record.score is True
         else:
-            assert getattr(record.tool_evaluation, component).status == 'fail'
+            assert getattr(record.tool_evaluation, component).status == (
+                'inconclusive' if endpoint_mode == 'tool_choice_truncated' else 'fail')
             if component != 'protocol':
                 assert record.tool_evaluation.protocol.status == 'pass'
                 assert record.valid

@@ -10,7 +10,7 @@ from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.concurrent_workloads import SCENARIOS, execution_config
 from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
-from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt
+from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 
@@ -186,11 +186,17 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             f"{config.arrivals.requests} scheduled offers; the pending queue and run limits can leave some undispatched.")
     if "prefix" in selected:
         settings = config.prefix
-        prompt_chars = len(label_prompt(96))
-        history = sum(prompt_chars * (turn + 1) + 4 * turn + 24 + 32 <= config.context_limit
-                      for turn in range(settings.history_turns))
-        add("prefix", 2 * settings.repeats + history,
-            f"{2 * settings.repeats} shared/independent prefix controls and {history} fixed-history requests admitted by the character ceiling.")
+        # Include the 32-character nonce, newline, filler/instruction and trial suffix.
+        prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
+        if not prefix_admitted(prefix_chars, 24, config.context_limit):
+            add("prefix", 0, "Estimated prefix input plus output/template reserves exceeds context_limit; no prefix requests are admitted.")
+            warnings.append("Prefix coverage will be unfinished: estimated token admission rejects the configured prefix.")
+        else:
+            prompt_chars = len(label_prompt(96))
+            history = sum(prefix_admitted(prompt_chars * (turn + 1) + 4 * turn, 24, config.context_limit)
+                          for turn in range(settings.history_turns))
+            add("prefix", 2 * settings.repeats + history,
+                f"{2 * settings.repeats} shared/independent prefix controls and {history} fixed-history requests admitted by the token estimate.")
 
     bucket_cases, bucket_levels = [], []
     if selected & {"buckets", "mixed"}:

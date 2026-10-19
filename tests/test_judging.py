@@ -115,7 +115,7 @@ async def test_complete_panel_majority(monkeypatch, votes, score, status):
     ('{"verdict":true,"reason":""}', "stop", "invalid_verdict"),
     ('{"verdict":true,"reason":"ok","extra":1}', "stop", "invalid_verdict"),
     ('{"verdict":true,"verdict":false,"reason":"ok"}', "stop", "invalid_verdict"),
-    ('```json\n{"verdict":true,"reason":"ok"}\n```', "stop", "invalid_verdict"),
+    ('```json\n{"verdict":true,"reason":"ok"}\n``` trailing', "stop", "invalid_verdict"),
     (json.dumps({"verdict": True, "reason": "x" * 2001}), "stop", "invalid_verdict"),
 ])
 async def test_strict_verdict_contract(monkeypatch, content, finish, category):
