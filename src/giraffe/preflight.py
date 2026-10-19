@@ -7,7 +7,7 @@ import json
 import ssl
 
 import httpx
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 
 from giraffe.client import LLMClient, _headers, completion_url
 from giraffe.models import Model, RequestSpec, RunConfig, Target
@@ -26,7 +26,36 @@ class _PreflightClient(LLMClient):
         return client
 
 
-class ModelDiscovery(Model):
+class APIKeyInput(Model):
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def validate_api_key(cls, value):
+        if value is None:
+            return None
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw, str):
+            raise ValueError("API key must be text")
+        raw = raw.strip()
+        if not raw:
+            return None
+        if len(raw) > 8192 or any(ord(c) < 33 or ord(c) > 126 for c in raw):
+            raise ValueError("API key must contain printable ASCII characters without whitespace")
+        return raw
+
+
+def attach_api_key(target: Target, key: SecretStr | None) -> None:
+    if key is None:
+        return
+    if any(header.lower() == "authorization" for header in target.headers_env):
+        raise ValueError("Use either a pasted API key or a custom Authorization header.")
+    target._api_key = key
+    # Export a usable reference, never silently turn an authenticated setup into an open one.
+    target.api_key_env = target.api_key_env or "GIRAFFE_API_KEY"
+
+
+class ModelDiscovery(APIKeyInput):
     url: str
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
@@ -34,8 +63,10 @@ class ModelDiscovery(Model):
     proxy: str | None = None
 
     def target(self, model: str = "discovery") -> Target:
-        return Target(name="connection", model=model, url=self.url.strip(),
-                      api_key_env=self.api_key_env, headers_env=self.headers_env)
+        target = Target(name="connection", model=model, url=self.url.strip(),
+                        api_key_env=self.api_key_env, headers_env=self.headers_env)
+        attach_api_key(target, self.api_key)
+        return target
 
     def configuration(self, model: str, *, request_options: dict | None = None) -> RunConfig:
         return RunConfig(targets=[self.target(model)], checks=["access"], concurrency=1,
@@ -89,8 +120,8 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False) -
         async with asyncio.timeout(8), client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code in {401, 403}:
-                    raise PreflightError("Server denied access. Check the authentication "
-                                        "environment variable in the API key section.")
+                    raise PreflightError("Server denied access. Check your authentication: "
+                                        "the API key or environment variable in the API key section.")
                 if response.status_code != 200:
                     if allow_manual:
                         return {"models": [], "message": "The server does not provide a model list. "
@@ -184,8 +215,8 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.", blocking=False)
     if record.http_status in {401, 403}:
-        raise PreflightError("Server denied access. Check the authentication environment "
-                            "variable and header settings.")
+        raise PreflightError("Server denied access. Check your authentication: the API key, "
+                            "environment variable and header settings.")
     if not record.valid:
         blocking = record.http_status == 404
         if record.http_status is None:

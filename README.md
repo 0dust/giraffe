@@ -209,12 +209,32 @@ It checks that a usable reply returns, not answer accuracy or load capacity. No 
 report is created. Editing the endpoint, model or authentication clears that result.
 You can continue with a manually specified model without a successful probe.
 
-**API key (optional)** accepts the name of an environment variable on the machine
-running Giraffe, not the secret key. Open local endpoints need no key. The connection
-API also honors configured header variables, TLS trust and proxy settings.
-`POST /api/targets/test-connection` accepts `url`, optional `model`, `api_key_env`,
-`headers_env`, `ca_bundle`, `proxy` and `request_options`; it returns `connected`
-or `needs_model`. `POST /api/targets/models` remains a metadata-only lookup.
+**API key (optional)** accepts a pasted key in a masked field. No terminal setup
+or UI restart is needed. Giraffe keeps it in this browser tab's memory and sends it
+to the local runner only for connection tests and runs. Reloading the page or
+changing the endpoint clears the key; **Clear key** removes it explicitly. An
+already running test keeps the key it started with. Open local endpoints need no key.
+The **Use an environment variable instead** option preserves the existing
+`api_key_env` workflow for automation and shared configurations.
+
+Pasted keys are separate from configuration and are not written into saved setups,
+reports, baselines, or copied terminal commands. A saved setup uses the reference
+`GIRAFFE_API_KEY` (or its existing `api_key_env`). When reopening it, paste the key
+again or set that environment variable. A copied CLI command requires the variable.
+Keys are used only for the selected inference endpoint, not separate metrics or
+evaluator endpoints. Additional targets and evaluators can still use their own
+environment-variable references in the advanced configuration.
+
+`POST /api/targets/test-connection` accepts `url`, optional `model`, `api_key`,
+`api_key_env`, `headers_env`, `ca_bundle`, `proxy` and `request_options`; it returns
+`connected` or `needs_model`. `POST /api/targets/models` accepts the same credentials
+for a metadata-only lookup. `POST /api/runs` and `POST /api/runs/try-example` accept
+an optional `api_keys` array alongside `config`, with entries shaped as
+`{"target": "local", "url": "https://endpoint.example/v1", "api_key": "..."}`.
+Each entry must match a configured target name and URL. It applies only to that
+request/run and is never added to the server's environment. A pasted key takes
+precedence over `api_key_env`; combining it with a custom Authorization header is
+rejected. TLS trust, proxy settings and other configured header variables still apply.
 
 **Checks** opens on your selected checks. Use **Add checks** to search
 the full catalog by purpose. Without `--config`, the initial selection is endpoint
