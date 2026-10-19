@@ -90,7 +90,8 @@ Exit codes:
         run.add_argument("--model", help="Model name served by the endpoint")
         run.add_argument("--api-key-env", help="Name of an environment variable containing the key")
         run.add_argument("--concurrency", type=int, help="Maximum requests in flight")
-        run.add_argument("--max-requests", type=int, help="Maximum suite request budget across all targets")
+        run.add_argument("--max-requests", type=int, help="Maximum suite request budget across all targets "
+                         f"(default: {RunConfig.model_fields['max_requests'].default})")
         run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Maximum suite duration in seconds")
         run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Per-request timeout in seconds")
         run.add_argument("--max-output-tokens", type=int, help="Maximum output tokens per request")
@@ -265,11 +266,17 @@ def main(argv: list[str] | None = None) -> int:
                          allow_nan=False))
 
     def failure(errors: list[dict]) -> int:
+        errors = [{**error, "message": error["message"].removeprefix("Value error, ").removeprefix("Assertion failed, ")}
+                  for error in errors]
         if json_output:
             emit("error", 4, errors=errors)
         else:
             for error in errors:
                 location = ".".join(map(str, error["loc"]))
+                if len(error["loc"]) == 2 and error["loc"][0] == "targets" and error["message"].startswith(
+                    ("target url ", "metrics_url ")
+                ):
+                    location = ""
                 print(f"giraffe: {location + ': ' if location else ''}{error['message']}", file=sys.stderr)
         return 4
 
@@ -397,9 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         from giraffe.planning import request_plan
         from giraffe.preflight import PreflightError, check_target
 
-        warnings = request_plan(config)["warnings"]
-        for warning in warnings:
-            print(f"Warning: {warning}", file=sys.stderr)
+        warnings = []
         if args.command == "run" and not args.skip_preflight:
             async def preflight():
                 for target in config.targets:
@@ -418,8 +423,12 @@ def main(argv: list[str] | None = None) -> int:
                 target, message = blocked
                 print(f"giraffe: preflight failed for {target}: {message}", file=sys.stderr)
                 if json_output:
-                    emit("blocked", 3, target=target, message=message, warnings=warnings)
+                    emit("blocked", 3, target=target, message=message)
                 return 3
+        planning_warnings = request_plan(config)["warnings"]
+        for warning in planning_warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
+        warnings = planning_warnings + warnings
         directory.mkdir(parents=True, exist_ok=True)
         print(f"Giraffe: {len(config.targets)} target(s), at most {config.max_requests} requests, "
               f"{config.concurrency} in flight, {config.max_duration_seconds:g}s total, "

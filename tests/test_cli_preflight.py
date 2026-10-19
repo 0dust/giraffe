@@ -17,13 +17,14 @@ def test_failed_preflight_stops_before_artifacts(tmp_path, monkeypatch, capsys, 
                  "--output-format", output_format]) == 3
     captured = capsys.readouterr()
     assert "giraffe: preflight failed for local:" in captured.err
+    assert "Warning:" not in captured.err
     assert "Check the model name" in captured.err
     assert captured.err.strip().endswith("Use --skip-preflight to run anyway.")
     assert len(requests) == 1 and not directory.exists()
     if output_format == "json":
         value = json.loads(captured.out)
         assert value["outcome"] == "blocked" and value["exit_code"] == 3
-        assert isinstance(value["warnings"], list)
+        assert not value.get("warnings")
         assert value["message"].endswith("Use --skip-preflight to run anyway.")
 
 
@@ -67,7 +68,8 @@ def test_cli_preflight_errors_are_bounded_and_actionable(status, tmp_path, monke
     assert not directory.exists()
 
 
-def test_successful_preflight_checks_each_target_with_run_settings(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("skip_preflight", [False, True])
+def test_successful_preflight_checks_each_target_with_run_settings(skip_preflight, tmp_path, monkeypatch, capsys):
     from giraffe.models import RunReport
     from tests.test_connection import answer, endpoint
 
@@ -75,18 +77,22 @@ def test_successful_preflight_checks_each_target_with_run_settings(tmp_path, mon
     config["targets"].append({"name": "other", "url": "http://other/v1", "model": "second",
                               "headers_env": {"X-Gateway": "PREFLIGHT_HEADER"}})
     monkeypatch.setenv("PREFLIGHT_HEADER", "header-value")
-    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(200, json=answer()))
+    def respond(request):
+        assert not capsys.readouterr().err
+        return httpx.Response(200, json=answer())
+
+    requests, _ = endpoint(monkeypatch, respond)
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
 
     async def run(config, **kwargs):
-        assert len(requests) == 2
+        assert len(requests) == (0 if skip_preflight else 2)
         return RunReport(run_id="ok", started_at="now", finished_at="now", overall="pass",
                          manifest={"config": config.model_dump(mode="json")})
 
     monkeypatch.setattr("giraffe.cli._run", run)
     assert main(["run", "--config", str(path), "--output", str(tmp_path / "output"),
-                 "--output-format", "json"]) == 0
+                 "--output-format", "json", *(["--skip-preflight"] if skip_preflight else [])]) == 0
     captured = capsys.readouterr()
     result = json.loads(captured.out)
     from giraffe.models import RunConfig
@@ -94,11 +100,12 @@ def test_successful_preflight_checks_each_target_with_run_settings(tmp_path, mon
 
     assert result["warnings"] == request_plan(RunConfig.model_validate(config))["warnings"]
     assert captured.err.startswith("Warning:")
-    for request, model in zip(requests, ["tiny", "second"], strict=True):
-        payload = json.loads(request.content)
-        assert payload["model"] == model and payload["max_tokens"] == 32
-        assert payload["temperature"] == 0 and payload["stream"] is False
-    assert requests[1].headers["X-Gateway"] == "header-value"
+    if not skip_preflight:
+        for request, model in zip(requests, ["tiny", "second"], strict=True):
+            payload = json.loads(request.content)
+            assert payload["model"] == model and payload["max_tokens"] == 32
+            assert payload["temperature"] == 0 and payload["stream"] is False
+        assert requests[1].headers["X-Gateway"] == "header-value"
 
 
 @pytest.mark.parametrize("flag", [[], ["--show-config"]])
@@ -124,17 +131,56 @@ def test_missing_config_has_friendly_error(command, tmp_path, capsys):
     assert f"config file not found: {path}" in message and "Errno" not in message
 
 
-@pytest.mark.parametrize("override,expected", [
-    ({"targets": [{"url": "http://server", "model": "tiny"}]}, "name: local"),
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("override,expected,location", [
+    ({"targets": [{"url": "http://server", "model": "tiny"}]}, "name: local", ["targets", 0, "name"]),
     ({"targets": [{"name": "local", "url": "localhost:11434", "model": "tiny"}]},
-     "target url must start with http:// or https:// (for example http://localhost:11434/v1)"),
-    ({"checks": ["foo", "bar"]}, "Unknown check name(s): bar, foo. Valid names: access"),
+     "target url must start with http:// or https:// (for example http://localhost:11434/v1)", ["targets", 0]),
+    ({"targets": [{"name": "local", "url": "http://server", "model": "tiny", "metrics_url": "bad"}]},
+     "metrics_url must be an http(s) endpoint", ["targets", 0]),
+    ({"targets": [{"name": "local", "url": "http://server", "model": "tiny", "route": "replica"}]},
+     "replica targets require parent service name", ["targets", 0]),
+    ({"max_requests": 0}, "Input should be greater than or equal to 1", ["max_requests"]),
+    ({"checks": ["foo", "bar"]}, "Unknown check name(s): bar, foo. Valid names: access", []),
 ])
-def test_friendly_configuration_messages(override, expected, tmp_path, capsys):
+def test_friendly_configuration_messages(override, expected, location, output_format, tmp_path, capsys):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(values(**override)))
-    assert main(["validate", "--config", str(path)]) == 4
-    assert expected in capsys.readouterr().err
+    assert main(["validate", "--config", str(path), "--output-format", output_format]) == 4
+    captured = capsys.readouterr()
+    assert "Value error, " not in captured.out + captured.err
+    if output_format == "json":
+        error = json.loads(captured.out)["errors"][0]
+        assert error["loc"] == location and expected in error["message"]
+        assert not captured.err
+    else:
+        assert expected in captured.err
+        if expected.startswith(("target url ", "metrics_url ")):
+            assert captured.err.startswith("giraffe: " + expected)
+        elif location:
+            assert captured.err.startswith("giraffe: " + ".".join(map(str, location)) + ": ")
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_cli_strips_assertion_prefix_but_keeps_field_location(output_format, monkeypatch, capsys):
+    from pydantic import ValidationError
+
+    def invalid(args):
+        raise ValidationError.from_exception_data("RunConfig", [{
+            "type": "assertion_error", "loc": ("targets", 0, "url"), "input": "PRIVATE_INPUT",
+            "ctx": {"error": AssertionError("target url rejected")},
+        }])
+
+    monkeypatch.setattr("giraffe.cli.configuration", invalid)
+    assert main(["run", "--output-format", output_format]) == 4
+    captured = capsys.readouterr()
+    assert "Assertion failed, " not in captured.out + captured.err
+    assert "PRIVATE_INPUT" not in captured.out + captured.err
+    if output_format == "json":
+        assert json.loads(captured.out)["errors"] == [{
+            "loc": ["targets", 0, "url"], "message": "target url rejected", "type": "assertion_error"}]
+    else:
+        assert captured.err.strip() == "giraffe: targets.0.url: target url rejected"
 
 
 def test_unknown_cli_checks_list_bad_and_valid_names(capsys):
@@ -151,6 +197,7 @@ def test_run_help_has_all_flags_examples_and_exit_codes(capsys):
     assert stopped.value.code == 0
     output = capsys.readouterr().out
     assert "--structured-output" in output and "--json " not in output
+    assert "(default: 300)" in output
     assert "--checks CHECKS" in output and "first_output" in output
     assert "llama3.2:3b" in output and "--config giraffe.yaml" in output and "--baseline runs/previous" in output
     assert "2  inconclusive" in output and "3  blocked" in output and "4  usage" in output
