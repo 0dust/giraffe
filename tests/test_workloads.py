@@ -181,12 +181,14 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
     lights = [r for r in records if r.scenario.startswith("mixed_short")]
     for index, light in enumerate(lights):
         light.workload = {"pair": index, "observed_overlap": light.overlap}
+        light.timing_start_ms, light.first_output_ms, light.last_output_ms = index * 200, 1, light.elapsed_ms
         light.completion_tokens, light.input_tokens, light.requested_max_tokens = 96, 100, 128
         heavy = light.model_copy(deep=True)
         heavy.id = f"heavy-{index}"
         heavy.scenario = light.scenario.replace("mixed_short", "mixed_heavy")
         heavy.workload.update(heavy_type="long_input")
         heavy.input_tokens = 1000
+        heavy.first_output_ms = 2
         records.append(heavy)
     run = SimpleNamespace(
         config=execution_config(settings),
@@ -482,7 +484,7 @@ async def test_strict_consistency_and_insufficient_samples_are_explicit():
 
 @pytest.mark.parametrize("budget", [5, 72])
 async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_budget(budget):
-    with FakeEndpoint(first_token_delay=0.02) as endpoint:
+    with FakeEndpoint(first_token_delay=0.02, chunk_delay=0.02) as endpoint:
         report = await run_suite(config(
             endpoint, checks=["buckets"], concurrency=8, max_requests=budget,
             buckets={"levels": [8], "samples_per_bucket": 2},

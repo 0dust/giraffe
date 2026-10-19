@@ -259,10 +259,11 @@ async def test_nonstrict_consistency_does_not_certify_variation(monkeypatch, mod
     if mode == 'logprob_drift':
         settings['logprobs'] = {'top_logprobs': 0, 'tolerance': .01}
     outcome = next(c for c in (await runner.run_suite(workload_config(endpoint,
-        checks=['consistency'], stream=False, consistency=settings))).checks if c.id == 'consistency')
+        checks=['consistency'], stream=True, consistency=settings))).checks if c.id == 'consistency')
     assert outcome.status == expected
     if expected == 'inconclusive':
-        assert 'variation observed; enable strict to enforce' in outcome.summary.lower()
+        assert ('server-side concurrency needs streamed output timing' if mode == 'logprob_drift'
+                else 'variation observed; enable strict to enforce') in outcome.summary.lower()
 
 
 async def test_consistency_summary_discloses_incorrect_answers(monkeypatch):

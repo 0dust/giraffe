@@ -111,11 +111,11 @@ async def test_w1_sequential_probability_baseline_and_strict_token_divergence(mo
         'shapes': ['short'], 'levels': [1, 2], 'repetitions': 3,
         'logprobs': {'strict': True, 'tolerance': .01, 'top_logprobs': 0, 'compare_levels': False}}))
     result = check(report, 'consistency')
-    assert result.status == 'fail'
+    assert result.status == 'inconclusive'
     cross = result.metrics['logprobs']['cross_conditions'][0]
-    assert cross['levels'] == [1, 2] and cross['status'] == 'fail'
-    assert (cross['max_absolute_delta'] == .25 if mode == 'logprob_drift'
-            else cross['token_divergences'] > 0)
+    assert cross['levels'] == [1, 2] and cross['status'] == 'inconclusive'
+    assert not result.metrics['logprobs']['conditions'][1]['qualified_samples']
+    assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
 
 
 async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypatch):
@@ -187,13 +187,16 @@ async def test_w6_pool_refills_immediately_and_flags_tail_samples():
         on_start()
         await asyncio.sleep(.2 if index == 0 else .005)
         ends.append(time.monotonic())
-        return SimpleNamespace(workload={})
+        return SimpleNamespace(target=target.name, timing_start_ms=starts[index] * 1000,
+                               first_output_ms=.1, last_output_ms=(ends[-1] - starts[index]) * 1000,
+                               elapsed_ms=(ends[-1] - starts[index]) * 1000,
+                               workload={})
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2)
     assert starts[2] < ends[-1] - .03
     assert len(rows) == 6
     assert sum(r.workload['load_qualified'] for r in rows) == 5
-    assert 1 < rows[-1].workload['time_weighted_inflight'] < 1.5
+    assert 1 < rows[-1].workload['client_time_weighted_inflight'] < 1.5
 
     starts.clear()
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2)
@@ -361,15 +364,15 @@ async def test_w6_bucket_and_logprob_dispatch_refills_a_slow_round(monkeypatch, 
     assert len(report.requests) == request_plan(settings)['planned_per_target']
     if kind == 'buckets':
         cells = check(report, 'buckets').metrics['buckets']
-        assert all(c['qualified_samples'] == 5 and len(c['tail_samples']) == 1
-                   and 1 < c['time_weighted_inflight'] < 2
+        assert all(c['qualified_samples'] == 0 and len(c['tail_samples']) == 6
+                   and 1 < c['client_time_weighted_inflight'] < 2
                    for c in cells.values())
     else:
         conditions = check(report, 'consistency').metrics['logprobs']['conditions']
         loaded = next(c for c in conditions if c['level'] == 2)
-        assert loaded['coverage_complete']
-        assert all(r['qualified_samples'] == 2 and len(r['tail_samples']) == 1
-                   and r['time_weighted_inflight'] > 1
+        assert not loaded['coverage_complete']
+        assert all(r['qualified_samples'] == 0 and len(r['tail_samples']) == 3
+                   and r['client_time_weighted_inflight'] > 1
                    for r in loaded['rounds'])
 
 
@@ -392,7 +395,7 @@ async def test_round2_consistency_copy_prompts_and_wrong_answers_are_independent
     settings = config(endpoint, checks=['consistency'], stream=False,
         consistency={'shapes': ['short'], 'repetitions': 4, 'strict': True})
     result = check(await run_suite(settings), 'consistency')
-    assert result.status == 'pass'
+    assert result.status == 'inconclusive'
     assert result.metrics['correctness_observed'] == 0
     for payload in endpoint.requests:
         prompt = payload['messages'][0]['content']
@@ -475,7 +478,8 @@ async def test_round2_nonstrict_logprob_summary_shows_cross_level_drift(monkeypa
     result = check(await run_suite(config(endpoint, checks=['consistency'], stream=False, consistency={
         'shapes': ['short'], 'repetitions': 3, 'logprobs': {'top_logprobs': 0}})), 'consistency')
     assert 'maximum cross-level delta' in result.summary.lower()
-    assert ('0.25' in result.summary if mode == 'logprob_drift' else 'divergences: 0' not in result.summary)
+    assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
+    assert result.metrics['logprobs']['max_cross_level_delta'] is None
     assert 'token divergences:' in result.summary
 
 
@@ -523,7 +527,8 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
         started.append(index)
         on_start()
         await gates[index].wait()
-        return SimpleNamespace(id=str(index), workload={})
+        return SimpleNamespace(id=str(index), target=target.name, timing_start_ms=0,
+                               first_output_ms=.1, last_output_ms=now, elapsed_ms=now, workload={})
 
     monkeypatch.setattr(workload, 'time', SimpleNamespace(monotonic=lambda: now))
     run = SimpleNamespace(allowed=lambda _: True, request=request)
@@ -537,7 +542,7 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
         await asyncio.sleep(0)
     rows = await task
     assert [r.workload['observed_overlap'] for r in rows] == [3, 3, 3]
-    assert [r.workload['time_weighted_inflight'] for r in rows] == [3, 2.5, 1.75]
+    assert [r.workload['client_time_weighted_inflight'] for r in rows] == [3, 2.5, 1.75]
     assert [r.workload['load_qualified'] for r in rows] == [True, True, False]
 
 
@@ -589,7 +594,8 @@ async def test_round2_fixed_session_plan_counts_admitted_turns_without_saved_ans
         'turns': ['Choose a name.', 'Recall it.', 'Recall it again.', 'Recall it once more.']})
     report = await run_suite(settings)
     assert request_plan(settings)['planned_per_target'] == len(report.requests) == 8
-    assert check(report, 'sessions').status == 'pass'
+    assert check(report, 'sessions').status == 'inconclusive'
+    assert 'conversations were not observed concurrently' in check(report, 'sessions').summary.lower()
     limited = settings.model_copy(update={'context_limit': 256})
     report = await run_suite(limited)
     assert request_plan(limited)['planned_per_target'] == len(report.requests) == 4

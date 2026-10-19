@@ -99,7 +99,7 @@ async def test_fairness_compares_decode_duration_without_first_output_wait(
             return baseline_first, baseline_first+baseline_decode, baseline_first+baseline_decode+1
         if spec.scenario == "fairness_short":
             return loaded_first, loaded_first+loaded_decode, loaded_first+loaded_decode+1
-        return 1, elapsed-1, elapsed
+        return loaded_first+1, loaded_first+2, loaded_first+3
     monkeypatch.setattr(endpoint, "timing", staticmethod(timing))
     report = await runner.run_suite(config(checks=["fairness"],
         limits=Limits(fairness_max_ratio=2, min_samples=2)))

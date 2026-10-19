@@ -11,6 +11,7 @@ from pathlib import Path
 
 from giraffe.fixtures import final_answer
 from giraffe.logprob_workload import corpus_width, refill, sample_count
+from giraffe.overlap import NEEDS_STREAM, answer_window, evidenced_overlap, scheduling_delay_windows
 from giraffe.models import INTERNAL_CHECK_NAMES as CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec, ToolExpectation
 from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, resolved_tool_fixtures, resolved_tool_modes
 
@@ -288,6 +289,30 @@ def bucket_spec(settings, input_shape, output_shape, scenario, check, level, con
     )
 
 
+def pair_evidenced(light, heavy):
+    """Server evidence for a mixed pair; client dispatch timing alone is not evidence.
+
+    active_stream: the heavy request's first output lands strictly inside the light
+    request's output window. before_output: it lands after light dispatch and
+    before the light request's last output.
+    """
+    if light is None or heavy is None or light.target != heavy.target:
+        return False
+    light_window, heavy_window = answer_window(light), answer_window(heavy)
+    if not light_window or not heavy_window:
+        return False
+    if light.workload.get("interference_phase") == "active_stream":
+        return light_window[0] < heavy_window[0] < light_window[1]
+    return light.timing_start_ms < heavy_window[0] < light_window[1]
+
+
+def _mark_pair(light, heavy):
+    evidenced = pair_evidenced(light, heavy)
+    for row in (light, heavy):
+        if row is not None:
+            row.workload["observed_overlap"] = 2 if evidenced else 1
+
+
 async def buckets(run, target, client):
     settings = run.config.buckets
     if "buckets" in run.config.checks:
@@ -353,10 +378,7 @@ async def buckets(run, target, client):
                             light.workload["heavy_active_at_dispatch"] = not first.done()
                         light_row = await run.request(target, client, light, on_start=light_started)
                         heavy_row = await first
-                        if light_row is not None:
-                            light_row.workload["observed_overlap"] = 2 if light.workload["heavy_active_at_dispatch"] else 1
-                        if heavy_row is not None:
-                            heavy_row.workload["observed_overlap"] = 2 if light.workload["heavy_active_at_dispatch"] else 1
+                        _mark_pair(light_row, heavy_row)
                     finally:
                         waiter.cancel()
                         if not first.done():
@@ -371,11 +393,8 @@ async def buckets(run, target, client):
                         def heavy_started():
                             heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
                         heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
-                        if heavy_row is not None:
-                            heavy_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
                         light_row = await first
-                        if light_row is not None:
-                            light_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
+                        _mark_pair(light_row, heavy_row)
                     finally:
                         waiter.cancel()
                         if not first.done():
@@ -663,7 +682,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     if status != "fail":
                         status, summary = (
                             "inconclusive",
-                            "Repetition/load coverage lacks sufficient samples or observed overlap.",
+                            "Repetition/load coverage lacks sufficient samples or server-evidenced overlap (overlapping streamed output).",
                         )
             if check == "buckets":
                 level = items[0].workload["level"]
@@ -694,8 +713,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 entry["qualified_samples"] = sum(r.valid and r.status == "completed"
                                                   and r.workload.get("load_qualified", False) for r in items)
                 entry["tail_samples"] = [r.id for r in items if not r.workload.get("load_qualified", False)]
-                entry["time_weighted_inflight"] = items[0].workload.get("cell_time_weighted_inflight")
+                entry["client_time_weighted_inflight"] = items[0].workload.get("cell_client_time_weighted_inflight")
+                entry["evidenced_concurrency"] = items[0].workload.get("cell_evidenced_concurrency")
+                entry["evidenced_overlap"] = max((r.workload.get("evidenced_overlap", 0) for r in items), default=0)
                 gaps = []
+                if level > 1 and (entry["evidenced_concurrency"] or 0) < level:
+                    gaps.append(f"Requested concurrency {level} was not evidenced by overlapping server output"
+                                + ("" if any(r.stream for r in items) else f"; {NEEDS_STREAM}") + ".")
                 entry["expected_samples"] = sample_count(run.config.buckets.samples_per_bucket, level)
                 if len(items) < entry["expected_samples"] or entry["completed"] < minimum:
                     gaps.append("Insufficient requested or successful samples.")
@@ -713,7 +737,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             "inconclusive",
                             ("input length not exercised; see per-cell coverage gaps."
                              if entry["input_length_verified"] < minimum else
-                             "Some length/load cells lack sufficient samples, achieved overlap or observed lengths; see per-cell coverage gaps."),
+                             "Some length/load cells lack sufficient samples, server-evidenced overlap or observed lengths; see per-cell coverage gaps."),
                         )
             if check == "prefix":
                 entry["cache_observations"] = [
@@ -798,6 +822,18 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             metrics["completed_sessions_per_mode"] = completed_sessions
             if any(count < minimum for count in completed_sessions.values()) and status != "fail":
                 status, summary = "inconclusive", "Insufficient completed independent sessions per mode."
+            metrics["configured_session_concurrency"] = run.config.sessions.concurrency
+            delays = scheduling_delay_windows(run)
+            metrics["evidenced_session_overlap"] = max((evidenced_overlap(r, [other for other in records
+                if other is r or other.workload.get("session_id") != r.workload.get("session_id")], delays)
+                for r in records), default=0)
+            metrics["conversation_performance"]["evidenced_overlap"] = metrics["evidenced_session_overlap"]
+            if status != "fail" and (run.config.sessions.concurrency < 2 or metrics["evidenced_session_overlap"] < 2):
+                status, summary = "inconclusive", (
+                    "Conversations were not observed concurrently: "
+                    + ("session concurrency is below two." if run.config.sessions.concurrency < 2 else
+                       "no session turn's output overlapped another conversation's output; "
+                       + (NEEDS_STREAM if not any(r.stream for r in records) else "client overlap alone does not show server concurrency") + "."))
         if check == "mixed":
             controls = [r for r in records if r.scenario == "mixed_control" and r.score is True
                         and r.completion_tokens is not None and r.completion_tokens >= 64]
@@ -824,13 +860,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         if r.workload.get("heavy_type") == "long_output" else
                         r.input_tokens is not None and light.input_tokens is not None
                         and r.input_tokens >= max(light.input_tokens * 2, light.input_tokens + 128)
-                    ) and r.workload.get("observed_overlap", 0) >= 2 for r in matches)
-                    if light.workload.get("interference_phase") == "active_stream":
-                        exercised = exercised and any(light.last_output_ms is not None
-                            and light.dispatch_ms is not None and r.dispatch_ms is not None
-                            and light.dispatch_ms + light.last_output_ms > r.dispatch_ms for r in matches)
+                    ) and pair_evidenced(light, r) for r in matches)
                     if (exercised and light.valid and light.status == "completed" and light.score is True
-                            and light.workload.get("observed_overlap", 0) >= 2
                             and light.completion_tokens is not None and light.completion_tokens >= 64):
                         shape_qualified.append(light)
                 observed = row["achieved_overlap"] >= 2
@@ -857,7 +888,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if not qualified and status != "fail":
                     status, summary = (
                         "inconclusive",
-                        "Mixed-load comparison lacks sufficient samples, observed overlap or exercised light/heavy shapes.",
+                        "Mixed-load comparison lacks sufficient samples, server-evidenced overlap or exercised light/heavy shapes.",
                     )
                 if (
                     qualified
@@ -972,10 +1003,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             from giraffe.logprob_workload import summarize_logprobs
             metrics["logprobs"] = summarize_logprobs(records, run.config.consistency, min_samples=minimum)
             probability_status = metrics["logprobs"]["status"]
+            reasons = list(dict.fromkeys(reason for row in metrics["logprobs"]["conditions"] for reason in row["coverage_reasons"]))
             if probability_status == "fail" or (probability_status == "inconclusive" and status == "pass"):
                 status, summary = probability_status, "Token probability consistency or capability expectation is not satisfied; see independent probability outcomes."
             elif status == "pass":
                 summary = "Token probability comparison completed (" + probability_status + "); answer correctness is separate."
+            if probability_status == "inconclusive" and status != "fail" and reasons:
+                summary += " " + " ".join(reason[:1].upper() + reason[1:].rstrip(".") + "." for reason in reasons)
         assessed_stats = stats(assessed)
         if check != "tools" and assessed_stats["completed"] < minimum and status != "fail":
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
@@ -1057,7 +1091,11 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if check == "consistency" and (correctness := metrics.get("correctness_observed")) is not None and correctness < 1:
             summary += f" correctness_observed: {correctness}."
         if check == "sessions" and status == "pass" and config.sessions.profile == "performance":
-            summary = "Concurrent conversation performance met configured limits. Answer quality was not assessed; capped replies are reported separately."
+            summary = ("Concurrent conversation performance met configured limits." if any(value is not None for value in (
+                config.limits.first_output_ms, config.limits.latency_ms, config.limits.stream_gap_ms,
+                config.limits.min_output_tokens_per_second)) else
+                "Concurrent conversations completed; performance was measured but no timing limits are configured.") + (
+                " Answer quality was not assessed; capped replies are reported separately.")
         result.append(
             CheckResult(
                 id=check,

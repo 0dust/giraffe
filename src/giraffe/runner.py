@@ -20,6 +20,7 @@ from .client import LLMClient
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options)
+from .overlap import NEEDS_STREAM, answer_window, evidenced_overlap, scheduling_delay_windows
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
 from .timing import TimingHealth, configured_metrics, qualified_violations, run_quality
 from .models import (
@@ -483,24 +484,22 @@ async def _fairness(run, target, client, fixtures):
         short = _spec(short_fixtures[0], "fairness_short", ["fairness"])
         task = asyncio.create_task(run.request(target, client, short, event))
         waiter = asyncio.create_task(event.wait())
-        dispatched = None
+        long_record = None
         try:
             await asyncio.wait([task, waiter], return_when=asyncio.FIRST_COMPLETED)
             observation["pairs"] += 1
             if event.is_set() and not task.done():
-                def on_start():
-                    nonlocal dispatched
-                    dispatched = (time.monotonic()-run.start)*1000
                 competitor = _spec(fixtures["long"][index % len(fixtures["long"])],
                                    "fairness_long", ["fairness"])
                 messages = [dict(message) for message in competitor.messages]
                 messages[0]["content"] = uuid.uuid4().hex + "\n" + messages[0]["content"]
-                await run.request(target, client, competitor.model_copy(update={"messages": messages}),
-                                  on_start=on_start)
+                long_record = await run.request(target, client, competitor.model_copy(update={"messages": messages}))
             record = await task
-            if (record and dispatched is not None and record.dispatch_ms is not None
-                    and record.last_output_ms is not None and record.answer_chunks >= 2
-                    and record.dispatch_ms + record.last_output_ms > dispatched):
+            # Server evidence: the long request's first output lands strictly inside the
+            # short request's output window, so its prefill finished mid-stream.
+            short_window, long_window = answer_window(record) if record else None, answer_window(long_record) if long_record else None
+            if (short_window and long_window and record.answer_chunks >= 2
+                    and short_window[0] < long_window[0] < short_window[1]):
                 observation["overlaps"] += 1
         finally:
             waiter.cancel()
@@ -896,6 +895,8 @@ def _pack_results(run: _Run, target: Target) -> dict:
         }, "stages": [{"stage_index": stage["stage_index"], "rate_rps": stage["rate_rps"],
                         **stage["case_counts"][case_id]} for stage in stages]})
     limits = _check_config(run.config, "correctness").limits
+    target_records = [r for r in run.records if r.target == target.name]
+    delays = scheduling_delay_windows(run)
     for case, spec in zip(cases, run.pack_specs, strict=True):
         loaded = [r for r in run.records if r.target == target.name and r.fixture_id == spec.fixture_id
                   and (r.traffic_stage is not None or r.scenario == "pack_loaded")]
@@ -903,8 +904,12 @@ def _pack_results(run: _Run, target: Target) -> dict:
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
         failed = accuracy is not None and accuracy < limits.min_correctness
         observed = bool(loaded) and all(r.valid and r.score is not None for r in loaded)
-        concurrent = run.config.concurrency == 1 or max((r.overlap for r in loaded), default=0) >= 2
-        case["loaded"] = {**stats, "accuracy": accuracy,
+        evidenced = max((evidenced_overlap(r, target_records, delays) for r in loaded if r.score is not None), default=0)
+        concurrent = run.config.concurrency == 1 or evidenced >= 2
+        case["loaded"] = {**stats, "accuracy": accuracy, "evidenced_overlap": evidenced,
+                          "configured_concurrency": run.config.concurrency,
+                          "concurrency_reason": None if concurrent else NEEDS_STREAM
+                              if not any(r.stream for r in loaded) else "No streamed responses overlapped outside client scheduling delays.",
                           "status": "fail" if failed else "pass" if observed and concurrent else "inconclusive"}
     coverage = bool(cases) and all(case["quiet"]["scored"] >= 1 for case in cases)
     all_scored = all(spec.scorer != "none" for spec in run.pack_specs)
@@ -1088,7 +1093,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 "first_output_ms": None, "latency_ms": None, "min_output_tokens_per_second": None}))
             def decode_p50(rows):
                 return _percentile([r.last_output_ms-r.first_output_ms for r in rows
-                    if r.valid and r.answer_chunks >= 2 and r.last_output_ms is not None
+                    if r.valid and r.score is True and r.answer_chunks >= 2 and r.last_output_ms is not None
                     and r.first_output_ms is not None and r.last_output_ms > r.first_output_ms], .5)
             base_decode, loaded_decode = decode_p50(baseline_records), decode_p50(mixed_records)
             ratio = loaded_decode / base_decode if loaded_decode is not None and base_decode else None
@@ -1111,7 +1116,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Client scheduling delay prevents attributing mixed-traffic timing effects to the endpoint."
             elif (observations["fairness"]["overlaps"] < config.samples or ratio is None
                   or len(baseline_records) < config.samples):
-                status, summary = "inconclusive", "Long prefill did not observably overlap every active short stream, or timing is noisy."
+                status, summary = "inconclusive", "Long prefill did not observably overlap every active short stream (long-request output inside the short output window), or timing is noisy."
             elif limits.stream_gap_ms and mixed["max_stream_gap_ms"] is not None and mixed["max_stream_gap_ms"] > limits.stream_gap_ms:
                 status, summary = "fail", "Active short-stream pauses exceeded the configured stream-gap limit under mixed traffic."
             elif ratio is not None and limits.fairness_max_ratio and ratio > limits.fairness_max_ratio:
@@ -1141,13 +1146,19 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                         coverage[size] = record.workload["position_coverage"]
                 metrics["position_coverage"] = coverage
                 metrics["reduced_position_coverage"] = any(row["reduced"] for row in coverage.values())
+            if check_id in {"correctness", "json"} and not run.pack_specs:
+                metrics["configured_concurrency"] = config.concurrency
+                delays = scheduling_delay_windows(run)
+                metrics["evidenced_overlap"] = max((evidenced_overlap(r, all_records, delays) for r in records
+                                                    if r.score is not None), default=0)
             if check_id == "context" and any(_serving_failure(r, r.scenario) for r in records):
                 status, summary = "fail", "Context prompts encountered HTTP or protocol failures."
-            elif check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and max(
-                    (r.overlap for r in records if r.score is not None), default=0) < 2:
-                status, summary = "inconclusive", "Known-answer checks were not exercised concurrently."
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
+            elif check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and metrics["evidenced_overlap"] < 2:
+                status, summary = "inconclusive", ("Known-answer checks were not exercised concurrently: no scored answer's streamed response "
+                    "overlapped another outside recorded client scheduling delays" + (f"; {NEEDS_STREAM}." if not config.stream else
+                                                             " (client overlap alone does not show server concurrency)."))
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
             elif check_id == "context" and metrics["reduced_position_coverage"]:
