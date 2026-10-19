@@ -24,6 +24,9 @@ from giraffe.logprobs import LogprobBudget
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_RESPONSE_EVENTS = 256
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
+_MAX_CONTENT_READS = 65536
+_REASONING_OPEN = re.compile(r"<(think|thinking|reasoning)>", re.IGNORECASE)
+REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
 class _ProtocolError(Exception):
@@ -134,6 +137,30 @@ def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _answer_spans(output: str) -> list[tuple[int, int]] | None:
+    """Raw-output spans that fixtures.final_answer keeps; None when reasoning is unclosed."""
+    start = 0
+    closings = list(re.finditer(r"</(?:think|thinking|reasoning)>", output, re.IGNORECASE))
+    if closings and not _REASONING_OPEN.search(output, 0, closings[0].start()):
+        start = closings[-1].end()
+    spans = []
+    while match := _REASONING_OPEN.search(output, start):
+        closing = re.compile(rf"</{match[1]}>", re.IGNORECASE).search(output, match.end())
+        if closing is None:
+            return None
+        spans.append((start, match.start()))
+        start = closing.end()
+    return [*spans, (start, len(output))]
+
+
+def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[tuple[int, int]]:
+    start, result = 0, []
+    for a, b in spans or ():
+        result.append((start, a))
+        start = b
+    return [*result, (start, length)]
+
+
 class LLMClient:
     def __init__(self, target: Target, config: RunConfig):
         self.target = target
@@ -195,7 +222,7 @@ class LLMClient:
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
             started_at=datetime.now(timezone.utc).isoformat(), status="failed",
-            input_chars=spec.input_chars, requested_max_tokens=budget, stream=stream,
+            input_chars=spec.input_chars, requested_max_tokens=budget, stream=stream, answer_reads=0,
         )
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
@@ -222,6 +249,10 @@ class LLMClient:
         record.client_preparation_ms = (start - preparation_start) * 1000
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
+        tool_output: float | None = None
+        # (output offset, read time) per network read carrying content; bounded.
+        content_reads: list[tuple[int, float]] = []
+        reads_truncated = False
         response_sequence = -1
         conversation = spec.workload.get("selection") == "conversation"
         assistant_content_present = False
@@ -239,7 +270,7 @@ class LLMClient:
             record.response_events.append({"sequence": response_sequence, "kind": kind, **metadata})
 
         def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
-            nonlocal last_answer, response_sequence, assistant_content_present
+            nonlocal last_answer, response_sequence, assistant_content_present, tool_output, reads_truncated
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
                     and len(server_id) > 4096):
@@ -269,6 +300,7 @@ class LLMClient:
                 reasoning_tokens = _token_count(details.get("reasoning_tokens")) if isinstance(
                     details, dict,
                 ) else None
+                record.reasoning_tokens = reasoning_tokens
                 if record.output_tokens is not None and reasoning_tokens is not None:
                     record.output_tokens = max(0, record.output_tokens - reasoning_tokens)
             choices = data.get("choices")
@@ -338,6 +370,8 @@ class LLMClient:
                           type_present=call.get("type") is not None)
                     part["function"]["name"] += name
                     part["function"]["arguments"] += arguments
+                    if tool_output is None and (function.get("name") or function.get("arguments")):
+                        tool_output = now
                     if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
                         record.first_output_ms = (now-start)*1000
                         if first_output_event is not None:
@@ -346,6 +380,11 @@ class LLMClient:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
                 trace("content", offset=len(record.output), length=len(answer))
+                if not content_reads or content_reads[-1][1] != now:
+                    if len(content_reads) < _MAX_CONTENT_READS:
+                        content_reads.append((len(record.output), now))
+                    else:
+                        reads_truncated = True
                 record.output += answer
                 if answer.strip():
                     if record.first_output_ms is None:
@@ -443,7 +482,16 @@ class LLMClient:
                         ids = [call["id"] for call in record.tool_calls]
                         if any(not call["id"] or call["type"] != "function" or not call["function"]["name"] for call in record.tool_calls) or len(set(ids)) != len(ids):
                             raise _ProtocolError("incomplete tool-call ID/type/function structure")
-                    if record.first_output_ms is None or (not record.output.strip() and spec.scorer != "tool"):
+                    from .fixtures import final_answer
+                    final, _, _ = final_answer(record.output)
+                    if spec.scorer != "tool" and not final.strip():
+                        if record.finish_reason == "length":
+                            # The endpoint honoured Giraffe's own output budget: not a
+                            # serving failure, but also not an answer.
+                            record.status, record.error = "completed", REASONING_BUDGET_ERROR
+                            return record
+                        raise _ProtocolError("response contained no useful answer output")
+                    if record.first_output_ms is None:
                         raise _ProtocolError("response contained no useful answer output")
                     if conversation and stream:
                         record.assistant_message = {"role": "assistant",
@@ -474,9 +522,49 @@ class LLMClient:
             record.elapsed_ms = (now - start) * 1000
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
+            # Answer timing excludes inline reasoning and counts network reads,
+            # not SSE events: one buffered read carries no gap or pace evidence.
+            from .fixtures import final_answer
+            final, stripped, _ = final_answer(record.output)
+            record.answer_chars = len(final)
+            spans = _answer_spans(record.output)
+            if (record.reasoning.strip() or stripped) and record.reasoning_tokens is None:
+                record.output_tokens = None
+            record.reasoning_stripped = record.reasoning_stripped or stripped
+            reasoning_spans = _reasoning_spans(spans, len(record.output))
+            first_read = last_read = None
+            gap = None
+            for index, (offset, at) in enumerate(content_reads):
+                end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
+                text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
+                if (stripped and record.first_reasoning_ms is None
+                        and any(record.output[max(offset, a):min(end, b)].strip()
+                                for a, b in reasoning_spans)):
+                    record.first_reasoning_ms = (at - start) * 1000
+                if not text.strip():
+                    continue
+                record.answer_reads += 1
+                if first_read is None:
+                    first_read, record.first_read_answer_chars = at, len(text)
+                else:
+                    gap = max(gap or 0, (at - last_read) * 1000)
+                last_read = at
+            if reads_truncated:
+                record.answer_reads = 0
+                record.first_read_answer_chars = 0
+                record.last_output_ms = record.max_stream_gap_ms = None
+                if stripped:
+                    record.first_output_ms = None
+            else:
+                if stream:
+                    record.max_stream_gap_ms = gap
+                if stripped:
+                    candidates = [value for value in (tool_output, first_read) if value is not None]
+                    record.first_output_ms = (min(candidates) - start) * 1000 if candidates else None
+                if tool_output is None:
+                    record.last_output_ms = (last_read - start) * 1000 if last_read is not None else None
             if record.valid and record.status == "completed":
-                from .fixtures import final_answer
-                answer, _, _ = final_answer(record.output)
+                answer = final
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
