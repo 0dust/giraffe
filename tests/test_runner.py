@@ -243,8 +243,11 @@ async def test_budget_verdict_has_real_plan_minimum(client):
     assert "select fewer checks" in check.summary
 
 
-async def test_fairness_failure_cause_survives_public_summary(client):
+@pytest.mark.parametrize("answers", [False, True])
+async def test_fairness_failure_cause_survives_public_summary(client, answers):
     client.bad_mixed_gap = True
+    if answers:
+        client.bad_target = "service"
     report = await runner.run_suite(config(checks=["concurrency"],
         concurrent_workloads={"scenarios": ["streaming_fairness"]},
         limits=Limits(min_samples=2, stream_gap_ms=50, fairness_max_ratio=3)))
@@ -252,6 +255,10 @@ async def test_fairness_failure_cause_survives_public_summary(client):
     assert check.status == "fail"
     assert "stream gap 500 ms > allowed 50 ms" in check.summary
     assert "To conclude," in check.summary
+    assert "address the slowdown" in check.summary
+    assert ("rerun after changing the model or its settings" in check.summary) == answers
+    if answers:
+        assert check.summary.index("check the model's answers") < check.summary.index("address the slowdown")
 
 
 async def test_sustained_verdict_names_required_duration(client):
@@ -840,6 +847,9 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
                    if f["fixture_id"] == failed_fixture)
     assert failure["warmup_failed"] == 0
     assert failure["failed"] > 0
+    if check_id == "fairness":
+        assert "rerun after changing the model or its settings" in result.summary
+        assert "address the slowdown" not in result.summary
 
 
 async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeypatch):

@@ -1569,7 +1569,10 @@ def _output_budget_guidance(config, records):
 
 
 def _verdict_summary(check, config, records, budget):
+    from .concurrent_workloads import remedy_conditions
+
     summary, metrics, limits = check.summary, check.metrics, config.limits
+    answer_failed, timing_failed = remedy_conditions(check, config, records)
     reason = metrics.get("reason_code")
     text = summary.lower() if check.status != "fail" else ""
     if check.status == "fail":
@@ -1650,6 +1653,12 @@ def _verdict_summary(check, config, records, budget):
                 details.append(f"{failed.fixture_id}: {failed.error or ('HTTP ' + str(failed.http_status) if failed.http_status else 'invalid or unfinished response')}")
         if details:
             summary += " Observed: " + "; ".join(details[:4]) + "."
+    if answer_failed and not metrics.get("answer_failures"):
+        failures = _answer_failures(records, [])
+        if failures:
+            summary += " Answer checks failed: " + "; ".join(
+                f"{row['fixture_id']} ({row['failed']}/{row['scored']})" for row in failures) + "."
+    if check.status == "fail" or answer_failed:
         mismatch = next((r for r in records if r.score is False and r.evaluation
                          and r.evaluation.expected_provided), None)
         if mismatch:
@@ -1657,7 +1666,21 @@ def _verdict_summary(check, config, records, budget):
             summary += answer_difference(mismatch.evaluation.expected, final_answer(mismatch.output)[0])
 
     samples = max(2, config.samples, limits.min_samples)
-    if check.id == "fairness" and check.status == "inconclusive" and (config.concurrency < 2 or not config.stream):
+    if answer_failed or timing_failed:
+        remedies = []
+        if answer_failed:
+            remedies.append("check the model's answers for the listed fixtures (the received text above); "
+                            "a refusal or wrong answer is a model/prompt issue, not a serving slowdown; "
+                            "rerun after changing the model or its settings")
+        if timing_failed:
+            remedies.append({
+                "fairness": "inspect short-stream pauses and long-request interference on the server, address the slowdown, then rerun the same mixed traffic",
+                "mixed": "inspect light-request latency and heavy-request interference on the server, address the slowdown, then rerun the same mixed traffic",
+                "buckets": "inspect slow requests in the failing size/concurrency cells and server load, address the slowdown, then rerun the same matrix",
+                "token_stress": "inspect slow token-stress requests and server load, address the slowdown, then rerun the same token stress cases",
+            }[check.id])
+        remedy = "; then ".join(remedies)
+    elif check.id == "fairness" and check.status == "inconclusive" and (config.concurrency < 2 or not config.stream):
         prerequisites = []
         if config.concurrency < 2:
             prerequisites.append("set --concurrency 2 or more")

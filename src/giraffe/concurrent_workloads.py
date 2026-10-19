@@ -13,6 +13,40 @@ SCENARIOS = {
 }
 
 
+def remedy_conditions(check, config, records):
+    if check.id not in {item[0] for item in SCENARIOS.values()} or check.status not in {"fail", "inconclusive"}:
+        return False, False
+    metrics, limits = check.metrics, config.limits
+    answers = bool(metrics.get("answer_failures")) or any(record.score is False for record in records)
+    if check.id == "fairness" and metrics.get("accuracy") is not None:
+        answers = metrics["accuracy"] < limits.min_correctness
+    rows = ([row for case in metrics.get("cases", {}).values() for row in case.get("levels", {}).values()]
+            if check.id == "token_stress" else [metrics])
+    timing = any(row.get("qualified_timing_violations") or (row.get("timing_violations")
+        and row.get("timing_quality", {}).get("status") != "client_delayed") for row in rows)
+    if check.id == "fairness":
+        from giraffe.timing import qualified_violations
+
+        quality = {"affected_metrics": {}, **metrics.get("timing_quality", {})}
+        short = [record for record in records if record.scenario == "fairness_short"]
+        gap_limits = limits.model_copy(update={"first_output_ms": None, "latency_ms": None,
+                                               "min_output_tokens_per_second": None})
+        ratio = metrics.get("latency_ratio")
+        timing = bool(qualified_violations(short, gap_limits, quality)) or bool(
+            quality.get("status") != "client_delayed" and limits.fairness_max_ratio
+            and metrics.get("overlaps", 0) >= config.samples
+            and metrics.get("short_only", {}).get("attempted", 0) >= config.samples
+            and not metrics.get("reasoning_budget_exhausted")
+            and not any(record.finish_reason == "length" for record in records)
+            and ratio is not None and ratio > limits.fairness_max_ratio)
+    elif check.id == "mixed":
+        timing |= any(row.get("samples_and_overlap_qualified") and row.get("latency_ratio") is not None
+            and limits.fairness_max_ratio and row["latency_ratio"] > limits.fairness_max_ratio
+            and row.get("timing_quality", {}).get("status") != "client_delayed"
+            for row in metrics.get("comparisons", []))
+    return answers, timing
+
+
 def execution_config(config):
     """Expand the public selection only inside execution, never in saved config."""
     selected = []

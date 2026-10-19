@@ -416,6 +416,8 @@ async def test_round2_mixed_wrong_light_is_unqualified_not_failed(monkeypatch):
     assert result.metrics['correctness_observed'] < 1
     assert result.metrics['unqualified_light_samples']
     assert all(c['shape_qualified_samples'] == 0 for c in result.metrics['comparisons'])
+    assert "rerun after changing the model or its settings" in result.summary
+    assert "address the slowdown" not in result.summary
 
 
 @pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'fail')])
