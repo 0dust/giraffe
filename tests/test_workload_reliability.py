@@ -97,6 +97,8 @@ class MemoryEndpoint:
                         await asyncio.sleep(.001)
                         data = {'model': payload['model'], 'choices': [{'delta': {'content': piece}}]}
                         yield ('data: ' + json.dumps(data) + '\n\n').encode()
+                    # Leave a measurable output-to-finish window even for a one-word answer.
+                    await asyncio.sleep(.01)
                     data = {'choices': [{'delta': {}, 'finish_reason': 'stop'}], 'usage': usage}
                     yield ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode()
                 finally:
@@ -111,11 +113,11 @@ async def test_w1_sequential_probability_baseline_and_strict_token_divergence(mo
         'shapes': ['short'], 'levels': [1, 2], 'repetitions': 3,
         'logprobs': {'strict': True, 'tolerance': .01, 'top_logprobs': 0, 'compare_levels': False}}))
     result = check(report, 'consistency')
-    assert result.status == 'fail'
+    assert result.status == 'inconclusive'
     cross = result.metrics['logprobs']['cross_conditions'][0]
-    assert cross['levels'] == [1, 2] and cross['status'] == 'fail'
-    assert (cross['max_absolute_delta'] == .25 if mode == 'logprob_drift'
-            else cross['token_divergences'] > 0)
+    assert cross['levels'] == [1, 2] and cross['status'] == 'inconclusive'
+    assert not result.metrics['logprobs']['conditions'][1]['qualified_samples']
+    assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
 
 
 async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypatch):
@@ -134,13 +136,13 @@ async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypa
 @pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'fail'), (16, 'fail'), (1024, 'inconclusive')])
 async def test_w3_prefix_requires_substantial_cached_tokens_and_separate_blocks(monkeypatch, cached, status):
     endpoint = MemoryEndpoint(monkeypatch, cached=cached)
-    settings = config(endpoint, checks=['prefix'], prefix={'repeats': 3, 'history_turns': 2})
+    settings = config(endpoint, checks=['prefix'], context_limit=16384, prefix={'repeats': 3, 'history_turns': 2})
     report = await run_suite(settings)
     assert check(report, 'prefix').status == status
     assert len(endpoint.requests) == request_plan(settings)['planned_per_target']
     prompts = [p['messages'][0]['content'] for p in endpoint.requests[:6]]
-    assert all(p.startswith(' The rock') for p in prompts[:3])
-    assert all(p.startswith('Control') for p in prompts[3:])
+    assert all(p.split('\n', 1)[1].startswith(' The rock') for p in prompts[:3])
+    assert all(p.split('\n', 1)[1].startswith('Control') for p in prompts[3:])
     assert len(prompts[0]) > 8192
 
 
@@ -187,13 +189,17 @@ async def test_w6_pool_refills_immediately_and_flags_tail_samples():
         on_start()
         await asyncio.sleep(.2 if index == 0 else .005)
         ends.append(time.monotonic())
-        return SimpleNamespace(workload={})
+        return SimpleNamespace(target=target.name, timing_start_ms=starts[index] * 1000,
+                               first_output_ms=.1, last_output_ms=(ends[-1] - starts[index]) * 1000,
+                               elapsed_ms=(ends[-1] - starts[index]) * 1000,
+                               stream_end_ms=(ends[-1] - starts[index]) * 1000,
+                               workload={})
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2)
     assert starts[2] < ends[-1] - .03
     assert len(rows) == 6
     assert sum(r.workload['load_qualified'] for r in rows) == 5
-    assert 1 < rows[-1].workload['time_weighted_inflight'] < 1.5
+    assert 1 < rows[-1].workload['client_time_weighted_inflight'] < 1.5
 
     starts.clear()
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2)
@@ -361,15 +367,15 @@ async def test_w6_bucket_and_logprob_dispatch_refills_a_slow_round(monkeypatch, 
     assert len(report.requests) == request_plan(settings)['planned_per_target']
     if kind == 'buckets':
         cells = check(report, 'buckets').metrics['buckets']
-        assert all(c['qualified_samples'] == 5 and len(c['tail_samples']) == 1
-                   and 1 < c['time_weighted_inflight'] < 2
+        assert all(c['qualified_samples'] == 0 and len(c['tail_samples']) == 6
+                   and 1 < c['client_time_weighted_inflight'] < 2
                    for c in cells.values())
     else:
         conditions = check(report, 'consistency').metrics['logprobs']['conditions']
         loaded = next(c for c in conditions if c['level'] == 2)
-        assert loaded['coverage_complete']
-        assert all(r['qualified_samples'] == 2 and len(r['tail_samples']) == 1
-                   and r['time_weighted_inflight'] > 1
+        assert not loaded['coverage_complete']
+        assert all(r['qualified_samples'] == 0 and len(r['tail_samples']) == 3
+                   and r['client_time_weighted_inflight'] > 1
                    for r in loaded['rounds'])
 
 
@@ -380,7 +386,7 @@ async def test_round2_workload_temperature_preserves_user_option(monkeypatch, wo
     extra = {'consistency': {'shapes': ['short'], 'repetitions': 2}}
     if workload == 'logprobs':
         extra['consistency']['logprobs'] = {'top_logprobs': 0}
-    settings = config(endpoint, checks=[selected], request_options={'temperature': .7},
+    settings = config(endpoint, checks=[selected], context_limit=16384 if selected == 'prefix' else 2048, request_options={'temperature': .7},
         buckets={'levels': [1], 'samples_per_bucket': 2, 'mixed_pairs': 1},
         sessions={'sessions': 1}, prefix={'repeats': 3}, **extra)
     await run_suite(settings)
@@ -392,7 +398,7 @@ async def test_round2_consistency_copy_prompts_and_wrong_answers_are_independent
     settings = config(endpoint, checks=['consistency'], stream=False,
         consistency={'shapes': ['short'], 'repetitions': 4, 'strict': True})
     result = check(await run_suite(settings), 'consistency')
-    assert result.status == 'pass'
+    assert result.status == 'inconclusive'
     assert result.metrics['correctness_observed'] == 0
     for payload in endpoint.requests:
         prompt = payload['messages'][0]['content']
@@ -417,12 +423,12 @@ async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, m
     def cached(payload, usage):
         nonlocal seen
         prompt = payload['messages'][0]['content']
-        if not prompt.startswith(' The rock'):
+        if not prompt.split('\n', 1)[-1].startswith(' The rock'):
             return 16
         seen += 1
         return 0 if 1 < seen <= 1 + misses else usage['prompt_tokens']
     endpoint = MemoryEndpoint(monkeypatch, cached=cached)
-    result = check(await run_suite(config(endpoint, checks=['prefix'], prefix={'repeats': 4})), 'prefix')
+    result = check(await run_suite(config(endpoint, checks=['prefix'], context_limit=16384, prefix={'repeats': 4})), 'prefix')
     assert result.status == status
     assert result.metrics['cache_repeat_misses'] == {'misses': misses, 'observed': 3, 'planned': 3}
     assert f'{misses} of 3 repeat misses' in result.summary
@@ -430,7 +436,7 @@ async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, m
 
 async def test_round2_prefix_all_cached_is_not_discriminative(monkeypatch):
     endpoint = MemoryEndpoint(monkeypatch, cached=lambda p, u: u['prompt_tokens'])
-    result = check(await run_suite(config(endpoint, checks=['prefix'])), 'prefix')
+    result = check(await run_suite(config(endpoint, checks=['prefix'], context_limit=16384)), 'prefix')
     assert result.status == 'inconclusive'
     assert 'cache reporting not discriminative' in result.summary
 
@@ -448,6 +454,7 @@ async def test_round2_live_session_history_strips_reasoning_and_fixed_keeps_seed
     report = await run_suite(config(endpoint, checks=['sessions'], sessions={
         'sessions': 2, 'turns': ['Choose a name.', 'Recall it.', 'Recall it again.']}))
     assert check(report, 'sessions').status == 'pass'
+    assert check(report, 'sessions').metrics['evidenced_session_overlap'] >= 2
     for payload in endpoint.requests:
         value = re.search(r'Use this exact bakery name for this session: (\w+)', payload['messages'][0]['content'])[1]
         assistants = [m['content'] for m in payload['messages'] if m['role'] == 'assistant']
@@ -475,7 +482,8 @@ async def test_round2_nonstrict_logprob_summary_shows_cross_level_drift(monkeypa
     result = check(await run_suite(config(endpoint, checks=['consistency'], stream=False, consistency={
         'shapes': ['short'], 'repetitions': 3, 'logprobs': {'top_logprobs': 0}})), 'consistency')
     assert 'maximum cross-level delta' in result.summary.lower()
-    assert ('0.25' in result.summary if mode == 'logprob_drift' else 'divergences: 0' not in result.summary)
+    assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
+    assert result.metrics['logprobs']['max_cross_level_delta'] is None
     assert 'token divergences:' in result.summary
 
 
@@ -499,7 +507,7 @@ async def test_round2_mixed_missing_ratio_preserves_shape_reason(monkeypatch):
 async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workload):
     endpoint = MemoryEndpoint(monkeypatch)
     selected = 'consistency' if workload == 'logprobs' else workload
-    settings = config(endpoint, checks=[selected], stream=False, sessions={'modes': ['fixed'], 'sessions': 3},
+    settings = config(endpoint, checks=[selected], context_limit=16384 if selected == 'prefix' else 2048, stream=False, sessions={'modes': ['fixed'], 'sessions': 3},
         arrivals={'requests': 3, 'requests_per_second': 100},
         buckets={'levels': [1, 2], 'samples_per_bucket': 2, 'mixed_pairs': 1},
         prefix={'repeats': 3}, consistency={'shapes': ['short'], 'repetitions': 2,
@@ -523,7 +531,8 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
         started.append(index)
         on_start()
         await gates[index].wait()
-        return SimpleNamespace(id=str(index), workload={})
+        return SimpleNamespace(id=str(index), target=target.name, timing_start_ms=0,
+                               first_output_ms=.1, last_output_ms=now, elapsed_ms=now, stream_end_ms=now, workload={})
 
     monkeypatch.setattr(workload, 'time', SimpleNamespace(monotonic=lambda: now))
     run = SimpleNamespace(allowed=lambda _: True, request=request)
@@ -531,13 +540,13 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
         [spec('p', 's', 'buckets')], 3, 3))
     while len(started) < 3:
         await asyncio.sleep(0)
-    for index, finish in enumerate((1, 2, 4)):
+    for index, finish in enumerate((2, 4, 8)):
         now = finish
         gates[index].set()
         await asyncio.sleep(0)
     rows = await task
     assert [r.workload['observed_overlap'] for r in rows] == [3, 3, 3]
-    assert [r.workload['time_weighted_inflight'] for r in rows] == [3, 2.5, 1.75]
+    assert [r.workload['client_time_weighted_inflight'] for r in rows] == [3, 2.5, 1.75]
     assert [r.workload['load_qualified'] for r in rows] == [True, True, False]
 
 
@@ -548,8 +557,8 @@ async def test_round2_prefix_missing_evidence_is_inconclusive(monkeypatch, locat
             response = await super().handle(request)
             payload = json.loads(request.content)
             prompt = payload['messages'][0]['content']
-            if ((location != 'control' and prompt.startswith(' The rock') and 'Trial 0002' in prompt)
-                    or (location == 'control' and prompt.startswith('Control 0002'))):
+            if ((location != 'control' and prompt.split('\n', 1)[-1].startswith(' The rock') and 'Trial 0002' in prompt)
+                    or (location == 'control' and prompt.split('\n', 1)[-1].startswith('Control 0002'))):
                 data = json.loads(response.content)
                 if location == 'input_usage':
                     data['usage'].pop('prompt_tokens')
@@ -557,8 +566,8 @@ async def test_round2_prefix_missing_evidence_is_inconclusive(monkeypatch, locat
                     data['usage'].pop('prompt_tokens_details')
                 return httpx.Response(200, json=data)
             return response
-    endpoint = Missing(monkeypatch, cached=lambda p, u: 0 if p['messages'][0]['content'].startswith('Control') else u['prompt_tokens'])
-    result = check(await run_suite(config(endpoint, checks=['prefix'], stream=False)), 'prefix')
+    endpoint = Missing(monkeypatch, cached=lambda p, u: 0 if p['messages'][0]['content'].split('\n', 1)[-1].startswith('Control') else u['prompt_tokens'])
+    result = check(await run_suite(config(endpoint, checks=['prefix'], context_limit=16384, stream=False)), 'prefix')
     assert result.status == 'inconclusive'
     assert 'missing' in result.summary.lower()
 
@@ -589,7 +598,8 @@ async def test_round2_fixed_session_plan_counts_admitted_turns_without_saved_ans
         'turns': ['Choose a name.', 'Recall it.', 'Recall it again.', 'Recall it once more.']})
     report = await run_suite(settings)
     assert request_plan(settings)['planned_per_target'] == len(report.requests) == 8
-    assert check(report, 'sessions').status == 'pass'
+    assert check(report, 'sessions').status == 'inconclusive'
+    assert 'conversations were not observed concurrently' in check(report, 'sessions').summary.lower()
     limited = settings.model_copy(update={'context_limit': 256})
     report = await run_suite(limited)
     assert request_plan(limited)['planned_per_target'] == len(report.requests) == 4

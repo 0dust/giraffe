@@ -10,11 +10,13 @@ import asyncio
 import math
 import random
 import time
+from statistics import mean, median
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, TrafficConfig
+from .timing import qualify, qualified_violations
 
 
 def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int = 0):
@@ -28,17 +30,24 @@ def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int =
     for key in classes:
         total += weights[key]
         cumulative.append(total)
+    # Condition Poisson arrivals on N so a seeded draw cannot under-offer a rate.
+    count = (round(rate_rps * traffic.duration_seconds) if traffic.arrival == "poisson"
+             else math.ceil(rate_rps * traffic.duration_seconds))
+    if traffic.arrival == "steady":
+        while count > 0 and (count - 1) / rate_rps >= traffic.duration_seconds:
+            count -= 1
+        while count / rate_rps < traffic.duration_seconds:
+            count += 1
+    overflow = count > MAX_PLANNED_ARRIVALS
+    count = min(count, MAX_PLANNED_ARRIVALS)
+    offsets = (sorted(arrivals.random() * traffic.duration_seconds for _ in range(count))
+               if traffic.arrival == "poisson" else None)
     schedule = []
-    offset = 0.0 if traffic.arrival == "steady" else arrivals.expovariate(rate_rps)
-    while offset < traffic.duration_seconds:
-        if len(schedule) == MAX_PLANNED_ARRIVALS:
-            return schedule, True
+    for index in range(count):
         choice = choices.random() * total
         kind = next(key for key, bound in zip(classes, cumulative, strict=True) if choice < bound)
-        schedule.append((offset, kind))
-        offset = (len(schedule) / rate_rps if traffic.arrival == "steady" else
-                  offset + arrivals.expovariate(rate_rps))
-    return schedule, False
+        schedule.append((index / rate_rps if offsets is None else offsets[index], kind))
+    return schedule, overflow
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -124,6 +133,8 @@ class StageEvidence:
     interrupted: bool
     drain_expired: bool
     case_scorers: tuple[tuple[str, str], ...] | None
+    stalls: tuple[tuple[float, float], ...] = ()
+    arrival: str = "steady"
 
 
 async def run_stage(
@@ -172,6 +183,7 @@ async def run_stage(
     peak = 0
     execution_errors = 0
     discard_through = -1.0
+    stalls: list[tuple[float, float]] = []
     interrupted = overflow
     drain_expired = False
     if overflow:
@@ -195,6 +207,7 @@ async def run_stage(
             # arrivals within the explicit tolerance are legitimate clusters;
             # the next random gap is not a scheduler lateness threshold.
             discard_through = max(discard_through, now - started_at)
+            stalls.append((offset, now - started_at))
         return offset <= discard_through
 
     async def dispatch(index: int, kind: str, offset: float):
@@ -315,7 +328,8 @@ async def run_stage(
         schedule=tuple(schedule), outcomes=tuple(outcomes), records=tuple(records),
         lifetimes=tuple(lifetimes.values()), reasons=tuple(reasons), peak=peak,
         execution_errors=execution_errors, overflow=overflow, interrupted=interrupted,
-        drain_expired=drain_expired, case_scorers=case_scorers,
+        drain_expired=drain_expired, case_scorers=case_scorers, stalls=tuple(stalls),
+        arrival=traffic.arrival,
     )
     result = finalize_stage(evidence, limits)
     if capture_evidence is not None:
@@ -345,7 +359,36 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     )
     answer_failure = (best_possible_correctness is not None
                       and best_possible_correctness < limits.min_correctness)
-    timing_failure = bool(stats["timing_violations"] and not counts["dropped_late"])
+    timing_failure = bool(stats["timing_violations"])
+    if timing_failure and evidence.stalls:
+        # Express records and discarded windows on the same stage-relative clock.
+        timing_records = [record.model_copy(update={
+            "dispatch_ms": schedule[index][0] * 1000 + (record.dispatch_lag_ms or 0),
+            "timing_start_ms": schedule[index][0] * 1000 + (record.dispatch_lag_ms or 0),
+            "scheduled_ms": schedule[index][0] * 1000,
+            "completed_ms": schedule[index][0] * 1000 + (
+                record.arrival_elapsed_ms if record.arrival_elapsed_ms is not None else record.elapsed_ms),
+        }) for index, record in records]
+        health = {"schema_version": 1, "windows": [
+            {"start_ms": low * 1000, "end_ms": high * 1000, "lag_ms": (high-low) * 1000}
+            for low, high in evidence.stalls]}
+        quality = qualify(timing_records, health, 0)
+        for record in timing_records:
+            span = (record.last_output_ms or 0) - (record.first_output_ms or 0)
+            speed = record.generation_tokens_per_second
+            overages = {"latency_ms": (record.arrival_elapsed_ms or 0) - (limits.latency_ms or math.inf),
+                        "first_output_ms": (record.arrival_first_output_ms or 0) - (limits.first_output_ms or math.inf),
+                        "max_stream_gap_ms": (record.max_stream_gap_ms or 0) - (limits.stream_gap_ms or math.inf),
+                        "generation_tokens_per_second": span * (1 - speed / limits.min_output_tokens_per_second)
+                            if speed is not None and limits.min_output_tokens_per_second else 0}
+            for metric, overage in overages.items():
+                # A brief overlapping stall cannot explain a large overage.
+                if overage > 0 and record.id in quality["affected_metrics"][metric] and record.id not in qualify(
+                        [record], health, max(0, overage * .5 - 1e-9), metrics=(metric,))["affected_metrics"][metric]:
+                    quality["affected_metrics"][metric].remove(record.id)
+        timing_failure = any(_timing(record, limits)[0] and qualified_violations(
+            [record], limits if record.stream_gap_applicable else limits.model_copy(update={"stream_gap_ms": None}),
+            quality, arrival=True) for record in timing_records)
     if service_failure:
         reasons.append("Service failures exceeded the error limit.")
     if answer_failure:
@@ -399,7 +442,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         if not all_cases_scored:
             reasons.append("An active unscored case prevents a full-pack correct-capacity claim.")
     failed = service_failure or answer_failure or timing_failure
-    accepted = bool(not failed and fully_offered and enough_samples and latency_configured
+    passed = bool(not failed and fully_offered and enough_samples and latency_configured
                     and not evidence.drain_expired and not stats["missing_timing"]
                     and not stats["unscored_completions"] and not stats["cancelled"]
                     and coverage_complete and all_cases_scored)
@@ -418,10 +461,48 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
             "dropped_late": window_counts["dropped_late"],
             "not_offered": window_counts["not_offered"] + window_counts["dispatching"],
             "pending_at_end": sum(begin <= upper < end for begin, end in evidence.lifetimes),
+            "time_weighted_in_flight": sum(max(0, min(end, upper)-max(begin, lower))
+                                           for begin, end in evidence.lifetimes) / (upper-lower),
             "error_rate": ((window_stats["failed"] + window_stats["timed_out"]) / window_started
                            if window_started else None),
             **window_stats,
         })
+    # Theil-Sen on at most 64 evenly sampled requests bounds pairwise work.
+    # Calibrated: 2,000 seeds, conditioned Poisson, FIFO 0.5 s mean service with
+    # lognormal sigma=.3, 60 s stages. Slope > .08 s/s, rise > .5 * early mean,
+    # end backlog/last-window occupancy > 1.3 * rate * early mean: 99.45/100%
+    # rejected at 120/150% load; 0/.45% flagged at 60/80%. Below 80 Poisson
+    # samples, require slope > .6 to flag growth; slope > .02 with
+    # p90-p10 > max(.25*p10, .01*T) leaves stability unverified instead.
+    # At 10/20 s this rejects >=95% of overload seeds while flagging <=2% of
+    # healthy seeds (see regression).
+    latencies = sorted((schedule[index][0], record.arrival_elapsed_ms / 1000)
+                       for index, record in records if record.valid and record.status == "completed"
+                       and record.arrival_elapsed_ms is not None)
+    queue_growth = stability_unverified = False
+    short_poisson = evidence.arrival == "poisson" and len(latencies) < 80
+    if short_poisson and latencies:
+        values = sorted(value for _, value in latencies)
+        low, high = (values[int(q * (len(values) - 1))] for q in (.1, .9))
+        stability_unverified = high > max(1.25 * low, low + .01 * evidence.duration_seconds)
+    if len(latencies) >= 6:
+        sampled = latencies[::max(1, math.ceil(len(latencies) / 64))]
+        slopes = [(y2-y1) / (x2-x1) for i, (x1, y1) in enumerate(sampled)
+                  for x2, y2 in sampled[i+1:] if x2 > x1]
+        early = [value for offset, value in latencies if offset < evidence.duration_seconds / 5]
+        early_mean = mean(early or [value for _, value in latencies[:max(1, len(latencies) // 5)]])
+        slope = median(slopes) if slopes else 0
+        stability_unverified = stability_unverified and slope > .02
+        queue_growth = bool(slope > (.6 if short_poisson else .08)
+                            and slope * evidence.duration_seconds > .5 * early_mean
+                            and windows[-1]["pending_at_end"]
+                            and max(windows[-1]["pending_at_end"], windows[-1]["time_weighted_in_flight"])
+                                > 1.3 * evidence.rate_rps * early_mean)
+    if queue_growth:
+        reasons.append("Queue grew throughout the stage; rate not sustained.")
+    if stability_unverified:
+        reasons.append("Too few variable-latency Poisson samples to distinguish transient bursts from unsustainable load (need 80).")
+    accepted = passed and not queue_growth and not stability_unverified
     return {
         "stage_index": evidence.stage_index, "rate_rps": evidence.rate_rps,
         "duration_seconds": evidence.duration_seconds,
@@ -439,7 +520,8 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         "good_fraction": stats["good"] / len(schedule) if schedule else None,
         "error_rate": error_rate, "peak_in_flight": evidence.peak,
         "fully_offered": fully_offered, "generator_limited": generator_limited,
-        "drain_expired": evidence.drain_expired, "accepted": accepted,
+        "drain_expired": evidence.drain_expired, "accepted": accepted, "queue_growth": queue_growth,
+        "stability_unverified": stability_unverified,
         "status": "fail" if failed else "pass" if accepted else "inconclusive",
         "reasons": list(dict.fromkeys(reasons)), "windows": windows,
         "planned_mix": dict(Counter(kind for _, kind in schedule)),

@@ -74,12 +74,38 @@ def configured_metrics(limits: Limits, check: str | None = None) -> tuple[str, .
     return tuple(dict.fromkeys(metrics))
 
 
+def exceeded_unfinished(record: RequestRecord, limits: Limits) -> list[str]:
+    """Limits an accepted request that never finished its answer is known to exceed.
+
+    A timed-out (or accepted-then-failed) request without first output waited at
+    least elapsed_ms for it; a timed-out request took at least elapsed_ms.
+    """
+    accepted = (record.status in {"timeout", "failed"} and record.http_status is not None
+                and 200 <= record.http_status < 300)
+    if not accepted:
+        return []
+    metrics = []
+    first = record.first_output_ms if record.first_output_ms is not None else record.elapsed_ms
+    if limits.first_output_ms and first > limits.first_output_ms:
+        metrics.append("first_output_ms")
+    if record.status == "timeout" and limits.latency_ms and record.elapsed_ms > limits.latency_ms:
+        metrics.append("latency_ms")
+    return metrics
+
+
 def qualified_violations(records: list[RequestRecord], limits: Limits, quality: dict,
-                         *, arrival: bool = False) -> list[str]:
-    """A delay in another sample/metric must not hide an independent violation."""
+                         *, arrival: bool = False, unfinished: bool = False) -> list[str]:
+    """A delay in another sample/metric must not hide an independent violation.
+
+    With ``unfinished``, accepted requests that timed out or failed count when
+    they are known to exceed a limit (see exceeded_unfinished).
+    """
     failed = []
     for record in records:
         if not record.valid or record.status != "completed":
+            if unfinished and any(record.id not in quality["affected_metrics"].get(metric, [])
+                                  for metric in exceeded_unfinished(record, limits)):
+                failed.append(record.id)
             continue
         values = (("latency_ms", limits.latency_ms,
                    record.arrival_elapsed_ms if arrival else record.elapsed_ms, False),

@@ -59,11 +59,14 @@ def evaluate_slot_reuse(rows, started_at_ns, cancelled_at_ns, cleanup_seconds, c
     generated = reused["cache"] - first["prompt"]
     if (not control or not control.valid or control.finish_reason != "length"
             or tokens is None or control.requested_max_tokens != tokens
-            or not 0 <= generated < tokens - 1):
+            or generated < 0):
         return None
     delay = (reused["admitted_at_ns"] - cancelled_at_ns) / 1e9
-    return {"status": "pass" if delay <= cleanup_seconds else "inconclusive",
-            "reason": ("The same isolated runner slot admitted the follow-up within the cleanup deadline."
+    full_budget = generated >= tokens - 1
+    return {"status": "fail" if full_budget else "pass" if delay <= cleanup_seconds else "inconclusive",
+            "reason": ("Cancelled request grew its cache to the capped reference length; work was not released early."
+                       if full_budget else
+                       "The same isolated runner slot admitted the follow-up within the cleanup deadline."
                        if delay <= cleanup_seconds else
                        "Slot reuse was late; logs do not identify when the prior request actually terminated."),
             "termination_ms": None, "slot_reuse_ms": delay * 1000,

@@ -61,7 +61,8 @@ def check(report, name):
 @pytest.mark.parametrize("mode", ["fixed", "live"])
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_concurrent_session_history_exact_marker_and_no_cross_contamination(tmp_path, mode, legacy):
-    with FakeEndpoint(first_token_delay=0.02) as endpoint:
+    # Keep answer windows observable when HTTP threads and the client contend for CPU.
+    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
         settings = {"sessions": 2, "concurrency": 2, "modes": [mode], "delay_seconds": 0.01}
         if legacy:
             settings["turns"] = ["Suggest a name for a bakery. Reply with just the name.",
@@ -181,12 +182,14 @@ def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
     lights = [r for r in records if r.scenario.startswith("mixed_short")]
     for index, light in enumerate(lights):
         light.workload = {"pair": index, "observed_overlap": light.overlap}
+        light.timing_start_ms, light.first_output_ms, light.last_output_ms = index * 200, 1, light.elapsed_ms
         light.completion_tokens, light.input_tokens, light.requested_max_tokens = 96, 100, 128
         heavy = light.model_copy(deep=True)
         heavy.id = f"heavy-{index}"
         heavy.scenario = light.scenario.replace("mixed_short", "mixed_heavy")
         heavy.workload.update(heavy_type="long_input")
         heavy.input_tokens = 1000
+        heavy.first_output_ms = 2
         records.append(heavy)
     run = SimpleNamespace(
         config=execution_config(settings),
@@ -276,7 +279,7 @@ def test_workload_timing_uses_core_generator_qualification(lag, warm_first, corr
     assert next(c for c in outcome if c.id == "prefix").status == expected
 
 
-async def test_independent_prefix_controls_use_reproducible_matched_prose():
+async def test_independent_prefix_controls_use_fresh_nonces_and_matched_prose():
     with FakeEndpoint() as endpoint:
         settings = config(endpoint, prefix={"prefix_chars": 256, "repeats": 3, "history_turns": 2})
         report = await run_suite(settings)
@@ -284,7 +287,8 @@ async def test_independent_prefix_controls_use_reproducible_matched_prose():
         endpoint.requests.clear()
         await run_suite(settings)
         second = [p["messages"][0]["content"] for p in endpoint.requests if "Trial" in p["messages"][0]["content"]]
-    assert first == second and len(first) == 6
+    assert len(first) == len(second) == 6 and first != second
+    assert [p.split("\n", 1)[1] for p in first] == [p.split("\n", 1)[1] for p in second]
     comparison = check(report, "prefix").metrics["first_repeat"]
     assert comparison["shared_first"]["attempted"] == 1
     assert comparison["shared_repeats"]["attempted"] == 2
@@ -341,9 +345,9 @@ def test_fenced_arguments_and_truncated_tool_completion_do_not_pass(arguments, f
         ],
     )
     result = score_response(request, record)
-    assert result.score is False
+    assert result.score is (None if finish == "length" else False)
     if finish == "length":
-        assert result.tool_evaluation.protocol.status == "fail"
+        assert result.tool_evaluation.protocol.status == "inconclusive"
         assert "truncated" in result.tool_evaluation.protocol.message
 
 
@@ -353,6 +357,7 @@ async def test_missing_configured_workload_timing_is_inconclusive():
             config(
                 endpoint,
                 stream=False,
+                context_limit=16384,
                 prefix={"repeats": 2},
                 limits={"min_samples": 2, "min_output_tokens_per_second": 1},
             )
@@ -438,7 +443,7 @@ async def test_cancellation_stops_arrival_scheduler_and_saves_partial_evidence()
     "mode", ["healthy", "variable_correct", "wrong", "http_error", "overlap_variation"]
 )
 async def test_consistency_hashes_before_retention_and_separates_task_correctness(tmp_path, mode):
-    with FakeEndpoint(mode=mode, first_token_delay=0.02) as endpoint:
+    with FakeEndpoint(mode=mode, first_token_delay=0.02, chunk_delay=0.006) as endpoint:
         report = await run_suite(
             config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]},
                    retention="none", stop_after_errors=100)
@@ -482,7 +487,8 @@ async def test_strict_consistency_and_insufficient_samples_are_explicit():
 
 @pytest.mark.parametrize("budget", [5, 72])
 async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_budget(budget):
-    with FakeEndpoint(first_token_delay=0.02) as endpoint:
+    # All eight output windows must intersect outside client scheduling delays.
+    with FakeEndpoint(first_token_delay=0.05, chunk_delay=0.05) as endpoint:
         report = await run_suite(config(
             endpoint, checks=["buckets"], concurrency=8, max_requests=budget,
             buckets={"levels": [8], "samples_per_bucket": 2},
@@ -497,7 +503,7 @@ async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_bu
 
 
 async def test_buckets_keep_shape_overlap_lengths_and_eos_coverage_separate():
-    with FakeEndpoint(first_token_delay=0.02, chunk_delay=0.015) as endpoint:
+    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
         report = await run_suite(
             config(endpoint, buckets={"samples_per_bucket": 2, "mixed_pairs": 1})
         )

@@ -6,11 +6,13 @@ import asyncio
 import hashlib
 import random
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
 
-from giraffe.fixtures import final_answer
+from giraffe.fixtures import final_answer, reasoning_budget
 from giraffe.logprob_workload import corpus_width, refill, sample_count
+from giraffe.overlap import NEEDS_STREAM, answer_window, evidenced_overlap, scheduling_delay_windows
 from giraffe.models import INTERNAL_CHECK_NAMES as CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec, ToolExpectation
 from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, resolved_tool_fixtures, resolved_tool_modes
 
@@ -185,6 +187,9 @@ async def arrivals(run, target, client, fixtures):
         await asyncio.gather(*pending, return_exceptions=True)
         records = [r for r in run.records if r.target == target.name and r.scenario == "arrival"]
         observation["issued"] = len(records)
+        # Arrivals have no intentional cancellation: a cancelled one was cut by
+        # the run deadline or a stop and is not evidence that it was served.
+        observation["incomplete"] = sum(r.status == "cancelled" for r in records)
         missing = (
             settings.requests
             - len(records)
@@ -207,23 +212,43 @@ async def arrivals(run, target, client, fixtures):
             else None
         )
         observation["configured_rate_achieved"] = (
-            not observation["unissued"] and not observation["delayed"]
+            not observation["unissued"] and not observation["delayed"] and not observation["incomplete"]
         )
 
 
+def prefix_admitted(input_chars, max_tokens, context_limit):
+    # Filler can use ~3.6 chars/token; reserve extra for the hex nonce and template.
+    return (input_chars + 2) // 3 + 20 + max_tokens + 32 <= context_limit
+
+
 async def prefixes(run, target, client):
+    from giraffe.runner import _context_rejection, _serving_failure
+
+    async def send(request):
+        record = await run.request(target, client, request)
+        if record is not None and _context_rejection(record):
+            # Undo the serving-health charge for our own prompt-sizing failure.
+            if _serving_failure(record, request.scenario):
+                run.errors -= 1
+            record.check_ids = list(request.check_ids)
+            run.unfinished[target.name].add("prefix")
+            run.observations[target.name]["prefix_stop"] = "Generated prompt exceeded the server context length."
+            return None
+        return record
+
     settings = run.config.prefix
-    prefix = (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
+    nonce = uuid.uuid4().hex + "\n"
+    prefix = nonce + (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
     for kind in ("shared", "independent"):
         for index in range(settings.repeats):
-            # Deterministic controls of equal character length; observed token counts stay separate.
+            # Unique initial nonces keep warm-cache controls independent across runs and targets.
             rng = random.Random(index)
             matched = f"Control {index:04d}: " + "".join(
                 f" The {rng.choice(('tree', 'bird', 'boat', 'rock'))} is "
                 f"{rng.choice(('blue', 'gray', 'pink', 'gold'))}."
                 for _ in range(len(prefix) // 18 + 1)
             )
-            matched = matched[:len(prefix)]
+            matched = (uuid.uuid4().hex + "\n" + matched)[:len(prefix)]
             prompt = label_prompt(len(prefix) + 80, prefix if kind == "shared" else matched)
             prompt += f"\nTrial {index:04d}."
             request = spec(
@@ -236,8 +261,12 @@ async def prefixes(run, target, client):
                 order=index,
                 cache_state="first unique use is not proof of empty server cache",
             )
+            if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
+                run.unfinished[target.name].add("prefix")
+                run.observations[target.name]["prefix_stop"] = "Estimated token admission ceiling reached."
+                return
             request.options = deterministic_options(run.config, request.options)
-            if not await run.request(target, client, request):
+            if not await send(request):
                 return
     history = []
     for turn in range(settings.history_turns):
@@ -246,14 +275,14 @@ async def prefixes(run, target, client):
         request = spec(prompt, "prefix_history", "prefix", expected="K7P4", turn=turn, mode="fixed")
         request.messages = messages
         request.input_chars = sum(len(m["content"]) for m in messages)
-        if request.input_chars + request.max_tokens + 32 > run.config.context_limit:
+        if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
             run.unfinished[target.name].add("prefix")
             run.observations[target.name]["prefix_history_stop"] = (
-                "Conservative character admission ceiling reached; no history cropped."
+                "Estimated token admission ceiling reached; no history cropped."
             )
             break
         request.options = deterministic_options(run.config, request.options)
-        if not await run.request(target, client, request):
+        if not await send(request):
             break
         history = [*messages, {"role": "assistant", "content": "K7P4"}]
 
@@ -286,6 +315,30 @@ def bucket_spec(settings, input_shape, output_shape, scenario, check, level, con
         requested_input_chars=chars,
         requested_output_tokens=cap,
     )
+
+
+def pair_evidenced(light, heavy):
+    """Server evidence for a mixed pair; client dispatch timing alone is not evidence.
+
+    active_stream: the heavy request's first output lands strictly inside the light
+    request's output window. before_output: it lands after light dispatch and
+    before the light request's last output.
+    """
+    if light is None or heavy is None or light.target != heavy.target:
+        return False
+    light_window, heavy_window = answer_window(light), answer_window(heavy)
+    if not light_window or not heavy_window:
+        return False
+    if light.workload.get("interference_phase") == "active_stream":
+        return light_window[0] < heavy_window[0] < light_window[1]
+    return light.timing_start_ms < heavy_window[0] < light_window[1]
+
+
+def _mark_pair(light, heavy):
+    evidenced = pair_evidenced(light, heavy)
+    for row in (light, heavy):
+        if row is not None:
+            row.workload["observed_overlap"] = 2 if evidenced else 1
 
 
 async def buckets(run, target, client):
@@ -353,10 +406,7 @@ async def buckets(run, target, client):
                             light.workload["heavy_active_at_dispatch"] = not first.done()
                         light_row = await run.request(target, client, light, on_start=light_started)
                         heavy_row = await first
-                        if light_row is not None:
-                            light_row.workload["observed_overlap"] = 2 if light.workload["heavy_active_at_dispatch"] else 1
-                        if heavy_row is not None:
-                            heavy_row.workload["observed_overlap"] = 2 if light.workload["heavy_active_at_dispatch"] else 1
+                        _mark_pair(light_row, heavy_row)
                     finally:
                         waiter.cancel()
                         if not first.done():
@@ -371,11 +421,8 @@ async def buckets(run, target, client):
                         def heavy_started():
                             heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
                         heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
-                        if heavy_row is not None:
-                            heavy_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
                         light_row = await first
-                        if light_row is not None:
-                            light_row.workload["observed_overlap"] = 2 if heavy.workload.get("short_stream_active_at_dispatch") else 1
+                        _mark_pair(light_row, heavy_row)
                     finally:
                         waiter.cancel()
                         if not first.done():
@@ -450,6 +497,10 @@ async def sessions(run, target, client):
                 run.unfinished[target.name].add("sessions")
                 break
             item["turns"].append(record.id)
+            if reasoning_budget(record):
+                item["stop_reason"] = "reasoning exhausted the output budget before an answer; session recall unverified"
+                run.unfinished[target.name].add("sessions")
+                break
             if (
                 not record.valid
                 or record.status != "completed"
@@ -663,7 +714,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     if status != "fail":
                         status, summary = (
                             "inconclusive",
-                            "Repetition/load coverage lacks sufficient samples or observed overlap.",
+                            "Repetition/load coverage lacks sufficient samples or server-evidenced overlap (overlapping streamed output).",
                         )
             if check == "buckets":
                 level = items[0].workload["level"]
@@ -694,8 +745,13 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 entry["qualified_samples"] = sum(r.valid and r.status == "completed"
                                                   and r.workload.get("load_qualified", False) for r in items)
                 entry["tail_samples"] = [r.id for r in items if not r.workload.get("load_qualified", False)]
-                entry["time_weighted_inflight"] = items[0].workload.get("cell_time_weighted_inflight")
+                entry["client_time_weighted_inflight"] = items[0].workload.get("cell_client_time_weighted_inflight")
+                entry["evidenced_concurrency"] = items[0].workload.get("cell_evidenced_concurrency")
+                entry["evidenced_overlap"] = max((r.workload.get("evidenced_overlap", 0) for r in items), default=0)
                 gaps = []
+                if level > 1 and (entry["evidenced_concurrency"] or 0) < level:
+                    gaps.append(f"Requested concurrency {level} was not evidenced by overlapping server output"
+                                + ("" if any(r.stream for r in items) else f"; {NEEDS_STREAM}") + ".")
                 entry["expected_samples"] = sample_count(run.config.buckets.samples_per_bucket, level)
                 if len(items) < entry["expected_samples"] or entry["completed"] < minimum:
                     gaps.append("Insufficient requested or successful samples.")
@@ -713,7 +769,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             "inconclusive",
                             ("input length not exercised; see per-cell coverage gaps."
                              if entry["input_length_verified"] < minimum else
-                             "Some length/load cells lack sufficient samples, achieved overlap or observed lengths; see per-cell coverage gaps."),
+                             "Some length/load cells lack sufficient samples, server-evidenced overlap or observed lengths; see per-cell coverage gaps."),
                         )
             if check == "prefix":
                 entry["cache_observations"] = [
@@ -732,7 +788,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             shared = [r for r in records if r.scenario == "prefix_shared"]
             independent = [r for r in records if r.scenario == "prefix_independent"]
             first, repeat = stats(shared[:1]), stats(shared[1:])
-            observed = [r for r in shared[1:] if r.valid and r.status == "completed"
+            observed = [r for r in shared[1:] if (r.valid and r.status == "completed" or reasoning_budget(r))
                         and r.cached_prompt_tokens is not None and r.input_tokens]
             def reused(r):
                 prefix_fraction = r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
@@ -741,7 +797,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             and r.cached_prompt_tokens >= threshold)
 
             verified = [r for r in observed if reused(r)]
-            controls = [r for r in independent if r.valid and r.status == "completed"
+            controls = [r for r in independent if (r.valid and r.status == "completed" or reasoning_budget(r))
                         and r.cached_prompt_tokens is not None and r.input_tokens]
             misses = len(observed) - len(verified)
             metrics["cache_reuse_samples"] = len(verified)
@@ -754,7 +810,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             elif len(controls) < minimum or len(controls) != run.config.prefix.repeats:
                 status, summary = "inconclusive", "cache reuse unverified: missing independent-control cache evidence; " + counts
             elif misses > (run.config.prefix.repeats - 1) / 2:
-                status, summary = "fail", "no prefix reuse observed on a majority of repeats; " + counts
+                prefix_tokens = [r.input_tokens * r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
+                                 for r in observed]
+                if prefix_tokens and max(prefix_tokens) < 512:
+                    status, summary = "inconclusive", "Prefix is estimated below 512 tokens; cache misses do not establish failed reuse; " + counts
+                else:
+                    status, summary = "fail", "no prefix reuse observed on a majority of repeats; " + counts
             elif len(observed) < run.config.prefix.repeats - 1:
                 status, summary = "inconclusive", "cache reuse unverified: missing repeated cache/token evidence; " + counts
             elif len(verified) < minimum:
@@ -774,11 +835,15 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             }
         if check == "arrivals":
             metrics["schedule"] = run.observations[target.name].get("arrivals", {})
-            if metrics["schedule"].get("unissued") or metrics["schedule"].get("delayed"):
+            if (metrics["schedule"].get("unissued") or metrics["schedule"].get("delayed")
+                    or metrics["schedule"].get("incomplete")):
                 status, summary = (
                     "inconclusive",
-                    "Scheduled traffic was delayed or unissued; configured arrival rate is not established.",
+                    "Scheduled traffic was delayed, unissued or cancelled before completion; "
+                    "configured arrival rate is not established.",
                 )
+            elif not configured_metrics(config.limits, check):
+                status, summary = "inconclusive", "Arrivals observed; no acceptance limit configured."
         if check == "sessions":
             metrics["sessions"] = run.observations[target.name].get("sessions")
             from .session_metrics import performance
@@ -798,6 +863,18 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             metrics["completed_sessions_per_mode"] = completed_sessions
             if any(count < minimum for count in completed_sessions.values()) and status != "fail":
                 status, summary = "inconclusive", "Insufficient completed independent sessions per mode."
+            metrics["configured_session_concurrency"] = run.config.sessions.concurrency
+            delays = scheduling_delay_windows(run)
+            metrics["evidenced_session_overlap"] = max((evidenced_overlap(r, [other for other in records
+                if other is r or other.workload.get("session_id") != r.workload.get("session_id")], delays)
+                for r in records), default=0)
+            metrics["conversation_performance"]["evidenced_overlap"] = metrics["evidenced_session_overlap"]
+            if status != "fail" and (run.config.sessions.concurrency < 2 or metrics["evidenced_session_overlap"] < 2):
+                status, summary = "inconclusive", (
+                    "Conversations were not observed concurrently: "
+                    + ("session concurrency is below two." if run.config.sessions.concurrency < 2 else
+                       "no session turn's output overlapped another conversation's output; "
+                       + (NEEDS_STREAM if not any(r.stream for r in records) else "client overlap alone does not show server concurrency") + "."))
         if check == "mixed":
             controls = [r for r in records if r.scenario == "mixed_control" and r.score is True
                         and r.completion_tokens is not None and r.completion_tokens >= 64]
@@ -824,13 +901,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                         if r.workload.get("heavy_type") == "long_output" else
                         r.input_tokens is not None and light.input_tokens is not None
                         and r.input_tokens >= max(light.input_tokens * 2, light.input_tokens + 128)
-                    ) and r.workload.get("observed_overlap", 0) >= 2 for r in matches)
-                    if light.workload.get("interference_phase") == "active_stream":
-                        exercised = exercised and any(light.last_output_ms is not None
-                            and light.dispatch_ms is not None and r.dispatch_ms is not None
-                            and light.dispatch_ms + light.last_output_ms > r.dispatch_ms for r in matches)
+                    ) and pair_evidenced(light, r) for r in matches)
                     if (exercised and light.valid and light.status == "completed" and light.score is True
-                            and light.workload.get("observed_overlap", 0) >= 2
                             and light.completion_tokens is not None and light.completion_tokens >= 64):
                         shape_qualified.append(light)
                 observed = row["achieved_overlap"] >= 2
@@ -857,7 +929,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 if not qualified and status != "fail":
                     status, summary = (
                         "inconclusive",
-                        "Mixed-load comparison lacks sufficient samples, observed overlap or exercised light/heavy shapes.",
+                        "Mixed-load comparison lacks sufficient samples, server-evidenced overlap or exercised light/heavy shapes.",
                     )
                 if (
                     qualified
@@ -926,7 +998,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 else "rejected or unverified; see request outcomes"
             )
             if any(not is_discovery_rejection(r) and
-                   (r.score is False or not r.valid or r.status != "completed") for r in auto) or any(
+                   (r.score is False or (not r.valid or r.status != "completed") and not reasoning_budget(r)) for r in auto) or any(
                        session["status"] == "fail" for session in conversations):
                 status, summary = (
                     "fail",
@@ -972,19 +1044,36 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             from giraffe.logprob_workload import summarize_logprobs
             metrics["logprobs"] = summarize_logprobs(records, run.config.consistency, min_samples=minimum)
             probability_status = metrics["logprobs"]["status"]
+            reasons = list(dict.fromkeys(reason for row in metrics["logprobs"]["conditions"] for reason in row["coverage_reasons"]))
             if probability_status == "fail" or (probability_status == "inconclusive" and status == "pass"):
                 status, summary = probability_status, "Token probability consistency or capability expectation is not satisfied; see independent probability outcomes."
             elif status == "pass":
                 summary = "Token probability comparison completed (" + probability_status + "); answer correctness is separate."
+            if probability_status == "inconclusive" and status != "fail" and reasons:
+                summary += " " + " ".join(reason[:1].upper() + reason[1:].rstrip(".") + "." for reason in reasons)
         assessed_stats = stats(assessed)
-        if check != "tools" and assessed_stats["completed"] < minimum and status != "fail":
+        from giraffe.runner import _context_rejection
+        prefix_rejected = [r for r in assessed if check == "prefix" and _context_rejection(r)]
+        prefix_rejected_ids = {r.id for r in prefix_rejected}
+        if check == "prefix":
+            metrics["context_rejections"] = len(prefix_rejected)
+        budget_records = [r for r in assessed if check in {"prefix", "sessions", "tools"} and reasoning_budget(r)]
+        if check in {"prefix", "sessions", "tools"}:
+            metrics["reasoning_budget_unscored"] = len(budget_records)
+        successful = assessed_stats["completed"] + (len(budget_records) if check == "prefix" else 0)
+        if check != "tools" and successful < minimum and status != "fail":
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
         errors = stats([r for r in assessed if not (
             (check == "consistency" and r.logprob_evidence and
              r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
              run.config.consistency.logprobs.support == "discover")
             or (r.tool_conversation and r.tool_conversation["status"] == "inconclusive")
+            or (check in {"prefix", "sessions", "tools"} and reasoning_budget(r))
+            or r.id in prefix_rejected_ids
         )])["error_rate"]
+        if budget_records or prefix_rejected:
+            metrics["failed"] -= stats(budget_records + prefix_rejected)["failed"]
+            metrics["error_rate"] = errors
         cap_violations = [
             r.id
             for r in assessed
@@ -1042,6 +1131,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 "inconclusive",
                 "Requested workload coverage unfinished within shared budgets.",
             )
+        if prefix_rejected and status != "fail":
+            status, summary = "inconclusive", "Server rejected a Giraffe-built prefix prompt for context length; token admission estimate did not fit."
         if check == "consistency" and run.config.consistency.logprobs:
             probability = metrics["logprobs"]
             if not probability["strict"] and any(
@@ -1057,7 +1148,11 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if check == "consistency" and (correctness := metrics.get("correctness_observed")) is not None and correctness < 1:
             summary += f" correctness_observed: {correctness}."
         if check == "sessions" and status == "pass" and config.sessions.profile == "performance":
-            summary = "Concurrent conversation performance met configured limits. Answer quality was not assessed; capped replies are reported separately."
+            summary = ("Concurrent conversation performance met configured limits." if any(value is not None for value in (
+                config.limits.first_output_ms, config.limits.latency_ms, config.limits.stream_gap_ms,
+                config.limits.min_output_tokens_per_second)) else
+                "Concurrent conversations completed; performance was measured but no timing limits are configured.") + (
+                " Answer quality was not assessed; capped replies are reported separately.")
         result.append(
             CheckResult(
                 id=check,

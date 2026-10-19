@@ -48,7 +48,7 @@ class LoadClient:
             http_status=200, output=output, output_chars=len(output),
             input_chars=spec.input_chars, input_tokens=max(1, spec.input_chars//4),
             output_tokens=max(1, len(output.split())), elapsed_ms=reported_elapsed,
-            first_output_ms=first, last_output_ms=last, answer_chunks=2, chunks=2,
+            first_output_ms=first, last_output_ms=last, answer_chunks=2, answer_reads=2, chunks=2,
             max_stream_gap_ms=max(.1, last-first), stream=spec.stream,
             stream_terminated=True, finish_reason="stop", requested_max_tokens=spec.max_tokens,
         )
@@ -99,7 +99,7 @@ async def test_fairness_compares_decode_duration_without_first_output_wait(
             return baseline_first, baseline_first+baseline_decode, baseline_first+baseline_decode+1
         if spec.scenario == "fairness_short":
             return loaded_first, loaded_first+loaded_decode, loaded_first+loaded_decode+1
-        return 1, elapsed-1, elapsed
+        return loaded_first+1, loaded_first+2, loaded_first+3
     monkeypatch.setattr(endpoint, "timing", staticmethod(timing))
     report = await runner.run_suite(config(checks=["fairness"],
         limits=Limits(fairness_max_ratio=2, min_samples=2)))
@@ -147,7 +147,8 @@ async def test_recovery_ratio_compares_same_fixture_before_and_after_load(endpoi
 
 
 async def test_recovery_without_timing_acceptance_limit_is_inconclusive(endpoint):
-    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.045))
+    # Amortize worker startup/refill delays so occupancy is not the inconclusive reason.
+    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.25))
     result = check(report, "recovery")
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["correct"] == 2
@@ -225,8 +226,9 @@ async def test_recovery_consumed_allowance_can_qualify_before_duration(endpoint)
         sustained_seconds=10, limits=Limits(recovery_max_ratio=10, min_samples=2)))
     result = check(report, 'recovery')
     assert result.status == 'pass'
-    assert result.metrics['sustained_budget']['allowance'] == 36
-    assert result.metrics['sustained']['attempted'] == 36
+    assert result.metrics['sustained_budget']['allowance'] == 35
+    assert result.metrics['sustained']['attempted'] == 35
+    assert len([r for r in report.requests if r.scenario == 'recovery_prime']) == 1
     assert result.metrics['sustained_completion']['reason'] == 'allowance consumed with sustained concurrency'
     assert result.metrics['sustained_completion']['time_weighted_in_flight'] >= 1.8
 
@@ -280,7 +282,7 @@ async def test_matched_ratio_qualifies_client_delay_in_both_controls_and_probes(
     limits = Limits(min_samples=2, **{
         'recovery_max_ratio' if check_id == 'recovery' else 'fairness_max_ratio': 100,
     })
-    report = await runner.run_suite(config(checks=[check_id], limits=limits))
+    report = await runner.run_suite(config(checks=[check_id], sustained_seconds=.25, limits=limits))
     outcome = check(report, check_id)
     assert outcome.status == expected
     assert outcome.metrics['timing_quality']['status'] == (

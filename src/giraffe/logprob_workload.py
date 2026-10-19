@@ -5,6 +5,10 @@ import time
 from itertools import combinations
 
 from giraffe.logprobs import compare_samples, comparison_status
+from giraffe.overlap import NEEDS_STREAM, evidenced_overlap, peak_evidenced_concurrency, scheduling_delay_windows
+
+# Few near-certain tokens say nothing about probability consistency.
+MIN_COMPARED_POSITIONS = 32
 
 
 def sample_count(count, level):
@@ -59,17 +63,23 @@ async def refill(run, target, client, specs, count, level, *, end=None):
                 duration = (evidence['ended'] - evidence['started']
                             if evidence['started'] is not None and evidence['ended'] is not None else 0)
                 overlap = (area - evidence['start_area']) / duration if duration > 0 else 0
-                record.workload.update(observed_overlap=evidence['peak'],
-                                       time_weighted_inflight=overlap,
-                                       load_qualified=level == 1 or overlap >= level - .5)
+                # Client in-flight counts only show dispatch; a serial server queues them.
+                record.workload.update(client_peak_inflight=evidence['peak'],
+                                       client_time_weighted_inflight=overlap)
                 records.append(record)
             else:
                 break
 
     await asyncio.gather(*(worker() for _ in range(min(level, count))))
     average = area / (last - begin) if begin is not None and last > begin else 0
+    delays = scheduling_delay_windows(run)
+    peak = peak_evidenced_concurrency(records, delays)
     for record in records:
-        record.workload['cell_time_weighted_inflight'] = average
+        evidenced = evidenced_overlap(record, getattr(run, 'records', records), delays)
+        record.workload.update(cell_client_time_weighted_inflight=average, cell_evidenced_concurrency=peak,
+                               evidenced_overlap=evidenced, observed_overlap=min(evidenced, peak),
+                               load_qualified=level == 1 or (record.workload['client_time_weighted_inflight'] >= level - .5
+                                                             and evidenced >= 2 and peak >= level))
     if len(records) < count:
         run.unfinished[target.name].update(check for spec in specs for check in spec.check_ids)
     return records
@@ -79,12 +89,29 @@ def corpus_width(settings):
     return max(settings.levels)
 
 
+def logprob_fixtures(config, fixtures):
+    """Non-repetitive copy passage (>= 64 tokens) so token comparisons cover many positions."""
+    from giraffe.workloads import COPY_PASSAGES, label_context, spec
+    answer = COPY_PASSAGES[0]
+    result = {}
+    for shape in ('short', 'long'):
+        context = ''
+        if shape == 'long':
+            context = label_context(max(64, (config.context_limit - 256) * 2)) + '\nThe background above is context only.\n'
+        base = fixtures[shape][0]
+        result[shape] = spec(context + f'Copy the following text exactly, with no extra text:\n{answer}',
+                             base.scenario, 'consistency', expected=answer,
+                             max_tokens=min(192, config.max_output_tokens), options=dict(base.options))
+    return result
+
+
 async def run_logprob_consistency(run, target, client, fixtures):
     from giraffe.workloads import consistency_options
 
     settings = run.config.consistency
     options = settings.logprobs
     width = corpus_width(settings)
+    templates = logprob_fixtures(run.config, fixtures)
     for shape in settings.shapes:
         for level in dict.fromkeys([1, *settings.levels]):
             scenario = f'consistency_c{level}_{shape}'
@@ -95,7 +122,7 @@ async def run_logprob_consistency(run, target, client, fixtures):
                         return
                     specs = []
                     for slot in range(width):
-                        spec = fixtures[shape][0].model_copy(deep=True)
+                        spec = templates[shape].model_copy(deep=True)
                         spec.fixture_id = f'logprob_{shape}_{slot}'
                         spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], False
                         spec.options = consistency_options(run.config, spec.options)
@@ -131,20 +158,35 @@ def summarize_logprobs(records, settings, *, min_samples=2):
                        'completed': sum(r.valid and r.status == 'completed' for r in batch),
                        'achieved_overlap': max((r.workload.get('observed_overlap', 0) for r in batch), default=0),
                        'qualified_samples': sum(r.workload.get('load_qualified', False) for r in batch),
-                       'time_weighted_inflight': batch[0].workload.get('cell_time_weighted_inflight') if batch else None,
+                       'client_time_weighted_inflight': batch[0].workload.get('cell_client_time_weighted_inflight') if batch else None,
+                       'evidenced_concurrency': batch[0].workload.get('cell_evidenced_concurrency') if batch else None,
+                       'evidenced_overlap': max((r.workload.get('evidenced_overlap', 0) for r in batch), default=0),
                        'tail_samples': [r.id for r in batch if not r.workload.get('load_qualified', False)]}
                       for repeat in range(settings.repetitions)]
-            available = [r for r in samples if usable(r) and r.workload.get('load_qualified', False)]
+            available = [r for r in samples if usable(r) and r.workload.get('load_qualified', False)
+                         and (level == 1 or r.stream)]
             comparison = compare_samples(available, prefix_cache=prefix_cache)
             complete = (len(observed) == planned and set(observed) == expected
                         and len(priming) == width * options.priming_rounds
                         and all(usable(r) and r.logprob_evidence.status == 'available' for r in cohort)
-                        and len(available) >= min_samples)
+                        and len(available) >= min_samples
+                        and comparison['compared_positions'] >= MIN_COMPARED_POSITIONS)
             status = comparison_status(comparison, options, complete)
+            reasons = []
+            truncated = sorted({r.requested_max_tokens for r in cohort if r.finish_reason == 'length'})
+            if truncated:
+                reasons.append(f"The output budget ({', '.join(map(str, truncated))} tokens) was exhausted before the complete logprob passage; raise max_output_tokens.")
+            if level > 1 and len(available) < min_samples:
+                reasons.append(NEEDS_STREAM if not any(r.stream for r in samples) else
+                               'Requested concurrency was not evidenced by overlapping server output.')
+            if comparison['compared_positions'] < MIN_COMPARED_POSITIONS:
+                reasons.append(f"Fewer than {MIN_COMPARED_POSITIONS} token positions were compared.")
+                status = 'inconclusive' if status in {'pass', 'diagnostic'} else status
             if options.support == 'required' and any(r.logprob_evidence and
                     r.logprob_evidence.status in {'missing', 'rejected'} for r in cohort):
                 status = 'fail'
             conditions.append({'shape': shape, 'level': level, 'status': status, 'coverage_complete': complete,
+                'coverage_reasons': reasons,
                 'planned_requests': planned, 'issued_requests': len(samples),
                 'completed_requests': sum(r.status == 'completed' and r.valid for r in samples),
                 'missing_requests': max(0, planned - len(samples)), 'usable_samples': len(available),
@@ -164,8 +206,11 @@ def summarize_logprobs(records, settings, *, min_samples=2):
                 samples = [r for r in measured if r.workload['input_bucket'] == shape and r.workload['level'] in {left, right} and usable(r) and r.workload.get('load_qualified', False)]
                 comparison = compare_samples(samples, cross=True, prefix_cache=prefix_cache)
                 complete = all(c['coverage_complete'] for c in conditions if c['shape'] == shape and c['level'] in {left, right})
+                cross_status = comparison_status(comparison, options, complete)
+                if comparison['compared_positions'] < MIN_COMPARED_POSITIONS and cross_status in {'pass', 'diagnostic'}:
+                    cross_status = 'inconclusive'
                 cross_conditions.append({'shape': shape, 'levels': [left, right],
-                    'status': comparison_status(comparison, options, complete), **comparison})
+                    'status': cross_status, **comparison})
     statuses = [item['status'] for item in conditions + cross_conditions]
     status = 'fail' if 'fail' in statuses else 'inconclusive' if 'inconclusive' in statuses else 'pass' if options.strict else 'diagnostic'
     deltas = [c['max_absolute_delta'] for c in cross_conditions if c['max_absolute_delta'] is not None]

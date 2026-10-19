@@ -19,6 +19,7 @@ async def test_client_cancellation_waits_for_answer_chunks_not_ttft_timer(client
         record = await original(self, spec, **kwargs)
         if spec.scenario == "client_cancel":
             record.first_output_ms = 500
+            record.client_cancelled_ms = record.elapsed_ms = 501
         return record
     monkeypatch.setattr(client, "execute", delayed)
     report = await runner.run_suite(config(checks=["cancellation"]))
@@ -72,6 +73,7 @@ async def test_output_cap_length_finish_is_evidence_and_must_match_usage(
         record = await original(self, spec, **kwargs)
         if spec.fixture_id.startswith("limits.output_cap"):
             record.output_tokens, record.completion_tokens, record.finish_reason = usage, usage, finish
+            record.output = "1 2 3 4"  # Compliant short output; without usage it bounds the token count.
         return record
     monkeypatch.setattr(client, "execute", capped)
     report = await runner.run_suite(config(checks=["cancellation"]))

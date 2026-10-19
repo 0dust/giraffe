@@ -227,7 +227,8 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
                 return RequestRecord(id=spec.fixture_id, fixture_id=spec.fixture_id, scenario=spec.scenario,
                     check_ids=spec.check_ids, target="local", started_at=datetime.now(timezone.utc).isoformat(),
                     status=status, valid=status == "completed", output=output, output_tokens=1,
-                    first_output_ms=1, answer_chunks=spec.cancel_after_chunks or 1,
+                    first_output_ms=1, elapsed_ms=2, client_cancelled_ms=2 if status == "cancelled" else None,
+                    answer_chunks=spec.cancel_after_chunks or 1,
                     finish_reason=None if status == "cancelled" else "stop",
                     client_cancelled_at_ns=time.time_ns() if spec.scenario == "client_cancel" else None)
             now = time.time_ns()
@@ -273,7 +274,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
     monkeypatch.setattr(runner, "LLMClient", Client)
     config = RunConfig(targets=[Target(name="local", url="http://localhost", model="tiny",
                                      metrics_profile="sglang")], checks=["cancellation"],
-                       max_requests=7 if mode in {"budget", "late_budget"} else 20, max_duration_seconds=2,
+                       max_requests=8 if mode in {"budget", "late_budget"} else 20, max_duration_seconds=2,
                        test_options={"cancellation": {"backend_verification": "required", "samples": 1, "trace_file": str(path),
                            "cleanup_seconds": .001 if mode in {"late", "late_budget"} else 1, "trace_wait_seconds": .02}})
     report = await runner.run_suite(config)

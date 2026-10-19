@@ -73,6 +73,7 @@ async def test_configured_concurrency_without_observed_overlap_is_inconclusive(c
         record = await original(self, *args, **kwargs)
         if record:
             record.overlap = 1
+            record.timing_start_ms = None
         return record
     monkeypatch.setattr(runner._Run, "request", serial_evidence)
     report = await runner.run_suite(config(checks=[check_id]))
@@ -99,4 +100,4 @@ async def test_serial_wrong_scores_do_not_claim_concurrent_failure(client, monke
     report = await runner.run_suite(config(checks=[check_id]))
     result = check(report, check_id)
     assert result.metrics["accuracy"] == 0
-    assert result.status == "inconclusive" and "not exercised concurrently" in result.summary
+    assert result.status == "fail" and "scoring failed" in result.summary

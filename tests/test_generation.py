@@ -12,7 +12,8 @@ def record(**changes):
         "scenario": "capacity_c1_long", "check_ids": ["generation", "capacity"],
         "started_at": "2026-10-04T00:00:00Z", "status": "completed", "valid": True,
         "first_output_ms": 39000, "last_output_ms": 39250, "elapsed_ms": 45000,
-        "output_tokens": 4, "answer_chunks": 4, "stream": True, **changes,
+        "output_tokens": 4, "answer_chunks": 4, "answer_reads": 4,
+        "answer_chars": 4, "first_read_answer_chars": 1, "stream": True, **changes,
     })
 
 
@@ -36,7 +37,7 @@ def test_slow_decoding_still_fails_and_total_latency_remains_independent():
 
 @pytest.mark.parametrize("changes", [
     {"output_tokens": None}, {"output_tokens": 0}, {"output_tokens": 1},
-    {"stream": False}, {"answer_chunks": 1}, {"answer_chunks": 0},
+    {"stream": False}, {"answer_reads": 1}, {"answer_reads": 0},
     {"first_output_ms": None}, {"last_output_ms": None},
     {"last_output_ms": 39000}, {"last_output_ms": 38000},
     {"valid": False}, {"status": "timeout"},
@@ -53,7 +54,7 @@ def test_unobservable_or_incomplete_generation_is_not_reported_as_a_rate(changes
 def test_single_token_answers_do_not_hide_or_invalidate_measured_multi_token_answers():
     limits = Limits(min_output_tokens_per_second=1)
     assert not _missing_timing([record(), record(output_tokens=1)], limits)
-    assert _missing_timing([record(), record(answer_chunks=1)], limits)
+    assert _missing_timing([record(), record(answer_reads=1)], limits)
 
 
 def test_legacy_records_do_not_get_reconstructed_generation_timings():

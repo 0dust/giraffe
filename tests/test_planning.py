@@ -38,8 +38,8 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     ("generation", {"test_options": {"generation": {"samples": 3}}}, 3),
     ("correctness", {"test_options": {"correctness": {"samples": 1}}}, 3),
     ("json", {}, 6),
-    ("cancellation", {}, 15),
-    ("recovery", {"sustained_seconds": 0}, 12),
+    ("cancellation", {}, 16),
+    ("recovery", {"sustained_seconds": 0}, 13),
     ("gpu", {}, 0),
     ("arrivals", {}, 8),
     ("prefix", {}, 15),
@@ -163,15 +163,15 @@ def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
                for warning in plan(configuration)["warnings"])
 
 
-def test_poisson_rates_are_labeled_expected_estimates_without_building_schedules(monkeypatch):
+def test_poisson_rates_have_exact_counts_without_building_schedules(monkeypatch):
     monkeypatch.setattr("giraffe.traffic.arrival_schedule", lambda *a, **k: pytest.fail("Built schedule"))
     result = plan(config(checks=["access", "capacity"], traffic={
         "rates": [1, 3], "duration_seconds": 2.5, "arrival": "poisson"}))
-    assert result["count_kind"] == "estimate"
+    assert result["count_kind"] == "exact"
     assert result["planned_per_target"] == 11
-    assert result["known_per_target"] == 1
-    assert result["required_request_limit"] is None
-    assert "expected" in next(row for row in result["rows"] if row["id"] == "capacity")["summary"]
+    assert result["known_per_target"] == 11
+    assert result["required_request_limit"] == 11
+    assert "Starts 10 requests" in next(row for row in result["rows"] if row["id"] == "capacity")["summary"]
 
 
 def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
@@ -187,7 +187,7 @@ def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
 
 
 @pytest.mark.parametrize("updates,known", [
-    ({"checks": ["access", "recovery"]}, 13),
+    ({"checks": ["access", "recovery"]}, 14),
     ({"checks": ["access", "context"]}, 7),
     ({"checks": ["access"], "restart_target": "local"}, 1),
     ({"checks": ["access", "correctness"], "custom_fixtures": "/unread/questions.json"}, 1),
@@ -323,7 +323,7 @@ async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch
                  'correctness': [f'correctness_c{configured.concurrency}'],
                  'json': [f'json_c{configured.concurrency}'],
                  'capacity': [name for name in counts if name.startswith('traffic_stage_')],
-                 'cancellation': ['limits', 'client_cancel', 'client_deadline', 'cancellation_probe'],
+                 'cancellation': ['limits', 'cancellation_baseline', 'client_cancel', 'client_deadline', 'cancellation_probe'],
                  'limits.stop_control': ['stop_control'],
                  'buckets': [name for name in counts if name.startswith('bucket_c')],
                  'mixed': [name for name in counts if name.startswith('mixed_') and name != 'mixed_control']}

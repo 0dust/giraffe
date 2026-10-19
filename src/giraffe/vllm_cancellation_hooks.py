@@ -31,6 +31,9 @@ class CancellationScheduler(Scheduler):
                "model": model, "finish_reasons": [reason],
                "started_at_ns": int(request.arrival_time * 1e9),
                "finished_at_ns": ended, "received_at_ns": time.time_ns()}
+        tokens = getattr(request, "num_output_tokens", None)
+        if type(tokens) is int and tokens >= 0:
+            row["completion_tokens"] = tokens
         data = json.dumps(row).encode() + b"\n"
         # Observability must never prevent the runtime from freeing a request.
         try:

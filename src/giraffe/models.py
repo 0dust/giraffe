@@ -1215,6 +1215,10 @@ class EvaluationEvidence(Model):
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
 
+# Coarse bursts cannot establish a reliable answer-token generation rate.
+MAX_TOKENS_PER_READ = 16
+
+
 class RequestRecord(Model):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
@@ -1229,14 +1233,21 @@ class RequestRecord(Model):
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
     client_cancelled_monotonic_ns: int | None = None
+    client_cancelled_ms: float | None = None
     elapsed_ms: float = 0
+    stream_end_ms: float | None = None
     first_output_ms: float | None = None
     last_output_ms: float | None = None
     answer_chunks: int = 0
+    generation_chunks: int = 0
+    answer_reads: int = 0
+    answer_chars: int = 0
+    first_read_answer_chars: int = 0
     first_reasoning_ms: float | None = None
     max_stream_gap_ms: float | None = None
     completion_tokens: int | None = None
     output_tokens: int | None = None
+    reasoning_tokens: int | None = None
     input_tokens: int | None = None
     output_chars: int = 0
     output: str = ""
@@ -1289,22 +1300,44 @@ class RequestRecord(Model):
 
     @property
     def stream_gap_applicable(self) -> bool:
-        return not (self.stream and self.answer_chunks == 1 and self.completion_tokens in (1, 2))
+        return not (self.stream and self.answer_reads <= 1 and self.completion_tokens in (1, 2))
+
+    @property
+    def first_read_tokens(self) -> float | None:
+        chars = self.answer_chars or (self.output_chars if not self.reasoning_stripped else 0)
+        if self.output_tokens is None or chars <= 0 or self.first_read_answer_chars <= 0:
+            return None
+        return max(1.0, self.output_tokens * self.first_read_answer_chars / chars)
+
+    @property
+    def measured_stream_gap(self) -> bool:
+        first = self.first_read_tokens
+        return (self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
+                and first is not None and first <= MAX_TOKENS_PER_READ)
 
     @property
     def generation_tokens_per_second(self) -> float | None:
-        """Client-observed estimate; streamed chunks are not individual tokens.
+        """Client-observed estimate; streamed reads are not individual tokens.
 
-        Exclude the first token and time before the first useful answer. Waiting
-        for usage, finish markers or stream cleanup must not slow generation.
-        Legacy records and single-chunk/non-streamed answers lack this evidence.
+        Exclude tokens in the first answer read and time before it. Waiting for
+        usage, finish markers or stream cleanup must not slow generation.
+        Single-read, non-streamed, buffered (> MAX_TOKENS_PER_READ per read) or
+        reasoning answers without a reported reasoning token count lack this evidence.
         """
+        reads = self.answer_reads
         if (not self.valid or self.status != "completed" or not self.stream
                 or self.output_tokens is None or self.output_tokens <= 1
-                or self.answer_chunks < 2 or self.first_output_ms is None
-                or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms):
+                or reads < 2 or self.first_output_ms is None
+                or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms
+                or ((self.reasoning_stripped or self.reasoning.strip()) and not self.reasoning_tokens)):
             return None
-        return (self.output_tokens - 1) * 1000 / (self.last_output_ms - self.first_output_ms)
+        first = self.first_read_tokens
+        if first is None or first > MAX_TOKENS_PER_READ:
+            return None
+        later = self.output_tokens - first
+        if later <= 0 or later / (reads - 1) > MAX_TOKENS_PER_READ:
+            return None
+        return later * 1000 / (self.last_output_ms - self.first_output_ms)
 
 
 class CheckResult(Model):

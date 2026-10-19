@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from giraffe.models import CHECK_NAMES, CheckResult, RequestSpec, overall_status
+from giraffe.overlap import NEEDS_STREAM, peak_evidenced_concurrency, scheduling_delay_windows
 
 SCENARIOS = {
     "size_matrix": ("buckets", "Input/output size and concurrency matrix"),
@@ -160,15 +161,18 @@ async def token_stress(run, target, client):
                                       concurrency=level)
             row = _stats(records)
             row["planned_requests"] = planned
-            row["achieved_overlap"] = max((record.overlap for record in records), default=0)
+            # Client dispatch overlap is not server evidence; only overlapping output windows are.
+            row["client_peak_inflight"] = max((record.overlap for record in records), default=0)
+            row["achieved_overlap"] = peak_evidenced_concurrency(records, scheduling_delay_windows(run))
             row["evidence_ids"] = [record.id for record in records]
             row["coverage_gaps"] = gaps = []
             if len(records) < planned:
                 gaps.append("The shared budget ended before all planned requests were sent.")
             if row["completed"] < effective.limits.min_samples:
                 gaps.append("Insufficient successful samples.")
-            if row["achieved_overlap"] < level:
-                gaps.append("Requested concurrency was not observed.")
+            if level > 1 and row["achieved_overlap"] < level:
+                gaps.append("Requested concurrency was not observed in overlapping server output"
+                            + ("." if any(record.stream for record in records) else f"; {NEEDS_STREAM}."))
             if any(record.input_tokens is None for record in records) or not records:
                 gaps.append("Actual input token length is unavailable.")
             elif case.input_tokens and any(

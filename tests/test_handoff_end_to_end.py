@@ -17,7 +17,7 @@ from tests.test_web import browser, finished, start
 @pytest.mark.parametrize("compare", [False, True])
 @pytest.mark.parametrize("request_source", ["builtin", "request_pack"])
 async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, compare, request_source):
-    with FakeEndpoint(first_token_delay=.001, chunk_delay=0) as endpoint:
+    with FakeEndpoint(first_token_delay=.02, chunk_delay=.02) as endpoint:
         config = RunConfig(
             targets=[{"name": "local", "url": endpoint.url, "model": "fake-model"}],
             checks=["correctness"], samples=6, max_requests=20,

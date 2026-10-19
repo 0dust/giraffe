@@ -172,7 +172,8 @@ def test_multiple_calls_are_compared_in_order_and_extra_calls_fail():
                                     {"name": "weather", "arguments": {"city": "Mumbai"}}])
     calls = [call(), call(arguments={"city": "Mumbai"})]
     assert evaluate_fixture(value, "Checking now. Final sentence.", calls).score is True
-    assert evaluate_fixture(value, "Checking now. Final sentence.", calls[::-1]).score is False
+    # Parallel calls are unordered: a reordered set still matches as a multiset.
+    assert evaluate_fixture(value, "Checking now. Final sentence.", calls[::-1]).score is True
     assert evaluate_fixture(value, "Checking now. Final sentence.", calls + [call()]).score is False
 
 
@@ -205,8 +206,9 @@ def test_exact_arguments_compare_json_values_not_serializations(expected, actual
 
 def test_truncation_cannot_pass_even_when_observed_assertions_match():
     result = scored(finish_reason="length")
-    assert result.score is False
-    assert result.tool_evaluation.protocol.status == "fail"
+    # Truncation by the output cap is unverified (unscored), never a pass.
+    assert result.score is None
+    assert result.tool_evaluation.protocol.status == "inconclusive"
     assert result.tool_evaluation.content.status == "pass"
     assert "Truncated tool-call completion" in result.score_message
 

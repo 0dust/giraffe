@@ -168,9 +168,9 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
                 raise httpx.RemoteProtocolError('peer closed without response headers')
             await asyncio.sleep(.003)
             answer = answers[prompt]
-            split = max(1, len(answer) // 2)
-            events = [dict(choices=[dict(delta={'content': piece})])
-                      for piece in [answer[:split], answer[split:]]]
+            split = max(1, len(answer) // (2 if is_heavy else 8))
+            events = [dict(choices=[dict(delta={'content': answer[start:start + split]})])
+                      for start in range(0, len(answer), split)]
             events.append(dict(choices=[dict(delta={}, finish_reason='stop')],
                                usage={'prompt_tokens': 32, 'completion_tokens': len(answer.split())}))
             class EventStream(httpx.AsyncByteStream):
@@ -201,13 +201,13 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
         assert len(sustained) >= 5 and all(r.status == 'completed' and r.valid for r in sustained)
         assert outcome.metrics['sustained']['error_rate'] == 0
         return
-    assert outcome.status == report.overall == 'fail'
+    assert outcome.status == report.overall == ('inconclusive' if mode == 'phase_cancel' else 'fail')
     assert heavy_started == 3 and hangs == 2
     assert sum(r.status == 'completed' and r.valid for r in sustained) == 1
     assert completion['requests'] < completion['required_requests'] == 5
     assert completion['reason'] == 'insufficient load evidence'
     assert completion['successful_requests'] < completion['required_successful_requests'] == 5
-    assert outcome.metrics['sustained_error_rate'] == pytest.approx(2 / 3)
+    assert outcome.metrics['sustained_error_rate'] == pytest.approx(0 if mode == 'phase_cancel' else 2 / 3)
     if mode == 'phase_cancel':
         assert interrupted == 2
         assert sum(r.status == 'cancelled' for r in sustained) == 2
@@ -259,10 +259,11 @@ async def test_nonstrict_consistency_does_not_certify_variation(monkeypatch, mod
     if mode == 'logprob_drift':
         settings['logprobs'] = {'top_logprobs': 0, 'tolerance': .01}
     outcome = next(c for c in (await runner.run_suite(workload_config(endpoint,
-        checks=['consistency'], stream=False, consistency=settings))).checks if c.id == 'consistency')
+        checks=['consistency'], stream=True, consistency=settings))).checks if c.id == 'consistency')
     assert outcome.status == expected
     if expected == 'inconclusive':
-        assert 'variation observed; enable strict to enforce' in outcome.summary.lower()
+        assert ('server-side concurrency needs streamed output timing' if mode == 'logprob_drift'
+                else 'variation observed; enable strict to enforce') in outcome.summary.lower()
 
 
 async def test_consistency_summary_discloses_incorrect_answers(monkeypatch):
@@ -310,6 +311,7 @@ async def test_capacity_single_chunk_gap_qualification(monkeypatch, tokens, expe
         async def execute(self, spec, **kwargs):
             result = await super().execute(spec, **kwargs)
             result.completion_tokens, result.answer_chunks, result.max_stream_gap_ms = tokens, 1, None
+            result.answer_reads = 1
             return result
 
     monkeypatch.setattr(runner, 'LLMClient', Client)

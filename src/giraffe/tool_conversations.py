@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jsonschema import ValidationError
 
-from giraffe.fixtures import _normalized, _parsed_tool_arguments
+from giraffe.fixtures import _normalized, _parsed_tool_arguments, final_answer, matched_calls, reasoning_budget
 from giraffe.models import ExpectedToolCall, RequestSpec, ToolChoiceRule, ToolExpectation
 from giraffe.tool_schema import tool_call_fingerprint
 
@@ -84,6 +84,7 @@ async def run_conversation(run, target, client, fixture, mode):
                 record.score = {"pass": True, "fail": False, "inconclusive": None}[status]
                 record.score_message = message
 
+            parsed = []
             for call in record.tool_calls:
                 function = call["function"]
                 if not call.get("id") or call.get("type") != "function" or function.get("name") not in schemas:
@@ -93,6 +94,7 @@ async def run_conversation(run, target, client, fixture, mode):
                     fingerprint = tool_call_fingerprint(function["name"], arguments)
                 except (ValueError, TypeError, RecursionError, ValidationError):
                     continue
+                parsed.append(arguments)
                 evidence["calls"].append({"call_id": call["id"], "function": function["name"],
                                           "fingerprint": fingerprint, "result": None,
                                           "result_outcome": None, "supplied_in_request": None})
@@ -102,13 +104,18 @@ async def run_conversation(run, target, client, fixture, mode):
             if evidence["repetition_count"]:
                 finish("fail", "repeated_satisfied_call", "An already-satisfied operation was requested again.")
                 return
+            if reasoning_budget(record):
+                finish("inconclusive", "truncated", "Reasoning exhausted the output budget before a conversation answer.")
+                return
             if not record.valid or record.status != "completed":
                 reason = record.status if record.status in {"timeout", "cancelled"} else "protocol_or_api_failure"
                 finish("fail" if reason == "protocol_or_api_failure" else "inconclusive", reason,
                        "Conversation response did not complete validly.")
                 return
             if record.finish_reason == "length":
-                finish("inconclusive", "truncated", "Conversation response was truncated; completion is unverified.")
+                finish("fail" if record.score is False else "inconclusive", "truncated",
+                       "Complete calls violate the conversation contract." if record.score is False else
+                       "Conversation response was truncated; completion is unverified.")
                 return
             if record.tool_evaluation.protocol.status != "pass" or record.assistant_message is None:
                 finish("fail", "protocol_or_api_failure", "Conversation assistant history is not usable.")
@@ -127,7 +134,14 @@ async def run_conversation(run, target, client, fixture, mode):
                     finish("inconclusive", "history_limit", "Observed conversation context exceeds the configured limit.")
                     return
                 messages = [*messages, record.assistant_message]
-                for call, expected, item in zip(record.tool_calls, step.expected_calls, evidence["calls"], strict=True):
+                # Parallel calls are unordered: link each supplied result to its matched call id.
+                assignment = matched_calls(step.expected_calls, [c["function"]["name"] for c in record.tool_calls], parsed)
+                if assignment is None:
+                    finish("fail", "unexpected_call", "Calls differ from the declared conversation step.")
+                    return
+                expected_for = {call_index: step.expected_calls[index] for index, call_index in enumerate(assignment)}
+                for index, (call, item) in enumerate(zip(record.tool_calls, evidence["calls"], strict=True)):
+                    expected = expected_for[index]
                     result = _expand(expected.result, marker)
                     messages.append({"role": "tool", "tool_call_id": call["id"],
                                      "content": json.dumps(result, ensure_ascii=False)})
@@ -140,7 +154,9 @@ async def run_conversation(run, target, client, fixture, mode):
             elif record.tool_calls:
                 finish("fail", "unexpected_call", "The final response requested an operation outside the fixture.")
                 return
-            elif all(_answer_matches(item, record.output) for item in final_content):
+            elif (answer := final_answer(record.output))[2]:
+                finish("inconclusive", "reasoning_without_answer", "Final response has unclosed reasoning and no answer to check.")
+            elif all(_answer_matches(item, answer[0]) for item in final_content):
                 finish("pass", "completed", "Final answer satisfies the supplied-result expectations.")
             else:
                 finish("fail", "final_answer_mismatch", "Final answer does not satisfy the supplied-result expectations.")

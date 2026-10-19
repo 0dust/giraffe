@@ -40,7 +40,7 @@ def test_invalid_performance_profiles_are_rejected(updates):
 
 @pytest.mark.parametrize("retention", ["all", "none"])
 async def test_mixed_live_conversations_overlap_and_keep_actual_history_isolated(retention, tmp_path):
-    with FakeEndpoint(first_token_delay=.02) as endpoint:
+    with FakeEndpoint(first_token_delay=.03, chunk_delay=.03) as endpoint:
         report = await run_suite(config(endpoint, checks=["sessions"], retention=retention,
             sessions={"profile": "performance", "modes": ["live"], "sessions": 4,
                       "concurrency": 2, "workloads": workloads(), "max_tokens": 64}))
@@ -74,7 +74,7 @@ async def test_mixed_live_conversations_overlap_and_keep_actual_history_isolated
         assert "Conversation performance by task and turn" in html
 
 
-@pytest.mark.parametrize("sessions,expected", [(1, "inconclusive"), (2, "pass")])
+@pytest.mark.parametrize("sessions,expected", [(1, "inconclusive"), (2, "inconclusive")])
 async def test_performance_caps_are_reported_without_stopping_remaining_turns(sessions, expected):
     with FakeEndpoint() as endpoint:
         report = await run_suite(config(endpoint, checks=["sessions"],
@@ -104,7 +104,8 @@ def record(user, turn, rate=None, *, failed=False):
     return RequestRecord(id=f"{user}-{turn}", target="local", fixture_id="test", scenario="sessions",
         check_ids=["sessions"], started_at="2026-10-14T00:00:00Z",
         status="failed" if failed else "completed", valid=not failed, stream=True,
-        output_tokens=11, answer_chunks=2 if rate else 1, first_output_ms=100,
+        output_tokens=11, answer_chunks=2 if rate else 1, answer_reads=2 if rate else 1,
+        answer_chars=11, first_read_answer_chars=1, first_output_ms=100,
         last_output_ms=100 + 10000/rate if rate else 100, elapsed_ms=1200,
         dispatch_ms=turn*1500, completed_ms=turn*1500+1200,
         workload={"session_id": user, "task_type": "coding", "turn_id": turn, "mode": "live"})
@@ -125,11 +126,19 @@ def test_user_average_does_not_overweight_users_with_more_responses_or_invent_mi
 
 async def test_recovery_uses_long_streamed_known_answers_for_every_phase():
     with FakeEndpoint() as endpoint:
-        report = await run_suite(config(endpoint, checks=["recovery"], sustained_seconds=.01,
-            limits={"min_output_tokens_per_second": 1, "min_samples": 2}))
+        settings = config(endpoint, checks=["recovery"], sustained_seconds=.75,
+            limits={"min_output_tokens_per_second": 1, "min_samples": 2})
+        report = await run_suite(settings)
     result = check(report, "recovery")
     assert result.status == "pass"
-    assert {row.scenario for row in report.requests} == {"sustained", "recovery_baseline", "recovery"}
+    completion = result.metrics["sustained_completion"]
+    assert completion["reason"] == "duration elapsed"
+    assert completion["requests"] >= settings.concurrency * 2
+    assert completion["time_weighted_in_flight"] >= settings.concurrency * .9
+    assert {row.scenario for row in report.requests} == {"sustained", "recovery_baseline", "recovery", "recovery_prime"}
+    prime, = [row for row in report.requests if row.scenario == "recovery_prime"]
+    assert prime.check_ids == [] and prime.id not in result.evidence_ids
+    assert result.metrics["baseline"]["attempted"] == result.metrics["baseline"]["completed"] == settings.samples
     probes = [row for row in report.requests if row.scenario != "sustained"]
     assert all(row.answer_chunks > 10 and row.score is True for row in probes)
     assert len({row.fixture_id for row in probes}) == 1

@@ -24,6 +24,9 @@ from giraffe.logprobs import LogprobBudget
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_RESPONSE_EVENTS = 256
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
+_MAX_CONTENT_READS = 65536
+_REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
+REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
 class _ProtocolError(Exception):
@@ -59,9 +62,11 @@ def _headers(target: Target) -> dict[str, str]:
     return headers
 
 
-async def _limited_body(response: httpx.Response) -> bytes:
+async def _limited_body(response: httpx.Response, *, on_read=None) -> bytes:
     body = bytearray()
     async for chunk in response.aiter_bytes():
+        if on_read is not None:
+            on_read(time.perf_counter())
         if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
             raise _ProtocolError("response exceeded the 4 MiB safety limit")
         body.extend(chunk)
@@ -134,6 +139,33 @@ def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _answer_spans(output: str) -> list[tuple[int, int]] | None:
+    """Raw-output spans that fixtures.final_answer keeps; None when reasoning is unclosed."""
+    cursor, spans, stack = 0, [], []
+    for tag in _REASONING_TAG.finditer(output):
+        name = tag[2].lower()
+        if not tag[1]:
+            if not stack:
+                spans.append((cursor, tag.start()))
+            stack.append(name)
+        elif stack:
+            if stack[-1] == name:
+                stack.pop()
+                if not stack:
+                    cursor = tag.end()
+        else:
+            spans, cursor = [], tag.end()
+    return None if stack else [*spans, (cursor, len(output))]
+
+
+def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[tuple[int, int]]:
+    start, result = 0, []
+    for a, b in spans or ():
+        result.append((start, a))
+        start = b
+    return [*result, (start, length)]
+
+
 class LLMClient:
     def __init__(self, target: Target, config: RunConfig):
         self.target = target
@@ -195,7 +227,7 @@ class LLMClient:
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
             started_at=datetime.now(timezone.utc).isoformat(), status="failed",
-            input_chars=spec.input_chars, requested_max_tokens=budget, stream=stream,
+            input_chars=spec.input_chars, requested_max_tokens=budget, stream=stream, answer_reads=0,
         )
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
@@ -222,6 +254,10 @@ class LLMClient:
         record.client_preparation_ms = (start - preparation_start) * 1000
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
+        tool_output: float | None = None
+        # (output offset, read time) per network read carrying content; bounded.
+        content_reads: list[tuple[int, float]] = []
+        reads_truncated = False
         response_sequence = -1
         conversation = spec.workload.get("selection") == "conversation"
         assistant_content_present = False
@@ -239,7 +275,7 @@ class LLMClient:
             record.response_events.append({"sequence": response_sequence, "kind": kind, **metadata})
 
         def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
-            nonlocal last_answer, response_sequence, assistant_content_present
+            nonlocal last_answer, response_sequence, assistant_content_present, tool_output, reads_truncated
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
                     and len(server_id) > 4096):
@@ -269,6 +305,7 @@ class LLMClient:
                 reasoning_tokens = _token_count(details.get("reasoning_tokens")) if isinstance(
                     details, dict,
                 ) else None
+                record.reasoning_tokens = reasoning_tokens
                 if record.output_tokens is not None and reasoning_tokens is not None:
                     record.output_tokens = max(0, record.output_tokens - reasoning_tokens)
             choices = data.get("choices")
@@ -305,6 +342,8 @@ class LLMClient:
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
+            if streaming and (_REASONING_TAG.sub("", answer).strip() or reasoning.strip()):
+                record.generation_chunks += 1
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > 16:
@@ -338,6 +377,8 @@ class LLMClient:
                           type_present=call.get("type") is not None)
                     part["function"]["name"] += name
                     part["function"]["arguments"] += arguments
+                    if tool_output is None and (function.get("name") or function.get("arguments")):
+                        tool_output = now
                     if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
                         record.first_output_ms = (now-start)*1000
                         if first_output_event is not None:
@@ -346,6 +387,11 @@ class LLMClient:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
                 trace("content", offset=len(record.output), length=len(answer))
+                if not content_reads or content_reads[-1][1] != now:
+                    if len(content_reads) < _MAX_CONTENT_READS:
+                        content_reads.append((len(record.output), now))
+                    else:
+                        reads_truncated = True
                 record.output += answer
                 if answer.strip():
                     if record.first_output_ms is None:
@@ -363,7 +409,7 @@ class LLMClient:
                     record.last_output_ms = (now - start) * 1000
             if reasoning:
                 record.reasoning += reasoning
-                if record.first_reasoning_ms is None:
+                if reasoning.strip() and record.first_reasoning_ms is None:
                     record.first_reasoning_ms = (now - start) * 1000
             if streaming:
                 record.chunks += 1
@@ -403,12 +449,15 @@ class LLMClient:
                             record.logprob_evidence = LogprobEvidence(status="rejected" if rejected else "incomplete",
                                 reason="Logprob request field rejected." if rejected else "HTTP request failed; logprob support unverified.",
                                 requested_top_logprobs=spec.workload["top_logprobs"])
-                        if response.status_code == 400 and spec.scenario.startswith("context"):
-                            # Classify only this documented rejection; never retain
-                            # arbitrary server error text or echoed request content.
+                        if response.status_code in {400, 413, 422} and spec.scenario.startswith(("context", "prefix_")):
+                            # Classify only documented engine rejections (vLLM/SGLang, TGI, llama.cpp);
+                            # never retain arbitrary server error text or echoed request content.
                             body = (await _limited_body(response)).decode("utf-8", errors="replace").lower()
-                            if any(term in body for term in ("context length", "context_length", "maximum context", "too many tokens")):
-                                raise _ProtocolError("HTTP 400: context length rejection")
+                            if any(term in body for term in (
+                                    "context length", "context_length", "maximum context", "too many tokens",
+                                    "context size", "context window", "max_model_len",
+                                    "inputs` tokens + `max_new_tokens`", "inputs` must have less than")):
+                                raise _ProtocolError(f"HTTP {response.status_code}: context length rejection")
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):
@@ -418,20 +467,24 @@ class LLMClient:
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
+                                record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
                             receive(_object(event), streaming=True, observed_at=observed_at)
                             if (spec.cancel_after_chunks is not None
-                                    and record.answer_chunks >= spec.cancel_after_chunks
+                                    and record.generation_chunks >= spec.cancel_after_chunks
                                     and record.finish_reason is None):
+                                record.client_cancelled_ms = (time.perf_counter() - start) * 1000
                                 record.client_cancelled_at_ns = time.time_ns()
                                 record.client_cancelled_monotonic_ns = time.monotonic_ns()
                                 raise _IntentionalCancellation
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
-                        body = await _limited_body(response)
-                        observed_at = time.perf_counter()
+                        def body_read(at):
+                            record.stream_end_ms = (at - start) * 1000
+                        body = await _limited_body(response, on_read=body_read)
+                        observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
                         receive(_object(body), streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
@@ -443,7 +496,17 @@ class LLMClient:
                         ids = [call["id"] for call in record.tool_calls]
                         if any(not call["id"] or call["type"] != "function" or not call["function"]["name"] for call in record.tool_calls) or len(set(ids)) != len(ids):
                             raise _ProtocolError("incomplete tool-call ID/type/function structure")
-                    if record.first_output_ms is None or (not record.output.strip() and spec.scorer != "tool"):
+                    from .fixtures import final_answer
+                    final, stripped, _ = final_answer(record.output)
+                    if spec.scorer != "tool" and not final.strip():
+                        if record.finish_reason == "length" and (record.reasoning.strip() or stripped
+                                                                  or (record.reasoning_tokens or 0) > 0):
+                            # The endpoint honoured Giraffe's own output budget: not a
+                            # serving failure, but also not an answer.
+                            record.status, record.error = "completed", REASONING_BUDGET_ERROR
+                            return record
+                        raise _ProtocolError("response contained no useful answer output")
+                    if record.first_output_ms is None:
                         raise _ProtocolError("response contained no useful answer output")
                     if conversation and stream:
                         record.assistant_message = {"role": "assistant",
@@ -453,7 +516,7 @@ class LLMClient:
                         record.assistant_message["tool_calls"] = record.tool_calls
                     record.status, record.valid = "completed", True
         except _IntentionalCancellation:
-            record.status, record.error = "cancelled", "intentional cancellation after answer chunks"
+            record.status, record.error = "cancelled", "intentional cancellation after generation chunks"
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
@@ -474,9 +537,49 @@ class LLMClient:
             record.elapsed_ms = (now - start) * 1000
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
+            # Answer timing excludes inline reasoning and counts network reads,
+            # not SSE events: one buffered read carries no gap or pace evidence.
+            from .fixtures import final_answer
+            final, stripped, _ = final_answer(record.output)
+            record.answer_chars = len(final)
+            spans = _answer_spans(record.output)
+            if (record.reasoning.strip() or stripped) and not record.reasoning_tokens:
+                record.output_tokens = None
+            record.reasoning_stripped = record.reasoning_stripped or stripped
+            reasoning_spans = _reasoning_spans(spans, len(record.output))
+            first_read = last_read = None
+            gap = None
+            for index, (offset, at) in enumerate(content_reads):
+                end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
+                text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
+                if (stripped and record.first_reasoning_ms is None
+                        and any(_REASONING_TAG.sub("", record.output[max(offset, a):min(end, b)]).strip()
+                                for a, b in reasoning_spans)):
+                    record.first_reasoning_ms = (at - start) * 1000
+                if not text.strip():
+                    continue
+                record.answer_reads += 1
+                if first_read is None:
+                    first_read, record.first_read_answer_chars = at, len(text)
+                else:
+                    gap = max(gap or 0, (at - last_read) * 1000)
+                last_read = at
+            if reads_truncated:
+                record.answer_reads = 0
+                record.first_read_answer_chars = 0
+                record.last_output_ms = record.max_stream_gap_ms = None
+                if stripped:
+                    record.first_output_ms = None
+            else:
+                if stream:
+                    record.max_stream_gap_ms = gap
+                if stripped:
+                    candidates = [value for value in (tool_output, first_read) if value is not None]
+                    record.first_output_ms = (min(candidates) - start) * 1000 if candidates else None
+                if tool_output is None:
+                    record.last_output_ms = (last_read - start) * 1000 if last_read is not None else None
             if record.valid and record.status == "completed":
-                from .fixtures import final_answer
-                answer, _, _ = final_answer(record.output)
+                answer = final
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()

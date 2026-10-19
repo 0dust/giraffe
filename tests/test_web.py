@@ -669,7 +669,7 @@ async def test_paths_and_symlinks_do_not_expose_unrelated_files(tmp_path):
 
 
 async def test_real_api_to_runner_to_http_endpoint(tmp_path):
-    with FakeEndpoint() as endpoint:
+    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
         values = config(checks=["access", "serving", "correctness"], concurrency=2,
                         samples=2, max_requests=30, max_duration_seconds=15)
         values["targets"][0]["url"] = endpoint.url

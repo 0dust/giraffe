@@ -54,7 +54,7 @@ def test_server_stop_verdict_requires_all_native_terminations_not_combined_backe
     (admissions(), control(), "pass"),
     (admissions(admitted_at_ns=2_000_000_200), control(), "inconclusive"),
     (admissions(id=1), control(), None),
-    (admissions(cache=168), control(), None),
+    (admissions(cache=168), control(), "fail"),
     (admissions(), control(finish_reason="stop"), None),
     (admissions(), control(valid=False), None),
     (admissions(), control(requested_max_tokens=256), None),
