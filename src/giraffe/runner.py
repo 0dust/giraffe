@@ -100,7 +100,7 @@ def _stress(scenario):
     return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_"))
             or scenario in {"sustained", "recovery", "recovery_baseline", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
-                            "cancellation_probe"})
+                            "cancellation_probe", "cancellation_baseline"})
 
 
 def _context_rejection(record):
@@ -441,6 +441,11 @@ def _gpu_snapshot(snapshot):
     return {**snapshot, "samples": samples, "unavailable": sorted(set(_GPU_FAMILIES)-families)}
 
 
+def _gpu_scraped(snapshot):
+    return snapshot.get("status") == "available" and any(
+        sample["family"] in _GPU_FAMILIES and not sample["stale"] for sample in snapshot.get("samples", []))
+
+
 async def _metrics(run, target, phase):
     from giraffe.telemetry import scrape
     data = run.observations[target.name]["serving_telemetry"]
@@ -457,8 +462,7 @@ async def _metrics(run, target, phase):
 async def _finish_gpu_observation(run, target):
     """Allow DCGM at least one refresh, bounded by the enclosing run deadline."""
     data = run.observations[target.name]["serving_telemetry"]
-    first = next((snap["elapsed_seconds"] for snap in data["snapshots"]
-                  if any(sample["family"] in _GPU_FAMILIES for sample in snap.get("samples", []))), None)
+    first = next((snap["elapsed_seconds"] for snap in data["snapshots"] if _gpu_scraped(snap)), None)
     window = run.config.gpu_min_observation_seconds
     if first is not None and not run.stop_reason():
         delay = min(max(0, window-(time.monotonic()-run.start-first)),
@@ -468,11 +472,17 @@ async def _finish_gpu_observation(run, target):
                 await asyncio.wait_for(run.stop.wait(), delay)
             except TimeoutError:
                 pass
+    count = len(data["snapshots"])
     await _metrics(run, target, "end")
-    elapsed = data["snapshots"][-1]["elapsed_seconds"] - first if first is not None else 0
+    # Only a successful, fresh end scrape closes the window; failed end scrapes leave it open.
+    end = data["snapshots"][-1] if len(data["snapshots"]) > count else None
+    last = next((snap["elapsed_seconds"] for snap in reversed(data["snapshots"]) if _gpu_scraped(snap)), None)
+    elapsed = last - first if first is not None and last is not None else 0
+    fresh_end = end is not None and _gpu_scraped(end)
     run.observations[target.name]["gpu_observation_window"] = {
         "required_seconds": window, "elapsed_seconds": elapsed,
-        "complete": first is not None and elapsed >= window}
+        "end_scrape_status": end["status"] if end else "not_collected", "end_scrape_fresh": fresh_end,
+        "complete": first is not None and fresh_end and elapsed >= window}
 
 
 async def _fairness(run, target, client, fixtures):
@@ -726,16 +736,21 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                 count=1, checks=["cancellation"])
                 await run.group(target, client, normal, "limits",
                                 count=max(effective.samples, len(normal)), checks=["cancellation"])
+                if cancel:
+                    # Same-fixture baseline: a follow-up queued behind leaked generation shows as delay.
+                    await run.group(target, client, fixtures["short"][:1], "cancellation_baseline",
+                                    count=1, checks=["cancellation"])
                 await run.group(target, client, cancel, "client_cancel", count=len(cancel),
                                 checks=["cancellation"])
+                # Follow-ups go immediately after the disconnect, while leaked work would still run.
+                await run.group(target, client, fixtures["short"], "cancellation_probe",
+                                count=effective.samples, checks=["cancellation"])
                 if cancel:
                     deadline_spec = _spec(cancel[0].model_copy(update={"cancel_after_ms": None, "cancel_after_chunks": None}),
                                           "client_deadline", ["cancellation"])
                     probe_timeout = min(options["deadline_probe_ms"] / 1000, config.request_timeout_seconds)
                     run.observations[target.name]["deadline_probe_ms"] = probe_timeout * 1000
                     await run.request(target, client, deadline_spec, timeout_override=probe_timeout)
-                await run.group(target, client, fixtures["short"], "cancellation_probe",
-                                count=effective.samples, checks=["cancellation"])
                 if options["backend_verification"] == "required":
                     from giraffe.backend_cancellation import exercise
                     await exercise(run, target, client, fixtures)
@@ -995,7 +1010,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             window = observations.get("gpu_observation_window")
             metrics["observation_window"] = window
             if window and not window["complete"] and status != "fail":
-                status, summary = "inconclusive", "GPU observation window shorter than exporter refresh."
+                status, summary = "inconclusive", ("GPU end scrape did not return fresh device samples; the observation window is incomplete."
+                    if window.get("end_scrape_fresh") is False else "GPU observation window shorter than exporter refresh.")
         elif not records and check_id != "capacity":
             status, summary = "inconclusive", "No applicable requests completed within the run budget."
         elif check_id == "access":
@@ -1190,43 +1206,79 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                            if check_id in {"correctness", "json"} and config.concurrency > 1
                            else "Built-in deterministic checks passed for the recorded fixtures.")
         elif check_id == "cancellation":
+            import re as _re
+            from .fixtures import final_answer as _answer_text
             cancelled = [r for r in all_records if r.scenario == "client_cancel"]
             deadlines = [r for r in all_records if r.scenario == "client_deadline"]
             probes = [r for r in records if r.scenario == "cancellation_probe"]
+            baseline = next((r for r in records if r.scenario == "cancellation_baseline"), None)
+            # Reasoning spent the whole output budget: the cap held, but there is no answer to judge.
+            budget = {r.id for r in records if r.finish_reason == "length" and (
+                      r.status == "completed" or (r.status == "failed" and r.error == "response contained no useful answer output"))
+                      and not _answer_text(r.output or "")[0].strip()}
             metrics.update({"intentional_cancellations": len(cancelled),
                             "client_disconnect_observed": sum(r.status == "cancelled" for r in cancelled),
                             "backend_cancellation": observations.get("backend_cancellation", {"status": "unverified", "summary": "Backend verification was not enabled."}), "probes": _stats(probes),
-                            "deadline_probe_ms": observations.get("deadline_probe_ms"),
-                            "deadline_probes": _stats(deadlines)})
+                            "reasoning_budget_exhausted": sorted(budget),
+                            "client_deadline_self_test": {
+                                "deadline_ms": observations.get("deadline_probe_ms"), "requests": _stats(deadlines),
+                                "timed_out": bool(deadlines) and all(r.status == "timeout" for r in deadlines),
+                                "scope": "Exercises Giraffe's own client timer; nothing deadline-related reaches the server, so it is not endpoint evidence."}})
             cap_usage = {r.id: r.completion_tokens if r.completion_tokens is not None else r.output_tokens for r in records}
             caps = [r for r in records if r.fixture_id.startswith("limits.output_cap")]
-            bad_caps = [r.id for r in caps if cap_usage[r.id] is not None and r.requested_max_tokens
-                        and (cap_usage[r.id] > r.requested_max_tokens
-                             or (r.finish_reason == "length" and cap_usage[r.id] != r.requested_max_tokens))]
+            # Without usage, each streamed answer chunk and each fixture number is at least one token.
+            cap_bound = {r.id: max(r.answer_chunks or 0, len(_re.findall(r"\d+", r.output or ""))) for r in caps}
+            bad_caps = [r.id for r in caps if r.requested_max_tokens and (
+                cap_bound[r.id] > r.requested_max_tokens if cap_usage[r.id] is None else
+                cap_usage[r.id] > r.requested_max_tokens or (r.id not in budget and r.finish_reason == "length"
+                                                              and cap_usage[r.id] != r.requested_max_tokens))]
+            unverified_caps = [r.id for r in caps if cap_usage[r.id] is None and r.id not in bad_caps
+                               and (r.finish_reason != "length" or not cap_bound[r.id])]
             controls = [r for r in records if r.fixture_id.startswith("limits.stop_control")]
             stops = [r for r in records if r.fixture_id.startswith("limits.stop.")]
             reached = any(r.valid and r.output.strip() == "blue [END] green" for r in controls)
-            stop_failed = any("[END]" in r.output or (reached and "green" in r.output) for r in stops)
+            stop_failed = any("[END]" in r.output or (reached and "green" in r.output) for r in stops if r.id not in budget)
             stop_observed = reached and bool(stops) and all(
                 r.valid and r.output.strip() == "blue" and r.finish_reason == "stop" for r in stops)
             metrics["stop_enforcement"] = {"control_reached_stop": reached,
                 "status": "fail" if stop_failed else "pass" if stop_observed else "inconclusive"}
             metrics["output_cap_finish_reasons"] = [r.finish_reason for r in caps]
-            failed_limits = [r.id for r in records if r.scenario == "limits" and not r.valid and r.status != "cancelled"]
-            if bad_caps or failed_limits or stop_failed or any(r.score is False for r in records) or any(not r.valid and r.status != "cancelled" for r in probes):
+            metrics["output_cap_token_evidence"] = [{"id": r.id, "usage": cap_usage[r.id], "lower_bound": cap_bound[r.id],
+                                                     "requested_max_tokens": r.requested_max_tokens} for r in caps]
+            failed_limits = [r.id for r in records if r.scenario == "limits" and not r.valid
+                             and r.status != "cancelled" and r.id not in budget]
+            # Follow-up delay against a same-fixture baseline exposes leaked generation on shared slots.
+            first_probe = next((r for r in probes if baseline and r.fixture_id == baseline.fixture_id), None)
+            before = baseline.first_output_ms if baseline and baseline.valid else None
+            after = first_probe.first_output_ms if first_probe and first_probe.valid else None
+            threshold = max(3 * before, before + 1000) if before is not None else None
+            delayed = threshold is not None and after is not None and after > threshold
+            metrics["followup_delay"] = {"baseline_first_output_ms": before, "followup_first_output_ms": after,
+                                         "threshold_ms": threshold, "delayed": delayed}
+            if bad_caps or failed_limits or stop_failed or any(
+                    r.score is False for r in records if r.scenario != "client_deadline" and r.id not in budget) or any(
+                    not r.valid and r.status != "cancelled" and r.id not in budget for r in probes):
                 status, summary = "fail", "Output/stop limits or inference after client cancellation failed."
                 metrics["output_cap_violations"] = bad_caps
                 metrics["failed_limit_requests"] = failed_limits
             elif not cancelled or not all(r.status == "cancelled" and r.first_output_ms is not None
                                               and r.client_cancelled_at_ns is not None and r.finish_reason is None
-                                              and r.answer_chunks >= run.config.effective_check("cancellation")["cancel_after_chunks"] for r in cancelled) or not probes or not deadlines or not all(r.status == "timeout" for r in deadlines):
-                status, summary = "inconclusive", "Client disconnect, request deadline or follow-up inference could not be exercised."
+                                              and r.answer_chunks >= run.config.effective_check("cancellation")["cancel_after_chunks"] for r in cancelled) or not probes:
+                status, summary = "inconclusive", "Client disconnect or follow-up inference could not be exercised."
+            elif any(r.id in budget for r in probes) or (baseline and baseline.id in budget):
+                status, summary = "inconclusive", "Reasoning exhausted the follow-up output budget before an answer; follow-up inference is unverified."
             elif not stop_observed:
-                status, summary = "inconclusive", "Server stop enforcement lacks a matching full-output control or stop finish reason."
-            elif any(cap_usage[r.id] is None and r.finish_reason != "length" for r in caps):
-                status, summary = "inconclusive", "Output token usage and length finish reason missing; output cap compliance is unverified."
+                status, summary = "inconclusive", ("Reasoning exhausted the stop fixture's output budget before an answer; stop enforcement is unverified."
+                                                   if any(r.id in budget for r in [*stops, *controls]) else
+                                                   "Server stop enforcement lacks a matching full-output control or stop finish reason.")
+            elif unverified_caps:
+                status, summary = "inconclusive", "Output token usage or a usable token bound is missing; output cap compliance is unverified."
+            elif delayed:
+                status, summary = "inconclusive", "follow-up delayed after cancellation; server may still be generating cancelled requests."
+            elif threshold is None or after is None:
+                status, summary = "inconclusive", "Follow-up first output could not be compared with a pre-cancellation baseline."
             else:
-                summary = "Client cancellation, output limits and follow-up probes observed; server work cancellation is unverified."
+                summary = "Client cancellation, output limits and prompt follow-up probes observed; server work cancellation is unverified."
             if not config.stream:
                 status, summary = "inconclusive", "client cancellation requires streaming"
             backend = metrics["backend_cancellation"]

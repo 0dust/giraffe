@@ -164,8 +164,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                      for spec in fixtures["limits"])
         cancelled = sum(spec.cancel_after_ms is not None for spec in fixtures["limits"])
         add("limits.stop_control", 1, "One full-output control for stop-sequence enforcement.")
-        count = max(options["samples"], normal) + cancelled + bool(cancelled) + options["samples"]
-        add("cancellation", count, "Output/stop controls, a client cancellation, a deadline probe and follow-up health requests.")
+        count = max(options["samples"], normal) + cancelled + 2 * bool(cancelled) + options["samples"]
+        add("cancellation", count, "Output/stop controls, a pre-cancellation baseline, a client cancellation, a client deadline self-test and follow-up health requests.")
         if options["backend_verification"] == "required":
             add("backend_cancellation", None,
                 f"Runtime and local evidence availability determine whether up to {3 * options['samples']} additional verification requests run.",

@@ -24,7 +24,7 @@ def server_stop_result(backend: dict) -> dict:
     verdicts = [probe.get("server_stop", {}) for probe in probes]
     result["verified"] = sum(item.get("status") == "pass" for item in verdicts)
     if any(item.get("status") == "fail" for item in verdicts):
-        result.update(status="fail", summary="A matching backend request outlived the cleanup deadline.")
+        result.update(status="fail", summary="A matching backend request outlived the cleanup deadline or generated its full output budget after client cancellation.")
     elif verdicts and len(verdicts) == backend.get("planned") and result["verified"] == len(verdicts):
         result.update(status="pass", summary="Every cancelled request has a matching native terminal abort within the cleanup deadline.")
     elif backend.get("runtime") == "ollama":
@@ -85,6 +85,9 @@ def evaluate(record: RequestRecord, trace: dict, started_at_ns: int, cleanup_sec
         status, reason = "fail", "Backend request remained active beyond the cleanup deadline."
     elif reasons == ["abort"]:
         status, reason = "pass", "Matching backend request terminated with abort within the deadline."
+    elif (type(trace.get("completion_tokens")) is int and record.requested_max_tokens
+            and trace["completion_tokens"] == record.requested_max_tokens):
+        status, reason = "fail", "Backend request completed its full output budget after client cancellation; work was not released early."
     else:
         status, reason = "inconclusive", "Natural completion raced with client cancellation."
     return {"status": status, "reason": reason, "termination_ms": delay * 1000,
@@ -200,7 +203,7 @@ async def exercise(run, target, client, fixtures) -> None:
                     probe.update(match)
                     # Follow-up failure must not overwrite a proven termination.
                     probe["server_stop"] = {"status": match["status"], "summary": match["reason"]}
-                    if runtime == "ollama":
+                    if runtime == "ollama" and match["status"] != "fail":
                         probe["server_stop"] = {"status": "inconclusive",
                             "summary": "Runner capacity was released; native abort reason is unavailable."}
                     evidence["completed"] += 1

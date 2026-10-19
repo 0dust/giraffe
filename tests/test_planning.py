@@ -38,7 +38,7 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     ("generation", {"test_options": {"generation": {"samples": 3}}}, 3),
     ("correctness", {"test_options": {"correctness": {"samples": 1}}}, 3),
     ("json", {}, 6),
-    ("cancellation", {}, 15),
+    ("cancellation", {}, 16),
     ("recovery", {"sustained_seconds": 0}, 12),
     ("gpu", {}, 0),
     ("arrivals", {}, 8),
@@ -323,7 +323,7 @@ async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch
                  'correctness': [f'correctness_c{configured.concurrency}'],
                  'json': [f'json_c{configured.concurrency}'],
                  'capacity': [name for name in counts if name.startswith('traffic_stage_')],
-                 'cancellation': ['limits', 'client_cancel', 'client_deadline', 'cancellation_probe'],
+                 'cancellation': ['limits', 'cancellation_baseline', 'client_cancel', 'client_deadline', 'cancellation_probe'],
                  'limits.stop_control': ['stop_control'],
                  'buckets': [name for name in counts if name.startswith('bucket_c')],
                  'mixed': [name for name in counts if name.startswith('mixed_') and name != 'mixed_control']}

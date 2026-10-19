@@ -72,6 +72,7 @@ async def test_output_cap_length_finish_is_evidence_and_must_match_usage(
         record = await original(self, spec, **kwargs)
         if spec.fixture_id.startswith("limits.output_cap"):
             record.output_tokens, record.completion_tokens, record.finish_reason = usage, usage, finish
+            record.output = "1 2 3 4"  # Compliant short output; without usage it bounds the token count.
         return record
     monkeypatch.setattr(client, "execute", capped)
     report = await runner.run_suite(config(checks=["cancellation"]))
