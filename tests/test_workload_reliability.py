@@ -97,6 +97,8 @@ class MemoryEndpoint:
                         await asyncio.sleep(.001)
                         data = {'model': payload['model'], 'choices': [{'delta': {'content': piece}}]}
                         yield ('data: ' + json.dumps(data) + '\n\n').encode()
+                    # Leave a measurable output-to-finish window even for a one-word answer.
+                    await asyncio.sleep(.01)
                     data = {'choices': [{'delta': {}, 'finish_reason': 'stop'}], 'usage': usage}
                     yield ('data: ' + json.dumps(data) + '\n\ndata: [DONE]\n\n').encode()
                 finally:
@@ -451,6 +453,7 @@ async def test_round2_live_session_history_strips_reasoning_and_fixed_keeps_seed
     report = await run_suite(config(endpoint, checks=['sessions'], sessions={
         'sessions': 2, 'turns': ['Choose a name.', 'Recall it.', 'Recall it again.']}))
     assert check(report, 'sessions').status == 'pass'
+    assert check(report, 'sessions').metrics['evidenced_session_overlap'] >= 2
     for payload in endpoint.requests:
         value = re.search(r'Use this exact bakery name for this session: (\w+)', payload['messages'][0]['content'])[1]
         assistants = [m['content'] for m in payload['messages'] if m['role'] == 'assistant']

@@ -48,7 +48,7 @@ class LoadClient:
             http_status=200, output=output, output_chars=len(output),
             input_chars=spec.input_chars, input_tokens=max(1, spec.input_chars//4),
             output_tokens=max(1, len(output.split())), elapsed_ms=reported_elapsed,
-            first_output_ms=first, last_output_ms=last, answer_chunks=2, chunks=2,
+            first_output_ms=first, last_output_ms=last, answer_chunks=2, answer_reads=2, chunks=2,
             max_stream_gap_ms=max(.1, last-first), stream=spec.stream,
             stream_terminated=True, finish_reason="stop", requested_max_tokens=spec.max_tokens,
         )

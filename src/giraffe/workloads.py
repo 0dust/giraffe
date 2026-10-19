@@ -1052,7 +1052,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             or (check in {"prefix", "sessions", "tools"} and reasoning_budget(r))
         )])["error_rate"]
         if budget_records:
-            metrics["failed"] -= len(budget_records)
+            metrics["failed"] -= stats(budget_records)["failed"]
             metrics["error_rate"] = errors
         cap_violations = [
             r.id

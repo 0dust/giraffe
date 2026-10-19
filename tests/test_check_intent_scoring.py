@@ -128,7 +128,10 @@ async def test_se2_sessions_accept_period_answers(monkeypatch):
             return httpx.Response(200, json=data)
     endpoint = Period(monkeypatch)
     result = check(await runner.run_suite(config(endpoint, checks=["sessions"], stream=False)), "sessions")
-    assert result.status == "pass", result.summary
+    assert result.metrics["correct"] == result.metrics["scored"] > 0
+    assert result.metrics["failed"] == 0
+    assert result.status == "inconclusive", result.summary
+    assert "server-side concurrency needs streamed output timing" in result.summary
 
 
 def mock_transport(monkeypatch, handler):
@@ -311,9 +314,10 @@ def test_x2_healthy_near_limit_recall_passes():
 
 
 @pytest.mark.parametrize("check_id", ["prefix", "sessions"])
+@pytest.mark.parametrize("real_failure", [False, True])
 @pytest.mark.parametrize("status,error", [("failed", "response contained no useful answer output"),
     ("completed", "reasoning exhausted the output budget before an answer")])
-def test_r1_both_reasoning_budget_record_contracts(check_id, status, error):
+def test_r1_both_reasoning_budget_record_contracts(check_id, real_failure, status, error):
     from giraffe.fixtures import reasoning_budget
     settings = tool_config(checks=[check_id], prefix={"repeats": 3}, limits={"min_samples": 2})
     run = runner._Run(settings, None, None)
@@ -325,11 +329,13 @@ def test_r1_both_reasoning_budget_record_contracts(check_id, status, error):
                 scenario=f"prefix_{kind}", input_chars=8400, workload={"shared_prefix_chars": 8192})
             assert reasoning_budget(item)
             run.records.append(item)
+    if real_failure:
+        run.records.append(record(spec, status="failed", valid=False, error="HTTP 503"))
     result = next(r for r in runner._checks(run, settings.targets[0]) if r.id == check_id)
-    assert result.status == ("pass" if check_id == "prefix" else "inconclusive"), result.summary
+    assert result.status == ("fail" if real_failure else "pass" if check_id == "prefix" else "inconclusive"), result.summary
     assert result.metrics["reasoning_budget_unscored"] == 6
-    assert result.metrics["failed"] == 0
-    assert result.metrics["error_rate"] in {None, 0}
+    assert result.metrics["failed"] == int(real_failure)
+    assert result.metrics["error_rate"] in ({1} if real_failure else {None, 0})
 
 
 def test_t2_complete_wrong_call_is_not_hidden_by_later_partial_call():

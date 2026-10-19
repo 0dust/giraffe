@@ -662,10 +662,10 @@ async def test_unstreamed_generation_cannot_pass_a_generation_rate_limit():
 
 async def test_sustained_timing_is_observational_when_recovery_is_fast(client):
     client.bad_sustained = True
-    report = await runner.run_suite(config(checks=["recovery"],
+    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.1,
                                           limits=Limits(latency_ms=100, min_samples=2)))
     result = check(report, "recovery")
-    assert result.status == "pass"
+    assert result.status == "pass", (result.summary, result.metrics["sustained_completion"])
     assert result.metrics["recovery"]["p95_ms"] < 100
     assert result.metrics["sustained"]["p95_ms"] == 500
 

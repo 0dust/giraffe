@@ -344,7 +344,7 @@ def exercise_output_shapes(monkeypatch):
 @pytest.mark.parametrize('name', ['streaming_fairness', 'size_matrix', 'mixed_interference', 'token_stress'])
 async def test_http_serial_and_healthy_concurrency_scenarios(monkeypatch, name, serial):
     exercise_output_shapes(monkeypatch)
-    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.004) as endpoint:
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.02) as endpoint:
         config = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
             checks=['concurrency'], concurrent_workloads={
                 'scenarios': [name], 'levels': [2], 'samples_per_bucket': 2, 'mixed_pairs': 2,
@@ -367,7 +367,7 @@ async def test_http_serial_and_healthy_concurrency_scenarios(monkeypatch, name, 
 
 @pytest.mark.parametrize('serial', [False, True])
 async def test_http_known_answers_require_concurrent_output(serial):
-    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.008) as endpoint:
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.02) as endpoint:
         report = await run_suite(configuration(samples=6, targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}]))
     for result in report.checks:
         if result.id in {'correctness', 'json'}:
@@ -376,7 +376,7 @@ async def test_http_known_answers_require_concurrent_output(serial):
 
 @pytest.mark.parametrize('concurrency,serial', [(1, False), (2, True), (2, False)])
 async def test_http_sessions_require_concurrent_conversations(concurrency, serial):
-    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.004) as endpoint:
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.02) as endpoint:
         report = await run_suite(configuration(checks=['sessions'], concurrency=concurrency,
             targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
             sessions={'sessions': 2, 'concurrency': concurrency, 'modes': ['live']}))
@@ -437,6 +437,7 @@ class StreamEndpoint:
                     for piece in pieces:
                         yield ('data: ' + json.dumps({'model': 'fake-model', 'choices': [{'delta': {'content': piece}}]}) + '\n\n').encode()
                         await asyncio.sleep(.001)
+                    await asyncio.sleep(.01)
                     yield ('data: ' + json.dumps({'choices': [{'delta': {}, 'finish_reason': finish}], 'usage': usage}) + '\n\ndata: [DONE]\n\n').encode()
                 finally:
                     await self.aclose()
@@ -464,6 +465,33 @@ async def test_streamed_suite_server_evidence_without_sockets(monkeypatch, seria
             assert check.status == expected, (check.id, check.summary, check.metrics)
     for name in config.concurrent_workloads.scenarios:
         assert scenario(report, name)['status'] == expected, scenario(report, name)
+
+
+@pytest.mark.parametrize('serial', [False, True])
+async def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypatch, serial):
+    endpoint = StreamEndpoint(monkeypatch, serial)
+    settings = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
+        checks=['correctness', 'sessions'], request_source='request_pack',
+        request_pack={'version': 1, 'cases': [
+            {'fixture_id': f'question-{index}', 'messages': [{'role': 'user', 'content': f'Return 42 for question {index}'}],
+             'scorer': 'exact', 'expected': '42'} for index in range(6)]},
+        sessions={'sessions': 2, 'concurrency': 2, 'modes': ['live']})
+    for _ in range(5):
+        report = await run_suite(settings)
+        expected = 'inconclusive' if serial else 'pass'
+        for result in report.checks:
+            if result.id in settings.checks:
+                assert result.status == expected, (result.id, result.summary, result.metrics)
+            if result.id == 'correctness':
+                pack = result.metrics['request_pack']
+                assert pack['control_status'] == 'pass'
+                assert pack['loaded_status'] == expected
+                assert all((case['loaded']['evidenced_overlap'] == 1 if serial else
+                            case['loaded']['evidenced_overlap'] >= 2) for case in pack['cases'])
+            if result.id == 'sessions':
+                assert (result.metrics['evidenced_session_overlap'] == 1 if serial else
+                        result.metrics['evidenced_session_overlap'] >= 2)
+        assert all(r.answer_chunks == 1 for r in report.requests)
 
 
 @pytest.mark.parametrize('levels,expected', [([1], 'pass'), ([1, 2], 'inconclusive')])
@@ -503,8 +531,8 @@ def test_mixed_active_decoding_excludes_response_cleanup():
 
 
 @pytest.mark.parametrize('serial', [False, True])
-async def test_http_default_single_chunk_answers_have_honest_concurrency(serial):
-    with FakeEndpoint(service_slots=1 if serial else None) as endpoint:
+async def test_http_single_chunk_answers_have_honest_concurrency(serial):
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.02) as endpoint:
         report = await run_suite(configuration(samples=6, targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}]))
     for check in report.checks:
         if check.id in {'correctness', 'json'}:
