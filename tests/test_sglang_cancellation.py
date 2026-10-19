@@ -128,7 +128,7 @@ def test_collector_cli_receives_native_otlp_and_rejects_invalid_input(tmp_path):
 def test_collector_cli_rejects_invalid_port_without_network(capsys, tmp_path):
     pytest.importorskip("opentelemetry.proto.collector.trace.v1.trace_service_pb2")
     from giraffe.cli import main
-    assert main(["sglang-traces", "--output", str(tmp_path / "traces"), "--port", "0"]) == 2
+    assert main(["sglang-traces", "--output", str(tmp_path / "traces"), "--port", "0"]) == 4
     assert "1..65535" in capsys.readouterr().err
 
 
