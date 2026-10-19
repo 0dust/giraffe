@@ -308,7 +308,7 @@ class Target(Model):
 
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("target url must be an http(s) endpoint")
+            raise ValueError("target url must start with http:// or https:// (for example http://localhost:11434/v1)")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("use an endpoint URL without credentials, query or fragment")
         if self.metrics_url:
@@ -1048,7 +1048,8 @@ class RunConfig(Model):
         if len(names) != len(set(names)):
             raise ValueError("target names must be unique")
         if set(self.checks) - set(CHECK_NAMES):
-            raise ValueError("checks must contain supported check names")
+            raise ValueError("Unknown check name(s): " + ", ".join(sorted(set(self.checks) - set(CHECK_NAMES)))
+                             + ". Valid names: " + ", ".join(CHECK_NAMES))
         if ("capacity" in self.checks and self.traffic.max_in_flight is not None
                 and self.traffic.max_in_flight > self.concurrency):
             raise ValueError(f"traffic.max_in_flight must not exceed global concurrency ({self.concurrency})")

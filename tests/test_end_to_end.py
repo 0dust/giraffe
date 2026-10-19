@@ -83,7 +83,7 @@ def read_report(path):
     return json.loads(path.read_text())
 
 
-def cli_run(tmp_path, config, name, *, baseline=None):
+def cli_run(tmp_path, config, name, *, baseline=None, skip_preflight=False):
     configuration = tmp_path / f"{name}.yaml"
     configuration.write_text(json.dumps(config.model_dump(mode="json")))
     output = tmp_path / name
@@ -91,6 +91,8 @@ def cli_run(tmp_path, config, name, *, baseline=None):
         sys.executable, "-m", "giraffe.cli", "run", "--config", str(configuration),
         "--output", str(output),
     ]
+    if skip_preflight:
+        command += ["--skip-preflight"]
     if baseline is not None:
         command += ["--baseline", str(baseline)]
     result = subprocess.run(
@@ -154,7 +156,7 @@ def test_cli_detects_semantic_regression_with_valid_http_completions(tmp_path):
 def test_cli_rejects_seeded_completion_failures(tmp_path, mode):
     with FakeEndpoint(mode=mode) as endpoint:
         result, report, _ = cli_run(
-            tmp_path, run_config(endpoint, checks=["serving"]), mode,
+            tmp_path, run_config(endpoint, checks=["serving"]), mode, skip_preflight=True,
         )
     assert result.returncode == 1 and report["overall"] == "fail"
     assert report["requests"]
@@ -171,7 +173,8 @@ def test_cli_honors_request_budget_and_never_runs_restart_hook_by_default(tmp_pa
         ]
         result, report, _ = cli_run(tmp_path, config, "bounded")
         observed_requests = len(endpoint.requests)
-    assert observed_requests == len(report["requests"]) <= 3
+    assert observed_requests == len(report["requests"]) + 1
+    assert len(report["requests"]) <= 3
     assert report["overall"] == "inconclusive" and result.returncode == 2
     assert report["abort_reason"]
     assert not marker.exists()

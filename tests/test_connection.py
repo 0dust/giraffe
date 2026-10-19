@@ -33,7 +33,7 @@ def endpoint(monkeypatch, handler):
             kwargs["transport"] = httpx.MockTransport(respond)
         return original(**kwargs)
 
-    monkeypatch.setattr("giraffe.web.httpx.AsyncClient", client)
+    monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient", client)
     return requests, clients
 
 
@@ -54,6 +54,7 @@ async def test_explicit_model_sends_one_bounded_request_and_preserves_auth(monke
     assert str(requests[0].url) == "http://server" + base + "/chat/completions"
     assert requests[0].headers["Authorization"] == "Bearer private-key"
     assert requests[0].headers["X-Gateway"] == "private-header"
+    assert requests[0].headers["X-Giraffe-Preflight"] == "1"
     payload = json.loads(requests[0].content)
     assert payload == {"model": "manual-model", "messages": [{"role": "user", "content": "Reply with OK."}],
                        "stream": False, "max_tokens": 32, "n": 1, "temperature": 0}
@@ -134,7 +135,7 @@ async def test_http_status_alone_does_not_prove_usable_inference(monkeypatch, re
 async def test_same_ca_proxy_and_environment_transport_apply_to_discovery_and_probe(monkeypatch):
     trust = ssl.create_default_context()
     ca_files = []
-    monkeypatch.setattr("giraffe.web.ssl.create_default_context",
+    monkeypatch.setattr("giraffe.preflight.ssl.create_default_context",
                         lambda *, cafile: ca_files.append(cafile) or trust)
     requests, clients = endpoint(monkeypatch, lambda request: httpx.Response(
         200, json={"data": [{"id": "model"}]} if request.method == "GET" else answer(),
@@ -170,7 +171,7 @@ async def test_network_errors_are_sanitized(monkeypatch, model):
 
 async def test_connection_deadline_does_not_retry(monkeypatch):
     timeout = asyncio.timeout
-    monkeypatch.setattr("giraffe.web.asyncio.timeout", lambda seconds: timeout(.01))
+    monkeypatch.setattr("giraffe.preflight.asyncio.timeout", lambda seconds: timeout(.01))
 
     async def slow(request):
         await asyncio.sleep(.1)
@@ -184,7 +185,7 @@ async def test_connection_deadline_does_not_retry(monkeypatch):
 
 async def test_api_validates_sensitive_inputs_and_creates_no_run_artifacts(tmp_path, monkeypatch):
     requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(200, json=answer()))
-    async with browser(tmp_path) as client:
+    async with browser(tmp_path / "runs") as client:
         for invalid in [{"url": "http://user:PRIVATE@server"},
                         {"url": "http://server?key=PRIVATE"},
                         {"url": "file:///PRIVATE"},
@@ -202,7 +203,7 @@ async def test_api_validates_sensitive_inputs_and_creates_no_run_artifacts(tmp_p
                                      json={"url": "http://server", "model": "model"})
         assert response.status_code == 200 and response.json()["status"] == "connected"
         assert (await client.get("/api/runs")).json()["runs"] == []
-    assert sorted(path.name for path in tmp_path.iterdir()) == [".baselines"]
+    assert not list(tmp_path.iterdir())
 
 
 async def test_active_run_blocks_extra_connection_traffic(tmp_path, monkeypatch):
