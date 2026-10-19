@@ -334,16 +334,16 @@ def final_answer(output: str) -> tuple[str, bool, bool]:
     return (before + output[cursor:]).lstrip() if not before.strip() else before + output[cursor:], True, False
 
 
-def lenient_exact(text: str) -> str:
+def lenient_exact(text: str, expected: str = "") -> str:
     """Remove one trailing period and one layer of surrounding emphasis, code or quotes."""
     text = text.strip()
-    period = text.endswith(".")
+    period = not expected.endswith(".") and text.endswith(".")
     text = text[:-1].rstrip() if period else text
     for opening, closing in _WRAPPERS:
         if len(text) > len(opening) + len(closing) and text.startswith(opening) and text.endswith(closing):
             text = text[len(opening):-len(closing)].strip()
             break
-    return text[:-1].rstrip() if not period and text.endswith(".") else text
+    return text[:-1].rstrip() if not expected.endswith(".") and not period and text.endswith(".") else text
 
 
 def exact_matches(actual: str, expected: str, workload: dict | None = None) -> tuple[bool, bool]:
@@ -352,7 +352,7 @@ def exact_matches(actual: str, expected: str, workload: dict | None = None) -> t
     if actual == expected:
         return True, False
     lenient = (workload or {}).get("request_source") not in STRICT_EXACT_SOURCES
-    return (True, True) if lenient and lenient_exact(actual) == expected else (False, False)
+    return (True, True) if lenient and lenient_exact(actual, expected) == expected else (False, False)
 
 
 def _contains(actual: str, expected: str) -> bool:
@@ -364,7 +364,8 @@ def _contains(actual: str, expected: str) -> bool:
         # Decimal/group separators join adjacent digits into one numeric token.
         if expected and (expected[0].isdigit() or expected[0] in ".,"):
             left |= bool(start and actual[start - 1].isdigit())
-            left |= bool(start and actual[start - 1] in "+-")
+            left |= bool(start and actual[start - 1] in "+-−–—"
+                         and (start < 2 or not actual[start - 2].isalnum()))
             left |= bool(start >= 2 and actual[start - 1] in ".," and actual[start - 2].isdigit())
         if expected and (expected[-1].isdigit() or expected[-1] in ".,"):
             right |= bool(end < len(actual) and actual[end].isdigit())
@@ -422,6 +423,19 @@ def _incomplete_json(answer: str) -> bool:
         return False
     except json.JSONDecodeError as error:
         tail = text[error.pos:]
+        number = re.search(r'(?:^|[\s\[:,])(-?(?:0|[1-9][0-9]*)?(?:\.[0-9]*)?(?:[eE][+-]?[0-9]*)?)$', text)
+        if number and number[1]:
+            # Complete just the final numeric token, then let the decoder prove
+            # that no earlier syntax error was hidden by the truncated tail.
+            token = number[1]
+            if (token == "-" or re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.|(?:\.[0-9]+)?[eE][+-]?)', token)):
+                completed = text + "0"
+                try:
+                    json.loads(completed)
+                    return True
+                except json.JSONDecodeError as partial:
+                    if partial.pos == len(completed):
+                        return True
         return (error.pos >= len(text) or error.msg.startswith("Unterminated string")
                 or bool(tail) and any(word.startswith(tail) for word in ("true", "false", "null")))
     except (ValueError, RecursionError):
@@ -506,8 +520,11 @@ def _tool_calls_outcome(expectation: ToolExpectation, record: RequestRecord) -> 
     for index, (call, name) in enumerate(zip(calls, names, strict=True)):
         if call.get("type", "function") != "function":
             return ToolCheckOutcome(status="fail", message="Wrong tool-call type: expected a function.")
+        raw = call["function"].get("arguments")
+        if truncated and index == len(calls) - 1 and isinstance(raw, str) and not raw.strip():
+            return unverified
         try:
-            values.append(_parsed_tool_arguments(call["function"].get("arguments"), schemas[name]))
+            values.append(_parsed_tool_arguments(raw, schemas[name]))
         except ToolSchemaBudgetExceeded:
             return ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
         except RecursionError:
@@ -550,14 +567,18 @@ def _tool_choice_outcomes(expectation: ToolExpectation, record: RequestRecord):
         if name not in schemas or call.get("type") != "function":
             arguments = ToolCheckOutcome(status="fail", message="Call does not reference a declared function.")
             break
+        raw = call["function"].get("arguments")
+        if truncated and index == len(calls) - 1 and isinstance(raw, str) and not raw.strip():
+            arguments = ToolCheckOutcome(status="inconclusive", message="Tool arguments were truncated.")
+            break
         try:
-            parsed.append(_parsed_tool_arguments(call["function"].get("arguments"), schemas[name]))
+            parsed.append(_parsed_tool_arguments(raw, schemas[name]))
         except (ToolSchemaBudgetExceeded, RecursionError):
             arguments = ToolCheckOutcome(status="inconclusive", message="Tool argument validation exceeded bounded evaluation limits.")
             break
         except (ValueError, TypeError, KeyError, Unresolvable, SchemaError, ValidationError) as error:
             partial = (truncated and index == len(calls) - 1 and isinstance(error, json.JSONDecodeError)
-                       and _incomplete_json(call["function"]["arguments"]))
+                       and _incomplete_json(raw))
             arguments = ToolCheckOutcome(status="inconclusive" if partial else "fail", message=
                 "Tool arguments were truncated." if partial else "Tool arguments are malformed or do not satisfy the declared schema.")
             break

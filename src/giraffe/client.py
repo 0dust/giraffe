@@ -442,7 +442,7 @@ class LLMClient:
                             record.logprob_evidence = LogprobEvidence(status="rejected" if rejected else "incomplete",
                                 reason="Logprob request field rejected." if rejected else "HTTP request failed; logprob support unverified.",
                                 requested_top_logprobs=spec.workload["top_logprobs"])
-                        if response.status_code in {400, 413, 422} and spec.scenario.startswith("context"):
+                        if response.status_code in {400, 413, 422} and spec.scenario.startswith(("context", "prefix_")):
                             # Classify only documented engine rejections (vLLM/SGLang, TGI, llama.cpp);
                             # never retain arbitrary server error text or echoed request content.
                             body = (await _limited_body(response)).decode("utf-8", errors="replace").lower()

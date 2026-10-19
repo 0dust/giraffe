@@ -217,11 +217,25 @@ async def arrivals(run, target, client, fixtures):
 
 
 def prefix_admitted(input_chars, max_tokens, context_limit):
-    # Generated ASCII prose: estimate four characters per token plus a template reserve.
-    return (input_chars + 3) // 4 + max_tokens + 32 <= context_limit
+    # Filler can use ~3.6 chars/token; reserve extra for the hex nonce and template.
+    return (input_chars + 2) // 3 + 20 + max_tokens + 32 <= context_limit
 
 
 async def prefixes(run, target, client):
+    from giraffe.runner import _context_rejection, _serving_failure
+
+    async def send(request):
+        record = await run.request(target, client, request)
+        if record is not None and _context_rejection(record):
+            # Undo the serving-health charge for our own prompt-sizing failure.
+            if _serving_failure(record, request.scenario):
+                run.errors -= 1
+            record.check_ids = list(request.check_ids)
+            run.unfinished[target.name].add("prefix")
+            run.observations[target.name]["prefix_stop"] = "Generated prompt exceeded the server context length."
+            return None
+        return record
+
     settings = run.config.prefix
     nonce = uuid.uuid4().hex + "\n"
     prefix = nonce + (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
@@ -252,7 +266,7 @@ async def prefixes(run, target, client):
                 run.observations[target.name]["prefix_stop"] = "Estimated token admission ceiling reached."
                 return
             request.options = deterministic_options(run.config, request.options)
-            if not await run.request(target, client, request):
+            if not await send(request):
                 return
     history = []
     for turn in range(settings.history_turns):
@@ -268,7 +282,7 @@ async def prefixes(run, target, client):
             )
             break
         request.options = deterministic_options(run.config, request.options)
-        if not await run.request(target, client, request):
+        if not await send(request):
             break
         history = [*messages, {"role": "assistant", "content": "K7P4"}]
 
@@ -1038,6 +1052,11 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if probability_status == "inconclusive" and status != "fail" and reasons:
                 summary += " " + " ".join(reason[:1].upper() + reason[1:].rstrip(".") + "." for reason in reasons)
         assessed_stats = stats(assessed)
+        from giraffe.runner import _context_rejection
+        prefix_rejected = [r for r in assessed if check == "prefix" and _context_rejection(r)]
+        prefix_rejected_ids = {r.id for r in prefix_rejected}
+        if check == "prefix":
+            metrics["context_rejections"] = len(prefix_rejected)
         budget_records = [r for r in assessed if check in {"prefix", "sessions", "tools"} and reasoning_budget(r)]
         if check in {"prefix", "sessions", "tools"}:
             metrics["reasoning_budget_unscored"] = len(budget_records)
@@ -1050,9 +1069,10 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
              run.config.consistency.logprobs.support == "discover")
             or (r.tool_conversation and r.tool_conversation["status"] == "inconclusive")
             or (check in {"prefix", "sessions", "tools"} and reasoning_budget(r))
+            or r.id in prefix_rejected_ids
         )])["error_rate"]
-        if budget_records:
-            metrics["failed"] -= stats(budget_records)["failed"]
+        if budget_records or prefix_rejected:
+            metrics["failed"] -= stats(budget_records + prefix_rejected)["failed"]
             metrics["error_rate"] = errors
         cap_violations = [
             r.id
@@ -1111,6 +1131,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 "inconclusive",
                 "Requested workload coverage unfinished within shared budgets.",
             )
+        if prefix_rejected and status != "fail":
+            status, summary = "inconclusive", "Server rejected a Giraffe-built prefix prompt for context length; token admission estimate did not fit."
         if check == "consistency" and run.config.consistency.logprobs:
             probability = metrics["logprobs"]
             if not probability["strict"] and any(

@@ -8,7 +8,7 @@ from typing import Any
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.concurrent_workloads import SCENARIOS, execution_config
-from giraffe.models import CHECK_NAMES, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
+from giraffe.models import CHECK_NAMES, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -109,17 +109,15 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 count = sum(_steady_count(rate, traffic.duration_seconds) for rate in traffic.rates)
                 kind = "exact"
             else:
-                count = round(sum(traffic.rates) * traffic.duration_seconds)
-                kind = "estimate"
+                count = sum(min(round(rate * traffic.duration_seconds), MAX_PLANNED_ARRIVALS)
+                            for rate in traffic.rates)
+                kind = "exact"
             add("capacity", count,
-                (f"About {count} requests are expected across {len(traffic.rates)} rates. " if kind == "estimate"
-                 else f"Starts {count} requests across {len(traffic.rates)} rates. ")
+                f"Starts {count} requests across {len(traffic.rates)} rates. "
                 + "Requests may be dropped if all request slots are busy.",
                 source="your dataset" if pack else "generated examples", kind=kind)
         if len(traffic.rates) * traffic.duration_seconds > config.max_duration_seconds:
             warnings.append("The selected rates need more time than the run limit allows, before connection and answer checks.")
-        if traffic.arrival == "poisson" and not pack:
-            warnings.append("Random arrival timing uses an expected request count. The saved seed may produce more or fewer requests.")
 
     if "fairness" in selected:
         count = config.effective_check("fairness")["samples"]
@@ -172,6 +170,14 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Backend cancellation verification")
     if "recovery" in selected:
         options = config.effective_check("recovery")
+        later = [name for name in config.checks if name not in CORE_CHECKS]
+        later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["known_per_target"]
+        prior = sum(row["requests_per_target"] or 0 for row in rows)
+        needed = later_known + 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
+        eligible = [quota - prior > needed for quota in quotas.values()]
+        uncertain = any(row["kind"] != "exact" for row in rows) or len(set(eligible)) > 1
+        add("recovery_prime", int(any(eligible)), "One baseline warm-up when remaining target/run budget exceeds later fixed work, both probe batches and the minimum load batch.",
+            kind="bounded" if any(eligible) and uncertain else "exact", title="Recovery baseline warm-up")
         add("recovery_baseline", options["samples"], "Matched quiet controls before sustained load.")
         add("recovery", options["samples"], "Fixed follow-up health requests after sustained load.")
         if options["sustained_seconds"] > 0:

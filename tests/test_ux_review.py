@@ -15,7 +15,7 @@ def configuration(**overrides):
 
 @pytest.mark.parametrize("config,kind", [
     (configuration(checks=["access", "correctness"]), "exact"),
-    (configuration(checks=["capacity"], traffic={"arrival": "poisson", "rates": [1, 2], "duration_seconds": 1}), "estimate"),
+    (configuration(checks=["capacity"], traffic={"arrival": "poisson", "rates": [1, 2], "duration_seconds": 1}), "exact"),
     (configuration(checks=["fairness"], concurrency=2), "bounded"),
 ])
 def test_visible_traffic_keeps_count_certainty_and_limits(config, kind):
