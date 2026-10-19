@@ -20,7 +20,7 @@ async def test_discovery_normalizes_url_and_preserves_auth(monkeypatch, suffix):
     client = httpx.AsyncClient
     monkeypatch.setenv("GIRAFFE_TEST_KEY", "private-key")
     monkeypatch.setenv("GIRAFFE_TEST_HEADER", "private-gateway-key")
-    monkeypatch.setattr("giraffe.web.httpx.AsyncClient",
+    monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
     result = await discover_models(ModelDiscovery(url="http://server" + suffix,
                                   api_key_env="GIRAFFE_TEST_KEY",
@@ -51,7 +51,7 @@ async def test_discovery_errors_are_bounded_and_do_not_echo_remote_body(monkeypa
         return response
 
     client = httpx.AsyncClient
-    monkeypatch.setattr("giraffe.web.httpx.AsyncClient",
+    monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
     with pytest.raises(HTTPException) as error:
         await discover_models(ModelDiscovery(url="http://server"))
@@ -62,7 +62,7 @@ async def test_discovery_errors_are_bounded_and_do_not_echo_remote_body(monkeypa
 
 async def test_discovery_missing_auth_does_not_connect(monkeypatch):
     monkeypatch.delenv("GIRAFFE_MISSING_KEY", raising=False)
-    monkeypatch.setattr("giraffe.web.httpx.AsyncClient", lambda **kw: pytest.fail("Connected"))
+    monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient", lambda **kw: pytest.fail("Connected"))
     with pytest.raises(HTTPException, match="authentication environment variable"):
         await discover_models(ModelDiscovery(url="http://server", api_key_env="GIRAFFE_MISSING_KEY"))
 
@@ -72,7 +72,7 @@ async def test_discovery_network_error_is_actionable(monkeypatch):
         raise httpx.ConnectError("private exception", request=request)
 
     client = httpx.AsyncClient
-    monkeypatch.setattr("giraffe.web.httpx.AsyncClient",
+    monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
     with pytest.raises(HTTPException) as error:
         await discover_models(ModelDiscovery(url="http://server"))

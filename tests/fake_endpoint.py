@@ -33,6 +33,7 @@ class FakeEndpoint:
         self.chunk_delay = chunk_delay
         self.fault_contains = fault_contains
         self.requests: list[dict[str, Any]] = []
+        self.preflight_markers: list[str | None] = []
         self.request_started_at: list[float] = []
         self.request_finished_at: list[float] = []
         self.metrics_text = 'vllm:kv_cache_usage_perc{model_name="fake-model",engine="0"} 0.95\nvllm:num_requests_running{engine="0"} 2\nvllm:num_requests_waiting{engine="0"} 1\nvllm:num_preemptions_total{engine="0"} 5\n'
@@ -116,6 +117,7 @@ class FakeEndpoint:
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 with endpoint._lock:
                     endpoint.requests.append(payload)
+                    endpoint.preflight_markers.append(self.headers.get("X-Giraffe-Preflight"))
                     endpoint.request_started_at.append(time.monotonic())
                     endpoint.active += 1
                     endpoint.peak_active = max(endpoint.peak_active, endpoint.active)

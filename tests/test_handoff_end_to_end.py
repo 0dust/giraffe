@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from collections import Counter
 
 import pytest
 
@@ -72,14 +73,24 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
             assert envelope["outcome"] == "pass"
             replay = json.loads(Path(envelope["report_paths"]["json"]).read_text())
             assert replay["manifest"]["config"] == exported.json()
-            assert len(endpoint.requests) > before
+            traffic = endpoint.requests[before:]
+            assert len(traffic) == len(replay["requests"]) + 1
+            assert endpoint.preflight_markers[before:] == ["1"] + [None] * len(replay["requests"])
+            assert traffic[0] == {"model": "fake-model", "messages": [{"role": "user", "content": "Reply with OK."}],
+                                  "stream": False, "max_tokens": 32, "n": 1}
+            assert all(record["fixture_id"] != "connection" and record["scenario"] != "connection"
+                       for record in replay["requests"])
             assert {r["fixture_id"] for r in replay["requests"]} == {
                 r["fixture_id"] for r in original["report"]["requests"]
             }
             if request_source == "request_pack":
                 assert len(replay["requests"]) == 12
                 assert replay["requests"][0]["fixture_id"] == "pack:operator-question-0"
-                assert endpoint.requests[before:][0]["messages"] == config["request_pack"]["cases"][0]["messages"]
+                replayed = traffic[1:]
+                assert replayed[0]["messages"] == config["request_pack"]["cases"][0]["messages"]
+                assert replayed[:6] == endpoint.requests[:6]
+                assert Counter(json.dumps(request, sort_keys=True) for request in replayed[6:]) == Counter(
+                    json.dumps(request, sort_keys=True) for request in endpoint.requests[6:before])
             if compare:
                 assert replay["baseline"]["run_id"] == original["report"]["run_id"]
                 assert replay["baseline"]["status"] == "pass"
