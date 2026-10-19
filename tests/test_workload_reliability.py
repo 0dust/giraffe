@@ -192,6 +192,7 @@ async def test_w6_pool_refills_immediately_and_flags_tail_samples():
         return SimpleNamespace(target=target.name, timing_start_ms=starts[index] * 1000,
                                first_output_ms=.1, last_output_ms=(ends[-1] - starts[index]) * 1000,
                                elapsed_ms=(ends[-1] - starts[index]) * 1000,
+                               stream_end_ms=(ends[-1] - starts[index]) * 1000,
                                workload={})
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2)
@@ -531,7 +532,7 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
         on_start()
         await gates[index].wait()
         return SimpleNamespace(id=str(index), target=target.name, timing_start_ms=0,
-                               first_output_ms=.1, last_output_ms=now, elapsed_ms=now, workload={})
+                               first_output_ms=.1, last_output_ms=now, elapsed_ms=now, stream_end_ms=now, workload={})
 
     monkeypatch.setattr(workload, 'time', SimpleNamespace(monotonic=lambda: now))
     run = SimpleNamespace(allowed=lambda _: True, request=request)
@@ -539,7 +540,7 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
         [spec('p', 's', 'buckets')], 3, 3))
     while len(started) < 3:
         await asyncio.sleep(0)
-    for index, finish in enumerate((1, 2, 4)):
+    for index, finish in enumerate((2, 4, 8)):
         now = finish
         gates[index].set()
         await asyncio.sleep(0)

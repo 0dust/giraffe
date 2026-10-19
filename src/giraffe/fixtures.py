@@ -461,7 +461,11 @@ def _parsed_tool_arguments(arguments: Any, schema: dict) -> dict:
 
 
 def reasoning_budget(record: RequestRecord) -> bool:
-    return (not record.valid and record.finish_reason == "length" and (
+    if record.valid or record.finish_reason != "length":
+        return False
+    answer, stripped, _ = final_answer(record.output)
+    return (not answer.strip()
+        and (bool(record.reasoning.strip()) or stripped or record.reasoning_stripped or (record.reasoning_tokens or 0) > 0) and (
         record.status == "completed" and record.error == "reasoning exhausted the output budget before an answer"
         or record.status == "failed" and record.error == "response contained no useful answer output"))
 

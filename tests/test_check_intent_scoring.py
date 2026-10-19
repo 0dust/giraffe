@@ -248,7 +248,7 @@ def test_jd1_judge_accepts_one_complete_fence(fence):
 @pytest.mark.parametrize("status,wording", [(400, "maximum context"), (422, "context length"),
     (400, "context size"), (413, "too many tokens"), (400, "context_length"),
     (400, "context window"), (400, "max_model_len")])
-async def test_x1_calibrated_engine_rejections_fail_consistently(monkeypatch, status, wording):
+async def test_x1_calibrated_near_limit_rejections_are_inconclusive(monkeypatch, status, wording):
     import re
     def handler(request):
         payload = json.loads(request.content)
@@ -261,8 +261,8 @@ async def test_x1_calibrated_engine_rejections_fail_consistently(monkeypatch, st
             "usage": {"prompt_tokens": tokens, "completion_tokens": 2}})
     mock_transport(monkeypatch, handler)
     result = check(await runner.run_suite(tool_config(checks=["context"], context_limit=4096, concurrency=1)), "context")
-    assert result.status == "fail", result.summary
-    assert "server rejected an " in result.summary and "85% of declared context_limit" in result.summary
+    assert result.status == "inconclusive", result.summary
+    assert "server rejected" in result.summary and "70% estimated" in result.summary
     assert "PRIVATE" not in result.model_dump_json()
 
 
@@ -325,6 +325,7 @@ def test_r1_both_reasoning_budget_record_contracts(check_id, real_failure, statu
     for kind in ("shared", "independent"):
         for index in range(3):
             item = record(spec, status=status, valid=False, error=error, finish_reason="length",
+                reasoning="thinking",
                 input_tokens=2100, cached_prompt_tokens=2048 if kind == "shared" else 0,
                 scenario=f"prefix_{kind}", input_chars=8400, workload={"shared_prefix_chars": 8192})
             assert reasoning_budget(item)

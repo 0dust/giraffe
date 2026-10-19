@@ -27,7 +27,7 @@ def client(monkeypatch):
 
 @pytest.mark.parametrize("shape", ["legacy", "completed"])
 @pytest.mark.parametrize("fixture,usage,status", [
-    ("limits.output_cap", 8, "pass"), ("limits.output_cap", 7, "pass"),
+    ("limits.output_cap", 8, "pass"), ("limits.output_cap", 7, "fail"),
     ("limits.output_cap", 9, "fail"), ("limits.output_cap", None, "inconclusive"),
     ("limits.stop.", 24, "inconclusive"), ("limits.stop_control", 24, "inconclusive"),
 ])

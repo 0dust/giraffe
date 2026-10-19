@@ -25,7 +25,7 @@ _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_RESPONSE_EVENTS = 256
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 _MAX_CONTENT_READS = 65536
-_REASONING_OPEN = re.compile(r"<(think|thinking|reasoning)>", re.IGNORECASE)
+_REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
@@ -62,9 +62,11 @@ def _headers(target: Target) -> dict[str, str]:
     return headers
 
 
-async def _limited_body(response: httpx.Response) -> bytes:
+async def _limited_body(response: httpx.Response, *, on_read=None) -> bytes:
     body = bytearray()
     async for chunk in response.aiter_bytes():
+        if on_read is not None:
+            on_read(time.perf_counter())
         if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
             raise _ProtocolError("response exceeded the 4 MiB safety limit")
         body.extend(chunk)
@@ -139,18 +141,21 @@ def _token_count(value: Any) -> int | None:
 
 def _answer_spans(output: str) -> list[tuple[int, int]] | None:
     """Raw-output spans that fixtures.final_answer keeps; None when reasoning is unclosed."""
-    start = 0
-    closings = list(re.finditer(r"</(?:think|thinking|reasoning)>", output, re.IGNORECASE))
-    if closings and not _REASONING_OPEN.search(output, 0, closings[0].start()):
-        start = closings[-1].end()
-    spans = []
-    while match := _REASONING_OPEN.search(output, start):
-        closing = re.compile(rf"</{match[1]}>", re.IGNORECASE).search(output, match.end())
-        if closing is None:
-            return None
-        spans.append((start, match.start()))
-        start = closing.end()
-    return [*spans, (start, len(output))]
+    cursor, spans, stack = 0, [], []
+    for tag in _REASONING_TAG.finditer(output):
+        name = tag[2].lower()
+        if not tag[1]:
+            if not stack:
+                spans.append((cursor, tag.start()))
+            stack.append(name)
+        elif stack:
+            if stack[-1] == name:
+                stack.pop()
+                if not stack:
+                    cursor = tag.end()
+        else:
+            spans, cursor = [], tag.end()
+    return None if stack else [*spans, (cursor, len(output))]
 
 
 def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[tuple[int, int]]:
@@ -337,6 +342,8 @@ class LLMClient:
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
+            if streaming and (_REASONING_TAG.sub("", answer).strip() or reasoning.strip()):
+                record.generation_chunks += 1
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > 16:
@@ -402,7 +409,7 @@ class LLMClient:
                     record.last_output_ms = (now - start) * 1000
             if reasoning:
                 record.reasoning += reasoning
-                if record.first_reasoning_ms is None:
+                if reasoning.strip() and record.first_reasoning_ms is None:
                     record.first_reasoning_ms = (now - start) * 1000
             if streaming:
                 record.chunks += 1
@@ -460,20 +467,24 @@ class LLMClient:
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
+                                record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
                             receive(_object(event), streaming=True, observed_at=observed_at)
                             if (spec.cancel_after_chunks is not None
-                                    and record.answer_chunks >= spec.cancel_after_chunks
+                                    and record.generation_chunks >= spec.cancel_after_chunks
                                     and record.finish_reason is None):
+                                record.client_cancelled_ms = (time.perf_counter() - start) * 1000
                                 record.client_cancelled_at_ns = time.time_ns()
                                 record.client_cancelled_monotonic_ns = time.monotonic_ns()
                                 raise _IntentionalCancellation
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
-                        body = await _limited_body(response)
-                        observed_at = time.perf_counter()
+                        def body_read(at):
+                            record.stream_end_ms = (at - start) * 1000
+                        body = await _limited_body(response, on_read=body_read)
+                        observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
                         receive(_object(body), streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
@@ -486,9 +497,10 @@ class LLMClient:
                         if any(not call["id"] or call["type"] != "function" or not call["function"]["name"] for call in record.tool_calls) or len(set(ids)) != len(ids):
                             raise _ProtocolError("incomplete tool-call ID/type/function structure")
                     from .fixtures import final_answer
-                    final, _, _ = final_answer(record.output)
+                    final, stripped, _ = final_answer(record.output)
                     if spec.scorer != "tool" and not final.strip():
-                        if record.finish_reason == "length":
+                        if record.finish_reason == "length" and (record.reasoning.strip() or stripped
+                                                                  or (record.reasoning_tokens or 0) > 0):
                             # The endpoint honoured Giraffe's own output budget: not a
                             # serving failure, but also not an answer.
                             record.status, record.error = "completed", REASONING_BUDGET_ERROR
@@ -504,7 +516,7 @@ class LLMClient:
                         record.assistant_message["tool_calls"] = record.tool_calls
                     record.status, record.valid = "completed", True
         except _IntentionalCancellation:
-            record.status, record.error = "cancelled", "intentional cancellation after answer chunks"
+            record.status, record.error = "cancelled", "intentional cancellation after generation chunks"
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
@@ -531,7 +543,7 @@ class LLMClient:
             final, stripped, _ = final_answer(record.output)
             record.answer_chars = len(final)
             spans = _answer_spans(record.output)
-            if (record.reasoning.strip() or stripped) and record.reasoning_tokens is None:
+            if (record.reasoning.strip() or stripped) and not record.reasoning_tokens:
                 record.output_tokens = None
             record.reasoning_stripped = record.reasoning_stripped or stripped
             reasoning_spans = _reasoning_spans(spans, len(record.output))
@@ -541,7 +553,7 @@ class LLMClient:
                 end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
                 text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
                 if (stripped and record.first_reasoning_ms is None
-                        and any(record.output[max(offset, a):min(end, b)].strip()
+                        and any(_REASONING_TAG.sub("", record.output[max(offset, a):min(end, b)]).strip()
                                 for a, b in reasoning_spans)):
                     record.first_reasoning_ms = (at - start) * 1000
                 if not text.strip():

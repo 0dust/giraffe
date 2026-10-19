@@ -32,7 +32,8 @@ def record(name, start=0, first=10, last=20, **extra):
         'check_ids': ['correctness'], 'started_at': 'now', 'status': 'completed',
         'valid': True, 'score': True, 'finish_reason': 'stop', 'timing_start_ms': start,
         'first_output_ms': first, 'last_output_ms': last, 'dispatch_ms': start - 100,
-        'elapsed_ms': last or 20, 'answer_chunks': 2, 'stream': True, 'overlap': 8,
+        'elapsed_ms': last or 20, 'stream_end_ms': extra.get('elapsed_ms', last or 20),
+        'answer_chunks': 2, 'stream': True, 'overlap': 8,
         'completion_tokens': 80, 'output_tokens': 80, 'input_tokens': 100,
         'requested_max_tokens': 128, **extra})
 
@@ -47,7 +48,7 @@ def test_output_windows_use_stream_completion_and_strict_intersections():
     assert evidenced_overlap(a, [a, b]) == 1  # Touching boundaries are serial.
     point = record('point', 105, 10, 10)
     assert evidenced_overlap(a, [a, point]) == 1  # Zero intersection cannot qualify.
-    point.elapsed_ms = 18
+    point.stream_end_ms = 18
     assert output_window(point) == (115, 123)
     assert evidenced_overlap(a, [a, point]) == evidenced_overlap(point, [a, point]) == 2
     assert peak_evidenced_concurrency([a, point]) == 2
@@ -346,6 +347,7 @@ async def test_http_serial_and_healthy_concurrency_scenarios(monkeypatch, name, 
     exercise_output_shapes(monkeypatch)
     with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.02) as endpoint:
         config = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
+            request_timeout_seconds=10 if name == 'size_matrix' else 5,
             checks=['concurrency'], concurrent_workloads={
                 'scenarios': [name], 'levels': [2], 'samples_per_bucket': 2, 'mixed_pairs': 2,
                 'input_chars': {'short': 128, 'medium': 1024, 'long': 4096},
@@ -353,6 +355,10 @@ async def test_http_serial_and_healthy_concurrency_scenarios(monkeypatch, name, 
                 'stress_cases': [{'name': 'long_input_summary', 'input_tokens': 200,
                                   'output_tokens': 20, 'min_output_tokens': 1}]})
         report = await run_suite(config)
+    if name == 'size_matrix':
+        # Two serial 100-chunk responses need ~4 seconds plus transport/scheduler headroom.
+        assert all(r.status == 'completed' for r in report.requests), [
+            (r.scenario, r.status, r.error) for r in report.requests if r.status != 'completed']
     result = scenario(report, name)
     assert result['status'] == ('inconclusive' if serial else 'pass'), result
     if serial and name == 'streaming_fairness':

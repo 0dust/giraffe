@@ -163,7 +163,8 @@ def summarize_logprobs(records, settings, *, min_samples=2):
                        'evidenced_overlap': max((r.workload.get('evidenced_overlap', 0) for r in batch), default=0),
                        'tail_samples': [r.id for r in batch if not r.workload.get('load_qualified', False)]}
                       for repeat in range(settings.repetitions)]
-            available = [r for r in samples if usable(r) and r.workload.get('load_qualified', False)]
+            available = [r for r in samples if usable(r) and r.workload.get('load_qualified', False)
+                         and (level == 1 or r.stream)]
             comparison = compare_samples(available, prefix_cache=prefix_cache)
             complete = (len(observed) == planned and set(observed) == expected
                         and len(priming) == width * options.priming_rounds
@@ -172,6 +173,9 @@ def summarize_logprobs(records, settings, *, min_samples=2):
                         and comparison['compared_positions'] >= MIN_COMPARED_POSITIONS)
             status = comparison_status(comparison, options, complete)
             reasons = []
+            truncated = sorted({r.requested_max_tokens for r in cohort if r.finish_reason == 'length'})
+            if truncated:
+                reasons.append(f"The output budget ({', '.join(map(str, truncated))} tokens) was exhausted before the complete logprob passage; raise max_output_tokens.")
             if level > 1 and len(available) < min_samples:
                 reasons.append(NEEDS_STREAM if not any(r.stream for r in samples) else
                                'Requested concurrency was not evidenced by overlapping server output.')

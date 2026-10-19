@@ -1233,10 +1233,13 @@ class RequestRecord(Model):
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
     client_cancelled_monotonic_ns: int | None = None
+    client_cancelled_ms: float | None = None
     elapsed_ms: float = 0
+    stream_end_ms: float | None = None
     first_output_ms: float | None = None
     last_output_ms: float | None = None
     answer_chunks: int = 0
+    generation_chunks: int = 0
     answer_reads: int = 0
     answer_chars: int = 0
     first_read_answer_chars: int = 0
@@ -1300,6 +1303,19 @@ class RequestRecord(Model):
         return not (self.stream and self.answer_reads <= 1 and self.completion_tokens in (1, 2))
 
     @property
+    def first_read_tokens(self) -> float | None:
+        chars = self.answer_chars or (self.output_chars if not self.reasoning_stripped else 0)
+        if self.output_tokens is None or chars <= 0 or self.first_read_answer_chars <= 0:
+            return None
+        return max(1.0, self.output_tokens * self.first_read_answer_chars / chars)
+
+    @property
+    def measured_stream_gap(self) -> bool:
+        first = self.first_read_tokens
+        return (self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
+                and first is not None and first <= MAX_TOKENS_PER_READ)
+
+    @property
     def generation_tokens_per_second(self) -> float | None:
         """Client-observed estimate; streamed reads are not individual tokens.
 
@@ -1313,12 +1329,11 @@ class RequestRecord(Model):
                 or self.output_tokens is None or self.output_tokens <= 1
                 or reads < 2 or self.first_output_ms is None
                 or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms
-                or ((self.reasoning_stripped or self.reasoning.strip()) and self.reasoning_tokens is None)):
+                or ((self.reasoning_stripped or self.reasoning.strip()) and not self.reasoning_tokens)):
             return None
-        chars = self.answer_chars or (self.output_chars if not self.reasoning_stripped else 0)
-        if chars <= 0 or self.first_read_answer_chars <= 0:
+        first = self.first_read_tokens
+        if first is None or first > MAX_TOKENS_PER_READ:
             return None
-        first = max(1.0, self.output_tokens * self.first_read_answer_chars / chars)
         later = self.output_tokens - first
         if later <= 0 or later / (reads - 1) > MAX_TOKENS_PER_READ:
             return None
