@@ -74,19 +74,24 @@ function coatGeometry(count,width,height,{seed=count,columns,inset=4.5,jitter=.5
   const outlines=coatPolygons(sites,width,height,0,reach),inner=coatPolygons(sites,width,height,inset,reach);
   return sites.map((site,i)=>({site,points:(inner[i].length>2?inner[i]:outlines[i]).map(([x,y])=>`${x.toFixed(2)},${y.toFixed(2)}`).join(' ')}));
 }
-function reticulateCells(count) {
-  if(mosaicGeometry.has(count))return mosaicGeometry.get(count);
+// layout lets a partial last page reuse a full page's spot size and columns, so 2 leftover requests stay 2 normal spots.
+function reticulateCells(count,layout=count) {
+  const key=`${count}:${layout}`;
+  if(mosaicGeometry.has(key))return mosaicGeometry.get(key);
+  const basis=Math.max(count,layout);
   // Spots stay a readable size: a handful of requests never stretch into slabs.
-  const size=Math.max(34,Math.min(84,Math.sqrt(960*300/Math.max(1,count))));
+  const size=Math.max(34,Math.min(84,Math.sqrt(960*300/Math.max(1,basis))));
   // Keep the coat roughly 3:1 so small runs still read as spots, not slabs.
-  const rows=Math.ceil(count/Math.max(1,Math.min(count,Math.round(960/size),Math.ceil(Math.sqrt(count*3))))),columns=Math.ceil(count/rows);
-  const width=Math.round(columns*size),height=Math.round(Math.max(1,rows)*size*.86);
+  const basisRows=Math.ceil(basis/Math.max(1,Math.min(basis,Math.round(960/size),Math.ceil(Math.sqrt(basis*3))))),columns=Math.ceil(basis/basisRows);
+  const rows=Math.max(1,Math.ceil(count/columns)),sites=basis>count?rows*columns:count;
+  const width=Math.round(columns*size),height=Math.round(rows*size*.86);
   // Inset each cell by half the channel plus the corner radius; the stroke adds the radius back as a rounded edge.
   const round=Math.max(1.6,size*.075),channel=Math.max(2.4,size*.05);
-  const cells=coatGeometry(count,width,height,{columns,inset:channel/2+round}).map(cell=>cell.points);
+  // Unused sites on a partial page only bound their neighbours' cells; they are never drawn.
+  const cells=coatGeometry(sites,width,height,{columns,inset:channel/2+round}).slice(0,count).map(cell=>cell.points);
   const geometry={cells,width,height,columns,round:Number((round*2).toFixed(2))};
   if(mosaicGeometry.size>8)mosaicGeometry.clear();
-  mosaicGeometry.set(count,geometry);return geometry;
+  mosaicGeometry.set(key,geometry);return geometry;
 }
 function orderedRequests(report) {
   return [...report.requests].sort((a,b)=>{
@@ -99,7 +104,7 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
   const pages=Math.ceil(total/mosaicPageSize),page=Math.min(state.mosaicPage || 0,pages-1),offset=page*mosaicPageSize;
   state.mosaicPage=page;
-  const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count);
+  const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count,pages>1?mosaicPageSize:count);
   const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
   const bySlot=new Map(records.map((r,i)=>[live?r.slot:i,r]));
   const statuses=live?['pass','fail','inconclusive','running','idle']:['pass','fail','inconclusive'];
@@ -118,14 +123,21 @@ function renderBeeswarm(records,{width=960}={}) {
   // Tight clusters far from zero get a zoomed axis; the left label always states where it starts.
   const max=Math.max(values.at(-1),1),low=values[0]>max*.35?Math.floor(values[0]*.85):0,span=Math.max(1e-9,max-low),placed=[];
   const xOf=value=>16+(value-low)/span*(width-32);
-  for(const r of [...page].sort((a,b)=>a.elapsed_ms-b.elapsed_ms)){
-    const x=xOf(r.elapsed_ms);let lane=0,y=0;
-    while(placed.some(p=>Math.abs(p.x-x)<10&&Math.abs(p.y-y)<10)){lane++;y=(lane%2?1:-1)*Math.ceil(lane/2)*10;}
-    placed.push({r,x,y});
-  }
-  const extent=Math.max(25,...placed.map(p=>Math.abs(p.y)+10)),top=22,height=extent*2+10+top*2,mid=top+extent+5;
+  // Dense clusters (e.g. hundreds of timeouts at the same deadline) pack tighter instead of growing the chart:
+  // each dot's lane spacing shrinks with how many dots share its neighbourhood, so the swarm never exceeds maxExtent.
+  const sorted=[...page].sort((a,b)=>a.elapsed_ms-b.elapsed_ms),xs=sorted.map(r=>xOf(r.elapsed_ms)),maxExtent=64;
+  let from=0,to=0;
+  sorted.forEach((r,i)=>{
+    while(xs[i]-xs[from]>=10)from++;
+    while(to+1<xs.length&&xs[to+1]-xs[i]<10)to++;
+    const crowd=Math.max(to,i)-from+1,step=Math.min(10,(2*maxExtent-10)/crowd),x=xs[i];
+    let lane=0,y=0;
+    while(placed.some(p=>Math.abs(p.x-x)<10&&Math.abs(p.y-y)<step)&&lane<crowd*2){lane++;y=(lane%2?1:-1)*Math.ceil(lane/2)*step;}
+    placed.push({r,x,y:Math.max(-(maxExtent-5),Math.min(maxExtent-5,y)),packed:step<9});
+  });
+  const extent=Math.min(maxExtent,Math.max(25,...placed.map(p=>Math.abs(p.y)+10))),top=22,height=extent*2+10+top*2,mid=top+extent+5;
   const markers=values.length>=4?[['p50',quantile(.5),top-8],['p95',quantile(.95),height-4]].map(([label,value,y])=>{const x=xOf(value),anchor=x>width-120?'end':x<120?'start':'middle';return `<g class="swarm-marker ${label}"><line x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" y1="${top-4}" y2="${height-top+4}"/><text x="${x.toFixed(2)}" y="${y}" text-anchor="${anchor}">${label} ${escape(ms(value))}</text></g>`;}).join(''):'';
-  return `<section class="latency-viz"><div class="viz-heading"><h2>Latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M16 ${mid}H${width-16}" class="swarm-axis"/>${markers}${placed.map(({r,x,y},i)=>`<circle cx="${x.toFixed(2)}" cy="${(mid+y).toFixed(2)}" r="4.5" class="swarm-dot ${requestOutcome(r)}" style="--i:${i}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>${ms(low)}</span><span>${ms(max)}</span></div></section>`;
+  return `<section class="latency-viz"><div class="viz-heading"><h2>Latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M16 ${mid}H${width-16}" class="swarm-axis"/>${markers}${placed.map(({r,x,y,packed},i)=>`<circle cx="${x.toFixed(2)}" cy="${(mid+y).toFixed(2)}" r="4.5" class="swarm-dot ${requestOutcome(r)}${packed?' packed':''}" style="--i:${i}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(r.fixture_id)}: ${ms(r.elapsed_ms)}"></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>${ms(low)}</span><span>${ms(max)}</span></div></section>`;
 }
 function renderFlightPlan(plan) {
   if(!plan)return '';
