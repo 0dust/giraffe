@@ -248,7 +248,8 @@ async def test_l3_mixed_needs_limit_long_light_and_exercised_heavy(monkeypatch, 
     result = check(report, 'mixed')
     assert result.status == status
     if ratio is None:
-        assert result.summary == 'Mixed-load ratios measured; no acceptance ratio configured.'
+        assert result.summary.startswith('Mixed-load ratios measured; no acceptance ratio configured.')
+        assert 'To conclude, set limits.fairness_max_ratio' in result.summary
     lights = [r for r in report.requests if r.scenario.startswith('mixed_short')]
     assert all(r.completion_tokens >= 64 for r in lights)
     assert len(report.requests) == 18

@@ -26,7 +26,7 @@ def execution_config(config):
 
 
 def consolidate_checks(run, config, checks):
-    from giraffe.runner import _stats
+    from giraffe.runner import _stats, _budget_guidance
 
     component_ids = {item[0] for item in SCENARIOS.values()}
     retained = [check for check in checks if check.id not in component_ids]
@@ -41,7 +41,9 @@ def consolidate_checks(run, config, checks):
                 if check is None:
                     check = CheckResult(id=component, target=target.name, title=title,
                                         status="inconclusive", required=True,
-                                        summary="Scenario was not reached within the shared run budget.")
+                                        summary=("Scenario was not reached within the shared run budget. To conclude, "
+                                            + (getattr(run, "verdict_budget_guidance", None) or _budget_guidance(run.config))
+                                            + " Allow more max_duration_seconds if the deadline stopped the run."))
                 scenarios[scenario] = {**check.model_dump(mode="json"), "title": title}
         evidence = list(dict.fromkeys(rid for item in scenarios.values()
                                       for rid in item["evidence_ids"]))
@@ -50,11 +52,14 @@ def consolidate_checks(run, config, checks):
         status = overall_status([CheckResult.model_validate(item) for item in scenarios.values()], None)
         if not scenarios:
             status = "skipped"
+        problems = sorted((item for item in scenarios.values() if item["status"] in {"fail", "inconclusive", "blocked"}),
+                          key=lambda item: item["status"] != "fail")
         merged = CheckResult(
             id="concurrency", target=target.name, title=CHECK_NAMES["concurrency"],
             required="concurrency" in config.checks, status=status,
             summary=("Scenario results: " + "; ".join(
                 f"{item['title']}: {item['status']}" for item in scenarios.values())
+                + (f". {problems[0]['title']}: {problems[0]['summary']}" if problems else "")
                 if scenarios else "Concurrent workloads were not selected."),
             metrics={**_stats(records), "scenarios": scenarios}, evidence_ids=evidence)
         # Keep the merged check at the old fairness position in the public list.
@@ -211,7 +216,7 @@ async def token_stress(run, target, client):
 
 
 def stress_result(run, target):
-    from giraffe.runner import _stats
+    from giraffe.runner import _stats, _verdict_summary, _budget_guidance, _check_config
 
     observed = run.observations[target.name].get("token_stress", {}).get("cases", {})
     cases = {}
@@ -225,7 +230,13 @@ def stress_result(run, target):
     records = [record for record in run.records if record.id in evidence_set]
     statuses = [case["status"] for case in cases.values()]
     status = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
-    return CheckResult(id="token_stress", target=target.name, title="Token stress cases",
+    result = CheckResult(id="token_stress", target=target.name, title="Token stress cases",
                        required=True, status=status,
-                       summary="; ".join(f"{name}: {case['status']}" for name, case in cases.items()),
+                       summary="; ".join(f"{name}: {case['status']}" + (
+                           " — " + "; ".join(case["coverage_gaps"][:3]) if case["coverage_gaps"] else "")
+                           for name, case in cases.items()),
                        metrics={**_stats(records), "cases": cases}, evidence_ids=evidence)
+    if status in {"fail", "inconclusive"}:
+        result.summary = _verdict_summary(result, _check_config(run.config, "concurrency"),
+            records, getattr(run, "verdict_budget_guidance", None) or _budget_guidance(run.config))
+    return result

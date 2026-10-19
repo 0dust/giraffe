@@ -686,6 +686,14 @@ def _score_tool_response(expectation: ToolExpectation, record: RequestRecord) ->
     })
 
 
+def answer_difference(expected, received) -> str:
+    def excerpt(value):
+        text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+        text = _normalized(text)
+        return json.dumps(text if len(text) <= 80 else text[:79] + "…", ensure_ascii=False)
+    return f" Expected: {excerpt(expected)}; received: {excerpt(received)}."
+
+
 def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     """Score only a valid, completed answer; return a new record.
 
@@ -757,7 +765,6 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
             })
         except (ValueError, TypeError, SchemaError, ValidationError, Unresolvable) as error:
             score = False
-            # Do not include raw answers in scoring messages; retention is handled elsewhere.
             if isinstance(error, ValidationError):
                 path = ".".join(str(part) for part in error.absolute_path) or "<root>"
                 message = f"JSON schema violation at {path} ({error.validator})."
@@ -768,6 +775,8 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
                 message = f"Invalid JSON or schema: {error}"
     if not score and incomplete and record.finish_reason == "length":
         return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER})
+    if not score and (spec.expected_provided or spec.expected is not None):
+        message += answer_difference(spec.expected, answer)
     return record.model_copy(update={"score": score, "score_message": message})
 
 

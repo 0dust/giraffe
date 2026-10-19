@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 from statistics import median
 import tempfile
 from typing import Any
@@ -523,6 +524,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         excluded = len(rows) - len(assessed)
         if excluded:
             summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
+        if status == "inconclusive":
+            summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
+                        " using the same workload and settings; rerun longer if variation remains uncertain.")
         entry = {"target": name, "status": status, "reasons": target_reasons,
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
@@ -556,6 +560,11 @@ def _retained(report: RunReport) -> RunReport:
     if result.baseline:
         result.baseline = sanitize(result.baseline, bounded=False)
     policy = result.manifest.get("config", {}).get("retention", "failures")
+    if policy == "none":
+        for check in result.checks:
+            check.summary = _without_answer_excerpts(check.summary)
+            for scenario in check.metrics.get("scenarios", {}).values():
+                scenario["summary"] = _without_answer_excerpts(scenario["summary"])
     failed_evidence = {rid for check in result.checks if check.status in {"fail", "blocked"}
                        for rid in check.evidence_ids}
     for record in result.requests:
@@ -565,6 +574,8 @@ def _retained(report: RunReport) -> RunReport:
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
         if not keep:
+            if record.score_message:
+                record.score_message = _without_answer_excerpts(record.score_message)
             record.output = ""
             record.reasoning = ""
             record.tool_calls = []
@@ -587,8 +598,36 @@ def _e(value: Any) -> str:
     return escape(str(value), quote=True)
 
 
-def _json(value: Any) -> str:
-    return _e(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False))
+def _without_answer_excerpts(text: str) -> str:
+    return re.sub(r' Expected: "(?:[^"\\]|\\.)*"; received: "(?:[^"\\]|\\.)*"\.', '', text)
+
+
+def connection_summary(records: list[RequestRecord], url: str) -> str | None:
+    attempted = [r for r in records if r.status != "cancelled"]
+    classes = ("ConnectError", "ConnectTimeout", "SSLError", "ConnectionError",
+               "ConnectionRefusedError", "ProxyError", "UnsupportedProtocol")
+    errors = []
+    for record in attempted:
+        error = next((name for name in classes if name in (record.error or "")), None)
+        if error is None and "connection refused" in (record.error or "").lower():
+            error = "ConnectionRefusedError"
+        if record.http_status is not None or record.status != "failed" or error is None:
+            return None
+        errors.append(error)
+    if not errors:
+        return None
+    return f"Could not connect to {url} ({', '.join(dict.fromkeys(errors))}); no checks could run"
+
+
+def _preview(value: Any, limit: int = 1200) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return _e(text)
+    return _e(text[:limit]) + '… [Preview truncated; <a href="report.json">full evidence in report.json</a>]'
+
+
+def _json(value: Any, limit: int = 6000) -> str:
+    return _preview(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), limit)
 
 
 def _tool_evidence(record: RequestRecord) -> str:
@@ -795,8 +834,15 @@ def _traffic_baseline_html(target: dict[str, Any]) -> str:
 
 
 def _render(report: RunReport) -> str:
-    anchors = {record.id: f"request-{index}" for index, record in enumerate(report.requests)}
+    detailed = sorted(report.requests, key=lambda r: not (
+        r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error))[:25]
+    anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
+    disconnected = {target["name"]: summary for target in config.get("targets", [])
+                    if (summary := connection_summary(
+                        [r for r in report.requests if r.target == target["name"]], target.get("url", target["name"])))}
+    headline = ("; ".join(disconnected.values()) if disconnected and len(disconnected) == len(config.get("targets", []))
+                else "Giraffe acceptance results")
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
              f"<title>Giraffe — {_e(report.run_id)}</title>", """<style>
@@ -809,12 +855,15 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;p
 th{background:#f2f5f7;white-space:nowrap}.table{overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:#f4f6f8;padding:12px}
 summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{padding-left:22px}section{scroll-margin-top:16px}
 @media(max-width:640px){main{padding:16px}h1{font-size:25px}td,th{padding:7px}}
-</style><main>""", f"<h1>Giraffe acceptance results {_badge(report.overall)}</h1>",
+</style><main>""", f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>',
              '<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
              '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
              '<a href="#reproduction">Reproduce</a></p>']
+    if headline == "Giraffe acceptance results":
+        for summary in disconnected.values():
+            parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
     for target in config.get("targets", []):
@@ -823,6 +872,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                      f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></div>')
     for check in report.checks:
         if check.id == "capacity":
+            if check.target in disconnected:
+                continue
             arrival = "traffic_stages" in check.metrics
             highest = check.metrics.get("highest_acceptable_rate_rps" if arrival
                                         else "highest_tested_acceptable_concurrency")
@@ -941,8 +992,10 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     parts.append('</section>')
     parts.append('</section><section id="requests"><h2>Request evidence</h2>'
                  f'<p class="muted">Response retention: {_e(config.get("retention", "failures"))}. '
-                 'Retention changes stored bodies only; scores, character counts and measurements remain.</p>')
-    for record in report.requests:
+                 'Retention changes stored bodies only; scores, character counts and measurements remain.</p>'
+                 f'<p>Showing {len(detailed)} of {len(report.requests)} request details, failures first. '
+                 '<a href="report.json">All requests and complete retained bodies in report.json</a>.</p>')
+    for record in detailed:
         label = f"{record.target} · {record.scenario} · {record.fixture_id} · {record.status}"
         parts.append(f'<details id="{anchors[record.id]}"><summary>{_e(label)}'
                      f' · {_number(record.elapsed_ms)} ms</summary>'
@@ -952,30 +1005,38 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
-            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages)}</pre>'
+            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, 1200)}</pre>'
                          f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
             if evidence.tool_expectation is None:
                 if evidence.expected_provided:
-                    expected = _json(evidence.expected) if evidence.scorer == "json" else _e(evidence.expected)
+                    expected = _json(evidence.expected) if evidence.scorer == "json" else _preview(evidence.expected)
                     parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
                 else:
                     parts.append('<p>No expected answer configured.</p>')
             if evidence.rubric:
-                parts.append(f'<h3>Judge rubric</h3><pre>{_e(evidence.rubric)}</pre>')
+                parts.append(f'<h3>Judge rubric</h3><pre>{_preview(evidence.rubric)}</pre>')
             if evidence.schema_ is not None:
                 parts.append(f'<h3>JSON schema</h3><pre>{_json(evidence.schema_)}</pre>')
         if record.logprob_evidence:
-            parts.append('<h3>Token log probabilities</h3><pre>' + _json(record.logprob_evidence.model_dump()) + '</pre>')
+            probability = record.logprob_evidence.model_dump()
+            for token in probability["tokens"]:
+                token.pop("bytes")
+                for alternative in token["top_logprobs"]:
+                    alternative.pop("bytes")
+            parts.append('<h3>Token log probabilities</h3>'
+                         '<p>Token text, probabilities and alternatives. '
+                         '<a href="report.json">Complete evidence including token bytes in report.json</a>.</p>'
+                         '<pre>' + _json(probability) + '</pre>')
         parts.append(_tool_evidence(record))
         parts.append(_judgement_table(record))
         if record.output:
-            parts.append(f'<h3>Raw response</h3><pre>{_e(record.output)}</pre>')
+            parts.append(f'<h3>Raw response</h3><pre>{_preview(record.output)}</pre>')
         else:
             parts.append('<p class="muted">No retained response body.</p>')
         if record.reasoning:
-            parts.append(f'<h3>Reasoning response</h3><pre>{_e(record.reasoning)}</pre>')
+            parts.append(f'<h3>Reasoning response</h3><pre>{_preview(record.reasoning)}</pre>')
         parts.append(f'<details><summary>Local fixture and measured request evidence</summary><pre>'
-                     f'{_json(record.model_dump(exclude={"output", "reasoning"}))}</pre></details></details>')
+                     f'{_json(record.model_dump(exclude_defaults=True, exclude={"output", "reasoning", "evaluation", "logprob_evidence", "tool_calls", "tool_evaluation", "tool_request_options", "tool_conversation", "judgement"}))}</pre></details></details>')
     parts.append('</section><section id="reproduction"><h2>Reproduce this run</h2>'
                  '<p>Use the recorded configuration with the same suite and fixture pack. '
                  'Environment variable names are references; supply their values locally.</p>'

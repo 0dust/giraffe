@@ -33,6 +33,131 @@ def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
 
 
+def dead_endpoint_report():
+    from giraffe.models import EvaluationEvidence
+
+    report = make_report(count=8)
+    report.overall = "fail"
+    report.checks = [CheckResult(id="capacity", target="local", title="Capacity", status="fail",
+        summary="Some incoming rates exceeded known-answer, error or timing limits.",
+        metrics={"traffic_stages": [], "highest_acceptable_rate_rps": None})]
+    for record in report.requests:
+        record.status, record.valid, record.http_status = "failed", False, None
+        record.error, record.score = "request failed (ConnectError)", None
+        record.output, record.reasoning = "", ""
+        record.evaluation = EvaluationEvidence(messages=[{"role": "user", "content": "context <notes> " * 2000}],
+            scorer="exact", expected="42", expected_provided=True)
+    return report
+
+
+def test_short_baseline_summary_names_sample_gate_for_both_runs():
+    result = compare_baseline(make_report(count=1), make_report("baseline", count=1))
+    check = baseline_check(result)
+    assert check.status == "inconclusive"
+    assert "at least 5 measured samples per metric" in check.summary
+    assert "both the current and baseline runs" in check.summary
+
+
+def test_dead_endpoint_headline_and_bounded_html_keep_complete_json(tmp_path):
+    report = dead_endpoint_report()
+    before = report.model_dump_json()
+    json_path, html_path = write_report(report, tmp_path)
+    html = html_path.read_text()
+    print(f"dead endpoint HTML bytes: {html_path.stat().st_size}")
+    assert "Could not connect to http://localhost:8000 (ConnectError); no checks could run" in html
+    assert "highest tested acceptable arrival rate" not in html
+    assert html_path.stat().st_size < 60_000
+    assert 'href="report.json"' in html
+    saved = RunReport.model_validate_json(json_path.read_text())
+    assert saved.requests[0].evaluation == report.requests[0].evaluation
+    assert report.model_dump_json() == before
+
+
+def test_html_caps_request_details_and_raw_bodies_without_losing_json(tmp_path):
+    report = make_report(count=80)
+    report.manifest["config"]["retention"] = "all"
+    report.requests[-1].output = "<script>" + "long body " * 10000
+    report.requests[-1].score = False
+    json_path, html_path = write_report(report, tmp_path)
+    html = html_path.read_text()
+    assert "Showing 25 of 80 request details" in html
+    assert "&lt;script&gt;" in html and "<script>" not in html
+    assert len(html.encode()) < 120_000
+    saved = RunReport.model_validate_json(json_path.read_text())
+    assert saved.requests[-1].output == report.requests[-1].output
+
+
+@pytest.mark.parametrize("policy,retained", [("all", True), ("none", False), ("failures", False)])
+def test_html_logprob_alternatives_are_visible_despite_large_token_byte_arrays(policy, retained, tmp_path):
+    from giraffe.logprobs import collect_logprobs
+
+    report = make_report(count=1)
+    report.manifest["config"]["retention"] = policy
+    text, alternative = "retained chosen token " * 32, "ALT_ONLY_SECRET<script>"
+    chosen = {"token": text, "bytes": list(text.encode()), "logprob": -.05}
+    entry = {**chosen, "top_logprobs": [chosen.copy(), {
+        "token": alternative, "bytes": list(alternative.encode()), "logprob": -2.0}]}
+    record = report.requests[0]
+    record.output, record.output_chars = text, len(text)
+    record.logprob_evidence = collect_logprobs({"content": [entry]}, text, 2)
+    before = report.model_dump_json()
+    json_path, html_path = write_report(report, tmp_path)
+    html, data = html_path.read_text(), json_path.read_text()
+    assert ("ALT_ONLY_SECRET" in html) == retained
+    assert ("ALT_ONLY_SECRET" in data) == retained
+    assert "<script>" not in html
+    assert ("ALT_ONLY_SECRET&lt;script&gt;" in html) == retained
+    assert html_path.stat().st_size < 40_000
+    saved = RunReport.model_validate_json(data)
+    if retained:
+        assert saved.requests[0].logprob_evidence == record.logprob_evidence
+        assert 'href="report.json"' in html
+    else:
+        assert saved.requests[0].logprob_evidence.tokens == []
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("change", ["http_error", "success", "timeout", "no_requests"])
+def test_connection_headline_requires_only_connection_failures(change, tmp_path):
+    report = dead_endpoint_report()
+    if change == "http_error":
+        report.requests[0].http_status = 503
+    elif change == "success":
+        report.requests[0].status, report.requests[0].valid = "completed", True
+    elif change == "timeout":
+        report.requests[0].status, report.requests[0].error = "timeout", "request timeout (ReadTimeout)"
+    else:
+        report.requests = []
+    _, path = write_report(report, tmp_path)
+    assert "Could not connect to" not in path.read_text()
+    assert "highest tested acceptable arrival rate" in path.read_text()
+
+
+@pytest.mark.parametrize("policy", ["all", "failures", "none"])
+def test_mismatch_excerpts_are_escaped_and_follow_retention(policy, tmp_path):
+    from giraffe.fixtures import score_response
+    from giraffe.models import RequestSpec
+
+    report = make_report(count=1)
+    report.manifest["config"]["retention"] = policy
+    spec = RequestSpec(fixture_id="mismatch", scenario="warm", check_ids=["correctness"],
+        messages=[], scorer="exact", expected='<expected "answer">')
+    record = report.requests[0].model_copy(update={"output": '<received "answer">'})
+    report.requests[0] = score_response(spec, record)
+    check = report.checks[0]
+    check.status = "fail"
+    check.summary = report.requests[0].score_message
+    check.metrics["scenarios"] = {"example": {"title": "Example", "status": "fail", "summary": check.summary}}
+    json_path, html_path = write_report(report, tmp_path)
+    saved = RunReport.model_validate_json(json_path.read_text())
+    html = html_path.read_text()
+    assert "<received" not in html
+    assert ('&lt;received' in html) == (policy != "none")
+    assert ("received:" in saved.requests[0].score_message) == (policy != "none")
+    assert ("received:" in saved.checks[0].summary) == (policy != "none")
+    assert ("received:" in saved.checks[0].metrics["scenarios"]["example"]["summary"]) == (policy != "none")
+
+
 def test_same_evidence_passes_and_input_reports_are_unchanged():
     current, previous = make_report(), make_report("baseline")
     result = compare_baseline(current, previous)
