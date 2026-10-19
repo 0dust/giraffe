@@ -104,7 +104,8 @@ def record(user, turn, rate=None, *, failed=False):
     return RequestRecord(id=f"{user}-{turn}", target="local", fixture_id="test", scenario="sessions",
         check_ids=["sessions"], started_at="2026-10-14T00:00:00Z",
         status="failed" if failed else "completed", valid=not failed, stream=True,
-        output_tokens=11, answer_chunks=2 if rate else 1, first_output_ms=100,
+        output_tokens=11, answer_chunks=2 if rate else 1, answer_reads=2 if rate else 1,
+        answer_chars=11, first_read_answer_chars=1, first_output_ms=100,
         last_output_ms=100 + 10000/rate if rate else 100, elapsed_ms=1200,
         dispatch_ms=turn*1500, completed_ms=turn*1500+1200,
         workload={"session_id": user, "task_type": "coding", "turn_id": turn, "mode": "live"})

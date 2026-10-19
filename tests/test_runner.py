@@ -79,6 +79,7 @@ class FakeClient:
             input_chars=spec.input_chars, elapsed_ms=elapsed,
             first_output_ms=first_output, last_output_ms=first_output + 2,
             answer_chunks=(spec.cancel_after_chunks or 2) if spec.stream else 0,
+            answer_reads=2 if spec.stream else 0, first_read_answer_chars=max(1, len(output)//2),
             chunks=2, stream=spec.stream, stream_terminated=True,
             finish_reason=None if status == "cancelled" else "stop",
             client_cancelled_at_ns=time.time_ns() if spec.cancel_after_chunks and status == "cancelled" else None,
@@ -202,7 +203,7 @@ async def test_bucket_request_uses_remaining_window_after_queue_admission(client
 
 
 @pytest.mark.parametrize("selected,allowed", [
-    ("correctness", {"correctness_c2"}), ("generation", {"generation"}),
+    ("correctness", {"correctness_c2"}), ("generation", {"initial", "generation"}),
     ("json", {"json_c2"}), ("capacity", {"traffic_stage_0", "traffic_stage_1"}),
     ("gpu", set()),
 ])
@@ -219,7 +220,7 @@ async def test_selected_check_runs_only_its_workload(selected, allowed):
 
 async def test_disabled_custom_correctness_fixture_is_not_loaded():
     report = await runner.run_suite(config(checks=["generation"], custom_fixtures="/does-not-exist.json"))
-    assert len(report.requests) == 2
+    assert len(report.requests) == 3
     assert report.manifest["fixture_pack"]["custom_sha256"] is None
 
 
@@ -1018,7 +1019,7 @@ async def test_blocking_final_callback_is_captured_before_monitor_cancellation(c
         nonlocal completed
         record = await original(self, spec, **kwargs)
         completed += 1
-        if completed == 2:
+        if completed == 3:
             time.sleep(.18)
             record.elapsed_ms += 180
         return record
@@ -1030,14 +1031,14 @@ async def test_blocking_final_callback_is_captured_before_monitor_cancellation(c
     assert health["delayed_sample_count"] >= 1
     assert health["max_lag_ms"] > 100
     assert check(report, "generation").status == "inconclusive"
-    assert len(report.requests) == 2 and report.requests[-1].elapsed_ms >= 180
+    assert len(report.requests) == 3 and report.requests[-1].elapsed_ms >= 180
 
 
 async def test_delay_on_another_target_does_not_change_completed_target(monkeypatch):
     original = runner._checks
 
     def delayed(self, target):
-        request = next(r for r in self.records if r.target == "second")
+        request = next(r for r in self.records if r.target == "second" and r.scenario == "generation")
         self.max_lag_ms = 500
         self.timing_health.windows[:] = [{"start_ms": request.dispatch_ms,
             "end_ms": request.completed_ms, "lag_ms": 500}]
@@ -1064,7 +1065,8 @@ async def test_client_dispatch_anchor_excludes_slow_progress_callback(monkeypatc
     with FakeEndpoint(first_token_delay=.001, chunk_delay=0) as endpoint:
         report = await runner.run_suite(config(checks=["generation"], targets=[
             Target(name="service", model="fake-model", url=endpoint.url)]), progress=progress)
-    assert len(report.requests) == 2
+    assert len(report.requests) == 3
+    assert [r.scenario for r in report.requests] == ["initial", "generation", "generation"]
     assert all(r.timing_start_ms - r.dispatch_ms >= 20 for r in report.requests)
     assert all("_timing_started_monotonic" not in r.model_dump() for r in report.requests)
 

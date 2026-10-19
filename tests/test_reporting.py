@@ -13,9 +13,9 @@ def make_report(run_id: str = "current", *, latency: float = 100, count: int = 8
         id=f"{run_id}-{index}", target="local", fixture_id="arithmetic-v1", scenario="warm",
         check_ids=["serving", "correctness"], started_at="2026-10-04T10:00:00Z",
         status="completed", http_status=200, elapsed_ms=latency, first_output_ms=latency / 2,
-        last_output_ms=latency, answer_chunks=2,
+        last_output_ms=latency, answer_chunks=2, answer_reads=2, first_read_answer_chars=1,
         max_stream_gap_ms=latency / 10, output_tokens=10, output_chars=2, output="42",
-        reasoning="computed", stream_terminated=True, finish_reason="stop", valid=True,
+        reasoning="computed", reasoning_tokens=1, stream_terminated=True, finish_reason="stop", valid=True,
         score=True, score_message="Exact answer matched", input_chars=30, requested_max_tokens=128,
     ) for index in range(count)]
     return RunReport(

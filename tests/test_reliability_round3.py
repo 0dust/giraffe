@@ -168,9 +168,9 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
                 raise httpx.RemoteProtocolError('peer closed without response headers')
             await asyncio.sleep(.003)
             answer = answers[prompt]
-            split = max(1, len(answer) // 2)
-            events = [dict(choices=[dict(delta={'content': piece})])
-                      for piece in [answer[:split], answer[split:]]]
+            split = max(1, len(answer) // (2 if is_heavy else 8))
+            events = [dict(choices=[dict(delta={'content': answer[start:start + split]})])
+                      for start in range(0, len(answer), split)]
             events.append(dict(choices=[dict(delta={}, finish_reason='stop')],
                                usage={'prompt_tokens': 32, 'completion_tokens': len(answer.split())}))
             class EventStream(httpx.AsyncByteStream):
@@ -310,6 +310,7 @@ async def test_capacity_single_chunk_gap_qualification(monkeypatch, tokens, expe
         async def execute(self, spec, **kwargs):
             result = await super().execute(spec, **kwargs)
             result.completion_tokens, result.answer_chunks, result.max_stream_gap_ms = tokens, 1, None
+            result.answer_reads = 1
             return result
 
     monkeypatch.setattr(runner, 'LLMClient', Client)

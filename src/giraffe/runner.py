@@ -16,12 +16,12 @@ from pathlib import Path
 from typing import Callable
 
 
-from .client import LLMClient
+from .client import REASONING_BUDGET_ERROR, LLMClient
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options)
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
-from .timing import TimingHealth, configured_metrics, qualified_violations, run_quality
+from .timing import TimingHealth, configured_metrics, exceeded_unfinished, qualified_violations, run_quality
 from .models import (
     INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
     CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
@@ -42,19 +42,29 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     return round(ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower), 3)
 
 
+def _reasoning_budget(record) -> bool:
+    """Completed without an answer because reasoning used Giraffe's own output budget."""
+    return record.status == "completed" and not record.valid and record.error == REASONING_BUDGET_ERROR
+
+
 def _stats(records: list[RequestRecord]) -> dict:
+    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted.
+
+    Reasoning-budget records are neither errors nor answers; they are excluded from error_rate.
+    """
     good = [r for r in records if r.status == "completed" and r.valid]
     latencies = [r.elapsed_ms for r in good]
     output = [r.first_output_ms for r in good if r.first_output_ms is not None]
-    evaluated = [r for r in records if r.status != "cancelled"]
+    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)]
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
     generation_rates = [rate for r in good if (rate := r.generation_tokens_per_second) is not None]
     result = {
         "attempted": len(records), "completed": len(good),
-        "failed": sum(r.status == "failed" or (r.status == "completed" and not r.valid)
-                      for r in records),
+        "failed": sum(r.status == "failed" or (r.status == "completed" and not r.valid
+                                                and not _reasoning_budget(r)) for r in records),
+        "reasoning_budget_exhausted": sum(map(_reasoning_budget, records)),
         "timed_out": sum(r.status == "timeout" for r in records),
         "cancelled": sum(r.status == "cancelled" for r in records),
         "error_rate": errors / len(evaluated) if evaluated else None,
@@ -87,7 +97,7 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 
 def _stress(scenario):
-    return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival"))
+    return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_"))
             or scenario in {"sustained", "recovery", "recovery_baseline", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
                             "cancellation_probe"})
@@ -99,7 +109,8 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if scenario == "sustained" or scenario.startswith("traffic_stage_") or record.status == "cancelled":
+    if (scenario == "sustained" or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+            or _reasoning_budget(record)):
         return False
     if _stress(scenario) and (record.status == "timeout" or _context_rejection(record)):
         return False
@@ -323,6 +334,12 @@ class _Run:
             intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
                            and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
+            if record.status == "cancelled" and not intentional and timeout_override is None:
+                reason = self.stop_reason()
+                # Stress phases can cancel their own requests while the run continues.
+                if reason or not _stress(spec.scenario):
+                    self.reason = reason or "maximum run duration reached"
+                    self.unfinished[target.name].update(spec.check_ids)
             readiness = spec.scenario == "readiness" or (
                 spec.scenario == "initial" and self.config.restart_target == target.name)
             if _serving_failure(record, spec.scenario) and not readiness and not intentional:
@@ -566,7 +583,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             elif target.deployment.collector_url:
                 telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
             restart = run.observations[target.name]["restart"]
-            if enabled & {"access", "first_output"} or restart:
+            if enabled & {"access", "serving", "first_output", "generation"} or restart:
                 initial_timeout = (config.effective_check("access")["request_timeout_seconds"]
                                    if "access" in enabled else config.request_timeout_seconds)
                 initial_specs = [spec.model_copy(update={"request_timeout_seconds":
@@ -827,10 +844,12 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 current["unknown_fields"] = [key for key in current["unknown_fields"] if key != "model.served"]
 
 
-def _timing_violations(records, limits):
+def _timing_violations(records, limits, *, unfinished=False):
     failures = []
     for record in records:
         if record.status != "completed" or not record.valid:
+            if unfinished and exceeded_unfinished(record, limits):
+                failures.append(record.id)
             continue
         if limits.first_output_ms and record.first_output_ms is not None and record.first_output_ms > limits.first_output_ms:
             failures.append(record.id)
@@ -853,7 +872,7 @@ def _missing_timing(records, limits):
         if limits.first_output_ms is not None and record.first_output_ms is None:
             missing.add("first_output_ms")
         if (limits.stream_gap_ms is not None and record.stream_gap_applicable
-                and (not record.stream or record.max_stream_gap_ms is None)):
+                and (not record.stream or record.max_stream_gap_ms is None or record.answer_reads < 2)):
             missing.add("stream_gap_ms")
         if (limits.min_output_tokens_per_second is not None
                 and record.output_tokens != 1 and record.generation_tokens_per_second is None):
@@ -946,7 +965,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         if check_id == "cancellation":
             records = [r for r in all_records if check_id in r.check_ids]
         if check_id in {"first_output", "generation"}:
-            records = [r for r in records if r.scenario not in {"initial", "readiness"}]
+            # Only ordinary serial requests: loaded traffic belongs to its own checks.
+            records = [r for r in records if r.scenario in {"warm", "generation"}]
         if check_id == "generation":
             records = [r for r in records if r.scenario == "generation"]
         metrics, status, summary = _stats(records), "pass", "Observed requests met configured checks."
@@ -982,7 +1002,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             denied = [r for r in records if r.http_status in {401, 403}]
             disconnected = [r for r in records if r.http_status is None and r.status == "failed"
                             and any(name in (r.error or "") for name in
-                                    ("ConnectError", "ConnectTimeout", "SSLError", "ConnectionError"))]
+                                    ("ConnectError", "ConnectTimeout", "SSLError", "ConnectionError",
+                                     "ProxyError", "UnsupportedProtocol"))]
             if denied or disconnected:
                 status = "blocked" if not any(r.valid for r in records) else "fail"
                 summary = "Authentication or transport continuity failed on the configured route."
@@ -995,6 +1016,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif check_id == "serving":
             if metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate:
                 status, summary = "fail", "Invalid completions, errors or timeouts exceeded the configured allowance."
+            elif metrics["reasoning_budget_exhausted"]:
+                status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer; raise max_output_tokens."
             else:
                 summary = "Valid non-empty responses and required stream termination observed."
         elif check_id in {"first_output", "generation"}:
@@ -1002,12 +1025,16 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             thresholds = (limits.first_output_ms is not None if check_id == "first_output" else
                           any(v is not None for v in (limits.latency_ms, limits.stream_gap_ms,
                                                       limits.min_output_tokens_per_second)))
-            violations = _timing_violations(records, limits.model_copy(update={"first_output_ms": None}))
+            violations = _timing_violations(records, limits.model_copy(update={"first_output_ms": None}), unfinished=True)
             if check_id == "first_output":
-                violations = [r.id for r in records if limits.first_output_ms and r.first_output_ms is not None and r.first_output_ms > limits.first_output_ms]
+                violations = [r.id for r in records if limits.first_output_ms and (
+                    r.first_output_ms is not None and r.first_output_ms > limits.first_output_ms
+                    or "first_output_ms" in exceeded_unfinished(r, limits))]
             assessed_limits = limits.model_copy(update={"latency_ms": None, "stream_gap_ms": None,
                 "min_output_tokens_per_second": None}) if check_id == "first_output" else limits.model_copy(update={"first_output_ms": None})
-            qualified = qualified_violations(records, assessed_limits, quality)
+            qualified = qualified_violations(records, assessed_limits, quality, unfinished=True)
+            gap_samples = sum(r.valid and r.status == "completed" and r.max_stream_gap_ms is not None
+                              and r.answer_reads >= 2 for r in records)
             if qualified:
                 status, summary = "fail", "Observed request timing exceeded a configured limit without overlapping client scheduling delay."
                 metrics["violations"] = qualified
@@ -1021,6 +1048,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Timing observed; no acceptance limit configured."
             elif saturated or metrics["completed"] < limits.min_samples:
                 status, summary = "inconclusive", "Timing has too few successful samples or overlapping client scheduling delay."
+            elif metrics["reasoning_budget_exhausted"]:
+                status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer; raise max_output_tokens."
             elif check_id == "first_output" and any(r.valid and r.first_output_ms is None for r in records):
                 status, summary = "inconclusive", "Useful first-output timing unavailable for some responses."
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
@@ -1029,6 +1058,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif (check_id == "generation" and limits.min_output_tokens_per_second is not None
                   and metrics["generation_rate_samples"] < limits.min_samples):
                 status, summary = "inconclusive", "Too few measurable streamed answers to assess generation pace."
+            elif check_id == "generation" and limits.stream_gap_ms is not None and gap_samples < limits.min_samples:
+                status, summary = "inconclusive", "Too few answers streamed over separate network reads to assess pauses."
         elif check_id == "capacity":
             stages = observations["capacity"]
             for stage in stages:
@@ -1386,6 +1417,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         run.max_lag_ms = max(run.max_lag_ms, run.timing_health.max_lag_ms)
         monitor.cancel()
         await asyncio.gather(monitor, return_exceptions=True)
+        run.stop_reason()
     inference_duration = time.monotonic() - run.start
     judging_summary = None
     if any(spec.scorer == "judge" for spec in run.pack_specs) and not run.stop.is_set():

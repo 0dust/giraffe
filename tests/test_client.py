@@ -174,7 +174,7 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
     assert result.last_output_ms == 39250
     assert result.elapsed_ms == 45000
     assert result.answer_chunks == 2
-    assert result.generation_tokens_per_second == 12
+    assert result.generation_tokens_per_second == pytest.approx((4 - 4 * 2 / 6) / .25)
 
 
 async def test_first_output_timestamp_precedes_json_processing(monkeypatch):
