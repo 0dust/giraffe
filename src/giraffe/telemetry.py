@@ -96,35 +96,61 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _gpu_device(labels):
+    # UUID is globally unique; otherwise host/instance disambiguate identical GPU indices.
+    uuid = labels.get("UUID") or labels.get("uuid")
+    return ("uuid", uuid) if uuid else ("index", labels.get("Hostname", ""), labels.get("instance", ""), labels.get("gpu"))
+
+
 def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperature_c=None):
     """Assess published GPU devices; an advancing scrape alone proves no freshness.
 
     Value changes establish freshness for that device, not for other GPUs. Unseen
     devices cannot be enumerated from this endpoint; declared counts bound coverage.
+    Every device must be fresh in the first and last successful scrape; one absent
+    from a later complete scrape disappeared during the run.
     """
     devices, series, alerts = {}, defaultdict(list), []
     temperatures = defaultdict(dict)
+    # XID history per (device, metric): exporters may attach err_code/err_msg labels.
+    xids = defaultdict(lambda: defaultdict(lambda: (set(), set())))
+    presence = defaultdict(dict)
+    successful, truncated = [], set()
     warnings, informational = [], []
     completed = 0
     for index, snap in enumerate(snapshots):
+        if snap.get("status") not in {"available", "stale_samples", "absent_families"}:
+            continue
         samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
         completed += bool(samples)
+        successful.append(index)
+        if snap.get("series_limit_reached"):
+            truncated.add(index)
         for sample in samples:
             labels, family, value = sample.get("labels", {}), sample["family"], sample["value"]
-            # Hostname disambiguates identical GPU indices on multiple exporter hosts.
-            key = (labels.get("Hostname", ""), labels.get("gpu"))
-            device = devices.setdefault(key, {"families": set(), "timestamped": set(),
-                                               "changing": False, "unknown_identity": key[1] is None})
+            key = _gpu_device(labels)
+            device = devices.setdefault(key, {"families": set(), "timestamped": set(), "changing": False,
+                                               "gpu": labels.get("gpu"), "hostname": labels.get("Hostname", ""),
+                                               "unknown_identity": key[0] != "uuid" and key[-1] is None})
+            presence[key].setdefault(index, False)
             timestamp = sample.get("sample_timestamp_ms")
             age = sample.get("age_seconds")
             if timestamp is not None and age is None:
                 collected = snap.get("collected_at")
                 observed = datetime.fromisoformat(collected).timestamp() if collected else time.time()
                 age = observed - timestamp / 1000
-            stale = timestamp is not None and (age > max_age_seconds or age < -5)
+            stale = (age > max_age_seconds or age < -5) if timestamp is not None else sample.get("stale", False)
             # DCGM's int64 blank/error sentinels are not measurements.
-            if stale or not math.isfinite(value) or value < 0 or value >= 2**63 - 1024:
+            if not math.isfinite(value) or value < 0 or value >= 2**63 - 1024:
                 continue
+            if family == "device_errors":
+                seen, fresh = xids[(key, sample["name"])][index]
+                seen.add(value)
+                if not stale:
+                    fresh.add(value)
+            if stale:
+                continue
+            presence[key][index] = True
             device["families"].add(family)
             if family == "temperature":
                 temperatures[key][index] = max(temperatures[key].get(index, value), value)
@@ -133,40 +159,59 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
             identity = (key, sample["name"], tuple(sorted(labels.items())))
             series[identity].append((index, value))
             if family == "throttling" and int(value) & ~sum(GPU_THROTTLE_REASONS):
-                informational.append({"gpu": key[1], "value": value, "snapshot": index})
+                informational.append({"gpu": device["gpu"], "value": value, "snapshot": index})
     for (key, name, _), values in series.items():
+        device = devices[key]
         if any(a[0] != b[0] and a[1] != b[1] for a, b in zip(values, values[1:])):
-            devices[key]["changing"] = True
-        family = GPU[name][0]
-        if family == "device_errors":
-            if values[0][1] > 0:
-                warnings.append({"gpu": key[1], "hostname": key[0], "historical_xid": values[0][1],
-                                 "reason": "Last XID predates observation; not an error count."})
-            for (_, previous), (index, value) in zip(values, values[1:]):
-                if value > 0 and value != previous:
-                    alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
-                                   "value": value, "reasons": ["XID changed during observation"], "snapshot": index})
-        elif family == "throttling":
+            device["changing"] = True
+        if GPU[name][0] == "throttling":
             for bit, reason in GPU_THROTTLE_REASONS.items():
                 observed = [(i, v) for i, v in values if int(v) & bit]
                 if len({i for i, _ in observed}) >= 2:
-                    alerts.append({"gpu": key[1], "hostname": key[0], "family": family,
+                    alerts.append({"gpu": device["gpu"], "hostname": device["hostname"], "family": "throttling",
                                    "value": observed[-1][1], "reasons": [reason],
                                    "snapshots": sorted({i for i, _ in observed})})
+    for (key, name), history in xids.items():
+        device, previous = devices[key], None
+        for index in sorted(history):
+            seen, fresh = history[index]
+            if previous is None and index == min(presence[key]):
+                warnings.extend({"gpu": device["gpu"], "hostname": device["hostname"], "historical_xid": value,
+                                 "reason": "Last XID predates observation; not an error count."}
+                                for value in sorted(seen) if value > 0)
+            else:
+                # A series first seen after the device's first scrape is new, whatever its labels.
+                alerts.extend({"gpu": device["gpu"], "hostname": device["hostname"], "family": "device_errors",
+                               "value": value, "snapshot": index, "reasons": [
+                                   "XID changed during observation" if previous is not None else "XID appeared during observation"]}
+                              for value in sorted(fresh) if value > 0 and value not in (previous or set()))
+            previous = seen
     if gpu_max_temperature_c is not None:
-        for (hostname, gpu), values in temperatures.items():
+        for key, values in temperatures.items():
             above = sorted(index for index, value in values.items() if value > gpu_max_temperature_c)
             if len(above) >= 2:
-                alerts.append({"gpu": gpu, "hostname": hostname, "family": "temperature",
+                alerts.append({"gpu": devices[key]["gpu"], "hostname": devices[key]["hostname"], "family": "temperature",
                                "value": max(values.values()), "snapshots": above,
                                "reasons": ["temperature exceeded configured limit in repeated snapshots"]})
-    rows = []
-    for (hostname, gpu), device in sorted(devices.items(), key=lambda item: str(item[0])):
+    rows, disappeared = [], False
+    bounds = {successful[0], successful[-1]} if successful else set()
+    for key, device in sorted(devices.items(), key=lambda item: str(item[0])):
+        seen = presence[key]
+        # A truncated scrape cannot prove a device was absent.
+        gone = next((i for i in successful if i > min(seen) and i not in seen and i not in truncated), None)
+        if gone is not None:
+            disappeared = True
+            alerts.append({"gpu": device["gpu"], "hostname": device["hostname"], "family": "presence", "value": None,
+                           "reasons": ["GPU device disappeared during the run"], "snapshot": gone})
         fresh = device["families"] if device["changing"] else device["timestamped"]
         missing = sorted(GPU_FAMILIES - device["families"])
         unknown = sorted(device["families"] - fresh)
-        rows.append({"gpu": gpu, "hostname": hostname, "missing_families": missing,
-                     "unknown_freshness_families": unknown, "identity_verified": not device["unknown_identity"],
+        rows.append({"gpu": device["gpu"], "hostname": device["hostname"],
+                     **({"uuid": key[1]} if key[0] == "uuid" else {"instance": key[2]} if key[2] else {}),
+                     "missing_families": missing, "unknown_freshness_families": unknown,
+                     "identity_verified": not device["unknown_identity"],
+                     "fresh_in_first_and_last_snapshot": all(seen.get(i) for i in bounds),
+                     "disappeared_at_snapshot": gone,
                      "freshness": "values changed across scrapes" if device["changing"] else
                      "source timestamps" if not unknown else "unknown"})
     unavailable = sorted({f for row in rows for f in row["missing_families"]}) if rows else sorted(GPU_FAMILIES)
@@ -175,15 +220,20 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
                "warnings": warnings, "informational_clock_events": informational,
                "coverage": "Published GPU labels only; devices absent from all scrapes cannot be discovered.",
                "metrics_max_age_seconds": max_age_seconds}
-    observed_count = sum(row["identity_verified"] for row in rows)
+    observed_count = sum(row["identity_verified"] and row["fresh_in_first_and_last_snapshot"]
+                         and row["disappeared_at_snapshot"] is None for row in rows)
     metrics.update({"declared_gpu_count": gpu_count, "observed_gpu_count": observed_count,
                     "max_temperature_c": max((v for values in temperatures.values() for v in values.values()), default=None),
                     "gpu_max_temperature_c": gpu_max_temperature_c})
     qualifier = "this is not device health certification."
+    if disappeared:
+        return metrics, "fail", "GPU device disappeared during the run (absent from a later successful scrape); " + qualifier
     if alerts:
         return metrics, "fail", "GPU telemetry reports a new XID, repeated adverse slowdown or configured temperature violation; " + qualifier
     if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and observed_count < gpu_count:
         return metrics, "inconclusive", f"GPU telemetry covers {observed_count} devices, fewer than the declared {gpu_count}; " + qualifier
+    if any(not row["fresh_in_first_and_last_snapshot"] for row in rows):
+        return metrics, "inconclusive", "GPU device samples are stale or missing in the first or last successful scrape; " + qualifier
     if not rows or any(row["missing_families"] or row["unknown_freshness_families"] or
                        not row["identity_verified"] for row in rows):
         return metrics, "inconclusive", "GPU observations lack per-device coverage or freshness evidence; " + qualifier
