@@ -275,6 +275,7 @@ def test_request_pack_flag_conflicts_fail_before_reading_pack(conflict, monkeypa
 def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, capsys, tmp_path):
     from giraffe.models import ConfigDraft
     from giraffe.request_pack import pack_preview
+    from giraffe.planning import request_plan
 
     values = {"targets": [{"name": "local", "url": "http://localhost", "model": ""}],
               "checks": ["capacity"], "request_source": "request_pack", "request_pack": operator_pack()}
@@ -284,7 +285,8 @@ def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, caps
     assert main(["preview", "--config", "-"]) == 0
     draft = ConfigDraft.model_validate(values)
     assert json.loads(capsys.readouterr().out) == {
-        "config": draft.model_dump(mode="json"), "request_pack_preview": pack_preview(draft)}
+        "config": draft.model_dump(mode="json"), "request_pack_preview": pack_preview(draft),
+        "request_plan": request_plan(draft)}
     assert not list(tmp_path.iterdir())
 
 
@@ -318,3 +320,37 @@ def test_invalid_pack_errors_have_case_locations_and_create_no_run(source, tmp_p
     error = json.loads(output.out)["errors"][0]
     assert error["loc"][-3:] == ["cases", 0, "weight"]
     assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("flags", [[], ["--output-format", "json"], ["--output-format=json"],
+                                   ["--output-format", "text"], ["--output-format=text"]])
+def test_preview_includes_plan_warnings_without_traffic(flags, tmp_path, monkeypatch, capsys):
+    import httpx
+
+    def no_traffic(*args, **kwargs):
+        pytest.fail("Preview sent traffic")
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", no_traffic)
+    monkeypatch.chdir(tmp_path)
+    values = {"targets": [{"name": "local", "url": "http://localhost", "model": ""}],
+              "checks": ["correctness"], "max_requests": 1}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
+    assert main(["preview", "--config", "-", *flags]) == 0
+    captured = capsys.readouterr()
+    warning = "local needs at least 6 requests, but its share of the run limit is 1. Some tests may be incomplete."
+    if any("text" in value for value in flags):
+        assert "No traffic was sent." in captured.out
+        assert f"Warning: {warning}\n" in captured.out
+        assert "Known requests per target: 6" in captured.out
+    else:
+        result = json.loads(captured.out)
+        assert result["request_plan"]["warnings"] == [warning]
+        assert result["request_plan"]["known_per_target"] == 6
+    assert not captured.err and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("flags", [["--output-format", "text"], ["--output-format=text"]])
+def test_preview_text_errors_remain_text(flags, tmp_path, capsys):
+    assert main(["preview", "--config", str(tmp_path / "missing.yaml"), *flags]) == 4
+    captured = capsys.readouterr()
+    assert not captured.out and "config file not found:" in captured.err
