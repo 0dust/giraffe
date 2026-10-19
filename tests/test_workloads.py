@@ -61,7 +61,8 @@ def check(report, name):
 @pytest.mark.parametrize("mode", ["fixed", "live"])
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_concurrent_session_history_exact_marker_and_no_cross_contamination(tmp_path, mode, legacy):
-    with FakeEndpoint(first_token_delay=0.02) as endpoint:
+    # Keep answer windows observable when HTTP threads and the client contend for CPU.
+    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
         settings = {"sessions": 2, "concurrency": 2, "modes": [mode], "delay_seconds": 0.01}
         if legacy:
             settings["turns"] = ["Suggest a name for a bakery. Reply with just the name.",
@@ -442,7 +443,7 @@ async def test_cancellation_stops_arrival_scheduler_and_saves_partial_evidence()
     "mode", ["healthy", "variable_correct", "wrong", "http_error", "overlap_variation"]
 )
 async def test_consistency_hashes_before_retention_and_separates_task_correctness(tmp_path, mode):
-    with FakeEndpoint(mode=mode, first_token_delay=0.02) as endpoint:
+    with FakeEndpoint(mode=mode, first_token_delay=0.02, chunk_delay=0.006) as endpoint:
         report = await run_suite(
             config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]},
                    retention="none", stop_after_errors=100)
@@ -486,7 +487,8 @@ async def test_strict_consistency_and_insufficient_samples_are_explicit():
 
 @pytest.mark.parametrize("budget", [5, 72])
 async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_budget(budget):
-    with FakeEndpoint(first_token_delay=0.02, chunk_delay=0.02) as endpoint:
+    # All eight output windows must intersect outside client scheduling delays.
+    with FakeEndpoint(first_token_delay=0.05, chunk_delay=0.05) as endpoint:
         report = await run_suite(config(
             endpoint, checks=["buckets"], concurrency=8, max_requests=budget,
             buckets={"levels": [8], "samples_per_bucket": 2},
@@ -501,7 +503,7 @@ async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_bu
 
 
 async def test_buckets_keep_shape_overlap_lengths_and_eos_coverage_separate():
-    with FakeEndpoint(first_token_delay=0.02, chunk_delay=0.015) as endpoint:
+    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
         report = await run_suite(
             config(endpoint, buckets={"samples_per_bucket": 2, "mixed_pairs": 1})
         )

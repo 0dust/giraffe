@@ -385,8 +385,8 @@ async def test_v2_fast_serial_endpoint_never_qualifies(monkeypatch, serial):
     from tests.fake_endpoint import FakeEndpoint
     from tests.test_check_intent_overlap import configuration, exercise_output_shapes
     exercise_output_shapes(monkeypatch)
-    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=0 if serial else .005,
-                      chunk_delay=0 if serial else .002) as endpoint:
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=0 if serial else .03,
+                      chunk_delay=0 if serial else .03) as endpoint:
         report = await runner.run_suite(configuration(targets=[{"name": "local", "url": endpoint.url,
             "model": "fake-model"}], concurrency=4, samples=12))
     for c in report.checks:

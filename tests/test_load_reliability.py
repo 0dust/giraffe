@@ -147,7 +147,8 @@ async def test_recovery_ratio_compares_same_fixture_before_and_after_load(endpoi
 
 
 async def test_recovery_without_timing_acceptance_limit_is_inconclusive(endpoint):
-    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.045))
+    # Amortize worker startup/refill delays so occupancy is not the inconclusive reason.
+    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.25))
     result = check(report, "recovery")
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["correct"] == 2
@@ -281,7 +282,7 @@ async def test_matched_ratio_qualifies_client_delay_in_both_controls_and_probes(
     limits = Limits(min_samples=2, **{
         'recovery_max_ratio' if check_id == 'recovery' else 'fairness_max_ratio': 100,
     })
-    report = await runner.run_suite(config(checks=[check_id], limits=limits))
+    report = await runner.run_suite(config(checks=[check_id], sustained_seconds=.25, limits=limits))
     outcome = check(report, check_id)
     assert outcome.status == expected
     assert outcome.metrics['timing_quality']['status'] == (

@@ -40,7 +40,7 @@ def test_invalid_performance_profiles_are_rejected(updates):
 
 @pytest.mark.parametrize("retention", ["all", "none"])
 async def test_mixed_live_conversations_overlap_and_keep_actual_history_isolated(retention, tmp_path):
-    with FakeEndpoint(first_token_delay=.02) as endpoint:
+    with FakeEndpoint(first_token_delay=.03, chunk_delay=.03) as endpoint:
         report = await run_suite(config(endpoint, checks=["sessions"], retention=retention,
             sessions={"profile": "performance", "modes": ["live"], "sessions": 4,
                       "concurrency": 2, "workloads": workloads(), "max_tokens": 64}))

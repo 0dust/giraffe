@@ -103,7 +103,7 @@ def cli_run(tmp_path, config, name, *, baseline=None):
 
 
 def test_cli_detects_latency_regression_and_preserves_baseline(tmp_path):
-    with FakeEndpoint() as endpoint:
+    with FakeEndpoint(first_token_delay=0.02, chunk_delay=0.03) as endpoint:
         config = run_config(
             endpoint, checks=["serving", "first_output", "correctness"],
             limits=Limits(min_samples=5, regression_percent=20, first_output_ms=500),
@@ -133,7 +133,7 @@ def test_cli_detects_latency_regression_and_preserves_baseline(tmp_path):
 
 
 def test_cli_detects_semantic_regression_with_valid_http_completions(tmp_path):
-    with FakeEndpoint() as endpoint:
+    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
         config = run_config(endpoint, checks=["serving", "correctness"])
         _, baseline, directory = cli_run(tmp_path, config, "baseline")
         assert baseline["overall"] == "pass"
