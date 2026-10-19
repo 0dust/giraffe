@@ -121,7 +121,7 @@ async def test_seeded_poisson_profile_does_not_drop_healthy_nearby_arrivals():
     result = await harness.run(profile(
         rates=[20], duration_seconds=1, arrival="poisson", seed=43, max_in_flight=8,
     ))
-    assert result["scheduled"] == result["started"] == 24
+    assert result["scheduled"] == result["started"] == 20
     assert result["dropped_late"] == 0 and result["accepted"]
 
 

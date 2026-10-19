@@ -185,6 +185,9 @@ async def arrivals(run, target, client, fixtures):
         await asyncio.gather(*pending, return_exceptions=True)
         records = [r for r in run.records if r.target == target.name and r.scenario == "arrival"]
         observation["issued"] = len(records)
+        # Arrivals have no intentional cancellation: a cancelled one was cut by
+        # the run deadline or a stop and is not evidence that it was served.
+        observation["incomplete"] = sum(r.status == "cancelled" for r in records)
         missing = (
             settings.requests
             - len(records)
@@ -207,7 +210,7 @@ async def arrivals(run, target, client, fixtures):
             else None
         )
         observation["configured_rate_achieved"] = (
-            not observation["unissued"] and not observation["delayed"]
+            not observation["unissued"] and not observation["delayed"] and not observation["incomplete"]
         )
 
 
@@ -774,11 +777,15 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             }
         if check == "arrivals":
             metrics["schedule"] = run.observations[target.name].get("arrivals", {})
-            if metrics["schedule"].get("unissued") or metrics["schedule"].get("delayed"):
+            if (metrics["schedule"].get("unissued") or metrics["schedule"].get("delayed")
+                    or metrics["schedule"].get("incomplete")):
                 status, summary = (
                     "inconclusive",
-                    "Scheduled traffic was delayed or unissued; configured arrival rate is not established.",
+                    "Scheduled traffic was delayed, unissued or cancelled before completion; "
+                    "configured arrival rate is not established.",
                 )
+            elif not configured_metrics(config.limits, check):
+                status, summary = "inconclusive", "Arrivals observed; no acceptance limit configured."
         if check == "sessions":
             metrics["sessions"] = run.observations[target.name].get("sessions")
             from .session_metrics import performance
