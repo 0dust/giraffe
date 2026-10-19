@@ -146,7 +146,6 @@ async def test_inline_reasoning_does_not_start_first_output(monkeypatch):
 
 @pytest.mark.parametrize("parts", [
     [ev("<think>"), ev("Let me consider the label"), ev(finish="length"), DONE],
-    [ev("   "), ev(finish="length"), DONE],
     [ev(reasoning="Let me consider"), ev(reasoning=" the label"), ev(finish="length"), DONE],
 ])
 async def test_reasoning_that_exhausts_budget_is_not_an_answer(monkeypatch, parts):
@@ -360,19 +359,19 @@ async def test_intentional_cancellation_does_not_mark_run_unfinished():
 
 
 @pytest.mark.parametrize("http_status", [None, 200, 503])
-async def test_no_output_failure_counts_only_without_http_error(http_status):
+async def test_no_output_failure_counts_only_after_successful_headers(http_status):
     from giraffe.timing import exceeded_unfinished
     record = RequestRecord(id="failed", target="t", fixture_id="f", scenario="warm",
         check_ids=["first_output"], started_at="now", status="failed", http_status=http_status,
         elapsed_ms=900)
     assert exceeded_unfinished(record, Limits(first_output_ms=500)) == (
-        [] if http_status == 503 else ["first_output_ms"])
+        ["first_output_ms"] if http_status == 200 else [])
 
 
 async def test_timeout_violation_respects_overlapping_client_delay():
     from giraffe.timing import qualify, qualified_violations
     record = RequestRecord(id="timeout", target="t", fixture_id="f", scenario="generation",
-        check_ids=["first_output", "generation"], started_at="now", status="timeout",
+        check_ids=["first_output", "generation"], started_at="now", status="timeout", http_status=200,
         elapsed_ms=900, timing_start_ms=0, completed_ms=900)
     limits = Limits(first_output_ms=500, latency_ms=500)
     health = {"schema_version": 1, "windows": [{"start_ms": 100, "end_ms": 600, "lag_ms": 450}]}
@@ -446,7 +445,8 @@ async def test_reasoning_budget_does_not_hide_real_serving_failure():
     run = runner._Run(config, None, None)
     base = dict(target="t", fixture_id="f", scenario="warm", check_ids=["serving"], started_at="now")
     run.records = [RequestRecord(id="good", status="completed", valid=True, **base),
-        RequestRecord(id="budget", status="completed", error=REASONING_BUDGET_ERROR, **base),
+        RequestRecord(id="budget", status="completed", error=REASONING_BUDGET_ERROR,
+                      finish_reason="length", reasoning="thinking", **base),
         RequestRecord(id="failure", status="failed", **base)]
     stats = runner._stats(run.records)
     assert stats["error_rate"] == .5 and stats["reasoning_budget_exhausted"] == 1

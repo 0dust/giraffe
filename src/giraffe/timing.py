@@ -80,7 +80,8 @@ def exceeded_unfinished(record: RequestRecord, limits: Limits) -> list[str]:
     A timed-out (or accepted-then-failed) request without first output waited at
     least elapsed_ms for it; a timed-out request took at least elapsed_ms.
     """
-    accepted = record.status == "timeout" or (record.status == "failed" and (record.http_status is None or 200 <= record.http_status < 300))
+    accepted = (record.status in {"timeout", "failed"} and record.http_status is not None
+                and 200 <= record.http_status < 300)
     if not accepted:
         return []
     metrics = []

@@ -76,7 +76,7 @@ class FakeClient:
             http_status=200, valid=status == "completed", output=output,
             output_chars=len(output), output_tokens=2,
             input_tokens=max(1, spec.input_chars//4) if cls.input_usage else None,
-            input_chars=spec.input_chars, elapsed_ms=elapsed,
+            input_chars=spec.input_chars, elapsed_ms=elapsed, stream_end_ms=elapsed if status == "completed" else None,
             first_output_ms=first_output, last_output_ms=first_output + 2,
             answer_chunks=(spec.cancel_after_chunks or 2) if spec.stream else 0,
             answer_reads=2 if spec.stream else 0, first_read_answer_chars=max(1, len(output)//2),

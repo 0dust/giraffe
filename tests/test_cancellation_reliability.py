@@ -19,6 +19,7 @@ async def test_client_cancellation_waits_for_answer_chunks_not_ttft_timer(client
         record = await original(self, spec, **kwargs)
         if spec.scenario == "client_cancel":
             record.first_output_ms = 500
+            record.client_cancelled_ms = record.elapsed_ms = 501
         return record
     monkeypatch.setattr(client, "execute", delayed)
     report = await runner.run_suite(config(checks=["cancellation"]))
