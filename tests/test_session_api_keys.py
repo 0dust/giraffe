@@ -41,6 +41,7 @@ async def test_paste_discovers_and_connects_without_environment_or_restart(tmp_p
         assert response.json()["status"] == "connected"
         assert [r.method for r in requests] == ["GET", "POST"]
         assert all(r.headers["Authorization"] == f"Bearer {KEY}" for r in requests)
+        assert requests[1].headers["X-Giraffe-Preflight"] == "1"
         assert all(not c["follow_redirects"] for c in clients)
         # A later caller does not inherit credentials from the successful probe.
         unauthenticated = await ui.post("/api/targets/test-connection", json={
@@ -99,6 +100,11 @@ async def test_duplicate_binding_and_conflicting_authorization_are_rejected(tmp_
         r = await ui.post("/api/targets/models", json={"url": "http://server",
                          "api_key": KEY, "headers_env": {"authorization": "OTHER"}})
         assert r.status_code == 422 and KEY not in r.text
+        values["targets"][0]["headers_env"] = {"Authorization": "OTHER"}
+        r = await ui.post("/api/runs", json={"config": values,
+                         "api_keys": [credential(values)]})
+        assert r.status_code == 422 and KEY not in r.text
+        assert "custom Authorization header" in r.text
 
 
 @pytest.mark.parametrize("bad", [KEY + "\r\nX: value", KEY + "\u00e9", KEY * 1000,

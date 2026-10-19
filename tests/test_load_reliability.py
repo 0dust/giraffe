@@ -153,7 +153,8 @@ async def test_recovery_without_timing_acceptance_limit_is_inconclusive(endpoint
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["correct"] == 2
     assert result.status == "inconclusive"
-    assert result.summary == "Recovery observed; no acceptance limit configured."
+    assert result.summary.startswith("Recovery observed; no acceptance limit configured.")
+    assert "To conclude, set limits.recovery_max_ratio" in result.summary
 
 
 async def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):

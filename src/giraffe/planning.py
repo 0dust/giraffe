@@ -94,7 +94,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     if "capacity" in selected:
         traffic = config.effective_traffic()
-        warnings.append("Scheduled requests use the run limit even when Giraffe cannot send them because all request slots are busy.")
         limits = config.effective_check("capacity")["limits"]
         if limits["first_output_ms"] is None and limits["latency_ms"] is None:
             warnings.append("Set a maximum answer time or time to first text for a pass/fail result under load. Without a time target, Giraffe reports measurements only.")
@@ -114,7 +113,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind = "exact"
             add("capacity", count,
                 f"Starts {count} requests across {len(traffic.rates)} rates. "
-                + "Requests may be dropped if all request slots are busy.",
+                + "Scheduled requests use the run limit even when Giraffe cannot send them because all request slots are busy.",
                 source="your dataset" if pack else "generated examples", kind=kind)
         if len(traffic.rates) * traffic.duration_seconds > config.max_duration_seconds:
             warnings.append("The selected rates need more time than the run limit allows, before connection and answer checks.")
@@ -332,6 +331,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     estimated = any(row["kind"] == "estimate" for row in rows)
     kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
     planned = None if unknown else sum(row["requests_per_target"] for row in rows)
+    counted = sum(row["requests_per_target"] or 0 for row in rows)
     adaptive_estimates = {}
     if "context" in selected:
         adaptive_estimates["context"] = 1 + 2 * context_count
@@ -340,8 +340,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "recovery" in selected and config.effective_check("recovery")["sustained_seconds"] > 0:
         adaptive_estimates["sustained"] = max(config.limits.min_samples,
             config.effective_check("recovery")["concurrency"] * 2,
-            max(quotas.values()) - known - sum(adaptive_estimates.values()))
-    estimated_total = sum(row["requests_per_target"] or 0 for row in rows) + sum(adaptive_estimates.values())
+            max(quotas.values()) - counted - sum(adaptive_estimates.values()))
+    estimated_total = counted + sum(adaptive_estimates.values())
     for target, quota in quotas.items():
         if estimated_total > quota and known <= quota:
             warnings.append(f"{target}: fixed work and conservative adaptive traffic need about {estimated_total} requests "

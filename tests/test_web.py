@@ -65,8 +65,7 @@ async def test_pack_preview_matches_cli_and_preserves_blank_model_draft(tmp_path
             assert (await client.post(endpoint, json={"config": normalized})).status_code == 422
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
         assert main(["preview", "--config", "-"]) == 0
-        assert json.loads(capsys.readouterr().out) == {
-            key: value for key, value in response.json().items() if key != "request_plan"}
+        assert json.loads(capsys.readouterr().out) == response.json()
         assert (await client.get("/api/runs")).json()["runs"] == []
 
 
@@ -712,3 +711,35 @@ async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_pat
         assert [p["event"] for p in detail["phases"]] == ["scenario_started", "scenario_finished"]
         await client.post(f"/api/runs/{identifier}/cancel", json={})
         await finished(client, identifier)
+
+
+async def test_startup_and_read_only_requests_leave_runs_directory_absent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://localhost:8787") as client:
+            assert (await client.get("/")).status_code == 200
+            assert (await client.get("/api/bootstrap")).status_code == 200
+            assert (await client.get("/api/runs")).json()["runs"] == []
+            assert (await client.get("/api/baselines")).json()["baselines"] == []
+            assert (await client.get("/api/runs/missing")).status_code == 404
+            assert (await client.post("/api/runs", json={})).status_code == 422
+    assert not (tmp_path / "runs").exists()
+
+
+async def test_first_run_and_baseline_create_only_their_required_directories(tmp_path, fake_runner):
+    runs = tmp_path / "nested" / "custom-runs"
+    async with browser(runs) as client:
+        assert not runs.exists()
+        identifier = await start(client)
+        await finished(client, identifier)
+        assert (runs / identifier / "report.json").is_file()
+        assert not (runs / ".baselines").exists()
+        assert (await client.get("/api/baselines")).json()["baselines"] == []
+        assert not (runs / ".baselines").exists()
+        response = await client.post("/api/baselines", json={"run_id": identifier, "name": "First"})
+        assert response.status_code == 201
+        baseline = response.json()
+        assert (runs / ".baselines" / baseline["id"] / "report.json").is_file()
+        assert (await client.get("/api/baselines")).json()["baselines"] == [baseline]

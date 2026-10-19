@@ -7,19 +7,77 @@ and what regressed against a saved run. Results stay in local HTML and JSON file
 Licensed under [Apache-2.0](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md)
 for the branch and approval policy.
 
-## Install
+## Try it in 30 seconds
 
-Python 3.11+ on macOS or Linux:
+Use Python 3.11+ on macOS or Linux, with Ollama already running and
+`llama3.2:3b` installed:
 
 ```sh
-python3 -m venv .venv
+git clone https://github.com/0dust/giraffe.git && cd giraffe
+python -m venv .venv
 . .venv/bin/activate
 pip install -e .
+giraffe run --url http://127.0.0.1:11434/v1 --model llama3.2:3b --checks access,serving,correctness --concurrency 1
 ```
+
+This command was measured against local Ollama with `llama3.2:3b`: **PASS,
+13 suite requests, exit 0**. Runtime and results depend on your model and server.
+It checks access, serving and known answers at concurrency 1. With `--concurrency 2`
+or higher on default Ollama, correctness is **INCONCLUSIVE** because Ollama serves
+one request at a time by default and the check requires observed scored overlap.
+To test concurrent serving, configure `OLLAMA_NUM_PARALLEL` on the Ollama server
+(or your engine's equivalent), restart it, and rerun with the desired concurrency.
+Parallel serving needs additional memory; see the
+[Ollama concurrency guidance](https://docs.ollama.com/faq#how-does-ollama-handle-concurrent-requests).
 
 Use a model already installed on your server. No test authoring, model download,
 cloud account, database, or hosted judge is needed. API origins, `/v1` bases, and
-complete `/chat/completions` URLs are accepted.
+complete `/chat/completions` URLs are accepted. For a non-editable package install,
+use `pip install giraffe-check`; the command is still `giraffe`.
+
+## What your first run looks like
+
+The CLI sends one bounded connection/model probe per target, then prints planning
+warnings before starting the suite. Each probe allows at most 32 output tokens
+and 15 seconds, uses your connection settings, and is
+separate from the suite request count and budget. `--skip-preflight` skips these
+probes. A preflight failure prints a remedy and exits as blocked without creating
+a run directory or report.
+
+The quick run above prints limits and live progress, followed by output shaped
+like this (summaries and paths vary):
+
+```text
+Giraffe: 1 target(s), at most 300 requests, 1 in flight, 300s total, 30s/request, 128 output tokens/request. Ctrl-C saves a partial report.
+...
+PASS: 13 requests
+  local / access: pass — ...
+  local / serving: pass — ...
+  local / correctness: pass — ...
+JSON: /your/checkout/giraffe/runs/<timestamp>/report.json
+HTML: /your/checkout/giraffe/runs/<timestamp>/report.html
+```
+
+**PASS** means the selected required checks have sufficient evidence and meet their
+acceptance limits. **FAIL** means a check observed a failure. **INCONCLUSIVE** means
+evidence is insufficient to decide, for example too few samples or no concurrent
+overlap. Inconclusive check lines include a remedy describing what to change or
+collect before rerunning. **BLOCKED** means the run or check could not proceed,
+for example because preflight could not connect to the model.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Pass |
+| `1` | Fail |
+| `2` | Inconclusive |
+| `3` | Blocked (including preflight failure) |
+| `4` | Usage or configuration error |
+
+Reports go to `runs/<timestamp>/report.html` and `report.json` relative to the
+working directory, or to the directory supplied with `--output`. Open the HTML
+file in your browser; JSON includes measurements and reproduction settings.
+Once the suite starts, failed or interrupted runs also save reports. Ctrl-C stops
+new requests and saves partial results.
 
 ## Ollama
 
@@ -28,6 +86,7 @@ Copy [examples/local.yaml](examples/local.yaml) and edit these settings:
 
 | Setting | What to enter |
 | --- | --- |
+| `targets[0].name` | Required unique target label, such as `local`; used in results and comparisons. |
 | `targets[0].url` | `http://127.0.0.1:11434/v1` for a local server; use its reachable address if remote. |
 | `targets[0].model` | A model name from `ollama list`, including its tag, such as `llama3.2:3b`. |
 | `context_limit` | The context length configured in Ollama for this model. |
@@ -42,6 +101,13 @@ giraffe run --config my-ollama.yaml --output runs/ollama-first
 ```
 
 Review the traffic budgets, acceptance limits and enabled checks before running.
+This broader example uses concurrency 2; configure server parallelism before
+expecting concurrent checks to qualify. For a sequential first run, use the
+three-check command above. The example's 300-request budget covers the planned
+fixed and conservative adaptive work. It intentionally keeps a small context and
+output budget; its 10k-token stress cases remain inconclusive. Use
+[concurrent-workloads.yaml](examples/concurrent-workloads.yaml) with matching
+server limits to exercise those cases.
 
 ## vLLM
 
@@ -53,6 +119,7 @@ Copy [examples/vllm.yaml](examples/vllm.yaml) and edit these settings:
 
 | Setting | What to enter |
 | --- | --- |
+| `targets[0].name` | Required unique target label, such as `vllm`; used in results and comparisons. |
 | `targets[0].url` | `http://127.0.0.1:8000/v1` for a local server; use the reachable host/port for a remote server. |
 | `targets[0].model` | An exact model ID from the server's `/v1/models` response, including any `--served-model-name` alias. |
 | `context_limit` | The context length configured on the server with `--max-model-len`. |
@@ -69,6 +136,9 @@ giraffe run --config my-vllm.yaml --output runs/vllm-first
 ```
 
 The example enables the ten standard checks; JSON and GPU checks remain optional.
+Its small context and output budgets intentionally leave the 10k-token stress
+cases inconclusive; use [concurrent-workloads.yaml](examples/concurrent-workloads.yaml)
+with matching server limits for those cases.
 A wrong answer can fail a load check even when requests complete successfully.
 Inspect the failed responses before treating the result as a vLLM server fault.
 
@@ -105,8 +175,9 @@ GPU-only engines need a compatible Linux host.
 
 ## Run and compare
 
-Open **http://127.0.0.1:8765** and select **New run**. Follow **Connect → Choose
-checks → Review & run**, then select **Start run**. The web interface uses the same
+Start the local UI with `giraffe ui`, open **http://127.0.0.1:8765** and select
+**New run**. Follow **Connect → Checks → Launch**, then select **Launch**.
+The header shows the suite version. The web interface uses the same
 runner and scores as the CLI. It lets
 you follow live activity, stop and keep partial results, inspect failed checks and
 individual responses, save a named baseline, and compare a later run. Existing
@@ -114,8 +185,22 @@ CLI reports in `runs/` appear in the history. A finished run can still fail its
 acceptance checks; those are displayed separately.
 
 `giraffe ui` starts on loopback only and never starts inference automatically.
-Use `--port 8766` to select another port or `--runs-dir /path/to/runs` for another
-report directory. Paste your endpoint in **Connect** and select **Test connection**.
+Its flags are:
+
+| Flag | Purpose |
+| --- | --- |
+| `--port PORT` | Loopback HTTP port; default `8765`. |
+| `--runs-dir PATH` | Report/history directory; default `runs` relative to the working directory. Created on the first run. |
+| `--config FILE` | Prefill the form from YAML/JSON, including the file's selected checks. |
+
+If the port is in use, Giraffe exits with code 4 and asks you to choose another
+with `--port`; it does not switch ports automatically. For example:
+
+```sh
+giraffe ui --port 8766 --runs-dir runs/local --config my-ollama.yaml
+```
+
+Paste your endpoint in **Connect** and select **Test connection**.
 Giraffe discovers available models and selects one automatically if only one is
 listed. If several are available, choose one; if listing is unsupported, enter its
 name. An explicitly entered model skips discovery. The test sends at most one
@@ -151,19 +236,20 @@ request/run and is never added to the server's environment. A pasted key takes
 precedence over `api_key_env`; combining it with a custom Authorization header is
 rejected. TLS trust, proxy settings and other configured header variables still apply.
 
-**Choose checks** opens on your selected checks. Use **Add checks** to search
-the full catalog by purpose. The initial selection is endpoint response and
-answer correctness. Each check has an **i**
+**Checks** opens on your selected checks. Use **Add checks** to search
+the full catalog by purpose. Without `--config`, the initial selection is endpoint
+response and answer correctness. With `giraffe ui --config FILE`, the initial
+selection is the file's checks. Each check has an **i**
 button for details and a **Settings** button for its controls. Load settings belong to their load
 check; answer checks and rate tests can use your own questions. Shared request
 and time limits apply across the run. The final review shows planned requests,
 stopping limits and separate evaluator calls before you start. Plans update as
 you edit; adaptive tests are labeled as bounded and built-in random arrival counts
 as estimates. Increasing the total request limit always requires an explicit
-action. **Start run** becomes available only after the current request plan is ready.
+action. **Launch** becomes available only after the current request plan is ready.
 
 The optional `--config` prefills the form and preserves the supplied test selection.
-In **Review & run**, expand **Save this setup or use advanced options** to save
+In **Launch**, expand **Save this setup or use advanced options** to save
 a setup, copy a terminal command, or open the **Advanced editor**. Its JSON view
 supports the same multi-model/replica settings as the CLI. **Apply changes** validates
 JSON before updating the form; unapplied edits are retained and must be applied or
@@ -177,20 +263,20 @@ you can run from a terminal. It does not start traffic. All UI assets are bundle
 locally, with no CDN or frontend build step. Closing the browser does not stop a run;
 use **Stop run**. One run is active at a time to avoid competing benchmark traffic.
 
-The CLI prints its limits before sending traffic: maximum requests, concurrency,
+After preflight, the CLI prints its suite limits: maximum requests, concurrency,
 total duration, per-request deadline, and output tokens. Ctrl-C stops new requests
 and saves partial results. Normal runs never restart the service.
 
 Open `report.html` in your run's output directory. `report.json` contains the same
 measurements and reproduction settings. A failed or interrupted run still produces
-a report.
+a report once the suite has started; preflight failures do not.
 
 To compare runs, substitute your edited Ollama or vLLM configuration for
 `my-config.yaml` below:
 
 ```sh
 giraffe run --config my-config.yaml --output runs/before
-giraffe baseline save runs/before/report.json baselines/local.json
+giraffe baseline save runs/before baselines/local.json
 
 # After changing your deployment:
 giraffe run --config my-config.yaml --baseline baselines/local.json \
@@ -230,8 +316,8 @@ are unqualified samples. Missing evidence leaves these checks inconclusive; see
 
 Read [the workload and telemetry guide](docs/workloads.md) and use
 [the expanded example](examples/workloads.yaml). Export a sanitized reproduction
-snapshot with `giraffe export runs/after/report.json`, or inspect deployment,
-telemetry and comparison evidence with `giraffe inspect runs/after/report.json`.
+snapshot with `giraffe export runs/after`, or inspect deployment,
+telemetry and comparison evidence with `giraffe inspect runs/after`.
 New workloads stay disabled unless configured; missing internal telemetry stays
 unverified.
 
@@ -313,8 +399,8 @@ schema 1 reports remain readable and are not compared against the new definition
 
 ## Configure targets and traffic
 
-All settings are optional except at least one target URL and model. Multiple targets
-share one global request/time/concurrency budget. Targets normally run sequentially;
+Each target requires a unique `name`, a `url` and a `model`; other settings have
+defaults. Multiple targets share one global request/time/concurrency budget. Targets normally run sequentially;
 `overlap_models: true` tests competing models within that same budget.
 
 ```yaml
@@ -335,7 +421,7 @@ targets:
     parent: service
 
 concurrency: 4
-max_requests: 160
+max_requests: 600
 max_duration_seconds: 300
 request_timeout_seconds: 30
 max_output_tokens: 128
@@ -381,7 +467,8 @@ in the recorded request scenarios.
 An explicit `checks` list is authoritative: selecting `json` or `gpu` enables it
 without a second flag. Without a list, the ten standard checks are selected, and
 legacy `structured_json` / `metrics` flags opt into their additional checks.
-`--json` and `--metrics` extend a saved selection unless `--checks` is also given.
+`--structured-output` and `--metrics` extend a saved selection unless `--checks`
+is also given. `--json` remains a hidden alias for `--structured-output`.
 When reusing an older manifest whose `checks` list included disabled optional
 tests, remove `json` or `gpu` from that list to keep them deselected. Saved custom
 fixtures are used only when correctness is selected.
@@ -448,7 +535,7 @@ giraffe run --config my-config.yaml --request-pack examples/request-pack.json \
 giraffe baseline save runs/pack-before/report.json baselines/pack.json
 # Saved configuration embeds the pack; the original file is no longer needed.
 giraffe preview --config exported-config.json
-giraffe run --manifest runs/pack-before/report.json --baseline baselines/pack.json \
+giraffe run --manifest runs/pack-before --baseline baselines/pack.json \
   --output runs/pack-after
 ```
 
@@ -635,6 +722,10 @@ The good fraction uses all planned arrivals, including unsent ones. A stage need
 sufficient samples and a first-output or total-response latency limit to qualify;
 stream-gap or generation-speed limits alone do not bound user waiting time.
 
+The capacity plan row explains that scheduled requests consume the run limit even
+when all request slots are busy and the generator cannot send them. This accounting
+note remains visible in the plan without warning on an otherwise valid budget.
+
 The result is the **highest acceptable tested arrival rate** for which every
 tested rate at or below it was accepted, not a discovered maximum. A failure at a
 lower rate followed by a pass at a higher rate is flagged as non-monotonic and
@@ -654,7 +745,7 @@ pack, and tool scoring is reserved for built-in tool checks. Custom fixture file
 remain available to reproduce a run.
 
 ```sh
-giraffe run --manifest runs/before/report.json --output runs/reproduced
+giraffe run --manifest runs/before --output runs/reproduced
 ```
 
 Cold-start testing is a separate, explicit command. Configure an argv list on the
@@ -695,26 +786,35 @@ docker run --rm -v "$PWD:/work" giraffe run \
 service address or the appropriate Docker host mapping. Pass credentials using
 `docker run -e INFERENCE_API_KEY ...` when configured.
 
-Exit codes: `0` pass, `1` observed failure, `2` inconclusive/blocked/skipped or invalid
-configuration. Use the JSON for per-check decisions.
-
 ## Agent and automation use
 
 Discover supported tests and the complete configuration schema, validate a file
-without sending traffic, then execute it with structured output:
+without sending traffic, then execute it with structured output. Plain
+`giraffe validate --config FILE` prints a short text summary and planning warnings;
+add `--show-config` to also print the normalized configuration.
+`giraffe preview --config FILE` returns the same JSON preview as the UI, including
+`config`, `request_pack_preview` and `request_plan`. Planning warnings are in
+`request_plan.warnings`; add `--output-format text` for a short summary and
+`Warning: ...` lines. Both commands work without sending traffic:
 
 ```sh
 giraffe describe
 giraffe validate --config deployment.json --output-format json
+giraffe preview --config deployment.json --output-format text
 giraffe run --config deployment.json --output-format json
 ```
 
 `--config -` reads JSON or YAML from standard input. `--output-format json` emits
 one JSON object on stdout; progress remains on stderr. Run results include
 `outcome`, `exit_code`, `run_id`, and absolute `report_paths.json` and
-`report_paths.html`. Errors include field locations and messages. The existing
-`--json` flag still selects the structured-output test; it does not control the
-CLI's output format. `cold-start` and `baseline save` also support structured output.
+`report_paths.html`. A preflight failure returns `outcome: "blocked"`, exit code 3,
+and a message without report paths. Errors include field locations and messages.
+`--structured-output` selects the structured JSON test; `--json` remains a hidden
+compatibility alias. Use `--output-format json` for the CLI's output format.
+`cold-start` and `baseline save` also support structured output.
+
+`inspect`, `export`, `baseline save`, `run --baseline` and `run --manifest` accept
+either a run directory containing `report.json` or the report file itself.
 
 The local HTTP API provides the same configuration and runner contracts:
 
@@ -772,7 +872,8 @@ configurations, real Ollama and vLLM-Metal results, endpoint failures and covera
 
 Verified locally on October 4, 2026 with Python 3.12 on macOS:
 
-The model runs below predate the arrival-rate capacity test. The new scheduler,
+The model runs below predate the arrival-rate capacity test and the stricter
+reliability audit; their pass counts do not certify the current suite. The new scheduler,
 selectable controls and upgrade comparison have automated loopback HTTP coverage;
 those results do not constitute live GPU qualification of the new workload.
 

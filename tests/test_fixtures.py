@@ -99,6 +99,22 @@ def test_arithmetic_uses_the_whole_answer(output, expected):
     assert score_response(spec, record(spec, output)).score is expected
 
 
+@pytest.mark.parametrize("scorer", ["exact", "contains", "json"])
+def test_mismatch_message_has_bounded_expected_and_received(scorer):
+    expected = "<expected>" + "e" * 100
+    actual = "<received>" + "a" * 100
+    spec = RequestSpec(fixture_id="mismatch", scenario="correctness", check_ids=["correctness"],
+        messages=[], scorer=scorer,
+        expected={"value": expected} if scorer == "json" else expected,
+        **({"schema": {"type": "object"}} if scorer == "json" else {}))
+    output = json.dumps({"value": actual}) if scorer == "json" else actual
+    result = score_response(spec, record(spec, output))
+    assert result.score is False
+    assert "Expected:" in result.score_message and "received:" in result.score_message
+    assert "<expected>" in result.score_message and "<received>" in result.score_message
+    assert "e" * 90 not in result.score_message and "a" * 90 not in result.score_message
+
+
 def test_extraction_and_classification_do_not_accept_reasoning_or_wrong_values():
     extraction, _, classification = builtin_fixtures(config())["correctness"]
     assert score_response(extraction, record(extraction, "T8R2")).score is True

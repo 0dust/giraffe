@@ -8,6 +8,25 @@ from pathlib import Path
 import pytest
 
 
+def test_pasted_key_is_not_restored_with_saved_setup_draft():
+    from tests.test_ui_navigation import run_browser_script
+
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+page.run(`
+sessionAPIKey={url:state.config.targets[0].url,key:'secret-excluded-from-draft'};
+state.config.targets[0].api_key_env='GIRAFFE_API_KEY';
+windowListeners.pagehide();
+`);
+const saved=storage.get('giraffe-draft-v1');
+assert(saved.includes('GIRAFFE_API_KEY'));
+assert(!saved.includes('secret-excluded-from-draft'));
+const reload=browser();await reload.run('init()');
+assert.equal(reload.run('state.config.targets[0].api_key_env'),'GIRAFFE_API_KEY');
+assert.equal(reload.run('sessionAPIKey'),null);
+""")
+
+
 def test_tab_key_scope_clearing_and_inflight_connection_changes():
     node = shutil.which("node")
     if not node:

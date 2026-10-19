@@ -89,7 +89,7 @@ def test_bucket_plan_covers_nine_real_prompts_and_full_batches():
         for chars in (64, 1024, 12288)
         for cap, extra in ((16, 0), (48, 32), (96, 32))
     ]
-    assert configuration.max_requests == 160
+    assert configuration.max_requests == 300
 
 
 def test_target_quotas_warn_for_the_smaller_share():
@@ -150,8 +150,9 @@ def test_steady_rate_counts_match_schedule_semantics(rate, duration):
     result = plan(configuration)
     assert result["planned_per_target"] == len(arrival_schedule(configuration.traffic, rate)[0])
     assert result["count_kind"] == "exact"
-    assert any("Scheduled requests use the run limit" in warning and "slots are busy" in warning
-               for warning in result["warnings"])
+    capacity = next(row for row in result["rows"] if row["id"] == "capacity")
+    assert "Scheduled requests use the run limit" in capacity["summary"]
+    assert "slots are busy" in capacity["summary"]
 
 
 def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
@@ -343,3 +344,29 @@ def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
     assert preview['known_per_target'] <= 28 < preview['conservative_requests_per_target']
     assert preview['adaptive_estimates']['sustained'] >= 8
     assert any('likely to be starved' in warning for warning in preview['warnings'])
+
+
+@pytest.mark.parametrize("quota", [300, 400, 1000])
+def test_local_recovery_warmup_is_reserved_once_in_adaptive_estimate(quota):
+    from pathlib import Path
+    import yaml
+
+    values = yaml.safe_load((Path(__file__).resolve().parents[1] / "examples/local.yaml").read_text())
+    configuration = RunConfig.model_validate({**values, "max_requests": quota})
+    result = plan(configuration)
+    warmup = next(row for row in result["rows"] if row["id"] == "recovery_prime")
+    assert warmup["kind"] == "bounded" and warmup["requests_per_target"] == 1
+    assert result["known_per_target"] == 250
+    assert result["conservative_requests_per_target"] <= quota
+    assert not any("starved" in warning or "Some tests may be incomplete" in warning
+                   for warning in result["warnings"])
+
+
+def test_capacity_accounting_note_does_not_warn_when_budgets_and_limits_fit():
+    result = plan(config(checks=["capacity"], max_requests=20,
+                         traffic={"rates": [1], "duration_seconds": 2},
+                         limits={"latency_ms": 1000}))
+    assert not result["warnings"]
+    capacity = next(row for row in result["rows"] if row["id"] == "capacity")
+    assert capacity["requests_per_target"] == 2
+    assert "Scheduled requests use the run limit" in capacity["summary"]

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
+import socket
 import json
 import signal
 import sys
@@ -18,8 +20,15 @@ from giraffe import __version__
 from giraffe.models import CHECK_NAMES, ConfigDraft, RunConfig, RunReport
 
 
-class UsageError(ValueError):
+class UsageError(SystemExit):
     """An argument error that can use the caller's requested output format."""
+
+    def __init__(self, message: str):
+        super().__init__(4)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -40,8 +49,10 @@ def parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate", help="Validate and normalize a configuration without traffic")
     validate.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
     validate.add_argument("--output-format", choices=["text", "json"], default="text")
-    preview = commands.add_parser("preview", help="Preview a draft configuration as JSON without traffic")
+    validate.add_argument("--show-config", action="store_true", help="Print the normalized configuration in text mode")
+    preview = commands.add_parser("preview", help="Preview a draft configuration without traffic")
     preview.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
+    preview.add_argument("--output-format", choices=["text", "json"], default="json")
     importer = commands.add_parser("import-dataset", help="Preview CSV or JSON dataset import as JSON without traffic")
     importer.add_argument("--file", required=True, type=Path)
     importer.add_argument("--input-field")
@@ -59,45 +70,62 @@ def parser() -> argparse.ArgumentParser:
     web.add_argument("--config", type=Path, help="Prefill the run form from a YAML/JSON config")
     for name in ("run", "cold-start"):
         run = commands.add_parser(name, help="Run the suite" if name == "run" else
-                                  "Explicitly restart one configured target and test readiness")
+                                  "Explicitly restart one configured target and test readiness",
+                                  formatter_class=argparse.RawDescriptionHelpFormatter,
+                                  epilog="""Examples:
+  giraffe run --url http://127.0.0.1:11434/v1 --model llama3.2:3b
+  giraffe run --config giraffe.yaml
+  giraffe run --config giraffe.yaml --baseline runs/previous
+
+Exit codes:
+  0  pass
+  1  fail
+  2  inconclusive
+  3  blocked (including preflight failure)
+  4  usage or configuration error""")
         source = run.add_mutually_exclusive_group()
         source.add_argument("--config", type=Path, help="YAML or JSON run configuration; - reads stdin")
         source.add_argument("--manifest", type=Path, help="Rerun the configuration in a saved report")
         run.add_argument("--url", help="OpenAI-compatible origin, API base, or chat-completions URL")
-        run.add_argument("--model")
+        run.add_argument("--model", help="Model name served by the endpoint")
         run.add_argument("--api-key-env", help="Name of an environment variable containing the key")
-        run.add_argument("--concurrency", type=int)
-        run.add_argument("--max-requests", type=int)
-        run.add_argument("--max-duration", type=float, dest="max_duration_seconds")
-        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds")
-        run.add_argument("--max-output-tokens", type=int)
-        run.add_argument("--context-limit", type=int)
-        run.add_argument("--samples", type=int)
-        run.add_argument("--sustained-seconds", type=float)
-        run.add_argument("--stop-after-errors", type=int)
-        run.add_argument("--checks", help="Comma-separated: " + ",".join(CHECK_NAMES))
-        run.add_argument("--json", action="store_true", default=None, dest="structured_json")
+        run.add_argument("--concurrency", type=int, help="Maximum requests in flight")
+        run.add_argument("--max-requests", type=int, help="Maximum suite request budget across all targets "
+                         f"(default: {RunConfig.model_fields['max_requests'].default})")
+        run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Maximum suite duration in seconds")
+        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Per-request timeout in seconds")
+        run.add_argument("--max-output-tokens", type=int, help="Maximum output tokens per request")
+        run.add_argument("--context-limit", type=int, help="Model context token limit")
+        run.add_argument("--samples", type=int, help="Samples per selected check")
+        run.add_argument("--sustained-seconds", type=float, help="Duration of sustained recovery load in seconds")
+        run.add_argument("--stop-after-errors", type=int, help="Stop after this many request errors")
+        run.add_argument("--checks", metavar="CHECKS", help="Comma-separated names: " + ", ".join(CHECK_NAMES))
+        run.add_argument("--structured-output", action="store_true", default=None, dest="structured_json",
+                         help="Include structured JSON output checks")
+        run.add_argument("--json", action="store_true", default=None, dest="structured_json",
+                         help=argparse.SUPPRESS)
+        run.add_argument("--skip-preflight", action="store_true", help="Skip the bounded connection/model probe")
         run.add_argument("--deployment-file", type=Path, help="Bounded deployment JSON for the first target")
         run.add_argument("--metrics-url", help="Separate statistics endpoint for the first target")
         run.add_argument("--metrics-api-key-env", help="Separate metrics secret reference")
-        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"])
-        run.add_argument("--tool-calling", action="store_true", default=None)
-        run.add_argument("--metrics", action="store_true", default=None)
-        run.add_argument("--nonstream", action="store_false", default=None, dest="stream")
-        run.add_argument("--overlap-models", action="store_true", default=None)
+        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"], help="Metrics format used by the statistics endpoint")
+        run.add_argument("--tool-calling", action="store_true", default=None, help="Include tool-calling capability checks")
+        run.add_argument("--metrics", action="store_true", default=None, help="Include GPU metrics observations")
+        run.add_argument("--nonstream", action="store_false", default=None, dest="stream", help="Disable streaming responses")
+        run.add_argument("--overlap-models", action="store_true", default=None, help="Run targets concurrently within the shared request limit")
         run.add_argument("--fixtures", dest="custom_fixtures", help="Optional custom fixture JSON")
         run.add_argument("--request-pack", dest="request_pack_file", metavar="PATH",
                          help="Import local request-pack JSON into the portable configuration")
-        run.add_argument("--retention", choices=["all", "failures", "none"])
-        run.add_argument("--ca-bundle")
-        run.add_argument("--proxy")
+        run.add_argument("--retention", choices=["all", "failures", "none"], help="Retain all responses, failures only, or no response content")
+        run.add_argument("--ca-bundle", help="TLS CA certificate bundle path")
+        run.add_argument("--proxy", help="HTTP proxy URL")
         for option in ("first-output-ms", "latency-ms", "stream-gap-ms",
                        "min-output-tokens-per-second", "max-error-rate", "min-correctness",
                        "fairness-max-ratio", "regression-percent"):
-            run.add_argument("--" + option, type=float)
+            run.add_argument("--" + option, type=float, help="Threshold for " + option.replace("-", " "))
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
-        run.add_argument("--output-format", choices=["text", "json"], default="text")
+        run.add_argument("--output-format", choices=["text", "json"], default="text", help="Result format on stdout; progress is written to stderr")
         if name == "cold-start":
             run.add_argument("--restart", required=True, help="Name of target with restart_command")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
@@ -115,10 +143,12 @@ def parser() -> argparse.ArgumentParser:
 
 
 def load_report(path: Path) -> RunReport:
-    return RunReport.model_validate_json(path.read_text())
+    return RunReport.model_validate_json((path / "report.json" if path.is_dir() else path).read_text())
 
 
 def load_configuration(path: Path) -> dict:
+    if path != Path("-") and not path.exists():
+        raise ValueError(f"config file not found: {path}")
     values = yaml.safe_load(sys.stdin.read() if path == Path("-") else path.read_text())
     if not isinstance(values, dict):
         raise ValueError("Configuration must be a YAML/JSON object")
@@ -185,7 +215,7 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     return RunConfig.model_validate(values)
 
 
-async def _run(config: RunConfig) -> RunReport:
+async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
@@ -202,8 +232,11 @@ async def _run(config: RunConfig) -> RunReport:
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
+        if json_progress:
+            print(json.dumps(event, allow_nan=False), file=sys.stderr, flush=True)
+            return
         current = (event.get("target"), event.get("scenario"))
-        if current[1] and (current != last or time.monotonic() - last_update >= 1):
+        if current[1] and (current != last or time.monotonic() - last_update >= 5):
             print(f"  {current[0]}: {current[1]} · "
                   f"{event.get('completed', 0)}/{config.max_requests} request budget · "
                   f"{event.get('elapsed_seconds', 0):g}s", file=sys.stderr, flush=True)
@@ -222,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
     json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or any(value == "--output-format=json" or (
         value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "json"
     ) for index, value in enumerate(arguments))
+    if arguments and arguments[0] == "preview" and any(value == "--output-format=text" or (
+        value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "text"
+    ) for index, value in enumerate(arguments)):
+        json_output = False
     kind = arguments[0] if arguments else "usage"
 
     def emit(outcome: str, exit_code: int, **details) -> None:
@@ -229,13 +266,19 @@ def main(argv: list[str] | None = None) -> int:
                          allow_nan=False))
 
     def failure(errors: list[dict]) -> int:
+        errors = [{**error, "message": error["message"].removeprefix("Value error, ").removeprefix("Assertion failed, ")}
+                  for error in errors]
         if json_output:
-            emit("error", 2, errors=errors)
+            emit("error", 4, errors=errors)
         else:
             for error in errors:
                 location = ".".join(map(str, error["loc"]))
+                if len(error["loc"]) == 2 and error["loc"][0] == "targets" and error["message"].startswith(
+                    ("target url ", "metrics_url ")
+                ):
+                    location = ""
                 print(f"giraffe: {location + ': ' if location else ''}{error['message']}", file=sys.stderr)
-        return 2
+        return 4
 
     try:
         args = parser().parse_args(arguments)
@@ -251,18 +294,39 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "validate":
             config = RunConfig.model_validate(load_configuration(args.config))
+            from giraffe.planning import request_plan
+
+            warnings = request_plan(config)["warnings"]
             if json_output:
-                emit("success", 0, config=config.model_dump(mode="json"))
+                emit("success", 0, config=config.model_dump(mode="json"), warnings=warnings)
             else:
                 print("Configuration is valid. No traffic was sent.")
-                print(config.model_dump_json(indent=2))
+                print("Targets: " + ", ".join(target.name for target in config.targets))
+                print("Checks: " + ", ".join(config.checks))
+                print(f"max_requests: {config.max_requests}")
+                for warning in warnings:
+                    print(f"Warning: {warning}")
+                if args.show_config:
+                    print(config.model_dump_json(indent=2))
             return 0
         if args.command == "preview":
             from giraffe.request_pack import pack_preview
+            from giraffe.planning import request_plan
 
             config = ConfigDraft.model_validate(load_configuration(args.config))
-            print(json.dumps({"config": config.model_dump(mode="json"),
-                              "request_pack_preview": pack_preview(config)}, allow_nan=False))
+            preview = pack_preview(config)
+            plan = request_plan(config, pack_details=preview)
+            if args.output_format == "json":
+                print(json.dumps({"config": config.model_dump(mode="json"),
+                                  "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
+            else:
+                print("Configuration preview. No traffic was sent.")
+                print("Targets: " + ", ".join(target.name for target in config.targets))
+                print("Checks: " + ", ".join(config.checks))
+                print(f"Known requests per target: {plan['known_per_target']}")
+                print(f"max_requests: {config.max_requests}")
+                for warning in plan["warnings"]:
+                    print(f"Warning: {warning}")
             return 0
         if args.command == "import-dataset":
             from giraffe.dataset_import import preview_dataset, read_dataset
@@ -271,25 +335,35 @@ def main(argv: list[str] | None = None) -> int:
                                      input_field=args.input_field, expected_field=args.expected_field,
                                      scorer=args.scorer)
             print(json.dumps(result, allow_nan=False))
-            return 2 if result["errors"] else 0
+            return 4 if result["errors"] else 0
         if args.command == "ui":
             if not 1 <= args.port <= 65535:
                 raise ValueError("Port must be between 1 and 65535")
             defaults = None
             if args.config:
-                defaults = RunConfig.model_validate(yaml.safe_load(args.config.read_text())).model_dump(
+                defaults = RunConfig.model_validate(load_configuration(args.config)).model_dump(
                     mode="json"
                 )
                 defaults["restart_target"] = None
             import uvicorn
             from giraffe.web import create_app
 
-            print(f"Giraffe UI: http://127.0.0.1:{args.port}\n"
-                  f"Local runs: {args.runs_dir.resolve()}\n"
-                  "Open the address in your browser. Review the plan, then choose Launch.",
-                  flush=True)
-            uvicorn.run(create_app(runs_dir=args.runs_dir, defaults=defaults),
-                        host="127.0.0.1", port=args.port, log_level="warning")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    listener.bind(("127.0.0.1", args.port))
+                    listener.listen(128)
+                except OSError as error:
+                    if error.errno == errno.EADDRINUSE:
+                        raise ValueError(f"port {args.port} is in use; choose another with --port") from None
+                    raise
+                app = create_app(runs_dir=args.runs_dir, defaults=defaults)
+                print(f"Giraffe UI: http://127.0.0.1:{args.port} — open in your browser\n"
+                      f"Local runs: {args.runs_dir.resolve()}\n"
+                      "Review the plan, then choose Launch.", flush=True)
+                server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port,
+                                                       log_level="warning"))
+                server.run(sockets=[listener])
             return 0
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
@@ -303,8 +377,11 @@ def main(argv: list[str] | None = None) -> int:
             from giraffe.reporting import _retained
             report = _retained(load_report(args.report))
             args.destination.parent.mkdir(parents=True, exist_ok=True)
-            with args.destination.open("w" if args.replace else "x") as file:
-                file.write(report.model_dump_json(indent=2) + "\n")
+            try:
+                with args.destination.open("w" if args.replace else "x") as file:
+                    file.write(report.model_dump_json(indent=2) + "\n")
+            except FileExistsError:
+                raise ValueError(f"Baseline already exists: {args.destination}; use --replace to overwrite it") from None
             if json_output:
                 emit("success", 0, run_id=report.run_id, destination=str(args.destination.resolve()))
             else:
@@ -324,25 +401,57 @@ def main(argv: list[str] | None = None) -> int:
         )
         if directory.exists() and any(directory.iterdir()):
             raise ValueError(f"Output directory is not empty: {directory}; choose a new directory")
-        # Check output writability before sending traffic.
+        from giraffe.planning import request_plan
+        from giraffe.preflight import PreflightError, check_target
+
+        warnings = []
+        if args.command == "run" and not args.skip_preflight:
+            async def preflight():
+                for target in config.targets:
+                    try:
+                        await check_target(target, config)
+                    except PreflightError as error:
+                        if error.blocking:
+                            return target.name, str(error) + " Use --skip-preflight to run anyway."
+                        warning = f"preflight for {target.name}: {error}; continuing."
+                        warnings.append(warning)
+                        print(f"Warning: {warning}", file=sys.stderr)
+                return None
+
+            blocked = asyncio.run(preflight())
+            if blocked:
+                target, message = blocked
+                print(f"giraffe: preflight failed for {target}: {message}", file=sys.stderr)
+                if json_output:
+                    emit("blocked", 3, target=target, message=message)
+                return 3
+        planning_warnings = request_plan(config)["warnings"]
+        for warning in planning_warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
+        warnings = planning_warnings + warnings
         directory.mkdir(parents=True, exist_ok=True)
         print(f"Giraffe: {len(config.targets)} target(s), at most {config.max_requests} requests, "
               f"{config.concurrency} in flight, {config.max_duration_seconds:g}s total, "
               f"{config.request_timeout_seconds:g}s/request, {config.max_output_tokens} output "
               "tokens/request. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
-        from giraffe.reporting import compare_baseline, write_report
+        from giraffe.reporting import _retained, compare_baseline, write_report
 
-        report = asyncio.run(_run(config))
+        report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
         if baseline:
             report = compare_baseline(report, baseline)
         json_path, html_path = write_report(report, directory)
-        exit_code = 0 if report.overall == "pass" else 1 if report.overall == "fail" else 2
+        report = _retained(report)
+        exit_code = {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+        summary = report.observations.get("summary")
         if json_output:
-            emit(report.overall, exit_code, run_id=report.run_id, request_count=len(report.requests),
+            emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
                  abort_reason=report.abort_reason,
+                 **({"summary": summary} if summary else {}),
                  report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve())})
         else:
             print(f"{report.overall.upper()}: {len(report.requests)} requests")
+            if summary:
+                print(summary)
             if report.abort_reason:
                 print(f"Stopped: {report.abort_reason}")
             for check in report.checks:
@@ -358,9 +467,13 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
             print(f"JSON: {json_path.resolve()}\nHTML: {html_path.resolve()}")
         return exit_code
+    except UsageError as error:
+        return failure([{"loc": [], "message": str(error), "type": "UsageError"}])
     except ValidationError as error:
         # Pydantic's full repr contains raw input; only print locations/messages.
-        return failure([{"loc": list(item["loc"]), "message": item["msg"], "type": item["type"]}
+        return failure([{"loc": list(item["loc"]), "message": ("Target name is required; add e.g. name: local"
+                          if item["type"] == "missing" and item["loc"][-1:] == ("name",)
+                          and "targets" in item["loc"] else item["msg"]), "type": item["type"]}
                         for item in error.errors(include_input=False, include_url=False, include_context=False)])
     except yaml.YAMLError as error:
         mark = getattr(error, "problem_mark", None)

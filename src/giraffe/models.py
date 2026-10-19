@@ -310,7 +310,7 @@ class Target(Model):
 
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("target url must be an http(s) endpoint")
+            raise ValueError("target url must start with http:// or https:// (for example http://localhost:11434/v1)")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("use an endpoint URL without credentials, query or fragment")
         if self.metrics_url:
@@ -917,7 +917,7 @@ class RunConfig(Model):
     targets: list[Target] = Field(min_length=1)
     concurrency: int = Field(default=4, ge=1, le=256,
                              description="Maximum simultaneous target requests across the run, chosen by the user; not detected hardware capacity.")
-    max_requests: int = Field(default=160, ge=1,
+    max_requests: int = Field(default=300, ge=1,
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)
@@ -1050,7 +1050,8 @@ class RunConfig(Model):
         if len(names) != len(set(names)):
             raise ValueError("target names must be unique")
         if set(self.checks) - set(CHECK_NAMES):
-            raise ValueError("checks must contain supported check names")
+            raise ValueError("Unknown check name(s): " + ", ".join(sorted(set(self.checks) - set(CHECK_NAMES)))
+                             + ". Valid names: " + ", ".join(CHECK_NAMES))
         if ("capacity" in self.checks and self.traffic.max_in_flight is not None
                 and self.traffic.max_in_flight > self.concurrency):
             raise ValueError(f"traffic.max_in_flight must not exceed global concurrency ({self.concurrency})")

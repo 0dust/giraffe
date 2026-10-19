@@ -248,7 +248,8 @@ async def test_l3_mixed_needs_limit_long_light_and_exercised_heavy(monkeypatch, 
     result = check(report, 'mixed')
     assert result.status == status
     if ratio is None:
-        assert result.summary == 'Mixed-load ratios measured; no acceptance ratio configured.'
+        assert result.summary.startswith('Mixed-load ratios measured; no acceptance ratio configured.')
+        assert 'To conclude, set limits.fairness_max_ratio' in result.summary
     lights = [r for r in report.requests if r.scenario.startswith('mixed_short')]
     assert all(r.completion_tokens >= 64 for r in lights)
     assert len(report.requests) == 18
@@ -415,6 +416,8 @@ async def test_round2_mixed_wrong_light_is_unqualified_not_failed(monkeypatch):
     assert result.metrics['correctness_observed'] < 1
     assert result.metrics['unqualified_light_samples']
     assert all(c['shape_qualified_samples'] == 0 for c in result.metrics['comparisons'])
+    assert "rerun after changing the model or its settings" in result.summary
+    assert "address the slowdown" not in result.summary
 
 
 @pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'fail')])
