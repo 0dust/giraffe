@@ -40,9 +40,9 @@ def settings(**options):
     return Consistency(repetitions=3, levels=[1, 2], shapes=['short'], logprobs=options)
 
 
-def run_config(endpoint, *, options=None, **extra):
+def run_config(endpoint, *, options=None, repetitions=3, **extra):
     return config(endpoint, checks=['consistency'], consistency={
-        'repetitions': 3, 'levels': [1, 2], 'shapes': ['short'], 'seed': 17,
+        'repetitions': repetitions, 'levels': [1, 2], 'shapes': ['short'], 'seed': 17,
         'logprobs': {'top_logprobs': 2, **(options or {})}}, **extra)
 
 
@@ -190,17 +190,18 @@ def test_extrema_match_brute_force_pairs_across_corpora_and_history_prefixes():
 @pytest.mark.parametrize('strict,expected', [(False, 'inconclusive'), (True, 'fail')])
 async def test_identical_answers_with_probability_drift_are_detected_through_http(strict, expected):
     with FakeEndpoint(mode='logprob_variable', first_token_delay=.02) as endpoint:
-        configuration = run_config(endpoint, options={'strict': strict, 'tolerance': .04, 'compare_levels': True})
+        configuration = run_config(endpoint, repetitions=4, options={
+            'strict': strict, 'tolerance': .04, 'compare_levels': True, 'priming_rounds': 2})
         report = await run_suite(configuration)
         payloads = endpoint.requests
     result = check(report, 'consistency')
     assert result.status == expected
     probabilities = result.metrics['logprobs']
-    assert probabilities['conditions'][0]['max_absolute_delta'] == 0
-    assert probabilities['conditions'][1]['max_absolute_delta'] == .06
-    assert all(c['coverage_complete'] for c in probabilities['conditions'])
+    assert probabilities['conditions'][0]['max_absolute_delta'] == .06
+    assert probabilities['conditions'][1]['max_absolute_delta'] is None
+    assert not any(c['coverage_complete'] for c in probabilities['conditions'])
     assert all(g['agreement_rate'] == 1 for g in result.metrics['buckets'].values())
-    assert len(payloads) == 12 and all(not p['stream'] and p['logprobs'] and p['top_logprobs'] == 2 for p in payloads)
+    assert len(payloads) == 24 and all(not p['stream'] and p['logprobs'] and p['top_logprobs'] == 2 for p in payloads)
     assert all(p['messages'] == payloads[0]['messages'] and p['temperature'] == 0 and p['seed'] == 17 for p in payloads)
     assert len({r.request_hash for r in report.requests}) == 1
     assert len({r.history_hash for r in report.requests}) == 1
@@ -227,19 +228,19 @@ async def test_rounds_priming_and_budget_coverage_are_explicit():
         limited = await run_suite(configuration.model_copy(update={'max_requests': 11}))
     assert plan['planned_per_target'] == len(report.requests) == 16
     result = check(report, 'consistency')
-    assert result.status == 'pass'
+    assert result.status == 'inconclusive'
     for cohort in result.metrics['logprobs']['conditions']:
         assert cohort['priming_issued'] == cohort['priming_planned'] == 2
         assert cohort['issued_requests'] == cohort['planned_requests'] == 6
-        assert cohort['sample_pairs'] == 6
-        assert all(r['achieved_overlap'] == cohort['level'] for r in cohort['rounds'])
+        assert cohort['sample_pairs'] == (6 if cohort['level'] == 1 else 0)
+        assert all(r['achieved_overlap'] == 0 for r in cohort['rounds'])
     assert len(limited.requests) == 11 and check(limited, 'consistency').status == 'inconclusive'
     assert any(c['missing_requests'] for c in check(limited, 'consistency').metrics['logprobs']['conditions'])
     modified = copy.deepcopy(report.requests)
     for r in modified:
         if r.workload['level'] == 2 and r.workload['round'] == 1:
             r.workload["load_qualified"] = False
-    assert summarize_logprobs(modified, configuration.consistency)['status'] == 'pass'
+    assert summarize_logprobs(modified, configuration.consistency)['status'] == 'inconclusive'
     for r in modified:
         if r.workload['level'] == 2:
             r.workload['load_qualified'] = False
@@ -260,15 +261,15 @@ async def test_disabled_mode_uses_text_workload_count_and_wire_contract():
 @pytest.mark.parametrize('retention,retained', [('all', True), ('none', False), ('failures', False)])
 async def test_retention_and_export_preserve_measurements_without_token_leakage(tmp_path, retention, retained):
     with FakeEndpoint(mode='logprob_variable') as endpoint:
-        report = await run_suite(run_config(endpoint, retention=retention))
+        report = await run_suite(run_config(endpoint, retention=retention, repetitions=4, options={'priming_rounds': 2}))
     write_report(report, tmp_path)
     data = (tmp_path/'report.json').read_text()
     html = (tmp_path/'report.html').read_text()
     assert ('ALT_ONLY_SECRET' in data) == retained
     assert ('ALT_ONLY_SECRET' in html) == retained
     stored = json.loads(data)
-    assert next(c for c in stored['checks'] if c['id'] == 'consistency')['metrics']['logprobs']['conditions'][1]['max_absolute_delta'] == .06
-    example = next(c for c in stored['checks'] if c['id'] == 'consistency')['metrics']['logprobs']['conditions'][1]['examples'][0]
+    assert next(c for c in stored['checks'] if c['id'] == 'consistency')['metrics']['logprobs']['conditions'][0]['max_absolute_delta'] == .06
+    example = next(c for c in stored['checks'] if c['id'] == 'consistency')['metrics']['logprobs']['conditions'][0]['examples'][0]
     for rid in example['request_ids']:
         index = next(i for i, r in enumerate(stored['requests']) if r['id'] == rid)
         assert f'href="#request-{index}"' in html
@@ -341,12 +342,13 @@ def test_real_collection_limits_and_shared_budget_admission():
 
 async def test_failure_retention_keeps_probability_violation_evidence(tmp_path):
     with FakeEndpoint(mode='logprob_variable') as endpoint:
-        report = await run_suite(run_config(endpoint, options={'strict': True, 'tolerance': .04}, retention='failures'))
+        report = await run_suite(run_config(endpoint, repetitions=4, options={
+            'strict': True, 'tolerance': .04, 'priming_rounds': 2}, retention='failures'))
     write_report(report, tmp_path)
     stored = json.loads((tmp_path/'report.json').read_text())
     result = next(c for c in stored['checks'] if c['id'] == 'consistency')
     assert result['status'] == 'fail'
-    representative = result['metrics']['logprobs']['conditions'][1]['examples'][0]['request_ids']
+    representative = result['metrics']['logprobs']['conditions'][0]['examples'][0]['request_ids']
     assert all(r['logprob_evidence']['tokens'] for r in stored['requests'] if r['id'] in representative)
 
 
@@ -384,13 +386,13 @@ async def test_api_preview_export_execution_retention_and_rerun(tmp_path):
             identifier = await start(client, normalized)
             detail = await finished(client, identifier)
             result = next(c for c in detail['report']['checks'] if c['id'] == 'consistency')
-            assert result['status'] == 'pass'
+            assert result['status'] == 'inconclusive'
             assert all(not r['logprob_evidence']['tokens'] for r in detail['report']['requests'])
             saved = (await client.get(f'/api/runs/{identifier}/config.json')).json()
             assert saved['consistency']['logprobs'] == normalized['consistency']['logprobs']
             rerun = await start(client, saved)
             repeated = await finished(client, rerun)
-            assert next(c for c in repeated['report']['checks'] if c['id'] == 'consistency')['status'] == 'pass'
+            assert next(c for c in repeated['report']['checks'] if c['id'] == 'consistency')['status'] == 'inconclusive'
             invalid = copy.deepcopy(saved)
             invalid['consistency']['logprobs']['response_mode'] = 'stream'
             count = len(endpoint.requests)
@@ -403,7 +405,8 @@ def test_cli_example_and_execution(tmp_path, capsys):
     example = configuration(parser().parse_args(['run', '--config', 'examples/logprob-consistency.yaml']))
     assert request_plan(example)['planned_per_target'] == 48
     with FakeEndpoint(mode='logprob_variable') as endpoint:
-        values = run_config(endpoint, options={'strict': True, 'tolerance': .04}).model_dump(mode='json')
+        values = run_config(endpoint, repetitions=4, options={
+            'strict': True, 'tolerance': .04, 'priming_rounds': 2}).model_dump(mode='json')
         path = tmp_path/'config.json'
         path.write_text(json.dumps(values))
         assert main(['run', '--config', str(path), '--output', str(tmp_path/'run')]) == 1
@@ -457,7 +460,7 @@ def test_comparison_work_limit_is_inconclusive_with_partial_measurements(monkeyp
 
 def test_round2_logprob_tail_exclusion_and_qualified_sample_minimum():
     options = settings(strict=True, tolerance=0, top_logprobs=0)
-    rows = [record(f'{level}-{repeat}-{slot}', [token(probability=-4 if level == 2 and slot else -.05)],
+    rows = [record(f'{level}-{repeat}-{slot}', [token(str(i), probability=-4 if level == 2 and slot else -.05) for i in range(32)],
                    level=level, repeat=repeat, slot=slot)
             for level in (1, 2) for repeat in range(3) for slot in range(2)]
     for row in rows:
@@ -479,7 +482,7 @@ def test_round2_logprob_tail_exclusion_and_qualified_sample_minimum():
 
 def test_round2_logprob_minimum_counts_qualified_requests_across_rounds():
     options = settings(strict=True, tolerance=0, top_logprobs=0)
-    rows = [record(f'{level}-{repeat}-{slot}', level=level, repeat=repeat, slot=slot)
+    rows = [record(f'{level}-{repeat}-{slot}', [token(str(i)) for i in range(32)], level=level, repeat=repeat, slot=slot)
             for level in (1, 2) for repeat in range(3) for slot in range(2)]
     result = summarize_logprobs(rows, options, min_samples=5)
     assert result['status'] == 'pass'

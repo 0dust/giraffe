@@ -1,0 +1,512 @@
+"""Concurrency claims require output evidence, even when client requests overlap."""
+
+import asyncio
+from collections import defaultdict
+from types import SimpleNamespace
+
+import pytest
+
+from giraffe.concurrent_workloads import execution_config, token_stress
+from giraffe.fixtures import builtin_fixtures
+from giraffe.logprob_workload import logprob_fixtures, refill, summarize_logprobs
+from giraffe.logprobs import collect_logprobs
+from giraffe.models import Consistency, RequestRecord, RunConfig
+from giraffe.overlap import evidenced_overlap, output_window, peak_evidenced_concurrency
+from giraffe.runner import _Run, _checks, _fairness, _missing_timing, _pack_results, _stats, _timing_violations, run_suite
+from giraffe.workloads import pair_evidenced, results, spec
+from tests.fake_endpoint import FakeEndpoint
+
+
+def configuration(**extra):
+    return RunConfig.model_validate({
+        'targets': [{'name': 'local', 'url': 'http://localhost:1/v1', 'model': 'fake-model'}],
+        'checks': ['correctness', 'json'], 'concurrency': 2, 'samples': 2,
+        'max_requests': 300, 'max_duration_seconds': 60, 'request_timeout_seconds': 5,
+        'context_limit': 8192, 'max_output_tokens': 128,
+        'limits': {'min_samples': 2, 'fairness_max_ratio': 100}, **extra})
+
+
+def record(name, start=0, first=10, last=20, **extra):
+    return RequestRecord(**{
+        'id': name, 'target': 'local', 'fixture_id': name, 'scenario': 'correctness_c2',
+        'check_ids': ['correctness'], 'started_at': 'now', 'status': 'completed',
+        'valid': True, 'score': True, 'finish_reason': 'stop', 'timing_start_ms': start,
+        'first_output_ms': first, 'last_output_ms': last, 'dispatch_ms': start - 100,
+        'elapsed_ms': last or 20, 'answer_chunks': 2, 'stream': True, 'overlap': 8,
+        'completion_tokens': 80, 'output_tokens': 80, 'input_tokens': 100,
+        'requested_max_tokens': 128, **extra})
+
+
+def workload_result(run, check):
+    return next(c for c in results(run, run.config.targets[0], _stats, _timing_violations, _missing_timing) if c.id == check)
+
+
+def test_output_windows_use_stream_completion_and_strict_intersections():
+    a, b = record('a', 100), record('b', 110)
+    assert output_window(a) == (110, 120)
+    assert evidenced_overlap(a, [a, b]) == 1  # Touching boundaries are serial.
+    point = record('point', 105, 10, 10)
+    assert evidenced_overlap(a, [a, point]) == 1  # Zero intersection cannot qualify.
+    point.elapsed_ms = 18
+    assert output_window(point) == (115, 123)
+    assert evidenced_overlap(a, [a, point]) == evidenced_overlap(point, [a, point]) == 2
+    assert peak_evidenced_concurrency([a, point]) == 2
+    assert output_window(record('missing', first=None)) is None
+    assert output_window(record('complete', stream=False)) is None
+    assert output_window(record('missing', last=None)) == (10, 20)
+
+
+def test_single_chunk_streams_require_positive_intersection_outside_delays():
+    a, b = record('a', first=10, last=10, elapsed_ms=20), record('b', first=15, last=15, elapsed_ms=25)
+    assert evidenced_overlap(a, [a, b]) == peak_evidenced_concurrency([a, b]) == 2
+    delays = [{'start_ms': 15, 'end_ms': 20, 'lag_ms': 150}]
+    assert evidenced_overlap(a, [a, b], delays) == peak_evidenced_concurrency([a, b], delays) == 1
+    # Some overlap outside a delay still proves concurrency.
+    delays[0]['end_ms'] = 19
+    assert evidenced_overlap(a, [a, b], delays) == peak_evidenced_concurrency([a, b], delays) == 2
+    # Adjacent and overlapping delay windows jointly cover the intersection.
+    delays += [{'start_ms': 18, 'end_ms': 20, 'lag_ms': 150}]
+    assert evidenced_overlap(a, [a, b], delays) == peak_evidenced_concurrency([a, b], delays) == 1
+
+
+def test_peak_excludes_simultaneity_hidden_only_inside_delay():
+    rows = [record('a', first=1, elapsed_ms=10), record('b', first=5, elapsed_ms=15),
+            record('c', first=8, elapsed_ms=20)]
+    delays = [{'start_ms': 8, 'end_ms': 10, 'lag_ms': 150}]
+    assert peak_evidenced_concurrency(rows) == 3
+    assert peak_evidenced_concurrency(rows, delays) == 2
+
+
+def test_peak_is_simultaneous_not_number_of_pairwise_neighbors():
+    wide, left, right = record('wide', 0, 0, 100), record('left', 0, 10, 20), record('right', 0, 30, 40)
+    assert evidenced_overlap(wide, [wide, left, right]) == 3
+    assert peak_evidenced_concurrency([wide, left, right]) == 2
+    assert peak_evidenced_concurrency([record('end', 0, 0, 10), record('point', 0, 10, 10), record('start', 0, 10, 20)]) == 1
+
+
+def test_output_evidence_is_target_local_and_rejects_invalid_windows():
+    a, b = record('a'), record('b', target='other')
+    assert evidenced_overlap(a, [a, b]) == 1
+    assert peak_evidenced_concurrency([a, b]) == 1
+    assert output_window(record('reversed', first=20, last=10, elapsed_ms=10)) is None
+    assert output_window(record('nan').model_copy(update={'timing_start_ms': float('nan')})) is None
+
+
+@pytest.mark.parametrize('check', ['correctness', 'json'])
+@pytest.mark.parametrize('concurrent', [False, True])
+@pytest.mark.parametrize('delayed', [False, True])
+def test_known_answers_require_server_output_overlap(check, concurrent, delayed):
+    config = configuration(checks=[check])
+    run = _Run(config, None, None)
+    run.records = [record('a', scenario=f'{check}_c2', check_ids=[check]),
+                   record('b', 5 if concurrent else 20, scenario=f'{check}_c2', check_ids=[check])]
+    if delayed:
+        run.timing_health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
+    result = next(c for c in _checks(run, config.targets[0]) if c.id == check)
+    assert result.status == ('pass' if concurrent and not delayed else 'inconclusive')
+    assert result.metrics['evidenced_overlap'] == (2 if concurrent and not delayed else 1)
+    assert result.metrics['configured_concurrency'] == 2
+
+
+@pytest.mark.parametrize('check', ['correctness', 'json'])
+def test_wrong_serial_answer_still_fails(check):
+    config = configuration(checks=[check])
+    run = _Run(config, None, None)
+    run.records = [record('wrong', score=False, check_ids=[check])]
+    assert next(c for c in _checks(run, config.targets[0]) if c.id == check).status == 'fail'
+
+
+@pytest.mark.parametrize('concurrent', [False, True])
+@pytest.mark.parametrize('delayed', [False, True])
+def test_loaded_pack_requires_server_evidence(concurrent, delayed):
+    config = configuration(checks=['correctness'], request_source='request_pack', request_pack={'version': 1, 'cases': [
+        {'fixture_id': 'case', 'messages': [{'role': 'user', 'content': 'Copy exactly: two words'}], 'scorer': 'exact', 'expected': 'two words'}]})
+    run = _Run(config, None, None)
+    run.records = [record('control', 0, fixture_id='pack:case', scenario='pack_control'),
+                   record('loaded', 100, fixture_id='pack:case', scenario='pack_loaded'),
+                   record('other', 105 if concurrent else 120, check_ids=['serving'])]
+    if delayed:
+        run.timing_health.overflow = {'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}
+    loaded = _pack_results(run, config.targets[0])
+    assert loaded['loaded_status'] == ('pass' if concurrent and not delayed else 'inconclusive')
+    assert loaded['cases'][0]['loaded']['evidenced_overlap'] == (2 if concurrent and not delayed else 1)
+
+
+@pytest.mark.parametrize('phase', ['before_output', 'active_stream'])
+def test_mixed_pairs_use_heavy_first_output_and_timing_origin(phase):
+    light = record('light', 100, 20, 80, workload={'interference_phase': phase})
+    heavy = record('heavy', 100, 10, 10)
+    assert pair_evidenced(light, heavy) is (phase == 'before_output')
+    heavy.first_output_ms = heavy.last_output_ms = 30
+    assert pair_evidenced(light, heavy)
+    heavy.first_output_ms = heavy.last_output_ms = 80
+    assert not pair_evidenced(light, heavy)
+    heavy.timing_start_ms = None
+    assert not pair_evidenced(light, heavy)
+
+
+@pytest.mark.parametrize('concurrent', [False, True])
+async def test_fairness_requires_long_output_inside_short_stream(concurrent):
+    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={'scenarios': ['streaming_fairness']}))
+    run = _Run(config, None, None)
+    async def group(*args, **kwargs):
+        return []
+    async def request(target, client, request, event=None):
+        if event is not None:
+            event.set()
+            await asyncio.sleep(.001)
+            return record('short', 100, 10, 100, elapsed_ms=200)
+        return record('long', 100, 50 if concurrent else 110, 120)
+    run.group, run.request = group, request
+    await _fairness(run, config.targets[0], None, builtin_fixtures(config))
+    assert run.observations['local']['fairness']['overlaps'] == (2 if concurrent else 0)
+
+
+def test_fairness_decode_ratio_excludes_wrong_answers_on_both_sides():
+    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={'scenarios': ['streaming_fairness']},
+                                           limits={'min_samples': 2, 'min_correctness': .5, 'fairness_max_ratio': 100}))
+    run = _Run(config, None, None)
+    run.observations['local']['fairness'].update(pairs=2, overlaps=2)
+    run.records = [record(str(i), first=10, last=end, score=correct, scenario=scenario, check_ids=['fairness'])
+                   for i, (scenario, end, correct) in enumerate([
+                       ('fairness_baseline', 30, True), ('fairness_baseline', 1010, False),
+                       ('fairness_short', 50, True), ('fairness_short', 5010, False)])]
+    result = next(c for c in _checks(run, config.targets[0]) if c.id == 'fairness')
+    assert result.metrics['decode_p50_ms'] == {'baseline': 20, 'loaded': 40}
+    assert result.metrics['latency_ratio'] == 2
+
+
+@pytest.mark.parametrize('concurrent', [False, True])
+@pytest.mark.parametrize('delayed', [False, True])
+async def test_refill_keeps_client_load_separate_from_server_evidence(concurrent, delayed):
+    issued = 0
+    async def request(target, client, request, *, on_start):
+        nonlocal issued
+        index = issued
+        issued += 1
+        on_start()
+        await asyncio.sleep(.001)
+        return record(str(index), index * (5 if concurrent else 20))
+    from giraffe.timing import TimingHealth
+    health = TimingHealth(0)
+    if delayed:
+        health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
+    run = SimpleNamespace(allowed=lambda _: True, request=request, unfinished=defaultdict(set), timing_health=health)
+    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('Copy exactly: two words', 'bucket', 'buckets')], 4, 2)
+    assert max(r.workload['client_peak_inflight'] for r in rows) == 2
+    assert all(r.workload['cell_evidenced_concurrency'] == (0 if delayed else 2 if concurrent else 1) for r in rows)
+    assert any(r.workload['load_qualified'] for r in rows) is (concurrent and not delayed)
+    assert all('client_time_weighted_inflight' in r.workload and 'time_weighted_inflight' not in r.workload for r in rows)
+
+
+@pytest.mark.parametrize('concurrency,concurrent', [(1, False), (2, False), (2, True)])
+@pytest.mark.parametrize('delayed', [False, True])
+def test_sessions_require_two_conversations_with_overlapping_outputs(concurrency, concurrent, delayed):
+    config = configuration(checks=['sessions'], concurrency=concurrency,
+                           sessions={'sessions': 2, 'concurrency': concurrency, 'modes': ['live']})
+    run = _Run(config, None, None)
+    run.observations['local']['sessions'] = {'sessions': [
+        {'id': str(i), 'mode': 'live', 'turns': [0, 1], 'stop_reason': None, 'completed_turns': 2, 'planned_turns': 2} for i in range(2)]}
+    run.records = [record(str(i), 5 * i if concurrent else 20 * i, scenario='session_live_turn0', check_ids=['sessions'],
+                          workload={'session_id': str(i), 'mode': 'live'}) for i in range(2)]
+    if delayed:
+        run.timing_health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
+    result = workload_result(run, 'sessions')
+    assert result.status == ('pass' if concurrent and not delayed else 'inconclusive')
+    if not concurrent or delayed:
+        assert 'conversations were not observed concurrently' in result.summary.lower()
+
+
+def probability_rows(positions):
+    rows = []
+    for repeat in range(3):
+        tokens = [{'token': f'{i} ', 'bytes': list(f'{i} '.encode()), 'logprob': -.1, 'top_logprobs': []} for i in range(positions)]
+        evidence = collect_logprobs({'content': tokens}, ''.join(t['token'] for t in tokens), 0)
+        rows.append(record(str(repeat), logprob_evidence=evidence, request_hash='same',
+                           workload={'input_bucket': 'short', 'level': 1, 'round': repeat, 'phase': 'measured',
+                                     'corpus_index': 0, 'load_qualified': True}))
+    return rows
+
+
+@pytest.mark.parametrize('positions,expected', [(1, 'inconclusive'), (31, 'inconclusive'), (32, 'pass')])
+def test_logprob_consistency_requires_meaningful_compared_positions(positions, expected):
+    settings = Consistency(levels=[1], shapes=['short'], repetitions=3,
+                           logprobs={'strict': True, 'tolerance': 0, 'top_logprobs': 0})
+    result = summarize_logprobs(probability_rows(positions), settings)
+    assert result['status'] == expected
+    assert result['conditions'][0]['coverage_complete'] is (positions >= 32)
+
+
+def test_logprob_short_sample_drift_still_fails():
+    rows = probability_rows(1)
+    rows[0].logprob_evidence.tokens[0].logprob = -.9
+    settings = Consistency(levels=[1], shapes=['short'], repetitions=3,
+                           logprobs={'strict': True, 'tolerance': 0, 'top_logprobs': 0})
+    assert summarize_logprobs(rows, settings)['status'] == 'fail'
+
+
+def test_logprob_fixtures_copy_a_substantial_nonrepetitive_passage():
+    config = configuration(checks=['consistency'])
+    fixtures = logprob_fixtures(config, builtin_fixtures(config))
+    assert all(len(f.expected.split()) >= 64 for f in fixtures.values())
+    assert all('Copy the following text exactly' in f.messages[0]['content'] for f in fixtures.values())
+    assert fixtures['long'].input_chars > fixtures['short'].input_chars
+
+
+@pytest.mark.parametrize('concurrent', [False, True])
+@pytest.mark.parametrize('delayed', [False, True])
+async def test_token_stress_uses_level_peak_output_concurrency(concurrent, delayed):
+    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={
+        'scenarios': ['token_stress'], 'levels': [2], 'samples_per_bucket': 2,
+        'stress_cases': [{'name': 'short_input_long_output', 'output_tokens': 80}]}))
+    run = _Run(config, None, None)
+    async def group(*args, **kwargs):
+        return [record('a'), record('b', 5 if concurrent else 20)]
+    run.group = group
+    if delayed:
+        run.timing_health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
+    await token_stress(run, config.targets[0], None)
+    row = run.observations['local']['token_stress']['cases']['short_input_long_output']['levels']['2']
+    assert row['status'] == ('pass' if concurrent and not delayed else 'inconclusive')
+    assert row['achieved_overlap'] == (0 if delayed else 2 if concurrent else 1)
+    assert row['client_peak_inflight'] == 8
+
+
+def test_performance_sessions_without_limits_do_not_claim_limits_met():
+    config = configuration(checks=['sessions'], sessions={
+        'profile': 'performance', 'modes': ['live'], 'sessions': 2, 'concurrency': 2,
+        'workloads': [{'name': 'chat', 'turns': ['Say hello', 'Say goodbye']} ]})
+    run = _Run(config, None, None)
+    run.observations['local']['sessions'] = {'sessions': [
+        {'id': str(i), 'mode': 'live', 'turns': [0, 1], 'stop_reason': None, 'completed_turns': 2, 'planned_turns': 2} for i in range(2)]}
+    run.records = [record(str(i), 5 * i, scenario='session_live_turn0', check_ids=['sessions'], score=None,
+                          workload={'session_id': str(i), 'mode': 'live'}) for i in range(2)]
+    result = workload_result(run, 'sessions')
+    assert result.status == 'pass'
+    assert 'no timing limits are configured' in result.summary
+    assert 'met configured limits' not in result.summary
+
+
+def test_sessions_cannot_use_two_turns_of_the_same_conversation_as_evidence():
+    config = configuration(checks=['sessions'], sessions={'modes': ['live'], 'sessions': 2})
+    run = _Run(config, None, None)
+    run.records = [record('a', check_ids=['sessions'], workload={'session_id': 'one'}),
+                   record('b', check_ids=['sessions'], workload={'session_id': 'one'})]
+    assert workload_result(run, 'sessions').metrics['evidenced_session_overlap'] == 1
+
+
+@pytest.mark.parametrize('concurrent', [False, True])
+async def test_bucket_cells_gap_when_client_load_has_no_output_overlap(concurrent):
+    from giraffe.models import Buckets
+    from giraffe.workloads import bucket_spec
+    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={
+        'scenarios': ['size_matrix'], 'levels': [2], 'samples_per_bucket': 2}))
+    run = _Run(config, None, None)
+    for shape, tokens in [('short', 100), ('medium', 300), ('long', 1500)]:
+        request_spec = bucket_spec(Buckets(), shape, 'short', f'bucket_c2_{shape}_short', 'buckets', 2)
+        rows = []
+        async def request(target, client, request, *, on_start):
+            index = len(rows)
+            row = record(f'{shape}-{index}', 5 * index if concurrent else 20 * index,
+                         check_ids=['buckets'], scenario=request.scenario, input_tokens=tokens,
+                         workload=dict(request.workload))
+            rows.append(row)
+            on_start()
+            await asyncio.sleep(.001)
+            return row
+        stub = SimpleNamespace(allowed=lambda _: True, request=request, unfinished=defaultdict(set))
+        run.records.extend(await refill(stub, config.targets[0], None, [request_spec], 2, 2))
+    result = workload_result(run, 'buckets')
+    assert result.status == ('pass' if concurrent else 'inconclusive')
+    assert all(cell['qualified_samples'] == (2 if concurrent else 0) for cell in result.metrics['buckets'].values())
+    if not concurrent:
+        assert all(any('overlapping server output' in gap for gap in cell['coverage_gaps']) for cell in result.metrics['buckets'].values())
+
+
+def scenario(report, name):
+    return next(c for c in report.checks if c.id == 'concurrency').metrics['scenarios'][name]
+
+
+def exercise_output_shapes(monkeypatch):
+    # Request the fake's supported 100-number output to exercise long shapes.
+    import giraffe.workloads as workloads
+    original = workloads.bucket_spec
+    def shaped(*args, **kwargs):
+        request = original(*args, **kwargs)
+        if request.workload['output_bucket'] != 'short':
+            request.messages[0]['content'] += '\nList the numbers from 1 to 100.'
+            request.input_chars = len(request.messages[0]['content'])
+        return request
+    monkeypatch.setattr(workloads, 'bucket_spec', shaped)
+
+
+@pytest.mark.parametrize('serial', [False, True])
+@pytest.mark.parametrize('name', ['streaming_fairness', 'size_matrix', 'mixed_interference', 'token_stress'])
+async def test_http_serial_and_healthy_concurrency_scenarios(monkeypatch, name, serial):
+    exercise_output_shapes(monkeypatch)
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.004) as endpoint:
+        config = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
+            checks=['concurrency'], concurrent_workloads={
+                'scenarios': [name], 'levels': [2], 'samples_per_bucket': 2, 'mixed_pairs': 2,
+                'input_chars': {'short': 128, 'medium': 1024, 'long': 4096},
+                'output_tokens': {'short': 16, 'medium': 100, 'long': 100},
+                'stress_cases': [{'name': 'long_input_summary', 'input_tokens': 200,
+                                  'output_tokens': 20, 'min_output_tokens': 1}]})
+        report = await run_suite(config)
+    result = scenario(report, name)
+    assert result['status'] == ('inconclusive' if serial else 'pass'), result
+    if serial and name == 'streaming_fairness':
+        assert result['metrics']['overlaps'] == 0
+    if serial and name == 'size_matrix':
+        assert all(cell['qualified_samples'] == 0 and cell['coverage_gaps'] for cell in result['metrics']['buckets'].values())
+    if serial and name == 'mixed_interference':
+        assert all(c['shape_qualified_samples'] == 0 for c in result['metrics']['comparisons'] if c['scenario'].endswith('active_stream'))
+    if serial and name == 'token_stress':
+        assert all(case['levels']['2']['achieved_overlap'] == 1 for case in result['metrics']['cases'].values())
+
+
+@pytest.mark.parametrize('serial', [False, True])
+async def test_http_known_answers_require_concurrent_output(serial):
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.008) as endpoint:
+        report = await run_suite(configuration(samples=6, targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}]))
+    for result in report.checks:
+        if result.id in {'correctness', 'json'}:
+            assert result.status == ('inconclusive' if serial else 'pass'), result
+
+
+@pytest.mark.parametrize('concurrency,serial', [(1, False), (2, True), (2, False)])
+async def test_http_sessions_require_concurrent_conversations(concurrency, serial):
+    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.004) as endpoint:
+        report = await run_suite(configuration(checks=['sessions'], concurrency=concurrency,
+            targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
+            sessions={'sessions': 2, 'concurrency': concurrency, 'modes': ['live']}))
+    result = next(c for c in report.checks if c.id == 'sessions')
+    assert result.status == ('pass' if concurrency == 2 and not serial else 'inconclusive'), result
+
+
+async def test_http_complete_responses_do_not_establish_concurrency():
+    with FakeEndpoint() as endpoint:
+        report = await run_suite(configuration(stream=False, targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}]))
+    for result in report.checks:
+        if result.id in {'correctness', 'json'}:
+            assert result.status == 'inconclusive'
+            assert 'server-side concurrency needs streamed output timing' in result.summary
+
+
+class StreamEndpoint:
+    """In-process output service, optionally serialized through the last chunk."""
+    url = 'http://stream.test/v1'
+
+    def __init__(self, monkeypatch, serial):
+        import httpx
+        from giraffe.client import LLMClient
+        self.lock = asyncio.Lock() if serial else None
+        async def enter(client):
+            client._client = httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
+            return client
+        monkeypatch.setattr(LLMClient, '__aenter__', enter)
+
+    async def handle(self, request):
+        import httpx
+        import json
+        import re
+        if request.method == 'GET':
+            return httpx.Response(200, json={'data': [{'id': 'fake-model'}]})
+        payload = json.loads(request.content)
+        prompt = '\n'.join(m['content'] for m in payload['messages'])
+        answer = FakeEndpoint._answer(prompt)
+        if 'Use this exact bakery name for this session:' in prompt:
+            answer = re.search(r'Use this exact bakery name for this session: (\w+)', prompt)[1]
+        pieces = re.findall(r'\S+\s*', answer)
+        finish = 'length' if len(pieces) > payload['max_tokens'] else 'stop'
+        pieces = pieces[:payload['max_tokens']]
+        usage = {'prompt_tokens': len(prompt.split()) + 8, 'completion_tokens': len(pieces)}
+        if self.lock:
+            await self.lock.acquire()
+        await asyncio.sleep(.003)
+        endpoint = self
+        class Stream(httpx.AsyncByteStream):
+            released = False
+            async def aclose(self):
+                if not self.released:
+                    self.released = True
+                    if endpoint.lock:
+                        endpoint.lock.release()
+            async def __aiter__(self):
+                try:
+                    for piece in pieces:
+                        yield ('data: ' + json.dumps({'model': 'fake-model', 'choices': [{'delta': {'content': piece}}]}) + '\n\n').encode()
+                        await asyncio.sleep(.001)
+                    yield ('data: ' + json.dumps({'choices': [{'delta': {}, 'finish_reason': finish}], 'usage': usage}) + '\n\ndata: [DONE]\n\n').encode()
+                finally:
+                    await self.aclose()
+        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=Stream())
+
+
+@pytest.mark.parametrize('serial', [False, True])
+async def test_streamed_suite_server_evidence_without_sockets(monkeypatch, serial):
+    exercise_output_shapes(monkeypatch)
+    endpoint = StreamEndpoint(monkeypatch, serial)
+    config = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
+        checks=['concurrency', 'correctness', 'json', 'sessions', 'consistency'],
+        concurrent_workloads={'scenarios': ['streaming_fairness', 'size_matrix', 'mixed_interference', 'token_stress'],
+            'levels': [2], 'samples_per_bucket': 2, 'mixed_pairs': 2,
+            'input_chars': {'short': 128, 'medium': 1024, 'long': 4096},
+            'output_tokens': {'short': 16, 'medium': 100, 'long': 100},
+            'stress_cases': [{'name': 'long_input_summary', 'input_tokens': 200,
+                              'output_tokens': 20, 'min_output_tokens': 1}]},
+        sessions={'sessions': 2, 'concurrency': 2, 'modes': ['live']},
+        consistency={'levels': [1, 2], 'shapes': ['short'], 'repetitions': 2})
+    report = await run_suite(config)
+    expected = 'inconclusive' if serial else 'pass'
+    for check in report.checks:
+        if check.id in config.checks:
+            assert check.status == expected, (check.id, check.summary, check.metrics)
+    for name in config.concurrent_workloads.scenarios:
+        assert scenario(report, name)['status'] == expected, scenario(report, name)
+
+
+@pytest.mark.parametrize('levels,expected', [([1], 'pass'), ([1, 2], 'inconclusive')])
+async def test_complete_logprob_pass_needs_depth_and_serial_scope(monkeypatch, levels, expected):
+    import httpx
+    import re
+    from tests.test_workload_reliability import MemoryEndpoint
+    class TokenEndpoint(MemoryEndpoint):
+        async def handle(self, request):
+            response = await super().handle(request)
+            data = response.json()
+            choice = data['choices'][0]
+            output = choice['message']['content']
+            choice['logprobs'] = {'content': [
+                {'token': piece, 'bytes': list(piece.encode()), 'logprob': -.1, 'top_logprobs': []}
+                for piece in re.findall(r'\S+\s*', output)]}
+            return httpx.Response(200, json=data)
+    endpoint = TokenEndpoint(monkeypatch)
+    report = await run_suite(configuration(checks=['consistency'], targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
+        consistency={'levels': levels, 'shapes': ['short'], 'repetitions': 3,
+                     'logprobs': {'top_logprobs': 0, 'strict': True, 'tolerance': 0}}))
+    result = next(c for c in report.checks if c.id == 'consistency')
+    assert result.status == expected, result
+    assert result.metrics['logprobs']['conditions'][0]['compared_positions'] >= 64
+    assert result.metrics['logprobs']['conditions'][0]['coverage_complete']
+    if 2 in levels:
+        loaded = result.metrics['logprobs']['conditions'][1]
+        assert not loaded['qualified_samples'] and not loaded['coverage_complete']
+        assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
+
+
+def test_mixed_active_decoding_excludes_response_cleanup():
+    light = record('light', first=10, last=20, elapsed_ms=100, workload={'interference_phase': 'active_stream'})
+    heavy = record('heavy', first=30, last=30, elapsed_ms=40)
+    assert evidenced_overlap(light, [light, heavy]) == 2
+    assert not pair_evidenced(light, heavy)
+
+
+@pytest.mark.parametrize('serial', [False, True])
+async def test_http_default_single_chunk_answers_have_honest_concurrency(serial):
+    with FakeEndpoint(service_slots=1 if serial else None) as endpoint:
+        report = await run_suite(configuration(samples=6, targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}]))
+    for check in report.checks:
+        if check.id in {'correctness', 'json'}:
+            assert check.status == ('inconclusive' if serial else 'pass'), check
+    assert all(r.answer_chunks == 1 for r in report.requests)

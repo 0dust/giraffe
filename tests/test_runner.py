@@ -447,7 +447,14 @@ async def test_buffered_stream_is_not_mixed_fairness_evidence(client):
     assert not any(r.scenario == "fairness_long" for r in report.requests)
 
 
-async def test_actual_mixed_overlap_and_stream_gap_violation(client):
+async def test_actual_mixed_overlap_and_stream_gap_violation(client, monkeypatch):
+    original = client.execute
+    async def overlapping_prefill(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        if spec.scenario == "fairness_long":
+            record.first_output_ms = 0
+        return record
+    monkeypatch.setattr(client, "execute", overlapping_prefill)
     client.bad_mixed_gap = True
     report = await runner.run_suite(config(checks=["fairness"],
                                           limits=Limits(stream_gap_ms=10, min_samples=2)))
@@ -880,6 +887,8 @@ async def test_fairness_missing_configured_gap_is_inconclusive(client, monkeypat
         result = await original(self, spec, **kwargs)
         if spec.scenario == "fairness_short":
             result.max_stream_gap_ms = None
+        elif spec.scenario == "fairness_long":
+            result.first_output_ms = 0
         return result
 
     monkeypatch.setattr(client, "execute", no_mixed_gap)

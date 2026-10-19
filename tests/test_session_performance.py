@@ -74,7 +74,7 @@ async def test_mixed_live_conversations_overlap_and_keep_actual_history_isolated
         assert "Conversation performance by task and turn" in html
 
 
-@pytest.mark.parametrize("sessions,expected", [(1, "inconclusive"), (2, "pass")])
+@pytest.mark.parametrize("sessions,expected", [(1, "inconclusive"), (2, "inconclusive")])
 async def test_performance_caps_are_reported_without_stopping_remaining_turns(sessions, expected):
     with FakeEndpoint() as endpoint:
         report = await run_suite(config(endpoint, checks=["sessions"],
