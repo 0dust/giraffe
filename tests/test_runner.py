@@ -1809,7 +1809,7 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         record = event["request"]
         assert record["elapsed_ms"] == by_id[record["id"]].elapsed_ms
         assert record["score"] == by_id[record["id"]].score
-        assert set(record) == {"id", "target", "fixture_id", "scenario", "status", "valid",
+        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid",
                                "score", "elapsed_ms", "first_output_ms", "check_ids"}
         assert event["budget_used"] >= event["attempted"]
 

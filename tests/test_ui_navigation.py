@@ -150,7 +150,7 @@ state.detail={id:'live',state:'running',config:{...state.config,max_requests:600
  live_requests:Array.from({length:240},(_,slot)=>({slot,status:slot===239?'running':'completed'}))};
 renderDetail();assert.equal(state.mosaicPage,0);
 let restored=0;
-const spot={dataset:{liveSlot:'239'},focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;restored++;}};
+const spot={dataset:{liveSlot:'239'},closest:q=>q==='.request-mosaic'?{}:null,focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;restored++;}};
 document.activeElement=spot;nodes['[data-live-slot="239"]']=spot;
 let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:240,status:'running'}]};
 api=async()=>next;refreshRuns=async()=>{};

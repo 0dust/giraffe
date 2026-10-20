@@ -107,6 +107,8 @@ async def arrivals(run, target, client, fixtures):
     settings = run.config.arrivals
     base = fixtures["short"][0].model_copy(deep=True)
     base.scenario, base.check_ids = "arrival", ["arrivals"]
+    base.workload = {"requests_per_second": settings.requests_per_second}
+    run.start_condition(target.name, base.scenario, base.workload, settings.requests)
     observation = {
         "planned": settings.requests,
         "issued": 0,
@@ -162,13 +164,14 @@ async def arrivals(run, target, client, fixtures):
                     {
                         "index": index,
                         "scheduled_ms": (due - run.start) * 1000,
-                        "reason": "bounded pending queue full",
+                        "reason": "pending queue full",
                     }
                 )
                 continue
             request = base.model_copy(
                 update={
                     "workload": {
+                        **base.workload,
                         "arrival_index": index,
                         "scheduled_ms": (due - run.start) * 1000,
                         "seed": settings.seed,
@@ -215,6 +218,10 @@ async def arrivals(run, target, client, fixtures):
             not observation["unissued"] and not observation["delayed"] and not observation["incomplete"]
         )
 
+        reasons = list(dict.fromkeys(item["reason"] for item in observation["unissued"]))
+        run.finish_condition(target.name, base.scenario, base.workload,
+            reason=run.condition_reason(target.name, "; ".join(reasons)) if reasons else None)
+
 
 def prefix_admitted(input_chars, max_tokens, context_limit):
     # Filler can use ~3.6 chars/token; reserve extra for the hex nonce and template.
@@ -237,54 +244,62 @@ async def prefixes(run, target, client):
         return record
 
     settings = run.config.prefix
-    nonce = uuid.uuid4().hex + "\n"
-    prefix = nonce + (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
-    for kind in ("shared", "independent"):
-        for index in range(settings.repeats):
-            # Unique initial nonces keep warm-cache controls independent across runs and targets.
-            rng = random.Random(index)
-            matched = f"Control {index:04d}: " + "".join(
-                f" The {rng.choice(('tree', 'bird', 'boat', 'rock'))} is "
-                f"{rng.choice(('blue', 'gray', 'pink', 'gold'))}."
-                for _ in range(len(prefix) // 18 + 1)
-            )
-            matched = (uuid.uuid4().hex + "\n" + matched)[:len(prefix)]
-            prompt = label_prompt(len(prefix) + 80, prefix if kind == "shared" else matched)
-            prompt += f"\nTrial {index:04d}."
-            request = spec(
-                prompt,
-                f"prefix_{kind}",
-                "prefix",
-                expected="K7P4",
-                prefix_group=kind,
-                shared_prefix_chars=len(prefix),
-                order=index,
-                cache_state="first unique use is not proof of empty server cache",
-            )
+    plans = {"prefix_shared": settings.repeats, "prefix_independent": settings.repeats,
+             "prefix_history": settings.history_turns}
+    for scenario, count in plans.items():
+        run.plan_condition(target.name, scenario, planned=count)
+    try:
+        nonce = uuid.uuid4().hex + "\n"
+        prefix = nonce + (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
+        for kind in ("shared", "independent"):
+            for index in range(settings.repeats):
+                # Unique initial nonces keep warm-cache controls independent across runs and targets.
+                rng = random.Random(index)
+                matched = f"Control {index:04d}: " + "".join(
+                    f" The {rng.choice(('tree', 'bird', 'boat', 'rock'))} is "
+                    f"{rng.choice(('blue', 'gray', 'pink', 'gold'))}."
+                    for _ in range(len(prefix) // 18 + 1)
+                )
+                matched = (uuid.uuid4().hex + "\n" + matched)[:len(prefix)]
+                prompt = label_prompt(len(prefix) + 80, prefix if kind == "shared" else matched)
+                prompt += f"\nTrial {index:04d}."
+                request = spec(
+                    prompt,
+                    f"prefix_{kind}",
+                    "prefix",
+                    expected="K7P4",
+                    prefix_group=kind,
+                    shared_prefix_chars=len(prefix),
+                    order=index,
+                    cache_state="first unique use is not proof of empty server cache",
+                )
+                if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
+                    run.unfinished[target.name].add("prefix")
+                    run.observations[target.name]["prefix_stop"] = "Estimated token admission ceiling reached."
+                    return
+                request.options = deterministic_options(run.config, request.options)
+                if not await send(request):
+                    return
+        history = []
+        for turn in range(settings.history_turns):
+            prompt = label_prompt(96)
+            messages = [*history, {"role": "user", "content": prompt}]
+            request = spec(prompt, "prefix_history", "prefix", expected="K7P4", turn=turn, mode="fixed")
+            request.messages = messages
+            request.input_chars = sum(len(m["content"]) for m in messages)
             if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
                 run.unfinished[target.name].add("prefix")
-                run.observations[target.name]["prefix_stop"] = "Estimated token admission ceiling reached."
-                return
+                run.observations[target.name]["prefix_history_stop"] = (
+                    "Estimated token admission ceiling reached; no history cropped."
+                )
+                break
             request.options = deterministic_options(run.config, request.options)
             if not await send(request):
-                return
-    history = []
-    for turn in range(settings.history_turns):
-        prompt = label_prompt(96)
-        messages = [*history, {"role": "user", "content": prompt}]
-        request = spec(prompt, "prefix_history", "prefix", expected="K7P4", turn=turn, mode="fixed")
-        request.messages = messages
-        request.input_chars = sum(len(m["content"]) for m in messages)
-        if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
-            run.unfinished[target.name].add("prefix")
-            run.observations[target.name]["prefix_history_stop"] = (
-                "Estimated token admission ceiling reached; no history cropped."
-            )
-            break
-        request.options = deterministic_options(run.config, request.options)
-        if not await send(request):
-            break
-        history = [*messages, {"role": "assistant", "content": "K7P4"}]
+                break
+            history = [*messages, {"role": "assistant", "content": "K7P4"}]
+    finally:
+        for scenario in plans:
+            run.finish_condition(target.name, scenario)
 
 
 def bucket_spec(settings, input_shape, output_shape, scenario, check, level, context_limit=None):
@@ -343,6 +358,19 @@ def _mark_pair(light, heavy):
 
 async def buckets(run, target, client):
     settings = run.config.buckets
+    heavy_shapes = [kind for kind, weight in settings.heavy_weights.items() for _ in range(weight)]
+    if "buckets" in run.config.checks:
+        for level in settings.levels:
+            for input_shape in ("short", "medium", "long"):
+                for output_shape in ("short", "medium", "long"):
+                    run.plan_condition(target.name, f"bucket_c{level}_{input_shape}_{output_shape}",
+                        planned=sample_count(settings.samples_per_bucket, level), planned_kind="upper_bound")
+    if "mixed" in run.config.checks:
+        run.plan_condition(target.name, "mixed_control", planned=settings.mixed_pairs)
+        for kind in dict.fromkeys(heavy_shapes):
+            for phase in ("before_output", "active_stream"):
+                run.plan_condition(target.name, f"mixed_short_{kind}_{phase}",
+                    planned=2 * settings.mixed_pairs * heavy_shapes.count(kind))
     if "buckets" in run.config.checks:
         for level in settings.levels:
             samples = sample_count(settings.samples_per_bucket, level)
@@ -368,66 +396,70 @@ async def buckets(run, target, client):
     if run.config.concurrency < 2:
         run.unfinished[target.name].add("mixed")
         return
-    heavy_shapes = [kind for kind, weight in settings.heavy_weights.items() for _ in range(weight)]
-    for block, kind in enumerate(heavy_shapes):
-        for phase in ("before_output", "active_stream"):
-            for index in range(settings.mixed_pairs):
-                if not run.allowed(target.name):
-                    run.unfinished[target.name].add("mixed")
-                    return
-                heavy = bucket_spec(
-                    settings,
-                    "long" if kind == "long_input" else "short",
-                    "short" if kind == "long_input" else "long",
-                    f"mixed_heavy_{kind}_{phase}",
-                    "mixed",
-                    2,
-                    run.config.context_limit,
-                )
-                heavy.options = deterministic_options(run.config, heavy.options)
-                pair = block * settings.mixed_pairs + index
-                heavy.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
-                light = short.model_copy(deep=True)
-                light.scenario = f"mixed_short_{kind}_{phase}"
-                light.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
-                event = asyncio.Event()
-                if phase == "before_output":
-                    started = asyncio.Event()
-                    first = asyncio.create_task(
-                        run.request(target, client, heavy, on_start=started.set)
+    try:
+        for block, kind in enumerate(heavy_shapes):
+            for phase in ("before_output", "active_stream"):
+                for index in range(settings.mixed_pairs):
+                    if not run.allowed(target.name):
+                        run.unfinished[target.name].add("mixed")
+                        return
+                    heavy = bucket_spec(
+                        settings,
+                        "long" if kind == "long_input" else "short",
+                        "short" if kind == "long_input" else "long",
+                        f"mixed_heavy_{kind}_{phase}",
+                        "mixed",
+                        2,
+                        run.config.context_limit,
                     )
-                    waiter = asyncio.create_task(started.wait())
-                    try:
-                        await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
-                        light.workload["heavy_active_at_dispatch"] = (
-                            not first.done() and started.is_set()
+                    heavy.options = deterministic_options(run.config, heavy.options)
+                    pair = block * settings.mixed_pairs + index
+                    heavy.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
+                    light = short.model_copy(deep=True)
+                    light.scenario = f"mixed_short_{kind}_{phase}"
+                    light.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
+                    event = asyncio.Event()
+                    if phase == "before_output":
+                        started = asyncio.Event()
+                        first = asyncio.create_task(
+                            run.request(target, client, heavy, on_start=started.set)
                         )
-                        def light_started():
-                            light.workload["heavy_active_at_dispatch"] = not first.done()
-                        light_row = await run.request(target, client, light, on_start=light_started)
-                        heavy_row = await first
-                        _mark_pair(light_row, heavy_row)
-                    finally:
-                        waiter.cancel()
-                        if not first.done():
-                            first.cancel()
-                        await asyncio.gather(waiter, first, return_exceptions=True)
-                else:
-                    first = asyncio.create_task(run.request(target, client, light, event))
-                    waiter = asyncio.create_task(event.wait())
-                    try:
-                        await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
-                        heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
-                        def heavy_started():
+                        waiter = asyncio.create_task(started.wait())
+                        try:
+                            await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
+                            light.workload["heavy_active_at_dispatch"] = (
+                                not first.done() and started.is_set()
+                            )
+                            def light_started():
+                                light.workload["heavy_active_at_dispatch"] = not first.done()
+                            light_row = await run.request(target, client, light, on_start=light_started)
+                            heavy_row = await first
+                            _mark_pair(light_row, heavy_row)
+                        finally:
+                            waiter.cancel()
+                            if not first.done():
+                                first.cancel()
+                            await asyncio.gather(waiter, first, return_exceptions=True)
+                    else:
+                        first = asyncio.create_task(run.request(target, client, light, event))
+                        waiter = asyncio.create_task(event.wait())
+                        try:
+                            await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
                             heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
-                        heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
-                        light_row = await first
-                        _mark_pair(light_row, heavy_row)
-                    finally:
-                        waiter.cancel()
-                        if not first.done():
-                            first.cancel()
-                        await asyncio.gather(waiter, first, return_exceptions=True)
+                            def heavy_started():
+                                heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
+                            heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
+                            light_row = await first
+                            _mark_pair(light_row, heavy_row)
+                        finally:
+                            waiter.cancel()
+                            if not first.done():
+                                first.cancel()
+                            await asyncio.gather(waiter, first, return_exceptions=True)
+    finally:
+        for kind in dict.fromkeys(heavy_shapes):
+            for phase in ("before_output", "active_stream"):
+                run.finish_condition(target.name, f"mixed_short_{kind}_{phase}")
 
 
 async def sessions(run, target, client):
@@ -524,32 +556,43 @@ async def sessions(run, target, client):
             due = time.monotonic() + settings.delay_seconds
         item["completed_turns"] = len(item["turns"])
 
-    if mixed:
-        from .session_metrics import workload_plan
+    from .session_metrics import workload_plan
 
-        pending = asyncio.Queue()
-        for index, workload in enumerate(workload_plan(settings.workloads, settings.sessions)):
-            pending.put_nowait((index, workload))
-
-        async def worker():
-            while not pending.empty():
-                index, workload = pending.get_nowait()
-                await session("live", index, workload)
-
-        await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
-        return
-
+    session_workloads = workload_plan(settings.workloads, settings.sessions) if mixed else []
     for mode in settings.modes:
-        next_index = 0
+        planned = sum(len(workload.turns) for workload in session_workloads) if mixed else settings.sessions * len(settings.turns)
+        run.plan_condition(target.name, f"session_{mode}_turn0", planned=planned)
+    try:
+        if mixed:
+            pending = asyncio.Queue()
+            for index, workload in enumerate(session_workloads):
+                pending.put_nowait((index, workload))
 
-        async def worker():
-            nonlocal next_index
-            while next_index < settings.sessions:
-                index = next_index
-                next_index += 1
-                await session(mode, index)
+            async def worker():
+                while not pending.empty():
+                    index, workload = pending.get_nowait()
+                    await session("live", index, workload)
 
-        await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
+            await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
+            return
+
+        for mode in settings.modes:
+            next_index = 0
+
+            async def worker():
+                nonlocal next_index
+                while next_index < settings.sessions:
+                    index = next_index
+                    next_index += 1
+                    await session(mode, index)
+
+            await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
+    finally:
+        for mode in settings.modes:
+            skipped = any(item["mode"] == mode and item["stop_reason"] and
+                          len(item["turns"]) < item["planned_turns"] for item in observation["sessions"])
+            run.finish_condition(target.name, f"session_{mode}_turn0",
+                reason="dependent turns skipped" if skipped else None)
 
 
 async def consistency(run, target, client, fixtures):
@@ -558,26 +601,36 @@ async def consistency(run, target, client, fixtures):
         from giraffe.logprob_workload import run_logprob_consistency
         await run_logprob_consistency(run, target, client, fixtures)
         return
+    levels = list(dict.fromkeys([1, *settings.levels]))
     for shape in settings.shapes:
-        for prompt_index in range(settings.prompts_per_shape):
-            answer = COPY_PASSAGES[prompt_index % len(COPY_PASSAGES)]
-            if prompt_index >= len(COPY_PASSAGES):
-                answer += f" The parcel tag reads R{prompt_index:04d}."
-            context = ""
-            if shape == "long":
-                context = label_context(max(64, (run.config.context_limit - 256) * 2))
-                context += "\nThe background above is context only.\n"
-            prompt = context + f"Copy the following text exactly, with no extra text:\n{answer}"
-            base = spec(prompt, "consistency", "consistency", expected=answer,
-                        max_tokens=min(192, run.config.max_output_tokens),
-                        options=consistency_options(run.config))
-            for level in dict.fromkeys([1, *settings.levels]):
-                base.scenario = f"consistency_c{level}_{shape}_p{prompt_index}"
-                base.check_ids = ["consistency"]
-                base.workload = {"level": level, "input_bucket": shape, "prompt_index": prompt_index,
-                                 "equality": settings.equality, "temperature": (run.config.request_options | base.options).get("temperature"),
-                                 "seed": settings.seed, "option_support": "requested; runtime enforcement unverified"}
-                await refill(run, target, client, [base], sample_count(settings.repetitions, level), level)
+        for level in levels:
+            run.plan_condition(target.name, f"consistency_c{level}_{shape}",
+                planned=settings.prompts_per_shape * sample_count(settings.repetitions, level))
+    try:
+        for shape in settings.shapes:
+            for prompt_index in range(settings.prompts_per_shape):
+                answer = COPY_PASSAGES[prompt_index % len(COPY_PASSAGES)]
+                if prompt_index >= len(COPY_PASSAGES):
+                    answer += f" The parcel tag reads R{prompt_index:04d}."
+                context = ""
+                if shape == "long":
+                    context = label_context(max(64, (run.config.context_limit - 256) * 2))
+                    context += "\nThe background above is context only.\n"
+                prompt = context + f"Copy the following text exactly, with no extra text:\n{answer}"
+                base = spec(prompt, "consistency", "consistency", expected=answer,
+                            max_tokens=min(192, run.config.max_output_tokens),
+                            options=consistency_options(run.config))
+                for level in dict.fromkeys([1, *settings.levels]):
+                    base.scenario = f"consistency_c{level}_{shape}_p{prompt_index}"
+                    base.check_ids = ["consistency"]
+                    base.workload = {"level": level, "input_bucket": shape, "prompt_index": prompt_index,
+                                     "equality": settings.equality, "temperature": (run.config.request_options | base.options).get("temperature"),
+                                     "seed": settings.seed, "option_support": "requested; runtime enforcement unverified"}
+                    await refill(run, target, client, [base], sample_count(settings.repetitions, level), level, condition_plan=False)
+    finally:
+        for shape in settings.shapes:
+            for level in levels:
+                run.finish_condition(target.name, f"consistency_c{level}_{shape}")
 
 
 TOOL = default_tool_fixture().tools[0]
@@ -624,7 +677,11 @@ async def tools(run, target, client):
                               "tool_fixture_id": fixture.fixture_id, "mode": mode},
                 )
                 request.options = deterministic_options(run.config, request.options)
-                await run.request(target, client, request)
+                run.start_condition(target.name, scenario, request.workload, planned=1)
+                try:
+                    await run.request(target, client, request)
+                finally:
+                    run.finish_condition(target.name, scenario, request.workload)
 
 
 async def execute(run, target, client, fixtures):
