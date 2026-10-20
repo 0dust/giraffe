@@ -57,6 +57,51 @@ assert.doesNotMatch(html,/data-request=/);
 """)
 
 
+def test_live_mosaic_follows_frontier_and_allows_manual_inspection():
+    run_render_checks(r"""
+const records=Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}));
+delete state.mosaicFollow;
+let html=renderMosaic(records,{budget:600,live:true});
+assert.equal(state.mosaicPage,1);assert.equal(state.mosaicLivePage,1);
+assert.match(html,/data-live-slot="250"/);assert.doesNotMatch(html,/data-live-slot="0"/);
+assert.match(html,/<g class="request-spot running current"[^>]*data-live-slot="253"[^>]*aria-label="Newest running request 254:/);
+assert.equal((html.match(/request-spot running current/g)||[]).length,1);
+assert.match(html,/Following live/);assert.doesNotMatch(html,/data-action="mosaic-live"/);
+state.mosaicFollow=false;state.mosaicPage=0;
+html=renderMosaic(records,{budget:600,live:true});
+assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,1);
+assert.match(html,/data-live-slot="0"/);assert.doesNotMatch(html,/data-live-slot="250"/);
+assert.match(html,/data-action="mosaic-live">Back to live/);
+assert.match(html,/Live on requests 241–480/);assert.match(html,/live on another page/);
+records.push({slot:490,status:'running'});renderMosaic(records,{budget:600,live:true});
+assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,2);
+""")
+
+
+def test_live_mosaic_frontier_prefers_running_then_latest_record_then_budget():
+    run_render_checks(r"""
+let html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'running'}],{budget:600,live:true});
+assert.equal(state.mosaicLivePage,1);assert.match(html,/Newest running request 251:/);
+html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'completed'}],{budget:600,live:true});
+assert.equal(state.mosaicPage,2);assert.doesNotMatch(html,/request-spot \w+ current|Newest running request/);
+renderMosaic([],{budget:600,live:true,budgetUsed:481});assert.equal(state.mosaicPage,2);
+renderMosaic([],{budget:600,live:true,budgetUsed:0});assert.equal(state.mosaicPage,0);
+renderMosaic([],{budget:600,live:true,budgetUsed:999});assert.equal(state.mosaicPage,2);
+""")
+
+
+def test_report_mosaic_ignores_follow_state_and_preserves_selected_page():
+    run_render_checks(r"""
+const records=Array.from({length:600},(_,i)=>({id:'request-'+i,status:'completed'}));
+for(const follow of [false,undefined,true]){
+ state.mosaicFollow=follow;state.mosaicPage=1;state.mosaicLivePage=2;
+ const html=renderMosaic(records);
+ assert.equal(state.mosaicPage,1);assert.match(html,/data-request="request-240"/);
+ assert.doesNotMatch(html,/data-request="request-0"|mosaic-live|Following live|live on another page|Newest running request/);
+}
+""")
+
+
 def test_beeswarm_excludes_missing_latency_and_preserves_each_measured_request():
     run_render_checks(r"""
 const records=[{id:'zero',elapsed_ms:0},{id:'one',elapsed_ms:100},

@@ -738,6 +738,11 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .viz-heading h2, .request-viz > h2, .latency-viz > h2 { font-size: 15px; }
 .viz-heading .eyebrow { margin-bottom: 4px; }
 .viz-heading .hint { font: 12.5px var(--mono); color: var(--text-2); }
+.request-viz .viz-heading { flex-wrap: wrap; gap: 8px 16px; }
+.mosaic-live-controls { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-left: auto; }
+.mosaic-live { color: var(--accent); white-space: nowrap; }
+.mosaic-following { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3); }
+.mosaic-following::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .viz-empty { color: var(--text-3); font-size: 13px; padding: 12px 0; }
 .mosaic-scroll { overflow-x: auto; }
 .request-mosaic { display: block; width: 100%; height: auto; overflow: visible; }
@@ -751,6 +756,7 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .request-spot.idle { --spot: color-mix(in oklab, var(--text) 6%, var(--surface)); }
 .request-spot.running polygon { animation: spot-live 1.3s ease-in-out infinite; }
 .request-spot[role=button]:hover polygon { fill: var(--spot-hot); stroke: var(--spot-hot); }
+.request-spot.current polygon { stroke: var(--text); }
 .request-spot:focus-visible polygon { fill: var(--spot-hot); stroke: var(--text); }
 .request-spot:focus-visible { outline: none; }
 .request-mosaic.is-entering .request-spot polygon { animation: fade .5s var(--ease) both; animation-delay: min(calc(var(--i) * 3ms), 600ms); }

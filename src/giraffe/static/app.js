@@ -25,7 +25,7 @@ function updateAPIKeySummary() {
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not needed for most local servers';
   $('.row-action',summary).textContent=key||ref?'Change':'Add';
 }
-const state = {bootstrap:null, runs:[], baselines:[], detail:null, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
+const state = {bootstrap:null, runs:[], baselines:[], detail:null, mosaicFollow:true, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null};
 const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Not run',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',inconclusive:'?',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -123,17 +123,30 @@ function orderedRequests(report) {
 function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length}={}) {
   const total=Math.max(records.length,budget || 0);
   if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
-  const pages=Math.ceil(total/mosaicPageSize),page=Math.min(state.mosaicPage || 0,pages-1),offset=page*mosaicPageSize;
+  const pages=Math.ceil(total/mosaicPageSize);
+  let page=Math.max(0,Math.min(state.mosaicPage || 0,pages-1)),frontier=-1;
+  if(live){
+    frontier=records.reduce((slot,r)=>r.status==='running'?Math.max(slot,r.slot):slot,-1);
+    if(frontier<0)frontier=records.length?records.reduce((slot,r)=>Math.max(slot,r.slot),-1):budgetUsed-1;
+    state.mosaicLivePage=Math.max(0,Math.min(Math.floor(frontier/mosaicPageSize),pages-1));
+    const focusedSlot=document.activeElement?.dataset?.liveSlot;
+    if(state.mosaicFollow!==false&&page!==state.mosaicLivePage&&focusedSlot!==undefined&&focusedSlot!==state.mosaicAutoFocus&&Math.floor(Number(focusedSlot)/mosaicPageSize)!==state.mosaicLivePage)state.mosaicFollow=false;
+    if(state.mosaicFollow!==false)page=state.mosaicLivePage;
+  }
+  const offset=page*mosaicPageSize,liveOffset=state.mosaicLivePage*mosaicPageSize;
   state.mosaicPage=page;
   const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count,pages>1?mosaicPageSize:count);
   const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
   const bySlot=new Map(records.map((r,i)=>[live?r.slot:i,r]));
   const statuses=live?['pass','fail','inconclusive','running','idle']:['pass','fail','inconclusive'];
-  return `<section class="request-viz"><div class="viz-heading"><h2>${live?'Request budget':'Requests'}</h2><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span></div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
-    const r=bySlot.get(offset+i),status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',label=r?`Request ${offset+i+1}: ${r.fixture_id || r.scenario || ''}. ${statusLabels[status] || status}. ${r.elapsed_ms==null?'Timing pending':ms(r.elapsed_ms)}`:status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
+  return `<section class="request-viz"><div class="viz-heading"><h2>${live?'Request budget':'Requests'}</h2><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span>${live&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
+    const r=bySlot.get(offset+i),status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',current=live&&status==='running'&&offset+i===frontier,label=r?`${current?'Newest running request':'Request'} ${offset+i+1}: ${r.fixture_id || r.scenario || ''}. ${statusLabels[status] || status}. ${r.elapsed_ms==null?'Timing pending':ms(r.elapsed_ms)}`:status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
     const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
-    return `<g class="request-spot ${status}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/></g>`;
-  }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}"></i>${status==='idle'?'Unused':statusLabels[status]}${live?'':`<b>${number(records.filter(r=>requestOutcome(r)===status).length)}</b>`}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed request, invalid completion or incorrect answer. Unscored answers, cancellations and intentional probes stay inconclusive. Check verdicts also consider timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
+    return `<g class="request-spot ${status}${current?' current':''}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/></g>`;
+  }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}"></i>${status==='idle'?'Unused':statusLabels[status]}${live?'':`<b>${number(records.filter(r=>requestOutcome(r)===status).length)}</b>`}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed request, invalid completion or incorrect answer. Unscored answers, cancellations and intentional probes stay inconclusive. Check verdicts also consider timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}${live&&page!==state.mosaicLivePage?' · live on another page':''}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
+}
+function focusMosaicStart() {
+  const spot=$('.request-mosaic [tabindex="0"]');state.mosaicAutoFocus=spot?.dataset?.liveSlot;spot?.focus({preventScroll:true});
 }
 function renderBeeswarm(records,{width=960}={}) {
   const measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
@@ -337,7 +350,7 @@ async function route() {
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
-      state.detail=detail;state.mosaicPage=0;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();enterRoute();
+      state.detail=detail;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';renderDetail();enterRoute();
       if(activeState(detail))schedulePoll(pollDetail,version);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
@@ -366,9 +379,9 @@ async function pollDetail(version) {
   const id=state.detail.id;
   try {
     const detail=await api(runPath(id));if(version!==state.routeVersion || state.detail.id!==id)return;
-    const focused=document.activeElement,slot=focused?.dataset?.liveSlot,action=focused?.dataset?.action;
+    const focused=document.activeElement,slot=focused?.dataset?.liveSlot,action=focused?.dataset?.action,autoFocused=slot!==undefined&&slot===state.mosaicAutoFocus;
     connectionError();state.detail=detail;renderDetail();
-    if(slot!==undefined)$(`[data-live-slot="${slot}"]`)?.focus({preventScroll:true});
+    if(slot!==undefined){const spot=$(`[data-live-slot="${slot}"]`);if(spot)spot.focus({preventScroll:true});else if(autoFocused&&activeState(detail)&&state.mosaicFollow!==false)focusMosaicStart();}
     else if(action==='stop')$('[data-action="stop"]')?.focus({preventScroll:true});
     if(activeState(detail))schedulePoll(pollDetail,version);else {if(state.active===id)setActive(null);await refreshRuns();}
   } catch(error) {if(version!==state.routeVersion)return;connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
@@ -2057,7 +2070,8 @@ document.addEventListener('click',async(event)=>{
   if(shellAction==='shortcuts'){openCommands(true);return;}
   if(shellAction==='toggle-rail'){toggleRail();return;}
   if(shellAction==='close-commands'){$('#command-dialog').close();return;}
-  if(shellAction==='mosaic-prev'||shellAction==='mosaic-next'){state.mosaicPage=Math.max(0,(state.mosaicPage || 0)+(shellAction==='mosaic-next'?1:-1));renderDetail();$('.request-mosaic [tabindex="0"]')?.focus({preventScroll:true});return;}
+  if(shellAction==='mosaic-prev'||shellAction==='mosaic-next'){state.mosaicPage=Math.max(0,(state.mosaicPage || 0)+(shellAction==='mosaic-next'?1:-1));if(activeState(state.detail))state.mosaicFollow=state.mosaicPage===state.mosaicLivePage;renderDetail();focusMosaicStart();return;}
+  if(shellAction==='mosaic-live'){state.mosaicFollow=true;state.mosaicPage=state.mosaicLivePage;renderDetail();focusMosaicStart();return;}
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
   const setupStep=event.target.closest('[data-setup-step]');if(setupStep){state.returnToReview=Boolean(setupStep.dataset.reviewEdit);navigateSetup(Number(setupStep.dataset.setupStep));return;}
   const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;renderDetail();$(`#tab-${state.tab}`).focus();return;}
@@ -2264,7 +2278,7 @@ document.addEventListener('scroll',event=>{
 },true);
 document.addEventListener('cancel',event=>{if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
 document.addEventListener('pointerover',event=>{const spot=event.target.closest?.('.request-spot, .swarm-dot');if(spot)showSpotTip(spot,event.clientX,event.clientY);else hideSpotTip();});
-document.addEventListener('focusin',event=>{const spot=event.target.closest?.('.request-spot, .swarm-dot');if(!spot){hideSpotTip();return;}const box=spot.getBoundingClientRect();showSpotTip(spot,box.left+box.width/2,box.top);});
+document.addEventListener('focusin',event=>{if(event.target.dataset?.liveSlot!==state.mosaicAutoFocus)state.mosaicAutoFocus=null;const spot=event.target.closest?.('.request-spot, .swarm-dot');if(!spot){hideSpotTip();return;}const box=spot.getBoundingClientRect();showSpotTip(spot,box.left+box.width/2,box.top);});
 document.addEventListener('pointermove',event=>{
   if(!$('#spot-tip')?.hidden&&event.target.closest?.('.request-spot, .swarm-dot'))showSpotTip(event.target.closest('.request-spot, .swarm-dot'),event.clientX,event.clientY);
   const coat=document.querySelector?.('.hero-coat');if(!coat)return;
