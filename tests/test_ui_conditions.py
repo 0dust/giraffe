@@ -52,7 +52,7 @@ const records=[{id:'a',target:'local',scenario:'warm',status:'completed'},
  {id:'c',target:'other',scenario:'warm',status:'completed'}];
 const html=renderTests(records,{report:report([],{requests:records})});
 assert.equal((html.match(/class="test-condition"/g)||[]).length,2);
-assert.equal((html.match(/Warm-up/g)||[]).length,2);
+assert.equal((html.match(/<h3>Warm-up<\/h3>/g)||[]).length,2);
 assert.match(html,/<h3 class="test-target">local<\/h3>/);assert.match(html,/<h3 class="test-target">other<\/h3>/);
 assert.match(html,/1 of 2 requests failed/);
 assert.equal((html.match(/class="request-spot /g)||[]).length,3);

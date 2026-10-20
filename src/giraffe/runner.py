@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import platform
 import socket
@@ -192,8 +193,8 @@ class _Run:
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
 
-    def _condition(self, target, scenario, workload=None):
-        condition = condition_for(scenario, workload or {})
+    def _condition(self, target, scenario, workload=None, *, request_parameters=None):
+        condition = condition_for(scenario, workload or {}, self.config, request_parameters=request_parameters)
         key = (target, condition["id"])
         row = self.conditions.get(key)
         if row is None:
@@ -205,6 +206,16 @@ class _Run:
                    "not_sent": None, "reason": None}
             self.conditions[key] = row
             self.observations[target]["conditions"].append(row)
+        else:
+            previous = row["condition"]["parameters"]
+            for name, value in condition["parameters"].items():
+                if name in {"input_chars", "input_tokens_approx", "output_tokens"} and name in previous:
+                    values = previous[name] if isinstance(previous[name], list) else [previous[name]]
+                    low, high = min(*values, value), max(*values, value)
+                    previous[name] = low if low == high else [low, high]
+                else:
+                    previous[name] = value
+            row["condition"].update(label=condition["label"], purpose=condition["purpose"])
         return row
 
     def plan_condition(self, target, scenario, workload=None, planned=None, planned_kind="exact"):
@@ -215,8 +226,8 @@ class _Run:
             self.emit_condition("condition_planned", scenario, row)
         return row
 
-    def start_condition(self, target, scenario, workload=None, planned=None, planned_kind="exact"):
-        row = self._condition(target, scenario, workload)
+    def start_condition(self, target, scenario, workload=None, planned=None, planned_kind="exact", *, request_parameters=None):
+        row = self._condition(target, scenario, workload, request_parameters=request_parameters)
         if row is None:
             return None
         previous = row["status"]
@@ -249,7 +260,7 @@ class _Run:
         return fallback
 
     def finish_condition(self, target, scenario, workload=None, reason=None):
-        key = (target, condition_for(scenario, workload or {})["id"])
+        key = (target, condition_for(scenario, workload or {}, self.config)["id"])
         row = self.conditions.get(key)
         if row is None:
             return
@@ -324,7 +335,7 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None, request_parameters=None):
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
@@ -340,11 +351,15 @@ class _Run:
                 self.unfinished[target.name].update(_scenario_checks(spec))
                 return None
             self.attempted += 1
-            condition_id = condition_for(spec.scenario, spec.workload)["id"]
-            condition_key = (target.name, condition_id)
-            condition = self.conditions.get(condition_key)
+            output_cap = min(spec.max_tokens or self.config.max_output_tokens, self.config.max_output_tokens)
+            request_parameters = {**(request_parameters or {}),
+                "input_chars": spec.input_chars or sum(len(str(message.get("content") or "")) for message in spec.messages),
+                "output_tokens": output_cap}
+            condition = self._condition(target.name, spec.scenario, spec.workload, request_parameters=request_parameters)
+            condition_id = (condition["condition"]["id"] if condition is not None else
+                            condition_for(spec.scenario, spec.workload, self.config)["id"])
             if condition is None or condition["status"] != "running":
-                condition = self.start_condition(target.name, spec.scenario, spec.workload)
+                condition = self.start_condition(target.name, spec.scenario, spec.workload, request_parameters=request_parameters)
             if condition is not None:
                 condition["sent"] += 1
                 condition["started"] += 1
@@ -370,6 +385,8 @@ class _Run:
                     on_start()
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
+                          input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
+                          requested_input_tokens=spec.workload.get("requested_input_tokens"),
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
                 if deadline_override is not None:
                     timeout_override = min(timeout_override or self.config.request_timeout_seconds,
@@ -395,8 +412,7 @@ class _Run:
                     status="cancelled" if isinstance(exc, asyncio.CancelledError) or global_deadline else "timeout",
                     error="run cancelled" if isinstance(exc, asyncio.CancelledError)
                     else ("maximum run duration reached" if global_deadline else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=spec.max_tokens or
-                    self.config.max_output_tokens, stream=spec.stream,
+                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
                 )
             except Exception as exc:
                 # Exception text can contain credential-bearing URLs from transports.
@@ -405,7 +421,7 @@ class _Run:
                     scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
                     status="failed", error=f"client failure ({type(exc).__name__})",
                     elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars,
+                    input_chars=spec.input_chars, requested_max_tokens=output_cap,
                 )
             finally:
                 self.active[key] -= 1
@@ -458,6 +474,8 @@ class _Run:
             # Live visualization gets measurements only, never retained response bodies.
             self.emit("request_completed", target.name, spec.scenario, status=record.status,
                       condition_id=condition_id, condition_summary=dict(condition) if condition else None,
+                      input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
+                      requested_input_tokens=spec.workload.get("requested_input_tokens"),
                       request_slot=request_slot, request=record.model_dump(mode="json", include={
                           "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                           "elapsed_ms", "first_output_ms", "check_ids",
@@ -467,7 +485,10 @@ class _Run:
     async def group(self, target, client, specs, scenario, count=None, concurrency=1, checks=()):
         count = count if count is not None else self.config.samples
         workload = specs[0].workload if specs else {}
-        self.start_condition(target.name, scenario, workload, count)
+        request_parameters = {"concurrency": concurrency,
+            "same_prompt": bool(specs) and len({json.dumps(specs[i % len(specs)].messages, sort_keys=True)
+                                               for i in range(count)}) == 1}
+        self.start_condition(target.name, scenario, workload, count, request_parameters=request_parameters)
         self.emit("scenario_started", target.name, scenario, planned_requests=count)
         if not specs:
             self.unfinished[target.name].update(checks)
@@ -483,7 +504,7 @@ class _Run:
                         self.unfinished[target.name].update(_scenario_checks(spec))
                     break
                 result.extend(r for r in await asyncio.gather(
-                    *(self.request(target, client, spec) for spec in batch)) if r is not None)
+                    *(self.request(target, client, spec, request_parameters=request_parameters) for spec in batch)) if r is not None)
             if len(result) < count:
                 self.unfinished[target.name].update(checks)
             return result

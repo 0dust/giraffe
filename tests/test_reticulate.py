@@ -21,12 +21,12 @@ assert.equal(requestOutcome({}),'inconclusive');
 
 def test_mosaic_is_one_spot_per_record_with_stable_paginated_identity():
     run_render_checks(r"""
-const records=Array.from({length:245},(_,i)=>({id:'request-'+i,fixture_id:'case <'+i+'>',
+const records=Array.from({length:245},(_,i)=>({id:'request-'+i,fixture_id:'case <'+i+'>',scenario:'bucket_c32_short_short',
  status:'completed',valid:true,score:i%2===0,elapsed_ms:i}));
 let html=renderMosaic(records);
 assert.equal((html.match(/data-request=/g)||[]).length,240);
 assert.match(html,/data-request="request-0"/);assert.match(html,/data-request="request-239"/);
-assert.doesNotMatch(html,/data-request="request-240"/);assert.match(html,/case &lt;0&gt;/);
+assert.doesNotMatch(html,/data-request="request-240"/);assert.match(html,/Short input \/ short output · 32 at once\. Request 1 of 245/);
 assert.equal((html.match(/tabindex="0"/g)||[]).length,1);
 state.mosaicPage=1;html=renderMosaic(records);
 assert.equal((html.match(/data-request=/g)||[]).length,5);
@@ -64,7 +64,7 @@ delete state.mosaicFollow;
 let html=renderMosaic(records,{budget:600,live:true});
 assert.equal(state.mosaicPage,1);assert.equal(state.mosaicLivePage,1);
 assert.match(html,/data-live-slot="250"/);assert.doesNotMatch(html,/data-live-slot="0"/);
-assert.match(html,/<g class="request-spot running current"[^>]*data-live-slot="253"[^>]*aria-label="Newest running request 254:/);
+assert.match(html,/<g class="request-spot running current"[^>]*data-live-slot="253"[^>]*aria-label="Requests\. Request 254 of 254/);
 assert.equal((html.match(/request-spot running current/g)||[]).length,1);
 assert.match(html,/Following live/);assert.doesNotMatch(html,/data-action="mosaic-live"/);
 state.mosaicFollow=false;state.mosaicPage=0;
@@ -81,7 +81,7 @@ assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,2);
 def test_live_mosaic_frontier_prefers_running_then_latest_record_then_budget():
     run_render_checks(r"""
 let html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'running'}],{budget:600,live:true});
-assert.equal(state.mosaicLivePage,1);assert.match(html,/Newest running request 251:/);
+assert.equal(state.mosaicLivePage,1);assert.match(html,/Requests\. Request 1 of 2/);
 html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'completed'}],{budget:600,live:true});
 assert.equal(state.mosaicPage,2);assert.doesNotMatch(html,/request-spot \w+ current|Newest running request/);
 renderMosaic([],{budget:600,live:true,budgetUsed:481});assert.equal(state.mosaicPage,2);

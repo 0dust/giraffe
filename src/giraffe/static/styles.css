@@ -1210,3 +1210,5 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 .all-requests { margin-bottom: 22px; border: 1px solid var(--line); border-radius: var(--r-xl); background: var(--surface); overflow: hidden; }
 .all-requests > summary { padding: 14px 20px; font-size: 13px; }
 .all-requests > .request-viz, .all-requests > .evidence-band { margin-bottom: 0; border: 0; border-radius: 0; box-shadow: none; }
+
+.request-sent, .request-identity, .request-internal { min-width: 0; overflow-wrap: anywhere; }

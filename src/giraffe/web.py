@@ -299,10 +299,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
                     job["requests"][slot] = {"slot": slot, "status": "running",
                         "target": event.get("target"), "scenario": event.get("scenario"),
                         "condition_id": event.get("condition_id"),
-                        "fixture_id": event.get("fixture_id")}
+                        "fixture_id": event.get("fixture_id"),
+                        "input_chars": event.get("input_chars"),
+                        "requested_max_tokens": event.get("requested_max_tokens"),
+                        "requested_input_tokens": event.get("requested_input_tokens")}
                 elif event["event"] == "request_completed" and event.get("request"):
                     job["requests"][slot] = {**event["request"], "slot": slot,
-                        "intentional": event.get("intentional", False)}
+                        "intentional": event.get("intentional", False),
+                        "input_chars": event.get("input_chars"),
+                        "requested_max_tokens": event.get("requested_max_tokens"),
+                        "requested_input_tokens": event.get("requested_input_tokens")}
             if event["event"] in {"scenario_started", "scenario_finished"}:
                 job["phases"].append({key: event.get(key) for key in
                     ("event", "target", "scenario", "elapsed_seconds")})
