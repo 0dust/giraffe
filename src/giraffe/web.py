@@ -5,19 +5,27 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
+import shutil
+import socket
+import tempfile
+import threading
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field, ValidationError
+from starlette.concurrency import run_in_threadpool
+from anyio import CancelScope
+from pydantic import Field, ValidationError, field_validator
 
 from giraffe.capabilities import capabilities
 from giraffe.deployment import safe_config
@@ -26,9 +34,14 @@ from giraffe.models import CHECK_NAMES, ConcurrentWorkloads, ConfigDraft, Model,
 from giraffe.planning import request_plan
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
-from giraffe.reporting import compare_baseline, reproduction_export, write_report
+from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
+                               save_baseline_report, save_failure_summary, write_report)
+from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
+from giraffe.resources import PhaseSampler, SAMPLING
 from giraffe.runner import run_suite
+from giraffe.storage import (DEFAULT_LIMITS, apply_cleanup, automatic_cleanup, check_start, cleanup_plan,
+                             is_giraffe_run, run_alive, run_size, set_kept, storage_summary)
 
 
 def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
@@ -41,7 +54,7 @@ def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
     config = body.get("config", body) if isinstance(body, dict) else {}
     labels = {"concurrency": "Maximum at once", "max_output_tokens": "Output cap (tokens)",
               "request_timeout_seconds": "Request timeout (seconds)",
-              "max_duration_seconds": "Traffic time limit", "concurrent_workloads.levels": "Concurrency levels",
+              "max_duration_seconds": "Traffic time limit", "max_memory_mb": "Memory limit (RAM)", "concurrent_workloads.levels": "Concurrency levels",
               "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
               "traffic.max_in_flight": "Capacity requests at once"}
 
@@ -165,6 +178,27 @@ class StartRun(SessionCredentials):
     restart_target: str | None = None
 
 
+class CleanupCriteria(Model):
+    older_than_days: int | None = Field(default=None, ge=0, strict=True)
+    keep_latest: int | None = Field(default=None, ge=0, strict=True)
+    max_total_bytes: int | None = Field(default=None, strict=True)
+
+    @field_validator("max_total_bytes")
+    @classmethod
+    def positive_total(cls, value):
+        if value is not None and value <= 0:
+            raise ValueError("Cleanup max total must be greater than 0; use --older-than 0 to remove all unprotected runs")
+        return value
+
+
+class CleanupRequest(CleanupCriteria):
+    ids: list[str]
+
+
+class KeepRun(Model):
+    keep: bool = Field(strict=True)
+
+
 class DatasetPreview(Model):
     text: str
     format: Literal["csv", "json"]
@@ -205,7 +239,7 @@ def _now() -> str:
 
 def _write(path: Path, value: dict) -> None:
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temporary.write_text(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
     temporary.replace(path)
 
 
@@ -231,7 +265,74 @@ def _report(path: Path) -> RunReport:
     try:
         return RunReport.model_validate_json(path.read_text())
     except (OSError, ValueError) as exc:
-        raise HTTPException(404, "Report unavailable or unreadable") from exc
+        message = "Report unavailable or unreadable"
+        if "SHA-256 mismatch" in str(exc):
+            message += ": saved input SHA-256 mismatch"
+        raise HTTPException(404, message) from exc
+
+
+class _WorkerCompletion(asyncio.Future):
+    def cancel(self, msg=None):
+        # Raw Task.cancel() cannot interrupt a running thread. Defer delivery
+        # until its completion callback, without retrying an already-cancelled await.
+        return False
+
+
+async def _finish_shielded(task):
+    completed = _WorkerCompletion()
+    task.add_done_callback(lambda _: completed.set_result(None))
+    cancelled = None
+    with CancelScope(shield=True):
+        try:
+            await completed
+        except asyncio.CancelledError as error:
+            cancelled = error
+    try:
+        result = task.result()
+    except BaseException:
+        if cancelled is not None:
+            raise cancelled
+        raise
+    return result, cancelled
+
+
+class _ReportDownload(Response):
+    def __init__(self, path, extension, identifier, lock, record_resources):
+        super().__init__()
+        self.path, self.extension, self.identifier = path, extension, identifier
+        self.lock, self.record_resources = lock, record_resources
+
+    def generate(self, output):
+        with output.open("x", encoding="utf-8") as stream:
+            if self.extension == "html":
+                stream.write(_render(_report(self.path)))
+            else:
+                with closing(expanded_report_chunks(self.path)) as chunks:
+                    for chunk in chunks:
+                        stream.write(chunk)
+
+    async def __call__(self, scope, receive, send):
+        with tempfile.TemporaryDirectory(prefix="giraffe-response-") as temporary:
+            output = Path(temporary) / ("report." + self.extension)
+            async with self.lock:
+                sampler = PhaseSampler("download_" + self.extension)
+                try:
+                    with sampler:
+                        _, cancelled = await _finish_shielded(asyncio.create_task(
+                            run_in_threadpool(self.generate, output)))
+                except (OSError, ValueError) as error:
+                    message = "Report unavailable or unreadable"
+                    if "SHA-256 mismatch" in str(error):
+                        message += ": saved input SHA-256 mismatch"
+                    raise HTTPException(404, message) from error
+                _, resource_cancelled = await _finish_shielded(asyncio.create_task(
+                    run_in_threadpool(self.record_resources, self.path.parent, sampler)))
+                if cancelled is not None or resource_cancelled is not None:
+                    raise cancelled or resource_cancelled
+            # Slow clients retain only their temporary file, never the render lease.
+            response = FileResponse(output, filename=f"giraffe-{self.identifier}.{self.extension}",
+                                    media_type="application/json" if self.extension == "json" else "text/html")
+            await response(scope, receive, send)
 
 
 def _targets(config: dict) -> list[dict]:
@@ -252,41 +353,110 @@ def _bootstrap_config(defaults: dict | None) -> dict:
     return config
 
 
-def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> FastAPI:
+def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
+               max_total_storage: int = DEFAULT_LIMITS["max_total_storage"],
+               min_free_disk: int = DEFAULT_LIMITS["min_free_disk"],
+               max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
+               auto_cleanup: dict | None = None) -> FastAPI:
+    limits = {"max_total_storage": max_total_storage, "min_free_disk": min_free_disk,
+              "max_run_storage": max_run_storage}
+    if any(type(value) is not int or value < 0 for value in limits.values()):
+        raise ValueError("Storage limits must be non-negative integers; 0 disables a limit")
+    policy = CleanupCriteria.model_validate(auto_cleanup or {}).model_dump(exclude_none=True)
     root = Path(runs_dir).resolve()
     baseline_root = root / ".baselines"
     if baseline_root.is_symlink():
         raise ValueError("Baseline directory cannot be a symlink")
     active: dict = {}
+    start_lock = asyncio.Lock()
+    download_lock = asyncio.Lock()
     connection_pending = False
     unsaved_metadata: dict[str, dict] = {}
+    metadata_lock = threading.RLock()
+    last_auto_cleanup: dict = {}
 
     def metadata(directory: Path) -> dict:
-        if directory.name in unsaved_metadata:
-            return unsaved_metadata[directory.name]
-        try:
-            return _read(directory / ".web.json")
-        except (OSError, ValueError):
-            return {}
+        with metadata_lock:
+            if directory.name in unsaved_metadata:
+                return unsaved_metadata[directory.name]
+            try:
+                return _read(directory / ".web.json")
+            except (OSError, ValueError):
+                return {}
+
+    def merge_resources(current: dict, saved: dict) -> dict:
+        resources = {**saved, **current}
+        peaks = dict(saved.get("sampled_peak_rss_bytes", {}))
+        for phase, peak in current.get("sampled_peak_rss_bytes", {}).items():
+            previous = peaks.get(phase)
+            peaks[phase] = max(previous, peak) if previous is not None and peak is not None else (
+                peak if peak is not None else previous)
+        if peaks:
+            resources["sampled_peak_rss_bytes"] = peaks
+        return resources
+
+    def save_metadata(directory: Path, meta: dict) -> None:
+        with metadata_lock:
+            try:
+                saved = _read(directory / ".web.json")
+            except (OSError, ValueError):
+                saved = {}
+            cached = unsaved_metadata.get(directory.name, {})
+            resources = merge_resources(meta.get("resources", {}), saved.get("resources", {}))
+            resources = merge_resources(resources, cached.get("resources", {}))
+            if resources:
+                meta["resources"] = resources
+            _write(directory / ".web.json", meta)
+            unsaved_metadata.pop(directory.name, None)
+
+    def record_download_resources(directory: Path, sampler: PhaseSampler) -> None:
+        with metadata_lock:
+            path = directory / ".web.json"
+            # A download never adopts a legacy directory or invents lifecycle state.
+            if path.is_symlink() or not path.is_file():
+                return
+            try:
+                meta = _read(path)
+            except (OSError, ValueError):
+                return
+            measured = {"sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": SAMPLING}
+            meta["resources"] = merge_resources(measured, meta.get("resources", {}))
+            cached = unsaved_metadata.get(directory.name)
+            if cached is not None:
+                cached["resources"] = merge_resources(cached.get("resources", {}), meta["resources"])
+            try:
+                _write(path, meta)
+            except OSError:
+                pass  # Resource-only failures never cache a possibly stale lifecycle state.
 
     def recover_interrupted() -> None:
-        if not root.exists():
+        try:
+            directories = list(root.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
             return
-        for directory in root.iterdir():
+        for directory in directories:
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
             meta = metadata(directory)
-            if meta.get("state") in {"running", "stopping"}:
-                # A report can finish just before a process exits while metadata is being saved.
-                meta["state"] = "completed" if (directory / "report.json").is_file() else "interrupted"
-                meta["finished_at"] = _now()
-                if meta["state"] == "interrupted":
-                    meta["error"] = "The local server stopped before a report was saved."
-                _write(directory / ".web.json", meta)
+            if (meta.get("state") not in {"running", "stopping"} or run_alive(directory, meta)
+                    or not is_giraffe_run(directory, meta)):
+                continue
+            try:
+                saved = _report(directory / "report.json")
+            except HTTPException:
+                meta.update(state="interrupted", finished_at=_now(),
+                            error="The writer stopped before a complete report was saved.")
+            else:
+                meta.update(state="completed", finished_at=saved.finished_at, run_id=saved.run_id)
+                meta.pop("error", None)
+            try:
+                save_metadata(directory, meta)
+            except OSError:
+                unsaved_metadata[directory.name] = meta
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        recover_interrupted()
+        await run_in_threadpool(recover_interrupted)
         yield
         if active:
             active["stop"].set()
@@ -325,17 +495,44 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         # Input values can contain secrets pasted into the wrong field.
         return JSONResponse({"detail": _configuration_errors(error.errors(), error.body)}, status_code=422)
 
-    def run_detail(identifier: str) -> dict:
+    @lru_cache(maxsize=256)
+    def listing_report(path: str, modified: int, size: int) -> dict | None:
+        try:
+            saved = _report(Path(path))
+        except HTTPException:
+            return None
+        return {"run_id": saved.run_id, "overall": saved.overall,
+                "started_at": saved.started_at, "finished_at": saved.finished_at,
+                "request_count": len(saved.requests),
+                "checks": [{"status": check.status} for check in saved.checks],
+                "manifest": {"config": {"targets": _targets(saved.manifest.get("config", {}))}}}
+
+    def run_detail(identifier: str, *, listing: bool = False) -> dict:
         directory = _directory(root, identifier)
         meta = metadata(directory)
         report_path = directory / "report.json"
+        summary_path = directory / "summary.json"
+        summary = None
+        if summary_path.is_file() and not summary_path.is_symlink():
+            try:
+                summary = _read(summary_path)
+                meta = {**meta, "state": "error", "error": summary.get("error") or meta.get("error")
+                        or "The report could not be saved. Only check summaries are available."}
+            except (OSError, ValueError):
+                pass
         if not meta and not report_path.is_file():
             raise HTTPException(404, "Unknown run")
         persisted = None
-        if report_path.is_file():
+        if report_path.is_file() and summary is None:
             try:
-                persisted = _report(report_path).model_dump(mode="json")
-            except HTTPException:
+                if listing:
+                    stat = report_path.stat()
+                    persisted = listing_report(str(report_path), stat.st_mtime_ns, stat.st_size)
+                    if persisted is None:
+                        raise HTTPException(404, "Saved report is unreadable")
+                else:
+                    persisted = _report(report_path).model_dump(mode="json")
+            except (HTTPException, FileNotFoundError, NotADirectoryError):
                 meta = {**meta, "state": "error", "error": "Saved report is unreadable."}
         live = active if active.get("id") == identifier else {}
         return {"id": identifier, "state": live.get("state", meta.get("state", "completed")),
@@ -345,20 +542,22 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
                 "live_conditions": list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", []),
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
-                "baseline_id": meta.get("baseline_id"), "report": persisted,
-                "started_at": (persisted or {}).get("started_at", meta.get("started_at")),
-                "finished_at": (persisted or {}).get("finished_at", meta.get("finished_at"))}
+                "baseline_id": meta.get("baseline_id"), "report": persisted, "summary": summary,
+                "resources": meta.get("resources", {}), "auto_cleanup": meta.get("auto_cleanup"),
+                "bytes": run_size(directory), "kept": (directory / ".keep").is_file(),
+                "started_at": (persisted or summary or {}).get("started_at", meta.get("started_at")),
+                "finished_at": (persisted or summary or {}).get("finished_at", meta.get("finished_at"))}
 
     def run_summary(detail: dict) -> dict:
-        report = detail["report"] or {}
+        report = detail["report"] or detail["summary"] or {}
         counts = dict.fromkeys(("pass", "fail", "inconclusive", "skipped", "blocked"), 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
         return {key: detail[key] for key in ("id", "state", "error", "progress", "baseline_id",
-                                             "started_at", "finished_at")} | {
+                                             "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
-            "request_count": len(report.get("requests", [])) if report else
+            "request_count": report.get("request_count", len(report.get("requests", []))) if report else
             detail["progress"].get("completed", 0)}
 
     def saved_baselines() -> list[dict]:
@@ -379,8 +578,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
 
     async def execute(job: dict, config: RunConfig, baseline: RunReport | None) -> None:
         meta = job["meta"]
+        finished = False
+        cancelled = None
 
         def progress(event: dict) -> None:
+            if finished:
+                return
             if not event["event"].startswith("condition_"):
                 job["progress"] = event
                 job["events"].append(event)
@@ -418,9 +621,25 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             report = await run_suite(config, progress=progress, stop_event=job["stop"])
             if baseline is not None:
                 report = compare_baseline(report, baseline)
-            write_report(report, job["directory"])
-            meta.update(state="completed", finished_at=_now())
-        except asyncio.CancelledError:
+            meta["run_id"] = report.run_id
+            sampler = PhaseSampler("export")
+            try:
+                with sampler:
+                    write_report(report, job["directory"], max_run_storage=max_run_storage)
+            except OSError as error:
+                if getattr(error, "json_complete", False):
+                    meta.update(state="completed", finished_at=_now(), error=html_failure_warning(error))
+                else:
+                    message = save_failure_summary(report, job["directory"], error)
+                    meta.update(state="error", finished_at=_now(), error=message)
+            else:
+                meta.update(state="completed", finished_at=_now())
+            finally:
+                meta["resources"] = {"sampled_peak_rss_bytes": dict(sampler.peaks),
+                                     "memory_measurement": "unavailable" if sampler.peaks.get("export") is None else "sampled process RSS",
+                                     "sampling": SAMPLING}
+        except asyncio.CancelledError as error:
+            cancelled = error
             meta.update(state="interrupted", finished_at=_now(),
                         error="The local server stopped before a report was saved.")
         except Exception as error:
@@ -428,17 +647,56 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             meta.update(state="error", finished_at=_now(),
                         error=f"Run could not finish ({type(error).__name__}). Review the configuration and retry.")
         finally:
+            finished = True
             meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
                         conditions=list(job["conditions"].values()))
+            status_warning_added = False
+
+            def persist_final():
+                nonlocal status_warning_added
+                warning = "Run status could not be saved to disk."
+                with metadata_lock:
+                    payload = dict(meta)
+                    if status_warning_added:
+                        error = (payload.get("error") or "").removesuffix(warning).strip()
+                        if error:
+                            payload["error"] = error
+                        else:
+                            payload.pop("error", None)
+                    try:
+                        save_metadata(job["directory"], payload)
+                    except OSError:
+                        if warning not in (meta.get("error") or ""):
+                            meta["error"] = ((meta.get("error") or "") + " " + warning).strip()
+                            status_warning_added = True
+                        unsaved_metadata[job["id"]] = meta
+                    else:
+                        meta.clear()
+                        meta.update(payload)
+                        status_warning_added = False
+                        unsaved_metadata.pop(job["id"], None)
+
             try:
-                _write(job["directory"] / ".web.json", meta)
-            except OSError:
-                # Keep the final state visible even when the disk cannot accept metadata.
-                meta["error"] = (meta.get("error", "") +
-                                 " Run status could not be saved to disk.").strip()
-                unsaved_metadata[job["id"]] = meta
+                # Publish the result before cleanup can block or be cancelled.
+                persist_final()
+                if policy and cancelled is None:
+                    try:
+                        task = asyncio.create_task(run_in_threadpool(
+                            automatic_cleanup, root, policy, active_id=job["id"]))
+                        result, cleanup_cancelled = await _finish_shielded(task)
+                        cancelled = cleanup_cancelled or cancelled
+                    except Exception as error:
+                        result = {"deleted": [], "error": f"Automatic cleanup failed ({type(error).__name__})."}
+                    meta.update(auto_cleanup=result, auto_cleanup_policy=policy)
+                    last_auto_cleanup.clear()
+                    last_auto_cleanup.update(result)
             finally:
-                active.clear()
+                try:
+                    persist_final()
+                finally:
+                    active.clear()
+            if cancelled is not None:
+                raise cancelled
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -458,7 +716,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.post("/api/targets/test-connection")
     async def target_connection(body: ConnectionTest):
         nonlocal connection_pending
-        if active:
+        if active or start_lock.locked():
             raise HTTPException(409, "A run is active. Wait for it to finish or stop it "
                                 "before testing another connection.")
         if connection_pending:
@@ -508,6 +766,46 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         return await start_run(StartRun(config=config, api_keys=[credential for credential
                                in body.api_keys if credential.target == body.target_name]))
 
+    @app.get("/api/storage")
+    async def get_storage():
+        result = await run_in_threadpool(storage_summary, root, active_id=active.get("id"), limits=limits,
+                                         auto_cleanup=policy)
+        def latest_cleanup():
+            if last_auto_cleanup:
+                return dict(last_auto_cleanup)
+            for row in result["runs"]:
+                saved = metadata(root / row["id"]).get("auto_cleanup")
+                if saved:
+                    return saved
+            return {}
+
+        result["last_auto_cleanup"] = await run_in_threadpool(latest_cleanup)
+        return result
+
+    @app.post("/api/storage/cleanup-preview")
+    async def preview_cleanup(body: CleanupCriteria):
+        return await run_in_threadpool(cleanup_plan, root, active_id=active.get("id"),
+                                       **body.model_dump(exclude_none=True))
+
+    @app.post("/api/storage/cleanup")
+    async def clean_storage(body: CleanupRequest):
+        for identifier in body.ids:
+            _directory(root, identifier)
+        return await run_in_threadpool(apply_cleanup, root, body.ids, active_id=active.get("id"),
+                                       **body.model_dump(exclude={"ids"}, exclude_none=True))
+
+    @app.post("/api/runs/{identifier}/keep")
+    async def keep_run(identifier: str, body: KeepRun):
+        directory = _directory(root, identifier)
+        def update_keep():
+            if not directory.is_dir() or not any((directory / name).is_file() for name in
+                                                ("report.json", ".web.json", "summary.json")):
+                raise HTTPException(404, "Unknown run")
+            set_kept(directory, body.keep)
+            return {"id": identifier, "kept": body.keep}
+
+        return await run_in_threadpool(update_keep)
+
     @app.get("/api/runs")
     async def list_runs():
         rows = []
@@ -515,7 +813,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
             try:
-                rows.append(run_summary(run_detail(directory.name)))
+                rows.append(run_summary(run_detail(directory.name, listing=True)))
             except HTTPException:
                 continue
         return {"runs": sorted(rows, key=lambda item: item.get("started_at") or "", reverse=True),
@@ -556,23 +854,29 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
 
     @app.post("/api/runs", status_code=202)
     async def start_run(body: StartRun):
-        if active:
-            raise HTTPException(409, "A run is already active; stop it or wait for its report")
-        if connection_pending:
-            raise HTTPException(409, "A connection test is running. Wait for its result "
-                                "before starting a run.")
-        config, baseline = prepare_run(body)
-        _validated_plan(config)
-        identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
-        directory = _directory(root, identifier)
-        directory.mkdir(parents=True)
-        meta = {"id": identifier, "state": "running", "started_at": _now(),
-                "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
-        _write(directory / ".web.json", meta)
-        active.update(id=identifier, state="running", directory=directory, meta=meta,
-                      progress={}, events=[], requests={}, conditions={}, phases=[], stop=asyncio.Event())
-        active["task"] = asyncio.create_task(execute(active, config, baseline))
-        return {"id": identifier, "state": "running"}
+        async with start_lock:
+            if active:
+                raise HTTPException(409, "A run is already active; stop it or wait for its report")
+            if connection_pending:
+                raise HTTPException(409, "A connection test is running. Wait for its result "
+                                    "before starting a run.")
+            config, baseline = prepare_run(body)
+            _validated_plan(config)
+            try:
+                await run_in_threadpool(check_start, root, limits)
+            except ValueError as error:
+                raise HTTPException(507, str(error)) from None
+            identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+            directory = _directory(root, identifier)
+            directory.mkdir(parents=True)
+            meta = {"id": identifier, "state": "running", "started_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+                    "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
+            save_metadata(directory, meta)
+            active.update(id=identifier, state="running", directory=directory, meta=meta,
+                          progress={}, events=[], requests={}, conditions={}, phases=[], stop=asyncio.Event())
+            active["task"] = asyncio.create_task(execute(active, config, baseline))
+            return {"id": identifier, "state": "running"}
+
 
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
@@ -596,7 +900,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             active["meta"]["state"] = "stopping"
             active["stop"].set()
             try:
-                _write(active["directory"] / ".web.json", active["meta"])
+                save_metadata(active["directory"], active["meta"])
             except OSError:
                 pass  # Stopping traffic must not depend on available disk space.
             return {"id": identifier, "state": "stopping"}
@@ -607,11 +911,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         if extension not in {"json", "html"}:
             raise HTTPException(404, "Unknown report format")
         directory = _directory(root, identifier)
-        path = directory / f"report.{extension}"
+        path = directory / "report.json"
         if path.is_symlink() or not path.is_file():
             raise HTTPException(404, "Report is not available yet")
-        return FileResponse(path, filename=f"giraffe-{identifier}.{extension}",
-                            media_type="application/json" if extension == "json" else "text/html")
+        return _ReportDownload(path, extension, identifier, download_lock, record_download_resources)
 
     @app.get("/api/runs/{identifier}/reproduction.json")
     async def export_reproduction(identifier: str):
@@ -634,12 +937,26 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             raise HTTPException(409, "That baseline name exists; explicitly replace it or use another name")
         identifier = existing["id"] if existing else uuid.uuid4().hex
         directory = _directory(baseline_root, identifier)
+        created = not directory.exists()
         directory.mkdir(parents=True, exist_ok=True)
         summary = {"id": identifier, "name": name, "run_id": body.run_id,
                    "saved_at": _now(), "overall": detail["report"]["overall"],
                    "targets": _targets(detail["config"])}
-        _write(directory / "report.json", detail["report"])
-        _write(directory / "baseline.json", summary)
+        try:
+            save_baseline_report(_directory(root, body.run_id) / "report.json",
+                                 directory / "report.json", replace=True)
+            _write(directory / "baseline.json", summary)
+        except BaseException as error:
+            if created:
+                try:
+                    shutil.rmtree(directory)
+                except OSError:
+                    pass
+            if isinstance(error, ValueError):
+                raise HTTPException(422, "Baseline source is invalid or changed; reload the run and try again.") from None
+            if isinstance(error, OSError):
+                raise HTTPException(507, "Baseline could not be saved. Check disk space and write permissions.") from None
+            raise
         return summary
 
     static = Path(__file__).with_name("static")

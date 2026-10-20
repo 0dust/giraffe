@@ -296,7 +296,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
         assert check.metrics["cancellation_results"]["answer"]["status"] == "fail"
         assert "protocol failures" not in check.summary
         from giraffe.reporting import write_report
-        _, html_path = write_report(report, tmp_path / "rendered")
+        _, html_path = write_report(report, tmp_path / "rendered", html=True)
         html = html_path.read_text()
         assert 'Cancellation — verify server stopped</td><td><span class="badge pass"' in html
         assert 'Cancellation — verify answer</td><td><span class="badge fail"' in html

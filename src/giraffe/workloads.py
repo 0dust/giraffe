@@ -706,6 +706,7 @@ async def execute(run, target, client, fixtures):
                 await callback(run, target, client, fixtures)
             else:
                 await callback(run, target, client)
+            run.finish_checks(target.name, selected)
             run.emit("scenario_finished", target.name, field)
 
 

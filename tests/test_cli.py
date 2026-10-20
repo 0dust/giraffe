@@ -241,7 +241,8 @@ def test_run_json_outcome_has_saved_report_paths_and_preserves_exit_code(
     assert result["kind"] == command and result["outcome"] == outcome and result["exit_code"] == exit_code
     assert result["run_id"] == "machine-run"
     assert json.loads(Path(result["report_paths"]["json"]).read_text())["run_id"] == "machine-run"
-    assert Path(result["report_paths"]["html"]).is_file()
+    assert result["report_paths"]["html"] is None
+    assert not (tmp_path / "report.html").exists()
     assert "Giraffe:" in captured.err
     assert captured_config[0].restart_target == ("local" if command == "cold-start" else None)
 

@@ -322,8 +322,10 @@ def test_run_surfaces_optional_overall_summary(summary, output_format, tmp_path,
             assert "summary" not in result
     else:
         lines = output.splitlines()
-        assert lines[0] == "BLOCKED: 0 requests"
-        assert lines[1] == (summary or "Stopped: stopped")
+        expected = ["BLOCKED: 0 requests", "Stopped: stopped"] + ([summary] if summary else [])
+        assert lines[-len(expected):] == expected
+        memory_line = next(i for i, line in enumerate(lines) if line.startswith("Peak memory (RAM), process RSS: "))
+        assert memory_line < len(lines) - len(expected)
 
 
 @pytest.mark.parametrize("source", ["config", "manifest"])
@@ -455,10 +457,14 @@ def test_cli_prints_the_retained_check_summary(policy, retained, tmp_path, monke
     path.write_text(json.dumps(values(retention=policy)))
     monkeypatch.setattr("giraffe.cli._run", run)
     directory = tmp_path / "run"
-    assert main(["run", "--config", str(path), "--skip-preflight", "--output", str(directory)]) == 1
+    assert main(["run", "--config", str(path), "--skip-preflight", "--output", str(directory), "--html"]) == 1
     captured = capsys.readouterr()
     saved = json.loads((directory / "report.json").read_text())
     assert saved["checks"][0]["summary"] in captured.out
+    lines = captured.out.splitlines()
+    assert lines[-1] == "FAIL: 0 requests"
+    memory_line = next(i for i, line in enumerate(lines) if line.startswith("Peak memory (RAM), process RSS: "))
+    assert memory_line < len(lines) - 1
     for secret in ["EXPECTED_SECRET", "RECEIVED_SECRET"]:
         assert (secret in captured.out) == retained
         assert (secret in (directory / "report.html").read_text()) == retained

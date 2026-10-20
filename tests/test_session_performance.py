@@ -65,7 +65,7 @@ async def test_mixed_live_conversations_overlap_and_keep_actual_history_isolated
     if retention == "none":
         import json
 
-        write_report(report, tmp_path)
+        write_report(report, tmp_path, html=True)
         saved = json.loads((tmp_path / "report.json").read_text())
         assert all(not row["output"] for row in saved["requests"])
         assert next(row for row in saved["checks"] if row["id"] == "sessions")["metrics"]["conversation_performance"] == measured

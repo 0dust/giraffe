@@ -262,7 +262,7 @@ async def test_disabled_mode_uses_text_workload_count_and_wire_contract():
 async def test_retention_and_export_preserve_measurements_without_token_leakage(tmp_path, retention, retained):
     with FakeEndpoint(mode='logprob_variable') as endpoint:
         report = await run_suite(run_config(endpoint, retention=retention, repetitions=4, options={'priming_rounds': 2}))
-    write_report(report, tmp_path)
+    write_report(report, tmp_path, html=True)
     data = (tmp_path/'report.json').read_text()
     html = (tmp_path/'report.html').read_text()
     assert ('ALT_ONLY_SECRET' in data) == retained
