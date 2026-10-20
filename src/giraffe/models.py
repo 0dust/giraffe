@@ -927,6 +927,10 @@ class RunConfig(Model):
     samples: int = Field(default=6, ge=1)
     sustained_seconds: float = Field(default=5, ge=0)
     stop_after_errors: int = Field(default=20, ge=1)
+    unresponsive_after_failures: int | None = Field(default=5, ge=0,
+        description="Stop a target after this many consecutive no-body inference failures and unresponsive_for_seconds of silence. 0 or null disables. Readiness and intentional deadlines/cancellations are excluded; stress timeouts do not count.")
+    unresponsive_for_seconds: float = Field(default=45, gt=0,
+        description="Minimum seconds without response body data before the target stops (default 45s; 5 failures). Body bytes, including error bodies and partial streams, reset the policy; headers alone do not.")
     checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS), min_length=1)
     structured_json: bool = False
     metrics: bool = False
@@ -1232,6 +1236,7 @@ class RequestRecord(Model):
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
+    response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
