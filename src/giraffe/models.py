@@ -1226,6 +1226,8 @@ class RunConfig(Model):
     max_requests: int = Field(default=300, ge=1,
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
+    max_memory_mb: int = Field(default=4096, ge=0,
+        description="Memory limit (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
     request_timeout_seconds: float = Field(default=30, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
@@ -1719,7 +1721,7 @@ class CheckResult(Model):
 
 
 class RunReport(Model):
-    schema_version: str = "2"
+    schema_version: str = "3"
     suite_version: str = "0.1.0"
     run_id: str
     started_at: str
@@ -1733,11 +1735,49 @@ class RunReport(Model):
     baseline: dict[str, Any] | None = None
     abort_reason: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def rehydrate_inputs(cls, value):
+        if not isinstance(value, dict) or "report_format" not in value:
+            return value
+        if value["report_format"] != 2 or not isinstance(value.get("inputs"), dict):
+            raise ValueError("Unsupported saved report format")
+        from copy import deepcopy
 
-def overall_status(checks: list[CheckResult], abort_reason: str | None = None) -> Status:
+        value = dict(value)
+        value.pop("report_format")
+        inputs = value.pop("inputs")
+        from .report_inputs import verify_input
+
+        for reference, messages in inputs.items():
+            verify_input(reference, messages)
+        records = value.get("requests", [])
+        if not isinstance(records, list):
+            raise ValueError("Saved requests must be an array")
+        requests = []
+        for record in records:
+            if isinstance(record, dict) and "input_ref" in record:
+                record = dict(record)
+                reference = record.pop("input_ref")
+                if (not isinstance(reference, str) or reference not in inputs
+                        or not isinstance(inputs[reference], list)
+                        or not isinstance(record.get("evaluation"), dict)
+                        or "messages" in record["evaluation"]):
+                    raise ValueError("Invalid saved input reference")
+                record["evaluation"] = {**record["evaluation"],
+                                        "messages": deepcopy(inputs[reference])}
+            requests.append(record)
+        value["requests"] = requests
+        return value
+
+
+def overall_status(checks: list[CheckResult], abort_reason: str | None = None, *,
+                   memory_limit_interrupted: bool = False) -> Status:
     required = [check for check in checks if check.required]
     if any(check.status == "fail" for check in checks):
         return "fail"
+    if memory_limit_interrupted:
+        return "inconclusive"
     if any(check.status == "blocked" for check in required):
         return "blocked"
     if abort_reason or not required or any(check.status == "inconclusive" for check in required):

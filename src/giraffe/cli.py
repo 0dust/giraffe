@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import errno
+import os
 import socket
 import json
 import signal
 import sys
 import time
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +21,8 @@ from pydantic import ValidationError
 
 from giraffe import __version__
 from giraffe.models import CHECK_NAMES, ConfigDraft, RunConfig, RunReport
+from giraffe.storage import DEFAULT_LIMITS, format_size as _disk_size, parse_size
+from giraffe.resources import PhaseSampler, SAMPLING
 
 
 class UsageError(SystemExit):
@@ -34,6 +39,79 @@ class UsageError(SystemExit):
 class ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise UsageError(message)
+
+
+def _nonnegative(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise ValueError("must be non-negative")
+    return number
+
+
+def _cleanup_size(value: str) -> int:
+    try:
+        size = parse_size(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Cleanup --max-total must be positive; use --older-than 0 to remove all unprotected runs") from None
+    if not size:
+        raise argparse.ArgumentTypeError("Cleanup --max-total must be positive; use --older-than 0 to remove all unprotected runs")
+    return size
+
+
+_HEARTBEAT_SECONDS = 30
+
+
+@contextmanager
+def _heartbeat(path: Path):
+    stopped = threading.Event()
+
+    def refresh():
+        while not stopped.wait(_HEARTBEAT_SECONDS):
+            try:
+                os.utime(path, None, follow_symlinks=False)
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=refresh, daemon=True)
+    thread.start()
+
+    def stop():
+        stopped.set()
+        thread.join()
+
+    try:
+        yield stop
+    finally:
+        stop()
+
+
+def _storage_flags(command: argparse.ArgumentParser) -> None:
+    for name, label in (("max_total_storage", "saved runs on disk, excluding baselines"),
+                        ("min_free_disk", "free disk required before starting"),
+                        ("max_run_storage", "retained JSON per run on disk")):
+        command.add_argument("--" + name.replace("_", "-"), type=parse_size,
+                             default=DEFAULT_LIMITS[name], metavar="SIZE",
+                             help=f"Limit for {label}; bytes or e.g. 500MiB, 2GiB; 0 disables "
+                                  f"(default: {DEFAULT_LIMITS[name]} bytes)")
+
+
+def _auto_cleanup_flags(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--auto-cleanup-keep-latest", type=_nonnegative, metavar="N",
+                         help="After each run, delete eligible runs beyond newest N (default: off)")
+    command.add_argument("--auto-cleanup-older-than", type=_nonnegative, metavar="DAYS",
+                         help="After each run, delete eligible runs older than DAYS (default: off)")
+    command.add_argument("--auto-cleanup-max-total", type=_cleanup_size, metavar="SIZE",
+                         help="After each run, delete oldest eligible runs to reach SIZE (default: off)")
+
+
+def _auto_cleanup_policy(args: argparse.Namespace) -> dict:
+    names = {"keep_latest": "auto_cleanup_keep_latest", "older_than_days": "auto_cleanup_older_than",
+             "max_total_bytes": "auto_cleanup_max_total"}
+    return {key: value for key, name in names.items() if (value := getattr(args, name, None)) is not None}
+
+
+def _storage_limits(args: argparse.Namespace) -> dict:
+    return {name: getattr(args, name) for name in DEFAULT_LIMITS}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -64,10 +142,29 @@ def parser() -> argparse.ArgumentParser:
     trial.add_argument("--target", required=True, dest="target_name")
     trial.add_argument("--output", type=Path)
     trial.add_argument("--output-format", choices=["text", "json"], default="text")
-    web = commands.add_parser("ui", help="Open the local web interface")
+    _storage_flags(trial)
+    web = commands.add_parser("ui", aliases=["web"], help="Open the local web interface")
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--runs-dir", type=Path, default=Path("runs"))
     web.add_argument("--config", type=Path, help="Prefill the run form from a YAML/JSON config")
+    _storage_flags(web)
+    _auto_cleanup_flags(web)
+    storage = commands.add_parser("storage", help="Show saved-run sizes and configured limits on disk")
+    storage.add_argument("--runs-dir", type=Path, default=Path("runs"))
+    storage.add_argument("--output-format", choices=["text", "json"], default="text")
+    _storage_flags(storage)
+    _auto_cleanup_flags(storage)
+    cleanup = commands.add_parser("cleanup", help="Preview saved runs to delete; --yes applies the preview")
+    cleanup.add_argument("--runs-dir", type=Path, default=Path("runs"))
+    cleanup.add_argument("--older-than", type=_nonnegative, dest="older_than_days", metavar="DAYS")
+    cleanup.add_argument("--keep-latest", type=_nonnegative, metavar="N",
+                         help="Keep newest N runs; protected runs count toward N too")
+    cleanup.add_argument("--max-total", type=_cleanup_size, dest="max_total_bytes", metavar="SIZE",
+                         help="Positive target size on disk; use --older-than 0 to remove all unprotected runs")
+    cleanup.add_argument("--yes", action="store_true", help="Delete the previewed candidates")
+    keep = commands.add_parser("keep", help="Protect a saved run from cleanup")
+    keep.add_argument("run_dir", type=Path, metavar="RUN_DIR")
+    keep.add_argument("--off", action="store_true", help="Remove the cleanup protection marker")
     for name in ("run", "cold-start"):
         run = commands.add_parser(name, help="Run the suite" if name == "run" else
                                   "Explicitly restart one configured target and test readiness",
@@ -92,6 +189,8 @@ Exit codes:
         run.add_argument("--concurrency", type=int, help="Maximum requests in flight")
         run.add_argument("--max-requests", type=int, help="Maximum suite request budget across all targets "
                          f"(default: {RunConfig.model_fields['max_requests'].default})")
+        run.add_argument("--max-memory", type=int, dest="max_memory_mb",
+                         help="Memory limit (RAM growth during this run) in MiB (default: 4096); 0 disables. Only unfinished work stops when sampled RAM growth exceeds the limit; completed checks keep their results")
         run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Maximum suite duration in seconds")
         run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Per-request timeout in seconds")
         run.add_argument("--max-output-tokens", type=int, help="Maximum output tokens per request")
@@ -120,7 +219,7 @@ Exit codes:
         run.add_argument("--fixtures", dest="custom_fixtures", help="Optional custom fixture JSON")
         run.add_argument("--request-pack", dest="request_pack_file", metavar="PATH",
                          help="Import local request-pack JSON into the portable configuration")
-        run.add_argument("--retention", choices=["all", "failures", "none"], help="Retain all responses, failures only, or no response content")
+        run.add_argument("--retention", choices=["all", "failures", "none"], help="Keep response text for all requests, failures only, or none; request metadata (timings, status, scores) is always saved. Retention does not cap disk usage; storage limits do")
         run.add_argument("--ca-bundle", help="TLS CA certificate bundle path")
         run.add_argument("--proxy", help="HTTP proxy URL")
         for option in ("first-output-ms", "latency-ms", "stream-gap-ms",
@@ -130,8 +229,16 @@ Exit codes:
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
         run.add_argument("--output-format", choices=["text", "json"], default="text", help="Result format on stdout; progress is written to stderr")
+        _storage_flags(run)
+        _auto_cleanup_flags(run)
+        run.add_argument("--runs-dir", type=Path, help="Explicit root for automatic cleanup; output must be a direct child")
+        run.add_argument("--html", action="store_true", help="Also save a standalone HTML report")
         if name == "cold-start":
             run.add_argument("--restart", required=True, help="Name of target with restart_command")
+    report = commands.add_parser("report", help="Render a saved report without model requests")
+    report.add_argument("run_dir", type=Path, metavar="RUN_DIR")
+    report.add_argument("--html", action="store_true", required=True)
+    report.add_argument("--output", type=Path, metavar="PATH")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
     export.add_argument("report", type=Path)
     inspect = commands.add_parser("inspect", help="Print recorded deployment/telemetry and comparison JSON")
@@ -261,6 +368,27 @@ async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
             loop.remove_signal_handler(sig)
 
 
+def _print_memory(resources: dict) -> None:
+    def size(value):
+        if value is None:
+            return ("not measured on this platform" if resources.get("memory_measurement") in {"unavailable", "not measured on this platform"}
+                    or resources.get("measurement_available") is False else "not recorded")
+        return f"{value / 1024**3:.2f} GiB" if value >= 1024**3 else f"{value / 1024**2:.1f} MiB"
+
+    phases = resources.get("sampled_peak_rss_bytes", {})
+    growth = resources.get("sampled_peak_growth_bytes", {})
+    print("Peak memory (RAM), process RSS: " + " · ".join(f"{phase}: {size(phases.get(phase))}" for phase in ("traffic", "scoring", "export")))
+    print("RAM at run start: " + size(resources.get("rss_at_start_bytes")))
+    print("Peak RAM growth during this run: " + " · ".join(f"{phase}: {size(growth.get(phase))}" for phase in ("traffic", "scoring")))
+    limit = resources.get("memory_limit_bytes")
+    print("Memory limit (RAM growth during this run): " + ("Off (0 = off)" if limit == 0 else size(limit)))
+    if resources.get("memory_limit_reached"):
+        print("Memory limit exceeded; " + ("unfinished work stopped with partial results; completed checks keep their results."
+              if resources.get("memory_limit_stopped_run") else "completed checks keep their results; no work was stopped."))
+    print("Process lifetime peak memory (RAM): " + size(resources.get("process_peak_rss_bytes")))
+    print(resources.get("sampling", "Sampling details not recorded."))
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or any(value == "--output-format=json" or (
@@ -350,7 +478,61 @@ def main(argv: list[str] | None = None) -> int:
                                      scorer=args.scorer)
             print(json.dumps(result, allow_nan=False))
             return 4 if result["errors"] else 0
-        if args.command == "ui":
+        if args.command == "storage":
+            from giraffe.storage import storage_summary
+
+            result = storage_summary(args.runs_dir, limits=_storage_limits(args), auto_cleanup=_auto_cleanup_policy(args))
+            if json_output:
+                print(json.dumps(result, allow_nan=False))
+            else:
+                print(f"Saved runs on disk: {_disk_size(result['runs_bytes'])}")
+                print(f"Baselines on disk: {_disk_size(result['baselines_bytes'])}; "
+                      f"{_disk_size(result['baselines_shared_bytes'])} shared with source run")
+                print(f"Automatic cleanup: {json.dumps(result['auto_cleanup']) if result['auto_cleanup'] else 'off'}")
+                print(f"Free disk: {_disk_size(result['free_bytes'])}")
+                for name, value in result["limits"].items():
+                    print(f"{name}: {_disk_size(value) if value else 'disabled'}")
+                for row in result["runs"]:
+                    protection = f"; protected: {row['protected_reason']}" if row["protected"] else ""
+                    print(f"  {row['id']}: {_disk_size(row['bytes'])} on disk{protection}")
+            return 0
+        if args.command == "cleanup":
+            from giraffe.storage import apply_cleanup, cleanup_plan
+
+            criteria = {name: getattr(args, name) for name in
+                        ("older_than_days", "keep_latest", "max_total_bytes")}
+            plan = cleanup_plan(args.runs_dir, **criteria)
+            count = len(plan["candidates"])
+            print(f"Cleanup preview: {count} {'run' if count == 1 else 'runs'}, {_disk_size(plan['bytes_freed'])} on disk")
+            days, latest = criteria["older_than_days"], criteria["keep_latest"]
+            reasons = {"older_than_days": f"Older than {days} {'day' if days == 1 else 'days'}",
+                       "keep_latest": "Beyond the newest run" if latest == 1 else f"Beyond the newest {latest} runs",
+                       "max_total_bytes": f"Oldest first to reach {_disk_size(criteria['max_total_bytes'] or 0)} on disk"}
+            for row in plan["candidates"]:
+                reason = row.get("criterion", row.get("criteria", "selected"))
+                reason = "; ".join(reasons.get(key, key) for key in reason.split(", "))
+                print(f"  {row['id']}: {_disk_size(row['bytes'])} on disk; "
+                      f"{row['started_at']}; {reason}")
+            for row in plan["protected"]:
+                print(f"  Protected {row['id']}: {row['protected_reason']}")
+            if args.yes:
+                result = apply_cleanup(args.runs_dir, [row["id"] for row in plan["candidates"]], **criteria)
+                count = len(result["deleted"])
+                print(f"Deleted {count} {'run' if count == 1 else 'runs'}, freed {_disk_size(result['bytes_freed'])} on disk.")
+                if result["skipped"]:
+                    print(f"Skipped {len(result['skipped'])}:")
+                for row in result["skipped"]:
+                    print(f"  {row['id']} — {row['reason']}")
+            else:
+                print("No runs deleted. Use --yes to delete these candidates.")
+            return 0
+        if args.command == "keep":
+            from giraffe.storage import set_kept
+
+            set_kept(args.run_dir, not args.off)
+            print(f"{args.run_dir}: {'cleanup protection removed' if args.off else 'kept; protected from cleanup'}")
+            return 0
+        if args.command in {"ui", "web"}:
             if not 1 <= args.port <= 65535:
                 raise ValueError("Port must be between 1 and 65535")
             defaults, migration_notes = None, []
@@ -371,13 +553,22 @@ def main(argv: list[str] | None = None) -> int:
                     if error.errno == errno.EADDRINUSE:
                         raise ValueError(f"port {args.port} is in use; choose another with --port") from None
                     raise
-                app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes)
+                app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes,
+                                 auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
                 print(f"Giraffe UI: http://127.0.0.1:{args.port} — open in your browser\n"
                       f"Local runs: {args.runs_dir.resolve()}\n"
                       "Review the plan, then choose Launch.", flush=True)
                 server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port,
                                                        log_level="warning"))
                 server.run(sockets=[listener])
+            return 0
+        if args.command == "report":
+            from giraffe.reporting import _atomic_write, _render
+
+            report = load_report(args.run_dir)
+            output = args.output or (args.run_dir if args.run_dir.is_dir() else args.run_dir.parent) / "report.html"
+            _atomic_write(output, _render(report))
+            print(f"HTML: {output.resolve()}")
             return 0
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
@@ -388,12 +579,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(value, indent=2, allow_nan=False))
             return 0
         if args.command == "baseline":
-            from giraffe.reporting import _retained
-            report = _retained(load_report(args.report))
-            args.destination.parent.mkdir(parents=True, exist_ok=True)
+            from giraffe.reporting import save_baseline_report
+            report = load_report(args.report)
+            source = args.report / "report.json" if args.report.is_dir() else args.report
             try:
-                with args.destination.open("w" if args.replace else "x") as file:
-                    file.write(report.model_dump_json(indent=2) + "\n")
+                save_baseline_report(source, args.destination, replace=args.replace, report=report, portable=True)
             except FileExistsError:
                 raise ValueError(f"Baseline already exists: {args.destination}; use --replace to overwrite it") from None
             if json_output:
@@ -410,11 +600,19 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = configuration(args)
             baseline = load_report(args.baseline) if args.baseline else None
-        directory = args.output or Path("runs") / datetime.now(timezone.utc).strftime(
+        runs_root = getattr(args, "runs_dir", None) or Path("runs")
+        directory = args.output or runs_root / datetime.now(timezone.utc).strftime(
             "%Y%m%dT%H%M%S.%fZ"
         )
+        policy = _auto_cleanup_policy(args)
+        if policy and directory.resolve().parent != runs_root.resolve():
+            raise ValueError("Automatic cleanup requires an explicit --runs-dir and --output directly inside it; "
+                             "without --runs-dir, --output must be inside the default runs directory")
         if directory.exists() and any(directory.iterdir()):
             raise ValueError(f"Output directory is not empty: {directory}; choose a new directory")
+        from giraffe.storage import check_start
+
+        check_start(directory.parent, _storage_limits(args))
         from giraffe.planning import request_plan
         from giraffe.preflight import PreflightError, check_target
 
@@ -444,30 +642,104 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Warning: {warning}", file=sys.stderr)
         warnings = planning_warnings + warnings
         directory.mkdir(parents=True, exist_ok=True)
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        def save_state(state: str, **details) -> None:
+            from giraffe.reporting import _atomic_write
+
+            _atomic_write(directory / ".web.json", json.dumps(
+                {"id": directory.name, "state": state, "started_at": started_at,
+                 "owner_pid": os.getpid(), "owner_host": socket.gethostname(), **details}, allow_nan=False, separators=(",", ":")) + "\n")
+
+        save_state("running")
         print(f"Giraffe: {len(config.targets)} target(s), at most {config.max_requests} requests, "
               f"{config.concurrency} in flight, {config.max_duration_seconds:g}s total, "
               f"{config.request_timeout_seconds:g}s/request, {config.max_output_tokens} output "
               "tokens/request. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
-        from giraffe.reporting import _retained, compare_baseline, write_report
+        from giraffe.reporting import _retained, compare_baseline, html_failure_warning, save_failure_summary, write_report
 
-        report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
-        if baseline:
-            report = compare_baseline(report, baseline)
-        json_path, html_path = write_report(report, directory)
+        warning = None
+        with _heartbeat(directory / ".web.json") as stop_heartbeat:
+            try:
+                report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
+                if baseline:
+                    report = compare_baseline(report, baseline)
+            except BaseException as error:
+                stop_heartbeat()
+                try:
+                    save_state("error", finished_at=datetime.now(timezone.utc).isoformat(),
+                               error=f"Run could not finish ({type(error).__name__}).")
+                except OSError:
+                    pass
+                raise
+            sampler = PhaseSampler("export")
+            resources = dict(report.observations.get("resources", {}))
+
+            def export_resources() -> dict:
+                resources["sampled_peak_rss_bytes"] = {
+                    **resources.get("sampled_peak_rss_bytes", {}), **sampler.peaks}
+                resources["sampling"] = SAMPLING
+                if not resources.get("memory_measurement"):
+                    resources["memory_measurement"] = "measured" if sampler.peaks.get("export") is not None else "unavailable"
+                return resources
+
+            try:
+                with sampler:
+                    json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
+                                                       html=getattr(args, "html", False))
+            except OSError as error:
+                export_resources()
+                if getattr(error, "json_complete", False):
+                    warning = html_failure_warning(error)
+                    warnings.append(warning)
+                    json_path, html_path = directory / "report.json", None
+                    print(f"Warning: {warning}", file=sys.stderr)
+                else:
+                    stop_heartbeat()
+                    message = save_failure_summary(report, directory, error)
+                    try:
+                        save_state("error", error=message, run_id=report.run_id, finished_at=report.finished_at,
+                                   progress={"completed": len(report.requests)}, resources=resources)
+                    except OSError:
+                        pass
+                    if json_output:
+                        emit("error", 4, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
+                    else:
+                        print(f"giraffe: {message}", file=sys.stderr)
+                        _print_memory(resources)
+                    return 4
+        export_resources()
+        from giraffe.storage import automatic_cleanup
+
+        policy = _auto_cleanup_policy(args)
+        cleanup_result = None
+        if policy:
+            try:
+                cleanup_result = automatic_cleanup(runs_root, policy, active_id=directory.name)
+            except OSError as error:
+                cleanup_result = {"deleted": [], "error": str(error)}
+            for identifier in cleanup_result["deleted"]:
+                if not json_output:
+                    print(f"Automatic cleanup deleted run: {identifier}")
+        try:
+            save_state("completed", run_id=report.run_id, finished_at=report.finished_at,
+                       **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
+                       **({"error": warning} if warning else {}), resources={
+                "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
+                "memory_measurement": "measured" if sampler.peaks.get("export") is not None else "unavailable"})
+        except OSError as error:
+            warning = f"Run completed, but run metadata could not be saved ({error.strerror or type(error).__name__})."
+            warnings.append(warning)
+            print(f"Warning: {warning}", file=sys.stderr)
         report = _retained(report)
         exit_code = {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
         summary = report.observations.get("summary")
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
-                 abort_reason=report.abort_reason,
+                 abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
                  **({"summary": summary} if summary else {}),
-                 report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve())})
+                 report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
         else:
-            print(f"{report.overall.upper()}: {len(report.requests)} requests")
-            if summary:
-                print(summary)
-            if report.abort_reason:
-                print(f"Stopped: {report.abort_reason}")
             for check in report.checks:
                 print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
             for name, observation in report.observations.get("targets", {}).items():
@@ -479,7 +751,17 @@ def main(argv: list[str] | None = None) -> int:
                     diff = target["configuration_diff"]
                     changes = [row["field"] for row in diff["fields"] if row["change"]!="no_observed_change"]
                     print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
-            print(f"JSON: {json_path.resolve()}\nHTML: {html_path.resolve()}")
+            print(f"JSON: {json_path.resolve()}")
+            if html_path:
+                print(f"HTML: {html_path.resolve()}")
+            else:
+                print(f"Export HTML: giraffe report {directory.resolve()} --html")
+            _print_memory(resources)
+            print(f"{report.overall.upper()}: {len(report.requests)} requests")
+            if report.abort_reason:
+                print(f"Stopped: {report.abort_reason}")
+            if summary:
+                print(summary)
         return exit_code
     except UsageError as error:
         return failure([{"loc": [], "message": str(error), "type": "UsageError"}])

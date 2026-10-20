@@ -151,7 +151,7 @@ def test_report_shows_quiet_and_loaded_case_evidence(tmp_path):
                    "stages": [{"rate_rps": 1, "planned": 5, "offered": 5,
                                "started": 5, "valid": 5, "scored": 5, "correct": 4}]}],
     }
-    _, html = write_report(report, tmp_path)
+    _, html = write_report(report, tmp_path, html=True)
     content = html.read_text()
     assert "Quiet result" in content and "Planned / offered / started" in content
     assert "&lt;script&gt;private&lt;/script&gt;" in content
@@ -255,7 +255,7 @@ def test_legacy_concurrency_report_stays_readable_but_cannot_compare_arrival_cap
     old = traffic_report("baseline")
     old.suite_version = "0.1.3"
     old.checks[0].metrics = {"highest_tested_acceptable_concurrency": 4}
-    _, html = write_report(old, tmp_path)
+    _, html = write_report(old, tmp_path, html=True)
     assert "highest tested acceptable concurrency: 4" in html.read_text()
     result = compare_baseline(traffic_report(), old)
     assert result.baseline["status"] == "inconclusive"
@@ -265,7 +265,7 @@ def test_legacy_concurrency_report_stays_readable_but_cannot_compare_arrival_cap
 def test_portable_report_explains_traffic_accounting_and_capacity_change(tmp_path):
     result = compare_baseline(traffic_report(high_failure="latency"), traffic_report("baseline"))
     original = deepcopy(result)
-    _, html = write_report(result, tmp_path)
+    _, html = write_report(result, tmp_path, html=True)
     content = html.read_text()
     assert "highest tested acceptable arrival rate: 1 requests/s" in content
     assert "Scheduled / sent" in content

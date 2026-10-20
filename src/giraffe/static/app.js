@@ -25,7 +25,7 @@ function updateAPIKeySummary() {
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not needed for most local servers';
   $('.row-action',summary).textContent=key||ref?'Change':'Add';
 }
-const state = {bootstrap:null, runs:[], baselines:[], detail:null, mosaicFollow:true, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}};
 const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Not run',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',inconclusive:'?',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -33,6 +33,7 @@ const icon = (name) => ({plus:'<svg viewBox="0 0 20 20" aria-hidden="true"><path
 const badge = (status, label) => `<span class="status ${escape(status)}"><span class="status-icon" aria-hidden="true">${statusIcons[status] || '·'}</span>${escape(label || statusLabels[status] || status)}</span>`;
 const number = (value, digits=0) => value == null ? '—' : Number(value).toLocaleString(undefined,{maximumFractionDigits:digits});
 const counted = (value, label) => `${number(value)} ${label}${Number(value)===1?'':'s'}`;
+const diskSize = (value) => {const size=Number(value || 0),units=['B','KiB','MiB','GiB','TiB'],i=size>0?Math.min(4,Math.floor(Math.log(size)/Math.log(1024))):0;return `${number(size/1024**i,i?1:0)} ${units[i]}`;};
 const ms = (value) => value == null ? '—' : `${number(value,1)} ms`;
 const date = (value) => value ? new Date(value).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 const elapsed = (seconds) => seconds == null ? '—' : seconds < 60 ? `${number(seconds,1)}s` : `${Math.floor(seconds/60)}m ${Math.floor(seconds%60)}s`;
@@ -426,7 +427,9 @@ function updateTitle() {
 function clearPoll() { clearTimeout(state.poll);state.poll=null; }
 function schedulePoll(callback, version, delay=1800) { clearPoll();state.poll=setTimeout(()=>{if(version===state.routeVersion) callback(version);},delay); }
 async function refreshRuns() {
-  const data=await api('/api/runs');state.runs=data.runs || [];setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
+  const [runs,storage]=await Promise.allSettled([api('/api/runs'),api('/api/storage')]);state.storage=storage.status==='fulfilled'?storage.value:null;state.storageUnavailable=storage.status==='rejected';
+  if(runs.status==='rejected')throw runs.reason;
+  const data=runs.value;state.runs=data.runs || [];setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
 }
 function relativeTime(value) {
   const then=Date.parse(value);if(!Number.isFinite(then))return '';
@@ -467,9 +470,9 @@ function showSpotTip(target,x,y) {
 }
 function hideSpotTip() {const tip=$('#spot-tip');if(tip)tip.hidden=true;}
 async function route() {
-  hideSpotTip();
+  hideSpotTip();state.cleanup=null;
   if($('#dataset-dialog')?.open)closeDatasetDialog();
-  for(const id of ['request-dialog','baseline-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
+  for(const id of ['request-dialog','baseline-dialog','storage-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
   if ($('#new-run-form')) captureFormDraft();
   window.scrollTo?.({top:0,left:0,behavior:'instant'});
   clearPoll();const version=++state.routeVersion;const hash=location.hash;
@@ -498,7 +501,7 @@ async function route() {
   }
 }
 async function pollRuns(version) {
-  try { const previous=JSON.stringify(state.runs),active=state.active;await refreshRuns();if(version!==state.routeVersion)return;connectionError();if(previous!==JSON.stringify(state.runs)||active!==state.active)renderRuns(); }
+  try { const previous=JSON.stringify([state.runs,state.storage,state.storageUnavailable]),active=state.active;await refreshRuns();if(version!==state.routeVersion)return;connectionError();if(previous!==JSON.stringify([state.runs,state.storage,state.storageUnavailable])||active!==state.active)renderRuns(); }
   catch(error) { if(version===state.routeVersion)connectionError(error.message+' Your saved runs have not changed.'); }
   if(version===state.routeVersion)schedulePoll(pollRuns,version,3000);
 }
@@ -534,28 +537,91 @@ function filteredRuns() {
   return state.runs.filter(run=>(state.filter==='all'||(activeState(run)?'active':runOutcome(run))===state.filter)&&
     (!query||[run.id,run.run_id,...(run.targets || []).flatMap(target=>[target.name,target.model,target.url])].join(' ').toLowerCase().includes(query)));
 }
+function storageLine() {
+  const s=state.storage,policy=s?.auto_cleanup||{},rules=[];
+  if(policy.keep_latest!=null)rules.push(`keep newest ${number(policy.keep_latest)} runs`);
+  if(policy.older_than_days!=null)rules.push(`older than ${number(policy.older_than_days)} days`);
+  if(policy.max_total_bytes!=null)rules.push(`oldest first to ${diskSize(policy.max_total_bytes)}`);
+  return `<div class="storage-line"><p>${s?`Saved runs on disk: ${diskSize(s.runs_bytes)}${s.limits?.max_total_storage?` of ${diskSize(s.limits.max_total_storage)} limit`:' · no total limit'} · Baselines ${diskSize(s.baselines_bytes)}${s.baselines_shared_bytes?` (${diskSize(s.baselines_shared_bytes)} shared with source run)`:''} · Automatic cleanup: ${rules.length?escape(rules.join(' or ')):'off'}${s.last_auto_cleanup?.deleted?.length?` · Automatically deleted: ${s.last_auto_cleanup.deleted.map(escape).join(', ')}`:''}${s.last_auto_cleanup?.error?` · Automatic cleanup failed: ${escape(s.last_auto_cleanup.error)}`:''} · Free disk ${diskSize(s.free_bytes)}`:state.storageUnavailable?'Storage information unavailable':'Saved runs on disk: loading…'}</p><button type="button" class="button small" data-action="storage-dialog">Clean up…</button></div>`;
+}
+function keepButton() {return `<button type="button" class="button small" data-action="keep-run" aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
+function openStorageDialog() {
+  state.cleanup={revision:0,preview:null,busy:false};
+  const dialog=$('#storage-dialog');
+  dialog.innerHTML=`<div class="dialog-head"><h2 id="storage-title">Clean up saved runs on disk</h2><button type="button" class="button ghost" data-action="close-storage" aria-label="Close cleanup">✕</button></div><div class="dialog-body"><p>Preview which runs to delete. Runs matching any criterion are included. Protected runs and baselines stay on disk.</p><form id="cleanup-form" novalidate><div class="fields"><label for="cleanup-age">Older than (days)<input id="cleanup-age" name="older_than_days" type="number" min="0" step="1" placeholder="Disabled"></label><label for="cleanup-latest">Keep newest runs (counts protected runs too)<input id="cleanup-latest" name="keep_latest" type="number" min="0" step="1" placeholder="Disabled"></label><label for="cleanup-total">Maximum saved runs on disk (MiB)<input id="cleanup-total" name="max_total_mib" type="number" min="0.000001" step="0.000001" placeholder="Disabled"></label></div><button type="submit" class="button" id="cleanup-preview-button">Preview</button></form><div id="cleanup-error" class="error-message" role="alert" hidden></div><div id="cleanup-preview" aria-live="polite"></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-storage">Cancel</button><button type="button" class="button danger" id="cleanup-confirm" data-action="cleanup-confirm" disabled>Delete runs</button></div>`;
+  dialog.showModal();$('#cleanup-age').focus();
+}
+function invalidateCleanup() {
+  if(!state.cleanup)return;
+  state.cleanup.revision++;state.cleanup.preview=null;$('#cleanup-confirm').disabled=true;$('#cleanup-confirm').textContent='Delete runs';$('#cleanup-preview').innerHTML='<p class="hint">Criteria changed. Preview again before deleting.</p>';
+}
+async function previewCleanup(event) {
+  event.preventDefault();const form=$('#cleanup-form');
+  const current=state.cleanup,revision=++current.revision,criteria={};current.preview=null;$('#cleanup-confirm').disabled=true;
+  for(const name of ['older_than_days','keep_latest']){const value=form.elements[name].value;if(value!=='')criteria[name]=Number(value);}
+  if(form.elements.max_total_mib.value!==''){
+    const bytes=Math.round(Number(form.elements.max_total_mib.value)*1024**2);
+    if(!Number.isFinite(bytes)||bytes<=0){$('#cleanup-error').textContent='Maximum saved runs on disk must be greater than 0. Use Older than 0 days (--older-than 0 in the CLI) to remove all unprotected runs.';$('#cleanup-error').hidden=false;return;}
+    criteria.max_total_bytes=bytes;
+  }
+  if(!form.reportValidity())return;
+  $('#cleanup-error').hidden=true;$('#cleanup-preview-button').disabled=true;
+  try {
+    const plan=await api('/api/storage/cleanup-preview',{method:'POST',body:JSON.stringify(criteria)});
+    if(state.cleanup!==current||revision!==current.revision||!$('#storage-dialog').open)return;
+    current.preview={criteria,ids:plan.candidates.map(run=>run.id)};
+    const reason=run=>String(run.criterion || '').split(', ').map(key=>({older_than_days:`Older than ${criteria.older_than_days} ${criteria.older_than_days===1?'day':'days'}`,keep_latest:criteria.keep_latest===1?'Beyond the newest run':`Beyond the newest ${criteria.keep_latest} runs`,max_total_bytes:`Oldest first to reach ${diskSize(criteria.max_total_bytes)} on disk`}[key] || key)).join(' · ');
+    const list=(runs,protectedRun)=>runs.map(run=>`<li><strong>${escape(run.id)}</strong> · ${diskSize(run.bytes)} on disk · ${date(run.started_at)}<small>${escape(protectedRun?run.protected_reason || run.reason:reason(run))}</small></li>`).join('');
+    $('#cleanup-preview').innerHTML=`<h3>${number(plan.candidates.length)} ${plan.candidates.length===1?'run':'runs'} to delete</h3>${plan.candidates.length?`<ul class="cleanup-runs">${list(plan.candidates,false)}</ul>`:'<p>No runs match these criteria.</p>'}<p>${diskSize(plan.bytes_freed)} on disk would be freed · ${diskSize(plan.runs_bytes_after)} would remain on disk.</p><h3>${number(plan.protected.length)} protected ${plan.protected.length===1?'run':'runs'}</h3>${plan.protected.length?`<ul class="cleanup-runs">${list(plan.protected,true)}</ul>`:'<p>No protected runs.</p>'}`;
+    const confirm=$('#cleanup-confirm');confirm.textContent=`Delete ${plan.candidates.length} ${plan.candidates.length===1?'run':'runs'} (${diskSize(plan.bytes_freed)})`;confirm.disabled=!plan.candidates.length;
+  }catch(error){if(state.cleanup===current&&revision===current.revision){$('#cleanup-error').textContent=error.message;$('#cleanup-error').hidden=false;}}
+  finally{if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
+}
+async function confirmCleanup() {
+  const current=state.cleanup,preview=current?.preview,routeVersion=state.routeVersion;if(!preview||current.busy)return;
+  current.busy=true;$('#cleanup-confirm').disabled=true;$('#cleanup-preview-button').disabled=true;$('#cleanup-error').hidden=true;
+  try {
+    const result=await api('/api/storage/cleanup',{method:'POST',body:JSON.stringify({...preview.criteria,ids:preview.ids})});
+    if(state.cleanup!==current)return;
+    current.preview=null;state.cleanupResult=result;$('#storage-dialog').close();renderRuns();
+    try{await refreshRuns();if(state.cleanup===current&&state.routeVersion===routeVersion)renderRuns();}
+    catch(error){toast('Cleanup finished, but run history could not be refreshed: '+error.message);}
+  }catch(error){if(state.cleanup===current){current.preview=null;$('#cleanup-error').textContent=error.message+' Preview again before deleting.';$('#cleanup-error').hidden=false;}}
+  finally{current.busy=false;if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
+}
+async function toggleKept() {
+  const detail=state.detail,button=$('[data-action="keep-run"]');button.disabled=true;
+  try{const result=await api(`${runPath(detail.id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});if(state.detail!==detail)return;detail.kept=result.kept;renderDetail();}
+  catch(error){toast(error.message);button.disabled=false;}
+}
+function cleanupResultNotice() {
+  const result=state.cleanupResult;if(!result)return '';
+  const count=result.deleted.length,skipped=result.skipped || [];
+  const message=`Deleted ${count} ${count===1?'run':'runs'}, freed ${diskSize(result.bytes_freed)} on disk.${skipped.length?` Skipped ${skipped.length}: ${skipped.map(run=>`${run.id} — ${run.reason}`).join('; ')}.`:''}`;
+  return `<div class="notice ${skipped.length?'warning':'info'}" role="status">${escape(message)}</div>`;
+}
 function renderRuns() {
   const focused=document.activeElement,focusId=['run-search','run-filter'].includes(focused?.id)?focused.id:null;
   const selection=focusId==='run-search'?[focused.selectionStart,focused.selectionEnd]:null;
 
   if(!state.runs.length&&!state.active){
-    $('#main').innerHTML=`<section class="first-run"><h1>Run history</h1><p>No runs yet.</p><a class="button primary" href="#new">${icon('plus')} New run</a></section>`;
+    $('#main').innerHTML=`<section class="first-run"><h1>Run history</h1><p>No runs yet.</p>${storageLine()}${cleanupResultNotice()}<a class="button primary" href="#new">${icon('plus')} New run</a></section>`;
     return;
   }
   const runs=filteredRuns();
-  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','cancelled','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
+  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','cancelled','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
   <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Search runs" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
   ${runs.length?`<div class="history-table"><table aria-label="Saved endpoint runs"><thead><tr><th>Model</th><th>Outcome</th><th>Started</th><th><span class="sr-only">Open run</span></th></tr></thead><tbody>${runs.map(r=>{
     const targets=r.targets || [],model=targets.map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model';
     const names=targets.map(t=>t.name).filter(name=>name&&name!=='local').join(', ');
     const started=`<time${r.started_at?` datetime="${escape(r.started_at)}"`:''}>${date(r.started_at)}</time>`;
     const hosts=[...new Set(targets.map(t=>{try{return new URL(t.url).host;}catch{return '';}}).filter(Boolean))].join(', ');
-    return `<tr class="history-row ${escape(runOutcome(r))}"><td class="history-identity"><span class="status-spot ${escape(runOutcome(r))}" aria-hidden="true"></span><span class="history-names"><a class="run-link" href="${linkRun(r.id)}"${names?` title="${escape(names)}"`:''}>${escape(model)}</a>${hosts?`<small class="history-host">${escape(hosts)}</small>`:''}<small class="history-mobile-date">${started}</small></span></td><td class="history-result">${badge(runOutcome(r))}</td><td class="history-date">${started}</td><td class="history-open"><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run for ${escape(model)}${r.started_at?` from ${escape(date(r.started_at))}`:''}">${icon('arrow')}</a></td></tr>`;}).join('')}</tbody></table></div>`:
+    return `<tr class="history-row ${escape(runOutcome(r))}"><td class="history-identity"><span class="status-spot ${escape(runOutcome(r))}" aria-hidden="true"></span><span class="history-names"><a class="run-link" href="${linkRun(r.id)}"${names?` title="${escape(names)}"`:''}>${escape(model)}</a>${hosts?`<small class="history-host">${escape(hosts)}</small>`:''}<small class="history-mobile-date">${started}</small><small class="history-storage">${diskSize(r.bytes)} on disk${r.kept?' · <span class="kept-marker">Kept</span>':''}</small></span></td><td class="history-result">${badge(runOutcome(r))}</td><td class="history-date">${started}</td><td class="history-open"><a class="text-button history-run-action" href="${linkRun(r.id)}" aria-label="Open run for ${escape(model)}${r.started_at?` from ${escape(date(r.started_at))}`:''}">${icon('arrow')}</a></td></tr>`;}).join('')}</tbody></table></div>`:
   `<div class="empty-state"><h2>No matching runs</h2><button class="button" data-action="clear-filter">Clear filters</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
 }
-const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Maximum at once','requests at once across all endpoints',1,1],['max_requests','Total request limit','Requests allowed during the whole run.',1,1],['max_duration_seconds','Traffic time limit','seconds of target traffic',.1,'any'],['request_timeout_seconds','Request timeout','seconds per request',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
+const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Maximum at once','requests at once across all endpoints',1,1],['max_requests','Total request limit','Requests allowed during the whole run.',1,1],['max_memory_mb','Memory limit (RAM growth during this run)','MiB; 0 = off',0,1],['max_duration_seconds','Traffic time limit','seconds of target traffic',.1,'any'],['request_timeout_seconds','Request timeout','seconds per request',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output (estimate)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
 const fieldDescriptions={
   url:{hint:'Address of your LLM server.',help:'Use the address Giraffe can reach, such as http://localhost:11434/v1 for Ollama or http://localhost:8000/v1 for vLLM. Giraffe connects to an existing server; it does not start or install a model.'},
@@ -564,6 +630,7 @@ const fieldDescriptions={
   name:{hint:'A name for this endpoint in results.',help:'Choose a unique name such as local or staging. Giraffe uses it to identify this endpoint in reports and comparisons.'},
   context_limit:{help:'The server’s configured limit for the question and answer together, measured in tokens. A token is a small piece of text. Use the context length configured on your server, which can be lower than the model’s advertised maximum.'},
   concurrency:{hint:'Requests running at the same time.',help:'The most requests Giraffe can run at the same time across all servers. You set this number; Giraffe does not detect your hardware limit. Individual tests can use fewer requests. Raising this does not change Total request limit or Concurrency levels.'},
+  max_memory_mb:{hint:'MiB of RAM growth since the run started; 0 = off. Exceeding the limit stops unfinished work with partial results; unfinished required checks make the verdict inconclusive unless a check failed. Completed checks keep their results. The requested workload stays unchanged.'},
   max_requests:{help:'The most target requests Giraffe may use during the whole run, shared across all tests and endpoints. Some scheduled requests can use budget without reaching the server. The run can stop with fewer completed requests. AI evaluator calls have separate limits.'},
   max_duration_seconds:{help:'Maximum seconds of target traffic, including connection, readiness and warm-up requests. AI evaluator calls and report saving happen outside this limit. Reaching it may leave checks unfinished.'},
   request_timeout_seconds:{help:'How long a single request may take before Giraffe times it out. This covers waiting for the answer and receiving it. A shorter test-specific or remaining run deadline can stop it sooner.'},
@@ -677,7 +744,7 @@ function settingDestination(path) {
   else if(root==='limits')name=`limit_${parts[1]}`;
   else if(root==='judging')name=parts[1]==='judges'?`judge_${parts[2]}_${parts[3]}`:`judging_${parts[1]}`;
   else if(root==='config')name='config_editor';
-  const labels={concurrency:'maximum at once',max_duration_seconds:'traffic time limit',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'request limit',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'duration per workload',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
+  const labels={max_memory_mb:'Memory limit (RAM growth during this run)',concurrency:'maximum at once',max_duration_seconds:'traffic time limit',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'request limit',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'duration per workload',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
   if(name.startsWith('session_cap_'))return {name,check,step,label:'task output cap'};
   return {name,check,step,label:labels[name]||human(name.replace(/^load_|^profile_|^test_/,'')).toLowerCase()};
 }
@@ -934,11 +1001,12 @@ function renderSharedRunSettings(config) {
     ['max_requests','Max requests','Across all selected checks and endpoints. Reaching this budget can leave checks unfinished. AI evaluator calls have separate limits.'],
     ['max_duration_seconds','Traffic time limit (seconds)','Stop test traffic after this long. This does not include AI evaluation or saving the report.'],
     ['concurrency','Maximum at once','Maximum target requests at once across all endpoints. Per-check Concurrency levels must be no higher than this limit.'],
+    ['max_memory_mb','Memory limit (RAM growth during this run)','The guardrail measures process RAM growth since this run started, excluding earlier allocations in the web server. It never reduces concurrency or request counts.'],
   ];
   const requestLabels={samples:'Samples per check',max_output_tokens:'Output cap (tokens)',request_timeout_seconds:'Request timeout (seconds)',context_limit:'Context window (tokens)'};
   const requestHelp={samples:'Default for checks that use a sample count; not the total run size. Explicit check overrides stay unchanged.',max_output_tokens:'Default and maximum answer length. Checks can request less; answers may finish sooner. Explicit check overrides stay unchanged.',request_timeout_seconds:'Default and maximum wait for one request. A check can use a shorter timeout. Explicit check overrides stay unchanged.',context_limit:'Use the context size configured on your server. Giraffe does not detect it.'};
   return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Edit run limits</h2><span class="run-ceilings-values" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit" aria-hidden="true">⌄</span></summary><div class="setup-body">
-  <div class="fields three run-limit-fields">${primary.map(([key,label,help])=>field(key,label,config[key],{type:'number',hint:'',help,min:key==='max_duration_seconds'?.1:1,max:key==='concurrency'?256:undefined,step:key==='max_duration_seconds'?'any':1,required:true})).join('')}</div>
+  <div class="fields three run-limit-fields">${primary.map(([key,label,help])=>field(key,label,key==='max_memory_mb'?(config[key] ?? 4096):config[key],{type:'number',hint:key==='max_memory_mb'?fieldDescriptions.max_memory_mb.hint:'',help,min:key==='max_memory_mb'?0:key==='max_duration_seconds'?.1:1,max:key==='concurrency'?256:undefined,step:key==='max_duration_seconds'?'any':1,required:true})).join('')}</div>
   <details class="setup-disclosure" id="shared-run-limits"><summary>Request settings <span class="dim" id="request-defaults-summary"></span></summary><div class="fields">${['samples','max_output_tokens','request_timeout_seconds','context_limit'].map(key=>field(key,requestLabels[key],config[key],{type:'number',min:key==='request_timeout_seconds'?.1:key==='context_limit'?128:1,step:key==='request_timeout_seconds'?'any':1,required:true,hint:'',help:requestHelp[key]})).join('')}${selectField('stream','How answers arrive',`<option value="true" ${config.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${config.stream?'':'selected'}>Wait for the complete answer</option>`,{hint:'',help:'First-answer timing and interruption checks need streaming.'})}</div></details>
   <details class="setup-disclosure" id="global-acceptance"><summary>Pass rules <span class="dim" id="acceptance-summary"></span></summary><div class="fields">${field('limit_max_error_rate','Errors allowed (%)',config.limits.max_error_rate*100,{type:'number',hint:'',help:'0% allows no request errors. Used by checks that support this criterion; a check-specific value takes priority.',min:0,max:100,step:'any'})}${field('limit_min_correctness','Correct answers (%)',config.limits.min_correctness*100,{type:'number',hint:'',help:'100% requires every scored answer to be correct. Used by checks that support this criterion. A check-specific value takes priority; diagnostics with fixed criteria still require every tested case to pass.',min:0,max:100,step:'any'})}${field('limit_min_samples','Minimum usable answers',config.limits.min_samples,{type:'number',hint:'',help:'Required per measured group where used. Too few leaves the result inconclusive.',min:state.bootstrap.limits_schema.properties.min_samples.minimum,step:1,required:true})}</div><h4>Timing, slowdown & comparison targets</h4><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,config.limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Measure only'})).join('')}${field('limit_regression_percent','Regression threshold (%)',config.limits.regression_percent,{type:'number',hint:'',help:'Used when comparing runs; percentage points for rates.',min:0,step:'any'})}</div></details></div></details><p class="checks-plan-summary sr-only" id="checks-plan-summary" role="status">Preparing request estimate…</p></section>`;
 }
@@ -1416,12 +1484,12 @@ function validateRunForm(form,step=null) {
 }
 function refreshInheritedFields(id,onlyInherited=false) {
   const check=state.bootstrap.checks.find(item=>item.id===id),form=$('#new-run-form');
-  const config=clone(state.config);for(const [name] of numericFields)config[name]=Number(form.elements[name].value);if(form.elements.samples)config.samples=Number(form.elements.samples.value);
+  const config=clone(state.config);for(const [name] of numericFields)if(form.elements[name])config[name]=form.elements[name].value===''?null:Number(form.elements[name].value);if(form.elements.samples)config.samples=Number(form.elements.samples.value);
   config.limits={...config.limits};for(const name of check.limit_fields){const input=form.elements[`limit_${name}`];if(input)config.limits[name]=input.value===''?null:Number(input.value)/(['max_error_rate','min_correctness'].includes(name)?100:1);}
   for(const name of check.option_fields){const input=form.elements[`test_${id}_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=optionDefault(config,check,name) ?? '';input.dataset.inherited='true';}}
   for(const name of check.limit_fields){const input=form.elements[`test_${id}_limit_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=config.limits[name]==null?'':config.limits[name]*(['max_error_rate','min_correctness'].includes(name)?100:1);input.dataset.inherited='true';}}
 }
-const inputRetentionNotice='Questions and expected answers are saved with the run. Response retention controls which model answers and evaluator reasons are saved.';
+const inputRetentionNotice='Questions and expected answers are saved with the run. Retention all / failures / none controls whether response text and evaluator reasons are kept. Request metadata (timings, status, scores) is always saved. Retention does not cap disk usage; storage limits do.';
 function configChanged() {
   state.configRevision++;
   if(state.requestPreview)state.requestPreview.status='stale';
@@ -1655,7 +1723,7 @@ function renderRequestPlan(config=null) {
   const issues=currentSettingErrors().length,planStatus=issues?`${number(issues)} ${issues===1?'setting':'settings'} to fix`:plan?setupPlanCount(plan):saved?.status==='error'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?'Plan unavailable':'Planning…';
   const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;const baselineName=(state.baselines || []).find(item=>item.id===$('#new-run-form')?.elements?.baseline_id?.value)?.name;dock.innerHTML=state.setupStep===3?`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> stops at ${number(config.max_requests)} requests or ${escape(elapsed(config.max_duration_seconds))}${baselineName?` <span>·</span> compared with <strong>${escape(baselineName)}</strong>`:''}`:`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${escape(planStatus)}`;}
   const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
-  const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>`:'';
+  const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div><div><dt>Memory limit (RAM growth during this run)</dt><dd>${config.max_memory_mb===0?'Off':`${number(config.max_memory_mb ?? 4096)} MiB`}</dd></div></dl>`:'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
     element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderConcurrentPlan(config)}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
@@ -1916,7 +1984,7 @@ function renderRunBlueprint(config,plan=null) {
   const waiting=state.requestPreview?.status==='error'?'Resolve the settings below to calculate traffic.':hasJsonChanges()?'Apply JSON changes to update this plan.':'Calculating traffic…';
   return `<header class="blueprint-heading"><h2>Run plan</h2></header>
   <p class="blueprint-intro">${escape(plan?setupPlanCount(plan):waiting)}</p>
-  <dl class="workload-bounds"><div><dt>Request ceiling</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>
+  <dl class="workload-bounds"><div><dt>Request ceiling</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div><div><dt>Memory limit (RAM growth during this run)</dt><dd>${config.max_memory_mb===0?'Off':`${number(config.max_memory_mb ?? 4096)} MiB`}</dd></div></dl>
   <p class="hint workload-help">Upper limits for the whole run, not predictions.</p><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits">Edit limits</button>
   ${traffic.length?`<details class="workload-breakdown"><summary>Request breakdown</summary><div>${traffic.map(row=>`<details data-plan-row="${escape(row.id)}"><summary><strong>${row.requests_per_target==null?(row.kind==='duration'?'Duration-based':'Adaptive'):`${row.kind==='estimate'?'~ ':''}${number(row.requests_per_target)}`}</strong> ${escape(row.title)}</summary><p>${escape(row.summary)}</p><small>${escape(row.source)} · ${row.requests_per_target==null?'bounded by your limits':'per endpoint, before run limits'}</small></details>`).join('')}</div></details>`:''}
   ${renderConcurrentPlan(config,plan)}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}${plan&&plan.required_request_limit>plan.request_limit?'<p class="blueprint-note">The request limit is below the planned workload; some checks may remain incomplete.</p>':''}`;
@@ -1957,7 +2025,7 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Baseline & restart options</summary><div class="details-content"><div class="fields">${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare baseline',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Response text retention',['all','failures','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention || 'failures')?'selected':''}>${mode}</option>`).join(''),{hint:inputRetentionNotice})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare baseline',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
   </div><section id="request-plan" class="request-plan review-section"></section><div id="load-guidance"></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" aria-label="Preview of this run" hidden></aside>
@@ -1985,10 +2053,11 @@ function readForm(allowEmpty=false) {
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
   if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
   first.metrics_url=form.elements.metrics_url.value.trim() || null;
-  for(const [key] of numericFields)config[key]=data.get(key)===''?null:Number(data.get(key));
+  for(const [key] of numericFields)if(data.has(key))config[key]=data.get(key)===''?null:Number(data.get(key));
   config.limits ||= {};
   for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
   if(form.elements.samples)config.samples=Number(form.elements.samples.value);
+  if(form.elements.retention)config.retention=form.elements.retention.value;
   if(form.elements.stream)config.stream=form.elements.stream.value==='true';
   config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty,percentageInputs:true});
   config=configureConcurrentLoad(config,data,concurrentFormDefaults(config),{allowInvalid:allowEmpty});
@@ -2096,42 +2165,44 @@ function resultGuidance(report) {
   if(report.overall==='pass')return 'The recorded checks met their configured limits. Save a baseline to compare your next change. This result applies to the endpoint and traffic tested here.';
   return 'Review the selected checks and their recorded reasons, then adjust the settings for your next run.';
 }
-function findingEvidence(report) {
-  const check=report.checks.find(c=>c.id!=='baseline'&&c.status==='fail') || report.checks.find(c=>c.id!=='baseline'&&['blocked','inconclusive'].includes(c.status));
-  if(!check)return {check:null,record:null};
-  const ids=new Set(check.evidence_ids || []),records=report.requests.filter(record=>ids.has(record.id));
-  const record=records.find(record=>record.score===false) || records.find(record=>['failed','timed_out'].includes(record.status)) || records[0];
-  return {check,record};
-}
-function inspectFinding() {
-  const {check,record}=findingEvidence(state.detail.report);
-  if(record){openRequest(record.id);return;}
-  if(check)state.selectedCheck=`${check.target}:${check.id}`;
-  state.tab='checks';renderDetail();
-  const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus();
-}
 function renderDetail() {
   const d=state.detail;
   if(activeState(d)&&state.active!==d.id)setActive(d.id);else if(state.active===d.id&&!activeState(d))setActive(null);else updateTitle();
   if(activeState(d)){renderLive();return;}
   const report=d.report;
-  if(!report){$('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>Run could not finish</h1><p>No report was saved. Review the error and settings before trying again.</p></div></div>${notice(d.error || 'The runner did not produce a report.','error')}<div class="actions"><button class="button primary" data-action="rerun">Review settings</button><a class="button" href="#runs">Back to runs</a></div>`;return;}
+  if(!report){const summary=d.summary;$('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>Run could not finish</h1><p>${summary?'Only a summary was saved; request evidence is unavailable.':'No report was saved. Review the error and settings before trying again.'}</p></div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderResources(null,d)}${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p>${(summary.checks || []).map(check=>`<article><h3>${escape(check.title || check.id)} ${badge(check.status)}</h3><p>${escape(check.summary)}</p></article>`).join('')}</section>`:''}<div class="actions">${keepButton()}<button class="button primary" data-action="rerun">Review settings</button><a class="button" href="#runs">Back to runs</a></div>`;return;}
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline'),counts={};checks.forEach(c=>counts[c.status]=(counts[c.status] || 0)+1);
   const required=checks.filter(c=>c.required);
-  const absolute=checks.some(c=>c.status==='fail')?'fail':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||checks.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
-  const completePass=d.state==='completed'&&!d.error&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||unselectedCheck(c,report));
-  const finding=findingEvidence(report);
+  const memoryInterrupted=report.observations?.resources?.memory_interrupted_checks || [];
+  const requiredMemoryInterrupted=required.some(c=>memoryInterrupted.some(item=>item.target===c.target&&item.id===c.id));
+  const absolute=d.state==='error'?'error':checks.some(c=>c.status==='fail')?'fail':requiredMemoryInterrupted?'inconclusive':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||checks.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
+  const completePass=d.state==='completed'&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||unselectedCheck(c,report));
+  const hasFinding=checks.some(c=>['fail','blocked','inconclusive'].includes(c.status));
   const savedBaseline=(state.baselines || []).find(item=>item.run_id===d.id);
   const compareNext=!completePass&&!checks.some(c=>['fail','blocked','inconclusive'].includes(c.status))&&!report.abort_reason&&['fail','inconclusive'].includes(report.baseline?.status);
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
-  $('#main').innerHTML=`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(mainFinding(report))}</h1><p class="result-guidance">${escape(resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${savedBaseline&&!finding.check?`<button class="button primary" data-action="compare-run">Compare a new run</button>`:completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>':finding.check?`<button class="button primary" data-action="inspect-finding">${finding.record?.score===false?'Inspect failed answer':finding.record?'Inspect evidence':'Inspect check'}</button>`:'<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext||finding.check?`<button class="button" data-action="rerun">${finding.check?'Review settings':`${icon('repeat')} Run again`}</button>`:''}</div></div>
-  ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,'error'):''}
+  $('#main').innerHTML=`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1><p class="result-guidance">${escape(absolute==='error'?'Review the error below before trying again.':resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${savedBaseline&&!hasFinding?`<button class="button primary" data-action="compare-run">Compare a new run</button>`:completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>': '<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext?`<button class="button" data-action="rerun">${icon('repeat')} Run again</button>`:''}</div></div>
+  ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,d.state==='error'?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderResources(report,d)}
   ${renderTests(report.requests,{report})}${renderAllRequests(orderedRequests(report))}
   <div class="result-summary"><div class="summary-bar" aria-hidden="true">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<span class="summary-seg ${k}" style="flex-grow:${counts[k]}"></span>`).join('')}</div><div class="summary-items">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item ${k}"><strong data-count="${counts[k]}">${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}${(config.targets || []).length>1?`<span class="hint summary-targets">${escape(config.targets.map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span>`:''}</div></div>
   <div class="result-tabs" role="tablist" aria-label="Run report"><button role="tab" id="tab-checks" aria-selected="${state.tab==='checks'}" tabindex="${state.tab==='checks'?0:-1}" aria-controls="result-content" class="${state.tab==='checks'?'selected':''}" data-tab="checks">Checks & evidence</button><button role="tab" id="tab-baseline" aria-selected="${state.tab==='baseline'}" tabindex="${state.tab==='baseline'?0:-1}" aria-controls="result-content" class="${state.tab==='baseline'?'selected':''}" data-tab="baseline">Baseline${report.baseline?` · ${escape(statusLabels[report.baseline.status] || report.baseline.status)}`:''}</button><button role="tab" id="tab-config" aria-selected="${state.tab==='config'}" tabindex="${state.tab==='config'?0:-1}" aria-controls="result-content" class="${state.tab==='config'?'selected':''}" data-tab="config">Run configuration</button></div>
   <section id="result-content" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='checks'?renderChecks(report):state.tab==='baseline'?renderComparison(report):renderConfig(report)}</section>
-  <div class="actions" style="margin-top:24px"><a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`;
+  <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`;
   syncComparisonFilters();
+}
+function memorySize(value,resources={}) {
+  if(typeof value!=='number')return ['unavailable','not measured on this platform'].includes(resources.memory_measurement)||resources.measurement_available===false?'not measured on this platform':'not recorded';
+  return value>=1024**3?`${number(value/1024**3,2)} GiB`:`${number(value/1024**2,1)} MiB`;
+}
+function renderResources(report,detail={}) {
+  const resources=report?.observations?.resources || {},saved=detail.resources || {},peaks=resources.sampled_peak_rss_bytes || {},growth=resources.sampled_peak_growth_bytes || {},exportPeak=saved.sampled_peak_rss_bytes?.export;
+  const limit=resources.memory_limit_bytes,active=resources.guardrail_active,unavailable=['unavailable','not measured on this platform'].includes(resources.memory_measurement)||resources.measurement_available===false;
+  const guard=resources.memory_limit_reached?(resources.memory_limit_stopped_run?'Memory limit exceeded; unfinished work stopped with partial results. Completed checks keep their results.':'Memory limit exceeded; completed checks keep their results. No work was stopped.') :limit===0?'Memory guardrail disabled (0 = off).':active===true?`Memory limit (RAM growth during this run): ${memorySize(limit)}. Guardrail active.`:active===false&&unavailable?'Memory guardrail inactive: RAM growth was not measured on this platform.':active===false?'Memory guardrail inactive: RAM at run start was not recorded.':'Memory guardrail status not recorded.';
+  return `<section class="panel resource-summary" aria-labelledby="memory-title"><h2 id="memory-title">Peak memory (RAM)</h2><p class="hint">Sampled process RSS and RAM growth since this run started, separate from saved runs on disk. Only growth triggers the guardrail.</p><dl class="metrics-grid">${metric('At run start',memorySize(resources.rss_at_start_bytes,resources))}${metric('Traffic',memorySize(peaks.traffic,resources),'Process RSS')}${metric('Scoring / aggregation',memorySize(peaks.scoring,resources),'Process RSS')}${metric('Traffic RAM growth',memorySize(growth.traffic,resources))}${metric('Scoring / aggregation RAM growth',memorySize(growth.scoring,resources))}${metric('Export',memorySize(exportPeak,saved),'Process RSS')}${metric('Process lifetime peak',memorySize(resources.process_peak_rss_bytes,resources),'Includes earlier runs in the web server; never used for the memory guardrail.')}</dl><p class="${resources.memory_limit_reached?'notice warning':'hint'}">${escape(guard)}</p><p class="hint">${escape(resources.sampling || 'Sampled about once per second; short spikes between samples can be missed.')}</p></section>`;
+}
+function storageOmission(report) {
+  const storage=report.manifest?.storage;if(!storage||!storage.response_bodies_omitted&&!storage.limit_exceeded)return '';
+  return notice(`Storage limit on disk: ${number(storage.response_bodies_omitted)} response ${storage.response_bodies_omitted===1?'body':'bodies'} omitted. ${storage.reason || 'Request metadata, scores and timing were preserved.'}${storage.limit_exceeded?' Request metadata alone exceeds the configured limit on disk.':''}`,'warning');
 }
 function keyMetric(check,report){if(check.status==='skipped')return report&&unselectedCheck(check,report)?'Not selected':check.summary || 'No result recorded';const m=check.metrics || {};if(check.id==='concurrency'&&m.load_types)return `${counted(Object.values(m.load_types).reduce((total,group)=>total+(group.points?.length || 0),0),'test point')} · ${counted(Object.keys(m.load_types).length,'load type')}`;if(check.id==='cancellation'&&m.cancellation_results)return `Server stopped: ${human(m.cancellation_results.server_stopped.status)} · Answer: ${human(m.cancellation_results.answer.status)}`;if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
 function renderChecks(report) {
@@ -2154,7 +2225,7 @@ function renderCancellationResults(metrics){
 function renderCheck(check,report) {
   const m=check.metrics || {},config=reportConfig(report),limits={...(config.limits || {}),...(config.test_options?.[check.id]?.limits || {})};
   const positions=requestPositions(report.requests),evidenceSet=new Set(check.evidence_ids || []),records=report.requests.filter(r=>evidenceSet.has(r.id));
-  const sorted=[...records].sort((a,b)=>(a.score===false?-2:a.status==='failed'?-1:0)-(b.score===false?-2:b.status==='failed'?-1:0));
+  const sorted=[...records].sort((a,b)=>(a.score===false?-2:(a.valid===false||a.evaluation_error||['failed','timeout','timed_out','evaluation_error'].includes(a.status))?-1:0)-(b.score===false?-2:(b.valid===false||b.evaluation_error||['failed','timeout','timed_out','evaluation_error'].includes(b.status))?-1:0));
   const metrics=[];
   if(m.timing_quality){
     const quality=m.timing_quality;
@@ -2206,7 +2277,7 @@ function renderCheck(check,report) {
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
   ${check.id==='capacity'&&m.levels?`<div class="metric-table"><table><thead><tr><th>Load</th><th>Achieved</th><th>Correct</th><th>p95</th></tr></thead><tbody>${Object.entries(m.levels).map(([k,v])=>`<tr><td class="mono">${escape(k)}</td><td>${number(v.achieved_concurrency)}</td><td>${v.correct ?? 0} / ${v.scored ?? 0}</td><td class="mono">${ms(v.p95_ms)}</td></tr>`).join('')}</tbody></table></div>`:''}
   ${check.id==='gpu'&&m.snapshots?renderGpuSnapshots(m.snapshots):''}
-  ${records.length?`<div class="evidence-title"><span>Requests</span><span class="hint">${records.length} recorded · wrong answers first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(scenarioLabel(r,report))}</button><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?'<span class="status fail">Incorrect</span>':r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
+  ${records.length?`<div class="evidence-title"><span>Requests</span><span class="hint">${records.length} recorded · incorrect and failed first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(scenarioLabel(r,report))}</button><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?'<span class="status fail">Incorrect</span>':r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
   ${Object.keys(extras).length?`<details class="check-observations"><summary>More measurements</summary><pre>${escape(JSON.stringify(extras,null,2))}</pre></details>`:''}`;
 }
 function renderGpuSnapshots(snapshots){return snapshots.map(snapshot=>`<div class="metric-table"><h3>${escape(human(snapshot.phase))} <span class="hint">${date(snapshot.collected_at)}</span></h3>${snapshot.reason?`<p class="hint" style="margin:12px 0">${escape(snapshot.reason)}</p>`:''}${snapshot.unavailable?.length?`<p class="hint" style="margin:12px 0">Unavailable: ${snapshot.unavailable.map(human).map(escape).join(', ')}</p>`:''}${snapshot.samples?.length?`<table><thead><tr><th>Metric</th><th>Value</th><th>Freshness</th></tr></thead><tbody>${snapshot.samples.map(s=>`<tr><td>${escape(s.name)}<small>${escape(s.labels)}</small></td><td class="mono">${number(s.value,3)}</td><td>${s.stale?'Stale':s.age_seconds==null?'Scrape only':`${number(s.age_seconds,1)}s old`}</td></tr>`).join('')}</tbody></table>`:''}</div>`).join('');}
@@ -2512,12 +2583,15 @@ document.addEventListener('click',async(event)=>{
     const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});return;}
   const request=event.target.closest('[data-request]');if(request){openRequest(request.dataset.request);return;}
   const action=event.target.closest('[data-action]')?.dataset.action;
+  if(action==='storage-dialog'){openStorageDialog();return;}
+  if(action==='close-storage'){$('#storage-dialog').close();state.cleanup=null;return;}
+  if(action==='cleanup-confirm'){await confirmCleanup();return;}
+  if(action==='keep-run'){await toggleKept();return;}
   if(action==='request-input'){const heading=$('#request-input-messages');heading?.scrollIntoView({block:'start'});heading?.focus({preventScroll:true});return;}
   if(action==='edit-setting'){try{focusSetting(event.target.closest('[data-setting-path]').dataset.settingPath);}catch(error){configError(error);}return;}
   if(action==='dismiss-migration-notes'){state.dismissedMigrationNotes=[...new Set([...(state.dismissedMigrationNotes || []),...(state.migrationNotes || [])])];acceptMigrationNotes();renderRequestPlan();saveDraft();return;}
   if(action==='load-select-all'||action==='load-clear'){selectLoadShapes(action==='load-select-all');return;}
   const loadCollapse=event.target.closest('[data-load-collapse]');if(loadCollapse){const type=loadCollapse.dataset.loadCollapse;setLoadPanel(type,$(`#load-panel-${type}`).hidden);return;}
-  if(action==='inspect-finding'){inspectFinding();return;}
   if(action==='toggle-checks'){state.checkNavigatorOpen=!state.checkNavigatorOpen;$('#result-content').innerHTML=renderChecks(state.detail.report);$('[data-action="toggle-checks"]')?.focus({preventScroll:true});return;}
   if(action==='check-intent'){browseCheckIntent(event.target.closest('[data-category]').dataset.category);return;}
   if(action==='runtime-shortcut'){useRuntimeShortcut(event.target.closest('[data-runtime]').dataset.runtime);return;}
@@ -2617,8 +2691,9 @@ document.addEventListener('click',async(event)=>{
   if(action==='export-config')await exportConfig();
   if(action==='copy-cli')await copyCli();
 });
-document.addEventListener('submit',event=>{if(event.target.id==='new-run-form')startRun(event);if(event.target.id==='baseline-form')saveBaseline(event);if(event.target.id==='dataset-example-form')saveExample(event);if(event.target.id==='dataset-import-form')useImportedDataset(event);if(event.target.id==='dataset-try-form')tryDatasetExample(event);});
+document.addEventListener('submit',event=>{if(event.target.id==='cleanup-form')previewCleanup(event);if(event.target.id==='new-run-form')startRun(event);if(event.target.id==='baseline-form')saveBaseline(event);if(event.target.id==='dataset-example-form')saveExample(event);if(event.target.id==='dataset-import-form')useImportedDataset(event);if(event.target.id==='dataset-try-form')tryDatasetExample(event);});
 document.addEventListener('input',event=>{
+  if(state.cleanup&&event.target.closest('#cleanup-form')){invalidateCleanup();return;}
   if(event.target.id==='command-search'){const query=event.target.value.toLowerCase();for(const item of $$('.command-item'))item.hidden=!item.textContent.toLowerCase().includes(query);for(const group of $$('.command-group'))group.hidden=!$$('.command-item',group).some(item=>!item.hidden);return;}
 
   if(event.target.id==='run-search'){state.historySearch=event.target.value;renderRuns();return;}
@@ -2715,7 +2790,7 @@ document.addEventListener('scroll',event=>{
   if(event.target.closest?.('.field-help'))return;
   for(const popover of $$('.field-help:popover-open'))popover.hidePopover();
 },true);
-document.addEventListener('cancel',event=>{if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
+document.addEventListener('cancel',event=>{if(event.target.id==='storage-dialog')state.cleanup=null;if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
 document.addEventListener('focusout',event=>{if(event.target.closest?.('.request-spot, .swarm-dot'))hideSpotTip();});
 document.addEventListener('pointerout',event=>{if(event.target.closest?.('.request-spot, .swarm-dot')&&!event.relatedTarget?.closest?.('.request-spot, .swarm-dot'))hideSpotTip();});
 document.addEventListener('pointerover',event=>{const spot=event.target.closest?.('.request-spot, .swarm-dot');if(spot)showSpotTip(spot,event.clientX,event.clientY);else hideSpotTip();});

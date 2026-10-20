@@ -296,7 +296,8 @@ async def test_arrivals_dispatch_wait_tolerance(threshold, wait, achieved):
     configured = config(arrivals=arrival)
     target = configured.targets[0]
     run = SimpleNamespace(config=configured, records=[], start=time.monotonic(),
-        deadline=time.monotonic() + 2, observations={target.name: {}}, allowed=lambda _: True)
+        deadline=time.monotonic() + 2, observations={target.name: {}}, allowed=lambda _: True,
+        start_condition=lambda *args, **kwargs: None, finish_condition=lambda *args, **kwargs: None)
 
     async def request(target, client, spec, on_start):
         on_start()

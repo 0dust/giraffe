@@ -371,8 +371,12 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     task = asyncio.create_task(workload.refill(run, SimpleNamespace(name='local'), None,
         [spec('p', 's', 'buckets')], 3, 3, condition_plan=False))
-    while len(started) < 3:
-        await asyncio.sleep(0)
+    async with asyncio.timeout(2):
+        while len(started) < 3:
+            if task.done():
+                await task  # Surface worker errors instead of spinning forever.
+                pytest.fail("Refill returned before starting the expected requests")
+            await asyncio.sleep(0)
     for index, finish in enumerate((2, 4, 8)):
         now = finish
         gates[index].set()

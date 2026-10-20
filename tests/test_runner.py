@@ -1803,7 +1803,7 @@ async def test_endpoint_outage_through_transport_stops_and_saves_records(monkeyp
     failures = [r for r in report.requests if r.status in {"timeout", "failed"}]
     assert len(failures) >= 3 and all(r.score is None and r.error for r in failures)
     assert any(e["event"] == "run_stopping" and e["abort_reason"] == report.abort_reason for e in events)
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = json.loads(json_path.read_text())
     assert saved["abort_reason"] == report.abort_reason
     assert len(saved["requests"]) == len(report.requests)
@@ -2078,7 +2078,7 @@ async def test_silent_target_stops_independently_and_healthy_target_finishes(mon
     assert any(e["event"] == "target_stopping" and e["target"] == "silent"
                and e["abort_reason"] == reasons["silent"] for e in events)
     assert not any(e["event"] == "run_stopping" for e in events)
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     assert json.loads(json_path.read_text())["observations"]["target_abort_reasons"] == reasons
     assert reasons["silent"] in html_path.read_text()
 

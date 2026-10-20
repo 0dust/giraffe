@@ -124,7 +124,8 @@ const failed=report([check('correctness','fail',{
 let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
 assert.match(html,/Expected &lt;Paris&gt;/);
-assert.match(html,/class="button primary" data-action="inspect-finding">Inspect check/);
+assert.match(html,/class="button primary" data-action="rerun">Review settings/);
+assert.doesNotMatch(html,/inspect-finding|Inspect failed answer|Inspect evidence|Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 assert.match(html,/Save as reference baseline/);
 assert.match(html,/report\.html" download/);
@@ -242,19 +243,45 @@ assert.equal(JSON.stringify(value),original);
 """)
 
 
-def test_failure_action_selects_evidence_from_the_failed_check_only():
+def test_checks_expose_all_requests_with_incorrect_and_failed_first():
     run_render_checks(r"""
-const failed=check('correctness','fail',{metrics:{correct:1,scored:2},evidence_ids:['bad','good']});
-const value=report([check('access','pass'),failed],{overall:'fail',requests:[
-  {id:'unrelated',score:false},{id:'good',score:true},{id:'bad',score:false}]});
+const request=(id,score,status='completed')=>({id,score,status,target:'local',scenario:id,elapsed_ms:12,output:'Answer '+id,output_chars:8,valid:true});
+const value=report([
+  check('correctness','fail',{evidence_ids:['correct-good','correct-bad','correct-timeout']}),
+  check('json','fail',{evidence_ids:['json-good','json-failed','json-bad']})
+],{overall:'fail',requests:[request('correct-good',true),request('correct-bad',false),request('correct-timeout',null,'timed_out'),request('json-good',true),request('json-failed',null,'timeout'),request('json-bad',false)]});
 let html=detail(value);
-assert.match(html,/data-action="inspect-finding">Inspect failed answer/);
-assert.match(html,/1 of 2 scored answers did not meet/);
-let opened;openRequest=id=>opened=id;inspectFinding();assert.equal(opened,'bad');
-assert.equal((html.match(/data-check="local:correctness"/g)||[]).length,1);
-assert.doesNotMatch(html,/result-check-strip/);
-value.requests=[];detail(value);assert.equal(findingEvidence(value).record,undefined);
-assert.match(nodes['#main'].innerHTML,/data-action="inspect-finding">Inspect check/);
+assert.match(html,/data-check="local:correctness"/);assert.match(html,/data-check="local:json"/);
+assert.doesNotMatch(html,/inspect-finding|Inspect failed answer|Inspect evidence|Inspect check/);
+nodes['#result-content']={innerHTML:''};
+nodes['#request-dialog']={innerHTML:'',showModal(){this.open=true;}};
+for(const [id,bad,failed,good] of [['correctness','correct-bad','correct-timeout','correct-good'],['json','json-bad','json-failed','json-good']]){
+  const checkNode={dataset:{check:'local:'+id}};
+  listeners.click({target:{closest:q=>q==='[data-check]'?checkNode:null}});
+  html=nodes['#result-content'].innerHTML;
+  assert.match(html,new RegExp('data-check="local:'+id+'" aria-pressed="true"'));
+  const list=html.slice(html.indexOf('class="evidence-table"'));
+  for(const requestId of [bad,failed,good])assert.match(list,new RegExp('data-request="'+requestId+'"'));
+  assert(list.indexOf('data-request="'+bad+'"')<list.indexOf('data-request="'+failed+'"'));
+  assert(list.indexOf('data-request="'+failed+'"')<list.indexOf('data-request="'+good+'"'));
+  for(const requestId of [bad,failed,good]){
+    listeners.click({target:{closest:q=>q==='[data-request]'?{dataset:{request:requestId}}:null}});
+    assert(nodes['#request-dialog'].open);assert.match(nodes['#request-dialog'].innerHTML,new RegExp('Answer '+requestId));
+  }
+}
+""")
+
+
+def test_checks_without_request_evidence_show_explanation_and_measurements():
+    run_render_checks(r"""
+const value=report([check('first_output','blocked',{summary:'Endpoint &lt;local&gt; did not become ready.',metrics:{attempted:3,completed:0,failed:2,timed_out:1,first_output_p95_ms:321}}),check('generation','inconclusive',{summary:'No measurable generation samples.',metrics:{attempted:2,completed:0,generation_rate_samples:0}})],{overall:'inconclusive'});
+let html=detail(value);
+assert.match(html,/Endpoint &amp;lt;local&amp;gt; did not become ready/);
+assert.match(html,/321 ms/);assert.match(html,/2 failed · 1 timed out/);
+assert.match(html,/No request evidence was recorded for this check/);
+state.selectedCheck='local:generation';html=renderChecks(value);
+assert.match(html,/No measurable generation samples/);assert.match(html,/0 measured samples/);
+assert.match(html,/No request evidence was recorded for this check/);
 """)
 
 

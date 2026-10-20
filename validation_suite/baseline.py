@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 import math
@@ -9,6 +10,8 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import sqlite3
+import tempfile
 from collections.abc import Iterator, Iterable
 from typing import Any, TextIO
 
@@ -84,7 +87,14 @@ def iter_report_requests(path: Path, *, metadata: dict | None = None) -> Iterato
     metadata = metadata if metadata is not None else {}
     limits = RESOURCE_POLICY["product_report_decoder"]
     seen: set[str] = set()
-    with path.open(encoding="utf-8") as handle:
+    report_format = None
+    # Inputs can exceed the metadata value bound in aggregate. Decode one entry
+    # at a time and keep the lookup on disk, rather than retaining the table in RAM.
+    with tempfile.TemporaryDirectory(prefix="giraffe-inputs-") as temporary, \
+            closing(sqlite3.connect(str(Path(temporary) / "inputs.sqlite"))) as inputs, \
+            path.open(encoding="utf-8") as handle:
+        inputs.execute("PRAGMA cache_size=-1024")
+        inputs.execute("CREATE TABLE inputs (ref TEXT PRIMARY KEY, messages TEXT)")
         reader = _ReportReader(handle)
         reader.consume("{")
         while reader.peek() != "}":
@@ -95,12 +105,44 @@ def iter_report_requests(path: Path, *, metadata: dict | None = None) -> Iterato
             if len(seen) > 64:
                 raise ValueError("Product report exceeds the bounded top-level member count")
             reader.consume(":")
-            if key == "requests":
+            if key == "inputs":
+                reader.consume("{")
+                while reader.peek() != "}":
+                    reference = reader.value(1024)
+                    reader.consume(":")
+                    messages = reader.value(limits["request_value_bytes"])
+                    if not isinstance(reference, str) or not isinstance(messages, list):
+                        raise ValueError("Invalid product input table entry")
+                    encoded = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+                    if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != reference:
+                        raise ValueError("Saved input SHA-256 mismatch")
+                    try:
+                        inputs.execute("INSERT INTO inputs VALUES (?, ?)",
+                                       (reference, encoded))
+                    except sqlite3.IntegrityError as error:
+                        raise ValueError("Duplicate product input table entry") from error
+                    if reader.peek() == "}":
+                        break
+                    reader.consume(",")
+                    if reader.peek() == "}":
+                        raise ValueError("Trailing comma in product input table")
+                reader.consume("}")
+            elif key == "requests":
                 reader.consume("[")
                 while reader.peek() != "]":
                     raw = reader.value(limits["request_value_bytes"])
                     if not isinstance(raw, dict):
                         raise ValueError("Product report request must be an object")
+                    if "input_ref" in raw:
+                        if report_format != 2:
+                            raise ValueError("Input references require product report format 2 before requests")
+                        reference = raw.pop("input_ref")
+                        if not isinstance(reference, str) or not isinstance(raw.get("evaluation"), dict):
+                            raise ValueError("Invalid product input reference")
+                        entry = inputs.execute("SELECT messages FROM inputs WHERE ref=?", (reference,)).fetchone()
+                        if entry is None or "messages" in raw["evaluation"]:
+                            raise ValueError("Missing or ambiguous product input reference")
+                        raw["evaluation"]["messages"] = json.loads(entry[0])
                     yield raw
                     if reader.peek() == "]":
                         break
@@ -110,6 +152,10 @@ def iter_report_requests(path: Path, *, metadata: dict | None = None) -> Iterato
                 reader.consume("]")
             else:
                 value = reader.value(limits["metadata_value_bytes"])
+                if key == "report_format":
+                    if value != 2:
+                        raise ValueError("Unsupported product report format")
+                    report_format = value
                 if key in {"overall", "abort_reason", "observations"}:
                     metadata[key] = value
             if reader.peek() == "}":
@@ -120,6 +166,8 @@ def iter_report_requests(path: Path, *, metadata: dict | None = None) -> Iterato
         reader.consume("}")
         if reader.peek() or "requests" not in seen:
             raise ValueError("Product report contains trailing data or no requests array")
+        if ("inputs" in seen) != (report_format == 2):
+            raise ValueError("Product report format and input table disagree")
 
 
 def _output(command: list[str], *, cwd: Path | None = None, env: dict | None = None) -> str:
@@ -341,7 +389,21 @@ def iter_normalized_results(requests: Iterable[dict], scenario: dict, context: d
 
 def normalize_results(report: dict, scenario: dict, context: dict) -> list[dict]:
     """Compatibility helper for small fixtures; live exports use the iterator."""
-    return list(iter_normalized_results(report.get("requests", []), scenario, context))
+    def requests():
+        from copy import deepcopy
+
+        for raw in report.get("requests", []):
+            if "input_ref" in raw:
+                raw = deepcopy(raw)
+                reference = raw.pop("input_ref")
+                messages = report["inputs"][reference]
+                encoded = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+                if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != reference:
+                    raise ValueError("Saved input SHA-256 mismatch")
+                raw["evaluation"]["messages"] = deepcopy(messages)
+            yield raw
+
+    return list(iter_normalized_results(requests(), scenario, context))
 
 
 def exported_phases(report: dict, scenario: dict, context: dict) -> dict:

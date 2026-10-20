@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import errno
 from fractions import Fraction
 from html import escape
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
-from statistics import median
+import shutil
 import tempfile
+from statistics import median
 from typing import Any
 
 from .deployment import deployment_diff, safe_config, sanitize
+from .report_inputs import input_ref as _input_ref
 from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status, load_shape_label
+from .storage import format_size
 from .workloads import WORKLOAD_CHECKS
 from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
 
@@ -60,7 +65,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     reasons = []
     if report.suite_version != baseline.suite_version:
         reasons.append("Suite versions differ.")
-    if report.schema_version != baseline.schema_version:
+    if (report.schema_version != baseline.schema_version
+            and {report.schema_version, baseline.schema_version} != {"2", "3"}):
         reasons.append("Report schema versions differ.")
     if report.abort_reason or report.observations.get("target_abort_reasons"):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
@@ -615,48 +621,199 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     baseline_checks = [check for check in result.checks if check.id == "baseline"]
     comparison["status"] = overall_status(baseline_checks)
     result.baseline = comparison
-    result.overall = overall_status(result.checks, result.abort_reason)
+    interrupted = {(item["target"], item["id"]) for item in
+                   result.observations.get("resources", {}).get("memory_interrupted_checks", [])}
+    result.overall = overall_status(result.checks, result.abort_reason,
+        memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted
+                                     for check in result.checks))
     return result
 
 
 def _retained(report: RunReport) -> RunReport:
-    result = report.model_copy(deep=True)
-    result.manifest["config"] = safe_config(result.manifest.get("config", {}))
+    result = report.model_copy(update={"manifest": {**report.manifest,
+        "config": safe_config(report.manifest.get("config", {}))}})
     if result.baseline:
         result.baseline = sanitize(result.baseline, bounded=False)
     policy = result.manifest.get("config", {}).get("retention", "failures")
     if policy == "none":
-        for check in result.checks:
-            check.summary = _without_answer_excerpts(check.summary)
-            for scenario in check.metrics.get("scenarios", {}).values():
-                scenario["summary"] = _without_answer_excerpts(scenario["summary"])
+        result.checks = []
+        for check in report.checks:
+            summary = _without_answer_excerpts(check.summary)
+            scenarios = check.metrics.get("scenarios", {})
+            changed = {name: {**scenario, "summary": _without_answer_excerpts(scenario["summary"])}
+                       for name, scenario in scenarios.items()
+                       if _without_answer_excerpts(scenario["summary"]) != scenario["summary"]}
+            metrics = ({**check.metrics, "scenarios": {**scenarios, **changed}}
+                       if changed else check.metrics)
+            result.checks.append(check.model_copy(update={"summary": summary, "metrics": metrics})
+                                 if summary != check.summary or changed else check)
     failed_evidence = {rid for check in result.checks if check.status in {"fail", "blocked"}
                        for rid in check.evidence_ids}
-    for record in result.requests:
+    result.requests = []
+    for record in report.requests:
         keep = policy == "all" or (policy == "failures" and (
             (record.status in {"failed", "timeout"} and record.scenario not in {"client_cancel", "client_deadline"})
             or (record.status == "completed" and not record.valid) or record.score is False
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
-        if not keep:
-            if record.score_message:
-                record.score_message = _without_answer_excerpts(record.score_message)
-            record.output = ""
-            record.reasoning = ""
-            record.tool_calls = []
-            if record.logprob_evidence:
-                record.logprob_evidence.tokens = []
-            record.assistant_message = None
-            if record.tool_conversation:
-                record.tool_conversation["final_content"] = None
-                for call in record.tool_conversation["calls"]:
-                    call["result"] = None
-                if record.evaluation:
-                    record.evaluation.messages = []
-            if record.judgement:
-                for vote in record.judgement.votes:
-                    vote.reason = None
+        result.requests.append(record if keep else _without_response(record))
     return result
+
+
+def _without_response(record: RequestRecord) -> RequestRecord:
+    updates: dict[str, Any] = {"output": "", "reasoning": "", "tool_calls": [], "assistant_message": None}
+    if record.score_message:
+        updates["score_message"] = _without_answer_excerpts(record.score_message)
+    if record.logprob_evidence and record.logprob_evidence.tokens:
+        updates["logprob_evidence"] = record.logprob_evidence.model_copy(update={"tokens": []})
+    if record.tool_conversation:
+        updates["tool_conversation"] = {**record.tool_conversation, "final_content": None,
+            "calls": [{**call, "result": None} for call in record.tool_conversation["calls"]]}
+        if record.evaluation and record.evaluation.messages:
+            updates["evaluation"] = record.evaluation.model_copy(update={"messages": []})
+    if record.judgement and any(vote.reason is not None for vote in record.judgement.votes):
+        updates["judgement"] = record.judgement.model_copy(update={"votes": [
+            vote.model_copy(update={"reason": None}) if vote.reason is not None else vote
+            for vote in record.judgement.votes]})
+    updates = {name: value for name, value in updates.items() if value != getattr(record, name)}
+    return record.model_copy(update=updates) if updates else record
+
+
+def _has_response(record: RequestRecord) -> bool:
+    return bool(record.output or record.reasoning or record.tool_calls or record.assistant_message
+                or (record.logprob_evidence and record.logprob_evidence.tokens)
+                or (record.judgement and any(v.reason for v in record.judgement.votes))
+                or (record.tool_conversation and (record.tool_conversation.get("final_content")
+                    or any(call.get("result") is not None
+                           for call in record.tool_conversation.get("calls", [])))))
+
+
+def _request_json(record: RequestRecord) -> str:
+    value = record.model_dump(mode="json")
+    if record.evaluation and record.evaluation.messages:
+        value["input_ref"] = _input_ref(record.evaluation.messages)
+        del value["evaluation"]["messages"]
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def _report_json_chunks(report: RunReport):
+    # Keep defaults for raw consumers. Only exact input messages move to the table.
+    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests"})
+    yield metadata[:-1] + ',"report_format":2,"inputs":{'
+    seen = set()
+    for record in report.requests:
+        if not record.evaluation or not record.evaluation.messages:
+            continue
+        messages = record.evaluation.messages
+        reference = _input_ref(messages)
+        if reference in seen:
+            continue
+        yield "," if seen else ""
+        seen.add(reference)
+        yield json.dumps(reference) + ":"
+        yield from json.JSONEncoder(ensure_ascii=False, allow_nan=False,
+                                    separators=(",", ":")).iterencode(messages)
+    yield '},"requests":['
+    for index, record in enumerate(report.requests):
+        yield "," if index else ""
+        yield _request_json(record)
+    yield "]}"
+
+
+def _portable_json_chunks(report: RunReport):
+    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests"})
+    yield metadata[:-1] + ',"requests":['
+    for index, record in enumerate(report.requests):
+        yield "," if index else ""
+        yield record.model_dump_json()
+    yield "]}"
+
+
+def save_baseline_report(source: Path, destination: Path, *, replace: bool = False,
+                         report: RunReport | None = None, portable: bool = False) -> None:
+    """Publish an independent snapshot, sharing immutable bytes where supported."""
+    source, destination = Path(source), Path(destination)
+    report = report if report is not None else RunReport.model_validate_json(source.read_text())
+    retained = _retained(report)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp",
+                                       dir=destination.parent)
+    temporary = Path(name)
+    try:
+        os.close(descriptor)
+        temporary.unlink()
+        if portable:
+            _atomic_write_chunks(temporary, _portable_json_chunks(retained))
+            os.chmod(temporary, 0o644)
+        elif (source.is_symlink() or source.name != "report.json"
+              or retained != report or report.schema_version != "3"):
+            _atomic_write_chunks(temporary, _report_json_chunks(retained))
+        else:
+            try:
+                os.link(source, temporary)
+            except OSError:
+                with source.open("rb") as incoming, temporary.open("xb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing, length=65536)
+        if replace:
+            temporary.replace(destination)
+        else:
+            # Exclusive publication keeps the CLI's no-overwrite contract.
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                raise
+            except OSError:
+                with destination.open("xb"):
+                    pass
+                try:
+                    temporary.replace(destination)
+                except OSError:
+                    destination.unlink(missing_ok=True)
+                    raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _json_size(report: RunReport) -> int:
+    return sum(len(chunk.encode("utf-8")) for chunk in _report_json_chunks(report))
+
+
+def _storage_limited(report: RunReport, limit: int) -> None:
+    storage = {"limit_bytes": limit, "response_bodies_omitted": 0,
+               "reason": "Per-run JSON storage limit on disk.", "limit_exceeded": False}
+    report.manifest["storage"] = storage
+    if not limit:
+        return
+    size = _json_size(report)
+    if size <= limit:
+        return
+    evidence = {rid for check in report.checks if check.status in {"fail", "blocked", "inconclusive"}
+                for rid in check.evidence_ids}
+    ordered = sorted((i for i, r in enumerate(report.requests) if _has_response(r)), key=lambda i: bool(
+        report.requests[i].id in evidence or report.requests[i].score is False
+        or report.requests[i].evaluation_error
+        or (report.requests[i].status in {"failed", "timeout"}
+            and report.requests[i].scenario not in {"client_cancel", "client_deadline"})
+        or (report.requests[i].status == "completed" and not report.requests[i].valid)))
+    previous_reason = storage["reason"]
+    storage["reason"] = "Response bodies omitted to fit the per-run JSON limit on disk."
+    size += len(storage["reason"]) - len(previous_reason)
+    for index in ordered:
+        original = report.requests[index]
+        before = len(_request_json(original).encode("utf-8"))
+        record = report.requests[index] = _without_response(original)
+        size -= before - len(_request_json(record).encode("utf-8"))
+        previous_count = storage["response_bodies_omitted"]
+        storage["response_bodies_omitted"] += 1
+        size += len(str(storage["response_bodies_omitted"])) - len(str(previous_count))
+        if original.evaluation and record.evaluation and original.evaluation.messages != record.evaluation.messages:
+            # Tool-conversation retention can also remove an input-table entry.
+            size = _json_size(report)
+        if size <= limit:
+            return
+    storage["limit_exceeded"] = True
+    storage["reason"] = ("Request metadata exceeds the per-run JSON limit on disk; "
+                         "all request metadata was preserved.")
 
 
 def _e(value: Any) -> str:
@@ -935,6 +1092,14 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
+    storage = report.manifest.get("storage", {})
+    if storage.get("response_bodies_omitted") or storage.get("limit_exceeded"):
+        omitted = storage.get("response_bodies_omitted", 0)
+        limit = f'{format_size(storage["limit_bytes"])} limit. ' if "limit_bytes" in storage else ""
+        parts.append(f'<p class="card" role="status"><strong>Storage limit on disk:</strong> '
+                     f'{limit}'
+                     f'Response bodies omitted for {_e(omitted)} {"request" if omitted == 1 else "requests"}. '
+                     f'{_e(storage.get("reason", ""))} Scores, request counts, timings and verdicts are unchanged.</p>')
     for reason in report.observations.get("target_abort_reasons", {}).values():
         if reason != report.abort_reason:
             parts.append(f'<p class="card">Target stopped: {_e(reason)}</p>')
@@ -1066,7 +1231,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     parts.append('</section>')
     parts.append('</section><section id="requests"><h2>Request evidence</h2>'
                  f'<p class="muted">Response retention: {_e(config.get("retention", "failures"))}. '
-                 'Retention changes stored bodies only; scores, character counts and measurements remain.</p>'
+                 'Retention controls response text; request metadata, timings, status and scores are always saved. '
+                 'Retention does not cap disk usage; storage limits do.</p>'
                  f'<p>Showing {len(detailed)} of {len(report.requests)} request details, failures first. '
                  '<a href="report.json">All requests and complete retained bodies in report.json</a>.</p>')
     for record in detailed:
@@ -1123,30 +1289,103 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     return "".join(parts)
 
 
-def _atomic_write(path: Path, contents: str) -> None:
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
-        temporary = Path(file.name)
-        try:
-            file.write(contents)
-            file.flush()
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+def _atomic_write_chunks(path: Path, chunks) -> None:
+    temporary = path.with_name(path.name + ".tmp")
     try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            for chunk in chunks:
+                file.write(chunk)
+            file.flush()
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def write_report(report: RunReport, directory: Path) -> tuple[Path, Path]:
-    """Write matching JSON and standalone HTML, applying retention only to output copies."""
+def _atomic_write(path: Path, contents: str) -> None:
+    _atomic_write_chunks(path, (contents,))
+
+
+class ReportWriteError(OSError):
+    def __init__(self, error: OSError, failed_file: str, *, json_complete: bool):
+        super().__init__(error.errno, error.strerror, error.filename)
+        self.failed_file = failed_file
+        self.json_complete = json_complete
+
+
+def _write_failure_reason(error: OSError) -> str:
+    return {errno.ENOSPC: "disk full", errno.EDQUOT: "disk quota exceeded",
+            errno.EROFS: "read-only disk", errno.EACCES: "permission denied",
+            errno.EPERM: "permission denied"}.get(error.errno, "disk write error")
+
+
+def html_failure_warning(error: OSError) -> str:
+    return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
+
+
+def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 256 * 1024**2,
+                 html: bool = False) -> tuple[Path, Path | None]:
+    """Save compact JSON; standalone HTML is an explicit optional export."""
+    if isinstance(max_run_storage, bool) or not isinstance(max_run_storage, int) or max_run_storage < 0:
+        raise ValueError("max_run_storage must be a non-negative integer")
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ReportWriteError(error, "report.json", json_complete=False) from error
     retained = _retained(report)
     json_path, html_path = directory / "report.json", directory / "report.html"
-    _atomic_write(json_path, retained.model_dump_json(indent=2))
-    _atomic_write(html_path, _render(retained))
+    _storage_limited(retained, max_run_storage)
+    try:
+        _atomic_write_chunks(json_path, _report_json_chunks(retained))
+    except OSError as error:
+        raise ReportWriteError(error, "report.json", json_complete=False) from error
+    if not html:
+        return json_path, None
+    try:
+        _atomic_write(html_path, _render(retained))
+    except OSError as error:
+        for path in (html_path, html_path.with_name("report.html.tmp")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ReportWriteError(error, "report.html", json_complete=True) from error
     return json_path, html_path
+
+
+def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> str:
+    if getattr(error, "json_complete", False):
+        for name in ("report.html", "report.html.tmp"):
+            try:
+                (Path(directory) / name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return html_failure_warning(error)
+    reason = _write_failure_reason(error)
+    prefix = (f"Report could not be saved ({reason}). Request evidence for "
+              f"{len(report.requests)} requests was lost; ")
+    directory = Path(directory)
+    for name in ("report.json", "report.html"):
+        try:
+            (directory / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    message = prefix + "a summary was saved."
+    summary = {"run_id": report.run_id, "overall": report.overall, "state": "error",
+               "started_at": report.started_at, "finished_at": report.finished_at,
+               "request_count": len(report.requests), "summary_saved": True, "error": message,
+               "checks": [{"id": check.id, "target": check.target, "title": check.title[:256],
+                           "status": check.status, "summary": (
+                               text if len(text := _without_answer_excerpts(check.summary)) <= 2048
+                               else text[:2048] + " … [truncated]")}
+                          for check in report.checks]}
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        _atomic_write(directory / "summary.json", json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    except OSError:
+        return prefix + "no summary could be saved."
+    return message
 
 
 def reproduction_export(report: RunReport) -> dict:

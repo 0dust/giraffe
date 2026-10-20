@@ -55,7 +55,7 @@ PASS: 13 requests
   local / serving: pass — ...
   local / correctness: pass — ...
 JSON: /your/checkout/giraffe/runs/<timestamp>/report.json
-HTML: /your/checkout/giraffe/runs/<timestamp>/report.html
+Export HTML: giraffe report /your/checkout/giraffe/runs/<timestamp> --html
 ```
 
 **PASS** means the selected required checks have sufficient evidence and meet their
@@ -73,9 +73,11 @@ for example because preflight could not connect to the model.
 | `3` | Blocked (including preflight failure) |
 | `4` | Usage or configuration error |
 
-Reports go to `runs/<timestamp>/report.html` and `report.json` relative to the
-working directory, or to the directory supplied with `--output`. Open the HTML
-file in your browser; JSON includes measurements and reproduction settings.
+Runs save `runs/<timestamp>/report.json` relative to the working directory, or
+in the directory supplied with `--output`. JSON includes measurements and
+reproduction settings. Download HTML from the web results page, or generate it
+without rerunning the suite with `giraffe report runs/<timestamp> --html`
+(optionally `--output PATH`). Add `--html` to `giraffe run` to save HTML at completion.
 Once the suite starts, failed or interrupted runs also save reports. Ctrl-C stops
 new requests and saves partial results.
 
@@ -267,8 +269,9 @@ After preflight, the CLI prints its suite limits: maximum requests, concurrency,
 total duration, per-request deadline, and output tokens. Ctrl-C stops new requests
 and saves partial results. Normal runs never restart the service.
 
-Open `report.html` in your run's output directory. `report.json` contains the same
-measurements and reproduction settings. A failed or interrupted run still produces
+Read results in the web UI, or run `giraffe report RUN_DIR --html` and open the
+generated `report.html`. The saved `report.json` contains measurements and
+reproduction settings. A failed or interrupted run still produces
 a report once the suite has started; preflight failures do not.
 
 To compare runs, substitute your edited Ollama or vLLM configuration for
@@ -744,9 +747,10 @@ generator-limited evidence cannot establish an exact capacity decrease. Older
 reports remain readable; the suite-version change prevents comparing the former
 concurrency sweep with this arrival-rate definition.
 
-Response retention is `failures` by default. Use `all` to keep every response, or
-`none` to discard all output/reasoning text after scoring. Aggregate metrics and
-request statuses remain. Prompts are deterministic built-ins; optional custom
+Response retention is `failures` by default. `all` keeps response text for every
+request, `failures` keeps failure evidence, and `none` discards response text after
+scoring. Request metadata (timings, status, scores) is always saved. Retention does
+not cap disk usage; the storage limits do. Prompts are deterministic built-ins; optional custom
 fixtures are a local JSON list of `RequestSpec` objects. Legacy `--fixtures` accepts
 only `exact`, `contains`, `json`, and `none` scorers; AI judges require a request
 pack, and tool scoring is reserved for built-in tool checks. Custom fixture files must
@@ -755,6 +759,65 @@ remain available to reproduce a run.
 ```sh
 giraffe run --manifest runs/before --output runs/reproduced
 ```
+
+Saved runs on disk default to a 5 GiB total limit, a 1 GiB minimum free disk
+reserve, and a 256 MiB retained JSON limit per run. Configure `--max-total-storage`,
+`--min-free-disk`, and `--max-run-storage` on `giraffe run` or `giraffe web` (`ui`
+also works); each accepts sizes such as `500MiB` or `2GiB`, and `0` disables it.
+Disk sizes are displayed in binary units (B, KiB, MiB, GiB, TiB); the Runs page
+cleanup size target is entered in MiB.
+Runs refuse to start when the saved total exceeds its limit or free disk falls
+below the reserve. Nothing is deleted automatically. Export removes response
+bodies to meet the per-run limit, preserving failure evidence as long as possible;
+metadata is always kept even if it exceeds the limit. Reports disclose omissions.
+Standalone HTML adds disk space beyond the JSON limit.
+
+```sh
+giraffe storage --runs-dir runs
+# Preview eligible runs without deleting them.
+giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10
+giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10 --yes
+# Protect a run.
+giraffe keep runs/before
+# Remove that protection.
+giraffe keep runs/before --off
+```
+
+Cleanup criteria combine with OR: old runs, runs beyond the newest N, or oldest
+eligible runs until the requested total is reached. The newest count includes
+protected runs. Cleanup `--max-total` must be positive; use `--older-than 0` to
+explicitly remove all unprotected runs. Active and live running/stopping runs,
+kept runs and baseline-source runs are protected. Baselines are counted separately and
+never cleaned. Directories containing files Giraffe did not write are protected.
+The Runs page offers the same preview and a separate deletion confirmation.
+Cleanup reports the runs deleted, space freed on disk, and every skipped run
+with its reason in both the UI and CLI.
+If JSON export fails, Giraffe records an error and tries to save a small summary;
+request evidence may be lost. If only HTML fails, the complete JSON stays saved
+and the run completes with a warning. CLI writers refresh a heartbeat so crashed
+runs can eventually become cleanable. Use the same storage flags with
+`giraffe storage` to display your configured limits. See [disk measurements and limits](docs/resources.md).
+
+Peak memory (RAM) is measured separately from saved data on disk. The default
+**Memory limit (RAM growth during this run)** (`max_memory_mb: 4096`) guardrail
+samples current process RSS about once per second and compares growth with RSS at
+the run start. Earlier web-server allocations do not count toward the growth
+budget. RAM uses binary MiB/GiB.
+Use `giraffe run --max-memory 2048` for a 2 GiB limit, or `--max-memory 0` to disable
+it. The web run-limits section offers the same setting. Exceeding it stops
+unfinished work with partial evidence; the verdict is inconclusive if a required
+check was cut short and no check failed. Completed checks keep their statuses, and
+a limit crossing after completion is a warning only. It never lowers the requested
+concurrency or request count. If RSS at run start is unavailable, the guardrail is
+inactive. Short spikes between samples can be missed.
+
+Reports record starting RSS, traffic and scoring absolute RSS peaks, and RAM-growth
+peaks; the CLI and run detail also show export RAM. Process lifetime peak is
+labelled separately because a web server can include earlier runs. Response bodies stay in RAM until their dependent
+scoring and checks finish, so usage grows with request count and response size;
+response retention controls saved output, not that working set. Export streams
+JSON and copies only retained data that changes. See the measured before/after
+results and limitations in [resources](docs/resources.md).
 
 Cold-start testing is a separate, explicit command. Configure an argv list on the
 specific target, such as `restart_command: [docker, restart, my-test-service]`, then:
@@ -814,8 +877,10 @@ giraffe run --config deployment.json --output-format json
 
 `--config -` reads JSON or YAML from standard input. `--output-format json` emits
 one JSON object on stdout; progress remains on stderr. Run results include
-`outcome`, `exit_code`, `run_id`, and absolute `report_paths.json` and
-`report_paths.html`. A preflight failure returns `outcome: "blocked"`, exit code 3,
+`outcome`, `exit_code`, `run_id`, and an absolute `report_paths.json` path.
+`report_paths.html` is `null` unless `--html` was requested, in which case it is
+an absolute path. Generate HTML later without traffic with
+`giraffe report RUN_DIR --html` (optionally `--output PATH`). A preflight failure returns `outcome: "blocked"`, exit code 3,
 and a message without report paths. Errors include field locations and messages.
 `--structured-output` selects the structured JSON test; `--json` remains a hidden
 compatibility alias. Use `--output-format json` for the CLI's output format.

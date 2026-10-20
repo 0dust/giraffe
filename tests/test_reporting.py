@@ -61,7 +61,7 @@ def test_short_baseline_summary_names_sample_gate_for_both_runs():
 def test_dead_endpoint_headline_and_bounded_html_keep_complete_json(tmp_path):
     report = dead_endpoint_report()
     before = report.model_dump_json()
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     html = html_path.read_text()
     print(f"dead endpoint HTML bytes: {html_path.stat().st_size}")
     assert "Could not connect to http://localhost:8000 (ConnectError); no checks could run" in html
@@ -78,7 +78,7 @@ def test_html_caps_request_details_and_raw_bodies_without_losing_json(tmp_path):
     report.manifest["config"]["retention"] = "all"
     report.requests[-1].output = "<script>" + "long body " * 10000
     report.requests[-1].score = False
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     html = html_path.read_text()
     assert "Showing 25 of 80 request details" in html
     assert "&lt;script&gt;" in html and "<script>" not in html
@@ -101,7 +101,7 @@ def test_html_logprob_alternatives_are_visible_despite_large_token_byte_arrays(p
     record.output, record.output_chars = text, len(text)
     record.logprob_evidence = collect_logprobs({"content": [entry]}, text, 2)
     before = report.model_dump_json()
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     html, data = html_path.read_text(), json_path.read_text()
     assert ("ALT_ONLY_SECRET" in html) == retained
     assert ("ALT_ONLY_SECRET" in data) == retained
@@ -128,7 +128,7 @@ def test_connection_headline_requires_only_connection_failures(change, tmp_path)
         report.requests[0].status, report.requests[0].error = "timeout", "request timeout (ReadTimeout)"
     else:
         report.requests = []
-    _, path = write_report(report, tmp_path)
+    _, path = write_report(report, tmp_path, html=True)
     assert "Could not connect to" not in path.read_text()
     assert "highest tested acceptable arrival rate" in path.read_text()
 
@@ -148,7 +148,7 @@ def test_mismatch_excerpts_are_escaped_and_follow_retention(policy, tmp_path):
     check.status = "fail"
     check.summary = report.requests[0].score_message
     check.metrics["scenarios"] = {"example": {"title": "Example", "status": "fail", "summary": check.summary}}
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     html = html_path.read_text()
     assert "<received" not in html
@@ -501,7 +501,7 @@ def test_serialized_retention_preserves_measurements_scores_and_source(policy, t
     report.requests[2].status = "timeout"
     report.requests[2].valid = False
     report.requests[2].error = "Request timed out"
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[1].score is False
     assert saved.requests[1].output_chars == 9
@@ -557,7 +557,7 @@ def test_tool_evidence_retention_and_html(policy, content_status, tmp_path):
         "response_events": events, "response_events_truncated": True,
     })
     before = report.model_dump()
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text()).requests[0]
     retained = policy == "all" or (policy == "failures" and content_status == "fail")
     assert saved.tool_evaluation.model_dump() == outcomes | {
@@ -587,7 +587,7 @@ def test_tool_evidence_retention_and_html(policy, content_status, tmp_path):
 def test_legacy_tool_report_remains_readable(tmp_path):
     report = make_report(count=1)
     report.requests[0].evaluation = None
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[0].tool_evaluation is None
     assert "Request evidence" in html_path.read_text()
@@ -611,7 +611,7 @@ def test_html_escapes_target_response_and_request_links(tmp_path: Path):
     report.requests[0].output = payload
     report.requests[0].id = '" onclick="alert(1)'
     report.checks[0].evidence_ids = [report.requests[0].id]
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     html = html_path.read_text()
     assert payload not in html
     assert "&lt;script&gt;" in html
@@ -623,7 +623,7 @@ def test_html_escapes_target_response_and_request_links(tmp_path: Path):
 
 def test_regression_evidence_bodies_are_retained_as_failures(tmp_path: Path):
     report = compare_baseline(make_report(latency=200), make_report("baseline"))
-    json_path, _ = write_report(report, tmp_path)
+    json_path, _ = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[0].output == "42"
     assert saved.baseline["status"] == "fail"
@@ -635,7 +635,7 @@ def test_intentional_cancellation_is_not_a_retention_failure(tmp_path: Path):
     report.requests[0].status = "cancelled"
     report.requests[0].valid = False
     report.requests[0].score = None
-    json_path, _ = write_report(report, tmp_path)
+    json_path, _ = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[0].output == ""
 
@@ -698,7 +698,7 @@ def test_judge_rationale_follows_answer_retention_without_losing_votes(tmp_path,
         "judgement": {"status": "pass" if score else "fail", "votes": [vote]},
     })
     original = report.model_copy(deep=True)
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = json.loads(json_path.read_text())["requests"][0]
     assert saved["judgement"]["votes"][0]["verdict"] == score
     assert bool(saved["judgement"]["votes"][0]["reason"]) == retained
@@ -721,7 +721,7 @@ def test_evaluation_context_and_schema_error_survive_report_retention(policy, tm
     record.evaluation = EvaluationEvidence(messages=[{"role": "user", "content": "<question>"}],
                                             scorer="json", expected=None, expected_provided=True,
                                             schema={"$ref": "#"}, rubric="No <invention>")
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text()).requests[0]
     assert saved.evaluation.messages == record.evaluation.messages
     assert saved.evaluation.schema_ == {"$ref": "#"}
@@ -761,7 +761,7 @@ def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evi
     report.checks = [CheckResult(id=name, target="local", title=name, status=status,
                                 summary="Measured evidence", evidence_ids=[r.id for r in evidence] + ["missing"])
                      for name in ["generation", "first_output", "serving"]]
-    _, path = write_report(report, tmp_path)
+    _, path = write_report(report, tmp_path, html=True)
     html = path.read_text()
     for index, record in enumerate(evidence):
         assert f'href="#request-{index}"' in html

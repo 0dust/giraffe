@@ -647,7 +647,7 @@ def _report(case_dir: Path) -> dict:
 def _record_missing_html(case_dir: Path, manifest: dict) -> None:
     if not (case_dir / "product-report" / "report.html").is_file():
         manifest.setdefault("artifact_absences", {})["product-report/report.html"] = (
-            "No final CLI HTML artifact survived; JSON availability and execution state are tracked separately.")
+            "HTML is optional: current Giraffe runs save JSON only; export with giraffe report RUN_DIR --html. JSON availability and execution state are tracked separately.")
 
 
 def run_case(study: Path, suite: dict, scenario: dict, repetition: int,

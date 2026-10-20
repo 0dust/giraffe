@@ -20,7 +20,7 @@ async def saved_report():
 
 async def test_load_report_columns_and_old_scenario_renderer(tmp_path):
     report = await saved_report()
-    _, html_path = write_report(report, tmp_path)
+    _, html_path = write_report(report, tmp_path, html=True)
     html = html_path.read_text()
     for text in ['How these are measured', 'Client concurrency mean / peak', 'Server-evidenced concurrency',
                  'Input tokens actual', 'Output tokens actual', 'Requested / observed request mix', 'Valid / required']:
