@@ -1,0 +1,470 @@
+[
+  {
+    "title": "1. Request accounting",
+    "key": "1_request_accounting",
+    "fields": [
+      {
+        "label": "Requests planned",
+        "key": "requests_planned"
+      },
+      {
+        "label": "Requests dispatched",
+        "key": "requests_dispatched"
+      },
+      {
+        "label": "Requests confirmed received by endpoint",
+        "key": "requests_confirmed_received_by_endpoint"
+      },
+      {
+        "label": "Requests never dispatched, by reason",
+        "key": "requests_never_dispatched_by_reason"
+      },
+      {
+        "label": "Dispatched requests with receipt unconfirmed",
+        "key": "dispatched_requests_with_receipt_unconfirmed"
+      },
+      {
+        "label": "Duplicate requests",
+        "key": "duplicate_requests"
+      },
+      {
+        "label": "Warm-up, probe, reference and retry attempt counts",
+        "key": "warm_up_probe_reference_and_retry_attempt_counts"
+      },
+      {
+        "label": "Logical-request and attempt reconciliation",
+        "key": "logical_request_and_attempt_reconciliation"
+      }
+    ]
+  },
+  {
+    "title": "2. Traffic delivery",
+    "key": "2_traffic_delivery",
+    "fields": [
+      {
+        "label": "Requested arrival rate",
+        "key": "requested_arrival_rate"
+      },
+      {
+        "label": "Actual dispatch, receipt, completion and successful-completion rates",
+        "key": "actual_dispatch_receipt_completion_and_successful_completion_rates"
+      },
+      {
+        "label": "Per-second traffic history and rate deviations",
+        "key": "per_second_traffic_history_and_rate_deviations"
+      },
+      {
+        "label": "Target concurrency",
+        "key": "target_concurrency"
+      },
+      {
+        "label": "Actual time-weighted mean, minimum and maximum concurrency",
+        "key": "actual_time_weighted_mean_minimum_and_maximum_concurrency"
+      },
+      {
+        "label": "Active time within concurrency tolerance",
+        "key": "active_time_within_concurrency_tolerance"
+      },
+      {
+        "label": "Replacement gap distribution",
+        "key": "replacement_gap_distribution"
+      },
+      {
+        "label": "Scheduled-start lateness distribution",
+        "key": "scheduled_start_lateness_distribution"
+      },
+      {
+        "label": "Burst dispatch and receiver arrival spreads",
+        "key": "burst_dispatch_and_receiver_arrival_spreads"
+      },
+      {
+        "label": "Catch-up bursts and rate overshoots",
+        "key": "catch_up_bursts_and_rate_overshoots"
+      },
+      {
+        "label": "Local-capacity and late-arrival drops",
+        "key": "local_capacity_and_late_arrival_drops"
+      }
+    ]
+  },
+  {
+    "title": "3. Duration",
+    "key": "3_duration",
+    "fields": [
+      {
+        "label": "Requested active duration",
+        "key": "requested_active_duration"
+      },
+      {
+        "label": "Actual load-generation duration",
+        "key": "actual_load_generation_duration"
+      },
+      {
+        "label": "Warm-up and ramp duration",
+        "key": "warm_up_and_ramp_duration"
+      },
+      {
+        "label": "Final response-drain duration",
+        "key": "final_response_drain_duration"
+      },
+      {
+        "label": "Total wall-clock duration",
+        "key": "total_wall_clock_duration"
+      },
+      {
+        "label": "Early termination and reason",
+        "key": "early_termination_and_reason"
+      },
+      {
+        "label": "Budget exhaustion and effect on requested workload",
+        "key": "budget_exhaustion_and_effect_on_requested_workload"
+      }
+    ]
+  },
+  {
+    "title": "4. Response accounting",
+    "key": "4_response_accounting",
+    "fields": [
+      {
+        "label": "Endpoint completed and failed responses",
+        "key": "endpoint_completed_and_failed_responses"
+      },
+      {
+        "label": "Responses fully processed by Giraffe",
+        "key": "responses_fully_processed_by_giraffe"
+      },
+      {
+        "label": "Partial responses, timeouts and cancellations",
+        "key": "partial_responses_timeouts_and_cancellations"
+      },
+      {
+        "label": "Responses absent from Giraffe records",
+        "key": "responses_absent_from_giraffe_records"
+      },
+      {
+        "label": "Missing, duplicate or corrupted response content/events",
+        "key": "missing_duplicate_or_corrupted_response_content_events"
+      },
+      {
+        "label": "Records processed, evaluated and persisted",
+        "key": "records_processed_evaluated_and_persisted"
+      },
+      {
+        "label": "Unreconciled response differences",
+        "key": "unreconciled_response_differences"
+      }
+    ]
+  },
+  {
+    "title": "5. Giraffe processing speed",
+    "key": "5_giraffe_processing_speed",
+    "fields": [
+      {
+        "label": "Responses processed per second",
+        "key": "responses_processed_per_second"
+      },
+      {
+        "label": "Stream protocol events processed per second",
+        "key": "stream_protocol_events_processed_per_second"
+      },
+      {
+        "label": "Response bytes processed per second",
+        "key": "response_bytes_processed_per_second"
+      },
+      {
+        "label": "Parsing time per response/event",
+        "key": "parsing_time_per_response_event"
+      },
+      {
+        "label": "Evaluation time per response",
+        "key": "evaluation_time_per_response"
+      },
+      {
+        "label": "Evaluation queue wait distribution",
+        "key": "evaluation_queue_wait_distribution"
+      },
+      {
+        "label": "Evaluation backlog and growth",
+        "key": "evaluation_backlog_and_growth"
+      },
+      {
+        "label": "Processing keeps pace with incoming data",
+        "key": "processing_keeps_pace_with_incoming_data"
+      }
+    ]
+  },
+  {
+    "title": "6. Giraffe delays",
+    "key": "6_giraffe_delays",
+    "fields": [
+      {
+        "label": "Request preparation time",
+        "key": "request_preparation_time"
+      },
+      {
+        "label": "Connection-pool or execution-slot wait",
+        "key": "connection_pool_or_execution_slot_wait"
+      },
+      {
+        "label": "Dispatch lateness",
+        "key": "dispatch_lateness"
+      },
+      {
+        "label": "Event-loop scheduling delay",
+        "key": "event_loop_scheduling_delay"
+      },
+      {
+        "label": "Independently measurable response-read delay",
+        "key": "independently_measurable_response_read_delay"
+      },
+      {
+        "label": "Result-writing delay",
+        "key": "result_writing_delay"
+      },
+      {
+        "label": "Worker-to-evaluator transfer and queue delay",
+        "key": "worker_to_evaluator_transfer_and_queue_delay"
+      }
+    ]
+  },
+  {
+    "title": "7. Timing accuracy",
+    "key": "7_timing_accuracy",
+    "fields": [
+      {
+        "label": "Reported and reference first-byte, first-answer and first-reasoning timings",
+        "key": "reported_and_reference_first_byte_first_answer_and_first_reasoning_timings"
+      },
+      {
+        "label": "Reported and reference completion latency",
+        "key": "reported_and_reference_completion_latency"
+      },
+      {
+        "label": "Reported and reference answer-event gaps",
+        "key": "reported_and_reference_answer_event_gaps"
+      },
+      {
+        "label": "Dispatch-based and intended-arrival-based latency",
+        "key": "dispatch_based_and_intended_arrival_based_latency"
+      },
+      {
+        "label": "Timing error distributions and allowed tolerances",
+        "key": "timing_error_distributions_and_allowed_tolerances"
+      },
+      {
+        "label": "Reference clock/network/observation uncertainty",
+        "key": "reference_clock_network_observation_uncertainty"
+      },
+      {
+        "label": "Qualified measurement count and percentage",
+        "key": "qualified_measurement_count_and_percentage"
+      },
+      {
+        "label": "Unreliable, missing or unknown measurements, by reason",
+        "key": "unreliable_missing_or_unknown_measurements_by_reason"
+      },
+      {
+        "label": "Buffered/coalesced events and unavailable token-level timing",
+        "key": "buffered_coalesced_events_and_unavailable_token_level_timing"
+      }
+    ]
+  },
+  {
+    "title": "8. Drops and lost evidence",
+    "key": "8_drops_and_lost_evidence",
+    "fields": [
+      {
+        "label": "Requests dropped before dispatch, by reason",
+        "key": "requests_dropped_before_dispatch_by_reason"
+      },
+      {
+        "label": "Confirmed client-side response/event loss",
+        "key": "confirmed_client_side_response_event_loss"
+      },
+      {
+        "label": "Results lost between processing, evaluation and persistence",
+        "key": "results_lost_between_processing_evaluation_and_persistence"
+      },
+      {
+        "label": "Records intentionally excluded by retention",
+        "key": "records_intentionally_excluded_by_retention"
+      },
+      {
+        "label": "Recorder overflow, truncation and checkpoint loss",
+        "key": "recorder_overflow_truncation_and_checkpoint_loss"
+      },
+      {
+        "label": "Unknown losses requiring investigation",
+        "key": "unknown_losses_requiring_investigation"
+      },
+      {
+        "label": "Attribution evidence and confidence",
+        "key": "attribution_evidence_and_confidence"
+      }
+    ]
+  },
+  {
+    "title": "9. Outcome, token and scoring correctness",
+    "key": "9_outcome_token_and_scoring_correctness",
+    "fields": [
+      {
+        "label": "Successful, failed, timed-out, cancelled and unresolved requests",
+        "key": "successful_failed_timed_out_cancelled_and_unresolved_requests"
+      },
+      {
+        "label": "Errors incorrectly classified as successes",
+        "key": "errors_incorrectly_classified_as_successes"
+      },
+      {
+        "label": "Valid completions incorrectly classified as failures",
+        "key": "valid_completions_incorrectly_classified_as_failures"
+      },
+      {
+        "label": "Expected and reported input/output tokens",
+        "key": "expected_and_reported_input_output_tokens"
+      },
+      {
+        "label": "Token-count source and reasoning/answer accounting",
+        "key": "token_count_source_and_reasoning_answer_accounting"
+      },
+      {
+        "label": "Expected and actual scores/verdicts",
+        "key": "expected_and_actual_scores_verdicts"
+      },
+      {
+        "label": "Evaluation failures and preserved partial records",
+        "key": "evaluation_failures_and_preserved_partial_records"
+      }
+    ]
+  },
+  {
+    "title": "10. Resource use and interference",
+    "key": "10_resource_use_and_interference",
+    "fields": [
+      {
+        "label": "CPU by process/thread and aggregate CPU",
+        "key": "cpu_by_process_thread_and_aggregate_cpu"
+      },
+      {
+        "label": "RAM per process and aggregate RAM, peak and growth",
+        "key": "ram_per_process_and_aggregate_ram_peak_and_growth"
+      },
+      {
+        "label": "Connections, file descriptors and leaks",
+        "key": "connections_file_descriptors_and_leaks"
+      },
+      {
+        "label": "Queue depths, bounds and growth",
+        "key": "queue_depths_bounds_and_growth"
+      },
+      {
+        "label": "Network and disk throughput",
+        "key": "network_and_disk_throughput"
+      },
+      {
+        "label": "Reference endpoint/recorder load and headroom",
+        "key": "reference_endpoint_recorder_load_and_headroom"
+      },
+      {
+        "label": "Instrumentation overhead and observation gaps",
+        "key": "instrumentation_overhead_and_observation_gaps"
+      },
+      {
+        "label": "Paired control versus scoring, telemetry, UI and reporting slowdown",
+        "key": "paired_control_versus_scoring_telemetry_ui_and_reporting_slowdown"
+      },
+      {
+        "label": "Effect on further dispatch, replacement gaps, reading and processing",
+        "key": "effect_on_further_dispatch_replacement_gaps_reading_and_processing"
+      }
+    ]
+  },
+  {
+    "title": "11. Failure and endurance results",
+    "key": "11_failure_and_endurance_results",
+    "fields": [
+      {
+        "label": "Injected fault, timing and expected behavior",
+        "key": "injected_fault_timing_and_expected_behavior"
+      },
+      {
+        "label": "Observed detection, classification and recovery",
+        "key": "observed_detection_classification_and_recovery"
+      },
+      {
+        "label": "Shutdown time and deadline",
+        "key": "shutdown_time_and_deadline"
+      },
+      {
+        "label": "Requests unresolved at shutdown",
+        "key": "requests_unresolved_at_shutdown"
+      },
+      {
+        "label": "Partial-evidence durability and last confirmed checkpoint",
+        "key": "partial_evidence_durability_and_last_confirmed_checkpoint"
+      },
+      {
+        "label": "Duplicate work after interruption/recovery",
+        "key": "duplicate_work_after_interruption_recovery"
+      },
+      {
+        "label": "Memory, connections and backlog trends over time",
+        "key": "memory_connections_and_backlog_trends_over_time"
+      },
+      {
+        "label": "Delivery, processing and timing degradation over time",
+        "key": "delivery_processing_and_timing_degradation_over_time"
+      },
+      {
+        "label": "Leaked processes, sockets or background work",
+        "key": "leaked_processes_sockets_or_background_work"
+      }
+    ]
+  },
+  {
+    "title": "12. Final verdict",
+    "key": "12_final_verdict",
+    "fields": [
+      {
+        "label": "Requested load delivered",
+        "key": "requested_load_delivered"
+      },
+      {
+        "label": "Response/accounting correctness",
+        "key": "response_accounting_correctness"
+      },
+      {
+        "label": "Measurement accuracy",
+        "key": "measurement_accuracy"
+      },
+      {
+        "label": "Evaluation correctness",
+        "key": "evaluation_correctness"
+      },
+      {
+        "label": "Reference test valid",
+        "key": "reference_test_valid"
+      },
+      {
+        "label": "Expected fault behavior",
+        "key": "expected_fault_behavior"
+      },
+      {
+        "label": "Overall experiment result",
+        "key": "overall_experiment_result"
+      },
+      {
+        "label": "Capacity contribution",
+        "key": "capacity_contribution"
+      },
+      {
+        "label": "Highest reliably supported workload",
+        "key": "highest_reliably_supported_workload"
+      },
+      {
+        "label": "Limitations, failed gates and next diagnostic",
+        "key": "limitations_failed_gates_and_next_diagnostic"
+      }
+    ]
+  }
+]

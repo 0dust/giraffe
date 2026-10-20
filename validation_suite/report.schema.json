@@ -1,0 +1,1028 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Giraffe validation exact per-case report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manifest",
+    "experiment_id",
+    "case_id",
+    "candidate",
+    "repetition",
+    "execution_status",
+    "sections",
+    "verdicts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "manifest": {
+      "type": "object"
+    },
+    "experiment_id": {
+      "enum": [
+        "E1",
+        "E2",
+        "E3",
+        "E4",
+        "E5",
+        "E6",
+        "E7"
+      ]
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repetition": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "execution_status": {
+      "enum": [
+        "completed",
+        "aborted",
+        "blocked",
+        "not_run"
+      ]
+    },
+    "sections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "1_request_accounting",
+        "2_traffic_delivery",
+        "3_duration",
+        "4_response_accounting",
+        "5_giraffe_processing_speed",
+        "6_giraffe_delays",
+        "7_timing_accuracy",
+        "8_drops_and_lost_evidence",
+        "9_outcome_token_and_scoring_correctness",
+        "10_resource_use_and_interference",
+        "11_failure_and_endurance_results",
+        "12_final_verdict"
+      ],
+      "properties": {
+        "1_request_accounting": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requests_planned",
+            "requests_dispatched",
+            "requests_confirmed_received_by_endpoint",
+            "requests_never_dispatched_by_reason",
+            "dispatched_requests_with_receipt_unconfirmed",
+            "duplicate_requests",
+            "warm_up_probe_reference_and_retry_attempt_counts",
+            "logical_request_and_attempt_reconciliation"
+          ],
+          "properties": {
+            "requests_planned": {
+              "$ref": "#/$defs/metric"
+            },
+            "requests_dispatched": {
+              "$ref": "#/$defs/metric"
+            },
+            "requests_confirmed_received_by_endpoint": {
+              "$ref": "#/$defs/metric"
+            },
+            "requests_never_dispatched_by_reason": {
+              "$ref": "#/$defs/metric"
+            },
+            "dispatched_requests_with_receipt_unconfirmed": {
+              "$ref": "#/$defs/metric"
+            },
+            "duplicate_requests": {
+              "$ref": "#/$defs/metric"
+            },
+            "warm_up_probe_reference_and_retry_attempt_counts": {
+              "$ref": "#/$defs/metric"
+            },
+            "logical_request_and_attempt_reconciliation": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "2_traffic_delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requested_arrival_rate",
+            "actual_dispatch_receipt_completion_and_successful_completion_rates",
+            "per_second_traffic_history_and_rate_deviations",
+            "target_concurrency",
+            "actual_time_weighted_mean_minimum_and_maximum_concurrency",
+            "active_time_within_concurrency_tolerance",
+            "replacement_gap_distribution",
+            "scheduled_start_lateness_distribution",
+            "burst_dispatch_and_receiver_arrival_spreads",
+            "catch_up_bursts_and_rate_overshoots",
+            "local_capacity_and_late_arrival_drops"
+          ],
+          "properties": {
+            "requested_arrival_rate": {
+              "$ref": "#/$defs/metric"
+            },
+            "actual_dispatch_receipt_completion_and_successful_completion_rates": {
+              "$ref": "#/$defs/metric"
+            },
+            "per_second_traffic_history_and_rate_deviations": {
+              "$ref": "#/$defs/metric"
+            },
+            "target_concurrency": {
+              "$ref": "#/$defs/metric"
+            },
+            "actual_time_weighted_mean_minimum_and_maximum_concurrency": {
+              "$ref": "#/$defs/metric"
+            },
+            "active_time_within_concurrency_tolerance": {
+              "$ref": "#/$defs/metric"
+            },
+            "replacement_gap_distribution": {
+              "$ref": "#/$defs/metric"
+            },
+            "scheduled_start_lateness_distribution": {
+              "$ref": "#/$defs/metric"
+            },
+            "burst_dispatch_and_receiver_arrival_spreads": {
+              "$ref": "#/$defs/metric"
+            },
+            "catch_up_bursts_and_rate_overshoots": {
+              "$ref": "#/$defs/metric"
+            },
+            "local_capacity_and_late_arrival_drops": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "3_duration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requested_active_duration",
+            "actual_load_generation_duration",
+            "warm_up_and_ramp_duration",
+            "final_response_drain_duration",
+            "total_wall_clock_duration",
+            "early_termination_and_reason",
+            "budget_exhaustion_and_effect_on_requested_workload"
+          ],
+          "properties": {
+            "requested_active_duration": {
+              "$ref": "#/$defs/metric"
+            },
+            "actual_load_generation_duration": {
+              "$ref": "#/$defs/metric"
+            },
+            "warm_up_and_ramp_duration": {
+              "$ref": "#/$defs/metric"
+            },
+            "final_response_drain_duration": {
+              "$ref": "#/$defs/metric"
+            },
+            "total_wall_clock_duration": {
+              "$ref": "#/$defs/metric"
+            },
+            "early_termination_and_reason": {
+              "$ref": "#/$defs/metric"
+            },
+            "budget_exhaustion_and_effect_on_requested_workload": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "4_response_accounting": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "endpoint_completed_and_failed_responses",
+            "responses_fully_processed_by_giraffe",
+            "partial_responses_timeouts_and_cancellations",
+            "responses_absent_from_giraffe_records",
+            "missing_duplicate_or_corrupted_response_content_events",
+            "records_processed_evaluated_and_persisted",
+            "unreconciled_response_differences"
+          ],
+          "properties": {
+            "endpoint_completed_and_failed_responses": {
+              "$ref": "#/$defs/metric"
+            },
+            "responses_fully_processed_by_giraffe": {
+              "$ref": "#/$defs/metric"
+            },
+            "partial_responses_timeouts_and_cancellations": {
+              "$ref": "#/$defs/metric"
+            },
+            "responses_absent_from_giraffe_records": {
+              "$ref": "#/$defs/metric"
+            },
+            "missing_duplicate_or_corrupted_response_content_events": {
+              "$ref": "#/$defs/metric"
+            },
+            "records_processed_evaluated_and_persisted": {
+              "$ref": "#/$defs/metric"
+            },
+            "unreconciled_response_differences": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "5_giraffe_processing_speed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "responses_processed_per_second",
+            "stream_protocol_events_processed_per_second",
+            "response_bytes_processed_per_second",
+            "parsing_time_per_response_event",
+            "evaluation_time_per_response",
+            "evaluation_queue_wait_distribution",
+            "evaluation_backlog_and_growth",
+            "processing_keeps_pace_with_incoming_data"
+          ],
+          "properties": {
+            "responses_processed_per_second": {
+              "$ref": "#/$defs/metric"
+            },
+            "stream_protocol_events_processed_per_second": {
+              "$ref": "#/$defs/metric"
+            },
+            "response_bytes_processed_per_second": {
+              "$ref": "#/$defs/metric"
+            },
+            "parsing_time_per_response_event": {
+              "$ref": "#/$defs/metric"
+            },
+            "evaluation_time_per_response": {
+              "$ref": "#/$defs/metric"
+            },
+            "evaluation_queue_wait_distribution": {
+              "$ref": "#/$defs/metric"
+            },
+            "evaluation_backlog_and_growth": {
+              "$ref": "#/$defs/metric"
+            },
+            "processing_keeps_pace_with_incoming_data": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "6_giraffe_delays": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "request_preparation_time",
+            "connection_pool_or_execution_slot_wait",
+            "dispatch_lateness",
+            "event_loop_scheduling_delay",
+            "independently_measurable_response_read_delay",
+            "result_writing_delay",
+            "worker_to_evaluator_transfer_and_queue_delay"
+          ],
+          "properties": {
+            "request_preparation_time": {
+              "$ref": "#/$defs/metric"
+            },
+            "connection_pool_or_execution_slot_wait": {
+              "$ref": "#/$defs/metric"
+            },
+            "dispatch_lateness": {
+              "$ref": "#/$defs/metric"
+            },
+            "event_loop_scheduling_delay": {
+              "$ref": "#/$defs/metric"
+            },
+            "independently_measurable_response_read_delay": {
+              "$ref": "#/$defs/metric"
+            },
+            "result_writing_delay": {
+              "$ref": "#/$defs/metric"
+            },
+            "worker_to_evaluator_transfer_and_queue_delay": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "7_timing_accuracy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reported_and_reference_first_byte_first_answer_and_first_reasoning_timings",
+            "reported_and_reference_completion_latency",
+            "reported_and_reference_answer_event_gaps",
+            "dispatch_based_and_intended_arrival_based_latency",
+            "timing_error_distributions_and_allowed_tolerances",
+            "reference_clock_network_observation_uncertainty",
+            "qualified_measurement_count_and_percentage",
+            "unreliable_missing_or_unknown_measurements_by_reason",
+            "buffered_coalesced_events_and_unavailable_token_level_timing"
+          ],
+          "properties": {
+            "reported_and_reference_first_byte_first_answer_and_first_reasoning_timings": {
+              "$ref": "#/$defs/metric"
+            },
+            "reported_and_reference_completion_latency": {
+              "$ref": "#/$defs/metric"
+            },
+            "reported_and_reference_answer_event_gaps": {
+              "$ref": "#/$defs/metric"
+            },
+            "dispatch_based_and_intended_arrival_based_latency": {
+              "$ref": "#/$defs/metric"
+            },
+            "timing_error_distributions_and_allowed_tolerances": {
+              "$ref": "#/$defs/metric"
+            },
+            "reference_clock_network_observation_uncertainty": {
+              "$ref": "#/$defs/metric"
+            },
+            "qualified_measurement_count_and_percentage": {
+              "$ref": "#/$defs/metric"
+            },
+            "unreliable_missing_or_unknown_measurements_by_reason": {
+              "$ref": "#/$defs/metric"
+            },
+            "buffered_coalesced_events_and_unavailable_token_level_timing": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "8_drops_and_lost_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requests_dropped_before_dispatch_by_reason",
+            "confirmed_client_side_response_event_loss",
+            "results_lost_between_processing_evaluation_and_persistence",
+            "records_intentionally_excluded_by_retention",
+            "recorder_overflow_truncation_and_checkpoint_loss",
+            "unknown_losses_requiring_investigation",
+            "attribution_evidence_and_confidence"
+          ],
+          "properties": {
+            "requests_dropped_before_dispatch_by_reason": {
+              "$ref": "#/$defs/metric"
+            },
+            "confirmed_client_side_response_event_loss": {
+              "$ref": "#/$defs/metric"
+            },
+            "results_lost_between_processing_evaluation_and_persistence": {
+              "$ref": "#/$defs/metric"
+            },
+            "records_intentionally_excluded_by_retention": {
+              "$ref": "#/$defs/metric"
+            },
+            "recorder_overflow_truncation_and_checkpoint_loss": {
+              "$ref": "#/$defs/metric"
+            },
+            "unknown_losses_requiring_investigation": {
+              "$ref": "#/$defs/metric"
+            },
+            "attribution_evidence_and_confidence": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "9_outcome_token_and_scoring_correctness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "successful_failed_timed_out_cancelled_and_unresolved_requests",
+            "errors_incorrectly_classified_as_successes",
+            "valid_completions_incorrectly_classified_as_failures",
+            "expected_and_reported_input_output_tokens",
+            "token_count_source_and_reasoning_answer_accounting",
+            "expected_and_actual_scores_verdicts",
+            "evaluation_failures_and_preserved_partial_records"
+          ],
+          "properties": {
+            "successful_failed_timed_out_cancelled_and_unresolved_requests": {
+              "$ref": "#/$defs/metric"
+            },
+            "errors_incorrectly_classified_as_successes": {
+              "$ref": "#/$defs/metric"
+            },
+            "valid_completions_incorrectly_classified_as_failures": {
+              "$ref": "#/$defs/metric"
+            },
+            "expected_and_reported_input_output_tokens": {
+              "$ref": "#/$defs/metric"
+            },
+            "token_count_source_and_reasoning_answer_accounting": {
+              "$ref": "#/$defs/metric"
+            },
+            "expected_and_actual_scores_verdicts": {
+              "$ref": "#/$defs/metric"
+            },
+            "evaluation_failures_and_preserved_partial_records": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "10_resource_use_and_interference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpu_by_process_thread_and_aggregate_cpu",
+            "ram_per_process_and_aggregate_ram_peak_and_growth",
+            "connections_file_descriptors_and_leaks",
+            "queue_depths_bounds_and_growth",
+            "network_and_disk_throughput",
+            "reference_endpoint_recorder_load_and_headroom",
+            "instrumentation_overhead_and_observation_gaps",
+            "paired_control_versus_scoring_telemetry_ui_and_reporting_slowdown",
+            "effect_on_further_dispatch_replacement_gaps_reading_and_processing"
+          ],
+          "properties": {
+            "cpu_by_process_thread_and_aggregate_cpu": {
+              "$ref": "#/$defs/metric"
+            },
+            "ram_per_process_and_aggregate_ram_peak_and_growth": {
+              "$ref": "#/$defs/metric"
+            },
+            "connections_file_descriptors_and_leaks": {
+              "$ref": "#/$defs/metric"
+            },
+            "queue_depths_bounds_and_growth": {
+              "$ref": "#/$defs/metric"
+            },
+            "network_and_disk_throughput": {
+              "$ref": "#/$defs/metric"
+            },
+            "reference_endpoint_recorder_load_and_headroom": {
+              "$ref": "#/$defs/metric"
+            },
+            "instrumentation_overhead_and_observation_gaps": {
+              "$ref": "#/$defs/metric"
+            },
+            "paired_control_versus_scoring_telemetry_ui_and_reporting_slowdown": {
+              "$ref": "#/$defs/metric"
+            },
+            "effect_on_further_dispatch_replacement_gaps_reading_and_processing": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "11_failure_and_endurance_results": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "injected_fault_timing_and_expected_behavior",
+            "observed_detection_classification_and_recovery",
+            "shutdown_time_and_deadline",
+            "requests_unresolved_at_shutdown",
+            "partial_evidence_durability_and_last_confirmed_checkpoint",
+            "duplicate_work_after_interruption_recovery",
+            "memory_connections_and_backlog_trends_over_time",
+            "delivery_processing_and_timing_degradation_over_time",
+            "leaked_processes_sockets_or_background_work"
+          ],
+          "properties": {
+            "injected_fault_timing_and_expected_behavior": {
+              "$ref": "#/$defs/metric"
+            },
+            "observed_detection_classification_and_recovery": {
+              "$ref": "#/$defs/metric"
+            },
+            "shutdown_time_and_deadline": {
+              "$ref": "#/$defs/metric"
+            },
+            "requests_unresolved_at_shutdown": {
+              "$ref": "#/$defs/metric"
+            },
+            "partial_evidence_durability_and_last_confirmed_checkpoint": {
+              "$ref": "#/$defs/metric"
+            },
+            "duplicate_work_after_interruption_recovery": {
+              "$ref": "#/$defs/metric"
+            },
+            "memory_connections_and_backlog_trends_over_time": {
+              "$ref": "#/$defs/metric"
+            },
+            "delivery_processing_and_timing_degradation_over_time": {
+              "$ref": "#/$defs/metric"
+            },
+            "leaked_processes_sockets_or_background_work": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        },
+        "12_final_verdict": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requested_load_delivered",
+            "response_accounting_correctness",
+            "measurement_accuracy",
+            "evaluation_correctness",
+            "reference_test_valid",
+            "expected_fault_behavior",
+            "overall_experiment_result",
+            "capacity_contribution",
+            "highest_reliably_supported_workload",
+            "limitations_failed_gates_and_next_diagnostic"
+          ],
+          "properties": {
+            "requested_load_delivered": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "inconclusive",
+                        "not_applicable"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "response_accounting_correctness": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "inconclusive",
+                        "not_applicable"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "measurement_accuracy": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "qualified",
+                        "unreliable",
+                        "unknown",
+                        "not_applicable"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "evaluation_correctness": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "inconclusive",
+                        "not_applicable"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "reference_test_valid": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "yes",
+                        "no",
+                        "unknown"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "expected_fault_behavior": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "inconclusive",
+                        "not_applicable"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "overall_experiment_result": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "inconclusive",
+                        "not run"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "capacity_contribution": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/metric"
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "enum": [
+                        "qualifies",
+                        "disqualifies",
+                        "inconclusive",
+                        "not_applicable"
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "highest_reliably_supported_workload": {
+              "$ref": "#/$defs/metric"
+            },
+            "limitations_failed_gates_and_next_diagnostic": {
+              "$ref": "#/$defs/metric"
+            }
+          }
+        }
+      }
+    },
+    "verdicts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_load_delivered",
+        "response_accounting_correctness",
+        "measurement_accuracy",
+        "evaluation_correctness",
+        "reference_test_valid",
+        "expected_fault_behavior",
+        "overall_experiment_result",
+        "capacity_contribution"
+      ],
+      "properties": {
+        "requested_load_delivered": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "not_applicable"
+          ]
+        },
+        "response_accounting_correctness": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "not_applicable"
+          ]
+        },
+        "measurement_accuracy": {
+          "enum": [
+            "qualified",
+            "unreliable",
+            "unknown",
+            "not_applicable"
+          ]
+        },
+        "evaluation_correctness": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "not_applicable"
+          ]
+        },
+        "reference_test_valid": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ]
+        },
+        "expected_fault_behavior": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "not_applicable"
+          ]
+        },
+        "overall_experiment_result": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "not run"
+          ]
+        },
+        "capacity_contribution": {
+          "enum": [
+            "qualifies",
+            "disqualifies",
+            "inconclusive",
+            "not_applicable"
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "value",
+        "unit",
+        "population",
+        "window",
+        "threshold",
+        "verdict",
+        "reason",
+        "evidence"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "measured",
+            "not_applicable",
+            "not_measured",
+            "unknown",
+            "unreliable"
+          ]
+        },
+        "value": {},
+        "unit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "population": {
+          "type": "string",
+          "minLength": 1
+        },
+        "window": {
+          "type": "string",
+          "minLength": 1
+        },
+        "threshold": {},
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive",
+            "not_applicable"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "measured"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "not": {
+                  "type": "null"
+                }
+              },
+              "evidence": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "not_measured",
+                  "unknown",
+                  "unreliable"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "verdict": {
+                "enum": [
+                  "inconclusive",
+                  "fail"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "not_applicable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "verdict": {
+                "const": "not_applicable"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "value": {
+                "type": "object",
+                "required": [
+                  "sample_count",
+                  "percentile_method"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/distribution"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "sample_count",
+        "min",
+        "median",
+        "p95",
+        "p99",
+        "max",
+        "percentile_method",
+        "qualification_coverage",
+        "tail_claims"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string"
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "median": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p95": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p99": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "percentile_method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "qualification_coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "qualified_count",
+            "total_count",
+            "percentage"
+          ],
+          "properties": {
+            "qualified_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "total_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "percentage": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 100
+            }
+          }
+        },
+        "tail_claims": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "p95",
+            "p99"
+          ],
+          "properties": {
+            "p95": {
+              "enum": [
+                "supported",
+                "unsupported_small_sample",
+                "unqualified"
+              ]
+            },
+            "p99": {
+              "enum": [
+                "supported",
+                "unsupported_small_sample",
+                "unqualified"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

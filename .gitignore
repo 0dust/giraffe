@@ -17,3 +17,6 @@ docs/reviews/
 
 # Local engine-validation notebooks and tooling.
 /examples/colab/
+
+# Local reliability implementation brief.
+/task.md
