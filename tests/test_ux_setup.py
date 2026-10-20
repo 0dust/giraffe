@@ -35,6 +35,156 @@ await vm.runInNewContext(source+'\n(async()=>{'+BODY+'\n})()',context);
     assert result.returncode == 0, result.stderr
 
 
+def test_structured_conflict_links_reveal_focus_and_clear_inline_errors():
+    run_browser_logic(r"""
+state.config={checks:['concurrency'],targets:[{}],concurrency:40};state.jsonDraft=state.jsonBase='synced';
+syncConfigView=syncSetupStep=syncTestControls=()=>{};
+const shared=element({tagName:'DETAILS',open:false}),nested=element({tagName:'DETAILS',open:false,parentElement:shared});
+const levels=element({name:'concurrent_levels',parentElement:nested,scrollIntoView(){this.scrolled=true;}});
+levels.attributes['aria-describedby']='field-concurrent_levels-hint';levels.getAttribute=name=>levels.attributes[name];
+const ceiling=element({name:'concurrency',parentElement:shared,scrollIntoView(){this.scrolled=true;}});
+for(const [name,input] of [['concurrent_levels',levels],['concurrency',ceiling]]){
+  nodes['#field-'+name]=input;nodes['#field-'+name+'-error']=element();
+}
+nodes['#new-run-form']={elements:{concurrent_levels:levels,concurrency:ceiling}};
+nodes['[data-test-card="concurrency"]']=element();
+const errors=[{field:'concurrent_workloads.levels',fields:['concurrent_workloads.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.',values:{concurrency:40}}];
+state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
+syncInlineErrors();
+assert.equal(levels.attributes['aria-invalid'],'true');assert.match(levels.attributes['aria-describedby'],/field-concurrent_levels-error/);
+assert.match(levels.attributes['aria-describedby'],/field-concurrent_levels-hint/);
+assert.match(nodes['#field-concurrency-error'].textContent,/64.*40/);
+let markup=renderRunBlueprint(state.config);
+assert.match(markup,/Concurrency level 64 exceeds Maximum at once 40/);
+assert.match(markup,/data-setting-path="concurrent_workloads.levels"[^>]*>Edit concurrency levels/);
+assert.match(markup,/data-setting-path="concurrency"[^>]*>Edit maximum at once/);
+state.setupStep=3;await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:'concurrent_workloads.levels'}}:null}});
+assert.equal(state.setupStep,2);assert.equal(state.openTest,'concurrency');assert(shared.open&&nested.open);assert(levels.focused&&levels.scrolled);
+assert.equal(levels.attributes['data-setting-highlight'],'true');
+focusSetting('concurrency');assert(ceiling.focused&&ceiling.scrolled);
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{}};
+syncInlineErrors();assert.equal(levels.attributes['aria-invalid'],undefined);assert(nodes['#field-concurrent_levels-error'].hidden);
+assert.equal(levels.attributes['aria-describedby'],'field-concurrent_levels-hint');
+assert.doesNotMatch(renderRunBlueprint(state.config),/Concurrency level 64 exceeds/);
+""")
+
+
+def test_indexed_and_section_errors_reveal_check_editors_instead_of_json():
+    run_browser_logic(r"""
+state.config={checks:['concurrency']};state.jsonDraft=state.jsonBase='synced';
+syncConfigView=syncSetupStep=syncTestControls=()=>{};
+switchConfigView=()=>{throw Error('Should stay in the form');};
+const levels=element({name:'concurrent_levels'}),heading=element();
+nodes['#new-run-form']={elements:{concurrent_levels:levels}};
+nodes['[data-test-card="concurrency"]']=element();nodes['#settings-concurrency [data-editor-title]']=heading;
+assert.equal(settingDestination('concurrent_workloads.levels.2').name,'concurrent_levels');
+focusSetting('concurrent_workloads.levels.2');assert(levels.focused);assert.equal(state.openTest,'concurrency');
+focusSetting('concurrent_workloads');assert(heading.focused);assert.equal(state.setupStep,2);
+""")
+
+
+def test_performance_session_conflicts_focus_visible_caps_and_selected_workload_rows():
+    run_browser_logic(r"""
+state.config={checks:['sessions'],sessions:{profile:'performance'}};state.jsonDraft=state.jsonBase='synced';
+syncConfigView=syncSetupStep=syncTestControls=()=>{};
+switchConfigView=()=>{throw Error('Should stay in the form');};
+const cap=element(),ceiling=element(),workload=element(),details=element({tagName:'DETAILS',open:false});workload.parentElement=details;
+nodes['#new-run-form']={elements:{sessions_profile:{value:'performance'},sessions_max_tokens:cap,concurrency:ceiling,
+  session_cap_1:workload,session_workload_count:{value:'2'},session_enabled_0:{checked:false},session_enabled_1:{checked:true}}};
+nodes['[data-test-card="sessions"]']=element();
+focusSetting('sessions.max_tokens');assert(cap.focused);
+focusSetting('sessions.concurrency');assert(ceiling.focused);
+focusSetting('sessions.workloads.0.max_tokens');assert(workload.focused);assert(details.open);
+assert.equal(settingDestination('sessions.workloads.0.max_tokens').name,'session_cap_1');
+nodes['#field-session_cap_1']=workload;nodes['#field-session_cap_1-error']=element();
+state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors:[{
+ field:'sessions.workloads.0.max_tokens',fields:['sessions.workloads.0.max_tokens','max_output_tokens'],msg:'Task cap exceeds output cap.'}]};
+syncInlineErrors();assert.equal(workload.attributes['aria-invalid'],'true');
+""")
+
+
+def test_draft_plan_errors_block_next_and_start_without_blocking_draft_operations():
+    run_browser_logic(r"""
+state.config={checks:['capacity'],targets:[{model:'m'}],max_duration_seconds:120};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+syncConfigView=syncSetupStep=captureFormDraft=()=>{};validateRunForm=()=>true;
+const input=element();nodes['#new-run-form']={elements:{max_duration_seconds:input}};nodes['#form-error']=element();nodes['#start-run']=element();nodes['#request-plan']=element();
+readForm=()=>({config:structuredClone(state.config)});
+const errors=[{field:'max_duration_seconds',fields:['max_duration_seconds'],msg:'Fixed windows need 180 seconds; limit is 120.'}];
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{errors}};
+assert(!canStartRun());navigateSetup(3);assert.equal(state.setupStep,2);assert(input.focused);
+let calls=[];api=async(path,options)=>{calls.push(path);return {config:JSON.parse(options.body),request_plan:{errors}};};
+// Apply/import, dataset edits and export snapshots deliberately use the editable draft endpoint.
+renderNew=toast=invalidateModelDiscovery=configChanged=()=>{};
+await applyConfig(JSON.stringify(state.config),{importing:true});assert.equal(calls.at(-1),'/api/config/draft');
+datasetEditingAllowed=()=>{};state.datasetSelection=[];
+assert(await applyDataset({version:1,cases:[]}));assert.equal(calls.at(-1),'/api/config/draft');
+state.jsonDraft=state.jsonBase='synced';const saved=await validatedSnapshot({draft:true});assert.equal(saved.config.max_duration_seconds,120);
+calls=[];state.setupStep=3;await startRun({preventDefault(){},target:{}});assert.equal(calls.length,0);assert(input.focused);
+""")
+
+
+def test_preview_conflict_blocks_next_and_clears_after_edit_without_review():
+    run_browser_logic(r"""
+state.config={checks:['concurrency'],targets:[{}],concurrency:40,max_requests:100,max_duration_seconds:300};
+state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+syncConfigView=syncSetupStep=syncTestControls=captureFormDraft=()=>{};validateRunForm=()=>true;
+nodes['#request-plan']=element();nodes['#form-error']=element();
+const input=element({name:'concurrent_levels'});nodes['#field-concurrent_levels']=input;nodes['#field-concurrent_levels-error']=element();
+nodes['#new-run-form']={elements:{concurrent_levels:input}};nodes['[data-test-card="concurrency"]']=element();
+readForm=()=>({config:structuredClone(state.config)});
+let fixed=false,calls=0;
+const errors=[{field:'concurrent_workloads.levels',fields:['concurrent_workloads.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
+api=async()=>{calls++;if(!fixed)throw Object.assign(new Error(errors[0].msg),{errors});return {config:state.config,request_plan:{rows:[],warnings:[],count_kind:'exact',planned_total:10}};};
+navigateSetup(3);await Promise.resolve();await Promise.resolve();await Promise.resolve();
+assert.equal(calls,1);assert.equal(state.setupStep,2);assert(input.focused);
+assert.equal(input.attributes['aria-invalid'],'true');assert.match(nodes['#request-plan'].innerHTML,/Edit concurrency levels/);
+// Editing invalidates old errors immediately; the debounced response confirms the fix.
+configChanged();assert.equal(input.attributes['aria-invalid'],undefined);
+fixed=true;await refreshRequestPreview(undefined,{draft:true});
+assert.equal(state.setupStep,2);assert(currentRequestPlan());assert.equal(currentSettingErrors().length,0);
+assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Concurrency level 64 exceeds/);
+""")
+
+
+def test_time_estimate_and_warning_have_distinct_copy_and_edit_links_in_both_views():
+    run_browser_logic(r"""
+state.config={checks:['access'],targets:[{}],concurrency:4,max_requests:100,max_duration_seconds:20};
+state.jsonDraft=state.jsonBase='synced';
+const plan={count_kind:'exact',planned_total:4,request_limit:100,rows:[],warnings:[],estimated_seconds:4,worst_case_seconds:120,
+ time_estimate_assumptions:['Assumes one second per request.'],time_warnings:[{msg:'The limit may leave checks unfinished.',fields:['max_duration_seconds','request_timeout_seconds']}]};
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};nodes['#request-plan']=element();
+renderRequestPlan();
+for(const markup of [nodes['#request-plan'].innerHTML,renderRunBlueprint(state.config,plan)]){
+  assert.match(markup,/Usually about 4s/);assert.match(markup,/Up to 2m 0s if every request hits its timeout/);
+  assert.match(markup,/Edit traffic time limit/);assert.match(markup,/Edit request timeout/);
+}
+assert(canStartRun());
+plan.errors=[{field:'max_duration_seconds',fields:['max_duration_seconds','traffic.rates'],msg:'Fixed windows exceed Traffic time limit.'}];
+assert(!canStartRun());renderRequestPlan();assert.match(nodes['#request-plan'].innerHTML,/data-setting-path="traffic.rates"/);
+plan.estimated_seconds=plan.worst_case_seconds=null;plan.time_bound_reasons=['Local fixture size unknown.'];
+assert.match(renderPlanTime(plan),/Completion time unknown/);assert.match(renderPlanTime(plan),/Local fixture size unknown/);
+""")
+
+
+def test_tab_title_tracks_active_run_across_pages_and_completion():
+    run_browser_logic(r"""
+for(const id of ['active-run-link','nav-new','nav-runs','breadcrumb'])nodes['#'+id]=element();
+updateNav('new','New run');assert.equal(document.title,'New run · Giraffe');
+state.runs=[{id:'live',state:'running',label:'Model test'}];setActive('live');
+assert.match(document.title,/● In progress · Model test · Giraffe/);
+updateNav('runs','History');assert.match(document.title,/In progress/);
+for(const status of ['completed','error','cancelled']){
+  state.runs[0].state='running';setActive('live');
+  state.runs[0].state=status;setActive(null);assert.equal(document.title,'History · Giraffe');
+}
+nodes['#run-count']=element();
+api=async()=>({active_run_id:'live',runs:[{id:'live',state:'running',label:'Polled run'}]});
+await refreshRuns();assert.equal(document.title,'● In progress · Polled run · Giraffe');
+api=async()=>({runs:[{id:'live',state:'completed'}]});
+await refreshRuns();assert.equal(document.title,'History · Giraffe');
+""")
+
+
 def test_connection_is_explicit_and_rejects_stale_endpoint_responses():
     run_browser_logic(r"""
 const form={elements:{url:element({value:'http://first/v1',checkValidity(){return true;},setCustomValidity(){}}),model:element({value:'manual-model',setCustomValidity(){}}),api_key_env:element({value:'FIRST_KEY'})}};

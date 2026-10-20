@@ -15,6 +15,163 @@ from giraffe.reporting import write_report
 from giraffe.web import create_app
 
 
+@pytest.mark.parametrize("endpoint", ["preview", "draft", "validate"])
+async def test_config_conflicts_include_fields_and_safe_values(tmp_path, endpoint):
+    values = config(checks=["concurrency"], concurrency=40, concurrent_workloads={
+        "scenarios": ["size_matrix"], "levels": [1, 2]})
+    values["concurrent_workloads"]["levels"] = [1, 64]
+    async with browser(tmp_path) as client:
+        response = await client.post(f"/api/config/{endpoint}", json=values)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["field"] == "concurrent_workloads.levels"
+    assert error["fields"] == ["concurrent_workloads.levels", "concurrency"]
+    assert error["values"] == {"concurrent_workloads.levels": [1, 64], "concurrency": 40}
+    assert "64" in error["msg"] and "Maximum at once 40" in error["msg"]
+
+
+@pytest.mark.parametrize("endpoint", ["preview", "validate"])
+async def test_config_time_policy_before_start(tmp_path, endpoint):
+    values = config(checks=["capacity"], max_duration_seconds=9,
+                    traffic={"rates": [1, 2], "duration_seconds": 5})
+    async with browser(tmp_path) as client:
+        response = await client.post(f"/api/config/{endpoint}", json=values)
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["field"] == "max_duration_seconds"
+        values["max_duration_seconds"] = 12
+        response = await client.post(f"/api/config/{endpoint}", json=values)
+        assert response.status_code == 200
+        assert response.json()["request_plan"]["time_warnings"]
+
+
+async def test_time_conflicts_remain_editable_exportable_and_allow_dataset_changes(tmp_path):
+    values = config(checks=["capacity"], max_duration_seconds=120,
+                    traffic={"rates": [1, 2, 3], "duration_seconds": 60})
+    async with browser(tmp_path) as client:
+        for edit in (False, True):
+            if edit:
+                values["request_pack"] = {"version": 1, "cases": [{"fixture_id": "one",
+                    "messages": [{"role": "user", "content": "Question"}], "scorer": "none"}]}
+                values["request_source"] = "request_pack"
+            response = await client.post("/api/config/draft", json=values)
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert result["request_plan"]["errors"][0]["field"] == "max_duration_seconds"
+            values = result["config"]  # Applying/importing and saving the normalized draft stays possible.
+            assert values["max_duration_seconds"] == 120
+            assert (await client.post("/api/config/validate", json=values)).status_code == 422
+            assert (await client.post("/api/config/cli", json={"config": values})).status_code == 200
+            assert (await client.post("/api/runs", json={"config": values})).status_code == 422
+
+
+@pytest.mark.parametrize("updates,field,expected", [
+    ({"checks": ["concurrency"], "concurrent_workloads": {"levels": [1, 16]}}, "concurrency", 4),
+    ({"checks": ["correctness"], "test_options": {"correctness": {"concurrency": 8}}}, "concurrency", 4),
+    ({"checks": ["access"], "test_options": {"access": {"request_timeout_seconds": 60}}}, "request_timeout_seconds", 30),
+])
+async def test_conflicts_resolve_omitted_global_defaults(tmp_path, updates, field, expected):
+    values = {"targets": [{"name": "local", "url": "http://localhost/v1", "model": "test"}], **updates}
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert "None" not in error["msg"]
+    assert error["values"][field] == expected
+
+
+async def test_coerced_bucket_caps_and_limits_return_conflict_instead_of_500(tmp_path):
+    values = {"targets": [{"name": "local", "url": "http://localhost/v1", "model": "test"}],
+              "checks": ["concurrency"], "max_output_tokens": "64", "concurrent_workloads": {
+                  "levels": [1, 2], "output_tokens": {"short": "16", "medium": "48", "long": "96"}}}
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["fields"] == ["concurrent_workloads.output_tokens.long", "max_output_tokens"]
+    assert "96" in error["msg"] and "64" in error["msg"]
+    assert error["values"]["concurrent_workloads.output_tokens.long"] == 96
+
+
+@pytest.mark.parametrize("raw_limit,expected", [("64", 200), ("not-a-number", 422)])
+async def test_concurrent_defaults_do_not_compare_raw_numeric_strings(tmp_path, raw_limit, expected):
+    values = {"targets": [{"name": "local", "url": "http://localhost/v1", "model": "test"}],
+              "checks": ["concurrency"], "concurrency": "4", "max_output_tokens": raw_limit,
+              "concurrent_workloads": {"scenarios": ["size_matrix"]}}
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == expected, response.text
+    if expected == 200:
+        assert response.json()["config"]["concurrent_workloads"]["output_tokens"]["long"] == 64
+
+
+async def test_performance_workload_cap_conflict_names_the_specific_workload(tmp_path):
+    values = config(checks=["sessions"], max_output_tokens=64, sessions={"profile": "performance",
+        "modes": ["live"], "workloads": [{"name": "coding", "turns": ["First", "Next"], "max_tokens": 32}]})
+    values["sessions"]["workloads"][0]["max_tokens"] = "96"
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["fields"] == ["sessions.workloads.0.max_tokens", "max_output_tokens"]
+    assert error["values"]["sessions.workloads.0.max_tokens"] == 96
+
+
+async def test_workload_question_validation_does_not_echo_numeric_input(tmp_path):
+    values = config(checks=["sessions"], sessions={"profile": "performance", "modes": ["live"],
+        "workloads": [{"name": "chat", "turns": ["First", "Second"]}]})
+    values["sessions"]["workloads"][0]["turns"][0] = 123456789
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == 422
+    assert "123456789" not in response.text
+
+
+async def test_field_validation_has_destination_without_echoing_secret_input(tmp_path):
+    values = config(checks=["access"])
+    values["request_timeout_seconds"] = "pasted-secret"
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["field"] == "request_timeout_seconds"
+    assert error["loc"] == ["body", "request_timeout_seconds"]
+    assert error["values"] == {}
+    assert "pasted-secret" not in response.text
+
+
+async def test_check_timeout_override_conflict_links_both_limits(tmp_path):
+    values = config(checks=["access"], request_timeout_seconds=30)
+    values["test_options"] = {"access": {"request_timeout_seconds": 60}}
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", json=values)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["fields"] == ["test_options.access.request_timeout_seconds", "request_timeout_seconds"]
+    assert error["values"] == {"test_options.access.request_timeout_seconds": 60, "request_timeout_seconds": 30}
+    assert "60" in error["msg"] and "30" in error["msg"]
+
+
+async def test_nonfinite_validation_values_remain_serializable(tmp_path):
+    values = config(checks=["access"])
+    values["request_timeout_seconds"] = float("nan")
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/config/preview", content=json.dumps(values),
+                                     headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["values"] == {}
+
+
+async def test_impossible_time_budget_cannot_start_traffic(tmp_path, monkeypatch):
+    monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Started impossible plan"))
+    values = config(checks=["capacity"], max_duration_seconds=1,
+                    traffic={"rates": [1], "duration_seconds": 2})
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/runs", json={"config": values})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["field"] == "max_duration_seconds"
+        assert (await client.get("/api/runs")).json()["runs"] == []
+
+
 def config(**updates):
     return RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1",
                                "model": "test-model"}], **updates).model_dump(mode="json")
