@@ -1,0 +1,55 @@
+targets:
+- name: local
+  url: http://127.0.0.1:8080/v1
+  model: replace-with-served-model-id
+checks:
+- concurrency
+concurrency: 2
+context_limit: 16384
+max_output_tokens: 10000
+max_requests: 300
+max_duration_seconds: 3600
+request_timeout_seconds: 900
+samples: 2
+retention: failures
+request_options:
+  temperature: 0
+concurrent_workloads:
+  scenarios:
+  - size_matrix
+  - mixed_interference
+  - streaming_fairness
+  - token_stress
+  input_chars:
+    short: 64
+    medium: 256
+    long: 4096
+  output_tokens:
+    short: 16
+    medium: 64
+    long: 128
+  levels:
+  - 1
+  - 2
+  samples_per_bucket: 2
+  mixed_pairs: 2
+  window_seconds: 120
+  input_token_tolerance: 0.1
+  calibration_attempts: 3
+  stress_cases:
+  - name: long_input_summary
+    input_tokens: 10000
+    output_tokens: 50
+    min_output_tokens: 50
+  - name: short_input_long_output
+    max_input_tokens: 128
+    output_tokens: 10000
+    min_output_tokens: 10000
+limits:
+  min_samples: 2
+  max_error_rate: 0
+  min_correctness: 1
+  first_output_ms: 60000
+  latency_ms: 900000
+  stream_gap_ms: 10000
+  fairness_max_ratio: 5

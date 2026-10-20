@@ -209,26 +209,6 @@ async def test_missing_cap_usage_remedy_does_not_raise_output_budget(client, mon
     assert "raise max_output_tokens" not in check.summary
 
 
-async def test_fairness_overlap_remedy_targets_server_parallelism(client, monkeypatch):
-    original, lock = client.execute, asyncio.Lock()
-
-    async def serialized(self, spec, **kwargs):
-        queued = time.monotonic()
-        async with lock:
-            waited = (time.monotonic() - queued) * 1000
-            record = await original(self, spec, **kwargs)
-            return record.model_copy(update={field: getattr(record, field) + waited
-                for field in ("elapsed_ms", "first_output_ms", "last_output_ms", "stream_end_ms")})
-
-    monkeypatch.setattr(client, "execute", serialized)
-    report = await runner.run_suite(config(checks=["concurrency"],
-        concurrent_workloads={"scenarios": ["streaming_fairness"]},
-        limits=Limits(min_samples=2, fairness_max_ratio=3)))
-    check = next(c for c in report.checks if c.id == "concurrency")
-    assert check.status == "inconclusive"
-    assert "enable parallel serving on the server" in check.summary
-    assert "raising client concurrency alone cannot" in check.summary
-    assert "--concurrency 1" not in check.summary
 
 
 async def test_budget_verdict_has_real_plan_minimum(client):
@@ -243,22 +223,6 @@ async def test_budget_verdict_has_real_plan_minimum(client):
     assert "select fewer checks" in check.summary
 
 
-@pytest.mark.parametrize("answers", [False, True])
-async def test_fairness_failure_cause_survives_public_summary(client, answers):
-    client.bad_mixed_gap = True
-    if answers:
-        client.bad_target = "service"
-    report = await runner.run_suite(config(checks=["concurrency"],
-        concurrent_workloads={"scenarios": ["streaming_fairness"]},
-        limits=Limits(min_samples=2, stream_gap_ms=50, fairness_max_ratio=3)))
-    check = next(c for c in report.checks if c.id == "concurrency")
-    assert check.status == "fail"
-    assert "stream gap 500 ms > allowed 50 ms" in check.summary
-    assert "To conclude," in check.summary
-    assert "address the slowdown" in check.summary
-    assert ("rerun after changing the model or its settings" in check.summary) == answers
-    if answers:
-        assert check.summary.index("check the model's answers") < check.summary.index("address the slowdown")
 
 
 async def test_sustained_verdict_names_required_duration(client):
@@ -320,30 +284,12 @@ async def test_wrong_answer_summary_has_expected_and_received(client):
 
 async def test_all_unfinished_default_verdicts_offer_a_remedy(client):
     report = await runner.run_suite(config(checks=RunConfig.model_fields["checks"].get_default(call_default_factory=True),
-        max_requests=1))
-    assert all("To conclude," in check.summary for check in report.checks
-               if check.status in {"fail", "inconclusive"})
+        max_requests=1, concurrency=4, max_duration_seconds=300))
+    unfinished = [check for check in report.checks if check.status in {"fail", "inconclusive"}]
+    assert any(check.id == "concurrency" for check in unfinished)
+    assert all("To conclude," in check.summary for check in unfinished), [(check.id, check.summary) for check in unfinished]
 
 
-def test_fairness_ratio_failure_names_metric_values():
-    from giraffe.concurrent_workloads import consolidate_checks, execution_config
-
-    configured = config(checks=["concurrency"], concurrent_workloads={"scenarios": ["streaming_fairness"]},
-        limits=Limits(min_samples=2, fairness_max_ratio=3))
-    state = runner._Run(execution_config(configured), None, None)
-    state.observations["service"]["fairness"].update(pairs=2, overlaps=2)
-    for scenario in ("fairness_baseline", "fairness_short", "fairness_long"):
-        for index in range(2):
-            state.records.append(RequestRecord(id=f"{scenario}-{index}", target="service",
-                fixture_id="fairness", scenario=scenario, check_ids=["fairness"],
-                started_at="2026-10-19T00:00:00Z", status="completed", valid=True, score=True,
-                elapsed_ms=20, first_output_ms=2, last_output_ms=10 if scenario == "fairness_short" else 4,
-                answer_chunks=2, stream_end_ms=20))
-    checks = consolidate_checks(state, configured, runner._checks(state, configured.targets[0]))
-    check = next(c for c in checks if c.id == "concurrency")
-    assert check.status == "fail"
-    assert "short-stream decoding ratio 4 > allowed 3" in check.summary
-    assert "address the slowdown" in check.summary
 
 
 async def test_capacity_guidance_uses_duration_and_real_sample_gate(client):
@@ -354,18 +300,12 @@ async def test_capacity_guidance_uses_duration_and_real_sample_gate(client):
     assert "at least 5 scored completions" in check.summary
 
 
-async def test_fairness_output_budget_names_actual_required_cap(client):
-    report = await runner.run_suite(config(checks=["concurrency"], max_output_tokens=8,
-        concurrent_workloads={"scenarios": ["streaming_fairness"]}))
-    check = next(c for c in report.checks if c.id == "concurrency")
-    assert check.status == "inconclusive"
-    assert "max_output_tokens (or --max-output-tokens) to at least 60" in check.summary
 
 
 async def test_versioned_recovery_prompt_has_stable_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
-        "9af0ebdc853200070007d5c0c38cd9f4e9cf8f6f259b8a4b006e504c4a8eb70c")
+        "9aa71dc20218667d5cfcb17bcc4b26d8fc6bd80f217715ecf7061b02e5b7293e")
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -408,51 +348,8 @@ def check(report, id, target="service"):
     return next(c for c in report.checks if c.id == id and c.target == target)
 
 
-async def test_bucket_window_expires_while_waiting_for_shared_concurrency(client):
-    from giraffe.workloads import buckets
-    from giraffe.concurrent_workloads import execution_config
-
-    configuration = config(checks=["buckets"], concurrency=8,
-                           buckets={"levels": [8], "samples_per_bucket": 2,
-                                    "window_seconds": .01})
-    run = runner._Run(execution_config(configuration), None, None)
-    target = configuration.targets[0]
-    for _ in range(configuration.concurrency):
-        run.slots.get_nowait()
-
-    async def release_competing_requests():
-        await asyncio.sleep(.04)
-        for _ in range(configuration.concurrency):
-            run.release_slot()
-
-    await asyncio.gather(buckets(run, target, client(target, configuration)),
-                         release_competing_requests())
-    assert not any(record.scenario == "bucket_c8_short_short" for record in run.records)
-    assert run.records  # Later cells can still use the released slots.
-    assert "buckets" in run.unfinished[target.name]
-    assert run.slots.qsize() == configuration.concurrency
 
 
-async def test_bucket_request_uses_remaining_window_after_queue_admission(client, monkeypatch):
-    from giraffe.workloads import bucket_spec
-
-    configuration = config(checks=["buckets"])
-    run = runner._Run(configuration, None, None)
-    target = configuration.targets[0]
-    request = bucket_spec(configuration.buckets, "short", "short", "bucket", "buckets", 1)
-    monkeypatch.setattr(client, "delay", 1)
-    for _ in range(configuration.concurrency):
-        run.slots.get_nowait()
-    deadline = time.monotonic() + .2
-    pending = asyncio.create_task(run.request(target, client(target, configuration), request,
-                                             timeout_override=.2, deadline_override=deadline))
-    await asyncio.sleep(.1)
-    for _ in range(configuration.concurrency):
-        run.release_slot()
-    record = await pending
-    assert record.status == "timeout"
-    assert record.elapsed_ms < 150
-    assert run.slots.qsize() == configuration.concurrency
 
 
 @pytest.mark.parametrize("selected,allowed", [
@@ -691,28 +588,8 @@ async def test_observational_timing_and_separate_initial_samples(client):
     assert check(unbounded, "first_output").status == "inconclusive"
 
 
-async def test_buffered_stream_is_not_mixed_fairness_evidence(client):
-    client.useful_event = False
-    report = await runner.run_suite(config(checks=["fairness"],
-                                          limits=Limits(fairness_max_ratio=2, min_samples=2)))
-    assert check(report, "fairness").status == "inconclusive"
-    assert report.observations["targets"]["service"]["fairness"]["overlaps"] == 0
-    assert not any(r.scenario == "fairness_long" for r in report.requests)
 
 
-async def test_actual_mixed_overlap_and_stream_gap_violation(client, monkeypatch):
-    original = client.execute
-    async def overlapping_prefill(self, spec, **kwargs):
-        record = await original(self, spec, **kwargs)
-        if spec.scenario == "fairness_long":
-            record.first_output_ms = 0
-        return record
-    monkeypatch.setattr(client, "execute", overlapping_prefill)
-    client.bad_mixed_gap = True
-    report = await runner.run_suite(config(checks=["fairness"],
-                                          limits=Limits(stream_gap_ms=10, min_samples=2)))
-    assert check(report, "fairness").status == "fail"
-    assert report.observations["targets"]["service"]["fairness"]["overlaps"] == 2
 
 
 async def test_deliberate_deadline_and_cancellation_not_serving_failures():
@@ -820,7 +697,7 @@ async def test_context_correction_does_not_erase_an_earlier_wrong_answer(client,
     assert result.metrics["correct"] < result.metrics["scored"]
 
 
-@pytest.mark.parametrize("check_id", ["capacity", "fairness", "cancellation", "recovery"])
+@pytest.mark.parametrize("check_id", ["capacity", "cancellation", "recovery"])
 async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     client, monkeypatch, check_id,
 ):
@@ -975,19 +852,6 @@ async def test_one_sample_still_exercises_both_output_and_stop_limits():
     assert check(report, "cancellation").status == "pass"
 
 
-async def test_fairness_cannot_pass_when_long_requests_fail(client, monkeypatch):
-    original = client.execute
-
-    async def failed_long(self, spec, **kwargs):
-        result = await original(self, spec, **kwargs)
-        if spec.scenario == "fairness_long":
-            result.status, result.valid = "failed", False
-        return result
-
-    monkeypatch.setattr(client, "execute", failed_long)
-    report = await runner.run_suite(config(checks=["fairness"],
-                                          limits=Limits(fairness_max_ratio=2, min_samples=2)))
-    assert check(report, "fairness").status == "fail"
 
 
 async def test_sustained_semantic_corruption_fails_recovery(client, monkeypatch):
@@ -1136,29 +1000,9 @@ async def test_nonstreaming_recovery_cannot_pass_configured_gap_limit():
     assert result.metrics["missing_timing_metrics"] == ["stream_gap_ms"]
 
 
-async def test_fairness_missing_configured_gap_is_inconclusive(client, monkeypatch):
-    original = client.execute
-
-    async def no_mixed_gap(self, spec, **kwargs):
-        result = await original(self, spec, **kwargs)
-        if spec.scenario == "fairness_short":
-            result.max_stream_gap_ms = None
-        elif spec.scenario == "fairness_long":
-            result.first_output_ms = 0
-        return result
-
-    monkeypatch.setattr(client, "execute", no_mixed_gap)
-    report = await runner.run_suite(config(checks=["fairness"],
-                                          limits=Limits(stream_gap_ms=10, fairness_max_ratio=10,
-                                                        min_samples=2)))
-    result = check(report, "fairness")
-    assert result.status == report.overall == "inconclusive"
-    assert result.metrics["overlaps"] == 2
-    assert result.metrics["missing_timing_metrics"] == ["stream_gap_ms"]
 
 
-@pytest.mark.parametrize("scenario,check_id", [("traffic_stage_1", "capacity"),
-                                                ("fairness_long", "fairness")])
+@pytest.mark.parametrize("scenario,check_id", [("traffic_stage_1", "capacity")])
 async def test_mixed_and_capacity_semantic_failures_are_not_acceptable_load(
         client, monkeypatch, scenario, check_id):
     original = client.execute
@@ -1181,7 +1025,7 @@ async def test_mixed_and_capacity_semantic_failures_are_not_acceptable_load(
         assert result.metrics["accuracy"] == pytest.approx(2/3)
 
 
-@pytest.mark.parametrize("check_id", ["capacity", "fairness"])
+@pytest.mark.parametrize("check_id", ["capacity"])
 async def test_unscored_valid_load_is_inconclusive(monkeypatch, check_id):
     original = runner.score_response
 
@@ -1219,7 +1063,7 @@ async def test_output_cap_includes_reported_reasoning_tokens(client, monkeypatch
     assert len(result.metrics["output_cap_violations"]) == 1
 
 
-@pytest.mark.parametrize("check_id", ["first_output", "generation", "capacity", "fairness", "recovery"])
+@pytest.mark.parametrize("check_id", ["first_output", "generation", "capacity", "recovery"])
 async def test_generator_saturation_makes_timing_violation_inconclusive(monkeypatch, check_id):
     original = runner._Run.monitor
 
@@ -1336,7 +1180,7 @@ async def test_client_dispatch_anchor_excludes_slow_progress_callback(monkeypatc
     assert all("_timing_started_monotonic" not in r.model_dump() for r in report.requests)
 
 
-@pytest.mark.parametrize("check_id", ["capacity", "fairness", "recovery"])
+@pytest.mark.parametrize("check_id", ["capacity", "recovery"])
 async def test_generator_saturation_does_not_hide_known_answer_failure(client, monkeypatch, check_id):
     client.bad_target = "service"
     original = runner._Run.monitor
@@ -1814,23 +1658,12 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         assert event["budget_used"] >= event["attempted"]
 
 
-@pytest.mark.parametrize("stream,concurrency", [(True, 1), (False, 1), (False, 2)])
-async def test_fairness_prerequisite_remedy_names_missing_configuration(client, stream, concurrency):
-    report = await runner.run_suite(config(checks=["fairness"], stream=stream, concurrency=concurrency))
-    result = check(report, "fairness")
-    assert result.status == "inconclusive"
-    remedy = result.summary.split("To conclude, ")[-1]
-    assert ("--concurrency 2 or more" in remedy) == (concurrency < 2)
-    assert ("stream: true" in remedy) == (not stream)
-    assert "completion token usage" not in remedy and "max_requests" not in remedy
 
 
 @pytest.mark.parametrize("check_id,summary,options", [
     ("first_output", "Timing observed; no acceptance limit configured.", ["first_output_ms"]),
     ("generation", "Timing observed; no acceptance limit configured.",
      ["latency_ms", "stream_gap_ms", "min_output_tokens_per_second"]),
-    ("fairness", "Mixed-traffic effect observed; no acceptance ratio configured.", ["fairness_max_ratio"]),
-    ("mixed", "Mixed-load ratios measured; no acceptance ratio configured.", ["fairness_max_ratio"]),
     ("recovery", "Recovery observed; no acceptance limit configured.",
      ["recovery_max_ratio", "first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second"]),
     ("arrivals", "Arrivals observed; no acceptance limit configured.",
@@ -2097,9 +1930,6 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
 
 @pytest.mark.parametrize("phase,settings", [
     ("initial", {}), ("warm", {}), ("context_calibration", {"checks": ["context"]}),
-    ("bucket_", {"checks": ["concurrency"], "concurrent_workloads": {"scenarios": ["size_matrix"]}}),
-    ("stress_", {"checks": ["concurrency"], "concurrent_workloads": {"scenarios": ["token_stress"],
-        "stress_cases": [{"name": "long_input_summary", "input_tokens": 128, "output_tokens": 50}]}}),
     ("session_", {"checks": ["sessions"], "context_limit": 4096}),
     ("traffic_stage_", {"checks": ["capacity"], "traffic": {"rates": [100], "duration_seconds": .1,
                                                            "drain_timeout_seconds": 1}}),
@@ -2253,7 +2083,7 @@ async def test_silent_target_stops_independently_and_healthy_target_finishes(mon
     assert reasons["silent"] in html_path.read_text()
 
 
-@pytest.mark.parametrize("scenario", ["traffic_stage_0", "sustained", "context", "stress_calibration_case", "fairness_long"])
+@pytest.mark.parametrize("scenario", ["traffic_stage_0", "sustained", "context", "context_calibration"])
 @pytest.mark.parametrize("fault", ["timeout", "connect"])
 async def test_stress_watchdog_counts_connection_failures_but_not_overload_timeouts(client, monkeypatch, scenario, fault):
     from giraffe.models import RequestSpec

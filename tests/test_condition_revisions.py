@@ -81,11 +81,10 @@ async def test_arrival_pending_queue_shortfall_is_not_a_stopped_check():
     assert row["reason"] == "pending queue full"
 
 
-@pytest.mark.parametrize("check", ["matrix", "mixed", "sessions", "consistency", "logprobs"])
+@pytest.mark.parametrize("check", ["sessions", "consistency", "logprobs"])
 async def test_full_known_plan_is_waiting_before_first_dispatch(check):
     events = []
     config = configuration(
-        concurrent_workloads={"scenarios": ["size_matrix", "mixed_interference"], "levels": [1, 2], "samples_per_bucket": 2, "mixed_pairs": 1},
         sessions={"modes": ["fixed", "live"], "sessions": 1},
         consistency={"shapes": ["short", "long"], "levels": [2], "prompts_per_shape": 2, "repetitions": 2,
                      **({"logprobs": {}} if check == "logprobs" else {})})
@@ -103,9 +102,7 @@ async def test_full_known_plan_is_waiting_before_first_dispatch(check):
 
     fixtures = builtin_fixtures(config)
     fixtures = {key: value if isinstance(value, list) else [value] for key, value in fixtures.items()}
-    if check in {"matrix", "mixed"}:
-        await workloads.buckets(run, config.targets[0], InspectClient())
-    elif check == "sessions":
+    if check == "sessions":
         await workloads.sessions(run, config.targets[0], InspectClient())
     else:
         await workloads.consistency(run, config.targets[0], InspectClient(), fixtures)

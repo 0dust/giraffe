@@ -22,7 +22,7 @@ from pydantic import Field, ValidationError
 from giraffe.capabilities import capabilities
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
-from giraffe.models import CHECK_NAMES, ConcurrentWorkloads, ConfigDraft, Model, RunConfig, RunReport, Sessions
+from giraffe.models import CHECK_NAMES, ConcurrentLoad, ConfigDraft, Model, RunConfig, RunReport, Sessions
 from giraffe.planning import request_plan
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
@@ -41,7 +41,7 @@ def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
     config = body.get("config", body) if isinstance(body, dict) else {}
     labels = {"concurrency": "Maximum at once", "max_output_tokens": "Output cap (tokens)",
               "request_timeout_seconds": "Request timeout (seconds)",
-              "max_duration_seconds": "Traffic time limit", "concurrent_workloads.levels": "Concurrency levels",
+              "max_duration_seconds": "Traffic time limit", "concurrent_load.schedule.levels": "Concurrency levels",
               "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
               "traffic.max_in_flight": "Capacity requests at once"}
 
@@ -67,9 +67,13 @@ def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
                       result[int(key)] if isinstance(result, list) and key.isdigit() and int(key) < len(result) else None)
         if result is None:
             parts = path.split(".")
-            model = RunConfig if len(parts) == 1 else {"sessions": Sessions, "concurrent_workloads": ConcurrentWorkloads}.get(parts[0])
+            model = RunConfig if len(parts) == 1 else {"sessions": Sessions, "concurrent_load": ConcurrentLoad}.get(parts[0])
             if model and len(parts) <= 2 and parts[-1] in model.model_fields:
                 result = model.model_fields[parts[-1]].get_default(call_default_factory=True)
+        if result is None and path.startswith("concurrent_load."):
+            result = ConcurrentLoad().model_dump()
+            for key in path.split(".")[1:]:
+                result = result.get(key) if isinstance(result, dict) else None
         if isinstance(result, list):
             values = [number(item) for item in result]
             return values if all(numeric(item) for item in values) else None
@@ -81,8 +85,36 @@ def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
         path = ".".join(map(str, [part for part in loc if part not in ("body", "config")]))
         fields = [path] if path else []
         override = re.search(r"test_options\.([a-z_]+)\.([a-z_]+) must not exceed", message)
-        levels = re.search(r"(concurrent_workloads|consistency)\.levels must not exceed", message)
-        if override:
+        levels = re.search(r"(consistency)\.levels must not exceed", message)
+        structured = item.get("ctx", {}).get("fields")
+        if structured:
+            fields = [str(f) for f in structured]
+            if path.startswith("concurrent_load.") and not fields[0].startswith("concurrent_load."):
+                parent = path.rsplit(".", len(fields[0].split(".")))[0]
+                fields = [parent + "." + f for f in fields]
+        elif path.startswith("concurrent_load."):
+            parts = path.split(".")[1:]
+            label = {"schedule.levels": "Concurrency levels", "schedule.duration_seconds": "Duration per workload at each concurrency level",
+                "combinations.selected": "Input/output combinations", "combinations.enabled": "Input → output combinations",
+                "mixed.shares": "Share of requests", "mixed.seed": "Mixed load seed",
+                "interference.trigger": "Introduce the long input", "interference.trigger_chunks": "Answer chunks per short stream",
+                "interference.max_slowdown": "Maximum slowdown vs short-only control",
+                "stress.min_output_percent": "Minimum output length (% of cap)",
+                "pass_criteria.first_output_p95_ms": "First answer p95 at most (ms)", "pass_criteria.response_p95_ms": "Response p95 at most (ms)",
+                "pass_criteria.max_error_percent": "Errors allowed (%)", "pass_criteria.min_correct_percent": "Correct answers required (%)",
+                "pass_criteria.min_valid_responses": "Minimum valid responses per test point",
+                "input_token_tolerance": "Input token tolerance", "calibration_attempts": "Calibration attempts"}.get(".".join(parts[:2]), "Concurrent load")
+            if parts[0] == "profile" and len(parts) >= 3 and parts[1] in {"short", "medium", "long"}:
+                label = parts[1].capitalize() + (" input token target" if parts[2] == "input_tokens" else " output token cap")
+            if item["type"] == "literal_error" and parts[:2] == ["interference", "trigger"]:
+                message = "Introduce the long input after the short streams begin responding or after a number of answer chunks."
+            elif item["type"] == "extra_forbidden":
+                message = "Remove the unrecognized setting under Concurrent load."
+            elif message.startswith("Input should be "):
+                message = label + " must be " + message.removeprefix("Input should be ").rstrip(".") + "."
+            elif item["type"] != "value_error":
+                message = label + ": " + message
+        elif override:
             path = f"test_options.{override[1]}.{override[2]}"
             fields = [path, override[2]]
             label = "requests at once" if override[2] == "concurrency" else labels.get(override[2], override[2]).lower()
@@ -97,12 +129,6 @@ def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
         elif message.startswith("session concurrency must not exceed"):
             fields = ["sessions.concurrency", "concurrency"]
             message = f"Session concurrency {value(fields[0])} exceeds Maximum at once {value('concurrency')}."
-        elif message.startswith("bucket output budgets"):
-            caps = config.get("concurrent_workloads", {}).get("output_tokens", ConcurrentWorkloads().output_tokens)
-            ceiling = value("max_output_tokens")
-            fields = [f"concurrent_workloads.output_tokens.{size}" for size, cap in caps.items()
-                      if numeric(number(cap)) and numeric(ceiling) and number(cap) > ceiling] + ["max_output_tokens"]
-            message = f"Answer caps {', '.join(str(number(caps[field.split('.')[-1]])) for field in fields[:-1])} tokens exceed Output cap {ceiling} tokens."
         elif message.startswith("session workload output budgets"):
             ceiling = value("max_output_tokens")
             fields = [f"sessions.workloads.{index}.max_tokens" for index, workload in enumerate(config.get("sessions", {}).get("workloads", []))
@@ -117,7 +143,7 @@ def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
         elif path in labels:
             message = f"{labels[path]}: {message}"
         safe_fields = set(labels) | {"samples", "max_requests", "sessions.max_tokens"} | set(fields if override or levels else [])
-        safe_fields.update(field for field in fields if field.startswith("concurrent_workloads.output_tokens.")
+        safe_fields.update(field for field in fields if field.startswith("concurrent_load.")
                            or re.fullmatch(r"sessions\.workloads\.\d+\.max_tokens", field))
         errors.append({"loc": loc, "msg": message, "field": fields[0], "fields": fields,
                        "values": {field: value(field) for field in fields if field in safe_fields and value(field) is not None}})
@@ -160,6 +186,7 @@ class SessionCredentials(Model):
 
 class StartRun(SessionCredentials):
     config: RunConfig
+    migration_notes: list[str] = Field(default_factory=list, max_length=1000)
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
     restart_target: str | None = None
@@ -248,11 +275,14 @@ def _bootstrap_config(defaults: dict | None) -> dict:
     else:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
         config.update(defaults)
+        if "concurrent_load" not in defaults:
+            config.pop("concurrent_load", None)
     config["restart_target"] = None
     return config
 
 
-def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> FastAPI:
+def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
+               migration_notes: list[str] | None = None) -> FastAPI:
     root = Path(runs_dir).resolve()
     baseline_root = root / ".baselines"
     if baseline_root.is_symlink():
@@ -445,6 +475,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         configuration = _bootstrap_config(defaults)
         resolved = ConfigDraft.model_validate(configuration)
         return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
+                "migration_notes": list(dict.fromkeys([*(migration_notes or []), *resolved._migration_notes])),
                 "active_run_id": active.get("id"), "request_plan": request_plan(resolved)}
 
     @app.get("/api/capabilities")
@@ -474,18 +505,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.post("/api/config/draft")
     async def validate_draft(config: ConfigDraft):
         """Normalize a draft for editing or export without requiring run readiness."""
-        return {"config": config.model_dump(mode="json"), "request_plan": request_plan(config)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": request_plan(config)}
 
+    @app.post("/api/config/plan")
     @app.post("/api/config/validate")
     async def validate_config(config: RunConfig):
         """Normalize edits using the same contract as a run without sending traffic."""
-        return {"config": config.model_dump(mode="json"), "request_plan": _validated_plan(config)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": _validated_plan(config)}
 
     @app.post("/api/config/preview")
     async def preview_config(config: ConfigDraft):
         """Describe effective requests and coverage without target calls or file imports."""
         preview = pack_preview(config)
-        return {"config": config.model_dump(mode="json"), "request_pack_preview": preview,
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_pack_preview": preview,
                 "request_plan": _validated_plan(config, pack_details=preview)}
 
     @app.post("/api/datasets/preview")
@@ -524,6 +556,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     def prepare_run(body: StartRun) -> tuple[RunConfig, RunReport | None]:
         """Resolve the same execution intent for Start and Copy CLI."""
         config = body.config
+        config._migration_notes = list(dict.fromkeys([*config._migration_notes, *body.migration_notes]))
         body.attach_api_keys(config)
         if body.mode == "normal":
             if config.restart_target or body.restart_target:

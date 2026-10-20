@@ -15,19 +15,18 @@ from giraffe.reporting import write_report
 from giraffe.web import create_app
 
 
-@pytest.mark.parametrize("endpoint", ["preview", "draft", "validate"])
+@pytest.mark.parametrize("endpoint", ["preview", "draft", "validate", "plan"])
 async def test_config_conflicts_include_fields_and_safe_values(tmp_path, endpoint):
-    values = config(checks=["concurrency"], concurrency=40, concurrent_workloads={
-        "scenarios": ["size_matrix"], "levels": [1, 2]})
-    values["concurrent_workloads"]["levels"] = [1, 64]
+    values = config(checks=["concurrency"], concurrency=40, concurrent_load={"schedule": {"levels": [1, 2]}})
+    values["concurrent_load"]["schedule"]["levels"] = [1, 64]
     async with browser(tmp_path) as client:
         response = await client.post(f"/api/config/{endpoint}", json=values)
     assert response.status_code == 422
     error = response.json()["detail"][0]
-    assert error["field"] == "concurrent_workloads.levels"
-    assert error["fields"] == ["concurrent_workloads.levels", "concurrency"]
-    assert error["values"] == {"concurrent_workloads.levels": [1, 64], "concurrency": 40}
-    assert "64" in error["msg"] and "Maximum at once 40" in error["msg"]
+    assert error["field"] == "concurrent_load.schedule.levels"
+    assert error["fields"] == ["concurrent_load.schedule.levels", "concurrency"]
+    assert error["values"] == {"concurrent_load.schedule.levels": [1, 64], "concurrency": 40}
+    assert error["msg"] == "Concurrency level 64 exceeds Maximum at once (40)."
 
 
 @pytest.mark.parametrize("endpoint", ["preview", "validate"])
@@ -65,7 +64,7 @@ async def test_time_conflicts_remain_editable_exportable_and_allow_dataset_chang
 
 
 @pytest.mark.parametrize("updates,field,expected", [
-    ({"checks": ["concurrency"], "concurrent_workloads": {"levels": [1, 16]}}, "concurrency", 4),
+    ({"checks": ["concurrency"], "concurrent_load": {"schedule": {"levels": [1, 16]}}}, "concurrency", 4),
     ({"checks": ["correctness"], "test_options": {"correctness": {"concurrency": 8}}}, "concurrency", 4),
     ({"checks": ["access"], "test_options": {"access": {"request_timeout_seconds": 60}}}, "request_timeout_seconds", 30),
 ])
@@ -79,17 +78,19 @@ async def test_conflicts_resolve_omitted_global_defaults(tmp_path, updates, fiel
     assert error["values"][field] == expected
 
 
-async def test_coerced_bucket_caps_and_limits_return_conflict_instead_of_500(tmp_path):
+async def test_profile_caps_return_structured_conflict_instead_of_500(tmp_path):
     values = {"targets": [{"name": "local", "url": "http://localhost/v1", "model": "test"}],
-              "checks": ["concurrency"], "max_output_tokens": "64", "concurrent_workloads": {
-                  "levels": [1, 2], "output_tokens": {"short": "16", "medium": "48", "long": "96"}}}
+              "checks": ["concurrency"], "max_output_tokens": "64", "concurrent_load": {
+                  "profile": {"short": {"input_tokens": 128, "output_tokens": 16},
+                              "medium": {"input_tokens": 512, "output_tokens": 48},
+                              "long": {"input_tokens": 2048, "output_tokens": 96}}}}
     async with browser(tmp_path) as client:
         response = await client.post("/api/config/preview", json=values)
     assert response.status_code == 422
     error = response.json()["detail"][0]
-    assert error["fields"] == ["concurrent_workloads.output_tokens.long", "max_output_tokens"]
+    assert error["fields"] == ["concurrent_load.profile.long.output_tokens", "max_output_tokens"]
     assert "96" in error["msg"] and "64" in error["msg"]
-    assert error["values"]["concurrent_workloads.output_tokens.long"] == 96
+    assert error["values"]["concurrent_load.profile.long.output_tokens"] == 96
 
 
 @pytest.mark.parametrize("raw_limit,expected", [("64", 200), ("not-a-number", 422)])
@@ -101,7 +102,7 @@ async def test_concurrent_defaults_do_not_compare_raw_numeric_strings(tmp_path, 
         response = await client.post("/api/config/preview", json=values)
     assert response.status_code == expected, response.text
     if expected == 200:
-        assert response.json()["config"]["concurrent_workloads"]["output_tokens"]["long"] == 64
+        assert response.json()["config"]["concurrent_load"]["profile"]["long"]["output_tokens"] == 64
 
 
 async def test_performance_workload_cap_conflict_names_the_specific_workload(tmp_path):
@@ -324,8 +325,8 @@ async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
     async with browser(tmp_path) as client:
         result = (await client.get("/api/bootstrap")).json()
         for check in result["checks"]:
-            assert set(check["option_fields"]) == CHECK_OPTION_FIELDS[check["id"]]
-            assert set(check["limit_fields"]) == CHECK_LIMIT_FIELDS[check["id"]]
+            assert set(check["option_fields"]) == CHECK_OPTION_FIELDS.get(check["id"], set())
+            assert set(check["limit_fields"]) == CHECK_LIMIT_FIELDS.get(check["id"], set())
             assert set(check["option_fields"]) <= result["option_schema"]["properties"].keys()
             assert set(check["limit_fields"]) <= result["limits_schema"]["properties"].keys()
         assert result["traffic_schema"]["properties"]["arrival"]["enum"] == ["steady", "poisson"]
@@ -463,10 +464,12 @@ async def test_config_validation_never_starts_traffic_and_preserves_sparse_overr
         assert saved["targets"][1]["name"] == "other"
         assert saved["traffic"]["arrival"] == "poisson"
         assert (await client.get("/api/runs")).json()["runs"] == []
-        for changes in ({"checks": []}, {"traffic": {"rates": [3, 1]}},
+        for changes in ({"traffic": {"rates": [3, 1]}},
                         {"test_options": {"correctness": {"sustained_seconds": 5}}}):
             rejected = await client.post("/api/config/validate", json=values | changes)
             assert rejected.status_code == 422
+        empty = await client.post("/api/config/validate", json=values | {"checks": []})
+        assert empty.status_code == 200 and empty.json()["config"]["checks"] == []
         assert (await client.get("/api/runs")).json()["runs"] == []
 
 
@@ -494,7 +497,7 @@ async def test_blank_model_draft_sync_and_export_keep_execution_strict(tmp_path,
             assert (await client.post("/api/config/draft", json=saved | changes)).status_code == 422
         for target in saved["targets"]:
             target["model"] = "test-model"
-        assert (await client.post("/api/config/validate", json=saved)).status_code == (200 if checks else 422)
+        assert (await client.post("/api/config/validate", json=saved)).status_code == 200
         saved["checks"] = ["capacity"]
         assert (await client.post("/api/config/validate", json=saved)).status_code == 200
         assert (await client.post("/api/config/cli", json={"config": saved})).status_code == 200

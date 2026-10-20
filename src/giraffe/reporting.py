@@ -15,7 +15,7 @@ import tempfile
 from typing import Any
 
 from .deployment import deployment_diff, safe_config, sanitize
-from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status
+from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status, load_shape_label
 from .workloads import WORKLOAD_CHECKS
 from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
 
@@ -388,11 +388,75 @@ def _compare_traffic(
     return result
 
 
+def _concurrent_load_html(metrics):
+    from giraffe.conditions import condition_for
+    def shown(value):
+        return "not reported" if value is None else f"{value:.3g}" if isinstance(value, float) else str(value)
+    def tokens(lengths, name):
+        values = lengths[name]
+        actual = f"{shown(values['median'])} ({shown(values['min'])}–{shown(values['max'])})"
+        return actual + " / " + shown(lengths["input_target" if name == "input_tokens" else "output_cap"])
+    seconds = metrics.get("configured_load_seconds")
+    parts = [f"<p>Configured load time: {_e(seconds)} {'second' if seconds == 1 else 'seconds'}.</p>"]
+    passed = [p for group in metrics["load_types"].values() for p in group["points"] if p["status"] == "pass"]
+    if passed:
+        level = max(p["level"] for p in passed)
+        parts.append(f"<p>Highest observed among tested settings: {level} concurrent {'request' if level == 1 else 'requests'}.</p>")
+    for kind, group in metrics["load_types"].items():
+        parts.append(f"<h4>{_e(group['title'])}</h4><div class=table><table><tr>" + "".join(
+            f"<th>{_e(h)}</th>" for h in ("Workload", "Requested concurrency", "Delivered / configured window (s)",
+            "Sent / completed", "Errors failed / timeouts", "Cancelled", "Valid / required", "Correct %",
+            "Client concurrency mean / peak", "Server-evidenced concurrency", "First-output p95 (ms)", "Response p95 (ms)",
+            "Requests/s", "Output tok/s", "Input tokens actual median (min–max) / target", "Output tokens actual median (min–max) / cap", "Status and reason")) + "</tr>")
+        for point in group["points"]:
+            lengths = point["token_lengths"]
+            cells = [condition_for(point["id"])["label"], point["level"],
+                f"{shown(point['delivered_window_seconds'])} / {shown(point['configured_window_seconds'])}",
+                f"{point['sent']} / {point['completed']}", f"{point['failed']} / {point['timed_out']}", point["cancelled"],
+                f"{point['valid']} / {point['required']}", shown(point["correct_percent"]) if point["correctness_applicable"] else "not applicable",
+                f"{shown(point['client_mean_inflight'])} / {point['client_peak_inflight']}", point["server_evidenced_concurrency"],
+                shown(point["first_output_p95_ms"]), shown(point["response_p95_ms"]), shown(point["requests_per_second"]), shown(point["output_tokens_per_second"]),
+                "; ".join(f"{load_shape_label(shape)}: {tokens(value, 'input_tokens')}" for shape, value in lengths.items()),
+                "; ".join(f"{load_shape_label(shape)}: {tokens(value, 'output_tokens')}" for shape, value in lengths.items()),
+                f"{point['status']} · {point['reason']}"]
+            parts.append("<tr>" + "".join(f"<td>{_e(v)}</td>" for v in cells) + "</tr>")
+            notes = [f"Drain: {shown(point['drain_seconds'])} s. Reasoning budget exhausted: {point['reasoning_budget_exhausted']}."]
+            if point.get("throughput_warning"):
+                notes.append(point["throughput_warning"])
+            if kind == "mixed":
+                notes.append("Requested / observed request mix / observed in-flight time: " + "; ".join(
+                    f"{load_shape_label(shape)}: {shown(m['requested_percent'])}% / {shown(m['sent_percent'])}% ({m['sent']} sent) / {shown(m['inflight_percent'])}%"
+                    for shape, m in point.get("observed_mix", {}).items()))
+            if kind == "interference" and (data := point.get("interference")):
+                notes.append(data["allocation"] + ". Control vs probe decode medians: " +
+                    f"{shown(data['control']['decode_median_ms'])} / {shown(data['probe']['decode_median_ms'])} ms; " +
+                    f"matched: {data['control']['matched_count']} / {data['probe']['matched_count']}; slowdown: {shown(data['slowdown'])}; " +
+                    f"response-time ratio: {shown(data['response_time_ratio'])}; longest pauses: {shown(data['control']['longest_stream_pause_ms'])} / {shown(data['probe']['longest_stream_pause_ms'])} ms; " +
+                    f"trigger latency median: {shown(data['trigger_latency_ms']['median'])} ms; probes never triggered: {data['probes_never_triggered']}. " +
+                    f"Short-stream concurrency mean / peak / server-evidenced: {shown(point.get('short_stream_mean_inflight'))} / {shown(point.get('short_stream_peak_inflight'))} / {shown(point.get('short_stream_evidenced_concurrency'))}. " +
+                    f"Buffered short streams excluded from matching: {shown(data.get('buffered_short_streams'))} / {shown(data.get('valid_short_streams'))}; ambiguous A/B overlaps excluded from both groups: {shown(data.get('ambiguous_short_streams'))}.")
+            if coverage := point.get("coverage"):
+                notes.append(f"Output coverage: {coverage['covered_valid_responses']} / {coverage['required']} required responses at or above {coverage['threshold_tokens']} {'token' if coverage['threshold_tokens'] == 1 else 'tokens'}.")
+            parts.append('<tr><td colspan="17">' + _e(" ".join(notes)) + "</td></tr>")
+        parts.append("</table></div>")
+    parts.append("<p><strong>How these are measured.</strong> Sending windows begin at first dispatch; individual slots refill until the window ends. In-flight requests drain and remain in latency, correctness and error counts. Client concurrency is a time-weighted mean and peak during sending; server concurrency needs overlapping streamed output. Interference qualifies its N−1 continuous short streams plus enough matched probes in both groups; probe trigger idle time does not count against short-stream load. Throughput uses completions from the first completion through the sending-window end, excluding drain. With few samples p95 is effectively the maximum. Missing token counts are not reported, never zero. Input tokens are targets; output tokens are caps and answers may finish sooner.</p>")
+    for calibration in metrics.get("calibrations", []):
+        if calibration.get("reason_code") == "minimum_prompt_length":
+            parts.append("<p>Input token calibration: " + _e(calibration["reason"]) + "</p>")
+    if metrics.get("migration_notes"):
+        parts.append("<p>Configuration migration: " + _e(" ".join(metrics["migration_notes"])) + "</p>")
+    return "".join(parts)
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
     result.checks = [check for check in result.checks if check.id != "baseline"]
     reasons = _settings_reasons(report, baseline)
+    current_load = [c for c in report.checks if c.id == "concurrency" and c.required]
+    previous_load = [c for c in baseline.checks if c.id == "concurrency" and c.required]
+    if any("load_types" in c.metrics for c in current_load) != any("load_types" in c.metrics for c in previous_load) and current_load and previous_load:
+        reasons.insert(0, "baseline uses the previous Concurrent workloads format")
     config = report.manifest.get("config", {})
     limits = config.get("limits", {})
     minimum = max(2, int(limits.get("min_samples", 5)))
@@ -920,6 +984,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "concurrency" and "load_types" in check.metrics:
+            metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(check.title)}</strong>'

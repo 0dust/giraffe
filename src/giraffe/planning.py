@@ -7,10 +7,10 @@ from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import corpus_width, sample_count
-from giraffe.concurrent_workloads import SCENARIOS, execution_config
-from giraffe.models import CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
+from giraffe.concurrent_load import context_window, calibration_keys, load_time_plan, minimum_reservation, running_shapes, test_points, later_reservation, prompt_overhead
+from giraffe.models import CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, load_shape_label
 from giraffe.request_pack import active_pack, pack_summary
-from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt, prefix_admitted
+from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 
@@ -31,7 +31,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
 
     Sum sequential phases and targets for a conservative bound even when targets
     overlap. Request calls do not retry; readiness polling has its own deadline.
-    Matrix windows cap admission, not completion: the last batch can still drain.
+    Configured load windows set minimum sending time; active requests can still drain.
     These are network/workload budgets, not bounds on Python or report I/O time.
     """
     typical = worst = minimum = 0.0
@@ -43,7 +43,6 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
         if count == 0 and name != "capacity":
             continue
         check = {"initial": "access", "pack_loaded": "correctness",
-                 "fairness_baseline": "fairness", "fairness_short": "fairness",
                  "context_first_batch": "context", "recovery_prime": "recovery",
                  "recovery_baseline": "recovery", "limits.stop_control": "cancellation",
                  "backend_cancellation": "cancellation"}.get(name, name)
@@ -61,11 +60,12 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
             typical += windows + len(traffic.rates) * min(1, timeout, traffic.drain_timeout_seconds)
             worst += windows + len(traffic.rates) * min(timeout, traffic.drain_timeout_seconds)
             continue
-        if name == "buckets":
-            for level in bucket_levels:
-                batches = math.ceil(level["requests_per_case"] / min(level["concurrency"], config.concurrency))
-                typical += 9 * min(batches * min(1, wait), config.buckets.window_seconds + min(1, wait))
-                worst += 9 * min(batches * wait, config.buckets.window_seconds + wait)
+        if name.startswith("load_") and name != "load_calibration":
+            detail = load_time_plan(config.concurrent_load)[name.removeprefix("load_")]
+            windows = detail["configured_load_seconds"]
+            minimum += windows
+            typical += windows + detail["test_points"] * min(1, wait)
+            worst += windows + detail["test_points"] * wait
             continue
         if name == "restart_readiness":
             typical += min(1, config.readiness_timeout_seconds)
@@ -97,15 +97,6 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
             typical += batches * min(1, wait)
             worst += count * wait
             continue
-        if name.startswith("token_stress_"):
-            settings = config.concurrent_workloads
-            case = next(case for case in settings.stress_cases if name == f"token_stress_{case.name}")
-            calibration = settings.calibration_attempts if case.input_tokens else 0
-            batches = calibration + sum(math.ceil(max(settings.samples_per_bucket, level) / min(level, config.concurrency))
-                                        for level in settings.levels)
-            typical += batches * min(1, wait)
-            worst += (calibration + sum(max(settings.samples_per_bucket, level) for level in settings.levels)) * wait
-            continue
         if name == "sessions":
             settings = config.sessions
             turns = max(len(workload.turns) for workload in settings.workloads) if settings.profile == "performance" else len(settings.turns)
@@ -119,8 +110,6 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
         if count is None:
             if name == "context":
                 count = 1 + 2 * next(row["requests_per_target"] for row in rows if row["id"] == "context_first_batch")
-            elif name == "fairness":
-                count = config.effective_check("fairness")["samples"]
             elif name == "backend_cancellation":
                 count = 3 * config.effective_check("cancellation")["samples"]
             else:
@@ -146,7 +135,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
     worst *= targets
     errors, warnings = [], []
     if minimum > config.max_duration_seconds:
-        fields = ["max_duration_seconds"]
+        fields = (["concurrent_load.schedule.duration_seconds", "max_duration_seconds"]
+                  if "concurrency" in selected else ["max_duration_seconds"])
         if "capacity" in selected:
             fields += ["traffic.duration_seconds", "traffic.rates"]
         if "arrivals" in selected:
@@ -184,7 +174,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     The optional preview avoids rebuilding request-pack schedules in the API.
     """
     public_config = config
-    config = execution_config(config)
     selected = set(config.checks)
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -198,11 +187,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         rows.append({"id": identifier, "title": title or CHECK_NAMES.get(identifier, identifier),
                      "requests_per_target": count, "kind": kind, "source": source,
                      "summary": summary})
-
-    if "concurrency" in public_config.checks:
-        names = public_config.concurrent_workloads.scenarios
-        add("concurrency", 0, "Selected scenarios: " + "; ".join(SCENARIOS[name][1] for name in names)
-            + ". The rows below count their separate requests and controls.")
 
     # Only fixture cardinalities are needed. Keep context filler small even if
     # the operator has configured a very large context limit.
@@ -268,18 +252,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         if len(traffic.rates) * traffic.duration_seconds > config.max_duration_seconds:
             warnings.append("The selected rates need more time than the run limit allows, before connection and answer checks.")
 
-    if "fairness" in selected:
-        count = config.effective_check("fairness")["samples"]
-        fairness_needed = len(next(spec for spec in fixtures["generation"]
-            if spec.fixture_id.startswith("fairness.copy")).expected.split()) + 12
-        if config.stream and config.concurrency >= 2 and config.max_output_tokens >= fairness_needed:
-            add("fairness_baseline", count, "Matched quiet streaming controls.", title="Fairness controls")
-            add("fairness_short", count, "One short request per fairness trial.", title="Fairness short requests")
-            add("fairness", None, f"Up to {count} long requests start only while a short response is streaming.",
-                kind="bounded")
-        else:
-            add("fairness", 0, "Requires streaming, concurrency of at least two and enough output tokens; no fairness requests run.")
-
     context_count = 0
     if "context" in selected:
         context_options = config.effective_check("context")
@@ -319,8 +291,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Backend cancellation verification")
     if "recovery" in selected:
         options = config.effective_check("recovery")
-        later = [name for name in config.checks if name not in CORE_CHECKS]
-        later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["known_per_target"]
+        later = [name for name in config.checks if name not in CORE_CHECKS or name == "concurrency"]
+        later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["minimum_reserved_per_target"]
         prior = sum(row["requests_per_target"] or 0 for row in rows)
         needed = later_known + 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
         eligible = [quota - prior > needed for quota in quotas.values()]
@@ -354,57 +326,46 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 f"{2 * settings.repeats} shared/independent prefix controls and {history} fixed-history requests admitted by the token estimate.")
 
     bucket_cases, bucket_levels = [], []
-    if selected & {"buckets", "mixed"}:
-        settings = config.buckets
-        for input_shape in ("short", "medium", "long"):
-            for output_shape in ("short", "medium", "long"):
-                request = bucket_spec(settings, input_shape, output_shape, "preview", "buckets", 1, config.context_limit)
-                bucket_cases.append({"input_chars": settings.input_chars[input_shape],
-                                     "actual_input_chars": request.input_chars,
-                                     "output_tokens": request.max_tokens})
-        if "buckets" in selected:
-            bucket_levels = [{"concurrency": level,
-                              "requests_per_case": sample_count(settings.samples_per_bucket, level),
-                              "requests_per_target": 9 * sample_count(settings.samples_per_bucket, level)}
-                             for level in settings.levels]
-            add("buckets", sum(level["requests_per_target"] for level in bucket_levels),
-                "Tries every question length with every answer cap at each selected load. Each combination sends enough requests to reach that load.",
-                title="Question and answer size tests")
-        if "mixed" in selected and config.max_output_tokens < 96:
-            add("mixed", 0, "Requires an output cap of at least 96 tokens for the known light passage.")
-            warnings.append("Mixed workload cannot qualify: max_output_tokens must be at least 96.")
-        elif "mixed" in selected:
-            add("mixed_control", settings.mixed_pairs, "Quiet short controls for mixed-load comparisons.",
-                title="Mixed-load controls")
-            if config.concurrency < 2:
-                add("mixed", 0, "Requires concurrency of at least two; only quiet controls run.")
-            else:
-                pairs = sum(settings.heavy_weights.values()) * settings.mixed_pairs
-                add("mixed", 4 * pairs,
-                    "Two requests per pair in each of the before-output and active-stream trials; buffered light responses leave overlap unqualified.")
-        if config.request_pack is not None:
-            warnings.append("Size and mixed-load tests use generated questions. Your saved questions are kept for answer and rate tests.")
-    if "token_stress" in selected:
-        settings = config.concurrent_workloads
-        for case in settings.stress_cases:
-            required_context = (case.input_tokens or case.max_input_tokens or 128) + case.output_tokens
-            context_limit = config.effective_check("concurrency")["context_limit"]
-            title = (f"{case.input_tokens:,}-token input / {case.output_tokens:,}-token summary"
-                     if case.input_tokens else f"Short input / {case.output_tokens:,}-token output")
-            identifier = f"token_stress_{case.name}"
-            if required_context > context_limit or case.output_tokens > config.max_output_tokens:
-                add(identifier, 0, f"Needs context length {required_context:,} and output cap {case.output_tokens:,}. "
-                    "Current limits prevent this case; no smaller substitute is sent.", title=title)
-                warnings.append(f"{title}: configured limits prevent this case; length coverage will be inconclusive.")
-                continue
-            count = sum(max(settings.samples_per_bucket, level) for level in settings.levels)
-            if case.input_tokens:
-                add(identifier, None, f"Up to {settings.calibration_attempts} input-sizing requests, followed by "
-                    f"up to {count} measured requests if calibration succeeds. Actual input and output usage must verify the targets.",
-                    kind="bounded", title=title)
-            else:
-                add(identifier, count, f"{count} measured requests across concurrency levels {settings.levels}. "
-                    "Early stopping leaves output-length coverage inconclusive.", title=title)
+    load_plan = load_time_plan(config.concurrent_load) if "concurrency" in selected else {}
+    load_warnings = []
+    if load_plan:
+        settings = config.concurrent_load
+        points = test_points(settings)
+        for kind, detail in load_plan.items():
+            levels = f"{len(settings.schedule.levels)} {'level' if len(settings.schedule.levels) == 1 else 'levels'}"
+            workloads = f"{detail['workloads']} {'workload' if detail['workloads'] == 1 else 'workloads'}"
+            breakdown = (f"1 workload (alternating short/long probe) × {levels} × {2 * settings.schedule.duration_seconds} s"
+                         if kind == "interference" else f"{workloads} × {levels} × {settings.schedule.duration_seconds} s")
+            add(f"load_{kind}", None, breakdown + ". " +
+                "Duration-based points send as many requests as the endpoint completes; slots refill individually.",
+                title=detail["title"], kind="duration")
+        add("load_calibration", len(calibration_keys(settings)) * settings.calibration_attempts,
+            "At most this many token-calibration requests; calibration is shared per input size and output-instruction variant.",
+            title="Input token calibration", kind="bounded")
+        demand = sum(p["level"] * p["configured_window_seconds"] for p in points)
+        preceding_known = sum(row["requests_per_target"] or 0 for row in rows if not row["id"].startswith("load_"))
+        expected = max(0, min(quotas.values()) - preceding_known - later_reservation(config) - len(calibration_keys(settings)) * settings.calibration_attempts)
+        if demand > expected:
+            message = f"Concurrent load may need about {demand:g} requests at an assumed 1 s/request, above the expected allowance {expected:g}. Raise the total request limit or reduce load time."
+            warnings.append(message)
+            load_warnings.append({"fields": ["max_requests"], "msg": message})
+        for size, variant in calibration_keys(settings):
+            target = getattr(settings.profile, size).input_tokens
+            overhead = prompt_overhead(variant)
+            if target < overhead:
+                message = f"{size.capitalize()} input target {target} is below the estimated minimum prompt length (≈{overhead} tokens); calibration measures the actual minimum."
+                warnings.append(message)
+                load_warnings.append({"fields": [f"concurrent_load.profile.{size}.input_tokens"], "msg": message})
+        for shape in running_shapes(settings):
+            a, b = shape.split("_")
+            if settings.schedule.duration_seconds < 3 * getattr(settings.profile, b).output_tokens / 30:
+                message = f"{load_shape_label(shape)}: window shorter than expected responses; throughput may be unreliable (output cap ÷ 30 tok/s)."
+                warnings.append(message)
+                load_warnings.append({"fields": ["concurrent_load.schedule.duration_seconds"], "msg": message})
+            if "context_limit" in config.model_fields_set and any(context_window(t)[0] is None for t in config.targets) and getattr(settings.profile, a).input_tokens + getattr(settings.profile, b).output_tokens > config.context_limit:
+                message = f"{load_shape_label(shape)}: input target + output cap exceeds Context window ({config.context_limit} tokens); server context window is unverified."
+                warnings.append(message)
+                load_warnings.append({"fields": [f"concurrent_load.profile.{a}.input_tokens", "context_limit"], "msg": message})
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":
@@ -448,10 +409,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         sample_counts["arrivals.requests"] = config.arrivals.requests
     if "prefix" in selected:
         sample_counts["prefix.repeats (excluding first use)"] = config.prefix.repeats - 1
-    if "buckets" in selected:
-        sample_counts["buckets.samples_per_bucket"] = config.buckets.samples_per_bucket
-    if "mixed" in selected:
-        sample_counts["buckets.mixed_pairs"] = config.buckets.mixed_pairs
     if "consistency" in selected:
         if config.consistency.logprobs:
             sample_counts["consistency.logprob measured samples"] = config.consistency.repetitions * corpus_width(config.consistency)
@@ -472,21 +429,21 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if evaluator["active"]:
         warnings.append("AI judge calls run separately from the target request budget and send cases and generated answers to each judge.")
         warnings.extend(evaluator["readiness_errors"])
-    if config.request_source == "request_pack" and not pack_selected and not selected & {"buckets", "mixed"}:
+    if config.request_source == "request_pack" and not pack_selected:
         warnings.append("Your dataset is inactive: select answer correctness or arrival capacity to use it.")
     if config.overlap_models and target_count > 1:
         warnings.append("Models run at the same time and share the maximum requests at a time. Their actual overlap depends on when request slots become free.")
-    known = sum(row["requests_per_target"] for row in rows if row["kind"] == "exact")
+    known = sum(row["requests_per_target"] or 0 for row in rows if row["kind"] == "exact")
     unknown = any(row["requests_per_target"] is None for row in rows)
     estimated = any(row["kind"] == "estimate" for row in rows)
     kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
     planned = None if unknown else sum(row["requests_per_target"] for row in rows)
     counted = sum(row["requests_per_target"] or 0 for row in rows)
     adaptive_estimates = {}
+    if load_plan:
+        adaptive_estimates["concurrency"] = sum(p["level"] * p["configured_window_seconds"] for p in test_points(config.concurrent_load))
     if "context" in selected:
         adaptive_estimates["context"] = 1 + 2 * context_count
-    if "fairness" in selected and any(row["id"] == "fairness_short" for row in rows):
-        adaptive_estimates["fairness"] = config.effective_check("fairness")["samples"]
     if "recovery" in selected and config.effective_check("recovery")["sustained_seconds"] > 0:
         adaptive_estimates["sustained"] = max(config.limits.min_samples,
             config.effective_check("recovery")["concurrency"] * 2,
@@ -503,6 +460,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     return {**_time_plan(config, rows, bucket_levels), "count_kind": kind, "planned_per_target": planned,
             "planned_total": planned * target_count if planned is not None else None,
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,
+            "concurrent_load": load_plan,
+            "configured_load_seconds": sum(v["configured_load_seconds"] for v in load_plan.values()),
+            "load_warnings": load_warnings,
+            "minimum_reserved_per_target": known + (minimum_reservation(config.concurrent_load) if load_plan else 0),
             "known_per_target": known, "known_total": known * target_count,
             "request_limit": config.max_requests,
             "required_request_limit": planned * target_count if kind == "exact" else None,

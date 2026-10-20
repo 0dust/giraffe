@@ -6,14 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from giraffe.concurrent_workloads import execution_config, token_stress
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import logprob_fixtures, refill, summarize_logprobs
 from giraffe.logprobs import collect_logprobs
 from giraffe.models import Consistency, RequestRecord, RunConfig
 from giraffe.overlap import evidenced_overlap, output_window, peak_evidenced_concurrency
-from giraffe.runner import _Run, _checks, _fairness, _missing_timing, _pack_results, _stats, _timing_violations, run_suite
-from giraffe.workloads import pair_evidenced, results, spec
+from giraffe.runner import _Run, _checks, _missing_timing, _pack_results, _stats, _timing_violations, run_suite
+from giraffe.workloads import results, spec
 from tests.fake_endpoint import FakeEndpoint
 
 
@@ -133,48 +132,10 @@ def test_loaded_pack_requires_server_evidence(concurrent, delayed):
     assert loaded['cases'][0]['loaded']['evidenced_overlap'] == (2 if concurrent and not delayed else 1)
 
 
-@pytest.mark.parametrize('phase', ['before_output', 'active_stream'])
-def test_mixed_pairs_use_heavy_first_output_and_timing_origin(phase):
-    light = record('light', 100, 20, 80, workload={'interference_phase': phase})
-    heavy = record('heavy', 100, 10, 10)
-    assert pair_evidenced(light, heavy) is (phase == 'before_output')
-    heavy.first_output_ms = heavy.last_output_ms = 30
-    assert pair_evidenced(light, heavy)
-    heavy.first_output_ms = heavy.last_output_ms = 80
-    assert not pair_evidenced(light, heavy)
-    heavy.timing_start_ms = None
-    assert not pair_evidenced(light, heavy)
 
 
-@pytest.mark.parametrize('concurrent', [False, True])
-async def test_fairness_requires_long_output_inside_short_stream(concurrent):
-    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={'scenarios': ['streaming_fairness']}))
-    run = _Run(config, None, None)
-    async def group(*args, **kwargs):
-        return []
-    async def request(target, client, request, event=None):
-        if event is not None:
-            event.set()
-            await asyncio.sleep(.001)
-            return record('short', 100, 10, 100, elapsed_ms=200)
-        return record('long', 100, 50 if concurrent else 110, 120)
-    run.group, run.request = group, request
-    await _fairness(run, config.targets[0], None, builtin_fixtures(config))
-    assert run.observations['local']['fairness']['overlaps'] == (2 if concurrent else 0)
 
 
-def test_fairness_decode_ratio_excludes_wrong_answers_on_both_sides():
-    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={'scenarios': ['streaming_fairness']},
-                                           limits={'min_samples': 2, 'min_correctness': .5, 'fairness_max_ratio': 100}))
-    run = _Run(config, None, None)
-    run.observations['local']['fairness'].update(pairs=2, overlaps=2)
-    run.records = [record(str(i), first=10, last=end, score=correct, scenario=scenario, check_ids=['fairness'])
-                   for i, (scenario, end, correct) in enumerate([
-                       ('fairness_baseline', 30, True), ('fairness_baseline', 1010, False),
-                       ('fairness_short', 50, True), ('fairness_short', 5010, False)])]
-    result = next(c for c in _checks(run, config.targets[0]) if c.id == 'fairness')
-    assert result.metrics['decode_p50_ms'] == {'baseline': 20, 'loaded': 40}
-    assert result.metrics['latency_ratio'] == 2
 
 
 @pytest.mark.parametrize('concurrent', [False, True])
@@ -193,7 +154,7 @@ async def test_refill_keeps_client_load_separate_from_server_evidence(concurrent
     if delayed:
         health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
     run = SimpleNamespace(allowed=lambda _: True, request=request, unfinished=defaultdict(set), timing_health=health)
-    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('Copy exactly: two words', 'bucket', 'buckets')], 4, 2)
+    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('Copy exactly: two words', 'bucket', 'buckets')], 4, 2, condition_plan=False)
     assert max(r.workload['client_peak_inflight'] for r in rows) == 2
     assert all(r.workload['cell_evidenced_concurrency'] == (0 if delayed else 2 if concurrent else 1) for r in rows)
     assert any(r.workload['load_qualified'] for r in rows) is (concurrent and not delayed)
@@ -254,23 +215,6 @@ def test_logprob_fixtures_copy_a_substantial_nonrepetitive_passage():
     assert fixtures['long'].input_chars > fixtures['short'].input_chars
 
 
-@pytest.mark.parametrize('concurrent', [False, True])
-@pytest.mark.parametrize('delayed', [False, True])
-async def test_token_stress_uses_level_peak_output_concurrency(concurrent, delayed):
-    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={
-        'scenarios': ['token_stress'], 'levels': [2], 'samples_per_bucket': 2,
-        'stress_cases': [{'name': 'short_input_long_output', 'output_tokens': 80}]}))
-    run = _Run(config, None, None)
-    async def group(*args, **kwargs):
-        return [record('a'), record('b', 5 if concurrent else 20)]
-    run.group = group
-    if delayed:
-        run.timing_health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
-    await token_stress(run, config.targets[0], None)
-    row = run.observations['local']['token_stress']['cases']['short_input_long_output']['levels']['2']
-    assert row['status'] == ('pass' if concurrent and not delayed else 'inconclusive')
-    assert row['achieved_overlap'] == (0 if delayed else 2 if concurrent else 1)
-    assert row['client_peak_inflight'] == 8
 
 
 def test_performance_sessions_without_limits_do_not_claim_limits_met():
@@ -296,79 +240,6 @@ def test_sessions_cannot_use_two_turns_of_the_same_conversation_as_evidence():
     assert workload_result(run, 'sessions').metrics['evidenced_session_overlap'] == 1
 
 
-@pytest.mark.parametrize('concurrent', [False, True])
-async def test_bucket_cells_gap_when_client_load_has_no_output_overlap(concurrent):
-    from giraffe.models import Buckets
-    from giraffe.workloads import bucket_spec
-    config = execution_config(configuration(checks=['concurrency'], concurrent_workloads={
-        'scenarios': ['size_matrix'], 'levels': [2], 'samples_per_bucket': 2}))
-    run = _Run(config, None, None)
-    for shape, tokens in [('short', 100), ('medium', 300), ('long', 1500)]:
-        request_spec = bucket_spec(Buckets(), shape, 'short', f'bucket_c2_{shape}_short', 'buckets', 2)
-        rows = []
-        async def request(target, client, request, *, on_start):
-            index = len(rows)
-            row = record(f'{shape}-{index}', 5 * index if concurrent else 20 * index,
-                         check_ids=['buckets'], scenario=request.scenario, input_tokens=tokens,
-                         workload=dict(request.workload))
-            rows.append(row)
-            on_start()
-            await asyncio.sleep(.001)
-            return row
-        stub = SimpleNamespace(allowed=lambda _: True, request=request, unfinished=defaultdict(set))
-        run.records.extend(await refill(stub, config.targets[0], None, [request_spec], 2, 2))
-    result = workload_result(run, 'buckets')
-    assert result.status == ('pass' if concurrent else 'inconclusive')
-    assert all(cell['qualified_samples'] == (2 if concurrent else 0) for cell in result.metrics['buckets'].values())
-    if not concurrent:
-        assert all(any('overlapping server output' in gap for gap in cell['coverage_gaps']) for cell in result.metrics['buckets'].values())
-
-
-def scenario(report, name):
-    return next(c for c in report.checks if c.id == 'concurrency').metrics['scenarios'][name]
-
-
-def exercise_output_shapes(monkeypatch):
-    # Request the fake's supported 100-number output to exercise long shapes.
-    import giraffe.workloads as workloads
-    original = workloads.bucket_spec
-    def shaped(*args, **kwargs):
-        request = original(*args, **kwargs)
-        if request.workload['output_bucket'] != 'short':
-            request.messages[0]['content'] += '\nList the numbers from 1 to 100.'
-            request.input_chars = len(request.messages[0]['content'])
-        return request
-    monkeypatch.setattr(workloads, 'bucket_spec', shaped)
-
-
-@pytest.mark.parametrize('serial', [False, True])
-@pytest.mark.parametrize('name', ['streaming_fairness', 'size_matrix', 'mixed_interference', 'token_stress'])
-async def test_http_serial_and_healthy_concurrency_scenarios(monkeypatch, name, serial):
-    exercise_output_shapes(monkeypatch)
-    with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=.02, chunk_delay=.02) as endpoint:
-        config = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
-            request_timeout_seconds=10 if name == 'size_matrix' else 5,
-            checks=['concurrency'], concurrent_workloads={
-                'scenarios': [name], 'levels': [2], 'samples_per_bucket': 2, 'mixed_pairs': 2,
-                'input_chars': {'short': 128, 'medium': 1024, 'long': 4096},
-                'output_tokens': {'short': 16, 'medium': 100, 'long': 100},
-                'stress_cases': [{'name': 'long_input_summary', 'input_tokens': 200,
-                                  'output_tokens': 20, 'min_output_tokens': 1}]})
-        report = await run_suite(config)
-    if name == 'size_matrix':
-        # Two serial 100-chunk responses need ~4 seconds plus transport/scheduler headroom.
-        assert all(r.status == 'completed' for r in report.requests), [
-            (r.scenario, r.status, r.error) for r in report.requests if r.status != 'completed']
-    result = scenario(report, name)
-    assert result['status'] == ('inconclusive' if serial else 'pass'), result
-    if serial and name == 'streaming_fairness':
-        assert result['metrics']['overlaps'] == 0
-    if serial and name == 'size_matrix':
-        assert all(cell['qualified_samples'] == 0 and cell['coverage_gaps'] for cell in result['metrics']['buckets'].values())
-    if serial and name == 'mixed_interference':
-        assert all(c['shape_qualified_samples'] == 0 for c in result['metrics']['comparisons'] if c['scenario'].endswith('active_stream'))
-    if serial and name == 'token_stress':
-        assert all(case['levels']['2']['achieved_overlap'] == 1 for case in result['metrics']['cases'].values())
 
 
 @pytest.mark.parametrize('serial', [False, True])
@@ -450,27 +321,6 @@ class StreamEndpoint:
         return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=Stream())
 
 
-@pytest.mark.parametrize('serial', [False, True])
-async def test_streamed_suite_server_evidence_without_sockets(monkeypatch, serial):
-    exercise_output_shapes(monkeypatch)
-    endpoint = StreamEndpoint(monkeypatch, serial)
-    config = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
-        checks=['concurrency', 'correctness', 'json', 'sessions', 'consistency'],
-        concurrent_workloads={'scenarios': ['streaming_fairness', 'size_matrix', 'mixed_interference', 'token_stress'],
-            'levels': [2], 'samples_per_bucket': 2, 'mixed_pairs': 2,
-            'input_chars': {'short': 128, 'medium': 1024, 'long': 4096},
-            'output_tokens': {'short': 16, 'medium': 100, 'long': 100},
-            'stress_cases': [{'name': 'long_input_summary', 'input_tokens': 200,
-                              'output_tokens': 20, 'min_output_tokens': 1}]},
-        sessions={'sessions': 2, 'concurrency': 2, 'modes': ['live']},
-        consistency={'levels': [1, 2], 'shapes': ['short'], 'repetitions': 2})
-    report = await run_suite(config)
-    expected = 'inconclusive' if serial else 'pass'
-    for check in report.checks:
-        if check.id in config.checks:
-            assert check.status == expected, (check.id, check.summary, check.metrics)
-    for name in config.concurrent_workloads.scenarios:
-        assert scenario(report, name)['status'] == expected, scenario(report, name)
 
 
 @pytest.mark.parametrize('serial', [False, True])
@@ -529,11 +379,6 @@ async def test_complete_logprob_pass_needs_depth_and_serial_scope(monkeypatch, l
         assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
 
 
-def test_mixed_active_decoding_excludes_response_cleanup():
-    light = record('light', first=10, last=20, elapsed_ms=100, workload={'interference_phase': 'active_stream'})
-    heavy = record('heavy', first=30, last=30, elapsed_ms=40)
-    assert evidenced_overlap(light, [light, heavy]) == 2
-    assert not pair_evidenced(light, heavy)
 
 
 @pytest.mark.parametrize('serial', [False, True])

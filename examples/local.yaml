@@ -1,38 +1,31 @@
-# Existing endpoint only. Giraffe does not install, start, or tune a model server.
+# Match the URL, model and server limits to your deployment.
 targets:
-  - name: local
-    url: http://127.0.0.1:11434/v1
-    model: qwen2.5:7b-instruct
-    # api_key_env: INFERENCE_API_KEY
-    # identity: {runtime: ollama, image: my-image-tag, quantization: Q4_K_M}
-
-# Concurrent checks need server parallelism (for Ollama, OLLAMA_NUM_PARALLEL).
+- name: local
+  url: http://127.0.0.1:11434/v1
+  model: qwen2.5:7b-instruct
 concurrency: 2
-# Covers the 250 fixed requests plus minimum adaptive work; runtime can need more.
-max_requests: 300
+max_requests: 400
 max_duration_seconds: 300
 request_timeout_seconds: 30
 max_output_tokens: 128
 context_limit: 4096
 samples: 6
 sustained_seconds: 5
-request_options: {temperature: 0}
+request_options:
+  temperature: 0
 structured_json: true
 retention: failures
-
-# Example acceptance limits, NOT hardware/model recommendations.
-# Set these to your service's requirements. Unspecified timing limits remain
-# observations and cannot certify an absolute performance pass.
 limits:
   first_output_ms: 5000
   latency_ms: 15000
   stream_gap_ms: 3000
-  fairness_max_ratio: 3
   recovery_max_ratio: 2
   max_error_rate: 0
   min_correctness: 1
   regression_percent: 20
   min_samples: 5
-
-# Large-token cases report insufficient limits with this small-memory profile.
-# Use concurrent-workloads.yaml and matching server limits to execute both 10k cases.
+concurrent_load:
+  schedule:
+    levels:
+    - 1
+    - 2

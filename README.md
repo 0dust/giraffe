@@ -289,7 +289,7 @@ reports change, while absolute checks still evaluate the current run.
 
 ## Additional workloads and deployment evidence
 
-Configurable concurrent workloads, opt-in arrivals, shared prefixes, fixed/live
+Concurrent load, opt-in arrivals, shared prefixes, fixed/live
 conversations, repeated-request consistency and parsed tool-calling checks use the
 same global budgets. Deployment snapshots and bounded serving-metrics collection
 keep configuration changes, provenance, missing data and performance evidence
@@ -298,8 +298,8 @@ configuration and evidence. `arrivals.max_client_wait_ms` sets the dispatch-wait
 tolerance (default 50 ms); exceeding it leaves the scheduled arrival rate unqualified.
 Prefix acceptance requires substantial cached-token reuse on enough repeats and
 independent controls below the reuse threshold; a majority of repeat misses fails.
-Size cells qualify each request's time-weighted overlap and reported length range;
-cell windows stop dispatch without cancelling requests. Text and optional logprob
+Concurrent load qualifies time-weighted client delivery and server output overlap;
+its sending windows drain requests already sent. Text and optional logprob
 consistency compare concurrent levels with sequential controls; strict mode fails
 answer or comparable token divergence. Non-strict variation or logprob drift beyond
 tolerance is inconclusive (not certified); full agreement can pass. Correctness is
@@ -307,10 +307,9 @@ reported independently, including `correctness_observed` in summaries below 1.0.
 Logprob summaries show the maximum cross-level delta and token divergence count.
 Strict cross-level equality requires batch-invariant serving; default vLLM serving
 can diverge. Sessions refill a conversation pool and recall unique seeded facts,
-feeding final answers without inline reasoning into live history. Mixed-load
-acceptance requires exercised long competitors, a non-repetitive known light
-passage of at least 64 tokens, and an explicit slowdown ratio. Wrong light answers
-are unqualified samples. Missing evidence leaves these checks inconclusive; see
+feeding final answers without inline reasoning into live history. Concurrent load
+scores the box label on every shape. Interference needs matched control/probe
+short streams and an explicit slowdown limit. Missing evidence is inconclusive; see
 [workload evidence](docs/workloads.md).
 
 
@@ -330,7 +329,7 @@ unverified.
 | 3 | First useful output | Client-observed first answer, separately from reasoning and initial requests |
 | 4 | Generation pace | Generation rate after first output, response time and streaming pauses |
 | 5 | Arrival traffic capacity | Independent mixed arrivals; correctness, timing, local delivery limits and highest tested rate with every lower tested rate accepted |
-| 6 | Concurrent workloads | Separate configurable size/concurrency matrix, mixed interference, streaming fairness and token-stress scenarios |
+| 6 | Concurrent load | Duration-based input/output combinations, seeded mixed requests, active-stream interference and token stress |
 | 7 | Long-context behavior | Known facts at different positions, calibrated from actual input-token usage |
 | 8 | Known-answer correctness | Known answers with observed scored overlap required when concurrency exceeds one |
 | 9 | Structured JSON | Required fields, types and expected values under concurrency |
@@ -343,20 +342,30 @@ unverified.
 | 16 | Repeated-request consistency | Answer agreement within and across sequential/concurrent levels; correctness reported separately |
 | 17 | Tool-calling capability | Parsed tool-call structure and expected arguments |
 
-The former checks 6, 15 and 16 are scenarios within **Concurrent workloads**.
-Every scenario keeps its own status, summary, all measurements and evidence IDs
-in JSON, the UI and standalone HTML. Size cells and interference comparisons
-remain separate. Existing cancellation sub-results are unchanged.
+**Concurrent load** uses `concurrent_load`: a token data profile, selected input → output
+combinations, request-frequency shares for Mixed load, optional active-stream interference,
+and optional large-input / large-output stress. Each workload runs at each configured
+concurrency level for the full sending duration, replenishing individual slots as requests
+finish, then draining in-flight requests. Minimum valid responses is an evidence requirement;
+it never ends a workload. Output lengths are caps, so early endings can leave coverage inconclusive.
 
-Use [the large-token example](examples/concurrent-workloads.yaml) for 10,000-token
-input / 50-token output and short-input / 10,000-token output cases. Inputs are
-sized from server-reported token usage and verified on each measured request.
-Output caps alone do not establish output-length coverage. Insufficient context,
-output, time or request budgets are reported explicitly; targets are never silently
-shrunk. Summary scoring checks a required fact, not full summary quality.
+Defaults select three combinations and Mixed load at levels `[1, 4]`, with 15 seconds per
+workload/level: 2 minutes of configured load time. This window avoids a short-window
+throughput warning for the default output caps. Interference is off by default: it requires streaming and every level
+at least 2. It alternates short and long probes A/B/A/B against continuously replenished short streams.
+Use [the token-stress example](examples/concurrent-workloads.yaml) for 10,000-token input
+and output targets. Inputs calibrate against server token usage, independently of `context_limit`.
+Known server windows and run-wide output caps are validated before execution.
 
-Arrival traffic capacity stays separate because it varies incoming requests per
-second; Concurrent workloads varies request shapes, starting order and overlap.
+Legacy configs load with migration notes on CLI stderr and web response metadata. Old sample
+counts, weights and per-request limits are not silently reinterpreted. Saved old reports still
+render; baseline comparisons across the old and new formats are inconclusive. Per-load-type
+point tables show requested/client/server concurrency, latency, throughput, token lengths and
+coverage. The best result is the highest observed among tested settings.
+
+Arrival traffic capacity and Scheduled arrivals remain separate checks, with their existing
+request-rate and burst behavior. See [workload settings](docs/workloads.md) for the schema and
+[the implementation contract](docs/concurrent-load-design.md) for measurement details.
 
 Each result is `pass`, `fail`, `inconclusive`, `skipped`, or `blocked`. A required
 inconclusive check prevents an overall pass. Missing acceptance limits produce
@@ -371,7 +380,7 @@ The suite checks a small, versioned set of observable serving behaviors. It is n
 a general model-quality benchmark. Context lengths depend on the server tokenizer;
 the report distinguishes measured token usage from character counts. A service URL
 does not establish which replicas or GPUs were reached. Client disconnect does not
-prove backend work was reclaimed. Buffered responses can prevent a valid fairness
+prove backend work was reclaimed. Buffered responses can prevent a valid interference
 measurement. The report preserves these limits.
 
 Generation pace is a client-observed estimate: `(output tokens - 1) / seconds from
@@ -435,7 +444,6 @@ limits:
   first_output_ms: 1000
   latency_ms: 10000
   stream_gap_ms: 1000
-  fairness_max_ratio: 2
 ```
 
 Set `limits.recovery_max_ratio` (the shipped examples use `2`) to catch post-load
@@ -461,7 +469,7 @@ advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one
 editor is open at a time. Defaults inherit the run configuration;
 custom settings change only the selected test. Deselecting a test does not run its
-workload. Shared probes needed for a selected timing/fairness check remain visible
+workload. Shared probes needed for a selected timing check remain visible
 in the recorded request scenarios.
 
 An explicit `checks` list is authoritative: selecting `json` or `gpu` enables it

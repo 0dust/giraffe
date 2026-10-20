@@ -1,38 +1,23 @@
-# Large-token qualification. Configure the server for >= 16k context first.
-# Run engines one at a time. These are requested targets, not recorded live results.
+# Match the URL, model and server limits to your deployment.
 targets:
-  - name: local
-    url: http://127.0.0.1:8080/v1
-    model: replace-with-served-model-id
-checks: [concurrency]
+- name: local
+  url: http://127.0.0.1:8080/v1
+  model: replace-with-served-model-id
+  deployment:
+    serving:
+      context_limit: 16384
+checks:
+- concurrency
 concurrency: 2
 context_limit: 16384
 max_output_tokens: 10000
-max_requests: 300
+max_requests: 1000
 max_duration_seconds: 3600
 request_timeout_seconds: 900
 samples: 2
 retention: failures
-request_options: {temperature: 0}
-concurrent_workloads:
-  scenarios: [size_matrix, mixed_interference, streaming_fairness, token_stress]
-  input_chars: {short: 64, medium: 256, long: 4096}
-  output_tokens: {short: 16, medium: 64, long: 128}
-  levels: [1, 2]
-  samples_per_bucket: 2
-  mixed_pairs: 2
-  window_seconds: 120
-  input_token_tolerance: 0.1
-  calibration_attempts: 3
-  stress_cases:
-    - name: long_input_summary
-      input_tokens: 10000
-      output_tokens: 50
-      min_output_tokens: 50
-    - name: short_input_long_output
-      max_input_tokens: 128
-      output_tokens: 10000
-      min_output_tokens: 10000
+request_options:
+  temperature: 0
 limits:
   min_samples: 2
   max_error_rate: 0
@@ -40,4 +25,50 @@ limits:
   first_output_ms: 60000
   latency_ms: 900000
   stream_gap_ms: 10000
-  fairness_max_ratio: 5
+test_options: {}
+concurrent_load:
+  profile:
+    short:
+      input_tokens: 128
+      output_tokens: 32
+    medium:
+      input_tokens: 512
+      output_tokens: 128
+    long:
+      input_tokens: 10000
+      output_tokens: 10000
+  combinations:
+    enabled: true
+    selected:
+    - short_short
+    - long_short
+    - short_long
+  mixed:
+    enabled: true
+    shares:
+      short_short: 60
+      long_short: 20
+      short_long: 20
+  interference:
+    enabled: false
+    trigger: first_output
+    trigger_chunks: 5
+    max_slowdown: 1.5
+  stress:
+    enabled: true
+    large_input: true
+    large_output: true
+    min_output_percent: 80
+  schedule:
+    levels:
+    - 1
+    - 2
+    duration_seconds: 10
+  pass_criteria:
+    first_output_p95_ms: 60000
+    response_p95_ms: 900000
+    max_error_percent: 0
+    min_correct_percent: 100
+    min_valid_responses: 2
+  input_token_tolerance: 0.1
+  calibration_attempts: 3

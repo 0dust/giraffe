@@ -1,19 +1,16 @@
-# Opt-in coverage example. Match endpoint, model and context to your server.
+# Match the URL, model and server limits to your deployment.
 targets:
-  - name: local
-    url: http://127.0.0.1:11434/v1
-    model: llama3.2:3b
-    deployment:
-      discovery: ollama
-      scope: local configured endpoint; other replicas unverified
-      serving: {context_limit: 4096}
-    metrics_profile: ollama
-    # metrics_url: http://127.0.0.1:8000/metrics
-    # metrics_profile: vllm-v1
-    # metrics_runtime_version: 0.30.0
-    # metrics_api_key_env: GIRAFFE_METRICS_KEY
+- name: local
+  url: http://127.0.0.1:11434/v1
+  model: llama3.2:3b
+  deployment:
+    discovery: ollama
+    scope: local configured endpoint; other replicas unverified
+    serving:
+      context_limit: 4096
+  metrics_profile: ollama
 concurrency: 2
-max_requests: 700
+max_requests: 2000
 max_duration_seconds: 1800
 request_timeout_seconds: 120
 max_output_tokens: 128
@@ -21,40 +18,41 @@ context_limit: 4096
 samples: 6
 sustained_seconds: 30
 retention: failures
-request_options: {temperature: 0}
+request_options:
+  temperature: 0
 metrics: true
 metrics_interval_seconds: 2
 metrics_max_samples: 1024
-arrivals: {mode: steady, requests: 12, requests_per_second: 0.5, max_pending: 4}
-prefix: {prefix_chars: 8192, repeats: 6, history_turns: 3}
-concurrent_workloads:
-  scenarios: [size_matrix, mixed_interference, streaming_fairness]
-  input_chars: {short: 64, medium: 1024, long: 12288}
-  output_tokens: {short: 24, medium: 64, long: 128}
-  levels: [1, 2]
-  # Rounded up to a multiple of each level; lifetime overlap qualifies each sample.
-  samples_per_bucket: 6
-  window_seconds: 120
-  mixed_pairs: 6
-  heavy_weights: {long_input: 1, long_output: 1}
+arrivals:
+  mode: steady
+  requests: 12
+  requests_per_second: 0.5
+  max_pending: 4
+prefix:
+  prefix_chars: 8192
+  repeats: 6
+  history_turns: 3
 sessions:
-  # Fixed history uses the seeded session name; live history feeds final answers only.
-  modes: [fixed, live]
+  modes:
+  - fixed
+  - live
   sessions: 5
   concurrency: 2
   max_tokens: 64
   delay_seconds: 0.05
 consistency:
   prompts_per_shape: 3
-  # Text repetitions also round up to a multiple of each level.
   repetitions: 6
-  shapes: [short, long]
-  levels: [1, 2]
+  shapes:
+  - short
+  - long
+  levels:
+  - 1
+  - 2
   temperature: 0
   seed: 17
   equality: bytes
   strict: false
-# Enable only on deployments expected to support parsed tool calls.
 tool_calling: false
 forced_tool_diagnostic: false
 limits:
@@ -63,7 +61,60 @@ limits:
   latency_ms: 90000
   stream_gap_ms: 10000
   min_output_tokens_per_second: 1
-  fairness_max_ratio: 3
   recovery_max_ratio: 2
   max_error_rate: 0
   min_correctness: 1
+test_options: {}
+concurrent_load:
+  profile:
+    short:
+      input_tokens: 128
+      output_tokens: 24
+    medium:
+      input_tokens: 512
+      output_tokens: 64
+    long:
+      input_tokens: 2048
+      output_tokens: 128
+  combinations:
+    enabled: true
+    selected:
+    - short_short
+    - short_medium
+    - short_long
+    - medium_short
+    - medium_medium
+    - medium_long
+    - long_short
+    - long_medium
+    - long_long
+  mixed:
+    enabled: false
+    shares:
+      short_short: 60
+      long_short: 20
+      short_long: 20
+    seed: null
+  interference:
+    enabled: false
+    trigger: first_output
+    trigger_chunks: 5
+    max_slowdown: 1.5
+  stress:
+    enabled: false
+    large_input: true
+    large_output: true
+    min_output_percent: 80
+  schedule:
+    levels:
+    - 1
+    - 2
+    duration_seconds: 10
+  pass_criteria:
+    first_output_p95_ms: null
+    response_p95_ms: null
+    max_error_percent: 0
+    min_correct_percent: 100
+    min_valid_responses: 5
+  input_token_tolerance: 0.1
+  calibration_attempts: 3

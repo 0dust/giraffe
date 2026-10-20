@@ -60,6 +60,24 @@ def _plain(value: str) -> str:
 def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a stable condition and plain label without changing request metadata."""
     workload = workload or {}
+    if role := re.fullmatch(r"load_interference_c(\d+)\.(short_stream|short_probe|long_probe)", scenario):
+        level, name = role.groups()
+        scenario = f"load_interference_{'probe' if name == 'long_probe' else 'control'}_c{level}"
+    if combo := re.fullmatch(r"load_combo_(short|medium|long)_(short|medium|long)_c(\d+)", scenario):
+        a, b, level = combo.groups()
+        return {"id": scenario, "label": f"{a.capitalize()} input → {b.capitalize()} output at {int(level)} concurrent request{'s' if int(level) != 1 else ''}",
+                "check": "concurrency", "load_type": "combinations", "level": int(level), "input": a, "output": b}
+    if mixed := re.fullmatch(r"(load_mixed_c(\d+))(?:\.(?:short|medium|long)_(?:short|medium|long))?", scenario):
+        identifier, level = mixed.groups()
+        return {"id": identifier, "label": f"Mixed load at {int(level)} concurrent request{'s' if int(level) != 1 else ''}", "check": "concurrency", "load_type": "mixed", "level": int(level)}
+    if load := re.fullmatch(r"load_(interference|stress)_(control|probe|input|output)_c(\d+)", scenario):
+        kind, workload, level = load.groups()
+        name = {"control": "Short-only control", "probe": "Long input during short streams", "input": "Large-input stress", "output": "Large-output stress"}[workload]
+        return {"id": scenario, "label": f"{name} at {int(level)} concurrent request{'s' if int(level) != 1 else ''}", "check": "concurrency", "load_type": kind, "level": int(level)}
+    if calibration := re.fullmatch(r"load_calibration_(short|medium|long)_(short_answer|long_output)", scenario):
+        size, variant = calibration.groups()
+        name = "long-output" if variant == "long_output" else "short-answer"
+        return {"id": scenario, "label": f"Calibrating {size.capitalize()} input tokens ({name} prompt)", "check": "concurrency", "load_type": "calibration"}
     if cell := re.fullmatch(r"bucket_c(\d+)_(short|medium|long)_(short|medium|long)", scenario):
         level, input_shape, output_shape = cell.groups()
         return {"id": scenario, "label": f"{input_shape.capitalize()} input / {output_shape} output · {int(level)} at once",
@@ -117,6 +135,7 @@ def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[
 
 
 _PURPOSES = {
+    "concurrency": "Measures serving under sustained request concurrency with individually replenished slots.",
     "access": "Checks that the server is reachable and can answer a request.",
     "serving": "Checks that the server returns valid answers reliably.",
     "generation": "Measures how quickly the server generates an answer.",
@@ -172,11 +191,6 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     if check == "fairness":
         parameters["concurrency"] = 1 if scenario in {"fairness", "fairness_baseline"} else 2
     if config is not None:
-        if check == "buckets" and config.buckets and not {"input_chars", "output_tokens"} <= details.keys():
-            from .workloads import bucket_spec
-            request = bucket_spec(config.buckets, condition["input"], condition["output"],
-                                  scenario, check, condition["level"], config.context_limit)
-            parameters.update(input_chars=request.input_chars, output_tokens=request.max_tokens)
         if check == "consistency" and config.consistency:
             settings = config.consistency
             level = condition.get("level", 1)
@@ -206,7 +220,9 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
             parameters[key] = details[key]
     if "output_tokens" not in parameters and workload.get("requested_output_tokens") is not None:
         parameters["output_tokens"] = workload["requested_output_tokens"]
-    if workload.get("requested_input_tokens") is not None:
+    if details.get("requested_input_tokens") is not None:
+        parameters["input_tokens_target"] = details["requested_input_tokens"]
+    elif workload.get("requested_input_tokens") is not None:
         parameters["input_tokens_approx"] = workload["requested_input_tokens"]
     elif parameters.get("input_chars") is not None:
         parameters["input_tokens_approx"] = (parameters["input_chars"] + 3) // 4

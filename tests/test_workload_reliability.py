@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from giraffe.client import LLMClient
-from giraffe.models import Buckets, Consistency, Limits, Prefix, Sessions
+from giraffe.models import Consistency, Limits, Prefix, Sessions
 from giraffe.planning import request_plan
 from giraffe.runner import run_suite
 from tests.test_workloads import check, config
@@ -146,34 +146,19 @@ async def test_w3_prefix_requires_substantial_cached_tokens_and_separate_blocks(
     assert len(prompts[0]) > 8192
 
 
-async def test_w4_cell_window_stops_dispatch_without_cancelling_healthy_requests(monkeypatch):
-    endpoint = MemoryEndpoint(monkeypatch, delay=.025)
-    settings = config(endpoint, checks=['buckets'], stream=False, buckets={
-        'levels': [2], 'samples_per_bucket': 4, 'window_seconds': .01})
-    report = await run_suite(settings)
-    result = check(report, 'buckets')
-    assert len(endpoint.requests) == 18
-    assert all(r.status == 'completed' for r in report.requests)
-    assert result.metrics['error_rate'] == 0 and result.status == 'inconclusive'
 
 
-async def test_w4_genuine_server_timeout_still_fails(monkeypatch):
-    endpoint = MemoryEndpoint(monkeypatch, delay=.05)
-    report = await run_suite(config(endpoint, checks=['buckets'], stream=False,
-        request_timeout_seconds=.01, buckets={'levels': [1], 'window_seconds': .02}))
-    assert check(report, 'buckets').status == 'fail'
-    assert any(r.status == 'timeout' for r in report.requests)
 
 
 def test_w5_defaults_and_sample_count_warnings():
     minimum = Limits().min_samples
-    assert min(Buckets().samples_per_bucket, Buckets().mixed_pairs, Consistency().repetitions,
+    assert min(Consistency().repetitions,
                Prefix().repeats - 1, Sessions().sessions) >= minimum
-    settings = config(MemoryEndpoint, checks=['buckets', 'mixed', 'consistency', 'prefix', 'sessions'],
-        buckets={'samples_per_bucket': 2, 'mixed_pairs': 1}, consistency={'repetitions': 2},
+    settings = config(MemoryEndpoint, checks=['consistency', 'prefix', 'sessions'],
+        consistency={'repetitions': 2},
         prefix={'repeats': 2}, sessions={'sessions': 1}, limits={'min_samples': 5})
     warnings = request_plan(settings)['warnings']
-    for field in ('samples_per_bucket', 'mixed_pairs', 'repetitions', 'repeats', 'sessions.sessions'):
+    for field in ('repetitions', 'repeats', 'sessions.sessions'):
         assert any(field in w and 'cannot qualify' in w for w in warnings)
 
 
@@ -195,14 +180,14 @@ async def test_w6_pool_refills_immediately_and_flags_tail_samples():
                                stream_end_ms=(ends[-1] - starts[index]) * 1000,
                                workload={})
     run = SimpleNamespace(allowed=lambda _: True, request=request)
-    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2)
+    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2, condition_plan=False)
     assert starts[2] < ends[-1] - .03
     assert len(rows) == 6
     assert sum(r.workload['load_qualified'] for r in rows) == 5
     assert 1 < rows[-1].workload['client_time_weighted_inflight'] < 1.5
 
     starts.clear()
-    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2)
+    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2, condition_plan=False)
     assert rows[0].workload['load_qualified'] is False
 
 
@@ -216,18 +201,6 @@ async def test_w7_history_mixup_fails_each_sessions_seeded_value(monkeypatch):
     assert all(r.score is False for r in report.requests if 'turn1' in r.scenario)
 
 
-@pytest.mark.parametrize('mode,status', [('healthy', 'pass'), ('flat_input', 'inconclusive')])
-async def test_w8_input_lengths_must_increase_and_match_requested_shape(monkeypatch, mode, status):
-    endpoint = MemoryEndpoint(monkeypatch, mode=mode)
-    settings = config(endpoint, checks=['buckets'], stream=False,
-                      buckets={'levels': [1], 'samples_per_bucket': 2})
-    report = await run_suite(settings)
-    assert check(report, 'buckets').status == status
-    assert len(report.requests) == request_plan(settings)['planned_per_target'] == 18
-    cells = check(report, 'buckets').metrics['buckets']
-    if mode == 'flat_input':
-        assert all(any('input length not exercised' in g for g in c['coverage_gaps']) for c in cells.values())
-    assert Buckets().input_chars['long'] >= 8192
 
 
 async def test_w9_pending_queue_does_not_cap_inflight(monkeypatch):
@@ -239,89 +212,12 @@ async def test_w9_pending_queue_does_not_cap_inflight(monkeypatch):
     assert check(report, 'arrivals').metrics['schedule']['unissued']
 
 
-@pytest.mark.parametrize('ratio,mode,status', [(None, 'healthy', 'inconclusive'),
-    (100, 'early_eos', 'inconclusive'), (100, 'healthy', 'pass')])
-async def test_l3_mixed_needs_limit_long_light_and_exercised_heavy(monkeypatch, ratio, mode, status):
-    endpoint = MemoryEndpoint(monkeypatch, mode=mode)
-    report = await run_suite(config(endpoint, checks=['mixed'],
-        buckets={'mixed_pairs': 2}, limits={'min_samples': 2, 'fairness_max_ratio': ratio}))
-    result = check(report, 'mixed')
-    assert result.status == status
-    if ratio is None:
-        assert result.summary.startswith('Mixed-load ratios measured; no acceptance ratio configured.')
-        assert 'To conclude, set limits.fairness_max_ratio' in result.summary
-    lights = [r for r in report.requests if r.scenario.startswith('mixed_short')]
-    assert all(r.completion_tokens >= 64 for r in lights)
-    assert len(report.requests) == 18
-    if mode == 'early_eos':
-        assert any(c['shape_qualified_samples'] == 0 for c in result.metrics['comparisons'])
 
 
-async def test_l3_buffered_answer_with_delayed_trailers_is_not_active_decoding(monkeypatch):
-    class Buffered(MemoryEndpoint):
-        async def handle(self, request):
-            response = await super().handle(request)
-            if 'Copy the following' not in request.content.decode():
-                return response
-            source = response.stream
-
-            class Stream(httpx.AsyncByteStream):
-                async def __aiter__(self):
-                    chunks = [chunk async for chunk in source]
-                    yield b''.join(chunks[:-1])
-                    await asyncio.sleep(.025)
-                    yield chunks[-1]
-            return httpx.Response(200, headers=response.headers, stream=Stream())
-    endpoint = Buffered(monkeypatch)
-    report = await run_suite(config(endpoint, checks=['mixed'], buckets={'mixed_pairs': 2},
-        limits={'min_samples': 2, 'fairness_max_ratio': 100}))
-    result = check(report, 'mixed')
-    assert result.status == 'inconclusive'
-    assert all(c['shape_qualified_samples'] == 0 for c in result.metrics['comparisons']
-               if c['scenario'].endswith('active_stream'))
 
 
-async def test_l3_weighted_pairs_cannot_borrow_another_blocks_shape_evidence(monkeypatch):
-    class Weighted(MemoryEndpoint):
-        heavy_outputs = 0
-
-        async def handle(self, request):
-            heavy = 'then list the numbers' in request.content.decode()
-            if heavy:
-                self.heavy_outputs += 1
-            response = await super().handle(request)
-            if not heavy or self.heavy_outputs <= 4:
-                return response
-            source = response.stream
-
-            class Stream(httpx.AsyncByteStream):
-                async def __aiter__(self):
-                    async for chunk in source:
-                        if b'"usage"' in chunk:
-                            data, done = chunk.decode().split('\n\ndata: [DONE]')
-                            payload = json.loads(data.removeprefix('data: '))
-                            payload['usage']['completion_tokens'] = 1
-                            chunk = ('data: ' + json.dumps(payload) + '\n\ndata: [DONE]' + done).encode()
-                        yield chunk
-            return httpx.Response(200, headers=response.headers, stream=Stream())
-    endpoint = Weighted(monkeypatch)
-    report = await run_suite(config(endpoint, checks=['mixed'], buckets={
-        'mixed_pairs': 2, 'heavy_weights': {'long_input': 1, 'long_output': 2}},
-        limits={'min_samples': 2, 'fairness_max_ratio': 100}))
-    result = check(report, 'mixed')
-    assert result.status == 'inconclusive'
-    assert len(report.requests) == 26
-    assert all(c['samples_and_overlap_qualified'] is False for c in result.metrics['comparisons']
-               if 'long_output' in c['scenario'])
 
 
-async def test_l3_small_output_budget_sends_no_unexercisable_light_passage(monkeypatch):
-    endpoint = MemoryEndpoint(monkeypatch)
-    settings = config(endpoint, checks=['mixed'], max_output_tokens=32,
-                      buckets={'output_tokens': {'short': 8, 'medium': 16, 'long': 32}})
-    report = await run_suite(settings)
-    assert check(report, 'mixed').status == 'inconclusive'
-    assert request_plan(settings)['planned_per_target'] == len(report.requests) == 0
 
 
 async def test_w5_session_turns_do_not_substitute_for_independent_samples(monkeypatch):
@@ -336,51 +232,9 @@ async def test_w5_session_turns_do_not_substitute_for_independent_samples(monkey
     assert result.metrics['completed_sessions_per_mode'] == {'fixed': 1, 'live': 1}
 
 
-@pytest.mark.parametrize('kind', ['buckets', 'logprobs'])
-async def test_w6_bucket_and_logprob_dispatch_refills_a_slow_round(monkeypatch, kind):
-    width = 6 if kind == 'buckets' else 3
-
-    class Jitter(MemoryEndpoint):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.begins, self.ends = [], {}
-
-        async def handle(self, request):
-            index = len(self.begins)
-            self.begins.append(time.monotonic())
-            if index % width == 0:
-                await asyncio.sleep(.08)
-            response = await super().handle(request)
-            self.ends[index] = time.monotonic()
-            return response
-    endpoint = Jitter(monkeypatch)
-    if kind == 'buckets':
-        settings = config(endpoint, checks=['buckets'], stream=False,
-            buckets={'levels': [2], 'samples_per_bucket': 6})
-        slow, refill_index = 0, 2
-    else:
-        settings = config(endpoint, checks=['consistency'], concurrency=3, consistency={
-            'shapes': ['short'], 'levels': [1, 2, 3], 'repetitions': 2,
-            'logprobs': {'top_logprobs': 0}})
-        slow, refill_index = 6, 8
-    report = await run_suite(settings)
-    assert endpoint.begins[refill_index] < endpoint.ends[slow]
-    assert len(report.requests) == request_plan(settings)['planned_per_target']
-    if kind == 'buckets':
-        cells = check(report, 'buckets').metrics['buckets']
-        assert all(c['qualified_samples'] == 0 and len(c['tail_samples']) == 6
-                   and 1 < c['client_time_weighted_inflight'] < 2
-                   for c in cells.values())
-    else:
-        conditions = check(report, 'consistency').metrics['logprobs']['conditions']
-        loaded = next(c for c in conditions if c['level'] == 2)
-        assert not loaded['coverage_complete']
-        assert all(r['qualified_samples'] == 0 and len(r['tail_samples']) == 3
-                   and r['client_time_weighted_inflight'] > 1
-                   for r in loaded['rounds'])
 
 
-@pytest.mark.parametrize('workload', ['mixed', 'consistency', 'logprobs', 'prefix', 'buckets', 'sessions'])
+@pytest.mark.parametrize('workload', ['consistency', 'logprobs', 'prefix', 'sessions'])
 async def test_round2_workload_temperature_preserves_user_option(monkeypatch, workload):
     endpoint = MemoryEndpoint(monkeypatch)
     selected = 'consistency' if workload == 'logprobs' else workload
@@ -388,7 +242,6 @@ async def test_round2_workload_temperature_preserves_user_option(monkeypatch, wo
     if workload == 'logprobs':
         extra['consistency']['logprobs'] = {'top_logprobs': 0}
     settings = config(endpoint, checks=[selected], context_limit=16384 if selected == 'prefix' else 2048, request_options={'temperature': .7},
-        buckets={'levels': [1], 'samples_per_bucket': 2, 'mixed_pairs': 1},
         sessions={'sessions': 1}, prefix={'repeats': 3}, **extra)
     await run_suite(settings)
     assert endpoint.requests and all(p['temperature'] == .7 for p in endpoint.requests)
@@ -408,16 +261,6 @@ async def test_round2_consistency_copy_prompts_and_wrong_answers_are_independent
         assert len(sentences) >= 3 and len(set(sentences)) == len(sentences)
 
 
-async def test_round2_mixed_wrong_light_is_unqualified_not_failed(monkeypatch):
-    endpoint = MemoryEndpoint(monkeypatch, mode='wrong_copy')
-    result = check(await run_suite(config(endpoint, checks=['mixed'], buckets={'mixed_pairs': 2},
-        limits={'min_samples': 2, 'fairness_max_ratio': 100})), 'mixed')
-    assert result.status == 'inconclusive'
-    assert result.metrics['correctness_observed'] < 1
-    assert result.metrics['unqualified_light_samples']
-    assert all(c['shape_qualified_samples'] == 0 for c in result.metrics['comparisons'])
-    assert "rerun after changing the model or its settings" in result.summary
-    assert "address the slowdown" not in result.summary
 
 
 @pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'fail')])
@@ -444,12 +287,6 @@ async def test_round2_prefix_all_cached_is_not_discriminative(monkeypatch):
     assert 'cache reporting not discriminative' in result.summary
 
 
-@pytest.mark.parametrize('mode,status', [('template_overhead', 'pass'), ('compressed_input', 'inconclusive')])
-async def test_round2_buckets_allow_template_overhead_but_require_length_range(monkeypatch, mode, status):
-    endpoint = MemoryEndpoint(monkeypatch, mode=mode)
-    result = check(await run_suite(config(endpoint, checks=['buckets'], stream=False,
-        buckets={'levels': [1], 'samples_per_bucket': 2})), 'buckets')
-    assert result.status == status
 
 
 async def test_round2_live_session_history_strips_reasoning_and_fixed_keeps_seed(monkeypatch):
@@ -498,21 +335,14 @@ async def test_round2_nonstrict_variation_preserves_coverage_reason(monkeypatch)
     assert 'coverage' in result.summary.lower() or 'Too few' in result.summary
 
 
-async def test_round2_mixed_missing_ratio_preserves_shape_reason(monkeypatch):
-    endpoint = MemoryEndpoint(monkeypatch, mode='early_eos')
-    result = check(await run_suite(config(endpoint, checks=['mixed'], buckets={'mixed_pairs': 2})), 'mixed')
-    assert result.status == 'inconclusive'
-    assert 'shapes' in result.summary
-    assert 'effect observed' not in result.summary
 
 
-@pytest.mark.parametrize('workload', ['arrivals', 'prefix', 'buckets', 'mixed', 'sessions', 'consistency', 'logprobs'])
+@pytest.mark.parametrize('workload', ['arrivals', 'prefix', 'sessions', 'consistency', 'logprobs'])
 async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workload):
     endpoint = MemoryEndpoint(monkeypatch)
     selected = 'consistency' if workload == 'logprobs' else workload
     settings = config(endpoint, checks=[selected], context_limit=16384 if selected == 'prefix' else 2048, stream=False, sessions={'modes': ['fixed'], 'sessions': 3},
         arrivals={'requests': 3, 'requests_per_second': 100},
-        buckets={'levels': [1, 2], 'samples_per_bucket': 2, 'mixed_pairs': 1},
         prefix={'repeats': 3}, consistency={'shapes': ['short'], 'repetitions': 2,
             **({'logprobs': {'top_logprobs': 0}} if workload == 'logprobs' else {})})
     report = await run_suite(settings)
@@ -540,7 +370,7 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
     monkeypatch.setattr(workload, 'time', SimpleNamespace(monotonic=lambda: now))
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     task = asyncio.create_task(workload.refill(run, SimpleNamespace(name='local'), None,
-        [spec('p', 's', 'buckets')], 3, 3))
+        [spec('p', 's', 'buckets')], 3, 3, condition_plan=False))
     while len(started) < 3:
         await asyncio.sleep(0)
     for index, finish in enumerate((2, 4, 8)):

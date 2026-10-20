@@ -16,11 +16,14 @@ def configuration(**overrides):
 @pytest.mark.parametrize("config,kind", [
     (configuration(checks=["access", "correctness"]), "exact"),
     (configuration(checks=["capacity"], traffic={"arrival": "poisson", "rates": [1, 2], "duration_seconds": 1}), "exact"),
-    (configuration(checks=["fairness"], concurrency=2), "bounded"),
+    (configuration(checks=["concurrency"], concurrency=2, concurrent_load={"schedule": {"levels": [1, 2]}}), "bounded"),
 ])
 def test_visible_traffic_keeps_count_certainty_and_limits(config, kind):
     plan = request_plan(config)
     assert plan["count_kind"] == kind
+    if "concurrency" in config.checks:
+        assert plan["planned_total"] is None
+        assert all(row["requests_per_target"] is None for row in plan["rows"] if row["kind"] == "duration")
     browser_logic(r"""
 const plan=PLAN;
 nodes['#request-plan']={};nodes['#start-run']={};nodes['#run-bar-summary']={textContent:'unchanged'};
@@ -34,7 +37,7 @@ assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass crite
 assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
 assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
 assert.equal(nodes['#start-run'].disabled,false);
-if(plan.count_kind==='bounded')assert.match(visible,/known requests \+ adaptive checks/);
+if(plan.count_kind==='bounded'){assert.match(visible,/known requests \+ adaptive checks/);assert.match(visible,/Configured load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/Duration-based/);}
 if(plan.count_kind==='estimate')assert.match(visible,/About /);
 state.configRevision++;renderRequestPlan();assert.equal(nodes['#start-run'].disabled,true);
 assert.match(nodes['#request-plan'].innerHTML,/stale/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/plan-total|Request breakdown/);

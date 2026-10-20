@@ -1,5 +1,4 @@
-# Review model ID, context and acceptance limits for your deployment.
-# These limits are a starting profile, not engine or hardware guarantees.
+# Match the URL, model and server limits to your deployment.
 targets:
 - name: tgi
   url: http://127.0.0.1:8080/v1
@@ -45,14 +44,59 @@ limits:
   latency_ms: 60000
   stream_gap_ms: 10000
   min_output_tokens_per_second: 1
-  fairness_max_ratio: 5
   max_error_rate: 0
   min_correctness: 1
-
-# Large-token cases report insufficient limits with this small-memory profile.
-# Use concurrent-workloads.yaml and matching server limits to execute both 10k cases.
-concurrent_workloads:
-  scenarios: [size_matrix, mixed_interference, streaming_fairness, token_stress]
-  levels: [1, 2]
-  samples_per_bucket: 5
-  mixed_pairs: 5
+test_options: {}
+concurrent_load:
+  profile:
+    short:
+      input_tokens: 128
+      output_tokens: 16
+    medium:
+      input_tokens: 512
+      output_tokens: 48
+    long:
+      input_tokens: 2048
+      output_tokens: 96
+  combinations:
+    enabled: true
+    selected:
+    - short_short
+    - short_medium
+    - short_long
+    - medium_short
+    - medium_medium
+    - medium_long
+    - long_short
+    - long_medium
+    - long_long
+  mixed:
+    enabled: false
+    shares:
+      short_short: 60
+      long_short: 20
+      short_long: 20
+    seed: null
+  interference:
+    enabled: false
+    trigger: first_output
+    trigger_chunks: 5
+    max_slowdown: 1.5
+  stress:
+    enabled: true
+    large_input: true
+    large_output: true
+    min_output_percent: 80
+  schedule:
+    levels:
+    - 1
+    - 2
+    duration_seconds: 10
+  pass_criteria:
+    first_output_p95_ms: null
+    response_p95_ms: null
+    max_error_percent: 0
+    min_correct_percent: 100
+    min_valid_responses: 5
+  input_token_tolerance: 0.1
+  calibration_attempts: 3

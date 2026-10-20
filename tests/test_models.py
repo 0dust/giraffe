@@ -113,23 +113,24 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
     assert not (set(default.checks) - ((set(CORE_CHECKS) - {"fairness"}) | {"concurrency"}))
     implicit = RunConfig(targets=[target], sessions={}, buckets={}, tool_calling=True)
     assert {"sessions", "concurrency", "tools"} <= set(implicit.checks)
-    assert set(implicit.concurrent_workloads.scenarios) == {
-        "streaming_fairness", "size_matrix", "mixed_interference"}
+    assert implicit.concurrent_load.combinations.enabled
+    assert implicit.concurrent_load.stress.enabled
+    assert not implicit.concurrent_load.mixed.enabled
     explicit = RunConfig(targets=[target], checks=["serving"], sessions={}, buckets={},
                          tool_calling=True)
     assert explicit.checks == ["serving"]
-    assert explicit.sessions is not None and explicit.buckets is not None
+    assert explicit.sessions is not None and explicit.concurrent_load is not None
     assert not explicit.tool_calling
-    assert RunConfig.model_validate(explicit.model_dump()) == explicit
+    assert RunConfig.model_validate(explicit.model_dump()).model_dump() == explicit.model_dump()
     draft = ConfigDraft.model_validate({**implicit.model_dump(), "checks": []})
     assert draft.checks == []
     assert not draft.tool_calling
     assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
-        "arrivals", "prefix", "concurrency", "sessions", "consistency", "tools"}
+        "arrivals", "prefix", "sessions", "consistency", "tools"}
 
 
 @pytest.mark.parametrize("check_id,field", [
-    ("arrivals", "arrivals"), ("prefix", "prefix"), ("concurrency", "concurrent_workloads"), ("sessions", "sessions"), ("consistency", "consistency"),
+    ("arrivals", "arrivals"), ("prefix", "prefix"), ("sessions", "sessions"), ("consistency", "consistency"),
     ("tools", "tool_calling"),
 ])
 def test_selected_extended_workloads_get_safe_defaults(check_id, field):
