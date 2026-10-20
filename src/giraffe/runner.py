@@ -17,6 +17,7 @@ from typing import Callable
 
 
 from .client import LLMClient, no_response_failure
+from .conditions import condition_for
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
@@ -119,6 +120,14 @@ def _serving_failure(record, scenario):
     return record.status != "completed" or not record.valid
 
 
+def _request_failed(record):
+    if (record.intentional or record.scenario in {"client_cancel", "client_deadline", "deadline_probe"}
+            or "intentional cancellation" in (record.error or "").lower()):
+        return False
+    return record.status in {"failed", "timeout"} or (
+        record.status == "completed" and (not record.valid or record.score is False))
+
+
 def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSpec:
     ids = list(dict.fromkeys([*spec.check_ids, *checks]))
     if _stress(scenario):
@@ -174,6 +183,7 @@ class _Run:
         self.max_lag_ms = 0.0
         self.timing_health = TimingHealth(self.start)
         self.inflight = {}
+        self.conditions = {}
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
         self.target_tasks = {}
@@ -181,12 +191,79 @@ class _Run:
         for target, observation in self.observations.items():
             observation["endpoint_health"] = self.endpoint_health[target]
         for observation in self.observations.values():
-            observation.update(deployment=None, deployment_history=[], phase_boundaries=[],
+            observation.update(conditions=[], deployment=None, deployment_history=[], phase_boundaries=[],
                 serving_telemetry={"snapshots": [], "sample_limit_reached": False,
                     "sampling_interval_seconds": config.metrics_interval_seconds,
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+    def _condition(self, target, scenario, workload=None):
+        condition = condition_for(scenario, workload or {})
+        key = (target, condition["id"])
+        row = self.conditions.get(key)
+        if row is None:
+            if len(self.observations[target]["conditions"]) >= 1024:
+                return None
+            row = {"target": target, "condition": condition, "planned": None,
+                   "planned_kind": "exact", "status": "waiting", "sent": 0,
+                   "started": 0, "running": 0, "completed": 0, "failed": 0,
+                   "not_sent": None, "reason": None}
+            self.conditions[key] = row
+            self.observations[target]["conditions"].append(row)
+        return row
+
+    def plan_condition(self, target, scenario, workload=None, planned=None, planned_kind="exact"):
+        row = self._condition(target, scenario, workload)
+        if row is not None:
+            row.update(planned=planned, planned_kind=planned_kind,
+                       not_sent=max(0, planned-row["sent"]) if planned is not None else None)
+            self.emit_condition("condition_planned", scenario, row)
+        return row
+
+    def start_condition(self, target, scenario, workload=None, planned=None, planned_kind="exact"):
+        row = self._condition(target, scenario, workload)
+        if row is None:
+            return None
+        previous = row["status"]
+        # An upfront plan already includes this dispatch segment. Repeated
+        # unplanned groups (e.g. context calibration rounds) extend their total.
+        if planned is not None and (previous != "waiting" or row["planned"] is None):
+            row["planned"] = (row["planned"] or 0) + planned
+        if row["planned"] is not None:
+            row["not_sent"] = max(0, row["planned"] - row["sent"])
+        if planned_kind == "upper_bound":
+            row["planned_kind"] = planned_kind
+        row.update(status="running", reason=None)
+        if previous != "running":
+            self.emit_condition("condition_started", scenario, row)
+        return row
+
+    def emit_condition(self, event, scenario, row):
+        # Keep the global completed progress counter separate from condition totals.
+        self.emit(event, row["target"], scenario, condition_summary=dict(row),
+                  **{k: v for k, v in row.items() if k not in {"target", "completed"}})
+
+    def condition_reason(self, target, fallback="check stopped early"):
+        if self.stop.is_set() or self.reason == "cancelled by user":
+            return "run stopped"
+        if time.monotonic() >= self.deadline or self.reason == "maximum run duration reached":
+            return "time limit reached"
+        if (self.budget_used >= self.config.max_requests or self.budget_counts[target] >= self.quotas[target]
+                or self.reason == "maximum request budget reached"):
+            return "request budget reached"
+        return fallback
+
+    def finish_condition(self, target, scenario, workload=None, reason=None):
+        key = (target, condition_for(scenario, workload or {})["id"])
+        row = self.conditions.get(key)
+        if row is None:
+            return
+        row["not_sent"] = max(0, row["planned"] - row["sent"]) if row["planned"] is not None else None
+        reason = reason or row["reason"]
+        row["reason"] = reason or (self.condition_reason(target) if row["not_sent"] else None)
+        row["status"] = "finished"
+        self.emit_condition("condition_finished", scenario, row)
 
     def emit(self, event: str, target: str = "", scenario: str = "", **extra):
         if target and event in {"scenario_started", "scenario_finished"}:
@@ -315,6 +392,17 @@ class _Run:
                 self.unfinished[target.name].update(_scenario_checks(spec))
                 return None
             self.attempted += 1
+            condition_id = condition_for(spec.scenario, spec.workload)["id"]
+            condition_key = (target.name, condition_id)
+            condition = self.conditions.get(condition_key)
+            if condition is None or condition["status"] != "running":
+                condition = self.start_condition(target.name, spec.scenario, spec.workload)
+            if condition is not None:
+                condition["sent"] += 1
+                condition["started"] += 1
+                condition["running"] += 1
+                if condition["planned"] is not None:
+                    condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
             request_slot = self.attempted - 1
             self.counts[target.name] += 1
             if not readiness:
@@ -335,7 +423,8 @@ class _Run:
                 if on_start:
                     on_start()
                 self.emit("request_started", target.name, spec.scenario,
-                          request_slot=request_slot, fixture_id=spec.fixture_id)
+                          request_slot=request_slot, fixture_id=spec.fixture_id,
+                          condition_id=condition_id, condition_summary=dict(condition) if condition else None)
                 if deadline_override is not None:
                     timeout_override = min(timeout_override or self.config.request_timeout_seconds,
                                            deadline_override - time.monotonic())
@@ -379,6 +468,7 @@ class _Run:
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
             record.completed_at = _now()
+            record.condition_id = condition_id
             record.dispatch_ms = (started-self.start)*1000
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
@@ -396,6 +486,7 @@ class _Run:
             intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
                            and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
+            record.intentional = intentional
             # Real clients report body reads immediately, including SSE
             # comments/reasoning. Test/alternate clients can provide record evidence.
             if (not getattr(client, "reports_response_activity", False)
@@ -423,34 +514,48 @@ class _Run:
                     name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
             if budget_exempt:
                 self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
+            if condition is not None:
+                condition["running"] -= 1
+                condition["completed"] += 1
+                condition["failed"] += int(_request_failed(record))
+                if record.status == "cancelled" and not intentional and (
+                        self.stop.is_set() or self.reason or time.monotonic() >= self.deadline):
+                    condition["reason"] = self.condition_reason(target.name)
             # Live visualization gets measurements only, never retained response bodies.
             self.emit("request_completed", target.name, spec.scenario, status=record.status,
+                      condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                       request_slot=request_slot, request=record.model_dump(mode="json", include={
-                          "id", "target", "fixture_id", "scenario", "status", "valid", "score",
+                          "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                           "elapsed_ms", "first_output_ms", "check_ids",
                       }), intentional=intentional)
             return record
 
     async def group(self, target, client, specs, scenario, count=None, concurrency=1, checks=()):
         count = count if count is not None else self.config.samples
+        workload = specs[0].workload if specs else {}
+        self.start_condition(target.name, scenario, workload, count)
         self.emit("scenario_started", target.name, scenario, planned_requests=count)
         if not specs:
             self.unfinished[target.name].update(checks)
+            self.finish_condition(target.name, scenario, workload)
             return []
-        result = []
-        for start in range(0, count, concurrency):
-            batch = [_spec(specs[i % len(specs)], scenario, checks)
-                     for i in range(start, min(start + concurrency, count))]
-            if not self.allowed(target.name):
-                for spec in batch:
-                    self.unfinished[target.name].update(_scenario_checks(spec))
-                break
-            result.extend(r for r in await asyncio.gather(
-                *(self.request(target, client, spec) for spec in batch)) if r is not None)
-        if len(result) < count:
-            self.unfinished[target.name].update(checks)
-        self.emit("scenario_finished", target.name, scenario)
-        return result
+        try:
+            result = []
+            for start in range(0, count, concurrency):
+                batch = [_spec(specs[i % len(specs)], scenario, checks)
+                         for i in range(start, min(start + concurrency, count))]
+                if not self.allowed(target.name):
+                    for spec in batch:
+                        self.unfinished[target.name].update(_scenario_checks(spec))
+                    break
+                result.extend(r for r in await asyncio.gather(
+                    *(self.request(target, client, spec) for spec in batch)) if r is not None)
+            if len(result) < count:
+                self.unfinished[target.name].update(checks)
+            return result
+        finally:
+            self.emit("scenario_finished", target.name, scenario)
+            self.finish_condition(target.name, scenario, workload)
 
     async def monitor(self, tasks):
         cancelled_targets = set()
@@ -759,6 +864,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                            case_sequence(config, len(schedule), index)],
                             "active_case_specs": run.pack_specs,
                         }
+                    schedule, _ = arrival_schedule(traffic, rate, index)
+                    run.start_condition(target.name, f"traffic_stage_{index}", planned=len(schedule))
                     stage_start = (time.monotonic() - run.start) * 1000
                     stage = await run_stage(
                         traffic=traffic, rate_rps=rate, stage_index=index,
@@ -770,6 +877,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                           if any(spec.scorer == "judge" for spec in run.pack_specs) else None),
                         **pack_arguments,
                     )
+                    drop_reasons = []
+                    if stage["dropped_local"]:
+                        drop_reasons.append("dropped: all request slots busy")
+                    if stage["dropped_late"]:
+                        drop_reasons.append("dropped: scheduler was late")
+                    if stage["not_offered"]:
+                        drop_reasons.append(run.condition_reason(target.name,
+                            "; ".join(stage["reasons"]) or "not offered"))
+                    run.finish_condition(target.name, f"traffic_stage_{index}",
+                        reason="; ".join(dict.fromkeys(drop_reasons)) or None)
                     stage["timing_interval_ms"] = [stage_start, (time.monotonic() - run.start) * 1000]
                     run.observations[target.name]["capacity"].append(stage)
                     if run.reason or run.stop.is_set() or time.monotonic() >= run.deadline:
@@ -886,9 +1003,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         dispatched += 1
                         spec = _spec(heavy_specs[index % len(heavy_specs)], "sustained", ["recovery"])
                         await run.request(target, client, spec)
+                run.start_condition(target.name, "sustained", planned=allowance, planned_kind="upper_bound")
                 run.emit("scenario_started", target.name, "sustained")
                 await asyncio.gather(*(worker() for _ in range(effective.concurrency)))
                 run.emit("scenario_finished", target.name, "sustained")
+                run.finish_condition(target.name, "sustained", reason="sending window ended" if dispatched < allowance else None)
                 run.observations[target.name]["sustained_batches"] = dispatched
                 sustained = [r for r in run.records if r.target == target.name and r.scenario == "sustained"]
                 window_ms = max((r.completed_ms for r in sustained), default=0) - min(
@@ -921,6 +1040,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         run.unfinished[target.name].update(enabled)
 
     finally:
+        for row in run.observations[target.name]["conditions"]:
+            if row["status"] != "finished":
+                run.finish_condition(target.name, row["condition"]["id"])
         if telemetry_task:
             telemetry_task.cancel()
             await asyncio.gather(telemetry_task, return_exceptions=True)
@@ -1942,6 +2064,11 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                     finalize_stage(evidence, limits) | {
                         "timing_interval_ms": stages[index]["timing_interval_ms"]}
                     for index, evidence in enumerate(run.stage_evidence[target.name])]
+        failures = Counter((record.target, record.condition_id) for record in run.records if _request_failed(record))
+        for key, row in run.conditions.items():
+            if row["failed"] != failures[key]:
+                row["failed"] = failures[key]
+                run.emit_condition("condition_finished", row["condition"]["id"], row)
     run.verdict_budget_guidance = _budget_guidance(config)
     checks = [check for target in config.targets for check in _checks(run, target)]
     checks = consolidate_checks(run, public_config, checks)

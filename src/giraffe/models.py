@@ -1240,6 +1240,8 @@ class RequestRecord(Model):
     target: str
     fixture_id: str
     scenario: str
+    condition_id: str | None = None
+    intentional: bool = False
     check_ids: list[str]
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]

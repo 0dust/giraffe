@@ -41,130 +41,137 @@ async def run_conversation(run, target, client, fixture, mode):
     tools_bytes = len(json.dumps(fixture.tools, ensure_ascii=False).encode())
     schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in fixture.tools}
 
-    for turn in range(len(fixture.steps) + 1):
-        step = fixture.steps[turn] if turn < len(fixture.steps) else None
-        if step and step.user_message is not None:
-            messages = [*messages, {"role": "user", "content": step.user_message}]
-            satisfied.clear()
-        if not run.allowed(target.name):
-            session["reason"] = "budget_exhausted"
-            run.unfinished[target.name].add("tools")
-            return
-        serialized_history = json.dumps(messages, ensure_ascii=False)
-        input_chars = len(serialized_history)
-        if len(serialized_history.encode()) + tools_bytes + run.config.max_output_tokens + 32 > run.config.context_limit:
-            session["reason"] = "history_limit"
-            run.unfinished[target.name].add("tools")
-            return
-        expectation = ToolExpectation(tools=fixture.tools, choice=ToolChoiceRule(mode="auto"),
-            expected_calls=[ExpectedToolCall(name=c.name, arguments=c.arguments)
-                            for c in step.expected_calls] if step else None)
-        scenario = f"tools_{fixture.fixture_id}_{mode}_turn{turn}"
-        spec = RequestSpec(fixture_id=scenario, scenario=scenario, check_ids=["tools"],
-            messages=messages, scorer="tool", stream=mode == "stream", tool_expectation=expectation,
-            input_chars=input_chars, max_tokens=run.config.max_output_tokens, options=fixture.options,
-            workload={"selection": "conversation", "tool_fixture_id": fixture.fixture_id,
-                      "mode": mode, "session_id": session_id, "turn_id": turn,
-                      "stage": "call" if step else "final"})
-        def assess(record):
-            nonlocal messages, pending_results
-            session["request_ids"].append(record.id)
-            for result in pending_results:
-                result["supplied_in_request"] = record.id
-            pending_results = []
-            evidence = {"session_id": session_id, "turn": turn, "stage": "call" if step else "final",
-                        "status": "inconclusive", "reason": "unverified", "calls": [],
-                        "repetition_count": 0,
-                        "final_content": [item.model_dump() for item in final_content] if not step else None}
-            record.tool_conversation = evidence
+    planned = len(fixture.steps) + 1
+    condition_scenario = f"tools_{fixture.fixture_id}_{mode}_turn0"
+    run.start_condition(target.name, condition_scenario, planned=planned)
+    try:
+        for turn in range(len(fixture.steps) + 1):
+            step = fixture.steps[turn] if turn < len(fixture.steps) else None
+            if step and step.user_message is not None:
+                messages = [*messages, {"role": "user", "content": step.user_message}]
+                satisfied.clear()
+            if not run.allowed(target.name):
+                session["reason"] = "budget_exhausted"
+                run.unfinished[target.name].add("tools")
+                return
+            serialized_history = json.dumps(messages, ensure_ascii=False)
+            input_chars = len(serialized_history)
+            if len(serialized_history.encode()) + tools_bytes + run.config.max_output_tokens + 32 > run.config.context_limit:
+                session["reason"] = "history_limit"
+                run.unfinished[target.name].add("tools")
+                return
+            expectation = ToolExpectation(tools=fixture.tools, choice=ToolChoiceRule(mode="auto"),
+                expected_calls=[ExpectedToolCall(name=c.name, arguments=c.arguments)
+                                for c in step.expected_calls] if step else None)
+            scenario = f"tools_{fixture.fixture_id}_{mode}_turn{turn}"
+            spec = RequestSpec(fixture_id=scenario, scenario=scenario, check_ids=["tools"],
+                messages=messages, scorer="tool", stream=mode == "stream", tool_expectation=expectation,
+                input_chars=input_chars, max_tokens=run.config.max_output_tokens, options=fixture.options,
+                workload={"selection": "conversation", "tool_fixture_id": fixture.fixture_id,
+                          "mode": mode, "session_id": session_id, "turn_id": turn,
+                          "stage": "call" if step else "final"})
+            def assess(record):
+                nonlocal messages, pending_results
+                session["request_ids"].append(record.id)
+                for result in pending_results:
+                    result["supplied_in_request"] = record.id
+                pending_results = []
+                evidence = {"session_id": session_id, "turn": turn, "stage": "call" if step else "final",
+                            "status": "inconclusive", "reason": "unverified", "calls": [],
+                            "repetition_count": 0,
+                            "final_content": [item.model_dump() for item in final_content] if not step else None}
+                record.tool_conversation = evidence
 
-            def finish(status, reason, message):
-                evidence.update(status=status, reason=reason)
-                session.update(status=status, reason=reason)
-                record.score = {"pass": True, "fail": False, "inconclusive": None}[status]
-                record.score_message = message
+                def finish(status, reason, message):
+                    evidence.update(status=status, reason=reason)
+                    session.update(status=status, reason=reason)
+                    record.score = {"pass": True, "fail": False, "inconclusive": None}[status]
+                    record.score_message = message
 
-            parsed = []
-            for call in record.tool_calls:
-                function = call["function"]
-                if not call.get("id") or call.get("type") != "function" or function.get("name") not in schemas:
-                    continue
-                try:
-                    arguments = _parsed_tool_arguments(function.get("arguments"), schemas[function["name"]])
-                    fingerprint = tool_call_fingerprint(function["name"], arguments)
-                except (ValueError, TypeError, RecursionError, ValidationError):
-                    continue
-                parsed.append(arguments)
-                evidence["calls"].append({"call_id": call["id"], "function": function["name"],
-                                          "fingerprint": fingerprint, "result": None,
-                                          "result_outcome": None, "supplied_in_request": None})
-                if fingerprint in satisfied:
-                    evidence["repetition_count"] += 1
-            session["repetition_count"] += evidence["repetition_count"]
-            if evidence["repetition_count"]:
-                finish("fail", "repeated_satisfied_call", "An already-satisfied operation was requested again.")
-                return
-            if reasoning_budget(record):
-                finish("inconclusive", "truncated", "Reasoning exhausted the output budget before a conversation answer.")
-                return
-            if not record.valid or record.status != "completed":
-                reason = record.status if record.status in {"timeout", "cancelled"} else "protocol_or_api_failure"
-                finish("fail" if reason == "protocol_or_api_failure" else "inconclusive", reason,
-                       "Conversation response did not complete validly.")
-                return
-            if record.finish_reason == "length":
-                finish("fail" if record.score is False else "inconclusive", "truncated",
-                       "Complete calls violate the conversation contract." if record.score is False else
-                       "Conversation response was truncated; completion is unverified.")
-                return
-            if record.tool_evaluation.protocol.status != "pass" or record.assistant_message is None:
-                finish("fail", "protocol_or_api_failure", "Conversation assistant history is not usable.")
-                return
-            if record.tool_evaluation.arguments.status == "inconclusive":
-                finish("inconclusive", "validation_limit", "Conversation argument validation exceeded its bound.")
-                return
-            if record.tool_evaluation.arguments.status == "fail":
-                finish("fail", "invalid_call", "Conversation call arguments or function are invalid.")
-                return
-            if step:
-                if record.score is not True:
-                    finish("fail", "unexpected_call", "Calls differ from the declared conversation step.")
+                parsed = []
+                for call in record.tool_calls:
+                    function = call["function"]
+                    if not call.get("id") or call.get("type") != "function" or function.get("name") not in schemas:
+                        continue
+                    try:
+                        arguments = _parsed_tool_arguments(function.get("arguments"), schemas[function["name"]])
+                        fingerprint = tool_call_fingerprint(function["name"], arguments)
+                    except (ValueError, TypeError, RecursionError, ValidationError):
+                        continue
+                    parsed.append(arguments)
+                    evidence["calls"].append({"call_id": call["id"], "function": function["name"],
+                                              "fingerprint": fingerprint, "result": None,
+                                              "result_outcome": None, "supplied_in_request": None})
+                    if fingerprint in satisfied:
+                        evidence["repetition_count"] += 1
+                session["repetition_count"] += evidence["repetition_count"]
+                if evidence["repetition_count"]:
+                    finish("fail", "repeated_satisfied_call", "An already-satisfied operation was requested again.")
                     return
-                if record.input_tokens is not None and record.input_tokens + run.config.max_output_tokens > run.config.context_limit:
-                    finish("inconclusive", "history_limit", "Observed conversation context exceeds the configured limit.")
+                if reasoning_budget(record):
+                    finish("inconclusive", "truncated", "Reasoning exhausted the output budget before a conversation answer.")
                     return
-                messages = [*messages, record.assistant_message]
-                # Parallel calls are unordered: link each supplied result to its matched call id.
-                assignment = matched_calls(step.expected_calls, [c["function"]["name"] for c in record.tool_calls], parsed)
-                if assignment is None:
-                    finish("fail", "unexpected_call", "Calls differ from the declared conversation step.")
+                if not record.valid or record.status != "completed":
+                    reason = record.status if record.status in {"timeout", "cancelled"} else "protocol_or_api_failure"
+                    finish("fail" if reason == "protocol_or_api_failure" else "inconclusive", reason,
+                           "Conversation response did not complete validly.")
                     return
-                expected_for = {call_index: step.expected_calls[index] for index, call_index in enumerate(assignment)}
-                for index, (call, item) in enumerate(zip(record.tool_calls, evidence["calls"], strict=True)):
-                    expected = expected_for[index]
-                    result = _expand(expected.result, marker)
-                    messages.append({"role": "tool", "tool_call_id": call["id"],
-                                     "content": json.dumps(result, ensure_ascii=False)})
-                    item.update(result=result, result_outcome=expected.outcome)
-                    pending_results.append(item)
-                    if expected.outcome == "success":
-                        satisfied.add(item["fingerprint"])
-                evidence.update(status="pass", reason="expected_calls")
-                session["completed_steps"] += 1
-            elif record.tool_calls:
-                finish("fail", "unexpected_call", "The final response requested an operation outside the fixture.")
-                return
-            elif (answer := final_answer(record.output))[2]:
-                finish("inconclusive", "reasoning_without_answer", "Final response has unclosed reasoning and no answer to check.")
-            elif all(_answer_matches(item, answer[0]) for item in final_content):
-                finish("pass", "completed", "Final answer satisfies the supplied-result expectations.")
-            else:
-                finish("fail", "final_answer_mismatch", "Final answer does not satisfy the supplied-result expectations.")
+                if record.finish_reason == "length":
+                    finish("fail" if record.score is False else "inconclusive", "truncated",
+                           "Complete calls violate the conversation contract." if record.score is False else
+                           "Conversation response was truncated; completion is unverified.")
+                    return
+                if record.tool_evaluation.protocol.status != "pass" or record.assistant_message is None:
+                    finish("fail", "protocol_or_api_failure", "Conversation assistant history is not usable.")
+                    return
+                if record.tool_evaluation.arguments.status == "inconclusive":
+                    finish("inconclusive", "validation_limit", "Conversation argument validation exceeded its bound.")
+                    return
+                if record.tool_evaluation.arguments.status == "fail":
+                    finish("fail", "invalid_call", "Conversation call arguments or function are invalid.")
+                    return
+                if step:
+                    if record.score is not True:
+                        finish("fail", "unexpected_call", "Calls differ from the declared conversation step.")
+                        return
+                    if record.input_tokens is not None and record.input_tokens + run.config.max_output_tokens > run.config.context_limit:
+                        finish("inconclusive", "history_limit", "Observed conversation context exceeds the configured limit.")
+                        return
+                    messages = [*messages, record.assistant_message]
+                    # Parallel calls are unordered: link each supplied result to its matched call id.
+                    assignment = matched_calls(step.expected_calls, [c["function"]["name"] for c in record.tool_calls], parsed)
+                    if assignment is None:
+                        finish("fail", "unexpected_call", "Calls differ from the declared conversation step.")
+                        return
+                    expected_for = {call_index: step.expected_calls[index] for index, call_index in enumerate(assignment)}
+                    for index, (call, item) in enumerate(zip(record.tool_calls, evidence["calls"], strict=True)):
+                        expected = expected_for[index]
+                        result = _expand(expected.result, marker)
+                        messages.append({"role": "tool", "tool_call_id": call["id"],
+                                         "content": json.dumps(result, ensure_ascii=False)})
+                        item.update(result=result, result_outcome=expected.outcome)
+                        pending_results.append(item)
+                        if expected.outcome == "success":
+                            satisfied.add(item["fingerprint"])
+                    evidence.update(status="pass", reason="expected_calls")
+                    session["completed_steps"] += 1
+                elif record.tool_calls:
+                    finish("fail", "unexpected_call", "The final response requested an operation outside the fixture.")
+                    return
+                elif (answer := final_answer(record.output))[2]:
+                    finish("inconclusive", "reasoning_without_answer", "Final response has unclosed reasoning and no answer to check.")
+                elif all(_answer_matches(item, answer[0]) for item in final_content):
+                    finish("pass", "completed", "Final answer satisfies the supplied-result expectations.")
+                else:
+                    finish("fail", "final_answer_mismatch", "Final answer does not satisfy the supplied-result expectations.")
 
-        record = await run.request(target, client, spec, evaluate_record=assess)
-        if record is None:
-            session["reason"] = "budget_exhausted"
-            run.unfinished[target.name].add("tools")
-            return
-        if record.tool_conversation["reason"] != "expected_calls":
-            return
+            record = await run.request(target, client, spec, evaluate_record=assess)
+            if record is None:
+                session["reason"] = "budget_exhausted"
+                run.unfinished[target.name].add("tools")
+                return
+            if record.tool_conversation["reason"] != "expected_calls":
+                return
+    finally:
+        run.finish_condition(target.name, condition_scenario,
+            reason="dependent turns skipped" if len(session["request_ids"]) < planned else None)

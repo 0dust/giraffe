@@ -15,7 +15,10 @@ def sample_count(count, level):
     return ((max(count, level) + level - 1) // level) * level
 
 
-async def refill(run, target, client, specs, count, level, *, end=None):
+async def refill(run, target, client, specs, count, level, *, end=None, condition_plan=True):
+    if condition_plan and specs:
+        run.start_condition(target.name, specs[0].scenario, specs[0].workload, count,
+                            "upper_bound" if end is not None else "exact")
     active, records = {}, []
     issued = 0
     area, last, begin = 0., None, None
@@ -70,7 +73,13 @@ async def refill(run, target, client, specs, count, level, *, end=None):
             else:
                 break
 
-    await asyncio.gather(*(worker() for _ in range(min(level, count))))
+    try:
+        await asyncio.gather(*(worker() for _ in range(min(level, count))))
+    finally:
+        if condition_plan and specs:
+            run.finish_condition(target.name, specs[0].scenario, specs[0].workload,
+                run.condition_reason(target.name, "sending window ended")
+                if end is not None and time.monotonic() >= end and len(records) < count else None)
     average = area / (last - begin) if begin is not None and last > begin else 0
     delays = scheduling_delay_windows(run)
     peak = peak_evidenced_concurrency(records, delays)
@@ -112,29 +121,39 @@ async def run_logprob_consistency(run, target, client, fixtures):
     options = settings.logprobs
     width = corpus_width(settings)
     templates = logprob_fixtures(run.config, fixtures)
+    levels = list(dict.fromkeys([1, *settings.levels]))
     for shape in settings.shapes:
-        for level in dict.fromkeys([1, *settings.levels]):
-            scenario = f'consistency_c{level}_{shape}'
-            for phase, rounds in [('priming', options.priming_rounds), ('measured', settings.repetitions)]:
-                for repeat in range(rounds):
-                    if not run.allowed(target.name):
-                        run.unfinished[target.name].add('consistency')
-                        return
-                    specs = []
-                    for slot in range(width):
-                        spec = templates[shape].model_copy(deep=True)
-                        spec.fixture_id = f'logprob_{shape}_{slot}'
-                        spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], False
-                        spec.options = consistency_options(run.config, spec.options)
-                        spec.options.update(logprobs=True, top_logprobs=options.top_logprobs)
-                        spec.workload = {'level': level, 'input_bucket': shape, 'equality': settings.equality,
-                                         'temperature': (run.config.request_options | spec.options).get('temperature'), 'seed': settings.seed,
-                                         'logprobs': True, 'top_logprobs': options.top_logprobs,
-                                         'phase': phase, 'round': repeat, 'corpus_index': slot,
-                                         'corpus_size': width, 'response_mode': 'complete',
-                                         'option_support': 'requested; runtime enforcement unverified'}
-                        specs.append(spec)
-                    await refill(run, target, client, specs, width, level)
+        for level in levels:
+            run.plan_condition(target.name, f'consistency_c{level}_{shape}',
+                planned=width * (options.priming_rounds + settings.repetitions))
+    try:
+        for shape in settings.shapes:
+            for level in dict.fromkeys([1, *settings.levels]):
+                scenario = f'consistency_c{level}_{shape}'
+                for phase, rounds in [('priming', options.priming_rounds), ('measured', settings.repetitions)]:
+                    for repeat in range(rounds):
+                        if not run.allowed(target.name):
+                            run.unfinished[target.name].add('consistency')
+                            return
+                        specs = []
+                        for slot in range(width):
+                            spec = templates[shape].model_copy(deep=True)
+                            spec.fixture_id = f'logprob_{shape}_{slot}'
+                            spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], False
+                            spec.options = consistency_options(run.config, spec.options)
+                            spec.options.update(logprobs=True, top_logprobs=options.top_logprobs)
+                            spec.workload = {'level': level, 'input_bucket': shape, 'equality': settings.equality,
+                                             'temperature': (run.config.request_options | spec.options).get('temperature'), 'seed': settings.seed,
+                                             'logprobs': True, 'top_logprobs': options.top_logprobs,
+                                             'phase': phase, 'round': repeat, 'corpus_index': slot,
+                                             'corpus_size': width, 'response_mode': 'complete',
+                                             'option_support': 'requested; runtime enforcement unverified'}
+                            specs.append(spec)
+                        await refill(run, target, client, specs, width, level, condition_plan=False)
+    finally:
+        for shape in settings.shapes:
+            for level in levels:
+                run.finish_condition(target.name, f'consistency_c{level}_{shape}')
 
 
 def summarize_logprobs(records, settings, *, min_samples=2):

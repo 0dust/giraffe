@@ -342,6 +342,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
                 "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
                 "live_requests": list(live.get("requests", {}).values()),
+                "live_conditions": list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", []),
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": meta.get("baseline_id"), "report": persisted,
@@ -380,14 +381,24 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
         meta = job["meta"]
 
         def progress(event: dict) -> None:
-            job["progress"] = event
-            job["events"].append(event)
-            del job["events"][:-100]
+            if not event["event"].startswith("condition_"):
+                job["progress"] = event
+                job["events"].append(event)
+                del job["events"][:-100]
+            summary = event.get("condition_summary")
+            if not summary and event["event"] in {"condition_planned", "condition_started", "condition_finished"}:
+                summary = {key: event.get(key) for key in ("target", "condition", "planned", "planned_kind",
+                    "status", "sent", "started", "running", "completed", "failed", "not_sent", "reason")}
+            if summary and summary.get("condition"):
+                key = (summary["target"], summary["condition"]["id"])
+                if key in job["conditions"] or len(job["conditions"]) < 2048:
+                    job["conditions"][key] = summary
             slot = event.get("request_slot")
             if isinstance(slot, int) and 0 <= slot < config.max_requests:
                 if event["event"] == "request_started":
                     job["requests"][slot] = {"slot": slot, "status": "running",
                         "target": event.get("target"), "scenario": event.get("scenario"),
+                        "condition_id": event.get("condition_id"),
                         "fixture_id": event.get("fixture_id")}
                 elif event["event"] == "request_completed" and event.get("request"):
                     job["requests"][slot] = {**event["request"], "slot": slot,
@@ -411,7 +422,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             meta.update(state="error", finished_at=_now(),
                         error=f"Run could not finish ({type(error).__name__}). Review the configuration and retry.")
         finally:
-            meta.update(progress=job["progress"], events=job["events"], phases=job["phases"])
+            meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
+                        conditions=list(job["conditions"].values()))
             try:
                 _write(job["directory"] / ".web.json", meta)
             except OSError:
@@ -552,7 +564,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
                 "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
         _write(directory / ".web.json", meta)
         active.update(id=identifier, state="running", directory=directory, meta=meta,
-                      progress={}, events=[], requests={}, phases=[], stop=asyncio.Event())
+                      progress={}, events=[], requests={}, conditions={}, phases=[], stop=asyncio.Event())
         active["task"] = asyncio.create_task(execute(active, config, baseline))
         return {"id": identifier, "state": "running"}
 
