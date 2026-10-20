@@ -1115,7 +1115,6 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 :root.rail-collapsed .app-shell-footer { flex-direction: column; padding: 12px 0 0; }
 :root.rail-collapsed .runner-indicator { justify-content: center; flex: 0; }
 :root.rail-collapsed .rail-tools { flex-direction: column; }
-.app-header, .workspace { transition: width .22s var(--ease), margin-left .22s var(--ease); }
 @media (max-width: 960px) { .rail-toggle { display: none; } }
 
 /* ── Make actions look like actions ── */
@@ -1169,3 +1168,7 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 .baseline-saved strong { font-family: var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #setup-review .review-compare { border-top: 1px solid var(--line); }
 #setup-review .review-compare .review-baseline { color: var(--text); font-size: 14px; margin-top: 0; }
+
+/* Dots packed into a dense cluster drop their outline so the cluster reads as a solid band, not a dark smear. */
+.swarm-dot.packed { stroke: none; }
+.swarm-dot.packed:hover, .swarm-dot.packed:focus-visible { stroke: var(--text); stroke-width: 1.5; }
