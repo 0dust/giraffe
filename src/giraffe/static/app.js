@@ -596,7 +596,10 @@ function focusSetting(path) {
     for(let parent=input.parentElement;parent;parent=parent.parentElement)if(parent.tagName==='DETAILS')parent.open=true;
   }
   for(const field of $$('[data-setting-highlight]'))field.removeAttribute('data-setting-highlight');
-  input?.setAttribute?.('data-setting-highlight','true');input?.scrollIntoView?.({block:'center'});input?.focus?.({preventScroll:true});
+  input?.setAttribute?.('data-setting-highlight','true');
+  const target=input?.closest?.('.form-field')||input,footerHeight=$('.setup-navigation')?.getBoundingClientRect?.().height||0;
+  if(target?.style)target.style.scrollMarginBottom=`${Math.max(160,footerHeight+32)}px`;
+  target?.scrollIntoView?.({block:'center'});input?.focus?.({preventScroll:true});
 }
 function focusFirstSettingError(error=null) {
   if(hasJsonChanges())return;
@@ -850,7 +853,22 @@ function checkFieldHint(check,config,name,kind='option',showValue=false) {
   if(overridden)return `Custom · ${origin}: ${checkSettingValue(name,defaultValue)}`;
   return `${human(origin)}${showValue?`: ${checkSettingValue(name,value)}`:''}`;
 }
+function runLimitHint(name,config) {
+  if(name==='concurrent_levels')return `Requests at once for each test, separated by commas. Each level must be at most Maximum at once (${config.concurrency}).`;
+  if(name==='traffic_max_in_flight')return `Requests at once for this check. Leave blank to use Maximum at once (${config.concurrency}); this check cannot exceed it.`;
+}
+function updateRunLimitHints(config) {
+  for(const name of ['concurrent_levels','traffic_max_in_flight']){const hint=$(`#field-${name}-hint`);if(hint)hint.textContent=runLimitHint(name,config);}
+  const bucket=$('#bucket-shared-limit');if(bucket)bucket.textContent=`Maximum at once is ${config.concurrency} requests. Question lengths and answer caps are also used by Short-request slowdown.`;
+  const form=$('#new-run-form');if(!form)return;
+  const concurrency=form.elements.profile_sessions_concurrency;
+  if(concurrency)concurrency.max=String(Math.min(Number.isFinite(config.concurrency)?config.concurrency:32,state.bootstrap.config_schema?.$defs?.Sessions?.properties?.concurrency?.maximum??32));
+  for(const input of [form.elements.profile_sessions_max_tokens,form.elements.sessions_max_tokens,...$$('[name^="session_cap_"]')].filter(Boolean)){
+    if(Number.isFinite(config.max_output_tokens))input.max=String(config.max_output_tokens);else input.removeAttribute?.('max');
+  }
+}
 function updateCheckFieldHints(config) {
+  updateRunLimitHints(config);
   const form=$('#new-run-form');
   if(form)for(const check of state.bootstrap.checks)for(const name of ['concurrency','max_output_tokens','request_timeout_seconds']){
     const input=form.elements[`test_${check.id}_${name}`];if(!input)continue;
@@ -946,7 +964,7 @@ function renderConcurrentEditor(config) {
     const item=settings.stress_cases.find(value=>value.name===name) || defaults.stress_cases.find(value=>value.name===name);
     return `<h4><label><input type="checkbox" name="concurrent_${name}_enabled" ${settings.stress_cases.some(value=>value.name===name)?'checked':''}> ${name==='long_input_summary'?'Large input → short summary':'Short input → long generation'}</label></h4><div class="fields">${name==='long_input_summary'?field(`concurrent_${name}_input`,'Input token target',item.input_tokens,{type:'number',min:128,max:65536,step:1,hint:'Sized using server-reported usage; verified on each request.'}):''}${field(`concurrent_${name}_output`,'Output token cap',item.output_tokens,{type:'number',min:1,max:65536,step:1})}${field(`concurrent_${name}_minimum`,'Minimum observed output tokens',item.min_output_tokens,{type:'number',min:1,max:65536,step:1,placeholder:'Use output cap',hint:'Early stopping leaves length coverage inconclusive.'})}</div>`;
   }).join('');
-  return `<div class="concurrent-editor" data-concurrent-settings><input type="hidden" name="concurrent_scenarios_rendered" value="1"><h3>Scenarios</h3><p class="hint">Each selected scenario keeps its own verdict, measurements and request evidence.</p><fieldset>${scenarios.map(([name,label])=>`<label><input type="checkbox" name="concurrent_scenario_${name}" ${settings.scenarios.includes(name)?'checked':''}> ${label}</label>`).join('')}</fieldset><div class="fields">${field('concurrent_levels','Concurrency levels',settings.levels.join(', '),{hint:`Requests at once for each test, separated by commas. Each level must be at most Maximum at once (${config.concurrency}).`})}${field('concurrent_samples_per_bucket','Samples per size/concurrency cell',settings.samples_per_bucket,{type:'number',min:2,max:100,step:1})}${field('concurrent_mixed_pairs','Pairs per interference scenario',settings.mixed_pairs,{type:'number',min:1,max:100,step:1})}${field('concurrent_heavy_long_input','Long-input weight',settings.heavy_weights.long_input,{type:'number',min:1,max:16,step:1})}${field('concurrent_heavy_long_output','Long-output weight',settings.heavy_weights.long_output,{type:'number',min:1,max:16,step:1})}${field('concurrent_window_seconds','Maximum seconds per matrix cell',settings.window_seconds,{type:'number',min:.1,step:'any'})}</div><details class="check-advanced"><summary>Input/output size matrix</summary><div class="fields">${sizeFields.join('')}</div><p class="hint">Every level sends all 9 size combinations, with at least as many requests as that level. Caps do not guarantee answer length.</p></details><details class="check-advanced"><summary>Token-stress targets</summary><p class="hint">These cases run at every selected concurrency level. The global context, output, request and time limits still apply. Insufficient limits are reported separately for each case; targets are never silently reduced. Summary scoring checks the required box-label fact, not full summary quality.</p>${cases}<div class="fields">${field('concurrent_input_token_tolerance','Input token tolerance',settings.input_token_tolerance,{type:'number',min:0,max:.49,step:'any'})}${field('concurrent_calibration_attempts','Maximum input-sizing attempts',settings.calibration_attempts,{type:'number',min:1,max:5,step:1})}</div></details></div>`;
+  return `<div class="concurrent-editor" data-concurrent-settings><input type="hidden" name="concurrent_scenarios_rendered" value="1"><h3>Scenarios</h3><p class="hint">Each selected scenario keeps its own verdict, measurements and request evidence.</p><fieldset>${scenarios.map(([name,label])=>`<label><input type="checkbox" name="concurrent_scenario_${name}" ${settings.scenarios.includes(name)?'checked':''}> ${label}</label>`).join('')}</fieldset><div class="fields">${field('concurrent_levels','Concurrency levels',settings.levels.join(', '),{hint:runLimitHint('concurrent_levels',config)})}${field('concurrent_samples_per_bucket','Samples per size/concurrency cell',settings.samples_per_bucket,{type:'number',min:2,max:100,step:1})}${field('concurrent_mixed_pairs','Pairs per interference scenario',settings.mixed_pairs,{type:'number',min:1,max:100,step:1})}${field('concurrent_heavy_long_input','Long-input weight',settings.heavy_weights.long_input,{type:'number',min:1,max:16,step:1})}${field('concurrent_heavy_long_output','Long-output weight',settings.heavy_weights.long_output,{type:'number',min:1,max:16,step:1})}${field('concurrent_window_seconds','Maximum seconds per matrix cell',settings.window_seconds,{type:'number',min:.1,step:'any'})}</div><details class="check-advanced"><summary>Input/output size matrix</summary><div class="fields">${sizeFields.join('')}</div><p class="hint">Every level sends all 9 size combinations, with at least as many requests as that level. Caps do not guarantee answer length.</p></details><details class="check-advanced"><summary>Token-stress targets</summary><p class="hint">These cases run at every selected concurrency level. The global context, output, request and time limits still apply. Insufficient limits are reported separately for each case; targets are never silently reduced. Summary scoring checks the required box-label fact, not full summary quality.</p>${cases}<div class="fields">${field('concurrent_input_token_tolerance','Input token tolerance',settings.input_token_tolerance,{type:'number',min:0,max:.49,step:'any'})}${field('concurrent_calibration_attempts','Maximum input-sizing attempts',settings.calibration_attempts,{type:'number',min:1,max:5,step:1})}</div></details></div>`;
 }
 
 function renderConcurrentResults(metrics) {
@@ -1005,7 +1023,7 @@ function renderTrafficEditor(config) {
   const traffic=config.traffic || state.bootstrap.config.traffic,custom=!sameConfig(traffic,state.bootstrap.config.traffic),schema=state.bootstrap.traffic_schema;
   const labels={rates:'Rates (requests/second)',duration_seconds:'Seconds per rate',arrival:'Arrival pattern',max_in_flight:'Capacity requests at once',seed:'Random seed',long_input_chars:'Long question (characters)',long_output_words:'Long answer (words)',drain_timeout_seconds:'Completion wait (seconds)',scheduler_lag_tolerance_ms:'Start delay (ms)'};
   const primary=new Set(['rates','duration_seconds','max_in_flight']);
-  const control=([name,fieldSchema])=>schemaField(`traffic_${name}`,traffic[name],fieldSchema,{label:labels[name] || human(name),hint:name==='max_in_flight'?`Requests at once for this check. Leave blank to use Maximum at once (${config.concurrency}); this check cannot exceed it.`:undefined});
+  const control=([name,fieldSchema])=>schemaField(`traffic_${name}`,traffic[name],fieldSchema,{label:labels[name] || human(name),hint:name==='max_in_flight'?runLimitHint('traffic_max_in_flight',config):undefined});
   const entries=Object.entries(schema.properties).filter(([name])=>name!=='mix'),mix=schema.$defs.TrafficMix;
   return `<div class="traffic-editor"><input type="hidden" name="traffic_mode" value="${custom?'custom':'default'}"><div class="test-editor-heading"><h3>Traffic to send</h3><button class="text-button reset-test" type="button" data-action="reset-traffic">Restore traffic defaults</button></div><p class="hint">Each rate is a separate stage. If all request slots are busy, extra arrivals count as dropped.</p><div data-traffic-settings><fieldset class="fields">${entries.filter(([name])=>primary.has(name)).map(control).join('')}</fieldset><details class="check-advanced"><summary>Arrival pattern, request mix & timing</summary><fieldset class="fields">${entries.filter(([name])=>!primary.has(name)).map(control).join('')}<div class="full traffic-mix-heading"><h4>Request mix</h4><p class="hint">Higher weights mean a larger share of traffic. For example, weights 3, 1 and 1 send about 60% short requests, 20% long questions and 20% long answers.</p></div>${Object.entries(mix.properties).map(([name,s])=>schemaField(`traffic_mix_${name}`,traffic.mix[name],s,{label:({short:'Short requests',long_input:'Long questions',long_output:'Long answers'})[name]})).join('')}</fieldset></details></div></div>`;
 }
@@ -1375,7 +1393,8 @@ function renderRequestPlan(config=null) {
   syncRunBlueprint(config,plan);
   const start=$('#start-run');if(start)start.disabled=!canStartRun();
   const checkPlan=$('#checks-plan-summary');if(checkPlan){checkPlan.textContent=plan?`${setupPlanCount(plan)}${plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.required_request_limit>plan.request_limit));}
-  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;const baselineName=(state.baselines || []).find(item=>item.id===$('#new-run-form')?.elements?.baseline_id?.value)?.name;dock.innerHTML=state.setupStep===3?`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> stops at ${number(config.max_requests)} requests or ${escape(elapsed(config.max_duration_seconds))}${baselineName?` <span>·</span> compared with <strong>${escape(baselineName)}</strong>`:''}`:`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${plan?escape(setupPlanCount(plan)):'Planning…'}`;}
+  const issues=currentSettingErrors().length,planStatus=issues?`${number(issues)} ${issues===1?'setting':'settings'} to fix`:plan?setupPlanCount(plan):saved?.status==='error'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?'Plan unavailable':'Planning…';
+  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;const baselineName=(state.baselines || []).find(item=>item.id===$('#new-run-form')?.elements?.baseline_id?.value)?.name;dock.innerHTML=state.setupStep===3?`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> stops at ${number(config.max_requests)} requests or ${escape(elapsed(config.max_duration_seconds))}${baselineName?` <span>·</span> compared with <strong>${escape(baselineName)}</strong>`:''}`:`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${escape(planStatus)}`;}
   const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
   const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div></dl>`:'';
   if(!plan){
@@ -1724,8 +1743,7 @@ function updateBounds() {
   let payload;try{payload=readForm(true);}catch{return;}
   const c=payload.config;
   syncSetupIdentity();
-  const trafficLimitHint=$('#field-traffic_max_in_flight-hint');if(trafficLimitHint)trafficLimitHint.textContent=`Requests at once for this check. Leave blank to use Maximum at once (${c.concurrency}); this check cannot exceed it.`;
-  const bucketLimitHint=$('#bucket-shared-limit');if(bucketLimitHint)bucketLimitHint.textContent=`Maximum at once is ${c.concurrency} requests. Question lengths and answer caps are also used by Short-request slowdown.`;refreshDefaultProfileFields(c);
+  refreshDefaultProfileFields(c);
   const derived=$('#derived-concurrency');if(derived){
     derived.textContent=`At most ${number(c.concurrency)} ${c.concurrency===1?'request':'requests'} at once.`;
     const ceiling=$('#new-run-form').elements.concurrency;

@@ -69,6 +69,40 @@ assert.doesNotMatch(renderRunBlueprint(state.config),/Concurrency level 64 excee
 """)
 
 
+def test_checks_footer_reports_validation_errors_then_returns_to_a_current_plan():
+    run_browser_logic(r"""
+state.config={checks:['access','concurrency','correctness'],targets:[],concurrency:40,max_requests:300,max_duration_seconds:120};
+state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+nodes['#request-plan']=element();nodes['#dock-summary']=element();
+const errors=[{field:'concurrent_workloads.levels',fields:['concurrent_workloads.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
+state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
+renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/3<\/strong> checks.*1 setting to fix/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/Planning/);
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{errors,count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
+renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/1 setting to fix/); // Draft plans can carry blocking errors with HTTP 200.
+state.requestPreview.errors=errors;state.requestPreview.status='error';state.requestPreview.error='Conflict';
+state.requestPreview.errors.push({field:'max_duration_seconds',msg:'Traffic time limit is too short.'});renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/2 settings to fix/);
+configChanged();assert.match(nodes['#dock-summary'].innerHTML,/Planning/);
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
+renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/30 requests planned/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/to fix|Planning/);
+state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,error:'Server unavailable'};
+renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/Plan unavailable/);
+""")
+
+
+def test_edit_setting_scrolls_the_field_and_error_clear_of_the_narrow_footer():
+    run_browser_logic(r"""
+state.config={checks:['concurrency']};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+syncConfigView=syncSetupStep=syncTestControls=()=>{};window.innerWidth=375;
+const error=element({hidden:false,textContent:'Concurrency level 64 exceeds Maximum at once 40.'});
+const group=element({style:{},scrollIntoView(options){assert.equal(options.block,'center');assert(!error.hidden);this.scrolled=true;}});
+const input=element({parentElement:group,closest(q){return q==='.form-field'?group:null;},scrollIntoView(){throw Error('Scroll the complete field group, not only its input');},focus(options){assert(options.preventScroll);this.focused=true;}});
+nodes['#new-run-form']={elements:{concurrent_levels:input}};nodes['[data-test-card="concurrency"]']=element();
+nodes['.setup-navigation']=element({getBoundingClientRect(){return {height:140};}});
+focusSetting('concurrent_workloads.levels');assert(group.scrolled);assert(input.focused);assert.equal(group.style.scrollMarginBottom,'172px');
+assert.equal(input.attributes['data-setting-highlight'],'true');
+""")
+
+
 def test_indexed_and_section_errors_reveal_check_editors_instead_of_json():
     run_browser_logic(r"""
 state.config={checks:['concurrency']};state.jsonDraft=state.jsonBase='synced';

@@ -277,7 +277,7 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 .fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px 18px; }
 .fields.three { grid-template-columns: repeat(3, minmax(0,1fr)); }
 .fields > .full, .form-field.full { grid-column: 1 / -1; }
-.form-field { min-width: 0; }
+.form-field { min-width: 0; scroll-margin-block: 76px 160px; }
 .form-field > .hint { display: block; margin-top: 6px; font-size: 12.5px; }
 .form-field input[data-inherited=true] { color: var(--text-2); }
 
