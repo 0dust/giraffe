@@ -77,6 +77,106 @@ listeners.keydown({...event('model'),isComposing:true});assert.equal(connected,2
 """)
 
 
+def test_live_mosaic_paging_pauses_follow_and_returning_to_live_resumes_it():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+state.detail={id:'live',state:'running',config:state.config,
+ live_requests:Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}))};
+state.detail.config.max_requests=600;renderDetail();assert.equal(state.mosaicPage,1);
+let focused=0;
+nodes['.request-mosaic [tabindex="0"]']={focus(options){assert.equal(options.preventScroll,true);focused++;}};
+const click=action=>listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action}}:null}});
+await click('mosaic-next');assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,false);
+renderDetail();assert.equal(state.mosaicPage,2);
+await click('mosaic-live');assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);
+await click('mosaic-prev');assert.equal(state.mosaicPage,0);assert.equal(state.mosaicFollow,false);
+await click('mosaic-next');assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);
+assert.equal(focused,4);
+state.mosaicFollow=false;location.hash='#runs/another';await route();
+assert.equal(state.mosaicFollow,true);assert.equal(state.mosaicPage,0);
+})()
+`);
+""")
+
+
+def test_live_mosaic_controls_keep_following_after_programmatic_focus():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+const spots={};
+for(const slot of [240,480,481,720]){
+ const spot={dataset:{liveSlot:String(slot)},closest:()=>spot,getAttribute:()=>null,getBoundingClientRect:()=>({left:0,top:0,width:10}),
+  focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;listeners.focusin({target:this});}};
+ spots[slot]=spot;
+ Object.defineProperty(nodes,'[data-live-slot="'+slot+'"]',{get:()=>Math.floor(slot/240)===state.mosaicPage?spot:null});
+}
+Object.defineProperty(nodes,'.request-mosaic [tabindex="0"]',{get:()=>spots[state.mosaicPage*240]});
+const click=action=>listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action}}:null}});
+for(const action of ['mosaic-live','mosaic-next','mosaic-prev']){
+ document.activeElement=null;state.mosaicFollow=false;state.mosaicPage=action==='mosaic-prev'?2:0;
+ state.detail={id:'live',state:'running',config:{...state.config,max_requests:960},
+  live_requests:Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}))};
+ renderDetail();await click(action);
+ assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);assert.equal(document.activeElement,spots[240]);
+ let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:480,status:'running'}]};
+ api=async()=>next;refreshRuns=async()=>{};
+ await pollDetail(state.routeVersion);
+ assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
+ assert.equal(document.activeElement,spots[480]);assert.equal(state.mosaicAutoFocus,'480');
+ // The transferred focus must also follow the next page boundary.
+ next={...next,live_requests:[...next.live_requests,{slot:720,status:'running'}]};
+ await pollDetail(state.routeVersion);
+ assert.equal(state.mosaicPage,3);assert.equal(state.mosaicFollow,true);assert.equal(document.activeElement,spots[720]);
+ // A user focus change clears the exemption, even if they return to that spot.
+ state.mosaicPage=2;state.mosaicFollow=true;state.mosaicAutoFocus='480';
+ spots[481].focus({preventScroll:true});spots[480].focus({preventScroll:true});
+ await pollDetail(state.routeVersion);
+ assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,false);assert.equal(document.activeElement,spots[480]);
+}
+})()
+`);
+""")
+
+
+def test_live_mosaic_poll_preserves_keyboard_inspection_and_page_at_run_end():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+state.detail={id:'live',state:'running',config:{...state.config,max_requests:600},
+ live_requests:Array.from({length:240},(_,slot)=>({slot,status:slot===239?'running':'completed'}))};
+renderDetail();assert.equal(state.mosaicPage,0);
+let restored=0;
+const spot={dataset:{liveSlot:'239'},focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;restored++;}};
+document.activeElement=spot;nodes['[data-live-slot="239"]']=spot;
+let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:240,status:'running'}]};
+api=async()=>next;refreshRuns=async()=>{};
+await pollDetail(state.routeVersion);
+assert.equal(state.mosaicFollow,false);assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,1);
+assert.equal(document.activeElement,spot);assert.equal(restored,1);assert.match(nodes['#main'].innerHTML,/data-live-slot="239"/);
+next={...next,live_requests:[...next.live_requests,{slot:490,status:'running'}]};
+await pollDetail(state.routeVersion);assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,2);
+// Explicitly returning to live overrides inspection of an earlier spot.
+nodes['.request-mosaic [tabindex="0"]']={focus(options){assert.equal(options.preventScroll,true);document.activeElement={dataset:{liveSlot:'480'}};}};
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'mosaic-live'}}:null}});
+assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
+// With no spot focused, polls follow the frontier across a page boundary.
+document.activeElement=null;state.mosaicPage=0;
+await pollDetail(state.routeVersion);assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
+// Ending a run keeps the shown page even when following was enabled.
+state.mosaicPage=0;
+next={id:'live',state:'completed',report:{run_id:'live',overall:'inconclusive',checks:[],
+ requests:Array.from({length:600},(_,i)=>({id:'request-'+i,status:'completed'})),manifest:{config:state.config}}};
+await pollDetail(state.routeVersion);assert.equal(state.mosaicPage,0);
+assert.doesNotMatch(nodes['#main'].innerHTML,/mosaic-live|Following live/);
+})()
+`);
+""")
+
+
 def test_bootstrap_defaults_scope_remembered_form_drafts_across_reloads():
     run_browser_script(r"""
 const first=browser();await first.run('init()');
