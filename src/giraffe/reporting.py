@@ -12,10 +12,13 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
+import tempfile
 from statistics import median
 from typing import Any
 
 from .deployment import deployment_diff, safe_config, sanitize
+from .report_inputs import input_ref as _input_ref
 from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status
 from .storage import format_size
 from .workloads import WORKLOAD_CHECKS
@@ -62,7 +65,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     reasons = []
     if report.suite_version != baseline.suite_version:
         reasons.append("Suite versions differ.")
-    if report.schema_version != baseline.schema_version:
+    if (report.schema_version != baseline.schema_version
+            and {report.schema_version, baseline.schema_version} != {"2", "3"}):
         reasons.append("Report schema versions differ.")
     if report.abort_reason or report.observations.get("target_abort_reasons"):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
@@ -621,16 +625,89 @@ def _has_response(record: RequestRecord) -> bool:
 
 
 def _request_json(record: RequestRecord) -> str:
-    return "    " + record.model_dump_json(indent=2).replace("\n", "\n    ")
+    value = record.model_dump(mode="json")
+    if record.evaluation and record.evaluation.messages:
+        value["input_ref"] = _input_ref(record.evaluation.messages)
+        del value["evaluation"]["messages"]
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
 def _report_json_chunks(report: RunReport):
-    metadata = report.model_dump_json(indent=2, exclude={"requests"})
-    yield metadata[:-2] + ',\n  "requests": ['
+    # Keep defaults for raw consumers. Only exact input messages move to the table.
+    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests"})
+    yield metadata[:-1] + ',"report_format":2,"inputs":{'
+    seen = set()
+    for record in report.requests:
+        if not record.evaluation or not record.evaluation.messages:
+            continue
+        messages = record.evaluation.messages
+        reference = _input_ref(messages)
+        if reference in seen:
+            continue
+        yield "," if seen else ""
+        seen.add(reference)
+        yield json.dumps(reference) + ":"
+        yield from json.JSONEncoder(ensure_ascii=False, allow_nan=False,
+                                    separators=(",", ":")).iterencode(messages)
+    yield '},"requests":['
     for index, record in enumerate(report.requests):
-        yield ",\n" if index else "\n"
+        yield "," if index else ""
         yield _request_json(record)
-    yield "\n  ]\n}" if report.requests else "]\n}"
+    yield "]}"
+
+
+def _portable_json_chunks(report: RunReport):
+    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests"})
+    yield metadata[:-1] + ',"requests":['
+    for index, record in enumerate(report.requests):
+        yield "," if index else ""
+        yield record.model_dump_json()
+    yield "]}"
+
+
+def save_baseline_report(source: Path, destination: Path, *, replace: bool = False,
+                         report: RunReport | None = None, portable: bool = False) -> None:
+    """Publish an independent snapshot, sharing immutable bytes where supported."""
+    source, destination = Path(source), Path(destination)
+    report = report if report is not None else RunReport.model_validate_json(source.read_text())
+    retained = _retained(report)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp",
+                                       dir=destination.parent)
+    temporary = Path(name)
+    try:
+        os.close(descriptor)
+        temporary.unlink()
+        if portable:
+            _atomic_write_chunks(temporary, _portable_json_chunks(retained))
+            os.chmod(temporary, 0o644)
+        elif (source.is_symlink() or source.name != "report.json"
+              or retained != report or report.schema_version != "3"):
+            _atomic_write_chunks(temporary, _report_json_chunks(retained))
+        else:
+            try:
+                os.link(source, temporary)
+            except OSError:
+                with source.open("rb") as incoming, temporary.open("xb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing, length=65536)
+        if replace:
+            temporary.replace(destination)
+        else:
+            # Exclusive publication keeps the CLI's no-overwrite contract.
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                raise
+            except OSError:
+                with destination.open("xb"):
+                    pass
+                try:
+                    temporary.replace(destination)
+                except OSError:
+                    destination.unlink(missing_ok=True)
+                    raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _json_size(report: RunReport) -> int:
@@ -658,13 +735,16 @@ def _storage_limited(report: RunReport, limit: int) -> None:
     storage["reason"] = "Response bodies omitted to fit the per-run JSON limit on disk."
     size += len(storage["reason"]) - len(previous_reason)
     for index in ordered:
-        record = report.requests[index]
-        before = len(_request_json(record).encode("utf-8"))
-        record = report.requests[index] = _without_response(record)
+        original = report.requests[index]
+        before = len(_request_json(original).encode("utf-8"))
+        record = report.requests[index] = _without_response(original)
         size -= before - len(_request_json(record).encode("utf-8"))
         previous_count = storage["response_bodies_omitted"]
         storage["response_bodies_omitted"] += 1
         size += len(str(storage["response_bodies_omitted"])) - len(str(previous_count))
+        if original.evaluation and record.evaluation and original.evaluation.messages != record.evaluation.messages:
+            # Tool-conversation retention can also remove an input-table entry.
+            size = _json_size(report)
         if size <= limit:
             return
     storage["limit_exceeded"] = True
@@ -1177,8 +1257,9 @@ def html_failure_warning(error: OSError) -> str:
     return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
 
 
-def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 256 * 1024**2) -> tuple[Path, Path]:
-    """Write matching JSON and standalone HTML, applying retention only to output copies."""
+def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 256 * 1024**2,
+                 html: bool = False) -> tuple[Path, Path | None]:
+    """Save compact JSON; standalone HTML is an explicit optional export."""
     if isinstance(max_run_storage, bool) or not isinstance(max_run_storage, int) or max_run_storage < 0:
         raise ValueError("max_run_storage must be a non-negative integer")
     directory = Path(directory)
@@ -1193,6 +1274,8 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 2
         _atomic_write_chunks(json_path, _report_json_chunks(retained))
     except OSError as error:
         raise ReportWriteError(error, "report.json", json_complete=False) from error
+    if not html:
+        return json_path, None
     try:
         _atomic_write(html_path, _render(retained))
     except OSError as error:
@@ -1233,7 +1316,7 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
                           for check in report.checks]}
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        _atomic_write(directory / "summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
+        _atomic_write(directory / "summary.json", json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
     except OSError:
         return prefix + "no summary could be saved."
     return message

@@ -87,7 +87,7 @@ def test_storage_text_uses_binary_sizes_and_exact_default_limits(tmp_path, monke
 
     monkeypatch.setattr(giraffe.storage, "storage_summary", lambda *args, **kwargs: {
         "runs_bytes": 1024, "baselines_bytes": 2 * 1024**2, "free_bytes": 3 * 1024**4,
-        "limits": DEFAULT_LIMITS, "runs": [{"id": "one", "bytes": 1536, "protected": False}]})
+        "baselines_shared_bytes": 0, "auto_cleanup": {}, "limits": DEFAULT_LIMITS, "runs": [{"id": "one", "bytes": 1536, "protected": False}]})
     assert main(["storage", "--runs-dir", str(tmp_path)]) == 0
     text = capsys.readouterr().out
     for expected in ("Saved runs on disk: 1 KiB", "Baselines on disk: 2 MiB", "Free disk: 3 TiB",
@@ -171,7 +171,7 @@ def test_cli_marks_running_during_export_and_forwards_per_run_limit(tmp_path, mo
         return RunReport(run_id="done", started_at="now", finished_at="now", overall="pass", manifest={})
 
     def export(report, path, **kwargs):
-        assert kwargs == {"max_run_storage": 7}
+        assert kwargs == {"max_run_storage": 7, "html": False}
         plan = cleanup_plan(tmp_path, keep_latest=0)
         assert not plan["candidates"] and plan["protected"][0]["id"] == "run"
         return original(report, path, **kwargs)

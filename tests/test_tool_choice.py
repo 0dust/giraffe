@@ -289,7 +289,7 @@ async def test_contract_report_retains_rules_and_verdicts_under_every_policy(pol
     from tests.fake_endpoint import FakeEndpoint
     with FakeEndpoint(mode='tool_choice_ignored') as endpoint:
         report = await run_suite(run_config(endpoint, [fixture(mode)], retention=policy))
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     for record in saved.requests:
         assert record.tool_evaluation.choice.status == ('fail' if mode == 'none' else 'pass')

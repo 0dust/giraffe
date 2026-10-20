@@ -87,7 +87,7 @@ async def test_merged_result_retains_each_scenario_and_measurement(tmp_path):
     assert all(item["evidence_ids"] for item in scenarios.values())
     assert all(item["status"] in {"pass", "fail", "inconclusive"} for item in scenarios.values())
     assert not {"fairness", "buckets", "mixed"}.intersection(report.manifest["config"]["checks"])
-    write_report(report, tmp_path)
+    write_report(report, tmp_path, html=True)
     html = (tmp_path / "report.html").read_text()
     for item in scenarios.values():
         assert item["title"] in html

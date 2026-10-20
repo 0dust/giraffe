@@ -130,12 +130,18 @@ def measure(requests, body_size, approach, retention):
     try:
         with tempfile.TemporaryDirectory(prefix="giraffe-memory-measure-") as temporary:
             directory = Path(temporary)
-            if approach == "old":
+            html = approach.endswith("html")
+            if approach.startswith("old"):
                 retained = _old_retained(report)
+                retained.schema_version = "2"
                 _atomic_write(directory / "report.json", _old_storage_limited(retained, 0))
-                _atomic_write(directory / "report.html", _render(retained))
+                if html:
+                    _atomic_write(directory / "report.html", _render(retained))
             else:
-                write_report(report, directory, max_run_storage=0)
+                write_report(report, directory, max_run_storage=0, html=html)
+            artifact_files = sorted(path.name for path in directory.iterdir())
+            json_bytes = (directory / "report.json").stat().st_size
+            html_bytes = (directory / "report.html").stat().st_size if html else 0
             end = current_rss_bytes()
             if end is not None:
                 samples.append(end)
@@ -143,7 +149,8 @@ def measure(requests, body_size, approach, retention):
         done.set()
         thread.join()
     return {"requests": requests, "body_bytes": body_size, "retention": retention,
-            "approach": approach, "holding_rss_bytes": holding,
+            "approach": approach, "artifact_files": artifact_files,
+            "json_bytes": json_bytes, "html_bytes": html_bytes, "holding_rss_bytes": holding,
             "holding_process_peak_bytes": holding_peak,
             "export_sampled_peak_bytes": max(samples, default=None),
             "process_peak_bytes": peak_rss_bytes(), "seconds": round(time.monotonic() - started, 3)}
@@ -154,17 +161,17 @@ def main():
     parser.add_argument("--requests", type=int, nargs="+", default=[1000, 10000])
     parser.add_argument("--body-sizes", type=int, nargs="+", default=[1024, 16384])
     parser.add_argument("--retention", choices=["all", "failures", "none"], default="all")
-    parser.add_argument("--child", choices=["old", "new"])
+    parser.add_argument("--child", choices=["old-json-html", "new-json-html", "old-json", "new-json"])
     args = parser.parse_args()
     if any(n < 1 for n in args.requests) or any(n < 0 for n in args.body_sizes):
         parser.error("requests must be positive and body sizes non-negative")
     if args.child:
         print(json.dumps(measure(args.requests[0], args.body_sizes[0], args.child, args.retention)))
         return
-    print("requests body_bytes retention approach holding_MiB holding_process_peak_MiB sampled_export_peak_MiB process_peak_MiB seconds")
+    print("requests body_bytes retention approach json_bytes html_bytes holding_MiB holding_process_peak_MiB sampled_export_peak_MiB process_peak_MiB seconds")
     for requests in args.requests:
         for body_size in args.body_sizes:
-            for approach in ("old", "new"):
+            for approach in ("old-json-html", "new-json-html", "old-json", "new-json"):
                 result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
                     "--requests", str(requests), "--body-sizes", str(body_size),
                     "--retention", args.retention, "--child", approach],
@@ -172,7 +179,7 @@ def main():
                 measured = json.loads(result.stdout)
                 sizes = ["unavailable" if measured[key] is None else f"{measured[key] / 1024**2:.1f}"
                          for key in ("holding_rss_bytes", "holding_process_peak_bytes", "export_sampled_peak_bytes", "process_peak_bytes")]
-                print(requests, body_size, args.retention, approach, *sizes, measured["seconds"], flush=True)
+                print(requests, body_size, args.retention, approach, measured["json_bytes"], measured["html_bytes"], *sizes, measured["seconds"], flush=True)
 
 
 if __name__ == "__main__":

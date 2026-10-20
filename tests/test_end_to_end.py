@@ -129,6 +129,10 @@ def test_cli_detects_latency_regression_and_preserves_baseline(tmp_path):
     )
     # The seed violates the baseline, while staying inside the absolute 500 ms limit.
     assert next(check for check in current["checks"] if check["id"] == "first_output")["status"] == "pass"
+    from giraffe.cli import main
+
+    assert not (output / "report.html").exists()
+    assert main(["report", str(output), "--html"]) == 0
     html = (output / "report.html").read_text()
     assert current["run_id"] in html and "baseline" in html.lower()
     assert "at most 100 requests" in result.stderr

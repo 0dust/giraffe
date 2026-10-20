@@ -131,7 +131,7 @@ def test_cli_html_only_write_failure_keeps_json_and_original_verdict(tmp_path, m
 
     monkeypatch.setattr("giraffe.cli._run", run)
     monkeypatch.setattr(giraffe.reporting, "_atomic_write", fail_html)
-    assert main(run_arguments(directory)) == expected_code
+    assert main(run_arguments(directory) + ["--html"]) == expected_code
     output = json.loads(capsys.readouterr().out)
     assert output["outcome"] == overall and output["report_paths"]["html"] is None
     assert any("HTML report could not be saved: disk full; report.json is complete" in w for w in output["warnings"])

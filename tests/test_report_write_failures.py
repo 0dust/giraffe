@@ -33,7 +33,7 @@ def test_html_write_failure_preserves_complete_json_and_reports_phase(tmp_path, 
 
     monkeypatch.setattr(Path, "replace", fail_html_replace)
     with pytest.raises(ReportWriteError) as raised:
-        write_report(report, tmp_path)
+        write_report(report, tmp_path, html=True)
     error = raised.value
     assert error.failed_file == "report.html" and error.json_complete is True
     assert error.errno == code and error.__cause__.errno == code
@@ -62,7 +62,7 @@ def test_json_write_failure_still_saves_summary_with_error_state(tmp_path, monke
 
     monkeypatch.setattr(Path, "replace", fail_json_replace)
     with pytest.raises(ReportWriteError) as raised:
-        write_report(report, tmp_path)
+        write_report(report, tmp_path, html=True)
     error = raised.value
     assert error.failed_file == "report.json" and error.json_complete is False
     assert error.errno == errno.ENOSPC

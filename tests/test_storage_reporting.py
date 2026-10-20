@@ -21,7 +21,7 @@ def report_with_bodies(policy="all"):
 
 
 def saved_report(tmp_path, report, limit):
-    path, html = write_report(report, tmp_path, max_run_storage=limit)
+    path, html = write_report(report, tmp_path, max_run_storage=limit, html=True)
     return RunReport.model_validate_json(path.read_text()), path, html
 
 
@@ -127,5 +127,5 @@ def test_atomic_export_does_not_follow_temp_symlink(tmp_path):
     elsewhere.write_text("unchanged")
     (tmp_path / "report.json.tmp").symlink_to(elsewhere)
     with pytest.raises(OSError):
-        write_report(report_with_bodies(), tmp_path)
+        write_report(report_with_bodies(), tmp_path, html=True)
     assert elsewhere.read_text() == "unchanged"

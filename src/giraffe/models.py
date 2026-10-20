@@ -1372,7 +1372,7 @@ class CheckResult(Model):
 
 
 class RunReport(Model):
-    schema_version: str = "2"
+    schema_version: str = "3"
     suite_version: str = "0.1.0"
     run_id: str
     started_at: str
@@ -1385,6 +1385,41 @@ class RunReport(Model):
     observations: dict[str, Any] = Field(default_factory=dict)
     baseline: dict[str, Any] | None = None
     abort_reason: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def rehydrate_inputs(cls, value):
+        if not isinstance(value, dict) or "report_format" not in value:
+            return value
+        if value["report_format"] != 2 or not isinstance(value.get("inputs"), dict):
+            raise ValueError("Unsupported saved report format")
+        from copy import deepcopy
+
+        value = dict(value)
+        value.pop("report_format")
+        inputs = value.pop("inputs")
+        from .report_inputs import verify_input
+
+        for reference, messages in inputs.items():
+            verify_input(reference, messages)
+        records = value.get("requests", [])
+        if not isinstance(records, list):
+            raise ValueError("Saved requests must be an array")
+        requests = []
+        for record in records:
+            if isinstance(record, dict) and "input_ref" in record:
+                record = dict(record)
+                reference = record.pop("input_ref")
+                if (not isinstance(reference, str) or reference not in inputs
+                        or not isinstance(inputs[reference], list)
+                        or not isinstance(record.get("evaluation"), dict)
+                        or "messages" in record["evaluation"]):
+                    raise ValueError("Invalid saved input reference")
+                record["evaluation"] = {**record["evaluation"],
+                                        "messages": deepcopy(inputs[reference])}
+            requests.append(record)
+        value["requests"] = requests
+        return value
 
 
 def overall_status(checks: list[CheckResult], abort_reason: str | None = None, *,

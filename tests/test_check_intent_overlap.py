@@ -193,7 +193,8 @@ async def test_refill_keeps_client_load_separate_from_server_evidence(concurrent
     if delayed:
         health.windows = [{'start_ms': 0, 'end_ms': 1000, 'lag_ms': 150}]
     run = SimpleNamespace(allowed=lambda _: True, request=request, unfinished=defaultdict(set), timing_health=health)
-    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('Copy exactly: two words', 'bucket', 'buckets')], 4, 2)
+    rows = await refill(run, SimpleNamespace(name='local'), None,
+                        [spec('Copy exactly: two words', 'bucket', 'buckets')], 4, 2, condition_plan=False)
     assert max(r.workload['client_peak_inflight'] for r in rows) == 2
     assert all(r.workload['cell_evidenced_concurrency'] == (0 if delayed else 2 if concurrent else 1) for r in rows)
     assert any(r.workload['load_qualified'] for r in rows) is (concurrent and not delayed)
@@ -316,7 +317,7 @@ async def test_bucket_cells_gap_when_client_load_has_no_output_overlap(concurren
             await asyncio.sleep(.001)
             return row
         stub = SimpleNamespace(allowed=lambda _: True, request=request, unfinished=defaultdict(set))
-        run.records.extend(await refill(stub, config.targets[0], None, [request_spec], 2, 2))
+        run.records.extend(await refill(stub, config.targets[0], None, [request_spec], 2, 2, condition_plan=False))
     result = workload_result(run, 'buckets')
     assert result.status == ('pass' if concurrent else 'inconclusive')
     assert all(cell['qualified_samples'] == (2 if concurrent else 0) for cell in result.metrics['buckets'].values())

@@ -160,7 +160,7 @@ async def test_retention_covers_dynamic_history_results_and_assertions(policy, m
     with FakeEndpoint(mode=mode) as endpoint:
         report = await run_suite(config(endpoint, retention=policy))
     marker = report.requests[0].tool_conversation['calls'][0]['result']['observation_id']
-    json_path, html_path = write_report(report, tmp_path)
+    json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     keep = policy == 'all' or (policy == 'failures' and mode == 'conversation_repeat')
     assert (marker in json_path.read_text()) is keep

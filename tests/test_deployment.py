@@ -25,7 +25,7 @@ def test_large_baseline_comparison_preserves_all_rows_while_redacting_secrets(tm
             {"request_id": str(index), "api_key": "private-test-value"} for index in range(300)
         ]
     }
-    write_report(report, tmp_path)
+    write_report(report, tmp_path, html=True)
     saved = json.loads((tmp_path / "report.json").read_text())
     assert len(saved["baseline"]["comparisons"]) == 300
     assert all(row["api_key"] == "[redacted]" for row in saved["baseline"]["comparisons"])
@@ -420,7 +420,7 @@ def test_secret_exclusion_across_config_report_baseline_html_and_reproduction(tm
     )
     report = make_report()
     report.manifest["config"] = config.model_dump(mode="json")
-    write_report(report, tmp_path)
+    write_report(report, tmp_path, html=True)
     exported = json.dumps(reproduction_export(report))
     saved = (
         (tmp_path / "report.json").read_text() + (tmp_path / "report.html").read_text() + exported

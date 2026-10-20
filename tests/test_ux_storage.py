@@ -8,7 +8,7 @@ def test_history_exposes_disk_totals_run_sizes_and_kept_marker():
 state.storage={runs_bytes:1.25*1024**3,baselines_bytes:40*1024**2,free_bytes:38*1024**3,limits:{max_total_storage:5*1024**3}};
 state.runs=[{id:'retained',state:'completed',overall:'pass',bytes:2.5*1024**2,kept:true,targets:[{model:'test'}]}];
 renderRuns();const html=nodes['#main'].innerHTML;
-assert.match(html,/Saved runs on disk: 1.3 GiB of 5 GiB limit · Baselines 40 MiB · Free disk 38 GiB/);
+assert.match(html,/Saved runs on disk: 1.3 GiB of 5 GiB limit · Baselines 40 MiB · Automatic cleanup: off · Free disk 38 GiB/);
 assert.match(html,/2.5 MiB on disk/);assert.match(html,/class="kept-marker">Kept/);
 assert.match(html,/<button type="button" class="button small" data-action="storage-dialog">Clean up…/);
 assert.doesNotMatch(html,/memory|RAM/);
@@ -142,4 +142,14 @@ const value=report([check('access','pass')]);value.manifest.storage={limit_bytes
 value.manifest.storage={limit_bytes:1000,response_bodies_omitted:2,reason:'Response text omitted to fit on disk.',limit_exceeded:true};
 html=detail(value);assert.match(html,/class="notice warning"/);assert.match(html,/2 response bodies omitted/);assert.match(html,/Request metadata alone exceeds/);
 assert.match(inputRetentionNotice,/all \/ failures \/ none/);assert.match(inputRetentionNotice,/Request metadata \(timings, status, scores\) is always saved/);assert.match(inputRetentionNotice,/Retention does not cap disk usage; storage limits do/);
+""")
+
+
+def test_history_shows_shared_baseline_bytes_policy_and_automatic_deletions():
+    run_render_checks(r"""
+state.storage={runs_bytes:1024,baselines_bytes:100,baselines_shared_bytes:2048,free_bytes:4096,limits:{},auto_cleanup:{keep_latest:5},last_auto_cleanup:{deleted:['old-a','old-b']}};
+const html=storageLine();
+assert.match(html,/2 KiB shared with source run/);
+assert.match(html,/Automatic cleanup: keep newest 5 runs/);
+assert.match(html,/Automatically deleted: old-a, old-b/);
 """)

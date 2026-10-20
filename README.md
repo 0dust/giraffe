@@ -55,7 +55,7 @@ PASS: 13 requests
   local / serving: pass — ...
   local / correctness: pass — ...
 JSON: /your/checkout/giraffe/runs/<timestamp>/report.json
-HTML: /your/checkout/giraffe/runs/<timestamp>/report.html
+Export HTML: giraffe report /your/checkout/giraffe/runs/<timestamp> --html
 ```
 
 **PASS** means the selected required checks have sufficient evidence and meet their
@@ -73,9 +73,11 @@ for example because preflight could not connect to the model.
 | `3` | Blocked (including preflight failure) |
 | `4` | Usage or configuration error |
 
-Reports go to `runs/<timestamp>/report.html` and `report.json` relative to the
-working directory, or to the directory supplied with `--output`. Open the HTML
-file in your browser; JSON includes measurements and reproduction settings.
+Runs save `runs/<timestamp>/report.json` relative to the working directory, or
+in the directory supplied with `--output`. JSON includes measurements and
+reproduction settings. Download HTML from the web results page, or generate it
+without rerunning the suite with `giraffe report runs/<timestamp> --html`
+(optionally `--output PATH`). Add `--html` to `giraffe run` to save HTML at completion.
 Once the suite starts, failed or interrupted runs also save reports. Ctrl-C stops
 new requests and saves partial results.
 
@@ -267,8 +269,9 @@ After preflight, the CLI prints its suite limits: maximum requests, concurrency,
 total duration, per-request deadline, and output tokens. Ctrl-C stops new requests
 and saves partial results. Normal runs never restart the service.
 
-Open `report.html` in your run's output directory. `report.json` contains the same
-measurements and reproduction settings. A failed or interrupted run still produces
+Read results in the web UI, or run `giraffe report RUN_DIR --html` and open the
+generated `report.html`. The saved `report.json` contains measurements and
+reproduction settings. A failed or interrupted run still produces
 a report once the suite has started; preflight failures do not.
 
 To compare runs, substitute your edited Ollama or vLLM configuration for
@@ -763,10 +766,13 @@ Standalone HTML adds disk space beyond the JSON limit.
 
 ```sh
 giraffe storage --runs-dir runs
-giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10  # preview only
+# Preview eligible runs without deleting them.
+giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10
 giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10 --yes
-giraffe keep runs/before                 # protect a run
-giraffe keep runs/before --off           # remove that protection
+# Protect a run.
+giraffe keep runs/before
+# Remove that protection.
+giraffe keep runs/before --off
 ```
 
 Cleanup criteria combine with OR: old runs, runs beyond the newest N, or oldest
@@ -863,8 +869,10 @@ giraffe run --config deployment.json --output-format json
 
 `--config -` reads JSON or YAML from standard input. `--output-format json` emits
 one JSON object on stdout; progress remains on stderr. Run results include
-`outcome`, `exit_code`, `run_id`, and absolute `report_paths.json` and
-`report_paths.html`. A preflight failure returns `outcome: "blocked"`, exit code 3,
+`outcome`, `exit_code`, `run_id`, and an absolute `report_paths.json` path.
+`report_paths.html` is `null` unless `--html` was requested, in which case it is
+an absolute path. Generate HTML later without traffic with
+`giraffe report RUN_DIR --html` (optionally `--output PATH`). A preflight failure returns `outcome: "blocked"`, exit code 3,
 and a message without report paths. Errors include field locations and messages.
 `--structured-output` selects the structured JSON test; `--json` remains a hidden
 compatibility alias. Use `--output-format json` for the CLI's output format.

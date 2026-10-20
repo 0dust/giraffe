@@ -13,9 +13,9 @@ def saved(root, identifier, days=0, **metadata):
     directory = root / identifier
     directory.mkdir(parents=True)
     started = datetime.now(timezone.utc) - timedelta(days=days)
-    (directory / "report.json").write_text(json.dumps({"run_id": identifier, "started_at": started.isoformat()}))
+    (directory / "report.json").write_text(json.dumps({"run_id": identifier, "started_at": started.isoformat(), "schema_version": "2", "suite_version": "0.1.0", "finished_at": started.isoformat(), "overall": "pass", "manifest": {}}))
     if metadata:
-        (directory / ".web.json").write_text(json.dumps(metadata))
+        (directory / ".web.json").write_text(json.dumps({"id": identifier, **metadata}))
     return directory
 
 
@@ -151,6 +151,7 @@ def test_apply_only_confirmed_ids_and_safe_paths_and_set_kept(tmp_path):
 def test_age_falls_back_to_directory_mtime(tmp_path):
     run = saved(tmp_path, "run")
     (run / "report.json").write_text("{}")
+    (run / ".web.json").write_text('{"id":"run"}')
     old = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp()
     os.utime(run, (old, old))
     assert cleanup_plan(tmp_path, older_than_days=20)["candidates"][0]["id"] == "run"
@@ -188,7 +189,7 @@ def test_start_refuses_total_or_free_disk_and_zero_disables(tmp_path, monkeypatc
 @pytest.mark.parametrize("layout", ["directory", "file"])
 def test_baseline_matches_report_identity_when_output_directory_has_another_name(tmp_path, layout):
     run = saved(tmp_path, "custom-output")
-    (run / "report.json").write_text('{"run_id":"actual-run-id"}')
+    (run / "report.json").write_text('{"run_id":"actual-run-id","started_at":"2020-01-01","schema_version":"2","suite_version":"0.1.0","finished_at":"2020-01-01","overall":"pass","manifest":{}}')
     baseline = tmp_path / ".baselines"
     baseline.mkdir()
     if layout == "directory":
@@ -197,7 +198,7 @@ def test_baseline_matches_report_identity_when_output_directory_has_another_name
         baseline = baseline / "report.json"
     else:
         baseline = baseline / "saved.json"
-    baseline.write_text('{"run_id":"actual-run-id"}')
+    baseline.write_text('{"run_id":"actual-run-id","started_at":"2020-01-01","schema_version":"2","suite_version":"0.1.0","finished_at":"2020-01-01","overall":"pass","manifest":{}}')
     plan = cleanup_plan(tmp_path, keep_latest=0)
     assert plan["candidates"] == []
     assert plan["protected"][0]["protected_reason"] == "source run of a saved baseline"

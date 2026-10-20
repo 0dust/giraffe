@@ -49,7 +49,7 @@ def test_stale_running_without_report_recovers_interrupted_and_cleanable(tmp_pat
     directory = tmp_path / "orphan"
     directory.mkdir()
     marker = directory / ".web.json"
-    marker.write_text(json.dumps({"state": "running", "owner_pid": 1, "owner_host": "other-container"}))
+    marker.write_text(json.dumps({"id": "orphan", "state": "running", "owner_pid": 1, "owner_host": "other-container"}))
     os.utime(marker, (1, 1))
     with TestClient(create_app(tmp_path)) as client:
         detail = client.get("/api/runs/orphan").json()
@@ -80,6 +80,16 @@ def test_failed_new_baseline_save_removes_its_directory(tmp_path, monkeypatch, f
         return original(path, value)
 
     monkeypatch.setattr(giraffe.web, "_write", full)
+    if failed_file == "report.json":
+        from pathlib import Path
+        original_replace = Path.replace
+
+        def fail_publish(path, target):
+            if ".baselines" in Path(target).parts and Path(target).name == "report.json":
+                raise OSError(errno.ENOSPC, "Disk full")
+            return original_replace(path, target)
+
+        monkeypatch.setattr(Path, "replace", fail_publish)
     with TestClient(create_app(tmp_path)) as client:
         result = client.post("/api/baselines", json={"run_id": "saved", "name": "new"})
         assert result.status_code == 507
@@ -88,7 +98,7 @@ def test_failed_new_baseline_save_removes_its_directory(tmp_path, monkeypatch, f
         assert [row["id"] for row in preview["candidates"]] == ["saved"]
 
 
-def test_html_only_export_failure_keeps_json_completed_verdict_and_ram(tmp_path, monkeypatch):
+def test_json_only_export_ignores_html_disk_failure_and_downloads_on_demand(tmp_path, monkeypatch):
     import giraffe.reporting
 
     async def runner(configuration, **kwargs):
@@ -109,10 +119,11 @@ def test_html_only_export_failure_keeps_json_completed_verdict_and_ram(tmp_path,
         detail = completed(client, identifier)
         assert detail["state"] == "completed" and detail["report"]["overall"] == "pass"
         assert detail["summary"] is None
-        assert "HTML report could not be saved: disk full; report.json is complete" in detail["error"]
+        assert detail["error"] is None
         assert "export" in detail["resources"]["sampled_peak_rss_bytes"]
         assert client.get(f"/api/runs/{identifier}/report.json").status_code == 200
-        assert client.get(f"/api/runs/{identifier}/report.html").status_code == 404
+        assert client.get(f"/api/runs/{identifier}/report.html").status_code == 200
+        assert not (tmp_path / identifier / "report.html").exists()
         assert not (tmp_path / identifier / "summary.json").exists()
         assert client.post("/api/baselines", json={"run_id": identifier, "name": "JSON evidence"}).status_code == 201
 

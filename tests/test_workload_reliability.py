@@ -195,14 +195,14 @@ async def test_w6_pool_refills_immediately_and_flags_tail_samples():
                                stream_end_ms=(ends[-1] - starts[index]) * 1000,
                                workload={})
     run = SimpleNamespace(allowed=lambda _: True, request=request)
-    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2)
+    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 6, 2, condition_plan=False)
     assert starts[2] < ends[-1] - .03
     assert len(rows) == 6
     assert sum(r.workload['load_qualified'] for r in rows) == 5
     assert 1 < rows[-1].workload['client_time_weighted_inflight'] < 1.5
 
     starts.clear()
-    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2)
+    rows = await refill(run, SimpleNamespace(name='local'), None, [spec('p', 's', 'buckets')], 1, 2, condition_plan=False)
     assert rows[0].workload['load_qualified'] is False
 
 
@@ -540,9 +540,13 @@ async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkey
     monkeypatch.setattr(workload, 'time', SimpleNamespace(monotonic=lambda: now))
     run = SimpleNamespace(allowed=lambda _: True, request=request)
     task = asyncio.create_task(workload.refill(run, SimpleNamespace(name='local'), None,
-        [spec('p', 's', 'buckets')], 3, 3))
-    while len(started) < 3:
-        await asyncio.sleep(0)
+        [spec('p', 's', 'buckets')], 3, 3, condition_plan=False))
+    async with asyncio.timeout(2):
+        while len(started) < 3:
+            if task.done():
+                await task  # Surface worker errors instead of spinning forever.
+                pytest.fail("Refill returned before starting the expected requests")
+            await asyncio.sleep(0)
     for index, finish in enumerate((2, 4, 8)):
         now = finish
         gates[index].set()

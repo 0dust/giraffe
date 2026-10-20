@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -46,18 +47,64 @@ def report_fixture(policy):
                 "unchanged": {"title": "Empty", "status": "inconclusive", "summary": "No excerpt", "count": 0}}})])
 
 
+def reference_size(report):
+    """Independent full-materialization format-2 oracle, used only in small tests."""
+    value = report.model_dump(mode="json")
+    value.update(schema_version="3", report_format=2, inputs={})
+    for row in value["requests"]:
+        if row["evaluation"] and row["evaluation"]["messages"]:
+            messages = row["evaluation"].pop("messages")
+            encoded = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+            reference = hashlib.sha256(encoded.encode()).hexdigest()
+            value["inputs"][reference] = messages
+            row["input_ref"] = reference
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def reference_limited(report, limit, legacy):
+    report = legacy._old_retained(report)
+    report.schema_version = "3"
+    storage = {"limit_bytes": limit, "response_bodies_omitted": 0,
+               "reason": "Per-run JSON storage limit on disk.", "limit_exceeded": False}
+    report.manifest["storage"] = storage
+    if not limit or reference_size(report) <= limit:
+        return report
+    evidence = {rid for check in report.checks if check.status in {"fail", "blocked", "inconclusive"}
+                for rid in check.evidence_ids}
+    ordered = sorted((row for row in report.requests if legacy._has_response(row)), key=lambda row: bool(
+        row.id in evidence or row.score is False or row.evaluation_error
+        or (row.status in {"failed", "timeout"} and row.scenario not in {"client_cancel", "client_deadline"})
+        or (row.status == "completed" and not row.valid)))
+    storage["reason"] = "Response bodies omitted to fit the per-run JSON limit on disk."
+    for row in ordered:
+        legacy._old_omit_response(row)
+        storage["response_bodies_omitted"] += 1
+        if reference_size(report) <= limit:
+            return report
+    storage["limit_exceeded"] = True
+    storage["reason"] = ("Request metadata exceeds the per-run JSON limit on disk; "
+                         "all request metadata was preserved.")
+    return report
+
+
 @pytest.mark.parametrize("policy", ["all", "failures", "none"])
-@pytest.mark.parametrize("limit", [0, 1, 19000])
-def test_streamed_export_matches_legacy_json_and_does_not_mutate_input(tmp_path, legacy_export, policy, limit):
+@pytest.mark.parametrize("limit", [0, 1, 19000, 12000])
+def test_streamed_export_matches_reference_and_does_not_mutate_input(tmp_path, legacy_export, policy, limit):
     report = report_fixture(policy)
     before = report.model_dump_json()
-    expected = json.loads(legacy_export._old_storage_limited(legacy_export._old_retained(report), limit))
+    expected = reference_limited(report, limit, legacy_export)
     json_path, _ = write_report(report, tmp_path, max_run_storage=limit)
-    saved = json.loads(json_path.read_text())
+    raw = json.loads(json_path.read_text())
+    saved = RunReport.model_validate(raw)
+    assert len(saved.requests) == len(expected.requests) == len(report.requests)
+    assert [row.id for row in saved.requests if row.output] == [row.id for row in expected.requests if row.output]
+    assert [row.evaluation for row in saved.requests] == [row.evaluation for row in expected.requests]
+    assert saved.manifest["storage"]["limit_exceeded"] == expected.manifest["storage"]["limit_exceeded"]
     assert saved == expected
-    assert saved["overall"] == report.overall
+    if policy == "all" and 0 < len([row for row in saved.requests if row.output]) < len(saved.requests):
+        assert saved.requests[0].output  # Failure evidence survives before either passing response.
     assert report.model_dump_json() == before
-    assert _json_size(RunReport.model_validate(saved)) == json_path.stat().st_size
+    assert _json_size(saved) == json_path.stat().st_size == reference_size(expected)
 
 
 def test_retention_shares_unchanged_records_but_copies_modified_nested_evidence():
@@ -98,7 +145,7 @@ def test_empty_requests_streams_valid_identical_json(tmp_path, legacy_export):
     report.requests = []
     expected = json.loads(legacy_export._old_storage_limited(legacy_export._old_retained(report), 0))
     json_path, _ = write_report(report, tmp_path, max_run_storage=0)
-    assert json.loads(json_path.read_text()) == expected
+    assert RunReport.model_validate_json(json_path.read_text()).model_dump(mode="json") == expected
 
 
 def test_comparison_preserves_memory_stop_inconclusive_with_blocked_checks():

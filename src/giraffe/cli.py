@@ -95,6 +95,21 @@ def _storage_flags(command: argparse.ArgumentParser) -> None:
                                   f"(default: {DEFAULT_LIMITS[name]} bytes)")
 
 
+def _auto_cleanup_flags(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--auto-cleanup-keep-latest", type=_nonnegative, metavar="N",
+                         help="After each run, delete eligible runs beyond newest N (default: off)")
+    command.add_argument("--auto-cleanup-older-than", type=_nonnegative, metavar="DAYS",
+                         help="After each run, delete eligible runs older than DAYS (default: off)")
+    command.add_argument("--auto-cleanup-max-total", type=_cleanup_size, metavar="SIZE",
+                         help="After each run, delete oldest eligible runs to reach SIZE (default: off)")
+
+
+def _auto_cleanup_policy(args: argparse.Namespace) -> dict:
+    names = {"keep_latest": "auto_cleanup_keep_latest", "older_than_days": "auto_cleanup_older_than",
+             "max_total_bytes": "auto_cleanup_max_total"}
+    return {key: value for key, name in names.items() if (value := getattr(args, name, None)) is not None}
+
+
 def _storage_limits(args: argparse.Namespace) -> dict:
     return {name: getattr(args, name) for name in DEFAULT_LIMITS}
 
@@ -133,10 +148,12 @@ def parser() -> argparse.ArgumentParser:
     web.add_argument("--runs-dir", type=Path, default=Path("runs"))
     web.add_argument("--config", type=Path, help="Prefill the run form from a YAML/JSON config")
     _storage_flags(web)
+    _auto_cleanup_flags(web)
     storage = commands.add_parser("storage", help="Show saved-run sizes and configured limits on disk")
     storage.add_argument("--runs-dir", type=Path, default=Path("runs"))
     storage.add_argument("--output-format", choices=["text", "json"], default="text")
     _storage_flags(storage)
+    _auto_cleanup_flags(storage)
     cleanup = commands.add_parser("cleanup", help="Preview saved runs to delete; --yes applies the preview")
     cleanup.add_argument("--runs-dir", type=Path, default=Path("runs"))
     cleanup.add_argument("--older-than", type=_nonnegative, dest="older_than_days", metavar="DAYS")
@@ -213,8 +230,15 @@ Exit codes:
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
         run.add_argument("--output-format", choices=["text", "json"], default="text", help="Result format on stdout; progress is written to stderr")
         _storage_flags(run)
+        _auto_cleanup_flags(run)
+        run.add_argument("--runs-dir", type=Path, help="Explicit root for automatic cleanup; output must be a direct child")
+        run.add_argument("--html", action="store_true", help="Also save a standalone HTML report")
         if name == "cold-start":
             run.add_argument("--restart", required=True, help="Name of target with restart_command")
+    report = commands.add_parser("report", help="Render a saved report without model requests")
+    report.add_argument("run_dir", type=Path, metavar="RUN_DIR")
+    report.add_argument("--html", action="store_true", required=True)
+    report.add_argument("--output", type=Path, metavar="PATH")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
     export.add_argument("report", type=Path)
     inspect = commands.add_parser("inspect", help="Print recorded deployment/telemetry and comparison JSON")
@@ -447,12 +471,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "storage":
             from giraffe.storage import storage_summary
 
-            result = storage_summary(args.runs_dir, limits=_storage_limits(args))
+            result = storage_summary(args.runs_dir, limits=_storage_limits(args), auto_cleanup=_auto_cleanup_policy(args))
             if json_output:
                 print(json.dumps(result, allow_nan=False))
             else:
                 print(f"Saved runs on disk: {_disk_size(result['runs_bytes'])}")
-                print(f"Baselines on disk: {_disk_size(result['baselines_bytes'])}")
+                print(f"Baselines on disk: {_disk_size(result['baselines_bytes'])}; "
+                      f"{_disk_size(result['baselines_shared_bytes'])} shared with source run")
+                print(f"Automatic cleanup: {json.dumps(result['auto_cleanup']) if result['auto_cleanup'] else 'off'}")
                 print(f"Free disk: {_disk_size(result['free_bytes'])}")
                 for name, value in result["limits"].items():
                     print(f"{name}: {_disk_size(value) if value else 'disabled'}")
@@ -517,13 +543,21 @@ def main(argv: list[str] | None = None) -> int:
                     if error.errno == errno.EADDRINUSE:
                         raise ValueError(f"port {args.port} is in use; choose another with --port") from None
                     raise
-                app = create_app(runs_dir=args.runs_dir, defaults=defaults, **_storage_limits(args))
+                app = create_app(runs_dir=args.runs_dir, defaults=defaults, auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
                 print(f"Giraffe UI: http://127.0.0.1:{args.port} — open in your browser\n"
                       f"Local runs: {args.runs_dir.resolve()}\n"
                       "Review the plan, then choose Launch.", flush=True)
                 server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port,
                                                        log_level="warning"))
                 server.run(sockets=[listener])
+            return 0
+        if args.command == "report":
+            from giraffe.reporting import _atomic_write, _render
+
+            report = load_report(args.run_dir)
+            output = args.output or (args.run_dir if args.run_dir.is_dir() else args.run_dir.parent) / "report.html"
+            _atomic_write(output, _render(report))
+            print(f"HTML: {output.resolve()}")
             return 0
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
@@ -534,12 +568,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(value, indent=2, allow_nan=False))
             return 0
         if args.command == "baseline":
-            from giraffe.reporting import _retained
-            report = _retained(load_report(args.report))
-            args.destination.parent.mkdir(parents=True, exist_ok=True)
+            from giraffe.reporting import save_baseline_report
+            report = load_report(args.report)
+            source = args.report / "report.json" if args.report.is_dir() else args.report
             try:
-                with args.destination.open("w" if args.replace else "x") as file:
-                    file.write(report.model_dump_json(indent=2) + "\n")
+                save_baseline_report(source, args.destination, replace=args.replace, report=report, portable=True)
             except FileExistsError:
                 raise ValueError(f"Baseline already exists: {args.destination}; use --replace to overwrite it") from None
             if json_output:
@@ -556,9 +589,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = configuration(args)
             baseline = load_report(args.baseline) if args.baseline else None
-        directory = args.output or Path("runs") / datetime.now(timezone.utc).strftime(
+        runs_root = getattr(args, "runs_dir", None) or Path("runs")
+        directory = args.output or runs_root / datetime.now(timezone.utc).strftime(
             "%Y%m%dT%H%M%S.%fZ"
         )
+        policy = _auto_cleanup_policy(args)
+        if policy and directory.resolve().parent != runs_root.resolve():
+            raise ValueError("Automatic cleanup requires an explicit --runs-dir and --output directly inside it; "
+                             "without --runs-dir, --output must be inside the default runs directory")
         if directory.exists() and any(directory.iterdir()):
             raise ValueError(f"Output directory is not empty: {directory}; choose a new directory")
         from giraffe.storage import check_start
@@ -600,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
 
             _atomic_write(directory / ".web.json", json.dumps(
                 {"id": directory.name, "state": state, "started_at": started_at,
-                 "owner_pid": os.getpid(), "owner_host": socket.gethostname(), **details}, allow_nan=False) + "\n")
+                 "owner_pid": os.getpid(), "owner_host": socket.gethostname(), **details}, allow_nan=False, separators=(",", ":")) + "\n")
 
         save_state("running")
         print(f"Giraffe: {len(config.targets)} target(s), at most {config.max_requests} requests, "
@@ -636,7 +674,8 @@ def main(argv: list[str] | None = None) -> int:
 
             try:
                 with sampler:
-                    json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage)
+                    json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
+                                                       html=getattr(args, "html", False))
             except OSError as error:
                 export_resources()
                 if getattr(error, "json_complete", False):
@@ -659,8 +698,21 @@ def main(argv: list[str] | None = None) -> int:
                         _print_memory(resources)
                     return 4
         export_resources()
+        from giraffe.storage import automatic_cleanup
+
+        policy = _auto_cleanup_policy(args)
+        cleanup_result = None
+        if policy:
+            try:
+                cleanup_result = automatic_cleanup(runs_root, policy, active_id=directory.name)
+            except OSError as error:
+                cleanup_result = {"deleted": [], "error": str(error)}
+            for identifier in cleanup_result["deleted"]:
+                if not json_output:
+                    print(f"Automatic cleanup deleted run: {identifier}")
         try:
             save_state("completed", run_id=report.run_id, finished_at=report.finished_at,
+                       **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
                        **({"error": warning} if warning else {}), resources={
                 "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
                 "memory_measurement": "measured" if sampler.peaks.get("export") is not None else "unavailable"})
@@ -673,16 +725,10 @@ def main(argv: list[str] | None = None) -> int:
         summary = report.observations.get("summary")
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
-                 abort_reason=report.abort_reason, resources=resources,
+                 abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
                  **({"summary": summary} if summary else {}),
                  report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
         else:
-            print(f"{report.overall.upper()}: {len(report.requests)} requests")
-            _print_memory(resources)
-            if summary:
-                print(summary)
-            if report.abort_reason:
-                print(f"Stopped: {report.abort_reason}")
             for check in report.checks:
                 print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
             for name, observation in report.observations.get("targets", {}).items():
@@ -697,6 +743,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"JSON: {json_path.resolve()}")
             if html_path:
                 print(f"HTML: {html_path.resolve()}")
+            else:
+                print(f"Export HTML: giraffe report {directory.resolve()} --html")
+            _print_memory(resources)
+            print(f"{report.overall.upper()}: {len(report.requests)} requests")
+            if report.abort_reason:
+                print(f"Stopped: {report.abort_reason}")
+            if summary:
+                print(summary)
         return exit_code
     except UsageError as error:
         return failure([{"loc": [], "message": str(error), "type": "UsageError"}])
