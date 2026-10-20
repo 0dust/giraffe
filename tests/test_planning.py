@@ -18,6 +18,111 @@ def plan(configuration):
     return request_plan(configuration)
 
 
+def test_time_plan_adds_sequential_phases_and_check_timeouts():
+    result = plan(config(checks=["access", "generation", "correctness"], samples=2,
+                         request_timeout_seconds=10, test_options={
+                             "access": {"request_timeout_seconds": 4},
+                             "generation": {"samples": 3},
+                             "correctness": {"samples": 4, "concurrency": 2}}))
+    assert result["estimated_seconds"] == 6
+    assert result["worst_case_seconds"] == 54  # 1*4 + 3*10 + ceil(4/2)*10
+    assert result["minimum_seconds"] == 0
+    assert result["errors"] == []
+
+
+def test_time_plan_capacity_windows_block_but_timeouts_only_warn():
+    values = dict(checks=["capacity"], request_timeout_seconds=10,
+                  traffic={"rates": [1, 2], "duration_seconds": 5,
+                           "drain_timeout_seconds": 3})
+    result = plan(config(**values, max_duration_seconds=9))
+    assert result["minimum_seconds"] == 10
+    assert result["worst_case_seconds"] == 16
+    assert result["errors"][0]["fields"] == ["max_duration_seconds", "traffic.duration_seconds", "traffic.rates"]
+    result = plan(config(**values, max_duration_seconds=12))
+    assert result["errors"] == []
+    assert result["time_warnings"][0]["fields"] == ["max_duration_seconds", "request_timeout_seconds"]
+    assert "unfinished" in result["time_warnings"][0]["msg"]
+
+
+def test_adaptive_work_reports_unknown_time_with_reason():
+    result = plan(config(checks=["correctness"], custom_fixtures="/not/imported"))
+    assert result["estimated_seconds"] is None
+    assert result["worst_case_seconds"] is None
+    assert result["time_bound_reasons"]
+
+
+def test_matrix_windows_are_upper_limits_not_required_sending_time():
+    result = plan(config(checks=["concurrency"], concurrency=2, max_duration_seconds=1,
+                         request_timeout_seconds=10, concurrent_workloads={
+                             "scenarios": ["size_matrix"], "levels": [1, 2],
+                             "samples_per_bucket": 2, "window_seconds": 3}))
+    assert result["minimum_seconds"] == 0
+    assert result["worst_case_seconds"] == 9 * (min(20, 3 + 10) + 10)
+    assert result["errors"] == []
+    assert result["time_warnings"]
+
+
+def test_readiness_warmup_and_multiple_targets_have_finite_bounds():
+    values = dict(checks=["access", "serving"], samples=2, restart_target="local",
+                  request_timeout_seconds=10, readiness_timeout_seconds=20,
+                  targets=[{"name": "local", "url": "http://localhost:1", "model": "a"},
+                           {"name": "other", "url": "http://localhost:2", "model": "b"}])
+    result = plan(config(**values))
+    # One connection, restart/readiness budget and two sequential warm requests.
+    assert result["worst_case_seconds"] == 2 * (10 + 30 + 20)
+    assert result["estimated_seconds"] == 8
+    overlap = plan(config(**values, overlap_models=True))
+    assert overlap["worst_case_seconds"] == result["worst_case_seconds"]
+    assert overlap["estimated_seconds"] == 4
+
+
+def test_context_batches_do_not_assume_parallel_dispatch_and_sessions_include_pauses():
+    result = plan(config(checks=["context"], samples=2, request_timeout_seconds=10))
+    first = next(row["requests_per_target"] for row in result["rows"] if row["id"] == "context_first_batch")
+    assert result["worst_case_seconds"] == (3 * first + 1) * 10
+    sessions = plan(config(checks=["sessions"], request_timeout_seconds=10,
+                           sessions={"modes": ["live"], "sessions": 2, "delay_seconds": 3}))
+    assert sessions["worst_case_seconds"] == 4 * (10 + 3)
+
+
+def test_empty_poisson_stage_still_needs_its_sending_window():
+    result = plan(config(checks=["capacity"], max_duration_seconds=1,
+                         traffic={"rates": [.01], "duration_seconds": 2, "arrival": "poisson"}))
+    assert result["planned_total"] == 0
+    assert result["minimum_seconds"] == 2
+    assert result["errors"]
+
+
+def test_arrivals_estimate_follows_the_schedule_without_serially_adding_all_requests():
+    result = plan(config(checks=["arrivals"], concurrency=16,
+                         arrivals={"requests": 600, "requests_per_second": 10}))
+    assert result["estimated_seconds"] == 60.9
+    assert result["worst_case_seconds"] == 59.9 + 600 * 30
+
+
+def test_consistency_estimate_uses_each_levels_pool_and_keeps_sequential_phases():
+    result = plan(config(checks=["consistency"], concurrency=8, consistency={"levels": [1, 8]}))
+    assert result["planned_total"] == 78
+    assert result["estimated_seconds"] == 36  # 6 prompt/shape pairs * (5 quiet + 1 loaded batch).
+
+
+def test_token_stress_estimate_uses_level_batches_and_sequential_calibration():
+    result = plan(config(checks=["concurrency"], concurrency=8, context_limit=20000,
+                         concurrent_workloads={"scenarios": ["token_stress"], "levels": [1, 8],
+                             "stress_cases": [{"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50}]}))
+    assert result["estimated_seconds"] == 3 + 5 + 1
+
+
+def test_sessions_estimate_pools_conversations_but_keeps_turns_and_pauses_in_order():
+    result = plan(config(checks=["sessions"], concurrency=4, sessions={"sessions": 8,
+        "concurrency": 4, "modes": ["fixed", "live"], "delay_seconds": 3}))
+    assert result["estimated_seconds"] == 2 * 2 * (2 + 3)  # Two modes, two waves, two turns/one pause.
+    result = plan(config(checks=["sessions"], concurrency=4, sessions={"profile": "performance",
+        "modes": ["live"], "sessions": 8, "concurrency": 4, "delay_seconds": 3,
+        "workloads": [{"name": "chat", "turns": ["First", "Second", "Third"]}]}))
+    assert result["estimated_seconds"] == 2 * (3 + 2 * 3)
+
+
 @pytest.mark.parametrize("checks,expected", [
     (["access", "correctness"], 7),
     (["access", "buckets"], 100),

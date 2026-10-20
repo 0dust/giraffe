@@ -25,6 +25,7 @@ _MATCH_CONFIG = (
     "concurrency", "max_requests", "max_duration_seconds", "request_timeout_seconds",
     "max_output_tokens", "context_limit", "samples", "sustained_seconds", "checks",
     "structured_json", "overlap_models", "stream", "request_options", "stop_after_errors",
+    "unresponsive_after_failures", "unresponsive_for_seconds",
     "limits",
 )
 
@@ -61,9 +62,9 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         reasons.append("Suite versions differ.")
     if report.schema_version != baseline.schema_version:
         reasons.append("Report schema versions differ.")
-    if report.abort_reason:
+    if report.abort_reason or report.observations.get("target_abort_reasons"):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
-    if baseline.abort_reason:
+    if baseline.abort_reason or baseline.observations.get("target_abort_reasons"):
         reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
     for label, run in (("Current", report), ("Baseline", baseline)):
         if any(record.evaluation_error for record in run.requests):
@@ -870,6 +871,9 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
+    for reason in report.observations.get("target_abort_reasons", {}).values():
+        if reason != report.abort_reason:
+            parts.append(f'<p class="card">Target stopped: {_e(reason)}</p>')
     for target in config.get("targets", []):
         parts.append(f'<div class="card"><strong>{_e(target.get("name", ""))}</strong> · '
                      f'{_e(target.get("route", "unknown"))}<br>Model: <code>{_e(target.get("model", ""))}</code>'

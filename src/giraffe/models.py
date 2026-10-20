@@ -927,6 +927,10 @@ class RunConfig(Model):
     samples: int = Field(default=6, ge=1)
     sustained_seconds: float = Field(default=5, ge=0)
     stop_after_errors: int = Field(default=20, ge=1)
+    unresponsive_after_failures: int | None = Field(default=5, ge=0,
+        description="Stop a target after this many consecutive no-body inference failures and unresponsive_for_seconds of silence. 0 or null disables. Readiness and intentional deadlines/cancellations are excluded; stress timeouts do not count.")
+    unresponsive_for_seconds: float = Field(default=45, gt=0,
+        description="Minimum seconds without response body data before the target stops (default 45s; 5 failures). Body bytes, including error bodies and partial streams, reset the policy; headers alone do not.")
     checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS), min_length=1)
     structured_json: bool = False
     metrics: bool = False
@@ -987,8 +991,16 @@ class RunConfig(Model):
             value["concurrent_workloads"] = settings
         if isinstance(value.get("concurrent_workloads"), dict):
             settings = dict(value["concurrent_workloads"])
-            settings.setdefault("levels", [level for level in (1, 2) if level <= value.get("concurrency", 4)])
-            settings.setdefault("output_tokens", {name: min(cap, value.get("max_output_tokens", 128))
+            # Infer defaults from coercible JSON numbers; field validation below
+            # still rejects invalid originals without migration raising TypeError.
+            def default_limit(name, default):
+                try:
+                    return int(float(value.get(name, default)))
+                except (TypeError, ValueError, OverflowError):
+                    return default
+
+            settings.setdefault("levels", [level for level in (1, 2) if level <= default_limit("concurrency", 4)])
+            settings.setdefault("output_tokens", {name: min(cap, default_limit("max_output_tokens", 128))
                                                   for name, cap in Buckets().output_tokens.items()})
             value["concurrent_workloads"] = settings
         if "checks" in value:
@@ -1232,6 +1244,7 @@ class RequestRecord(Model):
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
+    response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None

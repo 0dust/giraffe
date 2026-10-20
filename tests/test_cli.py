@@ -382,3 +382,20 @@ def test_preview_text_errors_remain_text(flags, tmp_path, capsys):
     assert main(["preview", "--config", str(tmp_path / "missing.yaml"), *flags]) == 4
     captured = capsys.readouterr()
     assert not captured.out and "config file not found:" in captured.err
+
+
+def test_cli_endpoint_unresponsiveness_defaults_and_overrides():
+    args = ["run", "--url", "http://localhost", "--model", "test"]
+    defaults = configuration(parser().parse_args(args))
+    assert defaults.unresponsive_after_failures == 5 and defaults.unresponsive_for_seconds == 45
+    changed = configuration(parser().parse_args(args + [
+        "--unresponsive-after-failures", "3", "--unresponsive-for", "12.5"]))
+    assert changed.unresponsive_after_failures == 3 and changed.unresponsive_for_seconds == 12.5
+
+
+def test_cli_zero_disables_endpoint_watchdog_and_help_explains_it():
+    parsed = parser()
+    config = configuration(parsed.parse_args([
+        "run", "--url", "http://localhost", "--model", "test", "--unresponsive-after-failures", "0"]))
+    assert config.unresponsive_after_failures == 0
+    assert "0 disables" in parsed._subparsers._group_actions[0].choices["run"].format_help()

@@ -55,6 +55,42 @@ function browser(config=defaults,hash='#new'){
     assert result.returncode == 0, result.stderr
 
 
+def test_archived_run_keeps_polling_active_status_without_replacing_the_report():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+  let callback;
+  schedulePoll=fn=>{callback=fn;};
+  location.hash='#runs/archived';await route();
+  assert.equal(callback,pollRunStatus);
+  assert.match(document.title,/Run detail/);
+  const markup=nodes['#main'].innerHTML;
+  api=async()=>({runs:[{id:'live',state:'running',label:'Another run'}],active_run_id:'live'});
+  await callback(state.routeVersion);assert.match(document.title,/In progress · Another run/);
+  assert.equal(nodes['#main'].innerHTML,markup);
+  api=async()=>({runs:[]});await callback(state.routeVersion);
+  assert.equal(document.title,'Run detail · Giraffe');
+})()
+`);
+""")
+
+
+def test_live_detail_keeps_1800ms_polling_and_archived_status_uses_3000ms():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+  const delays=[];schedulePoll=(fn,version,delay=1800)=>delays.push([fn,delay]);
+  api=async()=>({id:'live',state:'running',config:state.config,progress:{},events:[]});
+  location.hash='#runs/live';await route();assert.equal(delays.at(-1)[0],pollDetail);assert.equal(delays.at(-1)[1],1800);
+  api=async()=>({id:'old',state:'completed',config:state.config,report:null});
+  location.hash='#runs/old';await route();assert.equal(delays.at(-1)[0],pollRunStatus);assert.equal(delays.at(-1)[1],3000);
+})()
+`);
+""")
+
+
 def test_enter_in_connection_fields_uses_connect_and_respects_disabled_button():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
