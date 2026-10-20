@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
@@ -21,13 +22,113 @@ from pydantic import Field, ValidationError
 from giraffe.capabilities import capabilities
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
-from giraffe.models import ConfigDraft, Model, RunConfig, RunReport
+from giraffe.models import CHECK_NAMES, ConcurrentWorkloads, ConfigDraft, Model, RunConfig, RunReport, Sessions
 from giraffe.planning import request_plan
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from giraffe.request_pack import pack_preview
 from giraffe.runner import run_suite
+
+
+def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
+    """Expose setting destinations without echoing arbitrary (possibly secret) input.
+
+    Pydantic's model-level conflicts have no loc. Recognize their explicit field
+    names here; ordinary field errors retain their complete loc. Only numeric
+    conflicting values are included, never strings, request bodies or ctx input.
+    """
+    config = body.get("config", body) if isinstance(body, dict) else {}
+    labels = {"concurrency": "Maximum at once", "max_output_tokens": "Output cap (tokens)",
+              "request_timeout_seconds": "Request timeout (seconds)",
+              "max_duration_seconds": "Traffic time limit", "concurrent_workloads.levels": "Concurrency levels",
+              "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
+              "traffic.max_in_flight": "Capacity requests at once"}
+
+    def numeric(value):
+        return type(value) is int or type(value) is float and math.isfinite(value)
+
+    def number(value):
+        if type(value) is bool:
+            return int(value)
+        if isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError:
+                return None
+            if math.isfinite(value) and value.is_integer():
+                value = int(value)
+        return value if numeric(value) else None
+
+    def value(path):
+        result = config
+        for key in path.split("."):
+            result = (result.get(key) if isinstance(result, dict) else
+                      result[int(key)] if isinstance(result, list) and key.isdigit() and int(key) < len(result) else None)
+        if result is None:
+            parts = path.split(".")
+            model = RunConfig if len(parts) == 1 else {"sessions": Sessions, "concurrent_workloads": ConcurrentWorkloads}.get(parts[0])
+            if model and len(parts) <= 2 and parts[-1] in model.model_fields:
+                result = model.model_fields[parts[-1]].get_default(call_default_factory=True)
+        if isinstance(result, list):
+            values = [number(item) for item in result]
+            return values if all(numeric(item) for item in values) else None
+        return number(result)
+
+    errors = []
+    for item in items:
+        loc, message = list(item["loc"]), item["msg"].removeprefix("Value error, ")
+        path = ".".join(map(str, [part for part in loc if part not in ("body", "config")]))
+        fields = [path] if path else []
+        override = re.search(r"test_options\.([a-z_]+)\.([a-z_]+) must not exceed", message)
+        levels = re.search(r"(concurrent_workloads|consistency)\.levels must not exceed", message)
+        if override:
+            path = f"test_options.{override[1]}.{override[2]}"
+            fields = [path, override[2]]
+            label = "requests at once" if override[2] == "concurrency" else labels.get(override[2], override[2]).lower()
+            message = f"{CHECK_NAMES.get(override[1], override[1])} {label} {value(path)} exceeds {labels.get(override[2], override[2])} {value(override[2])}."
+        elif levels:
+            path = levels[1] + ".levels"
+            fields = [path, "concurrency"]
+            message = f"Concurrency level {max(value(path) or [0])} exceeds Maximum at once {value('concurrency')}."
+        elif message.startswith("traffic.max_in_flight must not exceed"):
+            fields = ["traffic.max_in_flight", "concurrency"]
+            message = f"Capacity requests at once {value(fields[0])} exceeds Maximum at once {value('concurrency')}."
+        elif message.startswith("session concurrency must not exceed"):
+            fields = ["sessions.concurrency", "concurrency"]
+            message = f"Session concurrency {value(fields[0])} exceeds Maximum at once {value('concurrency')}."
+        elif message.startswith("bucket output budgets"):
+            caps = config.get("concurrent_workloads", {}).get("output_tokens", ConcurrentWorkloads().output_tokens)
+            ceiling = value("max_output_tokens")
+            fields = [f"concurrent_workloads.output_tokens.{size}" for size, cap in caps.items()
+                      if numeric(number(cap)) and numeric(ceiling) and number(cap) > ceiling] + ["max_output_tokens"]
+            message = f"Answer caps {', '.join(str(number(caps[field.split('.')[-1]])) for field in fields[:-1])} tokens exceed Output cap {ceiling} tokens."
+        elif message.startswith("session workload output budgets"):
+            ceiling = value("max_output_tokens")
+            fields = [f"sessions.workloads.{index}.max_tokens" for index, workload in enumerate(config.get("sessions", {}).get("workloads", []))
+                      if numeric(value(f"sessions.workloads.{index}.max_tokens")) and numeric(ceiling)
+                      and value(f"sessions.workloads.{index}.max_tokens") > ceiling] + ["max_output_tokens"]
+            message = f"Task output caps {', '.join(str(value(field)) for field in fields[:-1])} tokens exceed Output cap {ceiling} tokens."
+        elif message.startswith("session output budget"):
+            fields = ["sessions.max_tokens", "max_output_tokens"]
+            message = f"Output cap per turn {value(fields[0])} tokens exceeds Output cap {value('max_output_tokens')} tokens."
+        elif not fields:
+            fields = ["config"]  # Advanced JSON is the destination for unmapped model errors.
+        elif path in labels:
+            message = f"{labels[path]}: {message}"
+        safe_fields = set(labels) | {"samples", "max_requests", "sessions.max_tokens"} | set(fields if override or levels else [])
+        safe_fields.update(field for field in fields if field.startswith("concurrent_workloads.output_tokens.")
+                           or re.fullmatch(r"sessions\.workloads\.\d+\.max_tokens", field))
+        errors.append({"loc": loc, "msg": message, "field": fields[0], "fields": fields,
+                       "values": {field: value(field) for field in fields if field in safe_fields and value(field) is not None}})
+    return errors
+
+
+def _validated_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | None = None) -> dict:
+    plan = request_plan(config, pack_details=pack_details)
+    if plan["errors"]:
+        raise HTTPException(422, detail=plan["errors"])
+    return plan
 
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
@@ -222,8 +323,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
         # Input values can contain secrets pasted into the wrong field.
-        return JSONResponse({"detail": [{"loc": item["loc"], "msg": item["msg"]}
-                                         for item in error.errors()]}, status_code=422)
+        return JSONResponse({"detail": _configuration_errors(error.errors(), error.body)}, status_code=422)
 
     def run_detail(identifier: str) -> dict:
         directory = _directory(root, identifier)
@@ -373,14 +473,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
     @app.post("/api/config/validate")
     async def validate_config(config: RunConfig):
         """Normalize edits using the same contract as a run without sending traffic."""
-        return {"config": config.model_dump(mode="json"), "request_plan": request_plan(config)}
+        return {"config": config.model_dump(mode="json"), "request_plan": _validated_plan(config)}
 
     @app.post("/api/config/preview")
     async def preview_config(config: ConfigDraft):
         """Describe effective requests and coverage without target calls or file imports."""
         preview = pack_preview(config)
         return {"config": config.model_dump(mode="json"), "request_pack_preview": preview,
-                "request_plan": request_plan(config, pack_details=preview)}
+                "request_plan": _validated_plan(config, pack_details=preview)}
 
     @app.post("/api/datasets/preview")
     async def preview_dataset_import(body: DatasetPreview):
@@ -456,6 +556,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None) -> F
             raise HTTPException(409, "A connection test is running. Wait for its result "
                                 "before starting a run.")
         config, baseline = prepare_run(body)
+        _validated_plan(config)
         identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         directory = _directory(root, identifier)
         directory.mkdir(parents=True)

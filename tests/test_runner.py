@@ -1869,3 +1869,506 @@ def test_timing_remedy_uses_reason_code_with_reworded_summary(reason, remedy):
                          summary="Streaming evidence is inconclusive.", metrics={"reason_code": reason,
                                   "timing_quality": {"status": "client_delayed"}})
     assert remedy in runner._verdict_summary(result, config(), [], "Raise max_requests")
+
+
+async def test_disconnected_sustained_endpoint_aborts_and_keeps_partial_evidence(client, monkeypatch):
+    original = client.execute
+
+    async def silent(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        if spec.scenario == "sustained":
+            record.status, record.valid = "failed", False
+            record.http_status, record.output, record.chunks = None, "", 0
+            record.error = "request failed (ConnectError)"
+        return record
+
+    monkeypatch.setattr(client, "execute", silent)
+    events = []
+    settings = config(checks=["recovery", "sessions"], sustained_seconds=1, max_requests=500,
+                      stop_after_errors=500, unresponsive_after_failures=3, unresponsive_for_seconds=.03)
+    started = time.monotonic()
+    report = await runner.run_suite(settings, progress=events.append)
+    assert time.monotonic() - started < .3
+    assert report.abort_reason.startswith("Endpoint service unresponsive:")
+    assert any(r.valid for r in report.requests)
+    assert any(r.status == "failed" for r in report.requests)
+    assert check(report, "sessions").status != "pass"
+    assert any(e.get("abort_reason") == report.abort_reason for e in events)
+
+
+async def test_run_deadline_during_readiness_is_reported_before_monitor_tick(client, monkeypatch):
+    async def restart(run, target):
+        run.observations[target.name]["restart"] = {
+            "status": "hook_completed", "started_monotonic": time.monotonic()}
+        return True
+
+    async def not_ready(self, deadline):
+        await asyncio.sleep(1)
+        return False
+
+    monkeypatch.setattr(runner, "_restart", restart)
+    monkeypatch.setattr(client, "ready", not_ready)
+    report = await runner.run_suite(config(max_duration_seconds=.02, restart_target="service"))
+    assert report.abort_reason == "maximum run duration reached"
+    assert not report.requests
+    assert check(report, "serving").status != "pass"
+
+
+def mock_inference_transport(monkeypatch, handler):
+    import httpx
+    from giraffe.client import LLMClient
+
+    actual_client = httpx.AsyncClient
+    monkeypatch.setattr(runner, "LLMClient", LLMClient)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: actual_client(
+        **kwargs, transport=httpx.MockTransport(handler)))
+
+
+def endpoint_answer(request):
+    import httpx
+    from tests.fake_endpoint import FakeEndpoint
+
+    payload = json.loads(request.content)
+    answer = FakeEndpoint._answer("\n".join(m.get("content") or "" for m in payload["messages"]))
+    return httpx.Response(200, json={"choices": [{"message": {"content": answer},
+        "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+
+@pytest.mark.parametrize("fault", ["refused", "reset", "silent"])
+async def test_endpoint_outage_through_transport_stops_and_saves_records(monkeypatch, tmp_path, fault):
+    import httpx
+    from giraffe.reporting import write_report
+
+    calls, active = 0, 0
+
+    async def handler(request):
+        nonlocal calls, active
+        calls += 1
+        if calls <= 2:
+            return endpoint_answer(request)
+        active += 1
+        try:
+            if fault == "silent":
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(.008)
+                raise (httpx.ConnectError("refused") if fault == "refused" else httpx.ReadError("reset"))
+        finally:
+            active -= 1
+
+    mock_inference_transport(monkeypatch, handler)
+    events = []
+    started = time.monotonic()
+    report = await runner.run_suite(config(checks=["serving", "sessions"], samples=50,
+        max_requests=500, stop_after_errors=500, stream=False, request_timeout_seconds=.015,
+        unresponsive_after_failures=3, unresponsive_for_seconds=.025), progress=events.append)
+    assert time.monotonic() - started < .5
+    assert active == 0
+    assert report.abort_reason.startswith("Endpoint service unresponsive:")
+    assert report.overall != "pass" and check(report, "sessions").status != "pass"
+    assert sum(r.valid for r in report.requests) == 2
+    failures = [r for r in report.requests if r.status in {"timeout", "failed"}]
+    assert len(failures) >= 3 and all(r.score is None and r.error for r in failures)
+    assert any(e["event"] == "run_stopping" and e["abort_reason"] == report.abort_reason for e in events)
+    json_path, html_path = write_report(report, tmp_path)
+    saved = json.loads(json_path.read_text())
+    assert saved["abort_reason"] == report.abort_reason
+    assert len(saved["requests"]) == len(report.requests)
+    assert saved["observations"]["targets"]["service"]["endpoint_health"]["consecutive_failures"] >= 3
+    assert report.abort_reason in html_path.read_text()
+
+
+@pytest.mark.parametrize("failures,quiet_seconds,slow", [(1, .005, 0), (2, .005, 0), (3, 1, 0), (0, .005, .03)])
+async def test_transient_failures_short_burst_and_slow_request_do_not_abort(monkeypatch, failures, quiet_seconds, slow):
+    import httpx
+
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if 2 <= calls < failures + 2:
+            await asyncio.sleep(.006)
+            raise httpx.ConnectError("transient")
+        if calls == 2 and slow:
+            await asyncio.sleep(slow)
+        return endpoint_answer(request)
+
+    mock_inference_transport(monkeypatch, handler)
+    report = await runner.run_suite(config(samples=6, stream=False, stop_after_errors=500,
+        unresponsive_after_failures=3, unresponsive_for_seconds=quiet_seconds))
+    assert report.abort_reason is None
+    assert len(report.requests) == 7 and report.requests[-1].valid
+    assert report.observations["targets"]["service"]["endpoint_health"]["consecutive_failures"] == 0
+
+
+async def test_http_error_responses_reset_unresponsiveness(monkeypatch):
+    import httpx
+
+    async def handler(request):
+        await asyncio.sleep(.006)
+        return httpx.Response(503, json={"error": "busy"})
+
+    mock_inference_transport(monkeypatch, handler)
+    report = await runner.run_suite(config(samples=5, stream=False, stop_after_errors=500,
+        unresponsive_after_failures=1, unresponsive_for_seconds=.001))
+    assert report.abort_reason is None
+    assert len(report.requests) == 6 and all(r.http_status == 503 for r in report.requests)
+    assert report.observations["targets"]["service"]["endpoint_health"]["consecutive_failures"] == 0
+
+
+async def test_silence_policy_cancels_capacity_drain_even_after_offer_budget_is_full(monkeypatch):
+    import httpx
+
+    calls, active = 0, 0
+
+    async def handler(request):
+        nonlocal calls, active
+        calls += 1
+        active += 1
+        try:
+            if calls <= 2:
+                await asyncio.sleep(.001)
+                raise httpx.ConnectError("down")
+            await asyncio.sleep(1)
+        finally:
+            active -= 1
+
+    mock_inference_transport(monkeypatch, handler)
+    started = time.monotonic()
+    report = await runner.run_suite(config(checks=["capacity"], max_requests=8,
+        traffic={"rates": [500], "duration_seconds": .1, "drain_timeout_seconds": 1},
+        unresponsive_after_failures=2, unresponsive_for_seconds=.025))
+    assert time.monotonic() - started < .5
+    assert active == 0 and report.abort_reason.startswith("Endpoint service unresponsive:")
+    assert any(r.status == "cancelled" for r in report.requests)
+    assert all(r.score is None for r in report.requests)
+    assert check(report, "capacity").status != "pass"
+    stage = report.observations["targets"]["service"]["capacity"][0]
+    assert stage["status"] != "pass"
+
+
+@pytest.mark.parametrize("intent", ["deadline_probe", "phase_deadline", "cancel_ms", "cancel_chunks", "user_stop"])
+async def test_intentional_no_response_timeouts_do_not_trigger_watchdog(client, monkeypatch, intent):
+    from giraffe.models import RequestSpec
+
+    async def silent(self, spec, **kwargs):
+        await asyncio.sleep(.005)
+        return RequestRecord(id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
+            scenario=spec.scenario, check_ids=spec.check_ids, started_at="now", status="timeout",
+            error="request deadline exceeded")
+
+    monkeypatch.setattr(client, "execute", silent)
+    settings = config(stop_after_errors=500, unresponsive_after_failures=1, unresponsive_for_seconds=.001)
+    state = runner._Run(settings, None, None)
+    target = settings.targets[0]
+    spec = RequestSpec(fixture_id="intent", scenario="client_deadline", check_ids=["cancellation"],
+        messages=[{"role": "user", "content": "hello"}],
+        **({"cancel_after_ms": 1} if intent == "cancel_ms" else
+           {"cancel_after_chunks": 2} if intent == "cancel_chunks" else {}))
+    arguments = ({"timeout_override": .02} if intent == "deadline_probe" else
+                 {"deadline_override": time.monotonic() + .02} if intent == "phase_deadline" else {})
+    if intent == "user_stop":
+        async def stopped(self, spec, **kwargs):
+            state.stop.set()
+            return await silent(self, spec, **kwargs)
+        monkeypatch.setattr(client, "execute", stopped)
+    async with client(target, settings) as transport:
+        record = await state.request(target, transport, spec, **arguments)
+    assert record is not None
+    assert state.endpoint_health[target.name]["consecutive_failures"] == 0
+    assert not state.reason or "unresponsive" not in state.reason
+
+
+async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
+    targets = [Target(name=name, model="test", url="http://localhost") for name in ("silent", "active")]
+    state = runner._Run(config(targets=targets, unresponsive_after_failures=2,
+                               unresponsive_for_seconds=.005), None, None)
+    await asyncio.sleep(.01)
+    state.endpoint_attempt("silent")
+    state.endpoint_failure("silent", "first")
+    state.endpoint_failure("silent", "second")
+    assert state.stop_reason() is None
+    state.endpoint_response("active")
+    await asyncio.sleep(.01)
+    assert state.stop_reason("silent").startswith("Endpoint silent unresponsive:")
+    assert state.stop_reason() is None
+
+
+@pytest.mark.parametrize("phase,settings", [
+    ("initial", {}), ("warm", {}), ("context_calibration", {"checks": ["context"]}),
+    ("bucket_", {"checks": ["concurrency"], "concurrent_workloads": {"scenarios": ["size_matrix"]}}),
+    ("stress_", {"checks": ["concurrency"], "concurrent_workloads": {"scenarios": ["token_stress"],
+        "stress_cases": [{"name": "long_input_summary", "input_tokens": 128, "output_tokens": 50}]}}),
+    ("session_", {"checks": ["sessions"], "context_limit": 4096}),
+    ("traffic_stage_", {"checks": ["capacity"], "traffic": {"rates": [100], "duration_seconds": .1,
+                                                           "drain_timeout_seconds": 1}}),
+])
+async def test_run_deadline_bounds_each_target_traffic_phase(client, monkeypatch, phase, settings):
+    original = client.execute
+    entered = []
+
+    async def slow_phase(self, spec, **kwargs):
+        if spec.scenario.startswith(phase):
+            entered.append(spec.scenario)
+            await asyncio.sleep(1)
+        return await original(self, spec, **kwargs)
+
+    monkeypatch.setattr(client, "execute", slow_phase)
+    started = time.monotonic()
+    report = await runner.run_suite(config(max_duration_seconds=.045, **settings))
+    assert entered, [r.scenario for r in report.requests]
+    assert time.monotonic() - started < .25
+    assert report.abort_reason == "maximum run duration reached"
+    interrupted = [r for r in report.requests if r.scenario in entered]
+    assert interrupted and all(r.status == "cancelled" and r.score is None for r in interrupted)
+    assert report.overall != "pass"
+
+
+async def test_slot_wait_is_bounded_by_run_deadline_without_monitor(client):
+    from giraffe.models import RequestSpec
+
+    settings = config(concurrency=1, max_duration_seconds=.01)
+    state = runner._Run(settings, None, None)
+    assert state.try_acquire_slot()
+    spec = RequestSpec(fixture_id="queued", scenario="warm", check_ids=["serving"], messages=[])
+    async with client(settings.targets[0], settings) as transport:
+        record = await asyncio.wait_for(state.request(settings.targets[0], transport, spec), .1)
+    assert record is None and state.stop_reason() == "maximum run duration reached"
+    assert "serving" in state.unfinished["service"]
+
+
+async def test_slow_cold_start_does_not_consume_watchdog_window(monkeypatch):
+    import httpx
+
+    polls = 0
+
+    async def restart(run, target):
+        run.observations[target.name]["restart"] = {
+            "status": "hook_completed", "started_monotonic": time.monotonic()}
+        return True
+
+    async def handler(request):
+        nonlocal polls
+        if request.method == "GET":
+            polls += 1
+            if polls < 3:
+                raise httpx.ConnectError("model is still loading")
+            return httpx.Response(200)
+        return endpoint_answer(request)
+
+    monkeypatch.setattr(runner, "_restart", restart)
+    mock_inference_transport(monkeypatch, handler)
+    events = []
+    report = await runner.run_suite(config(restart_target="service", stream=False,
+        readiness_timeout_seconds=1, unresponsive_after_failures=1,
+        unresponsive_for_seconds=.02), progress=events.append)
+    assert polls == 3 and report.abort_reason is None
+    assert check(report, "serving").status == "pass"
+    health = report.observations["targets"]["service"]["endpoint_health"]
+    assert health["first_attempt_seconds"] >= .3
+    assert health["consecutive_failures"] == 0
+    assert not any(e["event"] in {"target_stopping", "run_stopping"} for e in events)
+
+
+async def test_run_deadline_terminates_restart_hook():
+    import sys
+
+    target = Target(name="service", model="test", url="http://localhost",
+        restart_command=[sys.executable, "-c", "import time; time.sleep(2)"])
+    started = time.monotonic()
+    report = await runner.run_suite(config(targets=[target], restart_target="service", max_duration_seconds=.03))
+    assert time.monotonic() - started < .3
+    assert report.abort_reason == "maximum run duration reached"
+    assert not report.requests
+
+
+async def test_monitor_abort_during_target_cleanup_keeps_duration_reason(monkeypatch):
+    async def metrics(run, target, phase):
+        if phase == "end":
+            await asyncio.sleep(1)
+
+    monkeypatch.setattr(runner, "_metrics", metrics)
+    report = await runner.run_suite(config(checks=["gpu"], max_duration_seconds=.02))
+    assert report.abort_reason == "maximum run duration reached"
+
+
+async def test_repeated_sse_headers_without_body_abort_hung_engine(monkeypatch):
+    import httpx
+    from tests.test_client import Chunks
+
+    streams = []
+
+    def handler(request):
+        stream = Chunks([1.0])
+        streams.append(stream)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+
+    mock_inference_transport(monkeypatch, handler)
+    started = time.monotonic()
+    report = await runner.run_suite(config(samples=50, max_requests=100, stop_after_errors=100,
+        request_timeout_seconds=.015, unresponsive_after_failures=3, unresponsive_for_seconds=.025))
+    assert time.monotonic() - started < .5
+    assert report.abort_reason and "unresponsive" in report.abort_reason
+    assert len(report.requests) >= 3
+    assert all(r.http_status == 200 and r.status == "timeout" and r.score is None for r in report.requests)
+    assert all(stream.closed for stream in streams)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_silent_target_stops_independently_and_healthy_target_finishes(monkeypatch, tmp_path, overlap):
+    import httpx
+    from giraffe.reporting import write_report
+    from tests.test_client import Chunks
+
+    streams = []
+
+    async def handler(request):
+        if request.url.host == "silent":
+            stream = Chunks([1.0])
+            streams.append(stream)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+        await asyncio.sleep(.01)
+        return endpoint_answer(request)
+
+    mock_inference_transport(monkeypatch, handler)
+    targets = [Target(name=name, model="test", url="http://" + name) for name in ("silent", "healthy")]
+    events = []
+    report = await runner.run_suite(config(targets=targets, overlap_models=overlap, stream=False,
+        checks=["serving"], samples=8, stop_after_errors=100, request_timeout_seconds=.025,
+        unresponsive_after_failures=2, unresponsive_for_seconds=.03), progress=events.append)
+    assert report.abort_reason is None
+    assert report.overall != "pass"
+    assert check(report, "serving", "silent").status != "pass"
+    assert check(report, "serving", "healthy").status == "pass"
+    assert len([r for r in report.requests if r.target == "healthy"]) == 9
+    assert all(stream.closed for stream in streams)
+    reasons = report.observations["target_abort_reasons"]
+    assert list(reasons) == ["silent"] and "unresponsive" in reasons["silent"]
+    assert any(e["event"] == "target_stopping" and e["target"] == "silent"
+               and e["abort_reason"] == reasons["silent"] for e in events)
+    assert not any(e["event"] == "run_stopping" for e in events)
+    json_path, html_path = write_report(report, tmp_path)
+    assert json.loads(json_path.read_text())["observations"]["target_abort_reasons"] == reasons
+    assert reasons["silent"] in html_path.read_text()
+
+
+@pytest.mark.parametrize("scenario", ["traffic_stage_0", "sustained", "context", "stress_calibration_case", "fairness_long"])
+@pytest.mark.parametrize("fault", ["timeout", "connect"])
+async def test_stress_watchdog_counts_connection_failures_but_not_overload_timeouts(client, monkeypatch, scenario, fault):
+    from giraffe.models import RequestSpec
+
+    async def unavailable(self, spec, **kwargs):
+        await asyncio.sleep(.003)
+        return RequestRecord(id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
+            scenario=spec.scenario, check_ids=spec.check_ids, started_at="now",
+            status="timeout" if fault == "timeout" else "failed",
+            error="request deadline exceeded" if fault == "timeout" else "request failed (ConnectError)")
+
+    monkeypatch.setattr(client, "execute", unavailable)
+    settings = config(stop_after_errors=100, unresponsive_after_failures=2, unresponsive_for_seconds=.001)
+    state = runner._Run(settings, None, None)
+    spec = RequestSpec(fixture_id="stress", scenario=scenario, check_ids=[], messages=[])
+    async with client(settings.targets[0], settings) as transport:
+        for _ in range(4):
+            await state.request(settings.targets[0], transport, spec)
+    reason = state.stop_reason("service")
+    if fault == "timeout":
+        assert reason is None and len(state.records) == 4
+    else:
+        assert "unresponsive" in reason and len(state.records) == 2
+
+
+@pytest.mark.parametrize("disabled", [0, None])
+async def test_watchdog_can_be_disabled(monkeypatch, disabled):
+    import httpx
+
+    def handler(request):
+        raise httpx.ConnectError("offline")
+
+    mock_inference_transport(monkeypatch, handler)
+    report = await runner.run_suite(config(samples=6, stop_after_errors=100,
+        unresponsive_after_failures=disabled, unresponsive_for_seconds=.001))
+    assert len(report.requests) == 7 and report.abort_reason is None
+    assert not report.observations["target_abort_reasons"]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_target_outage_cancels_only_its_capacity_requests(monkeypatch, overlap):
+    import httpx
+    from tests.test_client import Chunks
+
+    silent_calls, healthy_calls, streams = 0, 0, []
+
+    async def handler(request):
+        nonlocal silent_calls, healthy_calls
+        if request.url.host == "silent":
+            silent_calls += 1
+            if silent_calls <= 2:
+                await asyncio.sleep(.001)
+                raise httpx.ConnectError("offline")
+            stream = Chunks([1.0])
+            streams.append(stream)
+            return httpx.Response(200, stream=stream)
+        healthy_calls += 1
+        await asyncio.sleep(.005)
+        return endpoint_answer(request)
+
+    mock_inference_transport(monkeypatch, handler)
+    targets = [Target(name=name, model="test", url="http://" + name) for name in ("silent", "healthy")]
+    report = await runner.run_suite(config(targets=targets, overlap_models=overlap, stream=False,
+        checks=["capacity"], concurrency=4, max_requests=100, stop_after_errors=100,
+        traffic={"rates": [100], "duration_seconds": .15, "drain_timeout_seconds": 1},
+        unresponsive_after_failures=2, unresponsive_for_seconds=.04))
+    assert report.abort_reason is None and list(report.observations["target_abort_reasons"]) == ["silent"]
+    assert streams and all(stream.closed for stream in streams)
+    interrupted = [r for r in report.requests if r.target == "silent" and r.status == "cancelled"]
+    assert interrupted and all(r.score is None and "unresponsive" in r.error for r in interrupted)
+    healthy = [r for r in report.requests if r.target == "healthy"]
+    assert healthy_calls == len(healthy) == 15
+    assert all(r.status == "completed" and r.valid for r in healthy)
+    assert report.observations["targets"]["healthy"]["endpoint_health"]["abort_reason"] is None
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_run_reason_is_set_once_every_target_is_unresponsive(monkeypatch, overlap):
+    import httpx
+
+    async def handler(request):
+        await asyncio.sleep(.006)
+        raise httpx.ConnectError("offline")
+
+    mock_inference_transport(monkeypatch, handler)
+    targets = [Target(name=name, model="test", url="http://" + name) for name in ("first", "second")]
+    report = await runner.run_suite(config(targets=targets, overlap_models=overlap,
+        unresponsive_after_failures=1, unresponsive_for_seconds=.001))
+    assert set(report.observations["target_abort_reasons"]) == {"first", "second"}
+    assert "Endpoint first unresponsive" in report.abort_reason
+    assert "Endpoint second unresponsive" in report.abort_reason
+    assert report.overall != "pass"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_serving_transport_diagnostics_do_not_classify_requests_as_workloads(monkeypatch, tmp_path, stream):
+    import httpx
+    from giraffe.reporting import write_report
+    from tests.test_client import Chunks, event
+
+    def handler(request):
+        response = endpoint_answer(request)
+        if not stream:
+            return response
+        answer = response.json()["choices"][0]["message"]["content"]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+            stream=Chunks([event(answer, finish="stop"), b"data: [DONE]\n\n"]))
+
+    mock_inference_transport(monkeypatch, handler)
+    report = await runner.run_suite(config(checks=["serving"], stream=stream,
+        arrivals={}, prefix={}, buckets={}, sessions={}, consistency={}, tool_calling=True))
+    assert {r.scenario for r in report.requests} == {"initial", "warm"}
+    assert all(r.valid for r in report.requests)
+    assert not any(r.workload for r in report.requests)
+    assert all(r.response_body_bytes > 0 for r in report.requests)
+    json_path, _ = write_report(report, tmp_path)
+    saved = json.loads(json_path.read_text())["requests"]
+    assert all(not r["workload"] and r["response_body_bytes"] > 0 for r in saved)

@@ -242,7 +242,7 @@ def test_generation_rate_comparison_does_not_confuse_longer_prefill_with_slower_
     assert rows["first_output_ms"]["status"] == "fail"
 
 
-@pytest.mark.parametrize("change", ["route", "model", "url", "load", "fixture", "unknown", "aborted"])
+@pytest.mark.parametrize("change", ["route", "model", "url", "load", "fixture", "unknown", "aborted", "target_aborted"])
 def test_incomparable_baseline_never_labels_regression(change):
     current, previous = make_report(latency=500), make_report("baseline")
     if change in {"route", "model", "url"}:
@@ -253,6 +253,8 @@ def test_incomparable_baseline_never_labels_regression(change):
         previous.manifest["fixture_pack"]["version"] = "unknown"
     elif change == "aborted":
         previous.abort_reason = "Request budget exhausted"
+    elif change == "target_aborted":
+        previous.observations["target_abort_reasons"] = {"local": "Endpoint local unresponsive"}
     else:
         previous.manifest = {}
     result = compare_baseline(current, previous)

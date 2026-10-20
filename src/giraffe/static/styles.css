@@ -277,7 +277,7 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 .fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px 18px; }
 .fields.three { grid-template-columns: repeat(3, minmax(0,1fr)); }
 .fields > .full, .form-field.full { grid-column: 1 / -1; }
-.form-field { min-width: 0; }
+.form-field { min-width: 0; scroll-margin-block: 76px 160px; }
 .form-field > .hint { display: block; margin-top: 6px; font-size: 12.5px; }
 .form-field input[data-inherited=true] { color: var(--text-2); }
 
@@ -461,10 +461,21 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 
 /* Shared run limits */
 .shared-run-settings { margin-top: 26px; border-radius: var(--r-lg); background: var(--surface); border: 1px solid var(--line); }
-.shared-settings-summary { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
+.shared-settings-summary { display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; }
+.shared-settings-summary:hover { background: var(--surface-2); }
+.shared-settings-summary:focus-visible, .configuration-tools > summary:focus-visible, #new-run-form details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.shared-settings-summary::marker { content: ''; }
+.field-error { color: var(--fail); font-size: 13px; line-height: 1.45; }
+[aria-invalid="true"] { border-color: var(--fail) !important; }
+[data-setting-highlight="true"] { outline: 2px solid var(--accent); outline-offset: 3px; scroll-margin-block: 100px; }
+.setting-issue p { margin: 0 0 8px; }
+.setting-issue .actions { flex-wrap: wrap; }
+.plan-time { margin-block: 16px; }
+.plan-time > p { margin-block: 6px; }
+.plan-time .hint { overflow-wrap: anywhere; }
 .shared-settings-summary h2 { font-size: 14px; }
 #run-ceilings-summary { position: static !important; width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; font: 12px var(--mono); color: var(--text-3); }
-.shared-settings-editor[open] #run-ceilings-summary { display: none; }
+.run-ceilings-values { min-width: 0; overflow-wrap: anywhere; }
 .shared-settings-edit { margin-left: auto; font-size: 12.5px; color: var(--text-2); }
 .shared-settings-editor[open] .shared-settings-edit { color: var(--accent); }
 .shared-run-settings .setup-body { padding: 6px 16px 16px; display: grid; gap: 10px; }
@@ -1100,7 +1111,7 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 #setup-panel-2 #run-ceilings-summary { grid-column: 3; grid-row: 1; font: 500 13px var(--mono); color: var(--text-2); }
 #setup-panel-2 .shared-settings-edit { grid-column: 4; display: inline-flex; align-items: center; height: 32px; padding: 0 14px; border-radius: var(--r-sm); border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 550; }
 #setup-panel-2 .shared-settings-summary:hover .shared-settings-edit { border-color: var(--accent-line); color: var(--accent); }
-#setup-panel-2 .shared-settings-editor[open] .shared-settings-edit { visibility: hidden; }
+#setup-panel-2 .shared-settings-editor[open] .shared-settings-edit { transform: rotate(180deg); }
 #setup-panel-2 .shared-settings-editor[open] > .shared-settings-summary { border-bottom: 1px solid var(--line); }
 @media (max-width: 640px) { #setup-panel-2 #run-ceilings-summary { grid-column: 2 / -1; grid-row: 2; } }
 

@@ -29,6 +29,20 @@ _REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
+def no_response_failure(record: RequestRecord, *, include_timeouts=True) -> bool:
+    """Headers do not prove the engine responded; body activity does."""
+    if record.response_body_bytes or record.chunks or record.output or record.reasoning:
+        return False
+    if record.status == "timeout":
+        return include_timeouts and record.error != "request timeout (PoolTimeout)"
+    network_errors = (httpx.NetworkError, httpx.ConnectError, httpx.ReadError, httpx.WriteError,
+                      httpx.CloseError, httpx.ConnectTimeout, httpx.RemoteProtocolError,
+                      OSError, ConnectionError, ConnectionResetError, ConnectionRefusedError,
+                      BrokenPipeError)
+    return record.status == "failed" and record.error in {
+        f"request failed ({kind.__name__})" for kind in network_errors}
+
+
 class _ProtocolError(Exception):
     pass
 
@@ -64,9 +78,11 @@ def _headers(target: Target) -> dict[str, str]:
     return headers
 
 
-async def _limited_body(response: httpx.Response, *, on_read=None) -> bytes:
+async def _limited_body(response: httpx.Response, *, on_read=None, on_body=None) -> bytes:
     body = bytearray()
     async for chunk in response.aiter_bytes():
+        if chunk and on_body is not None:
+            on_body(len(chunk))
         if on_read is not None:
             on_read(time.perf_counter())
         if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
@@ -75,7 +91,7 @@ async def _limited_body(response: httpx.Response, *, on_read=None) -> bytes:
     return bytes(body)
 
 
-async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str, float]]:
+async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterator[tuple[str, str, float]]:
     """Decode SSE independently of TCP boundaries, including CRLF and multiline data."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     buffer = ""
@@ -85,6 +101,8 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str,
 
     async def chunks_with_eof() -> AsyncIterator[tuple[bytes, bool]]:
         async for chunk in response.aiter_bytes():
+            if chunk and on_read is not None:
+                on_read(len(chunk))
             yield chunk, False
         yield b"", True
 
@@ -169,11 +187,14 @@ def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[t
 
 
 class LLMClient:
+    reports_response_activity = True
+
     def __init__(self, target: Target, config: RunConfig):
         self.target = target
         self.config = config
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | None = None
+        self.on_response = None
 
     def _create_client(self) -> httpx.AsyncClient:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
@@ -208,12 +229,14 @@ class LLMClient:
             return False
         try:
             async with asyncio.timeout(remaining):
-                response = await self._client.get(completion_url(self.target.url).removesuffix("/chat/completions") + "/models",
-                                                  timeout=min(5, remaining))
-                if response.status_code == 404:
+                url = completion_url(self.target.url).removesuffix("/chat/completions") + "/models"
+                async with self._client.stream("GET", url, timeout=min(5, remaining)) as response:
+                    status = response.status_code
+                if status == 404:
                     origin = httpx.URL(self.target.url).copy_with(path="/health")
-                    response = await self._client.get(origin, timeout=min(5, remaining))
-                return response.is_success
+                    async with self._client.stream("GET", origin, timeout=min(5, remaining)) as response:
+                        status = response.status_code
+                return 200 <= status < 300
         except (httpx.HTTPError, OSError, TimeoutError):
             return False
 
@@ -247,6 +270,11 @@ class LLMClient:
         if stream:
             payload.setdefault("stream_options", {"include_usage": True})
         record.workload = dict(spec.workload)
+
+        def body_received(size):
+            record.response_body_bytes += size
+            if self.on_response is not None:
+                self.on_response()
         record.request_hash = hashlib.sha256(json.dumps({
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
         }, sort_keys=True).encode()).hexdigest()
@@ -440,9 +468,9 @@ class LLMClient:
                         "x-replica-id",
                     )
                     if not 200 <= response.status_code < 300:
+                        error_body = await _limited_body(response, on_body=body_received)
                         if spec.workload.get("logprobs"):
                             from giraffe.models import LogprobEvidence
-                            error_body = await _limited_body(response)
                             try:
                                 error_data = json.loads(error_body).get("error", {})
                                 rejected = response.status_code in {400, 422} and isinstance(error_data, dict) and error_data.get("param") in {"logprobs", "top_logprobs"}
@@ -454,7 +482,7 @@ class LLMClient:
                         if response.status_code in {400, 413, 422} and spec.scenario.startswith(("context", "prefix_")):
                             # Classify only documented engine rejections (vLLM/SGLang, TGI, llama.cpp);
                             # never retain arbitrary server error text or echoed request content.
-                            body = (await _limited_body(response)).decode("utf-8", errors="replace").lower()
+                            body = error_body.decode("utf-8", errors="replace").lower()
                             if any(term in body for term in (
                                     "context length", "context_length", "maximum context", "too many tokens",
                                     "context size", "context window", "max_model_len",
@@ -463,9 +491,9 @@ class LLMClient:
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):
-                            _object(await _limited_body(response))
+                            _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        async for event_type, event, observed_at in _sse_events(response):
+                        async for event_type, event, observed_at in _sse_events(response, on_read=body_received):
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
@@ -485,7 +513,7 @@ class LLMClient:
                     else:
                         def body_read(at):
                             record.stream_end_ms = (at - start) * 1000
-                        body = await _limited_body(response, on_read=body_read)
+                        body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
                         receive(_object(body), streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
