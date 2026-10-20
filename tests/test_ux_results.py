@@ -1,6 +1,7 @@
 """Exercise the rendered result states without requiring a running LLM."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 
 
-def run_render_checks(assertions: str) -> None:
+def run_render_checks(assertions: str, *, dom: bool = False) -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser result rendering")
@@ -17,10 +18,12 @@ def run_render_checks(assertions: str) -> None:
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}},listeners={};
-const context={assert,structuredClone,nodes,listeners,
+import {browserDOM} from DOM_PATH;
+const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}},listeners={},warnings=[];
+const context={assert,structuredClone,nodes,listeners,warnings,console:{warn:(...args)=>warnings.push(args)},
   document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},
   window:{addEventListener(){}}};
+if(USE_DOM){context.document=browserDOM(listeners);context.location={hash:'#runs/live'};context.setTimeout=()=>{};context.clearTimeout=()=>{};context.window.innerWidth=1280;context.window.innerHeight=800;context.window.matchMedia=()=>({matches:false});nodes['#main']=context.document.querySelector('#main');}
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 vm.runInNewContext(source+`
@@ -39,7 +42,7 @@ function detail(value,extra={}) {
   state.tab='checks';state.selectedCheck=null;renderDetail();return nodes['#main'].innerHTML;
 }
 `+ASSERTIONS,context);
-""".replace("APP_PATH", json.dumps(str(app))).replace(
+""".replace("DOM_PATH", json.dumps((Path(__file__).parent / "ui_dom.mjs").as_uri())).replace("USE_DOM", "true" if dom else "false").replace("APP_PATH", json.dumps(str(app))).replace(
         "ASSERTIONS", json.dumps(assertions)
     )
     result = subprocess.run(
@@ -326,3 +329,69 @@ openRequest('tool');html=nodes['#request-dialog'].innerHTML;assert.match(html,/N
 assert.equal(renderToolEvaluation({}), '');assert.equal(renderActualToolCalls({}), '');assert.equal(renderResponseEvents({}), '');
 assert.match(renderEvaluationEvidence({evaluation:{messages:[],scorer:'exact',expected:'legacy',expected_provided:true}},{}),/legacy/);
 """)
+
+
+def test_terminal_run_clears_stale_request_and_hidden_active_indicators():
+    run_render_checks(r"""
+nodes['#active-run-link']={innerHTML:''};
+state.detail={id:'ended',state:'cancelled'};
+setActive('ended');setActive(null);
+assert.equal(nodes['#active-run-link'].innerHTML,'','hidden active link must not retain a running badge');
+const html=renderMosaic([{id:'stale',slot:0,status:'running'}]);
+assert.doesNotMatch(html,/request-spot running/,'saved terminal run cannot pulse stale unfinished evidence');
+assert.match(html,/Cancelled/);
+""")
+
+
+def test_request_terminal_display_states_have_distinct_labels_and_glyphs():
+    run_render_checks(r"""
+const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive'];
+assert.equal(new Set(statuses.map(status=>statusLabels[status])).size,statuses.length);
+assert.equal(new Set(statuses.map(status=>statusIcons[status])).size,statuses.length);
+for(const status of statuses){assert(statusLabels[status]);assert.match(badge(status),new RegExp(statusLabels[status]));}
+const records=['completed','failed','timeout','cancelled','skipped','completed'].map((status,i)=>({id:'r'+i,status,valid:true,score:i===0?true:null}));
+const html=renderMosaic(records);
+for(const status of statuses){assert(html.includes('request-spot '+status));assert(html.includes(statusLabels[status]));}
+""")
+
+
+def stylesheet_rules(css, parents=()):
+    """Walk nested style rules, retaining media conditions for cascade assertions."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    cursor = 0
+    while (opening := css.find("{", cursor)) >= 0:
+        header = css[cursor:opening].strip()
+        depth, end = 1, opening + 1
+        while depth and end < len(css):
+            depth += (css[end] == "{") - (css[end] == "}")
+            end += 1
+        assert depth == 0, "Unbalanced stylesheet block"
+        body = css[opening + 1:end - 1]
+        if header.startswith("@"):
+            if "keyframes" not in header:
+                yield from stylesheet_rules(body, parents + (header,))
+        else:
+            declarations = dict(item.strip().split(":", 1) for item in body.split(";")
+                                if ":" in item)
+            yield header, {key.strip(): value.strip() for key, value in declarations.items()}, parents
+        cursor = end
+
+
+def test_reduced_motion_disables_animations_instead_of_shortening_them():
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    rules = list(stylesheet_rules(css))
+    reduced = [declarations for _, declarations, parents in rules
+               if '@media (prefers-reduced-motion: reduce)' in parents]
+    assert any(row.get('animation') == 'none !important' for row in reduced)
+    assert any(row.get('transition') == 'none !important' for row in reduced)
+    animated = []
+    for selector, declarations, parents in rules:
+        animation = declarations.get('animation', declarations.get('animation-name', 'none'))
+        if animation.startswith('none'):
+            continue
+        animated.append(selector)
+        assert '@media (prefers-reduced-motion: no-preference)' in parents, selector
+        if 'infinite' in animation:
+            assert '.queued' not in selector and '.reserved' not in selector
+    assert animated, 'The parser must inspect real animation rules'
+    assert '.is-landing' not in css

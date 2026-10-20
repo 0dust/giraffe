@@ -175,6 +175,7 @@ class _Run:
         self.logprob_budget = LogprobBudget()
         self.attempted = 0
         self.budget_used = 0
+        self.dropped_offers = 0
         self.budget_counts = Counter()
         self.errors = 0
         self.reason: str | None = None
@@ -302,6 +303,7 @@ class _Run:
             self.progress({"event": event, "target": target, "scenario": scenario,
                            "completed": len(self.records), "attempted": self.attempted,
                            "budget_used": self.budget_used,
+                           "dropped_offers": self.dropped_offers,
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
@@ -402,6 +404,10 @@ class _Run:
         self.budget_used += 1
         self.budget_counts[target] += 1
         return True
+
+    def drop_offer(self, target: str, scenario: str):
+        self.dropped_offers += 1
+        self.emit("offer_dropped", target, scenario)
 
     def try_acquire_slot(self) -> bool:
         try:
@@ -898,6 +904,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         traffic=traffic, rate_rps=rate, stage_index=index,
                         fixtures=mixed_fixtures, execute=execute,
                         reserve_offer=lambda: run.reserve_offer(target.name),
+                        on_drop=lambda: run.drop_offer(target.name, f"traffic_stage_{index}"),
                         try_acquire=run.try_acquire_slot, release=run.release_slot,
                         stop_reason=traffic_stop_reason, deadline=run.deadline, limits=effective.limits,
                         capture_evidence=(run.stage_evidence[target.name].append
