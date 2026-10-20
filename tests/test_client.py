@@ -662,3 +662,57 @@ async def test_response_trace_limit_is_not_truncation_without_an_omitted_event(m
         result = await client.execute(spec(scorer="tool"))
     assert result.valid and len(result.response_events) == 256
     assert not result.response_events_truncated
+
+
+async def test_response_activity_requires_body_including_comments_and_partial_sse_bytes(monkeypatch):
+    import asyncio
+    from giraffe.client import no_response_failure
+
+    client, transport, _ = setup_client(monkeypatch, [
+        b": heartbeat\n\n", .005, b"data: {", .005, b'"incomplete"', .1], timeout=.03)
+    activity = []
+    client.on_response = lambda: activity.append(asyncio.get_running_loop().time())
+    async with client:
+        record = await client.execute(spec())
+    assert record.status == "timeout" and record.http_status == 200
+    assert record.output == "" and record.chunks == 0
+    assert len(activity) == 3  # Only raw body reads, before SSE parsing.
+    assert record.response_body_bytes > 0
+    assert not record.workload
+    assert not no_response_failure(record)
+    assert transport.closed
+
+
+@pytest.mark.parametrize("status", [200, 503])
+async def test_readiness_uses_headers_without_updating_watchdog(monkeypatch, status):
+    import time
+
+    target = Target(name="local", url="http://local", model="test")
+    transport = Chunks([1.0, b"body"])
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(**kwargs,
+        transport=httpx.MockTransport(lambda _: httpx.Response(status, stream=transport))))
+    responses = []
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        client.on_response = lambda: responses.append(True)
+        assert await client.ready(time.monotonic() + .02) == (status == 200)
+    assert responses == [] and transport.closed
+
+
+@pytest.mark.parametrize("kind", [httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
+                                  httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout,
+                                  httpx.PoolTimeout, ValueError])
+async def test_only_network_no_response_failures_qualify(monkeypatch, kind):
+    from giraffe.client import no_response_failure
+
+    target = Target(name="local", url="http://local", model="test")
+    original = httpx.AsyncClient
+
+    def failed(_):
+        raise kind("unavailable")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(**kwargs,
+        transport=httpx.MockTransport(failed)))
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec())
+    assert no_response_failure(record) == (kind not in {httpx.PoolTimeout, ValueError})

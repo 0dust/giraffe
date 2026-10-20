@@ -99,6 +99,10 @@ Exit codes:
         run.add_argument("--samples", type=int, help="Samples per selected check")
         run.add_argument("--sustained-seconds", type=float, help="Duration of sustained recovery load in seconds")
         run.add_argument("--stop-after-errors", type=int, help="Stop after this many request errors")
+        run.add_argument("--unresponsive-after-failures", type=int,
+                         help="Consecutive no-body inference failures before stopping a target, together with the silence interval (default: 5; 0 disables)")
+        run.add_argument("--unresponsive-for", type=float, dest="unresponsive_for_seconds",
+                         help="Minimum seconds without response body data before stopping a target (default: 45; headers and readiness polls do not reset it)")
         run.add_argument("--checks", metavar="CHECKS", help="Comma-separated names: " + ", ".join(CHECK_NAMES))
         run.add_argument("--structured-output", action="store_true", default=None, dest="structured_json",
                          help="Include structured JSON output checks")

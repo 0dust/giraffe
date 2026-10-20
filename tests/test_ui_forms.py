@@ -435,7 +435,7 @@ context.config.max_requests=288;
 guidance=vm.runInNewContext('renderLoadGuidance(config)',context);
 assert.doesNotMatch(guidance,/data-action="use-request-budget"/);
 context.config.concurrency=4;
-assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/highest tested level \\(8\\) exceeds/);
+assert.match(vm.runInNewContext('renderLoadGuidance(config)',context),/Concurrency level 8 exceeds Maximum at once 4/);
 context.config={{...source,checks:['correctness'],concurrent_workloads:null,max_requests:1}};
 assert.doesNotMatch(vm.runInNewContext('renderLoadGuidance(config)',context),/data-action="use-request-budget"/);
 """

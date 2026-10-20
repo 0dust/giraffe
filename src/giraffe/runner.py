@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 
-from .client import LLMClient
+from .client import LLMClient, no_response_failure
 from .conditions import condition_for
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
@@ -185,6 +185,12 @@ class _Run:
         self.timing_health = TimingHealth(self.start)
         self.inflight = {}
         self.conditions = {}
+        self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
+            "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
+        self.target_tasks = {}
+        self.stop_notified = False
+        for target, observation in self.observations.items():
+            observation["endpoint_health"] = self.endpoint_health[target]
         for observation in self.observations.values():
             observation.update(conditions=[], deployment=None, deployment_history=[], phase_boundaries=[],
                 serving_telemetry={"snapshots": [], "sample_limit_reached": False,
@@ -283,20 +289,63 @@ class _Run:
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
-    def stop_reason(self) -> str | None:
+    def stop_reason(self, target: str | None = None) -> str | None:
+        previous = self.reason
+        # A full offer budget must not hide a real stop during the drain.
+        if self.reason == "maximum request budget reached":
+            self.reason = None
         if self.stop.is_set():
             self.reason = self.reason or "cancelled by user"
         if time.monotonic() >= self.deadline:
             self.reason = self.reason or "maximum run duration reached"
+        for name, health in self.endpoint_health.items():
+            since = health["last_response_seconds"]
+            if since is None:
+                since = health["first_attempt_seconds"]
+            silence = time.monotonic() - self.start - since if since is not None else 0
+            if (self.config.unresponsive_after_failures and not health["abort_reason"]
+                    and health["consecutive_failures"] >= self.config.unresponsive_after_failures
+                    and silence >= self.config.unresponsive_for_seconds):
+                health["abort_reason"] = (f"Endpoint {name} unresponsive: no response for {silence:.3g}s "
+                    f"after {health['consecutive_failures']} consecutive failed requests")
+                self.unfinished[name].update(self.config.checks)
+                self.emit("target_stopping", name, abort_reason=health["abort_reason"])
+        if all(health["abort_reason"] for health in self.endpoint_health.values()):
+            self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
         if self.errors >= self.config.stop_after_errors:
             self.reason = self.reason or "error threshold reached"
-        return self.reason
+        self.reason = self.reason or previous
+        if self.reason and self.reason != "maximum request budget reached" and not self.stop_notified:
+            self.stop_notified = True
+            self.emit("run_stopping", abort_reason=self.reason)
+        return (self.endpoint_health[target]["abort_reason"] if target else None) or self.reason
+
+    def endpoint_attempt(self, target):
+        health = self.endpoint_health[target]
+        if health["first_attempt_seconds"] is None:
+            health["first_attempt_seconds"] = time.monotonic() - self.start
+
+    def endpoint_response(self, target):
+        health = self.endpoint_health[target]
+        if health["first_attempt_seconds"] is None or health["abort_reason"]:
+            return
+        health.update(last_response_seconds=time.monotonic() - self.start,
+                      consecutive_failures=0, failure_request_ids=[])
+
+    def endpoint_failure(self, target, record_id=None):
+        health = self.endpoint_health[target]
+        if not self.config.unresponsive_after_failures or health["abort_reason"]:
+            return
+        health["consecutive_failures"] += 1
+        if record_id is not None:
+            health["failure_request_ids"].append(record_id)
+        self.stop_reason()
 
     def allowed(self, target: str) -> bool:
-        self.stop_reason()
+        reason = self.stop_reason(target)
         if self.budget_used >= self.config.max_requests:
             self.reason = self.reason or "maximum request budget reached"
-        return not self.reason and self.budget_used < self.config.max_requests and (
+        return not reason and not self.reason and self.budget_used < self.config.max_requests and (
             self.budget_counts[target] < self.quotas[target])
 
     def reserve_offer(self, target: str) -> bool:
@@ -341,12 +390,15 @@ class _Run:
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
-        async with self.slot(slot_reserved, deadline_override) as admitted:
+        readiness = spec.scenario == "readiness" or (
+            spec.scenario == "initial" and self.config.restart_target == target.name)
+        slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
+        async with self.slot(slot_reserved, slot_deadline) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
-            stopped = not admitted or self.stop.is_set() or time.monotonic() >= min(
-                self.deadline, deadline_override if deadline_override is not None else self.deadline) or (
-                self.errors >= self.config.stop_after_errors)
+            reason = self.stop_reason(target.name)
+            stopped = not admitted or time.monotonic() >= slot_deadline or (
+                reason is not None and reason != "maximum request budget reached")
             if stopped or (not budget_reserved and not budget_exempt and not self.reserve_offer(target.name)):
                 self.unfinished[target.name].update(_scenario_checks(spec))
                 return None
@@ -368,6 +420,8 @@ class _Run:
                     condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
             request_slot = self.attempted - 1
             self.counts[target.name] += 1
+            if not readiness:
+                self.endpoint_attempt(target.name)
             key = (target.name, spec.scenario)
             self.active[key] += 1
             self.peak[key] = max(self.peak[key], self.active[key])
@@ -449,14 +503,26 @@ class _Run:
                            and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
             record.intentional = intentional
+            # Real clients report body reads immediately, including SSE
+            # comments/reasoning. Test/alternate clients can provide record evidence.
+            if (not getattr(client, "reports_response_activity", False)
+                    and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
+                self.endpoint_response(target.name)
+            if (not readiness and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+                    and not intentional and timeout_override is None
+                    and deadline_override is None and spec.cancel_after_ms is None
+                    and spec.cancel_after_chunks is None and not self.stop.is_set()
+                    and time.monotonic() < self.deadline):
+                self.endpoint_failure(target.name, record.id)
             if record.status == "cancelled" and not intentional and timeout_override is None:
-                reason = self.stop_reason()
+                reason = self.stop_reason(target.name)
                 # Stress phases can cancel their own requests while the run continues.
                 if reason or not _stress(spec.scenario):
-                    self.reason = reason or "maximum run duration reached"
+                    if not self.endpoint_health[target.name]["abort_reason"]:
+                        self.reason = reason or "maximum run duration reached"
+                    else:
+                        record.error = self.endpoint_health[target.name]["abort_reason"]
                     self.unfinished[target.name].update(_scenario_checks(spec))
-            readiness = spec.scenario == "readiness" or (
-                spec.scenario == "initial" and self.config.restart_target == target.name)
             budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
             if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
                 self.errors += 1
@@ -513,6 +579,7 @@ class _Run:
             self.finish_condition(target.name, scenario, workload)
 
     async def monitor(self, tasks):
+        cancelled_targets = set()
         while not all(task.done() for task in tasks):
             await asyncio.sleep(.05)
             now = time.monotonic()
@@ -520,12 +587,17 @@ class _Run:
             self.max_lag_ms = max(self.max_lag_ms, self.timing_health.max_lag_ms)
             if all(task.done() for task in tasks):
                 return
-            if self.stop.is_set() or now >= self.deadline or self.errors >= self.config.stop_after_errors:
-                self.allowed(self.config.targets[0].name)
+            reason = self.stop_reason()
+            if reason and reason != "maximum request budget reached":
                 for task in tasks:
                     if not task.done():
                         task.cancel()
                 return
+            for target, task in self.target_tasks.items():
+                if (self.endpoint_health[target]["abort_reason"] and target not in cancelled_targets
+                        and not task.done()):
+                    cancelled_targets.add(target)
+                    task.cancel()
 
 
 async def _restart(run: _Run, target: Target) -> bool:
@@ -601,7 +673,7 @@ async def _finish_gpu_observation(run, target):
     data = run.observations[target.name]["serving_telemetry"]
     first = next((snap["elapsed_seconds"] for snap in data["snapshots"] if _gpu_scraped(snap)), None)
     window = run.config.gpu_min_observation_seconds
-    if first is not None and not run.stop_reason():
+    if first is not None and not run.stop_reason(target.name):
         delay = min(max(0, window-(time.monotonic()-run.start-first)),
                     max(0, run.deadline-time.monotonic()-.01))
         if delay:
@@ -713,8 +785,13 @@ async def _target(run: _Run, target: Target, fixtures: dict):
     telemetry_task = None
     from giraffe import deployment, telemetry, workloads
     try:
+        reason = run.stop_reason(target.name)
+        if reason and reason != "maximum request budget reached":
+            run.unfinished[target.name].update(enabled)
+            return
         run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop)
         if not await _restart(run, target):
+            run.stop_reason(target.name)
             return
         # GPU observations do not require an inference client or an unrelated
         # warm-up. An explicitly requested restart still needs readiness probes.
@@ -723,6 +800,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             return
         async with LLMClient(target, config) as client:
             client.logprob_budget = run.logprob_budget
+            client.on_response = lambda: run.endpoint_response(target.name)
             if "gpu" in enabled and not config.metrics:
                 await _metrics(run, target, "start")
             if config.metrics:
@@ -743,7 +821,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     backoff = .1
                     initial = []
                     restart["health_polls"] = []
-                    while time.monotonic() < ready_deadline and not run.stop_reason():
+                    while time.monotonic() < ready_deadline and not run.stop_reason(target.name):
                         try:
                             async with asyncio.timeout_at(ready_deadline):
                                 ready = await client.ready(ready_deadline)
@@ -766,6 +844,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     restart["readiness_ms"] = round((time.monotonic()-restart.pop("started_monotonic"))*1000, 3)
                     if restart["status"] == "blocked":
                         restart["reason"] = "No successful inference within readiness budget"
+                        run.stop_reason(target.name)
                         return
                 else:
                     await run.group(target, client, initial_specs, "initial", count=1)
@@ -792,7 +871,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True)
 
                 def traffic_stop_reason():
-                    reason = run.stop_reason()
+                    reason = run.stop_reason(target.name)
                     # Exhausting new offers must not cancel already admitted work.
                     return None if reason == "maximum request budget reached" else reason
 
@@ -911,7 +990,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 from .planning import request_plan
                 later = [name for name in config.checks if name not in CORE_CHECKS]
                 later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
-                if "cancellation" in enabled:
+                if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
                     await asyncio.sleep(max(0, min(5, cleanup, run.deadline - time.monotonic())))
                 if min(config.max_requests-run.budget_used, run.quotas[target.name]-run.budget_counts[target.name]) > (
@@ -1939,19 +2018,33 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         fixtures["correctness"].extend(load_custom_fixtures(config.custom_fixtures))
         custom_hash = hashlib.sha256(Path(config.custom_fixtures).read_bytes()).hexdigest()
     run.emit("run_started")
+
+    async def target_task(target):
+        task = asyncio.create_task(_target(run, target, fixtures))
+        run.target_tasks[target.name] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling() or not run.endpoint_health[target.name]["abort_reason"]:
+                raise
+            run.unfinished[target.name].update(config.checks)
+
     if config.overlap_models:
-        tasks = [asyncio.create_task(_target(run, target, fixtures)) for target in config.targets]
+        tasks = [asyncio.create_task(target_task(target)) for target in config.targets]
     else:
         async def sequential():
             for target in config.targets:
-                await _target(run, target, fixtures)
+                await target_task(target)
         tasks = [asyncio.create_task(sequential())]
     monitor = asyncio.create_task(run.monitor(tasks))
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
-        run.reason = "cancelled by user"
-        run.stop.set()
+        # Child cleanup can propagate the monitor's cancellation. Only a
+        # cancellation of the suite itself is a new user stop.
+        if not run.reason or asyncio.current_task().cancelling():
+            run.reason = "cancelled by user"
+            run.stop.set()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -2000,6 +2093,12 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     run.verdict_budget_guidance = _budget_guidance(config)
     checks = [check for target in config.targets for check in _checks(run, target)]
     checks = consolidate_checks(run, public_config, checks)
+    target_abort_reasons = {target: health["abort_reason"] for target, health in run.endpoint_health.items()
+                           if health["abort_reason"]}
+    for check in checks:
+        if check.target in target_abort_reasons and check.status == "pass":
+            check.status = "inconclusive"
+            check.summary = target_abort_reasons[check.target] + ". This check was interrupted."
     counts = defaultdict(dict)
     for target in config.targets:
         for scenario in sorted({r.scenario for r in run.records if r.target == target.name}):
@@ -2023,6 +2122,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                         "Without capacity, one quiet pass and a concurrent pass of at least global concurrency run. "
                         "Legacy request previews omit this extra concurrent pass.")
     observations = {"targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
+                    "target_abort_reasons": target_abort_reasons,
                     "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
                     "inference_duration_seconds": inference_duration,
@@ -2102,9 +2202,9 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                     "latency_ms": "client dispatch through protocol completion",
                     "workload_sizes": "character sizing is requested shape; server token usage is observed length",
                     "warmup": "initial and warm short requests only when required by selected checks or restart readiness; fairness and recovery use their own matched baselines"}}
-    run.emit("run_finished", abort_reason=run.reason)
+    run.emit("run_finished", abort_reason=run.reason, target_abort_reasons=target_abort_reasons)
     return RunReport(run_id=run_id, suite_version=SUITE_VERSION,
                      started_at=started_at, finished_at=_now(),
-                     overall=overall_status(checks, run.reason), manifest=manifest, checks=checks,
+                     overall=overall_status(checks, run.reason or next(iter(target_abort_reasons.values()), None)), manifest=manifest, checks=checks,
                      requests=run.records, warnings=warnings, observations=observations,
                      abort_reason=run.reason)
