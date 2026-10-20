@@ -10,7 +10,7 @@ import subprocess
 import httpx
 import pytest
 
-from giraffe.models import ConcurrentWorkloads, RunConfig
+from giraffe.models import ConcurrentLoad, RunConfig
 from giraffe.planning import request_plan
 from giraffe.runner import run_suite
 from giraffe.web import create_app
@@ -33,7 +33,7 @@ async def test_concurrent_setup_plan_matches_requests_with_saved_dataset_and_low
         source = RunConfig(
             targets=[{"name": "local", "url": endpoint.url, "model": "fake-model"}],
             checks=["access", "correctness"], concurrency=16,
-            max_requests=200, max_output_tokens=32, max_duration_seconds=30,
+            max_requests=500, max_output_tokens=32, max_duration_seconds=30,
             request_timeout_seconds=3, limits={"min_samples": 2},
             request_source="request_pack",
             request_pack={"version": 1, "cases": [{
@@ -44,13 +44,18 @@ async def test_concurrent_setup_plan_matches_requests_with_saved_dataset_and_low
             test_options={"correctness": {"concurrency": 12}},
         ).model_dump(mode="json")
         script = f"""
-import {{applySetupPreset,configureConcurrentWorkloads,configureSetupLoad}} from {json.dumps(module)};
+import {{applySetupPreset,configureConcurrentLoad,configureSetupLoad}} from {json.dumps(module)};
 const source={json.dumps(source)};
-const defaults={json.dumps(ConcurrentWorkloads().model_dump(mode='json'))};
+const defaults={json.dumps(ConcurrentLoad().model_dump(mode='json'))};
 const values=new FormData();
-values.set('concurrent_levels','1, 4, 8');
+values.set('load_schedule_levels','1, 4, 8');
+values.set('load_schedule_duration_seconds','1');
+values.set('load_mixed_enabled','');
+values.set('load_profile_short_output_tokens','8');
+values.set('load_profile_medium_output_tokens','16');
+values.set('load_profile_long_output_tokens','32');
 let config=applySetupPreset(source,'concurrent',defaults);
-config=configureConcurrentWorkloads(config,values,defaults);
+config=configureConcurrentLoad(config,values,defaults);
 config=configureSetupLoad(config,'concurrent');
 process.stdout.write(JSON.stringify(config));
 """
@@ -61,11 +66,11 @@ process.stdout.write(JSON.stringify(config));
         assert result.returncode == 0, result.stderr
         values = json.loads(result.stdout)
         assert values["concurrency"] == 8
-        assert values["max_requests"] == 200
+        assert values["max_requests"] == 500
         assert values["max_output_tokens"] == 32
         assert values["request_pack"] == source["request_pack"]
         assert values["test_options"] == source["test_options"]
-        assert values["concurrent_workloads"]["output_tokens"] == {"short": 16, "medium": 32, "long": 32}
+        assert {size: profile["output_tokens"] for size, profile in values["concurrent_load"]["profile"].items()} == {"short": 8, "medium": 16, "long": 32}
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(tmp_path / "runs")),
@@ -76,32 +81,33 @@ process.stdout.write(JSON.stringify(config));
             preview = await client.post("/api/config/preview", json=validation.json()["config"])
             assert preview.status_code == 200, preview.text
             plan = preview.json()["request_plan"]
-            assert plan["count_kind"] == "exact"
-            assert plan["planned_total"] == 190
-            assert plan["required_request_limit"] == 190
-            assert len(plan["bucket_cases"]) == 9
+            assert plan["count_kind"] == "bounded"
+            assert plan["configured_load_seconds"] == 9
+            assert plan["concurrent_load"]["combinations"]["test_points"] == 9
+            assert plan["concurrent_load"]["combinations"]["levels"] == [1, 4, 8]
+            rows = {row["id"]: row for row in plan["rows"]}
+            assert rows["load_combinations"]["requests_per_target"] is None
+            assert rows["load_calibration"]["requests_per_target"] > 0
             assert plan["evaluator"]["call_upper_bound"] == 0
-            assert endpoint.requests == []  # Neither validation nor planning sends inference.
+            assert endpoint.requests == []
 
         configuration = RunConfig.model_validate(preview.json()["config"])
         assert request_plan(configuration) == plan
-        assert plan["bucket_levels"] == [
-            {"concurrency": 1, "requests_per_case": 5, "requests_per_target": 45},
-            {"concurrency": 4, "requests_per_case": 8, "requests_per_target": 72},
-            {"concurrency": 8, "requests_per_case": 8, "requests_per_target": 72},
-        ]
-        planned_scenarios = {"initial": 1}
-        for level in plan["bucket_levels"]:
-            for input_shape in ("short", "medium", "long"):
-                for output_shape in ("short", "medium", "long"):
-                    scenario = f"bucket_c{level['concurrency']}_{input_shape}_{output_shape}"
-                    planned_scenarios[scenario] = level["requests_per_case"]
+        # Keep the real client/runner traffic test short without changing form validation.
+        configuration.concurrent_load.schedule.duration_seconds = .2
         report = await run_suite(configuration)
         assert report.abort_reason is None
-        assert len(report.requests) == len(endpoint.requests) == 190
-        assert Counter(item.scenario for item in report.requests) == planned_scenarios
-        bucket_requests = [item for item in report.requests if item.scenario.startswith("bucket_c")]
-        assert Counter(item.workload["level"] for item in bucket_requests) == {1: 45, 4: 72, 8: 72}
+        assert len(report.requests) == len(endpoint.requests) <= 500
+        load_requests = [item for item in report.requests if item.load_point and item.load_point["type"] != "calibration"]
+        expected = {f"load_combo_{shape}_c{level}" for shape in ("short_short", "long_short", "short_long") for level in (1, 4, 8)}
+        assert {item.condition_id for item in load_requests} == expected
+        assert set(Counter(item.load_point["level"] for item in load_requests)) == {1, 4, 8}
+        assert all(not item.workload for item in load_requests)
+        load_check = next(item for item in report.checks if item.id == "concurrency")
+        points = load_check.metrics["load_types"]["combinations"]["points"]
+        assert len(points) == 9
+        assert sum(point["sent"] for point in points) == len(load_requests)
+        assert all(point["configured_window_seconds"] == .2 for point in points)
         assert all(item.valid for item in report.requests)
         assert all(call["max_tokens"] <= 32 for call in endpoint.requests)
         assert all("SAVED_QUESTION_MUST_NOT_BE_SENT" not in json.dumps(call)

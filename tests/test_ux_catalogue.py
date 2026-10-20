@@ -27,8 +27,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import * as formConfig from MODULE_PATH;
-const nodes={},groups={},listeners={};
-const context={assert,structuredClone,...formConfig,nodes,groups,listeners,console,
+const nodes={},groups={},listeners={},storage=new Map();
+const context={assert,structuredClone,FormData,...formConfig,nodes,groups,listeners,console,
+  sessionStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
   document:{querySelector:q=>nodes[q],querySelectorAll:q=>groups[q] || [],addEventListener:(event,fn)=>listeners[event]=fn},
   window:{addEventListener(){}},location:{hash:'#new'},setTimeout(){},clearTimeout(){}};
 context.bootstrap=BOOTSTRAP;context.config=CONFIG;
@@ -59,7 +60,7 @@ assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),confi
 const capacity={...config,checks:['capacity']};
 assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='capacity'),capacity),/id="setup-dataset"/);
 assert.doesNotMatch(renderCheckSelection({...config,checks:['access']}),/id="setup-dataset"/);
-for(const name of ['traffic_rates','traffic_duration_seconds','concurrent_levels','concurrent_input_short','profile_sessions_concurrency']){
+for(const name of ['traffic_rates','traffic_duration_seconds','load_schedule_levels','load_profile_short_input_tokens','profile_sessions_concurrency']){
   assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 }
 assert.doesNotMatch(markup,/name="setup_goal"|name="setup_load"/);
@@ -154,7 +155,7 @@ state.openTest=null;configureEvaluator();assert(added);
 def test_browse_warnings_follow_selection_and_open_draft_without_losing_values():
     browser_logic(r"""
 config.limits.min_samples=5;config.max_output_tokens=32;
-config.concurrent_workloads={...bootstrap.concurrent_workloads.defaults,levels:[1],samples_per_bucket:4,mixed_pairs:2};
+config.concurrent_load=structuredClone(bootstrap.concurrent_load.defaults);config.concurrent_load.schedule.levels=[1];
 config.consistency={...bootstrap.profile_defaults.consistency,repetitions:4,levels:[1,2],shapes:['short','long']};
 config.test_options.generation={max_output_tokens:64};
 state.catalogueFilter='all';state.openTest=null;
@@ -172,7 +173,7 @@ for(const check of bootstrap.checks){
   nodes['[data-test-card="'+check.id+'"]']={dataset:{category:'all',search:''},classList:{toggle(){}},querySelector:selector=>controls[selector]};
 }
 const original=JSON.stringify(config);
-for(const id of ['concurrency','consistency']){
+for(const id of ['consistency']){
   const check=bootstrap.checks.find(item=>item.id===id),markup=renderTestCard(check,config);
   assert.match(markup,new RegExp('data-check-coverage="'+id+'" hidden'));
   assert(warnings[id].coverage.textContent.length>0);
@@ -190,9 +191,9 @@ assert.equal(warnings.generation.override.hidden,true);
 assert.equal(JSON.stringify(config),original);
 // Selected checks keep warnings visible with their editor closed.
 config.checks.push('concurrency');selections.concurrency.checked=true;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.concurrency.coverage.hidden,false);
+assert.equal(warnings.concurrency.coverage.hidden,true); // Duration windows have no planned sample target.
 config.checks=config.checks.filter(id=>id!=='concurrency');selections.concurrency.checked=false;
-state.openTest='concurrency';syncTestControls();assert.equal(warnings.concurrency.coverage.hidden,false);
+state.openTest='concurrency';syncTestControls();assert.equal(warnings.concurrency.coverage.hidden,true); // Duration windows have no planned sample target.
 state.openTest=null;syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.concurrency.coverage.hidden,true);
 assert.equal(config.test_options.generation.max_output_tokens,64);

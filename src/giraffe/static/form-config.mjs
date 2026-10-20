@@ -32,7 +32,7 @@ function numeric(value, label, allowInvalid=false) {
   return result;
 }
 
-function validBucketLevels(levels) {
+function validLoadLevels(levels) {
   return Array.isArray(levels) && levels.length >= 1 && levels.length <= 16 &&
     new Set(levels).size === levels.length &&
     levels.every(level => Number.isInteger(level) && level >= 1 && level <= 256);
@@ -44,8 +44,8 @@ export function inferSetupPreset(config) {
     new Set(checks).size === checks.length && expected.every(id => checks.includes(id));
   if (matches(['access','correctness'])) return 'answers';
   if (matches(['access','correctness','capacity'])) return 'arrival';
-  if (matches(['access','concurrency']) && validBucketLevels(config.concurrent_workloads?.levels) &&
-      config.concurrency === Math.max(...config.concurrent_workloads.levels) &&
+  if (matches(['access','concurrency']) && validLoadLevels(config.concurrent_load?.schedule?.levels) &&
+      config.concurrency === Math.max(...config.concurrent_load.schedule.levels) &&
       checks.every(id => !Object.keys(config.test_options?.[id] || {}).length)) return 'concurrent';
   return 'custom';
 }
@@ -62,16 +62,8 @@ export function applySetupPreset(source, preset, defaults) {
   config.metrics = config.checks.includes('gpu');
   config.tool_calling = config.checks.includes('tools');
   if (preset === 'concurrent') {
-    if (!config.concurrent_workloads) {
-      config.concurrent_workloads = structuredClone(defaults);
-      config.concurrent_workloads.scenarios = ['size_matrix'];
-      config.concurrent_workloads.samples_per_bucket = Math.max(
-        config.concurrent_workloads.samples_per_bucket, config.limits?.min_samples ?? 5);
-      for (const size of Object.keys(config.concurrent_workloads.output_tokens)) {
-        config.concurrent_workloads.output_tokens[size] = Math.min(config.concurrent_workloads.output_tokens[size], config.max_output_tokens);
-      }
-    }
-    if (validBucketLevels(config.concurrent_workloads.levels)) config.concurrency = Math.max(...config.concurrent_workloads.levels);
+    config.concurrent_load ||= structuredClone(defaults);
+    if (validLoadLevels(config.concurrent_load.schedule?.levels)) config.concurrency = Math.max(...config.concurrent_load.schedule.levels);
   }
   return config;
 }
@@ -81,79 +73,107 @@ export function applySetupPreset(source, preset, defaults) {
 export function configureSetupLoad(source, preset, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   if (preset !== 'concurrent') return config;
-  if (!validBucketLevels(config.concurrent_workloads?.levels)) {
+  if (!validLoadLevels(config.concurrent_load?.schedule?.levels)) {
     if (allowInvalid) return config;
     throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
   }
-  config.concurrency = Math.max(...config.concurrent_workloads.levels);
+  config.concurrency = Math.max(...config.concurrent_load.schedule.levels);
   return config;
 }
 
-export function configureConcurrentWorkloads(source, values, defaults, {allowInvalid=false}={}) {
+export function configureConcurrentLoad(source, values, defaults, {allowInvalid=false}={}) {
   const config = structuredClone(source);
-  const fields = ['levels','samples_per_bucket','window_seconds','mixed_pairs','heavy_long_input','heavy_long_output',
-    ...['input','output'].flatMap(kind => ['short','medium','long'].map(size => `${kind}_${size}`))];
-  if (!fields.some(name => values.has(`concurrent_${name}`))) return config;
-  const settings = structuredClone(source.concurrent_workloads || defaults);
-  if (values.has('concurrent_levels')) {
-    settings.levels = String(values.get('concurrent_levels') || '').trim().split(/[\s,]+/)
-      .filter(Boolean).map(value => numeric(value, 'Concurrency levels', allowInvalid));
-    if (!allowInvalid && !validBucketLevels(settings.levels)) {
-      throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+  if (![...values.keys()].some(name => name.startsWith('load_'))) return config;
+  const settings = structuredClone(source.concurrent_load || defaults);
+  const validate = !allowInvalid && config.checks.includes('concurrency');
+  const invalid = (fields, msg) => {throw Object.assign(new Error(msg), {errors:[{fields, msg}]});};
+  const rendered = values.has('load_rendered');
+  const sizes = ['short','medium','long'];
+  const shapes = sizes.flatMap(input => sizes.map(output => `${input}_${output}`));
+  const number = (group, key, label, {minimum=0, maximum=Infinity, integer=false, nullable=false}={}) => {
+    const name = `load_${group}_${key}`;
+    if (!values.has(name)) return;
+    const value = numeric(values.get(name), label, true);
+    if (validate && !(nullable && value === null) &&
+        (typeof value !== 'number' || !Number.isFinite(value) || value < minimum || value > maximum ||
+         (integer && !Number.isInteger(value)))) {
+      const range = Number.isFinite(maximum) ? `from ${minimum} to ${maximum}` : `of at least ${minimum}`;
+      invalid([`concurrent_load.${group}.${key}`], `${label} must be ${integer ? 'a whole number' : 'a number'} ${range}.`);
+    }
+    settings[group] ||= {};
+    settings[group][key] = value;
+  };
+  for (const size of sizes) for (const field of ['input_tokens','output_tokens']) {
+    const name = `load_profile_${size}_${field}`;
+    if (!values.has(name)) continue;
+    const label = `${size[0].toUpperCase()+size.slice(1)} ${field === 'input_tokens' ? 'input target' : 'output cap'}`;
+    const value = numeric(values.get(name), label, true);
+    const maximum = field === 'input_tokens' ? 131072 : 65536;
+    if (validate && (!Number.isInteger(value) || value < 1 || value > maximum)) {
+      invalid([`concurrent_load.profile.${size}.${field}`], `${label} must be a whole number from 1 to ${maximum}.`);
+    }
+    settings.profile[size][field] = value;
+  }
+  for (const type of ['combinations','mixed','interference','stress']) {
+    const name = `load_${type}_enabled`;
+    if (rendered || values.has(name)) settings[type].enabled = values.get(name) === 'on';
+  }
+  if (rendered || shapes.some(shape => values.has(`load_combinations_selected_${shape}`))) {
+    const selected = shapes.filter(shape => values.get(`load_combinations_selected_${shape}`) === 'on');
+    settings.combinations.selected = [...settings.combinations.selected.filter(shape => selected.includes(shape)),
+      ...selected.filter(shape => !settings.combinations.selected.includes(shape))];
+  }
+  for (const shape of shapes) {
+    const name = `load_mixed_shares_${shape}`;
+    if (!rendered && !values.has(name)) continue;
+    const raw = values.get(name);
+    const value = raw == null || String(raw).trim() === '' ? 0 : numeric(raw, 'Share of requests', true);
+    if (validate && (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100)) {
+      invalid([`concurrent_load.mixed.shares.${shape}`], 'Share of requests must be a number from 0 to 100.');
+    }
+    if (value === 0) delete settings.mixed.shares[shape];
+    else settings.mixed.shares[shape] = value;
+  }
+  if (values.has('load_interference_trigger')) settings.interference.trigger = values.get('load_interference_trigger');
+  number('interference','trigger_chunks','Chunk count',{minimum:1,maximum:1000,integer:true});
+  number('interference','max_slowdown','Maximum slowdown',{minimum:1,nullable:true});
+  for (const key of ['large_input','large_output']) {
+    if (rendered || values.has(`load_stress_${key}`)) settings.stress[key] = values.get(`load_stress_${key}`) === 'on';
+  }
+  number('stress','min_output_percent','Minimum output length',{minimum:1,maximum:100});
+  if (values.has('load_schedule_levels')) {
+    settings.schedule.levels = String(values.get('load_schedule_levels') || '').trim().split(/[\s,]+/)
+      .filter(Boolean).map(value => numeric(value, 'Concurrency levels', true));
+    if (validate && !validLoadLevels(settings.schedule.levels)) {
+      invalid(['concurrent_load.schedule.levels'], 'Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+    }
+    if (validLoadLevels(settings.schedule.levels)) settings.schedule.levels.sort((left,right) => left-right);
+  }
+  number('schedule','duration_seconds','Duration per workload',{minimum:1,maximum:3600,integer:true});
+  for (const key of ['first_output_p95_ms','response_p95_ms']) {
+    number('pass_criteria',key,key === 'first_output_p95_ms' ? 'First answer p95' : 'Response p95',
+      {minimum:1,integer:true,nullable:true});
+  }
+  for (const key of ['max_error_percent','min_correct_percent']) {
+    number('pass_criteria',key,key === 'max_error_percent' ? 'Maximum errors' : 'Minimum correct answers',{maximum:100});
+  }
+  number('pass_criteria','min_valid_responses','Minimum valid responses',{minimum:2,integer:true});
+  if (validate) {
+    for (const size of sizes) if (settings.profile[size].output_tokens > config.max_output_tokens) {
+      invalid([`concurrent_load.profile.${size}.output_tokens`, 'max_output_tokens'], `Each output cap must be ${config.max_output_tokens} tokens or less. Lower the output cap or edit Maximum answer length under Shared run settings → Request defaults.`);
+    }
+    if (!Object.values(settings).some(value => value?.enabled)) invalid(['concurrent_load.combinations.enabled'], 'Enable at least one load type.');
+    if (settings.combinations.enabled && !settings.combinations.selected.length) invalid(['concurrent_load.combinations.selected'], 'Select at least one combination.');
+    if (settings.mixed.enabled && Math.abs(Object.values(settings.mixed.shares).reduce((sum,share) => sum+share,0)-100) > 1e-6) {
+      invalid([`concurrent_load.mixed.shares.${shapes.find(shape => settings.mixed.shares[shape] > 0) || shapes[0]}`], 'Mixed shares must equal 100%.');
+    }
+    if (settings.stress.enabled && !settings.stress.large_input && !settings.stress.large_output) invalid(['concurrent_load.stress.large_input'], 'Select at least one stress case.');
+    if (settings.interference.max_slowdown !== null && settings.interference.max_slowdown <= 1) {
+      invalid(['concurrent_load.interference.max_slowdown'], 'Maximum slowdown must be greater than 1, or blank to measure only.');
     }
   }
-  for (const name of ['samples_per_bucket','window_seconds','mixed_pairs']) {
-    if (values.has(`concurrent_${name}`)) settings[name] = numeric(values.get(`concurrent_${name}`), name, allowInvalid);
-  }
-  for (const [kind, group] of [['input','input_chars'],['output','output_tokens']]) {
-    for (const size of ['short','medium','long']) {
-      const name = `concurrent_${kind}_${size}`;
-      if (!values.has(name)) continue;
-      const label = `${size} ${kind === 'input' ? 'question target' : 'answer cap'}`;
-      const value = numeric(values.get(name), label, true);
-      if (!allowInvalid && (!Number.isInteger(value) || value < 1 || value > 65536)) {
-        throw new Error(`${label} must be a whole number from 1 to 65536.`);
-      }
-      settings[group] ||= structuredClone(defaults[group]);
-      settings[group][size] = value;
-    }
-  }
-  for (const name of ['long_input','long_output']) {
-    if (values.has(`concurrent_heavy_${name}`)) {
-      settings.heavy_weights ||= structuredClone(defaults.heavy_weights);
-      settings.heavy_weights[name] = numeric(values.get(`concurrent_heavy_${name}`), `${name} weight`, allowInvalid);
-    }
-  }
-  if (values.has('concurrent_scenarios_rendered')) {
-    settings.scenarios = ['size_matrix','mixed_interference','streaming_fairness','token_stress'].filter(name => values.get(`concurrent_scenario_${name}`) === 'on');
-    for (const name of ['input_token_tolerance','calibration_attempts']) {
-      if (values.has(`concurrent_${name}`)) settings[name] = numeric(values.get(`concurrent_${name}`), name, allowInvalid);
-    }
-    settings.stress_cases = ['long_input_summary','short_input_long_output'].filter(name => values.get(`concurrent_${name}_enabled`) === 'on').map(name => ({
-      ...(settings.stress_cases || defaults.stress_cases || []).find(item => item.name === name), name,
-      input_tokens: name === 'long_input_summary' ? numeric(values.get(`concurrent_${name}_input`), 'Input token target', allowInvalid) : null,
-      output_tokens: numeric(values.get(`concurrent_${name}_output`), 'Output token target', allowInvalid),
-      min_output_tokens: numeric(values.get(`concurrent_${name}_minimum`), 'Minimum observed output', allowInvalid),
-    }));
-  }
-  if (!allowInvalid && config.checks.some(id => id === 'concurrency') &&
-      Object.values(settings.output_tokens).some(cap => cap > config.max_output_tokens)) {
-    throw new Error(`Each answer cap must be ${config.max_output_tokens} tokens or less. Lower the answer cap or edit Maximum answer length under Shared run settings → Request defaults.`);
-  }
-  if (source.concurrent_workloads || config.checks.some(id => id === 'concurrency') ||
-      !sameConfig(settings, defaults)) config.concurrent_workloads = settings;
+  config.concurrent_load = settings;
   return config;
-}
-
-// A level needs at least one full concurrent batch for each of the nine size pairs.
-// This is bucket traffic only; other selected checks share the same request budget.
-export function bucketCoveragePlan(config) {
-  if (!config.checks.includes('concurrency') || !config.concurrent_workloads?.scenarios?.includes('size_matrix')) return null;
-  const {levels, samples_per_bucket: samples} = config.concurrent_workloads;
-  if (!levels.length || levels.some(level => !Number.isInteger(level) || level < 1 || level > 256) ||
-      !Number.isInteger(samples) || samples < 2) return null;
-  const perTarget = 9 * levels.reduce((total, level) => total + Math.ceil(Math.max(samples, level) / level) * level, 0);
-  return {levels, peak:Math.max(...levels), perTarget, total:perTarget * config.targets.length};
 }
 
 export function configureTests(source, values, checks, trafficDefaults, {allowEmpty=false, allowInvalid=false, percentageInputs=false}={}) {
@@ -165,7 +185,7 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
   config.tool_calling = config.checks.includes('tools');
   config.test_options ||= {};
   for (const check of checks) {
-    if (values.get(`test_mode_${check.id}`) !== 'custom') {
+    if (check.id === 'concurrency' || values.get(`test_mode_${check.id}`) !== 'custom') {
       delete config.test_options[check.id];
       continue;
     }

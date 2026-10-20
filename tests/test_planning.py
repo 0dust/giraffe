@@ -51,15 +51,6 @@ def test_adaptive_work_reports_unknown_time_with_reason():
     assert result["time_bound_reasons"]
 
 
-def test_matrix_windows_are_upper_limits_not_required_sending_time():
-    result = plan(config(checks=["concurrency"], concurrency=2, max_duration_seconds=1,
-                         request_timeout_seconds=10, concurrent_workloads={
-                             "scenarios": ["size_matrix"], "levels": [1, 2],
-                             "samples_per_bucket": 2, "window_seconds": 3}))
-    assert result["minimum_seconds"] == 0
-    assert result["worst_case_seconds"] == 9 * (min(20, 3 + 10) + 10)
-    assert result["errors"] == []
-    assert result["time_warnings"]
 
 
 def test_readiness_warmup_and_multiple_targets_have_finite_bounds():
@@ -106,11 +97,6 @@ def test_consistency_estimate_uses_each_levels_pool_and_keeps_sequential_phases(
     assert result["estimated_seconds"] == 36  # 6 prompt/shape pairs * (5 quiet + 1 loaded batch).
 
 
-def test_token_stress_estimate_uses_level_batches_and_sequential_calibration():
-    result = plan(config(checks=["concurrency"], concurrency=8, context_limit=20000,
-                         concurrent_workloads={"scenarios": ["token_stress"], "levels": [1, 8],
-                             "stress_cases": [{"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50}]}))
-    assert result["estimated_seconds"] == 3 + 5 + 1
 
 
 def test_sessions_estimate_pools_conversations_but_keeps_turns_and_pauses_in_order():
@@ -125,7 +111,6 @@ def test_sessions_estimate_pools_conversations_but_keeps_turns_and_pauses_in_ord
 
 @pytest.mark.parametrize("checks,expected", [
     (["access", "correctness"], 7),
-    (["access", "buckets"], 100),
     (["access", "correctness", "capacity"], 42),
 ])
 def test_basic_presets_have_complete_counts_before_caps(checks, expected):
@@ -157,44 +142,10 @@ def test_fixed_specialist_workloads_follow_their_own_runner_controls(check, upda
     assert result["planned_per_target"] == result["known_per_target"] == expected
 
 
-@pytest.mark.parametrize("stream,concurrency,kind,known", [
-    (False, 2, "exact", 0),
-    (True, 1, "exact", 0),
-    (True, 2, "bounded", 12),
-])
-def test_fairness_plan_only_includes_streaming_overlap_when_eligible(stream, concurrency, kind, known):
-    result = plan(config(checks=["fairness"], stream=stream, concurrency=concurrency))
-    assert result["count_kind"] == kind
-    assert result["known_per_target"] == known
-    assert result["required_request_limit"] == (known if kind == "exact" else None)
-    assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
 
 
-@pytest.mark.parametrize("concurrency,kind,known", [(1, "exact", 5), (2, "exact", 45)])
-def test_mixed_plan_only_includes_interference_work_when_concurrency_allows_it(concurrency, kind, known):
-    result = plan(config(checks=["mixed"], concurrency=concurrency))
-    assert result["count_kind"] == kind
-    assert result["known_per_target"] == known
-    assert result["required_request_limit"] == (known if kind == "exact" else None)
-    assert any(row["requests_per_target"] is None for row in result["rows"]) == (kind == "bounded")
 
 
-def test_bucket_plan_covers_nine_real_prompts_and_full_batches():
-    configuration = config(checks=["access", "buckets"], concurrency=8,
-                           buckets={"levels": [1, 4, 8], "samples_per_bucket": 4})
-    result = plan(configuration)
-    assert result["planned_per_target"] == 145
-    assert result["bucket_levels"] == [
-        {"concurrency": 1, "requests_per_case": 4, "requests_per_target": 36},
-        {"concurrency": 4, "requests_per_case": 4, "requests_per_target": 36},
-        {"concurrency": 8, "requests_per_case": 8, "requests_per_target": 72},
-    ]
-    assert result["bucket_cases"] == [
-        {"input_chars": chars, "actual_input_chars": min(chars, 11808) + extra, "output_tokens": cap}
-        for chars in (64, 1024, 12288)
-        for cap, extra in ((16, 0), (48, 32), (96, 32))
-    ]
-    assert configuration.max_requests == 300
 
 
 def test_target_quotas_warn_for_the_smaller_share():
@@ -231,20 +182,6 @@ def test_initial_warm_and_dataset_controls_are_reused_once():
     assert result["evaluator"]["judge_count"] == 1
 
 
-def test_saved_dataset_does_not_replace_generated_buckets_or_activate_judges():
-    configuration = ConfigDraft.model_validate(config().model_dump() | {
-        "checks": ["access", "buckets"], "request_source": "request_pack",
-        "request_pack": {"version": 1, "cases": [{"fixture_id": "own-question",
-            "messages": [{"role": "user", "content": "Private question"}],
-            "scorer": "judge", "expected": "Answer"}]},
-    })
-    result = plan(configuration)
-    assert result["planned_per_target"] == 100
-    assert next(row for row in result["rows"] if row["id"] == "buckets")["source"] == "generated examples"
-    assert result["evaluator"] == {"active": False, "call_upper_bound": 0, "judge_count": 0,
-                                   "ready": True, "readiness_errors": []}
-    assert any("saved questions" in warning and "generated questions" in warning for warning in result["warnings"])
-    assert not any("dataset is inactive" in warning for warning in result["warnings"])
 
 
 @pytest.mark.parametrize("rate,duration", [(1, 2.5), (3, .7), (.3, 10), (7, 1)])
@@ -323,33 +260,12 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     configuration = config(checks=list(CHECK_NAMES))
     result = plan(configuration)
     rows = {row["id"]: row for row in result["rows"]}
-    assert set(CHECK_NAMES) <= rows.keys()
+    assert set(CHECK_NAMES) - {"concurrency"} <= rows.keys()
+    assert {"load_combinations", "load_mixed", "load_calibration"} <= rows.keys()
     assert all(row["source"] and row["summary"] for row in rows.values())
     assert result["count_kind"] == "bounded"
 
 
-@pytest.mark.parametrize("case,output_cap,kind,count", [
-    ({"name": "short_input_long_output", "output_tokens": 10000}, 10000, "exact", 4),
-    ({"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50}, 10000, "bounded", None),
-    ({"name": "short_input_long_output", "output_tokens": 10000}, 128, "exact", 0),
-])
-def test_token_stress_planning_preserves_targets_and_calibration_uncertainty(case, output_cap, kind, count):
-    configuration = config(checks=["concurrency"], context_limit=16384,
-                           max_output_tokens=output_cap,
-                           concurrent_workloads={"scenarios": ["token_stress"],
-                               "levels": [1, 2], "samples_per_bucket": 2, "stress_cases": [case]})
-    result = plan(configuration)
-    assert result["count_kind"] == kind
-    assert result["planned_per_target"] == count
-    rows = {row["id"]: row for row in result["rows"]}
-    assert rows["concurrency"]["requests_per_target"] == 0
-    case_row = rows[f"token_stress_{case['name']}"]
-    assert case_row["requests_per_target"] == count
-    if count is None:
-        assert "input-sizing" in case_row["summary"]
-    if count == 0:
-        assert "no smaller substitute" in case_row["summary"]
-        assert any("inconclusive" in warning for warning in result["warnings"])
 
 
 def test_empty_dataset_and_blank_model_remain_editable_with_unknown_active_count():
@@ -443,7 +359,7 @@ async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch
 
 
 def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
-    configured = config(checks=['access', 'fairness', 'recovery'], max_requests=28,
+    configured = config(checks=['access', 'concurrency', 'recovery'], max_requests=28,
                         concurrency=4, samples=4)
     preview = plan(configured)
     assert preview['known_per_target'] <= 28 < preview['conservative_requests_per_target']
@@ -461,10 +377,11 @@ def test_local_recovery_warmup_is_reserved_once_in_adaptive_estimate(quota):
     result = plan(configuration)
     warmup = next(row for row in result["rows"] if row["id"] == "recovery_prime")
     assert warmup["kind"] == "bounded" and warmup["requests_per_target"] == 1
-    assert result["known_per_target"] == 250
-    assert result["conservative_requests_per_target"] <= quota
-    assert not any("starved" in warning or "Some tests may be incomplete" in warning
-                   for warning in result["warnings"])
+    assert result["known_per_target"] == 94
+    assert result["minimum_reserved_per_target"] > result["known_per_target"]
+    assert result["conservative_requests_per_target"] == max(302, quota)
+    assert any("starved" in warning for warning in result["warnings"]) is (quota < 302)
+    assert not any("Some tests may be incomplete" in warning for warning in result["warnings"])
 
 
 def test_capacity_accounting_note_does_not_warn_when_budgets_and_limits_fit():

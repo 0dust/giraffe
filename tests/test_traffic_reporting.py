@@ -279,7 +279,7 @@ def test_portable_report_explains_traffic_accounting_and_capacity_change(tmp_pat
 
 @pytest.mark.parametrize("field,value", [
     ("arrivals", {"requests": 3}), ("prefix", {"repeats": 3}),
-    ("buckets", {"mixed_pairs": 3}), ("sessions", {"sessions": 3}),
+    ("concurrent_load", {"schedule": {"duration_seconds": 12}}), ("sessions", {"sessions": 3}),
     ("consistency", {"repetitions": 3}), ("forced_tool_diagnostic", True),
 ])
 def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, value):
@@ -291,8 +291,8 @@ def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, v
 
 @pytest.mark.parametrize("field,check,value", [
     ("sessions", "sessions", {"sessions": 3}),
-    ("concurrent_workloads", "concurrency", {"mixed_pairs": 3}),
-    ("concurrent_workloads", "concurrency", {"samples_per_bucket": 3}),
+    ("concurrent_load", "concurrency", {"schedule": {"duration_seconds": 12}}),
+    ("concurrent_load", "concurrency", {"combinations": {"selected": ["short_short"]}}),
     ("forced_tool_diagnostic", "tools", True),
 ])
 def test_selected_workload_settings_still_block_comparison(field, check, value):

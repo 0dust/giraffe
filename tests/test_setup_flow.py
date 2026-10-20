@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from giraffe.models import ConcurrentWorkloads, CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, RunConfig
+from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, ConcurrentLoad, RunConfig
 
 
 MODULE = (Path(__file__).parents[1] / "src/giraffe/static/form-config.mjs").as_uri()
@@ -22,15 +22,15 @@ def run_setup_script(script):
         checks=["access", "correctness"], max_requests=100,
     )
     checks = [
-        {"id": name, "option_fields": sorted(CHECK_OPTION_FIELDS[name]),
-         "limit_fields": sorted(CHECK_LIMIT_FIELDS[name]), "defaults": config.effective_check(name)}
+        {"id": name, "option_fields": sorted(CHECK_OPTION_FIELDS.get(name, set())),
+         "limit_fields": sorted(CHECK_LIMIT_FIELDS.get(name, set())), "defaults": config.effective_check(name)}
         for name in CHECK_NAMES
     ]
     prelude = f"""
 import assert from 'node:assert/strict';
 import * as setup from {json.dumps(MODULE)};
 const source = {json.dumps(config.model_dump(mode='json'))};
-const defaults = {json.dumps(ConcurrentWorkloads().model_dump(mode='json'))};
+const defaults = {json.dumps(ConcurrentLoad().model_dump(mode='json'))};
 const checks = {json.dumps(checks)};
 """
     result = subprocess.run(
@@ -54,7 +54,7 @@ assert.equal(setup.inferSetupPreset(source), 'custom');
 source.checks = ['access', 'access', 'correctness'];
 assert.equal(setup.inferSetupPreset(source), 'custom');
 source.checks = ['concurrency', 'access'];
-source.concurrent_workloads = {...defaults, levels:[1, 4, 8]};
+source.concurrent_load = {...defaults,schedule:{...defaults.schedule,levels:[1,4,8]}};
 source.concurrency = 8;
 assert.equal(setup.inferSetupPreset(source), 'concurrent');
 source.concurrency = 16;
@@ -70,7 +70,7 @@ source.test_options.access = {request_timeout_seconds:12};
 assert.equal(setup.inferSetupPreset(source), 'custom');
 source.test_options = {};
 for (const levels of [[], ['8'], [1, 1], [0], [257], null]) {
-  source.concurrent_workloads.levels = levels;
+  source.concurrent_load.schedule.levels = levels;
   assert.equal(setup.inferSetupPreset(source), 'custom');
 }
 """)
@@ -99,11 +99,11 @@ assert.deepEqual(concurrent.checks, ['access','concurrency']);
 assert.equal(concurrent.structured_json, false);
 assert.equal(concurrent.metrics, false);
 assert.equal(concurrent.tool_calling, false);
-assert.equal(concurrent.concurrent_workloads.samples_per_bucket, 7);
-assert.equal(concurrent.concurrency, 2);
+assert.equal(concurrent.concurrent_load.pass_criteria.min_valid_responses, 5);
+assert.equal(concurrent.concurrency, 4);
 assert.equal(concurrent.max_requests, 100);
 assert.equal(concurrent.max_output_tokens, 128);
-assert.deepEqual(defaults.levels,[1,2]);
+assert.deepEqual(defaults.schedule.levels,[1,4]);
 for (const preset of ['answers','arrival','custom','concurrent']) {
   const next = setup.applySetupPreset(concurrent, preset, defaults);
   for (const key of ['targets','request_source','request_pack','request_options','judging','test_options','prefix','custom_fixtures']) {
@@ -119,14 +119,14 @@ assert.deepEqual(custom.checks,source.checks);
 assert.equal(custom.structured_json,true);
 assert.equal(custom.metrics,true);
 assert.equal(custom.tool_calling,true);
-source.concurrent_workloads = {...defaults,levels:[1,4,8],samples_per_bucket:3,input_chars:{short:25,medium:50,long:100},output_tokens:{short:5,medium:20,long:40},mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
+source.concurrent_load = {...defaults,schedule:{levels:[1,4,8],duration_seconds:3},profile:{short:{input_tokens:25,output_tokens:5},medium:{input_tokens:50,output_tokens:20},long:{input_tokens:100,output_tokens:40}}};
 const existing = setup.applySetupPreset(source,'concurrent',defaults);
 assert.equal(existing.concurrency,8);
-assert.deepEqual(existing.concurrent_workloads,source.concurrent_workloads);
-assert.equal(existing.concurrent_workloads.samples_per_bucket,3);
-source.concurrent_workloads = null;
+assert.deepEqual(existing.concurrent_load,source.concurrent_load);
+assert.equal(existing.concurrent_load.schedule.duration_seconds,3);
+source.concurrent_load = null;
 source.limits.min_samples = 5;
-assert.equal(setup.applySetupPreset(source,'concurrent',defaults).concurrent_workloads.samples_per_bucket,5);
+assert.equal(setup.applySetupPreset(source,'concurrent',defaults).concurrent_load.pass_criteria.min_valid_responses,5);
 """)
 
 
@@ -135,14 +135,14 @@ def test_setup_load_derives_only_basic_concurrency_without_raising_budgets():
 assert.equal(typeof setup.configureSetupLoad, 'function');
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
 const values = new FormData();
-values.set('concurrent_levels','1, 4 8');
-values.set('concurrent_samples_per_bucket','5');
-values.set('concurrent_window_seconds','30');
-const buckets = setup.configureConcurrentWorkloads(preset,values,defaults);
-const before = structuredClone(buckets);
-const configured = setup.configureSetupLoad(buckets,'concurrent');
-assert.deepEqual(buckets,before);
-assert.deepEqual(configured.concurrent_workloads.levels,[1,4,8]);
+values.set('load_schedule_levels','1, 4 8');
+values.set('load_pass_criteria_min_valid_responses','5');
+values.set('load_schedule_duration_seconds','10');
+const load = setup.configureConcurrentLoad(preset,values,defaults);
+const before = structuredClone(load);
+const configured = setup.configureSetupLoad(load,'concurrent');
+assert.deepEqual(load,before);
+assert.deepEqual(configured.concurrent_load.schedule.levels,[1,4,8]);
 assert.equal(configured.concurrency,8);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
@@ -162,10 +162,10 @@ def test_setup_load_keeps_invalid_drafts_and_rejects_them_when_running():
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
 for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']) {
   const values = new FormData();
-  values.set('concurrent_levels',raw);
-  values.set('concurrent_samples_per_bucket','5');
-  values.set('concurrent_window_seconds','30');
-  const draft = setup.configureConcurrentWorkloads(preset,values,defaults,{allowInvalid:true});
+  values.set('load_schedule_levels',raw);
+  values.set('load_pass_criteria_min_valid_responses','5');
+  values.set('load_schedule_duration_seconds','10');
+  const draft = setup.configureConcurrentLoad(preset,values,defaults,{allowInvalid:true});
   const before = structuredClone(draft);
   assert.deepEqual(setup.configureSetupLoad(draft,'concurrent',{allowInvalid:true}),before);
   assert.deepEqual(draft,before);
@@ -175,91 +175,120 @@ for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']
 """)
 
 
-def test_bucket_sizes_are_editable_and_keep_explicit_output_safety_limit():
+def test_load_profile_is_editable_and_keeps_explicit_output_safety_limit():
     result = run_setup_script("""
 source.checks = ['access','concurrency'];
 source.concurrency = 8;
-source.concurrent_workloads = {...defaults,levels:[1,4,8],mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
+source.concurrent_load = {...defaults,schedule:{levels:[1,4,8],duration_seconds:3},mixed:{...defaults.mixed,seed:42},input_token_tolerance:0.2,calibration_attempts:2};
 const values = new FormData();
 for (const [name,value] of Object.entries({
-  concurrent_input_short:100,concurrent_input_medium:600,concurrent_input_long:1200,
-  concurrent_output_short:12,concurrent_output_medium:36,concurrent_output_long:120,
+  load_profile_short_input_tokens:100,load_profile_medium_input_tokens:600,load_profile_long_input_tokens:1200,
+  load_profile_short_output_tokens:12,load_profile_medium_output_tokens:36,load_profile_long_output_tokens:120,
 })) values.set(name,String(value));
 const before = structuredClone(source);
-const configured = setup.configureConcurrentWorkloads(source,values,defaults);
+const configured = setup.configureConcurrentLoad(source,values,defaults);
 assert.deepEqual(source,before);
-assert.deepEqual(configured.concurrent_workloads.input_chars,{short:100,medium:600,long:1200});
-assert.deepEqual(configured.concurrent_workloads.output_tokens,{short:12,medium:36,long:120});
-assert.deepEqual(configured.concurrent_workloads.levels,[1,4,8]);
-assert.equal(configured.concurrent_workloads.samples_per_bucket,defaults.samples_per_bucket);
-assert.equal(configured.concurrent_workloads.window_seconds,defaults.window_seconds);
-assert.equal(configured.concurrent_workloads.mixed_pairs,7);
-assert.deepEqual(configured.concurrent_workloads.heavy_weights,source.concurrent_workloads.heavy_weights);
+assert.deepEqual(configured.concurrent_load.profile,{short:{input_tokens:100,output_tokens:12},medium:{input_tokens:600,output_tokens:36},long:{input_tokens:1200,output_tokens:120}});
+assert.deepEqual(configured.concurrent_load.schedule,{levels:[1,4,8],duration_seconds:3});
+assert.equal(configured.concurrent_load.mixed.seed,42);
+assert.equal(configured.concurrent_load.input_token_tolerance,0.2);
+assert.equal(configured.concurrent_load.calibration_attempts,2);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
-values.set('concurrent_output_long','256');
-assert.throws(()=>setup.configureConcurrentWorkloads(source,values,defaults),/answer cap must be 128 tokens or less/i);
-const draft = setup.configureConcurrentWorkloads(source,values,defaults,{allowInvalid:true});
-assert.equal(draft.concurrent_workloads.output_tokens.long,256);
+values.set('load_profile_long_output_tokens','256');
+assert.throws(()=>setup.configureConcurrentLoad(source,values,defaults),/output cap must be 128 tokens or less/i);
+const draft = setup.configureConcurrentLoad(source,values,defaults,{allowInvalid:true});
+assert.equal(draft.concurrent_load.profile.long.output_tokens,256);
 assert.equal(draft.max_output_tokens,128);
 const inactive = {...source,checks:['access','correctness']};
-assert.equal(setup.configureConcurrentWorkloads(inactive,values,defaults).concurrent_workloads.output_tokens.long,256);
-for (const name of ['concurrent_input_short','concurrent_input_medium','concurrent_input_long',
-                    'concurrent_output_short','concurrent_output_medium','concurrent_output_long']) {
-  for (const raw of ['', '0', '65537', '1.5', 'oops', 'Infinity']) {
-    const invalid = new FormData();
-    invalid.set(name,raw);
-    assert.throws(()=>setup.configureConcurrentWorkloads(source,invalid,defaults),/whole number.*1.*65536/);
-    const kept = setup.configureConcurrentWorkloads(source,invalid,defaults,{allowInvalid:true});
-    const [group,size] = name.replace('concurrent_','').split('_');
+assert.equal(setup.configureConcurrentLoad(inactive,values,defaults).concurrent_load.profile.long.output_tokens,256);
+for (const size of ['short','medium','long']) for (const field of ['input_tokens','output_tokens']) {
+  const name = `load_profile_${size}_${field}`;
+  const maximum = field === 'input_tokens' ? 131072 : 65536;
+  for (const raw of ['', '0', String(maximum+1), '1.5', 'oops', 'Infinity']) {
+    const invalid = new FormData(); invalid.set(name,raw);
+    assert.throws(()=>setup.configureConcurrentLoad(source,invalid,defaults),/whole number/);
+    const kept = setup.configureConcurrentLoad(source,invalid,defaults,{allowInvalid:true});
     const expected = raw === '' ? null : Number.isFinite(Number(raw)) ? Number(raw) : raw;
-    assert.equal(kept.concurrent_workloads[group === 'input' ? 'input_chars' : 'output_tokens'][size],expected);
+    assert.equal(kept.concurrent_load.profile[size][field],expected);
   }
 }
 console.log(JSON.stringify(configured));
 """)
     configured = RunConfig.model_validate(result)
-    assert configured.concurrent_workloads.input_chars["long"] == 1200
-    assert configured.concurrent_workloads.output_tokens["long"] == 120
+    assert configured.concurrent_load.profile.long.input_tokens == 1200
+    assert configured.concurrent_load.profile.long.output_tokens == 120
 
 
-def test_legacy_bucket_forms_preserve_sizes_and_do_not_activate_workloads():
+def test_unrendered_load_fields_preserve_settings_without_activating_check():
     run_setup_script("""
-source.concurrent_workloads = {...defaults,input_chars:{short:20,medium:40,long:80},output_tokens:{short:10,medium:20,long:30},mixed_pairs:9};
+source.concurrent_load = {...defaults,mixed:{...defaults.mixed,seed:9}};
 const values = new FormData();
 values.set('concurrent_levels','1, 2');
-const result = setup.configureConcurrentWorkloads(source,values,defaults);
-assert.deepEqual(result.concurrent_workloads,source.concurrent_workloads);
-assert.deepEqual(setup.configureConcurrentWorkloads(source,new FormData(),defaults),source);
-source.concurrent_workloads = null;
-values.set('concurrent_samples_per_bucket',String(defaults.samples_per_bucket));
-values.set('concurrent_window_seconds',String(defaults.window_seconds));
-for (const size of ['short','medium','long']) {
-  values.set(`concurrent_input_${size}`,String(defaults.input_chars[size]));
-  values.set(`concurrent_output_${size}`,String(defaults.output_tokens[size]));
-}
-const inactive = setup.configureConcurrentWorkloads(source,values,defaults);
-assert.equal(inactive.concurrent_workloads,null);
+const result = setup.configureConcurrentLoad(source,values,defaults);
+assert.deepEqual(result,source);
+assert.deepEqual(setup.configureConcurrentLoad(source,new FormData(),defaults),source);
+values.set('load_schedule_levels','1, 2');
+const inactive = setup.configureConcurrentLoad(source,values,defaults);
+assert.deepEqual(inactive.concurrent_load.schedule.levels,[1,2]);
 assert.deepEqual(inactive.checks,['access','correctness']);
+assert.equal(inactive.concurrent_load.mixed.seed,9);
 """)
 
 
-def test_new_concurrent_defaults_fit_existing_output_limit_without_rewriting_profiles():
-    result = run_setup_script("""
+def test_setup_preset_never_rewrites_existing_or_default_profile_to_fit_global_cap():
+    run_setup_script("""
 source.max_output_tokens = 32;
 const configured = setup.applySetupPreset(source,'concurrent',defaults);
-assert.deepEqual(configured.concurrent_workloads.output_tokens,{short:16,medium:32,long:32});
+assert.deepEqual(configured.concurrent_load.profile,defaults.profile);
 assert.equal(configured.max_output_tokens,32);
 assert.equal(configured.max_requests,100);
-assert.deepEqual(defaults.output_tokens,{short:16,medium:48,long:96});
-source.concurrent_workloads = structuredClone(defaults);
-const preserved = setup.applySetupPreset(source,'concurrent',defaults);
-assert.deepEqual(preserved.concurrent_workloads,defaults);
-assert.equal(preserved.max_output_tokens,32);
+assert.equal(defaults.profile.long.output_tokens,128);
+const values = new FormData(); values.set('load_schedule_duration_seconds','10');
+assert.throws(()=>setup.configureConcurrentLoad(configured,values,defaults),/output cap must be 32 tokens or less/);
+const draft = setup.configureConcurrentLoad(configured,values,defaults,{allowInvalid:true});
+assert.equal(draft.concurrent_load.profile.long.output_tokens,128);
+assert.equal(draft.max_output_tokens,32);
+""")
+
+
+def test_load_types_and_criteria_roundtrip_checkbox_state_without_generic_overrides():
+    result = run_setup_script("""
+source.checks = ['concurrency'];
+source.concurrent_load.mixed.seed = 123;
+const values = new FormData();
+values.set('load_rendered','1');
+for (const name of ['combinations','mixed','interference','stress']) values.set(`load_${name}_enabled`,'on');
+for (const shape of ['short_short','long_short','short_long']) values.set(`load_combinations_selected_${shape}`,'on');
+for (const [shape,share] of Object.entries({short_short:40,long_short:20,short_long:40})) values.set(`load_mixed_shares_${shape}`,String(share));
+values.set('load_schedule_levels','2, 4');
+values.set('load_stress_large_output','on');
+values.set('load_stress_min_output_percent','80');
+values.set('load_interference_trigger','after_chunks');
+values.set('load_interference_trigger_chunks','5');
+values.set('load_interference_max_slowdown','');
+values.set('load_pass_criteria_first_output_p95_ms','');
+values.set('load_pass_criteria_response_p95_ms','1200');
+const configured = setup.configureConcurrentLoad(source,values,defaults);
+assert.deepEqual(configured.concurrent_load.combinations.selected,['short_short','long_short','short_long']);
+assert.equal(configured.concurrent_load.mixed.seed,123);
+assert.equal(configured.concurrent_load.mixed.shares.medium_long ?? 0,0);
+assert.equal(Object.values(configured.concurrent_load.mixed.shares).reduce((sum,share)=>sum+share,0),100);
+assert.equal(configured.concurrent_load.stress.large_input,false);
+assert.equal(configured.concurrent_load.stress.large_output,true);
+assert.equal(configured.concurrent_load.interference.max_slowdown,null);
+assert.equal(configured.concurrent_load.pass_criteria.first_output_p95_ms,null);
+assert.equal(configured.concurrent_load.pass_criteria.response_p95_ms,1200);
+const testValues = new FormData(); testValues.append('check','concurrency');
+testValues.set('test_mode_concurrency','custom'); testValues.set('test_concurrency_samples','17');
+testValues.set('traffic_mode','default');
+const oldChecks = [...checks.filter(check=>check.id!=='concurrency'),{id:'concurrency',option_fields:['samples'],limit_fields:['min_samples'],defaults:{samples:5,limits:{min_samples:5}}}];
+assert.equal(setup.configureTests(configured,testValues,oldChecks,source.traffic).test_options.concurrency,undefined);
 console.log(JSON.stringify(configured));
 """)
     configured = RunConfig.model_validate(result)
-    assert configured.max_output_tokens == 32
+    assert configured.concurrent_load.mixed.seed == 123
+    assert configured.concurrent_load.interference.max_slowdown is None
 
 
 def test_ordinary_form_serialization_preserves_preset_overrides_and_imported_fields():
@@ -273,7 +302,7 @@ source.judging.ca_bundle = '/judge/ca';
 source.judging.proxy = 'http://proxy';
 source.test_options = {access:{request_timeout_seconds:12},correctness:{samples:9,concurrency:4},recovery:{sustained_seconds:2}};
 source.prefix = {prefix_chars:512,repeats:7,history_turns:3};
-source.concurrent_workloads = {...defaults,levels:[1,4,8],samples_per_bucket:5,input_chars:{short:100,medium:600,long:1200},output_tokens:{short:12,medium:36,long:120},mixed_pairs:7,heavy_weights:{long_input:2,long_output:3}};
+source.concurrent_load = {...defaults,schedule:{levels:[1,4,8],duration_seconds:5},mixed:{...defaults.mixed,seed:42},input_token_tolerance:0.2,calibration_attempts:2};
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
 const before = structuredClone(preset);
 const values = new FormData();
@@ -284,14 +313,14 @@ for (const check of checks) {
   for (const name of check.limit_fields) values.set(`test_${check.id}_limit_${name}`,setup.limitValue(preset,check,name) ?? '');
 }
 values.set('traffic_mode','default');
-values.set('concurrent_levels','1, 4, 8');
+values.set('load_schedule_levels','1, 4, 8');
 values.set('judge_count','1');
 for (const key of ['name','url','model','api_key_env']) values.set(`judge_0_${key}`,preset.judging.judges[0][key]);
 for (const key of ['concurrency','request_timeout_seconds','max_duration_seconds','max_output_tokens']) {
   values.set(`judging_${key}`,String(preset.judging[key]));
 }
 let configured = setup.configureTests(preset,values,checks,preset.traffic);
-configured = setup.configureConcurrentWorkloads(configured,values,defaults);
+configured = setup.configureConcurrentLoad(configured,values,defaults);
 configured = setup.configureJudging(configured,values);
 configured = setup.configureSetupLoad(configured,'concurrent');
 assert.deepEqual(preset,before);
@@ -303,7 +332,7 @@ for (const mode of ['answers','arrival','custom']) {
   assert.deepEqual(switched.test_options,source.test_options);
   assert.deepEqual(switched.judging,source.judging);
   assert.deepEqual(switched.request_pack,source.request_pack);
-  assert.deepEqual(switched.concurrent_workloads,source.concurrent_workloads);
+  assert.deepEqual(switched.concurrent_load,source.concurrent_load);
   assert.equal(switched.concurrency,8);
 }
 console.log(JSON.stringify(configured));
@@ -337,7 +366,7 @@ source.test_options = {
   capacity:{limits:{latency_ms:1200,first_output_ms:null}},
   recovery:{sustained_seconds:2},
 };
-source.concurrent_workloads = {...defaults,levels:[1,4,8],samples_per_bucket:5};
+source.concurrent_load = {...defaults,schedule:{...defaults.schedule,levels:[1,4,8]}};
 const before = structuredClone(source);
 const concurrent = setup.applySetupPreset(source,'concurrent',defaults);
 assert.equal(concurrent.concurrency,8);
@@ -391,4 +420,28 @@ assert.equal(configured.test_options.json,undefined);
 assert.deepEqual(configured.test_options.recovery,{sustained_seconds:2});
 values.set('test_mode_correctness','default');
 assert.equal(setup.configureTests(configured,values,checks,source.traffic).test_options.correctness,undefined);
+""")
+
+
+def test_load_validation_preserves_invalid_drafts_for_server_field_errors():
+    run_setup_script("""
+source.checks = ['concurrency'];
+for (const [fields,message] of [
+  [{load_mixed_shares_short_short:'59'},/must equal 100%/],
+  [{load_combinations_selected_short_short:''},/Select at least one combination/],
+  [{load_stress_enabled:'on',load_stress_large_input:'',load_stress_large_output:''},/Select at least one stress case/],
+  [{load_combinations_enabled:'',load_mixed_enabled:''},/Enable at least one load type/],
+  [{load_interference_max_slowdown:'1'},/greater than 1/],
+  [{load_pass_criteria_min_valid_responses:'1'},/whole number/],
+]) {
+  const values = new FormData();
+  for (const [key,value] of Object.entries(fields)) values.set(key,value);
+  assert.throws(()=>setup.configureConcurrentLoad(source,values,defaults),message);
+  const draft = setup.configureConcurrentLoad(source,values,defaults,{allowInvalid:true});
+  assert.deepEqual(draft.checks,source.checks);
+  assert.equal(draft.max_requests,source.max_requests);
+  assert.equal(draft.concurrency,source.concurrency);
+}
+const sorted = new FormData(); sorted.set('load_schedule_levels','8, 1, 4');
+assert.deepEqual(setup.configureConcurrentLoad(source,sorted,defaults).concurrent_load.schedule.levels,[1,4,8]);
 """)

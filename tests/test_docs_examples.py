@@ -34,8 +34,7 @@ def test_yaml_examples_validate_and_preview_without_traffic(path, monkeypatch, c
     assert all(quota >= plan['conservative_requests_per_target']
                for quota in plan['target_quotas'].values()), plan['warnings']
     for warning in plan['warnings']:
-        assert 'configured limits prevent this case' in warning
-        assert 'Large-token cases report insufficient limits' in path.read_text()
+        assert 'throughput may be unreliable' in warning or 'context_limit' in warning
 
 
 

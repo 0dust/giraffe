@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, field_serializer, model_serializer, model_validator
+from pydantic_core import PydanticCustomError
+from pydantic import ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, TypeAdapter, ValidationInfo, field_serializer, model_serializer, model_validator
+
+_LOAD_INTEGER = TypeAdapter(int)
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 CHECK_NAMES = {
@@ -24,7 +28,7 @@ CHECK_NAMES = {
     "recovery": "Sustained load and recovery",
     "gpu": "GPU observations",
 }
-CORE_CHECKS = tuple(CHECK_NAMES)
+CORE_CHECKS = tuple("concurrency" if name == "fairness" else name for name in CHECK_NAMES)
 DEFAULT_CHECKS = tuple("concurrency" if name == "fairness" else name
                        for name in CORE_CHECKS if name not in {"json", "gpu"})
 CHECK_NAMES.update({
@@ -33,12 +37,11 @@ CHECK_NAMES.update({
     "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
     "tools": "Tool-calling capability",
 })
-# Old identifiers remain execution components and readable report/config contracts.
-# Discovery and new reports expose one configurable check instead of three.
+# Legacy titles remain readable for saved reports; execution uses public check ids.
 INTERNAL_CHECK_NAMES = {**CHECK_NAMES, "token_stress": "Token stress cases",
-                        "concurrency": "Concurrent workloads"}
+                        "concurrency": "Concurrent load"}
 CHECK_NAMES = {("concurrency" if key == "fairness" else key):
-               ("Concurrent workloads" if key == "fairness" else title)
+               ("Concurrent load" if key == "fairness" else title)
                for key, title in CHECK_NAMES.items() if key not in {"buckets", "mixed"}}
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
@@ -82,41 +85,161 @@ class Prefix(Model):
     history_turns: int = Field(default=3, ge=2, le=32)
 
 
-class Buckets(Model):
-    input_chars: dict[str, int] = Field(default_factory=lambda: {
-        "short": 64, "medium": 1024, "long": 12288})
-    output_tokens: dict[str, int] = Field(default_factory=lambda: {
-        "short": 16, "medium": 48, "long": 96})
-    levels: list[int] = Field(default_factory=lambda: [1, 2])
-    samples_per_bucket: int = Field(
-        default=5, ge=2, le=100,
-        description="Minimum requests per input/output pair at each level, rounded up to full load groups. Requests refill as soon as a slot is free.",
-    )
-    window_seconds: float = Field(default=30, gt=0)
-    mixed_pairs: int = Field(default=5, ge=1, le=100)
-    heavy_weights: dict[str, int] = Field(default_factory=lambda: {
-        "long_input": 1, "long_output": 1})
+SIZES = ("short", "medium", "long")
+SHAPES = tuple(f"{a}_{b}" for a in SIZES for b in SIZES)
+
+
+def load_shape_label(shape):
+    a, b = shape.split("_")
+    return f"{a.capitalize()} input → {b.capitalize()} output"
+
+
+def load_validation_error(fields, message):
+    raise ValidationError.from_exception_data("Concurrent load", [{
+        "type": PydanticCustomError("concurrent_load", message, {"fields": fields}),
+        "loc": tuple(fields[0].split(".")), "input": None}])
+
+
+class LoadSize(Model):
+    input_tokens: StrictInt = Field(ge=1, le=131072)
+    output_tokens: StrictInt = Field(ge=1, le=65536)
+
+
+class DataProfile(Model):
+    short: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=128, output_tokens=32))
+    medium: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=512, output_tokens=64))
+    long: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=2048, output_tokens=128))
 
     @model_validator(mode="after")
-    def valid_buckets(self):
-        for values in (self.input_chars, self.output_tokens):
-            if set(values) != {"short", "medium", "long"} or any(
-                not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 65536
-                for v in values.values()
-            ):
-                raise ValueError("buckets need short/medium/long integer sizes in 1..65536")
-        if not self.levels or len(self.levels) > 16 or len(set(self.levels)) != len(self.levels) or any(
-            level < 1 or level > 256 for level in self.levels
-        ):
-            raise ValueError("bucket levels must be distinct concurrency values in 1..256")
-        if set(self.heavy_weights) != {"long_input", "long_output"} or any(
-            not 1 <= weight <= 16 for weight in self.heavy_weights.values()
-        ):
-            raise ValueError("mixed heavy_weights need long_input/long_output weights in 1..16")
+    def ordered(self, info: ValidationInfo):
+        if info.context and not info.context.get("active_load", True):
+            return self
+        for field in ("input_tokens", "output_tokens"):
+            for previous, size in zip(SIZES, SIZES[1:]):
+                if getattr(getattr(self, size), field) < getattr(getattr(self, previous), field):
+                    label = "input target" if field == "input_tokens" else "output cap"
+                    load_validation_error([f"{size}.{field}"], f"{size.capitalize()} {label} must be at least the {previous.capitalize()} {label} ({getattr(getattr(self, previous), field)} tokens).")
         return self
 
 
-class TokenStressCase(Model):
+class LoadCombinations(Model):
+    enabled: bool = True
+    selected: list[str] = Field(default_factory=lambda: ["short_short", "long_short", "short_long"])
+
+    @field_validator("selected")
+    @classmethod
+    def valid_shapes(cls, values):
+        if len(values) != len(set(values)) or set(values) - set(SHAPES):
+            raise ValueError("Choose each input/output combination at most once, using Short, Medium or Long sizes.")
+        return values
+
+    @model_validator(mode="after")
+    def nonempty(self, info: ValidationInfo):
+        if info.context and not info.context.get("active_load", True):
+            return self
+        if self.enabled and not self.selected:
+            load_validation_error(["selected"], "Select at least one input/output combination.")
+        return self
+
+
+class LoadMixed(Model):
+    enabled: bool = True
+    shares: dict[str, float] = Field(default_factory=lambda: {"short_short": 60, "long_short": 20, "short_long": 20})
+    seed: int | None = Field(default=None, ge=0, le=2**53 - 1)
+
+    @field_validator("shares")
+    @classmethod
+    def valid_shares(cls, values):
+        if set(values) - set(SHAPES) or any(not 0 <= v <= 100 for v in values.values()):
+            raise ValueError("Share of requests must be between 0 and 100% for the nine input/output combinations.")
+        return values
+
+    @model_validator(mode="after")
+    def total(self, info: ValidationInfo):
+        if info.context and not info.context.get("active_load", True):
+            return self
+        if self.enabled and not math.isclose(sum(self.shares.values()), 100, abs_tol=1e-6, rel_tol=0):
+            shape = next((shape for shape in SHAPES if self.shares.get(shape, 0)), SHAPES[0])
+            load_validation_error([f"shares.{shape}"], "Share of requests must total 100%.")
+        return self
+
+
+class LoadInterference(Model):
+    enabled: bool = False
+    trigger: Literal["first_output", "after_chunks"] = "first_output"
+    trigger_chunks: StrictInt = Field(default=5, ge=1, le=1000)
+    max_slowdown: float | None = Field(default=1.5, gt=1)
+
+
+class LoadStress(Model):
+    enabled: bool = False
+    large_input: bool = True
+    large_output: bool = True
+    min_output_percent: float = Field(default=80, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def cases(self, info: ValidationInfo):
+        if info.context and not info.context.get("active_load", True):
+            return self
+        if self.enabled and not (self.large_input or self.large_output):
+            load_validation_error(["large_input"], "Select at least one stress workload.")
+        return self
+
+
+class LoadSchedule(Model):
+    levels: list[StrictInt] = Field(default_factory=lambda: [1, 4], min_length=1, max_length=16)
+    duration_seconds: StrictInt = Field(default=15, ge=1, le=3600)
+
+    @field_validator("levels")
+    @classmethod
+    def valid_levels(cls, values):
+        if len(values) != len(set(values)) or any(not 1 <= v <= 256 for v in values):
+            raise ValueError("Concurrency levels must be distinct whole numbers from 1 to 256.")
+        return sorted(values)
+
+
+class LoadPassCriteria(Model):
+    first_output_p95_ms: StrictInt | None = Field(default=None, ge=1)
+    response_p95_ms: StrictInt | None = Field(default=None, ge=1)
+    max_error_percent: float = Field(default=0, ge=0, le=100)
+    min_correct_percent: float = Field(default=100, ge=0, le=100)
+    min_valid_responses: StrictInt = Field(default=5, ge=2)
+
+
+class ConcurrentLoad(Model):
+    profile: DataProfile = Field(default_factory=DataProfile)
+    combinations: LoadCombinations = Field(default_factory=LoadCombinations)
+    mixed: LoadMixed = Field(default_factory=LoadMixed)
+    interference: LoadInterference = Field(default_factory=LoadInterference)
+    stress: LoadStress = Field(default_factory=LoadStress)
+    schedule: LoadSchedule = Field(default_factory=LoadSchedule)
+    pass_criteria: LoadPassCriteria = Field(default_factory=LoadPassCriteria)
+    input_token_tolerance: float = Field(default=.1, ge=0, lt=.5)
+    calibration_attempts: StrictInt = Field(default=3, ge=1, le=5)
+
+
+class _LegacyBuckets(Model):
+    input_chars: dict[str, int] = Field(default_factory=lambda: {"short": 64, "medium": 1024, "long": 12288})
+    output_tokens: dict[str, int] = Field(default_factory=lambda: {"short": 16, "medium": 48, "long": 96})
+    levels: list[int] = Field(default_factory=lambda: [1, 2])
+    samples_per_bucket: int = Field(default=5, ge=2, le=100)
+    window_seconds: float = Field(default=30, gt=0)
+    mixed_pairs: int = Field(default=5, ge=1, le=100)
+    heavy_weights: dict[str, int] = Field(default_factory=lambda: {"long_input": 1, "long_output": 1})
+
+    @model_validator(mode="after")
+    def valid_values(self):
+        for values in (self.input_chars, self.output_tokens):
+            if set(values) != set(SIZES) or any(not 1 <= v <= 65536 for v in values.values()):
+                raise ValueError("Legacy buckets need short/medium/long integer sizes in 1..65536")
+        if not self.levels or len(self.levels) > 16 or len(set(self.levels)) != len(self.levels) or any(not 1 <= level <= 256 for level in self.levels):
+            raise ValueError("Legacy bucket levels must be distinct concurrency values in 1..256")
+        if set(self.heavy_weights) != {"long_input", "long_output"} or any(not 1 <= weight <= 16 for weight in self.heavy_weights.values()):
+            raise ValueError("Legacy heavy_weights need long_input/long_output weights in 1..16")
+        return self
+
+
+class _LegacyTokenStressCase(Model):
     name: Literal["long_input_summary", "short_input_long_output"]
     input_tokens: int | None = Field(default=None, ge=128, le=65536)
     max_input_tokens: int | None = Field(default=None, ge=1, le=65536)
@@ -129,35 +252,212 @@ class TokenStressCase(Model):
             raise ValueError("long_input_summary requires an input token target")
         if self.min_output_tokens is not None and self.min_output_tokens > self.output_tokens:
             raise ValueError("minimum observed output must not exceed the output cap")
-        if self.name == "short_input_long_output":
-            if self.input_tokens is not None:
-                raise ValueError("short_input_long_output uses max_input_tokens, not an input token target")
-            if self.max_input_tokens is None:
-                self.max_input_tokens = 128
+        if self.name == "short_input_long_output" and self.input_tokens is not None:
+            raise ValueError("short_input_long_output uses max_input_tokens, not an input token target")
         return self
 
 
-class ConcurrentWorkloads(Buckets):
+class _LegacyConcurrentWorkloads(_LegacyBuckets):
     scenarios: list[Literal["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"]] = Field(
-        default_factory=lambda: ["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"],
-        min_length=1)
-    samples_per_bucket: int = Field(default=5, ge=2, le=100)
-    mixed_pairs: int = Field(default=5, ge=1, le=100)
+        default_factory=lambda: ["size_matrix", "mixed_interference", "streaming_fairness", "token_stress"], min_length=1)
     input_token_tolerance: float = Field(default=.1, ge=0, lt=.5)
     calibration_attempts: int = Field(default=3, ge=1, le=5)
-    stress_cases: list[TokenStressCase] = Field(default_factory=lambda: [
-        TokenStressCase(name="long_input_summary", input_tokens=10000, output_tokens=50),
-        TokenStressCase(name="short_input_long_output", max_input_tokens=128, output_tokens=10000)])
+    stress_cases: list[_LegacyTokenStressCase] = Field(default_factory=lambda: [
+        _LegacyTokenStressCase(name="long_input_summary", input_tokens=10000, output_tokens=50),
+        _LegacyTokenStressCase(name="short_input_long_output", max_input_tokens=128, output_tokens=10000)])
 
     @model_validator(mode="after")
-    def distinct_scenarios(self):
+    def distinct_cases(self):
         if "token_stress" in self.scenarios and not self.stress_cases:
-            raise ValueError("Select at least one token stress case")
+            raise ValueError("Select at least one legacy token stress case")
         if len(set(self.scenarios)) != len(self.scenarios):
-            raise ValueError("concurrent workload scenarios must be distinct")
+            raise ValueError("Legacy concurrent workload scenarios must be distinct")
         if len({case.name for case in self.stress_cases}) != len(self.stress_cases):
-            raise ValueError("token stress case names must be distinct")
+            raise ValueError("Legacy token stress case names must be distinct")
         return self
+
+
+class _LegacyLoadInput(Model):
+    buckets: _LegacyBuckets | None = None
+    concurrent_workloads: _LegacyConcurrentWorkloads | None = None
+
+
+def migrate_concurrent_load(value):
+    """Convert legacy input without persisting migration metadata in config."""
+    if not isinstance(value, dict):
+        return value, []
+    value, notes = deepcopy(value), []
+    for key in ("concurrent_workloads", "buckets"):
+        if value.get(key) is None:
+            value.pop(key, None)
+    _LegacyLoadInput.model_validate({key: value[key].model_dump(exclude_unset=True) if isinstance(value[key], BaseModel) else value[key]
+                                    for key in ("concurrent_workloads", "buckets") if key in value})
+    for field in ("limits", "arrivals", "traffic"):
+        if isinstance(value.get(field), BaseModel):
+            value[field] = value[field].model_dump(exclude_unset=True)
+    if isinstance(value.get("test_options"), dict):
+        value["test_options"] = {k: v.model_dump(exclude_unset=True) if isinstance(v, BaseModel) else v for k, v in value["test_options"].items()}
+    if "test_options" in value:
+        _LegacyOptionsInput.model_validate({"test_options": value["test_options"]})
+
+    legacy_checks = {"fairness": "streaming_fairness", "buckets": "size_matrix",
+                     "mixed": "mixed_interference", "token_stress": "token_stress"}
+    checks = value.get("checks")
+    legacy = "concurrent_workloads" in value or "buckets" in value or any(c in legacy_checks for c in checks or [])
+    options = value.get("test_options") or {}
+    if not legacy and "concurrency" not in options:
+        return value, notes
+    if value.get("sustained_seconds", 5) is None:
+        value["sustained_seconds"] = 5
+    old = value.pop("concurrent_workloads", None) or {}
+    buckets = value.pop("buckets", None) or {}
+    old = old.model_dump(exclude_unset=True) if isinstance(old, BaseModel) else old
+    buckets = buckets.model_dump(exclude_unset=True) if isinstance(buckets, BaseModel) else buckets
+    old = {**buckets, **old}
+    selected = [legacy_checks[c] for c in checks or [] if c in legacy_checks]
+    scenarios = old.get("scenarios", selected or list(legacy_checks.values()))
+    old = {"levels": [1, 2], "input_chars": {"short": 64, "medium": 1024, "long": 12288},
+           "output_tokens": {"short": 16, "medium": 48, "long": 96}, "samples_per_bucket": 5,
+           "mixed_pairs": 5, "heavy_weights": {"long_input": 1, "long_output": 1}, "window_seconds": 30, **old}
+    if checks is not None:
+        value["checks"] = list(dict.fromkeys("concurrency" if c in legacy_checks else c for c in checks))
+    for name in ("concurrency", *legacy_checks):
+        removed = options.pop(name, None)
+        if removed:
+            removed = removed.model_dump(exclude_unset=True) if isinstance(removed, BaseModel) else removed
+            for field, actual in removed.items():
+                fields = {f"limits.{key}": setting for key, setting in actual.items()} if field == "limits" and isinstance(actual, dict) else {field: actual}
+                for key, setting in fields.items():
+                    notes.append(f"test_options.{name}.{key}={setting!r} dropped; Concurrent load uses its own schedule and p95/percent criteria.")
+    value["test_options"] = options
+    if not legacy:
+        return value, notes
+    settings = ConcurrentLoad().model_dump()
+    settings["mixed"]["enabled"] = False
+    notes.append("Mixed load is new; enable it if wanted")
+    def number(raw, default):
+        try:
+            result = float(raw)
+            return result if math.isfinite(result) else default
+        except (ValueError, TypeError):
+            return default
+    ceiling = max(1, int(number(value.get("concurrency", 4), 4)))
+    targets = len(value.get("targets") or []) or 1
+    ceiling = max(1, ceiling // targets) if value.get("overlap_models") else ceiling
+    levels = old.get("levels", [1, 2])
+    actual_levels = sorted(set(min(ceiling, max(1, int(n))) for n in levels))[:16] or [1]
+    settings["schedule"]["levels"] = actual_levels
+    if "levels" in old:
+        notes.append(f"levels={levels!r} moved to schedule.levels={actual_levels!r} (bounded by Maximum at once).")
+    settings["combinations"].update(enabled="size_matrix" in scenarios, selected=list(SHAPES))
+    if "size_matrix" in scenarios:
+        notes.append("size_matrix/buckets mapped to all 9 combinations; duration replaces sample counts.")
+    for scenario in ("streaming_fairness", "mixed_interference"):
+        if scenario not in scenarios:
+            continue
+        enabled = min(actual_levels) >= 2 and value.get("stream", True)
+        settings["interference"]["enabled"] |= enabled
+        notes.append(f"{scenario} ran at 2 concurrent requests; interference {'enabled' if enabled else 'left off; enable streaming and use only levels >= 2 to enable it'}.")
+        if scenario == "mixed_interference":
+            notes.append("mixed_interference long-input heavy partners map to interference; long-output heavy partners and before-output ordering have no equivalent, so that coverage is dropped.")
+    cases = old.get("stress_cases", [{"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50},
+                                    {"name": "short_input_long_output", "max_input_tokens": 128, "output_tokens": 10000}])
+    if "token_stress" in scenarios:
+        settings["stress"].update(enabled=bool(cases), large_input=any(c["name"] == "long_input_summary" for c in cases),
+                                  large_output=any(c["name"] == "short_input_long_output" for c in cases))
+        notes.append(f"token_stress stress_cases={cases!r} mapped to stress cases; old token targets, caps and min_output_tokens are not copied. Set the data profile and Minimum output length.")
+    cap = max(1, int(number(value.get("max_output_tokens", 128), 128)))
+    previous = 1
+    for size in SIZES:
+        old_cap = old.get("output_tokens", {}).get(size, settings["profile"][size]["output_tokens"])
+        old_cap = int(number(old_cap, settings["profile"][size]["output_tokens"]))
+        new_cap = max(previous, min(cap, old_cap))
+        settings["profile"][size]["output_tokens"] = previous = new_cap
+        if "output_tokens" in old or new_cap != old_cap:
+            notes.append(f"output_tokens.{size}={old_cap} copied to profile.{size}.output_tokens={new_cap}" + (f"; clipped to max_output_tokens={cap}." if old_cap > cap else "; kept non-decreasing." if new_cap != old_cap else "."))
+    if "input_chars" in old:
+        notes.append(f"input_chars={old['input_chars']!r} not converted; inputs now use token targets, with default profile targets.")
+    for field in ("samples_per_bucket", "mixed_pairs", "heavy_weights", "window_seconds"):
+        if field in old:
+            why = "the old window was a ceiling, not a duration" if field == "window_seconds" else "sample/pair counts and weights were stopping targets; the schedule is now duration-based"
+            notes.append(f"{field}={old[field]!r} dropped; {why}.")
+    for field in ("input_token_tolerance", "calibration_attempts"):
+        if field in old:
+            settings[field] = int(old[field]) if field == "calibration_attempts" else old[field]
+            notes.append(f"{field}={old[field]!r} copied with the same meaning.")
+    defaults = Limits().model_dump()
+    for field in ("first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second", "max_error_rate", "min_correctness", "min_samples", "fairness_max_ratio"):
+        actual = (value.get("limits") or {}).get(field, defaults[field])
+        if actual != defaults[field]:
+            guidance = {"fairness_max_ratio": "set Maximum slowdown vs short-only control",
+                        "stream_gap_ms": "there is no replacement criterion here",
+                        "min_output_tokens_per_second": "output tokens/s has no replacement criterion here"}.get(field, "set the new p95/percent pass criteria explicitly")
+            notes.append(f"limits.{field}={actual!r} no longer gates Concurrent load; {guidance}. It still applies to other checks as before.")
+    windows = [(t.get("deployment", {}).get("serving", {}) if isinstance(t, dict) else t.deployment.serving).get("context_limit")
+               for t in value.get("targets", [])]
+    windows = [w.get("value") if isinstance(w, dict) else w for w in windows]
+    windows = [w for w in windows if isinstance(w, (int, float)) and w > 0]
+    if windows:
+        window = min(windows)
+        def fits(shape):
+            a, b = shape.split("_")
+            return settings["profile"][a]["input_tokens"] + settings["profile"][b]["output_tokens"] <= window
+        selected_shapes = settings["combinations"]["selected"]
+        settings["combinations"]["selected"] = [shape for shape in selected_shapes if fits(shape)]
+        if settings["combinations"]["enabled"] and len(settings["combinations"]["selected"]) != len(selected_shapes):
+            notes.append(f"Combinations exceeding known server context window {window} were turned off.")
+            settings["combinations"]["enabled"] = bool(settings["combinations"]["selected"])
+        if settings["interference"]["enabled"] and not all(fits(shape) for shape in ("short_short", "long_short")):
+            settings["interference"]["enabled"] = False
+            notes.append(f"Interference turned off: profile exceeds known server context window {window}.")
+        if settings["stress"]["enabled"]:
+            for case, shape in (("large_input", "long_short"), ("large_output", "short_long")):
+                if settings["stress"][case] and not fits(shape):
+                    settings["stress"][case] = False
+                    notes.append(f"Stress {case} turned off: profile exceeds known server context window {window}.")
+            settings["stress"]["enabled"] = settings["stress"]["large_input"] or settings["stress"]["large_output"]
+    from giraffe.concurrent_load import load_time_plan
+    configured = sum(row["configured_load_seconds"] for row in load_time_plan(ConcurrentLoad.model_validate(settings)).values())
+    selected_checks = list(value.get("checks", DEFAULT_CHECKS))
+    if checks is None:
+        selected_checks.extend([*(["json"] if value.get("structured_json") else []),
+                                *(["gpu"] if value.get("metrics") else [])])
+        for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"), ("sessions", "sessions"),
+                             ("consistency", "consistency"), ("tool_calling", "tools"), ("tool_checks", "tools")):
+            if value.get(field) is not None and (field != "tool_calling" or value[field]):
+                selected_checks.append(check)
+    fixed = 0
+    if "capacity" in selected_checks:
+        traffic = value.get("traffic") or {}
+        fixed += len(traffic.get("rates", [1, 2, 4])) * traffic.get("duration_seconds", 5)
+    if "recovery" in selected_checks:
+        fixed += number(options.get("recovery", {}).get("sustained_seconds"), number(value.get("sustained_seconds", 5), 5))
+    if "arrivals" in selected_checks and value.get("arrivals"):
+        arrivals = value["arrivals"]
+        count = arrivals.get("requests", 8) - 1
+        fixed += count / arrivals.get("requests_per_second", 1) if arrivals.get("mode", "steady") == "steady" else (count // arrivals.get("burst_size", 2)) * arrivals.get("interval_seconds", 1)
+    sequential = 1 if value.get("overlap_models") else targets
+    remaining = number(value.get("max_duration_seconds", 300), 300) / sequential - fixed
+    if configured > remaining and "concurrency" in selected_checks:
+        duration = math.floor(10 * max(0, remaining) / configured)
+        if duration >= 1:
+            settings["schedule"]["duration_seconds"] = duration
+            notes.append(f"Migrated duration reduced from 10 to {duration} seconds to fit max_duration_seconds={value.get('max_duration_seconds', 300)} with other fixed windows.")
+        else:
+            for kind in ("combinations", "mixed", "interference", "stress"):
+                settings[kind]["enabled"] = False
+            notes.append(f"Concurrent load turned off: max_duration_seconds={value.get('max_duration_seconds', 300)} cannot fit its minimum sending windows.")
+    if value.get("overlap_models") and targets > int(number(value.get("concurrency", 4), 4)):
+        for kind in ("combinations", "mixed", "interference", "stress"):
+            settings[kind]["enabled"] = False
+        notes.append(f"Concurrent load turned off: {targets} overlapping targets need at least {targets} request slots; concurrency={value.get('concurrency', 4)}.")
+    # A legacy fairness-only selection may have no runnable equivalent.
+    if not any(settings[k]["enabled"] for k in ("combinations", "mixed", "interference", "stress")):
+        value["checks"] = list(dict.fromkeys(c for c in selected_checks if c != "concurrency"))
+        notes.append("Concurrent load unselected because no migrated load type can run with these settings.")
+    if "concurrent_load" not in value:
+        value["concurrent_load"] = settings
+    return value, notes
 
 
 class SessionWorkload(Model):
@@ -419,6 +719,10 @@ class CheckOptions(Model):
     limits: Limits | None = None
 
 
+class _LegacyOptionsInput(Model):
+    test_options: dict[str, CheckOptions]
+
+
 # These maps are shared by validation, execution and the local UI. A check only
 # exposes settings that affect its workload or verdict.
 CHECK_OPTION_FIELDS = {
@@ -453,8 +757,10 @@ CHECK_LIMIT_FIELDS = {
 for _check in CHECK_NAMES.keys() - CHECK_OPTION_FIELDS.keys():
     CHECK_OPTION_FIELDS[_check] = set()
     CHECK_LIMIT_FIELDS[_check] = set()
-CHECK_OPTION_FIELDS["concurrency"] = {"samples", "context_limit"}
-CHECK_LIMIT_FIELDS["concurrency"] = _TRAFFIC_LIMITS | {"fairness_max_ratio"}
+CHECK_OPTION_FIELDS.pop("concurrency", None)
+CHECK_OPTION_FIELDS.pop("fairness", None)
+CHECK_LIMIT_FIELDS.pop("concurrency", None)
+CHECK_LIMIT_FIELDS.pop("fairness", None)
 
 
 JUDGE_PROMPT_VERSION = "reference-correctness-v1"
@@ -933,7 +1239,7 @@ class RunConfig(Model):
         description="Stop a target after this many consecutive no-body inference failures and unresponsive_for_seconds of silence. 0 or null disables. Readiness and intentional deadlines/cancellations are excluded; stress timeouts do not count.")
     unresponsive_for_seconds: float = Field(default=45, gt=0,
         description="Minimum seconds without response body data before the target stops (default 45s; 5 failures). Body bytes, including error bodies and partial streams, reset the policy; headers alone do not.")
-    checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS), min_length=1)
+    checks: list[str] = Field(default_factory=lambda: list(DEFAULT_CHECKS))
     structured_json: bool = False
     metrics: bool = False
     metrics_interval_seconds: float = Field(default=1, ge=.1, le=60)
@@ -945,7 +1251,8 @@ class RunConfig(Model):
     cache_pressure_threshold: float = Field(default=.9, gt=0, le=1)
     arrivals: Arrival | None = None
     prefix: Prefix | None = None
-    concurrent_workloads: ConcurrentWorkloads | None = None
+    concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
+    _migration_notes: list[str] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
@@ -967,57 +1274,71 @@ class RunConfig(Model):
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     test_options: dict[str, CheckOptions] = Field(default_factory=dict)
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def migration_metadata(cls, value, handler):
+        migrated, notes = migrate_concurrent_load(value)
+        resolved = handler(migrated)
+        if notes:
+            resolved._migration_notes = notes
+        return resolved
+
     @model_validator(mode="before")
     @classmethod
-    def migrate_concurrent_workloads(cls, value):
+    def migrate_legacy_load(cls, value):
+        value = migrate_concurrent_load(value)[0]
         if not isinstance(value, dict):
             return value
-        value = dict(value)
-        legacy = {"fairness": "streaming_fairness", "buckets": "size_matrix",
-                  "mixed": "mixed_interference"}
-        selected = value.get("checks", [])
-        old_settings = value.pop("buckets", None)
-        if isinstance(old_settings, BaseModel):
-            old_settings = old_settings.model_dump(exclude_unset=True)
-        old_scenarios = [legacy[name] for name in selected if name in legacy]
-        if old_settings is not None and "checks" not in value:
-            old_scenarios = ["streaming_fairness", "size_matrix", "mixed_interference"]
-        if old_settings is not None or old_scenarios:
-            current = value.get("concurrent_workloads") or {}
-            if isinstance(current, BaseModel):
-                current = current.model_dump(exclude_unset=True)
-            settings = {**current, **(old_settings or {})}
-            settings.setdefault("scenarios", old_scenarios or ["size_matrix", "mixed_interference"])
-            settings.setdefault("samples_per_bucket", Buckets().samples_per_bucket)
-            settings.setdefault("mixed_pairs", Buckets().mixed_pairs)
-            value["concurrent_workloads"] = settings
-        if isinstance(value.get("concurrent_workloads"), dict):
-            settings = dict(value["concurrent_workloads"])
-            # Infer defaults from coercible JSON numbers; field validation below
-            # still rejects invalid originals without migration raising TypeError.
-            def default_limit(name, default):
-                try:
-                    return int(float(value.get(name, default)))
-                except (TypeError, ValueError, OverflowError):
-                    return default
+        load = value.get("concurrent_load", {})
+        if isinstance(load, BaseModel):
+            load = load.model_dump(exclude_unset=True)
+        if not isinstance(load, dict):
+            return value
+        load = deepcopy(load)
+        def integer(field, default):
+            try:
+                return _LOAD_INTEGER.validate_python(value.get(field, default))
+            except ValidationError:
+                return None
+        schedule = load.get("schedule", {})
+        if isinstance(schedule, BaseModel):
+            schedule = schedule.model_dump(exclude_unset=True)
+        if isinstance(schedule, dict) and "levels" not in schedule:
+            ceiling = integer("concurrency", 4)
+            if ceiling is not None and ceiling >= 1:
+                targets = len(value.get("targets") or []) or 1
+                ceiling = max(1, ceiling // targets) if value.get("overlap_models") else ceiling
+                load["schedule"] = {**schedule, "levels": [n for n in (1, 4) if n <= ceiling] or [1]}
+        profile = load.get("profile", {})
+        if isinstance(profile, BaseModel):
+            profile = profile.model_dump(exclude_unset=True)
+        cap = integer("max_output_tokens", 128)
+        if isinstance(profile, dict) and cap is not None and cap >= 1:
+            defaults = DataProfile().model_dump()
+            explicit = {}
+            for size in SIZES:
+                supplied = profile.get(size, {})
+                if isinstance(supplied, BaseModel):
+                    supplied = supplied.model_dump(exclude_unset=True)
+                if isinstance(supplied, dict):
+                    profile[size] = {**defaults[size], **supplied}
+                    if "output_tokens" in supplied:
+                        explicit[size] = supplied["output_tokens"]
+                else:
+                    profile[size] = supplied
+            for index, size in enumerate(SIZES):
+                if size in explicit or not isinstance(profile[size], dict):
+                    continue
+                low = max([1, *(explicit[s] for s in SIZES[:index] if type(explicit.get(s)) is int)])
+                high = min([cap, *(explicit[s] for s in SIZES[index + 1:] if type(explicit.get(s)) is int)])
+                profile[size]["output_tokens"] = max(low, min(defaults[size]["output_tokens"], high))
+            load["profile"] = profile
+        return {**value, "concurrent_load": load}
 
-            settings.setdefault("levels", [level for level in (1, 2) if level <= default_limit("concurrency", 4)])
-            settings.setdefault("output_tokens", {name: min(cap, default_limit("max_output_tokens", 128))
-                                                  for name, cap in Buckets().output_tokens.items()})
-            value["concurrent_workloads"] = settings
-        if "checks" in value:
-            value["checks"] = list(dict.fromkeys(
-                "concurrency" if name in legacy else name for name in selected))
-        options = dict(value.get("test_options") or {})
-        if "fairness" in options:
-            options.setdefault("concurrency", options.pop("fairness"))
-            value["test_options"] = options
-        return value
-
-    @property
-    def buckets(self):
-        """Legacy execution components share the canonical settings block."""
-        return self.concurrent_workloads
+    @field_validator("concurrent_load", mode="before")
+    @classmethod
+    def validate_load_relationships(cls, value, info: ValidationInfo):
+        return ConcurrentLoad.model_validate(value, context={"active_load": "concurrency" in info.data.get("checks", DEFAULT_CHECKS)})
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
@@ -1030,7 +1351,7 @@ class RunConfig(Model):
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                 ("concurrent_workloads", "concurrency"), ("sessions", "sessions"),
+                                 ("sessions", "sessions"),
                                  ("consistency", "consistency"), ("tool_calling", "tools"),
                                  ("tool_checks", "tools")):
                 if getattr(self, field):
@@ -1048,12 +1369,6 @@ class RunConfig(Model):
             self.arrivals = Arrival()
         if "prefix" in self.checks and self.prefix is None:
             self.prefix = Prefix()
-        if "concurrency" in self.checks and self.concurrent_workloads is None:
-            self.concurrent_workloads = ConcurrentWorkloads(
-                levels=[level for level in (1, 2) if level <= self.concurrency],
-                output_tokens={name: min(value, self.max_output_tokens)
-                               for name, value in Buckets().output_tokens.items()},
-            )
         if "sessions" in self.checks and self.sessions is None:
             self.sessions = Sessions(concurrency=min(2, self.concurrency),
                                      max_tokens=min(32, self.max_output_tokens))
@@ -1070,7 +1385,7 @@ class RunConfig(Model):
                 and self.traffic.max_in_flight > self.concurrency):
             raise ValueError(f"traffic.max_in_flight must not exceed global concurrency ({self.concurrency})")
         for check_id, options in self.test_options.items():
-            if check_id not in CHECK_NAMES:
+            if check_id not in CHECK_OPTION_FIELDS:
                 raise ValueError(f"unsupported test_options check: {check_id}")
             fields = options.model_fields_set - {"limits"}
             unsupported = fields - CHECK_OPTION_FIELDS[check_id]
@@ -1100,12 +1415,35 @@ class RunConfig(Model):
             proxy = urlsplit(self.proxy)
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
-        bucket_selected = "concurrency" in self.checks
-        for selected, settings, field in ((bucket_selected, self.buckets, "concurrent_workloads"),
-                                          ("consistency" in self.checks, self.consistency, "consistency")):
-            if selected and settings and max(settings.levels) > self.concurrency:
-                raise ValueError(f"{field}.levels must not exceed concurrency ({self.concurrency}); "
-                                 "raise the maximum in-flight requests or lower the tested levels")
+        if "consistency" in self.checks and max(self.consistency.levels) > self.concurrency:
+            raise ValueError(f"consistency.levels must not exceed concurrency ({self.concurrency})")
+        if "concurrency" in self.checks:
+            load = self.concurrent_load
+            prefix = "concurrent_load."
+            def invalid(fields, message):
+                load_validation_error(fields, message)
+            if not any(getattr(load, kind).enabled for kind in ("combinations", "mixed", "interference", "stress")):
+                invalid([prefix + "combinations.enabled"], "Enable at least one load type.")
+            allocated = max(load.schedule.levels) * (len(self.targets) if self.overlap_models else 1)
+            if allocated > self.concurrency:
+                level = str(max(load.schedule.levels)) + (f" × {len(self.targets)} endpoints" if self.overlap_models and len(self.targets) > 1 else "")
+                invalid([prefix + "schedule.levels", "concurrency"], f"Concurrency level {level} exceeds Maximum at once ({self.concurrency}).")
+            for size in SIZES:
+                if getattr(load.profile, size).output_tokens > self.max_output_tokens:
+                    invalid([prefix + f"profile.{size}.output_tokens", "max_output_tokens"], f"{size.capitalize()} output cap {getattr(load.profile, size).output_tokens} tokens exceeds Output cap ({self.max_output_tokens} token{'s' if self.max_output_tokens != 1 else ''}).")
+            if load.interference.enabled:
+                if not self.stream:
+                    invalid([prefix + "interference.enabled", "stream"], "Long input during an active short stream needs streaming responses. Turn on Streaming.")
+                if min(load.schedule.levels) < 2:
+                    invalid([prefix + "schedule.levels", prefix + "interference.enabled"], "Long input during an active short stream needs at least 2 concurrent requests at every level. Remove level 1 from Concurrency levels.")
+            from giraffe.concurrent_load import running_shapes, context_window
+            for target in self.targets:
+                window, source = context_window(target)
+                if window is not None:
+                    for shape in running_shapes(load):
+                        input_size, output_size = shape.split("_")
+                        if getattr(load.profile, input_size).input_tokens + getattr(load.profile, output_size).output_tokens > window:
+                            invalid([prefix + f"profile.{input_size}.input_tokens"], f"{load_shape_label(shape)} needs more than the known server context window ({window} token{'s' if window != 1 else ''}).")
         if "sessions" in self.checks and self.sessions:
             if self.sessions.concurrency > self.concurrency:
                 raise ValueError("session concurrency must not exceed the global ceiling")
@@ -1114,8 +1452,11 @@ class RunConfig(Model):
             if any(workload.max_tokens is not None and workload.max_tokens > self.max_output_tokens
                    for workload in self.sessions.workloads):
                 raise ValueError("session workload output budgets must stay within max_output_tokens")
-        if bucket_selected and self.buckets and max(self.buckets.output_tokens.values()) > self.max_output_tokens:
-            raise ValueError("bucket output budgets must stay within max_output_tokens")
+        if "concurrency" in self.checks:
+            from giraffe.planning import request_plan
+            errors = request_plan(self)["errors"]
+            if errors:
+                load_validation_error(errors[0]["fields"], errors[0]["msg"])
         from giraffe.deployment import sanitize
         if self.request_source != "request_pack":
             self.request_options = sanitize(self.request_options)
@@ -1139,8 +1480,9 @@ class RunConfig(Model):
         """Resolve sparse overrides once, retaining global safety ceilings."""
         if check_id not in INTERNAL_CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
-        options = self.test_options.get("concurrency" if check_id in {"fairness", "buckets", "mixed"}
-                                        else check_id, CheckOptions())
+        if check_id == "concurrency":
+            return self.concurrent_load.model_dump(mode="json")
+        options = self.test_options.get(check_id, CheckOptions())
         special_defaults = {"backend_verification": "off", "cancel_after_ms": 100, "deadline_probe_ms": 50,
                             "cancel_after_chunks": 5, "cleanup_seconds": 5,
                             "trace_wait_seconds": 10}
@@ -1191,11 +1533,12 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    condition_id: str | None = None
     fixture_id: str
     scenario: str
     check_ids: list[str]
     messages: list[dict[str, Any]]
-    scorer: Literal["none", "exact", "contains", "json", "tool", "judge"] = "none"
+    scorer: Literal["none", "exact", "contains", "json", "tool", "judge", "label"] = "none"
     expected: Any = None
     expected_provided: bool = False
     rubric: str | None = None
@@ -1209,6 +1552,9 @@ class RequestSpec(Model):
     context_position: str | None = None
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
+    load_point: dict[str, Any] | None = None
+    requested_input_tokens: int | None = None
+    requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -1310,6 +1656,9 @@ class RequestRecord(Model):
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
     overlap: int = 1
+    load_point: dict[str, Any] | None = None
+    requested_input_tokens: int | None = None
+    requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
     answer_hash: str | None = None
     request_hash: str | None = None

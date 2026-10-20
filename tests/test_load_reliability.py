@@ -70,59 +70,10 @@ def endpoint(monkeypatch):
     return Endpoint
 
 
-async def test_fairness_uses_one_long_answer_fixture_with_interleaved_controls_and_uncached_prefills(endpoint):
-    report = await runner.run_suite(config(checks=["fairness"], samples=3,
-        limits=Limits(fairness_max_ratio=10, min_samples=2)))
-    specs = [item[0] for item in endpoint.calls if item[0].scenario.startswith("fairness_")]
-    assert [spec.scenario for spec in specs] == [
-        "fairness_baseline", "fairness_short", "fairness_long",
-    ] * 3
-    short = [spec for spec in specs if spec.scenario != "fairness_long"]
-    assert len({spec.fixture_id for spec in short}) == 1
-    assert len({json.dumps(spec.messages) for spec in short}) == 1
-    assert all(spec.scorer == "exact" and 40 <= len(spec.expected.split()) <= 48 for spec in short)
-    long_prompts = [spec.messages[0]["content"] for spec in specs if spec.scenario == "fairness_long"]
-    assert all(re.match(r"^[0-9a-f]{32}\n", prompt) for prompt in long_prompts)
-    assert len({prompt.split("\n", 1)[0] for prompt in long_prompts}) == 3
-    assert check(report, "fairness").metrics["overlaps"] == 3
-    assert all(record.score is True for record in report.requests)
 
 
-@pytest.mark.parametrize("baseline_first,loaded_first,baseline_decode,loaded_decode,status", [
-    (1000, 1, 5, 15, "fail"),
-    (1, 1000, 10, 10, "pass"),
-])
-async def test_fairness_compares_decode_duration_without_first_output_wait(
-        endpoint, monkeypatch, baseline_first, loaded_first, baseline_decode, loaded_decode, status):
-    def timing(spec, elapsed):
-        if spec.scenario == "fairness_baseline":
-            return baseline_first, baseline_first+baseline_decode, baseline_first+baseline_decode+1
-        if spec.scenario == "fairness_short":
-            return loaded_first, loaded_first+loaded_decode, loaded_first+loaded_decode+1
-        return loaded_first+1, loaded_first+2, loaded_first+3
-    monkeypatch.setattr(endpoint, "timing", staticmethod(timing))
-    report = await runner.run_suite(config(checks=["fairness"],
-        limits=Limits(fairness_max_ratio=2, min_samples=2)))
-    result = check(report, "fairness")
-    assert result.status == status
-    assert result.metrics["latency_ratio"] == loaded_decode/baseline_decode
 
 
-async def test_fairness_finishing_answer_before_long_dispatch_cannot_fail_ratio(endpoint, monkeypatch):
-    def timing(spec, elapsed):
-        if spec.scenario == "fairness_baseline":
-            return .1, .2, elapsed
-        if spec.scenario == "fairness_short":
-            return 1, 2, elapsed
-        return 1, elapsed-1, elapsed
-    monkeypatch.setattr(endpoint, "timing", staticmethod(timing))
-    report = await runner.run_suite(config(checks=["fairness"],
-        limits=Limits(fairness_max_ratio=2, min_samples=2)))
-    result = check(report, "fairness")
-    assert result.metrics["latency_ratio"] == 10
-    assert result.metrics["overlaps"] == 0
-    assert result.status == "inconclusive"
-    assert "overlap" in result.summary.lower()
 
 
 @pytest.mark.parametrize("slow_metric", ["latency", "first_output"])
@@ -199,27 +150,8 @@ async def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(
     assert not report.observations["targets"]["service"]["sustained_complete"]
 
 
-async def test_fairness_insufficient_output_budget_cannot_blame_endpoint(endpoint):
-    report = await runner.run_suite(config(checks=["fairness"], max_output_tokens=1,
-        limits=Limits(fairness_max_ratio=2, min_samples=2)))
-    assert check(report, "fairness").status == "inconclusive"
-    assert "at least 60" in check(report, "fairness").summary
-    assert not endpoint.calls
 
 
-async def test_fairness_truncated_copy_is_insufficient_evidence(endpoint, monkeypatch):
-    original = endpoint.execute
-    async def truncated(self, spec, **kwargs):
-        record = await original(self, spec, **kwargs)
-        if spec.scenario in {"fairness_baseline", "fairness_short"}:
-            record.output = "red blue"
-            record.finish_reason = "length"
-        return record
-    monkeypatch.setattr(endpoint, "execute", truncated)
-    report = await runner.run_suite(config(checks=["fairness"],
-        limits=Limits(fairness_max_ratio=2, min_samples=2)))
-    assert check(report, "fairness").status == "inconclusive"
-    assert "output cap" in check(report, "fairness").summary
 
 
 async def test_recovery_consumed_allowance_can_qualify_before_duration(endpoint):
@@ -254,18 +186,12 @@ async def test_recovery_sustained_timeouts_and_errors_fail(endpoint, monkeypatch
     assert result.metrics['sustained_non_timeout_error_rate'] == (0 if failure == 'timeout' else 1)
 
 
-async def test_fairness_default_word_copy_passes_with_128_token_cap(endpoint):
-    report = await runner.run_suite(config(checks=['fairness'], max_output_tokens=128,
-        limits=Limits(fairness_max_ratio=10, min_samples=2)))
-    assert check(report, 'fairness').status == 'pass'
-    assert check(report, 'fairness').metrics['needed_output_tokens'] == 60
 
 
 @pytest.mark.parametrize('check_id,scenario,expected', [
     ('recovery', 'recovery_baseline', 'inconclusive'),
     ('recovery', 'recovery', 'inconclusive'),
     ('recovery', 'sustained', 'pass'),
-    ('fairness', 'fairness_baseline', 'inconclusive'),
 ])
 async def test_matched_ratio_qualifies_client_delay_in_both_controls_and_probes(
     endpoint, monkeypatch, check_id, scenario, expected,

@@ -153,7 +153,7 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         next((spec for spec in context if spec.fixture_id == "context.long.middle.v2"), context[-1]).model_copy(update={
             "fixture_id": "long.prefill.v2",
             "scenario": "long",
-            "check_ids": ["serving", "fairness", "capacity"],
+            "check_ids": ["serving", "capacity"],
         })
     ]
     correctness = [
@@ -229,16 +229,6 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         "short": short, "long": long, "context": context, "correctness": correctness,
         "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
-    if "fairness" in config.checks:
-        # Verified as single tokens with cached Qwen2.5 and RoBERTa BPE
-        # vocabularies/merges; no numeric separator tokens are needed.
-        sequence = " ".join("red blue green white black brown gold pink gray dark light sky sun moon star rain snow wind tree leaf grass seed bird fish cat dog horse cow sheep pig fox bear wolf lion mouse house door room wall floor roof road boat ship car train book pen".split())
-        fixtures["generation"].append(_request(
-            "fairness.copy", "fairness", ["fairness"],
-            "Copy exactly, with no extra text:\n" + sequence,
-            expected=sequence, max_tokens=config.max_output_tokens,
-            options=deterministic_options(config),
-        ))
     if "cancellation" in config.checks:
         fixtures["limits"].append(_request(
             "limits.stop_control", "stop_control", ["cancellation"],
@@ -726,6 +716,18 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         })
     if unclosed or (stripped and not answer.strip() and spec.scorer != "tool"):
         return record.model_copy(update={"score": None, "score_message": REASONING_WITHOUT_ANSWER})
+    if spec.scorer == "label":
+        actual = re.sub(r"^(?:(?:box\s+)?label)\s*:\s*", "", _normalized(answer), flags=re.I)
+        expected = str(spec.expected)
+        score = bool(re.match(r"^" + re.escape(expected) + r"(?![A-Za-z0-9])", actual))
+        if not score:
+            for opening, closing in _WRAPPERS:
+                if actual.startswith(opening):
+                    end = actual.find(closing, len(opening))
+                    if end >= 0:
+                        score = exact_matches(actual[:end + len(closing)], expected)[0]
+                    break
+        return record.model_copy(update={"score": score, "score_message": "Label appears first." if score else "Answer must start with the box label."})
     if spec.scorer == "judge":
         return record.model_copy(update={"score": None, "score_message": TRUNCATED_ANSWER
                                          if record.finish_reason == "length" else "AI judgment pending."})

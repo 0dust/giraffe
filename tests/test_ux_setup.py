@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from giraffe.models import ConcurrentLoad
+
 
 APP = Path(__file__).parents[1] / "src/giraffe/static/app.js"
 
@@ -20,16 +22,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 const nodes={},listeners={},groups={};
+const loadDefaults=LOAD_DEFAULTS;
 function element(extra={}) {
   return {hidden:false,disabled:false,innerHTML:'',textContent:'',value:'',dataset:{},
     attributes:{},classList:{toggle(){}},setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];},
     focus(){this.focused=true;},...extra};
 }
 const document={querySelector:q=>nodes[q],querySelectorAll:q=>groups[q] || [],addEventListener:(kind,fn)=>listeners[kind]=fn};
-const context={assert,nodes,listeners,groups,element,structuredClone,document,window:{addEventListener(){}},location:{hash:'#new'}};
+const context={assert,nodes,listeners,groups,element,loadDefaults,structuredClone,document,window:{addEventListener(){}},location:{hash:'#new'}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
-await vm.runInNewContext(source+'\n(async()=>{'+BODY+'\n})()',context);
-""".replace("APP_PATH", json.dumps(str(APP))).replace("BODY", json.dumps(body))
+await vm.runInNewContext(source+'\nstate.bootstrap={concurrent_load:{defaults:loadDefaults}};\n(async()=>{'+BODY+'\n})()',context);
+""".replace("APP_PATH", json.dumps(str(APP))).replace("BODY", json.dumps(body)).replace("LOAD_DEFAULTS", json.dumps(ConcurrentLoad().model_dump()))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -40,31 +43,31 @@ def test_structured_conflict_links_reveal_focus_and_clear_inline_errors():
 state.config={checks:['concurrency'],targets:[{}],concurrency:40};state.jsonDraft=state.jsonBase='synced';
 syncConfigView=syncSetupStep=syncTestControls=()=>{};
 const shared=element({tagName:'DETAILS',open:false}),nested=element({tagName:'DETAILS',open:false,parentElement:shared});
-const levels=element({name:'concurrent_levels',parentElement:nested,scrollIntoView(){this.scrolled=true;}});
-levels.attributes['aria-describedby']='field-concurrent_levels-hint';levels.getAttribute=name=>levels.attributes[name];
+const levels=element({name:'load_schedule_levels',parentElement:nested,scrollIntoView(){this.scrolled=true;}});
+levels.attributes['aria-describedby']='field-load_schedule_levels-hint';levels.getAttribute=name=>levels.attributes[name];
 const ceiling=element({name:'concurrency',parentElement:shared,scrollIntoView(){this.scrolled=true;}});
-for(const [name,input] of [['concurrent_levels',levels],['concurrency',ceiling]]){
+for(const [name,input] of [['load_schedule_levels',levels],['concurrency',ceiling]]){
   nodes['#field-'+name]=input;nodes['#field-'+name+'-error']=element();
 }
-nodes['#new-run-form']={elements:{concurrent_levels:levels,concurrency:ceiling}};
+nodes['#new-run-form']={elements:{load_schedule_levels:levels,concurrency:ceiling}};
 nodes['[data-test-card="concurrency"]']=element();
-const errors=[{field:'concurrent_workloads.levels',fields:['concurrent_workloads.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.',values:{concurrency:40}}];
+const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.',values:{concurrency:40}}];
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
 syncInlineErrors();
-assert.equal(levels.attributes['aria-invalid'],'true');assert.match(levels.attributes['aria-describedby'],/field-concurrent_levels-error/);
-assert.match(levels.attributes['aria-describedby'],/field-concurrent_levels-hint/);
+assert.equal(levels.attributes['aria-invalid'],'true');assert.match(levels.attributes['aria-describedby'],/field-load_schedule_levels-error/);
+assert.match(levels.attributes['aria-describedby'],/field-load_schedule_levels-hint/);
 assert.match(nodes['#field-concurrency-error'].textContent,/64.*40/);
 let markup=renderRunBlueprint(state.config);
 assert.match(markup,/Concurrency level 64 exceeds Maximum at once 40/);
-assert.match(markup,/data-setting-path="concurrent_workloads.levels"[^>]*>Edit concurrency levels/);
+assert.match(markup,/data-setting-path="concurrent_load.schedule.levels"[^>]*>Edit concurrency levels/);
 assert.match(markup,/data-setting-path="concurrency"[^>]*>Edit maximum at once/);
-state.setupStep=3;await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:'concurrent_workloads.levels'}}:null}});
+state.setupStep=3;await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:'concurrent_load.schedule.levels'}}:null}});
 assert.equal(state.setupStep,2);assert.equal(state.openTest,'concurrency');assert(shared.open&&nested.open);assert(levels.focused&&levels.scrolled);
 assert.equal(levels.attributes['data-setting-highlight'],'true');
 focusSetting('concurrency');assert(ceiling.focused&&ceiling.scrolled);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{}};
-syncInlineErrors();assert.equal(levels.attributes['aria-invalid'],undefined);assert(nodes['#field-concurrent_levels-error'].hidden);
-assert.equal(levels.attributes['aria-describedby'],'field-concurrent_levels-hint');
+syncInlineErrors();assert.equal(levels.attributes['aria-invalid'],undefined);assert(nodes['#field-load_schedule_levels-error'].hidden);
+assert.equal(levels.attributes['aria-describedby'],'field-load_schedule_levels-hint');
 assert.doesNotMatch(renderRunBlueprint(state.config),/Concurrency level 64 exceeds/);
 """)
 
@@ -74,7 +77,7 @@ def test_checks_footer_reports_validation_errors_then_returns_to_a_current_plan(
 state.config={checks:['access','concurrency','correctness'],targets:[],concurrency:40,max_requests:300,max_duration_seconds:120};
 state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 nodes['#request-plan']=element();nodes['#dock-summary']=element();
-const errors=[{field:'concurrent_workloads.levels',fields:['concurrent_workloads.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
+const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/3<\/strong> checks.*1 setting to fix/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/Planning/);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{errors,count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
@@ -96,9 +99,9 @@ syncConfigView=syncSetupStep=syncTestControls=()=>{};window.innerWidth=375;
 const error=element({hidden:false,textContent:'Concurrency level 64 exceeds Maximum at once 40.'});
 const group=element({style:{},scrollIntoView(options){assert.equal(options.block,'center');assert(!error.hidden);this.scrolled=true;}});
 const input=element({parentElement:group,closest(q){return q==='.form-field'?group:null;},scrollIntoView(){throw Error('Scroll the complete field group, not only its input');},focus(options){assert(options.preventScroll);this.focused=true;}});
-nodes['#new-run-form']={elements:{concurrent_levels:input}};nodes['[data-test-card="concurrency"]']=element();
+nodes['#new-run-form']={elements:{load_schedule_levels:input}};nodes['[data-test-card="concurrency"]']=element();
 nodes['.setup-navigation']=element({getBoundingClientRect(){return {height:140};}});
-focusSetting('concurrent_workloads.levels');assert(group.scrolled);assert(input.focused);assert.equal(group.style.scrollMarginBottom,'172px');
+focusSetting('concurrent_load.schedule.levels');assert(group.scrolled);assert(input.focused);assert.equal(group.style.scrollMarginBottom,'172px');
 assert.equal(input.attributes['data-setting-highlight'],'true');
 """)
 
@@ -108,12 +111,12 @@ def test_indexed_and_section_errors_reveal_check_editors_instead_of_json():
 state.config={checks:['concurrency']};state.jsonDraft=state.jsonBase='synced';
 syncConfigView=syncSetupStep=syncTestControls=()=>{};
 switchConfigView=()=>{throw Error('Should stay in the form');};
-const levels=element({name:'concurrent_levels'}),heading=element();
-nodes['#new-run-form']={elements:{concurrent_levels:levels}};
+const levels=element({name:'load_schedule_levels'}),heading=element();
+nodes['#new-run-form']={elements:{load_schedule_levels:levels}};
 nodes['[data-test-card="concurrency"]']=element();nodes['#settings-concurrency [data-editor-title]']=heading;
-assert.equal(settingDestination('concurrent_workloads.levels.2').name,'concurrent_levels');
-focusSetting('concurrent_workloads.levels.2');assert(levels.focused);assert.equal(state.openTest,'concurrency');
-focusSetting('concurrent_workloads');assert(heading.focused);assert.equal(state.setupStep,2);
+assert.equal(settingDestination('concurrent_load.schedule.levels.2').name,'load_schedule_levels');
+focusSetting('concurrent_load.schedule.levels.2');assert(levels.focused);assert.equal(state.openTest,'concurrency');
+focusSetting('concurrent_load');assert(heading.focused);assert.equal(state.setupStep,2);
 """)
 
 
@@ -163,11 +166,11 @@ state.config={checks:['concurrency'],targets:[{}],concurrency:40,max_requests:10
 state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 syncConfigView=syncSetupStep=syncTestControls=captureFormDraft=()=>{};validateRunForm=()=>true;
 nodes['#request-plan']=element();nodes['#form-error']=element();
-const input=element({name:'concurrent_levels'});nodes['#field-concurrent_levels']=input;nodes['#field-concurrent_levels-error']=element();
-nodes['#new-run-form']={elements:{concurrent_levels:input}};nodes['[data-test-card="concurrency"]']=element();
+const input=element({name:'load_schedule_levels'});nodes['#field-load_schedule_levels']=input;nodes['#field-load_schedule_levels-error']=element();
+nodes['#new-run-form']={elements:{load_schedule_levels:input}};nodes['[data-test-card="concurrency"]']=element();
 readForm=()=>({config:structuredClone(state.config)});
 let fixed=false,calls=0;
-const errors=[{field:'concurrent_workloads.levels',fields:['concurrent_workloads.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
+const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
 api=async()=>{calls++;if(!fixed)throw Object.assign(new Error(errors[0].msg),{errors});return {config:state.config,request_plan:{rows:[],warnings:[],count_kind:'exact',planned_total:10}};};
 navigateSetup(3);await Promise.resolve();await Promise.resolve();await Promise.resolve();
 assert.equal(calls,1);assert.equal(state.setupStep,2);assert(input.focused);

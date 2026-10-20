@@ -194,8 +194,8 @@ Exit codes:
         run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Maximum suite duration in seconds")
         run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Per-request timeout in seconds")
         run.add_argument("--max-output-tokens", type=int, help="Maximum output tokens per request")
-        run.add_argument("--context-limit", type=int, help="Model context token limit")
-        run.add_argument("--samples", type=int, help="Samples per selected check")
+        run.add_argument("--context-limit", type=int, help="Context window for context and history checks; Concurrent load uses profile token targets")
+        run.add_argument("--samples", type=int, help="Samples for count-based checks; Concurrent load uses its configured duration")
         run.add_argument("--sustained-seconds", type=float, help="Duration of sustained recovery load in seconds")
         run.add_argument("--stop-after-errors", type=int, help="Stop after this many request errors")
         run.add_argument("--unresponsive-after-failures", type=int,
@@ -224,7 +224,7 @@ Exit codes:
         run.add_argument("--proxy", help="HTTP proxy URL")
         for option in ("first-output-ms", "latency-ms", "stream-gap-ms",
                        "min-output-tokens-per-second", "max-error-rate", "min-correctness",
-                       "fairness-max-ratio", "regression-percent"):
+                       "regression-percent"):
             run.add_argument("--" + option, type=float, help="Threshold for " + option.replace("-", " "))
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
@@ -264,6 +264,13 @@ def load_configuration(path: Path) -> dict:
     if not isinstance(values, dict):
         raise ValueError("Configuration must be a YAML/JSON object")
     return values
+
+
+def migrated_configuration(values, model=RunConfig):
+    config = model.model_validate(values)
+    for note in config._migration_notes:
+        print(f"Migration: {note}", file=sys.stderr)
+    return config
 
 
 def configuration(args: argparse.Namespace) -> RunConfig:
@@ -323,7 +330,7 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     for key in ("metrics_url", "metrics_api_key_env", "metrics_profile"):
         if getattr(args, key, None) is not None:
             values["targets"][0][key] = getattr(args, key)
-    return RunConfig.model_validate(values)
+    return migrated_configuration(values)
 
 
 async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
@@ -425,12 +432,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(capabilities(), allow_nan=False))
             return 0
         if args.command == "validate":
-            config = RunConfig.model_validate(load_configuration(args.config))
+            config = migrated_configuration(load_configuration(args.config))
             from giraffe.planning import request_plan
 
-            warnings = request_plan(config)["warnings"]
+            plan = request_plan(config)
+            if plan["errors"]:
+                raise ValueError(plan["errors"][0]["msg"])
+            warnings = plan["warnings"]
             if json_output:
-                emit("success", 0, config=config.model_dump(mode="json"), warnings=warnings)
+                emit("success", 0, config=config.model_dump(mode="json"), migration_notes=config._migration_notes, warnings=warnings)
             else:
                 print("Configuration is valid. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
@@ -445,12 +455,12 @@ def main(argv: list[str] | None = None) -> int:
             from giraffe.request_pack import pack_preview
             from giraffe.planning import request_plan
 
-            config = ConfigDraft.model_validate(load_configuration(args.config))
+            config = migrated_configuration(load_configuration(args.config), ConfigDraft)
             preview = pack_preview(config)
             plan = request_plan(config, pack_details=preview)
             if args.output_format == "json":
                 print(json.dumps({"config": config.model_dump(mode="json"),
-                                  "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
+                                  "migration_notes": config._migration_notes, "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
             else:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
@@ -525,11 +535,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"ui", "web"}:
             if not 1 <= args.port <= 65535:
                 raise ValueError("Port must be between 1 and 65535")
-            defaults = None
+            defaults, migration_notes = None, []
             if args.config:
-                defaults = RunConfig.model_validate(load_configuration(args.config)).model_dump(
-                    mode="json"
-                )
+                resolved = migrated_configuration(load_configuration(args.config))
+                defaults = resolved.model_dump(mode="json")
+                migration_notes = resolved._migration_notes
                 defaults["restart_target"] = None
             import uvicorn
             from giraffe.web import create_app
@@ -543,7 +553,8 @@ def main(argv: list[str] | None = None) -> int:
                     if error.errno == errno.EADDRINUSE:
                         raise ValueError(f"port {args.port} is in use; choose another with --port") from None
                     raise
-                app = create_app(runs_dir=args.runs_dir, defaults=defaults, auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
+                app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes,
+                                 auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
                 print(f"Giraffe UI: http://127.0.0.1:{args.port} — open in your browser\n"
                       f"Local runs: {args.runs_dir.resolve()}\n"
                       "Review the plan, then choose Launch.", flush=True)
@@ -583,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "try-example":
             from giraffe.dataset_import import try_example_config
 
-            config = try_example_config(ConfigDraft.model_validate(load_configuration(args.config)),
+            config = try_example_config(migrated_configuration(load_configuration(args.config), ConfigDraft),
                                         args.fixture_id, args.target_name)
             baseline = None
         else:

@@ -111,14 +111,15 @@ def test_ui_rejects_invalid_port_before_starting_server(capsys):
     assert "Port must be" in capsys.readouterr().err
 
 
-def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch, capsys, legacy):
     import uvicorn
     import giraffe.web
 
     config = tmp_path / "ui.yaml"
     config.write_text(json.dumps({"targets": [{"name": "local", "url": "http://localhost",
                                              "model": "tiny", "restart_command": ["false"]}],
-                                  "restart_target": "local"}))
+                                  "restart_target": "local", **({"checks": ["buckets"], "buckets": {"samples_per_bucket": 7}} if legacy else {})}))
     captured = {}
 
     def create_app(**kwargs):
@@ -151,6 +152,10 @@ def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch
     assert "open in your browser" in capsys.readouterr().out
     assert captured["defaults"]["restart_target"] is None
     assert captured["defaults"]["targets"][0]["restart_command"] == ["false"]
+    if legacy:
+        assert any("samples_per_bucket=7" in note for note in captured["migration_notes"])
+    else:
+        assert captured["migration_notes"] == []
 
 
 def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, capsys):
@@ -314,7 +319,7 @@ def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, caps
     assert main(["preview", "--config", "-"]) == 0
     draft = ConfigDraft.model_validate(values)
     assert json.loads(capsys.readouterr().out) == {
-        "config": draft.model_dump(mode="json"), "request_pack_preview": pack_preview(draft),
+        "config": draft.model_dump(mode="json"), "migration_notes": [], "request_pack_preview": pack_preview(draft),
         "request_plan": request_plan(draft)}
     assert not list(tmp_path.iterdir())
 

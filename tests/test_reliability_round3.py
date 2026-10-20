@@ -47,17 +47,30 @@ async def test_sustained_errors_and_successful_sample_minimum(monkeypatch, statu
 
 @pytest.mark.parametrize('ratio_limit,expected', [(None, 'pass'), (2, 'fail')])
 async def test_recovery_absolute_only_pass_discloses_slowdown(monkeypatch, ratio_limit, expected):
+    clock = [time.monotonic()]
+    completed = asyncio.Barrier(2)
+
     class Client(FakeClient):
         async def execute(self, spec, **kwargs):
             result = await super().execute(spec, **kwargs)
             result.elapsed_ms = 85 if spec.scenario == 'recovery' else 10
             result.first_output_ms = 8.5 if spec.scenario == 'recovery' else 1
+            if spec.scenario == 'sustained':
+                if await completed.wait() == 0:
+                    clock[0] += .01
+                await completed.wait()
             return result
 
+    # Keep asyncio's clock real while the paired sustained slots advance runner time.
+    monkeypatch.setattr(runner, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(runner, 'LLMClient', Client)
     outcome = check(await runner.run_suite(config(checks=['recovery'],
         limits=Limits(min_samples=2, latency_ms=1000, recovery_max_ratio=ratio_limit))), 'recovery')
-    assert outcome.status == expected
+    assert outcome.status == expected, (outcome.summary, outcome.metrics['sustained_completion'])
+    completion = outcome.metrics['sustained_completion']
+    assert completion['reason'] == 'duration elapsed'
+    assert completion['requests'] == 4
+    assert completion['time_weighted_in_flight'] == pytest.approx(2)
     assert outcome.metrics['latency_ratio'] == 8.5
     if ratio_limit is None:
         assert '8.5' in outcome.summary
@@ -290,8 +303,13 @@ async def test_arrivals_dispatch_wait_tolerance(threshold, wait, achieved):
         on_start()
         run.records.append(record(spec, '4', target=target.name, client_wait_ms=wait))
 
+    conditions, finished = [], []
+    run.start_condition = lambda *args: conditions.append(args)
+    run.finish_condition = lambda *args, **kwargs: finished.append((args, kwargs))
     run.request = request
     await workloads.arrivals(run, target, None, builtin_fixtures(configured))
+    assert conditions == [(target.name, "arrival", {"requests_per_second": configured.arrivals.requests_per_second}, 16)]
+    assert finished == [((target.name, "arrival", {"requests_per_second": configured.arrivals.requests_per_second}), {"reason": None})]
     observation = run.observations[target.name]['arrivals']
     assert observation['issued'] == 16
     assert observation['configured_rate_achieved'] is achieved

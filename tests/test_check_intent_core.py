@@ -241,21 +241,6 @@ class FakeClient:
             answer_chunks=2, http_status=200 if ok else None, finish_reason="stop" if ok else None)
 
 
-async def test_token_stress_scenarios_are_not_core_traffic():
-    from giraffe.concurrent_workloads import _spec as stress_spec
-    from giraffe.models import TokenStressCase
-    config = cfg(checks=["access", "serving", "first_output"], concurrency=4, stop_after_errors=2,
-                 limits=Limits(min_samples=2, first_output_ms=500))
-    run = runner._Run(config, None, None)
-    target = config.targets[0]
-    assert runner._stress("stress_long_input_summary_c4") and runner._stress("stress_calibration_x")
-    case = TokenStressCase(name="long_input_summary", input_tokens=200, output_tokens=50)
-    spec = stress_spec(case, "p", "stress_long_input_summary_c4", level=4)
-    records = await run.group(target, FakeClient(status="timeout"), [spec],
-                              "stress_long_input_summary_c4", count=2, concurrency=2)
-    assert records and all(not set(r.check_ids) & {"access", "serving", "first_output", "generation"}
-                           for r in records)
-    assert run.errors == 0 and run.stop_reason() is None
 
 
 async def test_first_output_counts_timed_out_request_without_output(monkeypatch):

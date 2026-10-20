@@ -20,7 +20,7 @@ state.config=config;
 const values=new Map([['url','http://localhost/v1'],['model','test'],['name','local'],['max_memory_mb','0']]);
 FormData=class {constructor(){} get(key){return values.get(key) ?? null;} has(key){return values.has(key);} set(key,value){values.set(key,value);}};
 nodes['#new-run-form']={elements:{metrics_url:{value:''}},querySelectorAll:()=>[]};
-configureTests=(c)=>c;configureConcurrentWorkloads=(c)=>c;configureJudging=(c)=>c;configureProfiles=(c)=>c;configureSessions=(c)=>c;concurrentFormDefaults=()=>({});
+configureTests=(c)=>c;configureConcurrentLoad=(c)=>c;configureJudging=(c)=>c;configureProfiles=(c)=>c;configureSessions=(c)=>c;concurrentFormDefaults=()=>({});
 let payload=readForm();assert.equal(payload.config.max_memory_mb,0);assert.equal(portableConfig(payload).max_memory_mb,0);
 values.set('max_memory_mb','512');payload=readForm();assert.equal(payload.config.max_memory_mb,512);
 values.set('max_memory_mb','');payload=readForm();assert.equal(payload.config.max_memory_mb,null);

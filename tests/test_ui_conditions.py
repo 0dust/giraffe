@@ -185,7 +185,7 @@ const conditions=['short','long'].map(shape=>({condition:{id:'bucket_c32_'+shape
 const saved=report([check('concurrency','fail',{metrics:{scenarios:{size_matrix:{id:'buckets',status:'fail',metrics:{buckets:{bucket_c32_short_short:{status:'pass'},bucket_c32_long_short:{coverage_gaps:['Not enough overlap']}}}}}}})],{observations:{targets:{local:{conditions}}}});
 const html=renderTests([],{report:saved});
 assert.equal((html.match(/class="status fail"/g)||[]).length,1,'owning verdict appears on the check header once');
-assert.match(html,/<div class="test-check-heading"><h3>Concurrent workloads<\/h3>[\s\S]*?class="status fail"/);
+assert.match(html,/<div class="test-check-heading"><h3>Concurrent load<\/h3>[\s\S]*?class="status fail"/);
 assert.match(html,/data-condition-check="concurrency"/);assert.match(html,/2 tests/);
 const cards=html.match(/<article class="test-condition"[\s\S]*?<\/article>/g);
 assert.match(cards[0],/class="status pass"/);assert.doesNotMatch(cards[0],/class="status fail"/);

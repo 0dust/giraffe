@@ -4,7 +4,6 @@ import uuid
 
 import pytest
 
-from giraffe.concurrent_workloads import execution_config
 from giraffe.logprob_workload import refill
 from giraffe.models import RequestRecord, RunConfig
 from giraffe.runner import _Run, run_suite
@@ -13,8 +12,8 @@ from tests.test_web import browser, start, finished, report
 
 
 def configuration(**updates):
-    return execution_config(RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1", "model": "fake"}],
-        checks=["concurrency"], concurrency=2, max_requests=100, **updates))
+    return RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1", "model": "fake"}],
+        checks=["concurrency"], concurrent_load={"schedule": {"levels": [1, 2]}}, concurrency=2, max_requests=100, **updates)
 
 
 class Client:
@@ -87,7 +86,7 @@ async def test_condition_sessions_dependent_turns_skip():
 
 async def test_web_condition_summaries_survive_event_cap(tmp_path, monkeypatch):
     async def waiting(config, *, progress, stop_event):
-        runner = _Run(execution_config(config), progress, stop_event)
+        runner = _Run(config, progress, stop_event)
         await runner.group(config.targets[0], Client(), [spec("x", "warm", "serving")], "warm", count=120)
         await stop_event.wait()
         return report(config, cancelled=True)
@@ -114,29 +113,6 @@ def test_legacy_request_record_condition_defaults_to_none():
     assert record.condition_id is None
 
 
-async def test_saved_suite_has_one_summary_per_matrix_cell_and_global_progress(monkeypatch, tmp_path):
-    from giraffe.reporting import write_report
-    from tests.test_runner import FakeClient
-    from giraffe import runner
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    config = RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1", "model": "fake"}],
-        checks=["concurrency"], concurrency=2, max_requests=100,
-        concurrent_workloads={"scenarios": ["size_matrix"], "levels": [2], "samples_per_bucket": 2})
-    events = []
-    result = await run_suite(config, progress=events.append)
-    rows = result.observations["targets"]["local"]["conditions"]
-    assert len(rows) == 9
-    assert len(result.requests) == 18
-    assert all(row["planned"] == row["sent"] == row["completed"] == 2 for row in rows)
-    assert all(row["status"] == "finished" and row["reason"] is None for row in rows)
-    assert {r.condition_id for r in result.requests} == {row["condition"]["id"] for row in rows}
-    completed = [event["completed"] for event in events]
-    assert completed == sorted(completed)  # Condition totals must not replace global progress.
-    write_report(result, tmp_path)
-    import json
-    saved = json.loads((tmp_path / "report.json").read_text())
-    assert saved["observations"]["targets"]["local"]["conditions"] == rows
-    assert all(r["condition_id"] for r in saved["requests"])
 
 
 async def test_consistency_plan_groups_prompt_indices():
@@ -192,22 +168,6 @@ async def test_saved_condition_failures_include_post_run_judging(monkeypatch):
         assert row["failed"] == sum(record.score is False for record in records)
 
 
-async def test_mixed_condition_combines_both_members_and_weighted_pair_plan():
-    from giraffe.workloads import buckets
-    config = configuration(concurrent_workloads={"scenarios": ["mixed_interference"], "mixed_pairs": 2,
-        "heavy_weights": {"long_input": 2, "long_output": 1}})
-    run = _Run(config, None, None)
-    await buckets(run, config.targets[0], Client())
-    rows = {row["condition"]["id"]: row for row in run.observations["local"]["conditions"]}
-    assert len(rows) == 5  # Baseline plus two kinds at two interference phases.
-    for kind, count in [("long_input", 8), ("long_output", 4)]:
-        for phase in ["before_output", "active_stream"]:
-            condition_id = f"mixed_{kind}_{phase}"
-            row = rows[condition_id]
-            assert row["planned"] == row["sent"] == row["completed"] == count
-            assert row["not_sent"] == 0 and row["reason"] is None
-            assert {record.scenario for record in run.records if record.condition_id == condition_id} == {
-                f"mixed_short_{kind}_{phase}", f"mixed_heavy_{kind}_{phase}"}
 
 
 async def test_arrivals_have_rate_condition_and_exact_plan():

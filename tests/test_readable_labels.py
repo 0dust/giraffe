@@ -40,21 +40,28 @@ def test_capacity_rate_and_mixed_partner_metadata():
 
 
 def builder_scenarios():
-    from giraffe.models import ConcurrentWorkloads, Consistency, Sessions, ToolChoiceRule
+    from giraffe.models import Consistency, Sessions, ToolChoiceRule
 
     values = {
         "level": [1, 4, 32], "effective.concurrency": [1, 4], "check_id": ["correctness", "json"],
         "input_shape": ["short", "medium", "long"], "output_shape": ["short", "medium", "long"],
         "shape": get_args(get_args(Consistency.model_fields["shapes"].annotation)[0]),
         "kind": ["long_input", "long_output"], "phase": ["before_output", "active_stream"],
-        "case.name": [case.name for case in ConcurrentWorkloads().stress_cases],
         "fixture.fixture_id": ["lookup", "weather_result"], "prefix": ["tools", "tools_lookup"],
         "choice_mode": [*get_args(ToolChoiceRule.model_fields["mode"].annotation), "forced"],
         "turn": [0, 1, 2], "prompt_index": [0, 2], "index": [0, 1], "stage_index": [0, 1],
     }
     scenarios = set(_SCENARIOS)
+    for level in (1, 4, 32):
+        scenarios.update(f"load_combo_{a}_{b}_c{level}" for a in ("short", "medium", "long") for b in ("short", "medium", "long"))
+        scenarios.add(f"load_mixed_c{level}")
+        scenarios.add(f"load_mixed_c{level}.short_long")
+        scenarios.update(f"load_interference_{kind}_c{level}" for kind in ("control", "probe"))
+        scenarios.update(f"load_interference_c{level}.{role}" for role in ("short_stream", "short_probe", "long_probe"))
+        scenarios.update(f"load_stress_{kind}_c{level}" for kind in ("input", "output"))
+    scenarios.update(f"load_calibration_{size}_{variant}" for size in ("short", "medium", "long") for variant in ("short_answer", "long_output"))
     sources = Path(__file__).parents[1] / "src/giraffe"
-    for name in ("runner", "workloads", "concurrent_workloads", "logprob_workload", "traffic", "tool_conversations"):
+    for name in ("runner", "workloads", "logprob_workload", "traffic", "tool_conversations"):
         tree = ast.parse((sources / f"{name}.py").read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.JoinedStr):
@@ -110,7 +117,8 @@ detail(report([],{requests:records.map(({condition_id,...r})=>r)}));html=nodes['
 async def test_live_metadata_comes_from_actual_builders_and_survives_report_save(tmp_path):
     from giraffe.fixtures import builtin_fixtures
     from giraffe.runner import _Run
-    from giraffe.workloads import arrivals, bucket_spec
+    from giraffe.workloads import arrivals
+    from giraffe.concurrent_load import make_spec
     from giraffe.reporting import write_report
     from tests.test_condition_tracking import Client, configuration
     from tests.test_web import report
@@ -118,14 +126,14 @@ async def test_live_metadata_comes_from_actual_builders_and_survives_report_save
     config = configuration(arrivals={"requests": 2, "requests_per_second": 1000})
     events = []
     run = _Run(config, events.append, None)
-    request = bucket_spec(config.buckets, "short", "long", "bucket_c2_short_long", "buckets", 2, config.context_limit)
+    request = make_spec(config.concurrent_load, "short_long", "load_combo_short_long_c2", {"type": "combinations", "shape": "short_long", "level": 2}, 64)
     await run.group(config.targets[0], Client(), [request], request.scenario, count=2, concurrency=2)
     await arrivals(run, config.targets[0], Client(), builtin_fixtures(config))
     rows = run.observations["local"]["conditions"]
     matrix = rows[0]["condition"]
     assert matrix["parameters"] == {"concurrency": 2, "same_prompt": True,
         "input_chars": len(request.messages[0]["content"]),
-        "input_tokens_approx": (len(request.messages[0]["content"]) + 3) // 4,
+        "input_tokens_target": request.requested_input_tokens,
         "output_tokens": request.max_tokens}
     arrival = rows[1]["condition"]
     assert arrival["parameters"]["same_prompt"] is True

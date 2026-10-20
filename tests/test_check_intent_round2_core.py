@@ -78,15 +78,9 @@ def test_v3_recovery_budget_is_inconclusive_not_error(scenario):
     assert result.metrics["baseline_non_timeout_error_rate"] in (None, 0)
 
 
-def test_v3_fairness_budget_is_inconclusive():
-    run = runner._Run(cfg().model_copy(update={"checks": ["fairness"]}), None, None)
-    run.records = [record(scenario="fairness_long", check_ids=["fairness"], valid=False,
-        error=REASONING_BUDGET_ERROR, finish_reason="length", output="", reasoning="thinking")]
-    result = next(c for c in runner._checks(run, run.config.targets[0]) if c.id == "fairness")
-    assert result.status == "inconclusive" and "reasoning exhausted the output budget" in result.summary.lower()
 
 
-@pytest.mark.parametrize("check_id, scenario", [("fairness", "fairness_short"), ("recovery", "sustained")])
+@pytest.mark.parametrize("check_id, scenario", [("recovery", "sustained")])
 def test_v3_reasoning_budget_does_not_hide_a_real_failure(check_id, scenario):
     config = cfg().model_copy(update={"checks": [check_id]})
     run = runner._Run(config, None, None)
@@ -383,8 +377,7 @@ async def test_v2_complete_body_end_precedes_httpx_automatic_close(monkeypatch):
 @pytest.mark.parametrize("serial", [True, False])
 async def test_v2_fast_serial_endpoint_never_qualifies(monkeypatch, serial):
     from tests.fake_endpoint import FakeEndpoint
-    from tests.test_check_intent_overlap import configuration, exercise_output_shapes
-    exercise_output_shapes(monkeypatch)
+    from tests.test_check_intent_overlap import configuration
     with FakeEndpoint(service_slots=1 if serial else None, first_token_delay=0 if serial else .03,
                       chunk_delay=0 if serial else .03) as endpoint:
         report = await runner.run_suite(configuration(targets=[{"name": "local", "url": endpoint.url,
@@ -392,39 +385,3 @@ async def test_v2_fast_serial_endpoint_never_qualifies(monkeypatch, serial):
     for c in report.checks:
         if c.id in {"correctness", "json"}:
             assert c.status == ("inconclusive" if serial else "pass"), c
-
-
-@pytest.mark.parametrize("timeout_count, allowance, expected", [(0, .01, "inconclusive"),
-    (6, .01, "fail"), (6, .4, "inconclusive")])
-def test_bucket_timeouts_preserve_workload_error_policy(timeout_count, allowance, expected):
-    from giraffe.concurrent_workloads import execution_config
-    from giraffe.workloads import results
-    config = execution_config(cfg(checks=["concurrency"], concurrency=2,
-        limits=Limits(min_samples=2, max_error_rate=allowance), concurrent_workloads={
-            "scenarios": ["size_matrix"], "levels": [2], "samples_per_bucket": 2,
-            "input_chars": {"short": 128, "medium": 1024, "long": 4096},
-            "output_tokens": {"short": 16, "medium": 100, "long": 100}}))
-    run = runner._Run(config, None, None)
-    for shape in ("short", "medium", "long"):
-        for output in ("short", "medium", "long"):
-            for index in range(2):
-                timeout = bool(timeout_count and output != "short" and index == 1)
-                run.records.append(record(f"{shape}-{output}-{index}",
-                    scenario=f"bucket_c2_{shape}_{output}", check_ids=["buckets"],
-                    status="timeout" if timeout else "completed", valid=not timeout,
-                    score=None, error="request deadline exceeded" if timeout else None,
-                    first_output_ms=None if timeout else 2, stream_end_ms=None if timeout else 12,
-                    elapsed_ms=5000 if timeout else 2000, requested_max_tokens=100,
-                    workload={"level": 2, "input_bucket": shape, "output_bucket": output,
-                        "requested_input_chars": config.buckets.input_chars[shape],
-                        "requested_output_tokens": config.buckets.output_tokens[output],
-                        "cell_evidenced_concurrency": 1, "evidenced_overlap": 1,
-                        "observed_overlap": 1, "load_qualified": False}))
-    result = next(c for c in results(run, config.targets[0], runner._stats,
-        runner._timing_violations, runner._missing_timing) if c.id == "buckets")
-    assert result.status == expected, result.summary
-    assert result.metrics["timed_out"] == timeout_count
-    assert result.metrics["error_rate"] == timeout_count / 18
-    assert all(cell["coverage_gaps"] and cell["qualified_samples"] == 0
-               for cell in result.metrics["buckets"].values())
-    assert all(not runner._serving_failure(r, r.scenario) for r in run.records if r.status == "timeout")

@@ -9,7 +9,6 @@ import pytest
 from pydantic import ValidationError
 
 from giraffe.models import RequestRecord, RunConfig, Sessions, Target
-from giraffe.concurrent_workloads import execution_config
 from giraffe.reporting import write_report
 from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
@@ -147,91 +146,8 @@ async def test_failed_semantic_turn_stops_session_before_next_user_turn(repeat_p
     )
 
 
-def test_incomplete_later_mixed_group_does_not_hide_observed_failure():
-    settings = RunConfig(
-        targets=[Target(name="local", url="http://localhost:1", model="m")],
-        checks=["serving", "mixed"],
-        buckets={"mixed_pairs": 1},
-        limits={"min_samples": 2, "fairness_max_ratio": 2},
-    )
-    records = [
-        RequestRecord(
-            id=name,
-            target="local",
-            fixture_id=name,
-            scenario=name,
-            check_ids=["mixed"],
-            started_at="2026-10-08T00:00:00Z",
-            status="completed",
-            valid=True,
-            elapsed_ms=elapsed,
-            overlap=overlap, score=True,
-        )
-        for name, elapsed, overlap in [
-            ("mixed_control", 10, 1),
-            ("mixed_control", 10, 1),
-            ("mixed_short_failure", 100, 2),
-            ("mixed_short_failure", 100, 2),
-            ("mixed_short_unobserved", 10, 1),
-        ]
-    ]
-    for control in records:
-        if control.scenario == "mixed_control":
-            control.completion_tokens = 96
-            control.requested_max_tokens = 128
-    lights = [r for r in records if r.scenario.startswith("mixed_short")]
-    for index, light in enumerate(lights):
-        light.workload = {"pair": index, "observed_overlap": light.overlap}
-        light.timing_start_ms, light.first_output_ms, light.last_output_ms = index * 200, 1, light.elapsed_ms
-        light.completion_tokens, light.input_tokens, light.requested_max_tokens = 96, 100, 128
-        heavy = light.model_copy(deep=True)
-        heavy.id = f"heavy-{index}"
-        heavy.scenario = light.scenario.replace("mixed_short", "mixed_heavy")
-        heavy.workload.update(heavy_type="long_input")
-        heavy.input_tokens = 1000
-        heavy.first_output_ms = 2
-        records.append(heavy)
-    run = SimpleNamespace(
-        config=execution_config(settings),
-        records=records,
-        max_lag_ms=0,
-        observations={"local": {}},
-        unfinished={"local": set()},
-    )
-    outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
-    assert next(c for c in outcome if c.id == "mixed").status == "fail"
 
 
-@pytest.mark.parametrize("overlap,control_samples,mixed_samples", [(1, 2, 2), (2, 1, 2), (2, 2, 1)])
-def test_mixed_latency_ratio_requires_control_samples_and_actual_overlap(
-    overlap, control_samples, mixed_samples
-):
-    settings = RunConfig(
-        targets=[Target(name="local", url="http://localhost:1", model="m")],
-        buckets={"mixed_pairs": 2},
-        limits={"min_samples": 2, "fairness_max_ratio": 2},
-    )
-    records = [
-        RequestRecord(
-            id=f"{scenario}-{index}", target="local", fixture_id=scenario,
-            scenario=scenario, check_ids=["mixed"], started_at="2026-10-08T00:00:00Z",
-            status="completed", valid=True, elapsed_ms=elapsed, overlap=achieved,
-            completion_tokens=96, input_tokens=100, requested_max_tokens=128, score=True,
-        )
-        for scenario, count, elapsed, achieved in [
-            ("mixed_control", control_samples, 10, 1),
-            ("mixed_short_unqualified", mixed_samples, 100, overlap),
-        ]
-        for index in range(count)
-    ]
-    run = SimpleNamespace(config=execution_config(settings), records=records, max_lag_ms=0,
-                          observations={"local": {}}, unfinished={"local": set()})
-    outcome = results(run, settings.targets[0], _stats, _timing_violations, _missing_timing)
-    mixed = next(c for c in outcome if c.id == "mixed")
-    assert mixed.status == "inconclusive"
-    comparison = mixed.metrics["comparisons"][0]
-    assert comparison["latency_ratio"] == 10
-    assert comparison["samples_and_overlap_qualified"] is False
 
 
 @pytest.mark.parametrize(
@@ -485,37 +401,8 @@ async def test_strict_consistency_and_insufficient_samples_are_explicit():
     assert check(short, "consistency").status == "inconclusive"
 
 
-@pytest.mark.parametrize("budget", [5, 72])
-async def test_bucket_levels_above_sample_minimum_reach_requested_load_within_budget(budget):
-    # All eight output windows must intersect outside client scheduling delays.
-    with FakeEndpoint(first_token_delay=0.05, chunk_delay=0.05) as endpoint:
-        report = await run_suite(config(
-            endpoint, checks=["buckets"], concurrency=8, max_requests=budget,
-            buckets={"levels": [8], "samples_per_bucket": 2},
-        ))
-    assert len(report.requests) == budget
-    cells = check(report, "buckets").metrics["buckets"]
-    assert max(cell["achieved_overlap"] for cell in cells.values()) == min(8, budget)
-    if budget == 72:
-        assert len(cells) == 9
-        assert all(cell["attempted"] == cell["expected_samples"] == 8 for cell in cells.values())
-        assert all(cell["achieved_overlap"] == 8 for cell in cells.values())
 
 
-async def test_buckets_keep_shape_overlap_lengths_and_eos_coverage_separate():
-    with FakeEndpoint(first_token_delay=0.03, chunk_delay=0.03) as endpoint:
-        report = await run_suite(
-            config(endpoint, buckets={"samples_per_bucket": 2, "mixed_pairs": 1})
-        )
-    result = check(report, "buckets")
-    assert len(result.metrics["buckets"]) == 18
-    assert result.status == "inconclusive"  # Early EOS does not exercise long output.
-    assert all(b["actual_input_tokens"] for b in result.metrics["buckets"].values())
-    assert all(
-        b["achieved_overlap"] >= 2 for key, b in result.metrics["buckets"].items() if "c2_" in key
-    )
-    assert len(check(report, "mixed").metrics["comparisons"]) == 4
-    assert any(r.workload.get("short_stream_active_at_dispatch") for r in report.requests)
 
 
 @pytest.mark.parametrize(
@@ -566,11 +453,11 @@ async def test_tools_disabled_and_forced_diagnostic_remain_separate():
 @pytest.mark.parametrize(
     "extra",
     [
-        {"buckets": {"levels": [3]}},
+        {"concurrent_load": {"schedule": {"levels": [3]}}},
         {"sessions": {"concurrency": 3}},
         {"sessions": {"turns": ["one"]}},
         {"consistency": {"repetitions": 1}},
-        {"buckets": {"output_tokens": {"short": 16, "medium": 48, "long": 256}}},
+        {"concurrent_load": {"profile": {"long": {"output_tokens": 256}}}},
     ],
 )
 def test_invalid_workloads_rejected_before_network(extra):
@@ -595,17 +482,6 @@ async def test_retained_unselected_workloads_send_no_workload_requests():
     assert not any(payload.get("tools") for payload in endpoint.requests)
 
 
-@pytest.mark.parametrize("selected", ["buckets", "mixed"])
-async def test_bucket_and_mixed_workloads_can_be_selected_independently(selected):
-    with FakeEndpoint() as endpoint:
-        report = await run_suite(config(endpoint, checks=[selected], buckets={
-            "levels": [1], "samples_per_bucket": 2, "mixed_pairs": 1,
-        }))
-    assert {check.id for check in report.checks if check.status != "skipped"} == {"concurrency"}
-    assert set(check(report, "concurrency").metrics["scenarios"]) == {{"buckets": "size_matrix", "mixed": "mixed_interference"}[selected]}
-    workload_records = [record for record in report.requests if record.workload]
-    assert workload_records
-    assert all(set(record.check_ids) == {selected, "concurrency"} for record in workload_records)
 
 
 def text_tool_fixture(identifier='weather-text'):

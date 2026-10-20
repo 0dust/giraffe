@@ -19,10 +19,10 @@ from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, re
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
     "arrivals": {"arrivals"}, "prefix": {"prefix"},
-    "buckets": {"buckets", "mixed"}, "sessions": {"sessions"},
+    "sessions": {"sessions"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
-    "concurrent_workloads": {"concurrency", "token_stress"},
+    "concurrent_load": {"concurrency"},
 }
 
 
@@ -302,166 +302,6 @@ async def prefixes(run, target, client):
             run.finish_condition(target.name, scenario)
 
 
-def bucket_spec(settings, input_shape, output_shape, scenario, check, level, context_limit=None):
-    chars = settings.input_chars[input_shape]
-    if context_limit is not None:
-        context_char_ceiling = max(64, (context_limit - max(settings.output_tokens.values()) - 64) * 3)
-        chars = min(chars, max(64, context_char_ceiling * {"short": 1 / 16, "medium": 1 / 4, "long": 1}[input_shape]))
-        chars = int(chars)
-    cap = settings.output_tokens[output_shape]
-    if output_shape == "short":
-        prompt, expected = label_prompt(chars), "K7P4"
-    else:
-        # Realistic EOS allowed. A cap does not establish that this length was generated.
-        prompt = label_prompt(chars).replace(
-            "Reply with the box label only.",
-            f"First write the box label, then list the numbers from 1 to {cap}.",
-        )
-        expected = None
-    return spec(
-        prompt,
-        scenario,
-        check,
-        expected=expected,
-        max_tokens=cap,
-        input_bucket=input_shape,
-        output_bucket=output_shape,
-        level=level,
-        requested_input_chars=chars,
-        requested_output_tokens=cap,
-    )
-
-
-def pair_evidenced(light, heavy):
-    """Server evidence for a mixed pair; client dispatch timing alone is not evidence.
-
-    active_stream: the heavy request's first output lands strictly inside the light
-    request's output window. before_output: it lands after light dispatch and
-    before the light request's last output.
-    """
-    if light is None or heavy is None or light.target != heavy.target:
-        return False
-    light_window, heavy_window = answer_window(light), answer_window(heavy)
-    if not light_window or not heavy_window:
-        return False
-    if light.workload.get("interference_phase") == "active_stream":
-        return light_window[0] < heavy_window[0] < light_window[1]
-    return light.timing_start_ms < heavy_window[0] < light_window[1]
-
-
-def _mark_pair(light, heavy):
-    evidenced = pair_evidenced(light, heavy)
-    for row in (light, heavy):
-        if row is not None:
-            row.workload["observed_overlap"] = 2 if evidenced else 1
-
-
-async def buckets(run, target, client):
-    settings = run.config.buckets
-    heavy_shapes = [kind for kind, weight in settings.heavy_weights.items() for _ in range(weight)]
-    if "buckets" in run.config.checks:
-        for level in settings.levels:
-            for input_shape in ("short", "medium", "long"):
-                for output_shape in ("short", "medium", "long"):
-                    run.plan_condition(target.name, f"bucket_c{level}_{input_shape}_{output_shape}",
-                        planned=sample_count(settings.samples_per_bucket, level), planned_kind="upper_bound")
-    if "mixed" in run.config.checks:
-        run.plan_condition(target.name, "mixed_control", planned=settings.mixed_pairs)
-        for kind in dict.fromkeys(heavy_shapes):
-            for phase in ("before_output", "active_stream"):
-                run.plan_condition(target.name, f"mixed_short_{kind}_{phase}",
-                    planned=2 * settings.mixed_pairs * heavy_shapes.count(kind))
-    if "buckets" in run.config.checks:
-        for level in settings.levels:
-            samples = sample_count(settings.samples_per_bucket, level)
-            for input_shape in ("short", "medium", "long"):
-                for output_shape in ("short", "medium", "long"):
-                    scenario = f"bucket_c{level}_{input_shape}_{output_shape}"
-                    request = bucket_spec(
-                        settings, input_shape, output_shape, scenario, "buckets", level, run.config.context_limit
-                    )
-                    request.options = deterministic_options(run.config, request.options)
-                    end = min(run.deadline, time.monotonic() + settings.window_seconds)
-                    await refill(run, target, client, [request], samples, level, end=end)
-    if "mixed" not in run.config.checks:
-        return
-    if run.config.max_output_tokens < 96:
-        run.unfinished[target.name].add("mixed")
-        return
-    answer = COPY_PASSAGES[0]
-    short = spec(f"Copy the following text exactly, with no extra text:\n{answer}",
-                 "mixed_control", "mixed", expected=answer,
-                 max_tokens=min(192, run.config.max_output_tokens), options=deterministic_options(run.config))
-    await run.group(target, client, [short], "mixed_control", count=settings.mixed_pairs)
-    if run.config.concurrency < 2:
-        run.unfinished[target.name].add("mixed")
-        return
-    try:
-        for block, kind in enumerate(heavy_shapes):
-            for phase in ("before_output", "active_stream"):
-                for index in range(settings.mixed_pairs):
-                    if not run.allowed(target.name):
-                        run.unfinished[target.name].add("mixed")
-                        return
-                    heavy = bucket_spec(
-                        settings,
-                        "long" if kind == "long_input" else "short",
-                        "short" if kind == "long_input" else "long",
-                        f"mixed_heavy_{kind}_{phase}",
-                        "mixed",
-                        2,
-                        run.config.context_limit,
-                    )
-                    heavy.options = deterministic_options(run.config, heavy.options)
-                    pair = block * settings.mixed_pairs + index
-                    heavy.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
-                    light = short.model_copy(deep=True)
-                    light.scenario = f"mixed_short_{kind}_{phase}"
-                    light.workload.update(pair=pair, heavy_type=kind, interference_phase=phase)
-                    event = asyncio.Event()
-                    if phase == "before_output":
-                        started = asyncio.Event()
-                        first = asyncio.create_task(
-                            run.request(target, client, heavy, on_start=started.set)
-                        )
-                        waiter = asyncio.create_task(started.wait())
-                        try:
-                            await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
-                            light.workload["heavy_active_at_dispatch"] = (
-                                not first.done() and started.is_set()
-                            )
-                            def light_started():
-                                light.workload["heavy_active_at_dispatch"] = not first.done()
-                            light_row = await run.request(target, client, light, on_start=light_started)
-                            heavy_row = await first
-                            _mark_pair(light_row, heavy_row)
-                        finally:
-                            waiter.cancel()
-                            if not first.done():
-                                first.cancel()
-                            await asyncio.gather(waiter, first, return_exceptions=True)
-                    else:
-                        first = asyncio.create_task(run.request(target, client, light, event))
-                        waiter = asyncio.create_task(event.wait())
-                        try:
-                            await asyncio.wait([first, waiter], return_when=asyncio.FIRST_COMPLETED)
-                            heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
-                            def heavy_started():
-                                heavy.workload["short_stream_active_at_dispatch"] = event.is_set() and not first.done()
-                            heavy_row = await run.request(target, client, heavy, on_start=heavy_started)
-                            light_row = await first
-                            _mark_pair(light_row, heavy_row)
-                        finally:
-                            waiter.cancel()
-                            if not first.done():
-                                first.cancel()
-                            await asyncio.gather(waiter, first, return_exceptions=True)
-    finally:
-        for kind in dict.fromkeys(heavy_shapes):
-            for phase in ("before_output", "active_stream"):
-                run.finish_condition(target.name, f"mixed_short_{kind}_{phase}")
-
-
 async def sessions(run, target, client):
     settings = run.config.sessions
     mixed = settings.profile == "performance"
@@ -685,13 +525,11 @@ async def tools(run, target, client):
 
 
 async def execute(run, target, client, fixtures):
-    from giraffe.concurrent_workloads import token_stress
-
+    from giraffe.concurrent_load import execute as concurrent_load
     for field, callback in (
         ("arrivals", arrivals),
         ("prefix", prefixes),
-        ("buckets", buckets),
-        ("concurrent_workloads", token_stress),
+        ("concurrent_load", concurrent_load),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -699,7 +537,7 @@ async def execute(run, target, client, fixtures):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and getattr(run.config, field):
             run.emit("scenario_started", target.name, field)
-            if not run.allowed(target.name):
+            if field != "concurrent_load" and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:
@@ -722,7 +560,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if check not in selected:
             continue
         from giraffe.runner import _check_config
-        config = _check_config(run.config, "concurrency") if check in {"buckets", "mixed"} else run.config
+        config = run.config
         records = [r for r in run.records if r.target == target.name and check in r.check_ids]
         metrics = stats(records)
         quality = run_quality(run, records, target.name, configured_metrics(config.limits, check))
@@ -739,6 +577,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             entry = stats(items)
             entry["achieved_overlap"] = max((r.workload.get("observed_overlap", 0) for r in items), default=0)
             entry["workload"] = items[0].workload
+            if check == "prefix":
+                entry["cache_observations"] = [{
+                    "request_id": r.id, "input_tokens": r.input_tokens,
+                    "cached_tokens": r.cached_prompt_tokens, "source": r.cache_source,
+                    "reuse": "reported" if r.cached_prompt_tokens is not None else "unverified",
+                } for r in items]
             if check == "consistency":
                 hashes = Counter(
                     r.answer_hash
@@ -774,72 +618,6 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                             "inconclusive",
                             "Repetition/load coverage lacks sufficient samples or server-evidenced overlap (overlapping streamed output).",
                         )
-            if check == "buckets":
-                level = items[0].workload["level"]
-                expected = items[0].workload["requested_output_tokens"]
-                entry["output_length_exercised"] = sum(
-                    r.valid and r.status == "completed" and r.workload.get("load_qualified", False)
-                    and r.output_tokens is not None and r.output_tokens >= expected * 0.5 for r in items
-                )
-                siblings = {shape: [r.input_tokens for r in records if r.valid
-                            and r.workload.get("load_qualified", False) and r.status == "completed" and r.input_tokens is not None
-                            and r.workload.get("level") == level
-                            and r.workload.get("output_bucket") == items[0].workload["output_bucket"]
-                            and r.workload.get("input_bucket") == shape]
-                            for shape in ("short", "medium", "long")}
-                medians = [sorted(values)[len(values) // 2] if values else None for values in siblings.values()]
-                ordered = all(value is not None for value in medians) and medians[0] < medians[1] < medians[2]
-                requested_sizes = [next((r.workload["requested_input_chars"] for r in records
-                    if r.workload.get("level") == level and r.workload.get("input_bucket") == shape
-                    and r.workload.get("output_bucket") == items[0].workload["output_bucket"]), 0)
-                    for shape in ("short", "medium", "long")]
-                observed_token_span = medians[2] - medians[0] if ordered else 0
-                requested_character_span = requested_sizes[2] - requested_sizes[0]
-                span_verified = (ordered and requested_character_span > 0
-                                 and observed_token_span >= requested_character_span / 10)
-                entry["input_token_medians"] = dict(zip(siblings, medians))
-                entry["input_length_verified"] = sum(span_verified and r.valid and r.status == "completed"
-                    and r.workload.get("load_qualified", False) and r.input_tokens is not None for r in items)
-                entry["qualified_samples"] = sum(r.valid and r.status == "completed"
-                                                  and r.workload.get("load_qualified", False) for r in items)
-                entry["tail_samples"] = [r.id for r in items if not r.workload.get("load_qualified", False)]
-                entry["client_time_weighted_inflight"] = items[0].workload.get("cell_client_time_weighted_inflight")
-                entry["evidenced_concurrency"] = items[0].workload.get("cell_evidenced_concurrency")
-                entry["evidenced_overlap"] = max((r.workload.get("evidenced_overlap", 0) for r in items), default=0)
-                gaps = []
-                if level > 1 and (entry["evidenced_concurrency"] or 0) < level:
-                    gaps.append(f"Requested concurrency {level} was not evidenced by overlapping server output"
-                                + ("" if any(r.stream for r in items) else f"; {NEEDS_STREAM}") + ".")
-                entry["expected_samples"] = sample_count(run.config.buckets.samples_per_bucket, level)
-                if len(items) < entry["expected_samples"] or entry["completed"] < minimum:
-                    gaps.append("Insufficient requested or successful samples.")
-                if entry["qualified_samples"] < minimum:
-                    gaps.append("Requested concurrency lacks sufficient qualified samples; tail samples excluded.")
-                if (items[0].workload["output_bucket"] != "short"
-                        and entry["output_length_exercised"] < minimum):
-                    gaps.append("Requested output length was not sufficiently exercised; a cap alone is not coverage.")
-                if entry["input_length_verified"] < minimum:
-                    gaps.append("input length not exercised: require short < medium < long and a token span of at least the character span / 10.")
-                entry["coverage_gaps"] = gaps
-                if gaps:
-                    if status != "fail":
-                        status, summary = (
-                            "inconclusive",
-                            ("input length not exercised; see per-cell coverage gaps."
-                             if entry["input_length_verified"] < minimum else
-                             "Some length/load cells lack sufficient samples, server-evidenced overlap or observed lengths; see per-cell coverage gaps."),
-                        )
-            if check == "prefix":
-                entry["cache_observations"] = [
-                    {
-                        "request_id": r.id,
-                        "input_tokens": r.input_tokens,
-                        "cached_tokens": r.cached_prompt_tokens,
-                        "source": r.cache_source,
-                        "reuse": "reported" if r.cached_prompt_tokens is not None else "unverified",
-                    }
-                    for r in items
-                ]
             groups[scenario] = entry
         metrics["buckets"] = groups
         if check == "prefix":
@@ -933,85 +711,6 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                     + ("session concurrency is below two." if run.config.sessions.concurrency < 2 else
                        "no session turn's output overlapped another conversation's output; "
                        + (NEEDS_STREAM if not any(r.stream for r in records) else "client overlap alone does not show server concurrency") + "."))
-        if check == "mixed":
-            controls = [r for r in records if r.scenario == "mixed_control" and r.score is True
-                        and r.completion_tokens is not None and r.completion_tokens >= 64]
-            control = stats(controls)
-            comparisons = []
-            for name, row in groups.items():
-                if not name.startswith("mixed_short"):
-                    continue
-                ratio = (
-                    row["p50_ms"] / control["p50_ms"]
-                    if row["p50_ms"] is not None and control["p50_ms"]
-                    else None
-                )
-                light_rows = [r for r in records if r.scenario == name]
-                heavy_rows = [r for r in records if r.scenario == name.replace("mixed_short", "mixed_heavy")]
-                shape_qualified = []
-                heavy_by_pair = {}
-                for heavy in heavy_rows:
-                    heavy_by_pair.setdefault(heavy.workload.get("pair"), []).append(heavy)
-                for light in light_rows:
-                    matches = heavy_by_pair.get(light.workload.get("pair"), [])
-                    exercised = any(r.valid and r.status == "completed" and (
-                        r.completion_tokens is not None and r.completion_tokens >= .5 * r.requested_max_tokens
-                        if r.workload.get("heavy_type") == "long_output" else
-                        r.input_tokens is not None and light.input_tokens is not None
-                        and r.input_tokens >= max(light.input_tokens * 2, light.input_tokens + 128)
-                    ) and pair_evidenced(light, r) for r in matches)
-                    if (exercised and light.valid and light.status == "completed" and light.score is True
-                            and light.completion_tokens is not None and light.completion_tokens >= 64):
-                        shape_qualified.append(light)
-                observed = row["achieved_overlap"] >= 2
-                weight = config.buckets.heavy_weights.get(row["workload"].get("heavy_type"), 1)
-                qualified = (control["completed"] >= minimum
-                             and len(shape_qualified) >= max(minimum, config.buckets.mixed_pairs * weight))
-                qualified_stats = stats(shape_qualified)
-                ratio = (qualified_stats["p50_ms"] / control["p50_ms"]
-                         if qualified_stats["p50_ms"] is not None and control["p50_ms"] else ratio)
-                comparison_quality = run_quality(run, controls + [
-                    r for r in records if r.scenario == name], target.name, ("latency_ms",))
-                comparisons.append(
-                    {
-                        "scenario": name,
-                        "short_only": control,
-                        "mixed_short": row,
-                        "latency_ratio": ratio,
-                        "overlap_observed": observed,
-                        "samples_and_overlap_qualified": qualified,
-                        "shape_qualified_samples": len(shape_qualified),
-                        "timing_quality": comparison_quality,
-                    }
-                )
-                if not qualified and status != "fail":
-                    status, summary = (
-                        "inconclusive",
-                        "Mixed-load comparison lacks sufficient samples, server-evidenced overlap or exercised light/heavy shapes.",
-                    )
-                if (
-                    qualified
-                    and ratio is not None
-                    and config.limits.fairness_max_ratio
-                    and ratio > config.limits.fairness_max_ratio
-                    and comparison_quality["status"] != "client_delayed"
-                ):
-                    status, summary = (
-                        "fail",
-                        "Short-request latency exceeded the configured mixed-load ratio.",
-                    )
-            metrics["unqualified_light_samples"] = [r.id for r in records
-                if (r.scenario == "mixed_control" or r.scenario.startswith("mixed_short")) and r.score is not True]
-            if config.limits.fairness_max_ratio is None and status == "pass":
-                status, summary = "inconclusive", "Mixed-load ratios measured; no acceptance ratio configured."
-            metrics["comparisons"] = comparisons
-            if not comparisons:
-                status = "inconclusive"
-                summary = ("Mixed workload requires an output cap of at least 96 tokens."
-                           if run.config.max_output_tokens < 96 else
-                           "Mixed workload requires concurrency of at least two."
-                           if run.config.concurrency < 2 else
-                           "No mixed-load comparisons were exercised.")
         if check == "tools":
             auto = [r for r in records if r.workload.get("selection") in {"automatic", "contract"}]
             expected_cases = {(fixture.fixture_id, mode)
@@ -1138,12 +837,12 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             if r.completion_tokens is not None and r.completion_tokens > r.requested_max_tokens
         ]
         metrics["output_cap_violations"] = cap_violations
-        if check in {"consistency", "mixed"}:
+        if check in {"consistency"}:
             metrics["correctness_observed"] = (assessed_stats["correct"] / assessed_stats["scored"]
                                                 if assessed_stats["scored"] else None)
         if (
             cap_violations
-            or (check not in {"consistency", "mixed"} and any(r.score is False for r in assessed))
+            or (check not in {"consistency"} and any(r.score is False for r in assessed))
             or (errors is not None and errors > config.limits.max_error_rate)
         ):
             status, summary = (

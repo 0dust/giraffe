@@ -435,6 +435,8 @@ class LLMClient:
                     last_answer = now
                     if streaming:
                         record.answer_chunks += 1
+                        if first_output_event is not None and hasattr(first_output_event, "on_answer_chunk"):
+                            first_output_event.on_answer_chunk()
                 if record.first_output_ms is not None:
                     record.last_output_ms = (now - start) * 1000
             if reasoning:
