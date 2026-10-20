@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 
 import httpx
@@ -702,6 +703,7 @@ async def test_existing_cli_runs_and_interrupted_jobs_survive_restart(tmp_path):
     interrupted.mkdir()
     (interrupted / ".web.json").write_text(json.dumps({"state": "running", "config": config(),
                                                       "started_at": "2026-10-04T12:00:00Z"}))
+    os.utime(interrupted / ".web.json", (1, 1))
     # A standalone baseline JSON is not a run directory.
     (tmp_path / "baseline.json").write_text("{}")
     async with browser(tmp_path) as client:

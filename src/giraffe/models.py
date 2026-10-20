@@ -920,6 +920,8 @@ class RunConfig(Model):
     max_requests: int = Field(default=300, ge=1,
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float = Field(default=300, gt=0)
+    max_memory_mb: int = Field(default=4096, ge=0,
+        description="Memory limit (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
     request_timeout_seconds: float = Field(default=30, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
@@ -1385,10 +1387,13 @@ class RunReport(Model):
     abort_reason: str | None = None
 
 
-def overall_status(checks: list[CheckResult], abort_reason: str | None = None) -> Status:
+def overall_status(checks: list[CheckResult], abort_reason: str | None = None, *,
+                   memory_limit_interrupted: bool = False) -> Status:
     required = [check for check in checks if check.required]
     if any(check.status == "fail" for check in checks):
         return "fail"
+    if memory_limit_interrupted:
+        return "inconclusive"
     if any(check.status == "blocked" for check in required):
         return "blocked"
     if abort_reason or not required or any(check.status == "inconclusive" for check in required):

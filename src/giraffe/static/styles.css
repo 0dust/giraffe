@@ -1223,3 +1223,19 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 .all-requests > .request-viz, .all-requests > .evidence-band { margin-bottom: 0; border: 0; border-radius: 0; box-shadow: none; }
 
 .request-sent, .request-identity, .request-internal { min-width: 0; overflow-wrap: anywhere; }
+
+.storage-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 14px 0 24px; color: var(--text-2); font-size: 13px; }
+.storage-line p { margin: 0; }
+.storage-line button { flex-shrink: 0; }
+.history-storage { display: block; margin-top: 4px; color: var(--text-2); font-size: 11px; }
+.kept-marker { color: var(--text); }
+.cleanup-runs { list-style: none; padding: 0; max-height: 230px; overflow: auto; }
+.cleanup-runs li { padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.cleanup-runs small { display: block; margin-top: 4px; }
+#cleanup-preview { margin-top: 24px; }
+.saved-summary { margin: 20px 0; }
+@media (max-width: 600px) { .storage-line { align-items: flex-start; flex-direction: column; } }
+
+.resource-summary { margin: 24px 0; padding: 20px; display: grid; gap: 12px; }
+.resource-summary h2 { font-size: 18px; }
+.resource-summary .metric dd { font-size: 18px; }

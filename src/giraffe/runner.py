@@ -24,6 +24,7 @@ from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_cu
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
 from .overlap import NEEDS_STREAM, answer_window, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
+from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
 from .timing import TimingHealth, configured_metrics, exceeded_unfinished, qualified_violations, run_quality
 from .models import (
     INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
@@ -172,6 +173,14 @@ class _Run:
         self.budget_counts = Counter()
         self.errors = 0
         self.reason: str | None = None
+        self.memory_limit_reached = False
+        self.memory_stop_reason = None
+        self.memory_measured = False
+        self.memory_sampling_done = False
+        self.rss_at_start_bytes = None
+        self.memory_interrupted_checks = set()
+        self.pending_checks = {(target.name, check) for target in config.targets for check in config.checks}
+        self.judging_pending = any(spec.scorer == "judge" for spec in self.pack_specs)
         self.counts = Counter()
         base, extra = divmod(config.max_requests, len(config.targets))
         self.quotas = {t.name: base + (i < extra) for i, t in enumerate(config.targets)}
@@ -289,6 +298,38 @@ class _Run:
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
+    def mark_unfinished(self, target, checks):
+        self.unfinished[target].update(check for check in checks if not self.memory_limit_reached
+                                      or (target, check) in self.memory_interrupted_checks)
+
+    def finish_checks(self, target, checks):
+        for check in checks:
+            if not (self.judging_pending and check in {"correctness", "capacity"}):
+                self.pending_checks.discard((target, check))
+
+    def memory_sample(self, rss, unfinished=None):
+        if self.memory_sampling_done:
+            return
+        self.memory_measured |= rss is not None
+        limit = self.config.max_memory_mb * 1024**2
+        if rss is None or self.rss_at_start_bytes is None or not limit or self.memory_limit_reached:
+            return
+        growth = max(0, rss - self.rss_at_start_bytes)
+        if growth <= limit:
+            return
+        self.memory_limit_reached = True
+        self.memory_interrupted_checks.update(self.pending_checks if unfinished is None else unfinished)
+        if not self.memory_interrupted_checks:
+            return
+        self.stop_reason()
+        if self.reason in {None, "maximum request budget reached"}:
+            self.memory_stop_reason = (f"memory limit reached: RAM grew by {math.ceil(growth / 1024**2):,} MiB, "
+                                       f"over the {self.config.max_memory_mb:,} MiB limit")
+            self.reason = self.memory_stop_reason
+        for target, check in self.memory_interrupted_checks:
+            self.unfinished[target].add(check)
+        self.stop_reason()
+
     def stop_reason(self, target: str | None = None) -> str | None:
         previous = self.reason
         # A full offer budget must not hide a real stop during the drain.
@@ -400,7 +441,7 @@ class _Run:
             stopped = not admitted or time.monotonic() >= slot_deadline or (
                 reason is not None and reason != "maximum request budget reached")
             if stopped or (not budget_reserved and not budget_exempt and not self.reserve_offer(target.name)):
-                self.unfinished[target.name].update(_scenario_checks(spec))
+                self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
             self.attempted += 1
             output_cap = min(spec.max_tokens or self.config.max_output_tokens, self.config.max_output_tokens)
@@ -522,7 +563,7 @@ class _Run:
                         self.reason = reason or "maximum run duration reached"
                     else:
                         record.error = self.endpoint_health[target.name]["abort_reason"]
-                    self.unfinished[target.name].update(_scenario_checks(spec))
+                    self.mark_unfinished(target.name, _scenario_checks(spec))
             budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
             if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
                 self.errors += 1
@@ -567,7 +608,7 @@ class _Run:
                          for i in range(start, min(start + concurrency, count))]
                 if not self.allowed(target.name):
                     for spec in batch:
-                        self.unfinished[target.name].update(_scenario_checks(spec))
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
                     break
                 result.extend(r for r in await asyncio.gather(
                     *(self.request(target, client, spec, request_parameters=request_parameters) for spec in batch)) if r is not None)
@@ -848,13 +889,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         return
                 else:
                     await run.group(target, client, initial_specs, "initial", count=1)
+            run.finish_checks(target.name, {"access"})
             if enabled & {"serving", "first_output"}:
                 warm_count = config.samples
                 await run.group(target, client, fixtures["short"], "warm", count=warm_count)
+            run.finish_checks(target.name, {"serving", "first_output"})
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
                 await run.group(target, client, builtin_fixtures(effective)["generation"], "generation",
                                 count=effective.samples, checks=["generation"])
+            run.finish_checks(target.name, {"generation"})
             if "capacity" in enabled:
                 from .traffic import arrival_schedule, run_stage
 
@@ -913,8 +957,10 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     if run.reason or run.stop.is_set() or time.monotonic() >= run.deadline:
                         run.unfinished[target.name].add("capacity")
                         break
+            run.finish_checks(target.name, {"capacity"})
             if "fairness" in enabled:
                 await _fairness(run, target, client, builtin_fixtures(_check_config(config, "fairness")))
+            run.finish_checks(target.name, {"fairness"})
             if "context" in enabled:
                 effective = _check_config(config, "context")
                 check_fixtures = builtin_fixtures(effective)
@@ -934,6 +980,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     context_fixtures = await _context_fixtures(
                         run, target, client, check_fixtures, source=source,
                     )
+            run.finish_checks(target.name, {"context"})
             for check_id in ("correctness", "json"):
                 if check_id in enabled:
                     if check_id == "correctness" and run.pack_specs:
@@ -944,6 +991,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                             await run.group(target, client, run.pack_specs, "pack_loaded",
                                             count=max(len(run.pack_specs), effective.concurrency),
                                             concurrency=effective.concurrency, checks=["correctness"])
+                        run.finish_checks(target.name, {check_id})
                         continue
                     effective = _check_config(config, check_id)
                     specs = [spec.model_copy(update={"options": deterministic_options(config, spec.options)})
@@ -951,6 +999,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.group(target, client, specs, f"{check_id}_c{effective.concurrency}",
                                     count=max(effective.samples, len(specs)),
                                     concurrency=effective.concurrency, checks=[check_id])
+                    run.finish_checks(target.name, {check_id})
             if "cancellation" in enabled:
                 effective = _check_config(config, "cancellation")
                 options = config.effective_check("cancellation")
@@ -984,6 +1033,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 if options["backend_verification"] == "required":
                     from giraffe.backend_cancellation import exercise
                     await exercise(run, target, client, fixtures)
+            run.finish_checks(target.name, {"cancellation"})
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 probe_specs = fixtures["sustained"]
@@ -1051,9 +1101,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     "successful_requests": successful, "required_successful_requests": effective.limits.min_samples}
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
+            run.finish_checks(target.name, {"recovery"})
             await workloads.execute(run, target, client, fixtures)
+            run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
-        run.unfinished[target.name].update(enabled)
+        run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
     except Exception as exc:
         detail = str(exc) if isinstance(exc, ValueError) and str(exc).startswith((
             "Missing API key environment variable:", "Missing header environment variable:")) else type(exc).__name__
@@ -1101,6 +1153,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 if "configured" in row and row["configured"]["value"] not in (served, served[0] if len(served) == 1 else served):
                     row["status"] = "conflicting"
                 current["unknown_fields"] = [key for key in current["unknown_fields"] if key != "model.served"]
+
+        run.finish_checks(target.name, enabled)
 
 
 def _timing_violations(records, limits, *, unfinished=False):
@@ -1998,6 +2052,16 @@ def _verdict_summary(check, config, records, budget):
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None) -> RunReport:
+    with PhaseSampler("traffic") as sampler:
+        try:
+            return await _run_suite(config, progress=progress, stop_event=stop_event, sampler=sampler)
+        finally:
+            sampler.detach()
+            if hasattr(sampler, "run"):
+                sampler.run.memory_sampling_done = True
+
+
+async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     from .concurrent_workloads import execution_config, consolidate_checks
 
@@ -2010,6 +2074,24 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                              "per-check samples/concurrency overrides are unsupported.")
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
+    loop = asyncio.get_running_loop()
+    sampler.run = run
+    run.rss_at_start_bytes = sampler.initial_rss_bytes
+    samples = []
+    def consume_samples():
+        with sampler._lock:
+            pending, samples[:] = samples[:], []
+        for rss, unfinished in pending:
+            run.memory_sample(rss, unfinished)
+    def sampled(rss):
+        samples.append((rss, tuple(run.pending_checks)))
+        loop.call_soon_threadsafe(consume_samples)
+    with sampler._lock:
+        sampler.on_sample = sampled
+    run.emit("run_started")
+    sampler.sample()
+    consume_samples()
+    run.memory_sample(sampler.peaks.get("traffic"))
     fixtures = builtin_fixtures(config)
     fixtures = {key: [value] if isinstance(value, RequestSpec) else list(value)
                 for key, value in fixtures.items()}
@@ -2017,7 +2099,8 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     if config.custom_fixtures and "correctness" in config.checks:
         fixtures["correctness"].extend(load_custom_fixtures(config.custom_fixtures))
         custom_hash = hashlib.sha256(Path(config.custom_fixtures).read_bytes()).hexdigest()
-    run.emit("run_started")
+    sampler.sample()
+    consume_samples()
 
     async def target_task(target):
         task = asyncio.create_task(_target(run, target, fixtures))
@@ -2058,8 +2141,10 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         if any(task.cancelled() or not task.done() for task in tasks) or any(run.unfinished.values()):
             run.stop_reason()
     inference_duration = time.monotonic() - run.start
+    sampler.set_phase("scoring")
+    consume_samples()
     judging_summary = None
-    if any(spec.scorer == "judge" for spec in run.pack_specs) and not run.stop.is_set():
+    if any(spec.scorer == "judge" for spec in run.pack_specs) and not run.stop.is_set() and not run.memory_limit_reached:
         from .judging import judge_records
         from .traffic import finalize_stage
 
@@ -2069,14 +2154,24 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
             config, run.records, run.pack_specs, stop_event=run.stop,
             progress=lambda event: run.emit(**event, phase="judging"),
         ))
+        async def memory_watch():
+            while not evaluation.done():
+                if run.memory_limit_reached:
+                    run.stop.set()
+                    return
+                await asyncio.sleep(.05)
+        memory_monitor = asyncio.create_task(memory_watch())
         try:
             judging_summary = await asyncio.shield(evaluation)
         except asyncio.CancelledError:
             # Let the evaluator close its own workers and preserve partial votes.
             run.stop.set()
             judging_summary = await evaluation
+        finally:
+            memory_monitor.cancel()
+            await asyncio.gather(memory_monitor, return_exceptions=True)
         if run.stop.is_set():
-            run.reason = "cancelled by user"
+            run.reason = run.reason or "cancelled by user"
         limits = _check_config(config, "capacity").limits
         for target in config.targets:
             if run.stage_evidence[target.name]:
@@ -2090,12 +2185,28 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
             if row["failed"] != failures[key]:
                 row["failed"] = failures[key]
                 run.emit_condition("condition_finished", row["condition"]["id"], row)
+    run.judging_pending = False
+    for target in config.targets:
+        run.finish_checks(target.name, config.checks)
+    consume_samples()
     run.verdict_budget_guidance = _budget_guidance(config)
     checks = [check for target in config.targets for check in _checks(run, target)]
     checks = consolidate_checks(run, public_config, checks)
+    sampler.close()
+    consume_samples()
+    sampler.detach()
+    run.memory_sampling_done = True
+    if "concurrency" in public_config.checks:
+        from .concurrent_workloads import SCENARIOS
+        components = {item[0] for item in SCENARIOS.values()}
+        run.memory_interrupted_checks = {(target, "concurrency" if check in components else check)
+                                        for target, check in run.memory_interrupted_checks}
     target_abort_reasons = {target: health["abort_reason"] for target, health in run.endpoint_health.items()
                            if health["abort_reason"]}
     for check in checks:
+        if (check.target, check.id) in run.memory_interrupted_checks and check.status == "pass":
+            check.status = "inconclusive"
+            check.summary = run.reason + ". This check was interrupted."
         if check.target in target_abort_reasons and check.status == "pass":
             check.status = "inconclusive"
             check.summary = target_abort_reasons[check.target] + ". This check was interrupted."
@@ -2105,6 +2216,9 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
             counts[target.name][scenario] = _stats([r for r in run.records if r.target == target.name and r.scenario == scenario])
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
+    if run.memory_limit_reached:
+        warnings.append("Memory limit (RAM growth during this run) was exceeded." +
+            (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))
     if any(check.metrics.get("low_confidence") for check in checks):
         warnings.append("Some checks have too few successful samples for confident timing conclusions.")
     if run.max_lag_ms > 100:
@@ -2121,7 +2235,23 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
         warnings.append("Request-pack correctness covers every case; global samples does not select case count. "
                         "Without capacity, one quiet pass and a concurrent pass of at least global concurrency run. "
                         "Legacy request previews omit this extra concurrent pass.")
-    observations = {"targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
+    observations = {"resources": {
+                        "sampled_peak_rss_bytes": dict(sampler.peaks),
+                        "rss_at_start_bytes": run.rss_at_start_bytes,
+                        "sampled_peak_growth_bytes": {phase: max(0, value - run.rss_at_start_bytes)
+                            if value is not None and run.rss_at_start_bytes is not None else None
+                            for phase, value in sampler.peaks.items()},
+                        "process_peak_rss_bytes": peak_rss_bytes(),
+                        "memory_limit_bytes": config.max_memory_mb * 1024**2,
+                        "memory_limit_reached": run.memory_limit_reached,
+                        "memory_limit_stopped_run": bool(run.memory_interrupted_checks),
+                        "memory_interrupted_checks": [{"target": target, "id": check}
+                            for target, check in sorted(run.memory_interrupted_checks)],
+                        "measurement_available": run.memory_measured,
+                        "guardrail_active": bool(config.max_memory_mb and run.rss_at_start_bytes is not None),
+                        "memory_measurement": "sampled process RSS" if run.memory_measured else "not measured on this platform",
+                        "sampling": SAMPLING},
+                    "targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
                     "target_abort_reasons": target_abort_reasons,
                     "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
@@ -2202,9 +2332,15 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
                     "latency_ms": "client dispatch through protocol completion",
                     "workload_sizes": "character sizing is requested shape; server token usage is observed length",
                     "warmup": "initial and warm short requests only when required by selected checks or restart readiness; fairness and recovery use their own matched baselines"}}
-    run.emit("run_finished", abort_reason=run.reason, target_abort_reasons=target_abort_reasons)
+    memory_required_interrupted = any(check.required and (check.target, check.id)
+                                     in run.memory_interrupted_checks for check in checks)
+    verdict_reason = run.reason
+    if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
+        verdict_reason = None
+    run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)
     return RunReport(run_id=run_id, suite_version=SUITE_VERSION,
                      started_at=started_at, finished_at=_now(),
-                     overall=overall_status(checks, run.reason or next(iter(target_abort_reasons.values()), None)), manifest=manifest, checks=checks,
+                     overall=overall_status(checks, verdict_reason or next(iter(target_abort_reasons.values()), None),
+                                            memory_limit_interrupted=memory_required_interrupted), manifest=manifest, checks=checks,
                      requests=run.records, warnings=warnings, observations=observations,
-                     abort_reason=run.reason)
+                     abort_reason=verdict_reason)
