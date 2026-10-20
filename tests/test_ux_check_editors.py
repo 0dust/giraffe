@@ -181,7 +181,7 @@ assert.equal(elements.test_context_context_limit.max,'65536');
 assert.equal(config.test_options.correctness.concurrency,8);
 config.request_source='request_pack';config.request_pack={cases:[]};
 const recovery=checkOverrideWarning(check,config,true);
-assert.match(recovery,/Reset this check’s overrides or raise Concurrency ceiling in Run limits/);
+assert.match(recovery,/Reset this check’s overrides or raise Maximum at once in Run limits/);
 const markup=renderTestCard(check,config);
 assert.match(markup,/data-check-override-warning="correctness" >/);
 assert(markup.indexOf('data-check-override-warning')<markup.indexOf('data-test-editor="correctness" hidden'));

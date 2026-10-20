@@ -991,8 +991,16 @@ class RunConfig(Model):
             value["concurrent_workloads"] = settings
         if isinstance(value.get("concurrent_workloads"), dict):
             settings = dict(value["concurrent_workloads"])
-            settings.setdefault("levels", [level for level in (1, 2) if level <= value.get("concurrency", 4)])
-            settings.setdefault("output_tokens", {name: min(cap, value.get("max_output_tokens", 128))
+            # Infer defaults from coercible JSON numbers; field validation below
+            # still rejects invalid originals without migration raising TypeError.
+            def default_limit(name, default):
+                try:
+                    return int(float(value.get(name, default)))
+                except (TypeError, ValueError, OverflowError):
+                    return default
+
+            settings.setdefault("levels", [level for level in (1, 2) if level <= default_limit("concurrency", 4)])
+            settings.setdefault("output_tokens", {name: min(cap, default_limit("max_output_tokens", 128))
                                                   for name, cap in Buckets().output_tokens.items()})
             value["concurrent_workloads"] = settings
         if "checks" in value:

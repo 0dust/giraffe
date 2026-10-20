@@ -8,7 +8,7 @@ from typing import Any
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.concurrent_workloads import SCENARIOS, execution_config
-from giraffe.models import CHECK_NAMES, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
+from giraffe.models import CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig
 from giraffe.request_pack import active_pack, pack_summary
 from giraffe.workloads import bucket_spec, fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -23,6 +23,156 @@ def _steady_count(rate: float, duration: float) -> int:
     while count / rate < duration:
         count += 1
     return min(count, MAX_PLANNED_ARRIVALS)
+
+
+def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]],
+               bucket_levels: list[dict[str, Any]]) -> dict[str, Any]:
+    """Estimate target traffic before caps, with one second/request as a heuristic.
+
+    Sum sequential phases and targets for a conservative bound even when targets
+    overlap. Request calls do not retry; readiness polling has its own deadline.
+    Matrix windows cap admission, not completion: the last batch can still drain.
+    These are network/workload budgets, not bounds on Python or report I/O time.
+    """
+    typical = worst = minimum = 0.0
+    reasons = []
+    selected = set(config.checks)
+    timeout = config.request_timeout_seconds
+    for row in rows:
+        name, count = row["id"], row["requests_per_target"]
+        if count == 0 and name != "capacity":
+            continue
+        check = {"initial": "access", "pack_loaded": "correctness",
+                 "fairness_baseline": "fairness", "fairness_short": "fairness",
+                 "context_first_batch": "context", "recovery_prime": "recovery",
+                 "recovery_baseline": "recovery", "limits.stop_control": "cancellation",
+                 "backend_cancellation": "cancellation"}.get(name, name)
+        options = config.effective_check(check) if check in CHECK_OPTION_FIELDS else {}
+        wait = options.get("request_timeout_seconds", timeout)
+        concurrency = 1
+        if name in {"correctness", "json", "pack_loaded"}:
+            concurrency = options.get("concurrency", config.concurrency)
+        if name == "initial" and "access" not in selected:
+            wait = timeout
+        if name == "capacity":
+            traffic = config.effective_traffic()
+            windows = len(traffic.rates) * traffic.duration_seconds
+            minimum += windows
+            typical += windows + len(traffic.rates) * min(1, timeout, traffic.drain_timeout_seconds)
+            worst += windows + len(traffic.rates) * min(timeout, traffic.drain_timeout_seconds)
+            continue
+        if name == "buckets":
+            for level in bucket_levels:
+                batches = math.ceil(level["requests_per_case"] / min(level["concurrency"], config.concurrency))
+                typical += 9 * min(batches * min(1, wait), config.buckets.window_seconds + min(1, wait))
+                worst += 9 * min(batches * wait, config.buckets.window_seconds + wait)
+            continue
+        if name == "restart_readiness":
+            typical += min(1, config.readiness_timeout_seconds)
+            worst += config.readiness_timeout_seconds + timeout
+            continue
+        if name == "sustained":
+            seconds = config.effective_check("recovery")["sustained_seconds"]
+            minimum += seconds
+            typical += seconds + min(1, timeout)
+            worst += seconds + timeout
+            continue
+        if name == "arrivals":
+            settings = config.arrivals
+            last = ((settings.requests - 1) / settings.requests_per_second if settings.mode == "steady"
+                    else ((settings.requests - 1) // settings.burst_size) * settings.interval_seconds)
+            minimum += last
+            typical += last + min(1, wait)
+            worst += last + count * wait  # Conservatively include slot waiting/drain.
+            continue
+        if name == "consistency":
+            settings = config.consistency
+            levels = set([1, *settings.levels])
+            if settings.logprobs:
+                batches = len(settings.shapes) * (settings.repetitions + settings.logprobs.priming_rounds) * sum(
+                    math.ceil(corpus_width(settings) / min(level, config.concurrency)) for level in levels)
+            else:
+                batches = len(settings.shapes) * settings.prompts_per_shape * sum(
+                    math.ceil(sample_count(settings.repetitions, level) / min(level, config.concurrency)) for level in levels)
+            typical += batches * min(1, wait)
+            worst += count * wait
+            continue
+        if name.startswith("token_stress_"):
+            settings = config.concurrent_workloads
+            case = next(case for case in settings.stress_cases if name == f"token_stress_{case.name}")
+            calibration = settings.calibration_attempts if case.input_tokens else 0
+            batches = calibration + sum(math.ceil(max(settings.samples_per_bucket, level) / min(level, config.concurrency))
+                                        for level in settings.levels)
+            typical += batches * min(1, wait)
+            worst += (calibration + sum(max(settings.samples_per_bucket, level) for level in settings.levels)) * wait
+            continue
+        if name == "sessions":
+            settings = config.sessions
+            turns = max(len(workload.turns) for workload in settings.workloads) if settings.profile == "performance" else len(settings.turns)
+            modes = 1 if settings.profile == "performance" else len(settings.modes)
+            waves = math.ceil(settings.sessions / min(settings.concurrency, config.concurrency))
+            typical += modes * waves * (turns * min(1, wait) + (turns - 1) * settings.delay_seconds)
+            # A serial bound also covers unequal-length conversations and shared slots.
+            requests = count if count is not None else settings.sessions * turns * modes
+            worst += requests * (wait + settings.delay_seconds)
+            continue
+        if count is None:
+            if name == "context":
+                count = 1 + 2 * next(row["requests_per_target"] for row in rows if row["id"] == "context_first_batch")
+            elif name == "fairness":
+                count = config.effective_check("fairness")["samples"]
+            elif name == "backend_cancellation":
+                count = 3 * config.effective_check("cancellation")["samples"]
+            else:
+                reasons.append(f"{row['title']}: the full workload size is unknown before local inputs or target responses are available.")
+                continue
+        # Serial is intentionally conservative for compound scenarios whose
+        # requests overlap only when the server exhibits the required behavior.
+        batches = math.ceil(count / min(concurrency, config.concurrency))
+        typical += batches * min(1, wait)
+        worst += batches * wait
+    if "cancellation" in selected:
+        options = config.effective_check("cancellation")
+        worst += min(5, options["cleanup_seconds"])
+        if options["backend_verification"] == "required":
+            worst += options["samples"] * options["trace_wait_seconds"]
+    if "gpu" in selected:
+        typical = max(typical, config.gpu_min_observation_seconds)
+        worst = max(worst, config.gpu_min_observation_seconds) + 2 * config.metrics_timeout_seconds
+    targets = len(config.targets)
+    # Overlapping targets still share request slots. Never reduce the upper bound.
+    estimate = max(typical, typical * targets / config.concurrency) if config.overlap_models else typical * targets
+    minimum *= 1 if config.overlap_models else targets
+    worst *= targets
+    errors, warnings = [], []
+    if minimum > config.max_duration_seconds:
+        fields = ["max_duration_seconds"]
+        if "capacity" in selected:
+            fields += ["traffic.duration_seconds", "traffic.rates"]
+        if "arrivals" in selected:
+            fields += ["arrivals.requests", "arrivals.requests_per_second" if config.arrivals.mode == "steady" else "arrivals.interval_seconds"]
+        if "recovery" in selected:
+            fields += ["test_options.recovery.sustained_seconds"]
+        values = {"minimum_seconds": minimum, "max_duration_seconds": config.max_duration_seconds}
+        if "capacity" in selected:
+            values.update({"traffic.duration_seconds": config.effective_traffic().duration_seconds,
+                           "traffic.rates": config.effective_traffic().rates})
+        if "arrivals" in selected:
+            values.update({field: getattr(config.arrivals, field.split(".")[-1])
+                           for field in fields if field.startswith("arrivals.")})
+        if "recovery" in selected:
+            values["test_options.recovery.sustained_seconds"] = config.effective_check("recovery")["sustained_seconds"]
+        errors.append({"field": fields[0], "fields": fields, "loc": ["body", fields[0]],
+                       "values": values,
+                       "msg": f"Fixed sending windows need at least {minimum:g} seconds, exceeding Traffic time limit {config.max_duration_seconds:g} seconds."})
+    elif not reasons and worst > config.max_duration_seconds:
+        warnings.append({"fields": ["max_duration_seconds", "request_timeout_seconds"],
+                         "msg": "Request timeouts may exceed the Traffic time limit and stop target traffic with checks unfinished. Shorter per-check timeouts also apply."})
+    return {"estimated_seconds": None if reasons else round(estimate, 3),
+            "worst_case_seconds": None if reasons else round(worst, 3),
+            "minimum_seconds": minimum, "time_bound_reasons": reasons,
+            "time_estimate_assumptions": ["Assumes one second per request (or its shorter timeout); no endpoint measurements are available. Target traffic only, excluding AI evaluation and report saving."],
+            "errors": errors, "time_warnings": warnings}
 
 
 def request_plan(config: RunConfig | ConfigDraft, *,
@@ -350,7 +500,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             warnings.append(f"{target} needs at least {known} requests, but its share of the run limit is {quota}. Some tests may be incomplete.")
         elif planned is not None and planned > quota:
             warnings.append(f"About {planned} requests are planned for {target}, but its share of the run limit is {quota}. Some tests may be incomplete.")
-    return {"count_kind": kind, "planned_per_target": planned,
+    return {**_time_plan(config, rows, bucket_levels), "count_kind": kind, "planned_per_target": planned,
             "planned_total": planned * target_count if planned is not None else None,
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,
             "known_per_target": known, "known_total": known * target_count,
