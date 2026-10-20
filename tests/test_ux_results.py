@@ -231,7 +231,7 @@ assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;
 assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);
 assert.match(html,/data-comparison-group="context"/);assert.match(html,/Context recall/);
 assert.match(html,/1 regressed · 1 inconclusive/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
-assert.match(html,/question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
+assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
 assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
 state.comparisonFilter='all';html=renderComparison(value);
 assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
