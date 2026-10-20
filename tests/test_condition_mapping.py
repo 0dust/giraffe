@@ -5,8 +5,15 @@ import pytest
 from giraffe.conditions import condition_for
 
 
+def identity(condition):
+    """Keep the grouping contract separate from the new explanatory metadata."""
+    assert condition["purpose"]
+    assert isinstance(condition["parameters"], dict)
+    return {key: value for key, value in condition.items() if key not in {"purpose", "parameters"}}
+
+
 def test_matrix_cell_is_one_condition_with_plain_shapes_and_level():
-    assert condition_for("bucket_c32_short_short", {}) == {
+    assert identity(condition_for("bucket_c32_short_short", {})) == {
         "id": "bucket_c32_short_short", "label": "Short input / short output · 32 at once",
         "check": "buckets", "level": 32, "input": "short", "output": "short",
     }
@@ -16,7 +23,7 @@ def test_consistency_prompt_indices_are_details_within_level_and_shape():
     first = condition_for("consistency_c32_long_p0", {"prompt_index": 0})
     assert first == condition_for("consistency_c32_long_p19", {"prompt_index": 19})
     assert first == condition_for("consistency_c32_long", {})
-    assert first == {"id": "consistency_c32_long", "label": "Long input consistency · 32 at once",
+    assert identity(first) == {"id": "consistency_c32_long", "label": "Long input consistency · 32 at once",
                      "check": "consistency", "level": 32, "input": "long"}
     assert first["id"] != condition_for("consistency_c1_long_p0", {})["id"]
 
@@ -36,7 +43,7 @@ def test_mixed_short_and_heavy_share_one_condition(kind, phase):
 def test_sessions_group_all_turns_and_sessions_by_mode():
     assert condition_for("session_live_turn0", {"session_id": "a"}) == condition_for(
         "session_live_turn8", {"session_id": "b"})
-    assert condition_for("session_live_turn0", {}) == {
+    assert identity(condition_for("session_live_turn0", {})) == {
         "id": "session_live", "label": "Live sessions", "check": "sessions"}
     assert condition_for("session_fixed_turn0", {})["id"] == "session_fixed"
 
@@ -45,21 +52,21 @@ def test_sessions_group_all_turns_and_sessions_by_mode():
 def test_tool_conversation_turns_group_by_fixture_and_mode(mode):
     first = condition_for(f"tools_weather_result_{mode}_turn0", {})
     assert first == condition_for(f"tools_weather_result_{mode}_turn12", {"turn_id": 12})
-    assert first == {"id": f"tools_weather_result_{mode}",
-                     "label": f"Weather result conversation · {mode}", "check": "tools"}
+    assert identity(first) == {"id": f"tools_weather_result_{mode}",
+                     "label": f"Weather result conversation · {'streaming' if mode == 'stream' else 'non-streaming'}", "check": "tools"}
     assert first["id"] != condition_for(f"tools_other_{mode}_turn0", {})["id"]
 
 
 def test_arrivals_group_by_configured_rate():
     first = condition_for("arrival", {"requests_per_second": 2})
     assert first == condition_for("arrival", {"requests_per_second": 2.0, "arrival_index": 9})
-    assert first == {"id": "arrival_r2", "label": "Arrivals · 2 per second", "check": "arrivals"}
+    assert identity(first) == {"id": "arrival_r2", "label": "Arrivals · 2 per second", "check": "arrivals"}
     assert first["id"] != condition_for("arrival", {"requests_per_second": 4})["id"]
     assert first["id"] != condition_for("arrival", {"requests_per_second": 2.0000001})["id"]
 
 
 def test_token_stress_keeps_each_case_and_level_separate():
-    assert condition_for("stress_long_input_summary_c8", {}) == {
+    assert identity(condition_for("stress_long_input_summary_c8", {})) == {
         "id": "stress_long_input_summary_c8", "label": "Long input summary · 8 at once",
         "check": "token_stress", "level": 8,
     }
@@ -74,7 +81,7 @@ def test_token_stress_keeps_each_case_and_level_separate():
     ("client_deadline", "Client deadline", "cancellation"),
     ("fairness_short", "Short requests with competing load", "fairness"),
     ("prefix_shared", "Shared prefix", "prefix"),
-    ("tools_custom_auto_stream", "Tools custom auto stream", "tools"),
+    ("tools_custom_auto_stream", "Custom tool calls · automatic · streaming", "tools"),
     ("new_custom_scenario", "New custom scenario", "serving"),
 ])
 def test_other_scenarios_keep_their_own_condition(scenario, label, check):
@@ -85,8 +92,8 @@ def test_other_scenarios_keep_their_own_condition(scenario, label, check):
 
 
 def test_traffic_stages_stay_distinct_and_use_plain_labels():
-    assert condition_for("traffic_stage_0", {}) == {
-        "id": "traffic_stage_0", "label": "Traffic stage 1", "check": "capacity"}
+    assert identity(condition_for("traffic_stage_0", {})) == {
+        "id": "traffic_stage_0", "label": "Capacity traffic", "check": "capacity"}
 
 
 def test_mapping_does_not_mutate_workload_metadata():
