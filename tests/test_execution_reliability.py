@@ -116,7 +116,7 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
                  readiness_timeout_seconds=2)
     attempts = []
     class Cold(Client):
-        def __init__(self, *args):
+        def __init__(self, *args, max_connections=None):
             pass
         async def __aenter__(self):
             return self
@@ -146,7 +146,7 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
 async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(monkeypatch):
     cfg = config(checks=["access"], restart_target="t", readiness_timeout_seconds=.03)
     class Cold(Client):
-        def __init__(self, *args):
+        def __init__(self, *args, max_connections=None):
             pass
         async def __aenter__(self):
             return self
@@ -168,7 +168,7 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
 async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch):
     class Healthy(Client):
         count = 0
-        def __init__(self, *args):
+        def __init__(self, *args, max_connections=None):
             pass
         async def __aenter__(self):
             return self
@@ -182,7 +182,7 @@ async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(
     monkeypatch.setattr(runner, "LLMClient", Healthy)
     cfg = config(checks=["capacity", "correctness"], concurrency=64,
         test_options={"correctness": {"concurrency": 1}}, stop_after_errors=1,
-        traffic={"rates": [1000], "duration_seconds": .06},
+        traffic={"rates": [1000], "duration_seconds": .06, "max_in_flight": 64},
         limits={"latency_ms": 200, "min_samples": 2})
     report = await runner.run_suite(cfg)
     stage = next(c for c in report.checks if c.id == "capacity").metrics["traffic_stages"][0]
@@ -203,4 +203,4 @@ async def test_scorer_failure_preserves_attempt_record_and_clears_inflight(monke
         await run.request(cfg.targets[0], Client(), spec)
     assert len(run.records) == run.attempted == 1
     assert not run.inflight and run.active[("t", "warm")] == 0
-    assert run.slots.qsize() == cfg.concurrency
+    assert run.slots.qsize() == run.slots.maxsize

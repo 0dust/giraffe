@@ -359,9 +359,12 @@ def test_configuration_diff_visible_for_incomparable_and_legacy_baselines():
         }
     }
     baseline.manifest["config"]["concurrency"] = 8
+    baseline.limits_reached = ["concurrency"]
     original = baseline.model_dump_json()
     result = compare_baseline(current, baseline)
     assert result.baseline["status"] == "inconclusive"
+    assert any("concurrency differs and its limit stopped work" in reason
+               for reason in result.baseline["targets"][0]["reasons"])
     diff = result.baseline["targets"][0]["configuration_diff"]
     assert diff["unknown_baseline"] is True and diff["confounded"] is True
     assert {r["field"] for r in diff["fields"]} == {"runtime.image_digest", "backend.attention"}

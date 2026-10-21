@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from giraffe.models import ConcurrentLoad
+from giraffe.capabilities import capabilities
 
 
 APP = Path(__file__).parents[1] / "src/giraffe/static/app.js"
@@ -21,18 +22,19 @@ def run_browser_logic(body):
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {positiveBoundErrors} from MODULE_PATH;
 const nodes={},listeners={},groups={};
-const loadDefaults=LOAD_DEFAULTS;
+const loadDefaults=LOAD_DEFAULTS;const bootstrap=BOOTSTRAP;
 function element(extra={}) {
   return {hidden:false,disabled:false,innerHTML:'',textContent:'',value:'',dataset:{},
     attributes:{},classList:{toggle(){}},setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];},
     focus(){this.focused=true;},...extra};
 }
 const document={querySelector:q=>nodes[q],querySelectorAll:q=>groups[q] || [],addEventListener:(kind,fn)=>listeners[kind]=fn};
-const context={assert,nodes,listeners,groups,element,loadDefaults,structuredClone,document,window:{addEventListener(){}},location:{hash:'#new'}};
+const context={assert,positiveBoundErrors,nodes,listeners,groups,element,loadDefaults,bootstrap,structuredClone,document,window:{addEventListener(){}},location:{hash:'#new'}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
-await vm.runInNewContext(source+'\nstate.bootstrap={concurrent_load:{defaults:loadDefaults}};\n(async()=>{'+BODY+'\n})()',context);
-""".replace("APP_PATH", json.dumps(str(APP))).replace("BODY", json.dumps(body)).replace("LOAD_DEFAULTS", json.dumps(ConcurrentLoad().model_dump()))
+await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;\n(async()=>{'+BODY+'\n})()',context);
+""".replace("MODULE_PATH", json.dumps(APP.with_name("form-config.mjs").as_uri())).replace("APP_PATH", json.dumps(str(APP))).replace("BODY", json.dumps(body)).replace("LOAD_DEFAULTS", json.dumps(ConcurrentLoad().model_dump())).replace("BOOTSTRAP", json.dumps(capabilities()))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -51,16 +53,16 @@ for(const [name,input] of [['load_schedule_levels',levels],['concurrency',ceilin
 }
 nodes['#new-run-form']={elements:{load_schedule_levels:levels,concurrency:ceiling}};
 nodes['[data-test-card="concurrency"]']=element();
-const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.',values:{concurrency:40}}];
+const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Limit simultaneous requests 40.',values:{concurrency:40}}];
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
 syncInlineErrors();
 assert.equal(levels.attributes['aria-invalid'],'true');assert.match(levels.attributes['aria-describedby'],/field-load_schedule_levels-error/);
 assert.match(levels.attributes['aria-describedby'],/field-load_schedule_levels-hint/);
 assert.match(nodes['#field-concurrency-error'].textContent,/64.*40/);
 let markup=renderRunBlueprint(state.config);
-assert.match(markup,/Concurrency level 64 exceeds Maximum at once 40/);
+assert.match(markup,/Concurrency level 64 exceeds Limit simultaneous requests 40/);
 assert.match(markup,/data-setting-path="concurrent_load.schedule.levels"[^>]*>Edit concurrency levels/);
-assert.match(markup,/data-setting-path="concurrency"[^>]*>Edit maximum at once/);
+assert.match(markup,/data-setting-path="concurrency"[^>]*>Edit Limit simultaneous requests/);
 state.setupStep=3;await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:'concurrent_load.schedule.levels'}}:null}});
 assert.equal(state.setupStep,2);assert.equal(state.openTest,'concurrency');assert(shared.open&&nested.open);assert(levels.focused&&levels.scrolled);
 assert.equal(levels.attributes['data-setting-highlight'],'true');
@@ -77,13 +79,13 @@ def test_checks_footer_reports_validation_errors_then_returns_to_a_current_plan(
 state.config={checks:['access','concurrency','correctness'],targets:[],concurrency:40,max_requests:300,max_duration_seconds:120};
 state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 nodes['#request-plan']=element();nodes['#dock-summary']=element();
-const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
+const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Limit simultaneous requests 40.'}];
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/3<\/strong> checks.*1 setting to fix/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/Planning/);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{errors,count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/1 setting to fix/); // Draft plans can carry blocking errors with HTTP 200.
 state.requestPreview.errors=errors;state.requestPreview.status='error';state.requestPreview.error='Conflict';
-state.requestPreview.errors.push({field:'max_duration_seconds',msg:'Traffic time limit is too short.'});renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/2 settings to fix/);
+state.requestPreview.errors.push({field:'max_duration_seconds',msg:'Stop test traffic after is too short.'});renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/2 settings to fix/);
 configChanged();assert.match(nodes['#dock-summary'].innerHTML,/Planning/);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/30 requests planned/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/to fix|Planning/);
@@ -96,7 +98,7 @@ def test_edit_setting_scrolls_the_field_and_error_clear_of_the_narrow_footer():
     run_browser_logic(r"""
 state.config={checks:['concurrency']};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 syncConfigView=syncSetupStep=syncTestControls=()=>{};window.innerWidth=375;
-const error=element({hidden:false,textContent:'Concurrency level 64 exceeds Maximum at once 40.'});
+const error=element({hidden:false,textContent:'Concurrency level 64 exceeds Limit simultaneous requests 40.'});
 const group=element({style:{},scrollIntoView(options){assert.equal(options.block,'center');assert(!error.hidden);this.scrolled=true;}});
 const input=element({parentElement:group,closest(q){return q==='.form-field'?group:null;},scrollIntoView(){throw Error('Scroll the complete field group, not only its input');},focus(options){assert(options.preventScroll);this.focused=true;}});
 nodes['#new-run-form']={elements:{load_schedule_levels:input}};nodes['[data-test-card="concurrency"]']=element();
@@ -126,7 +128,7 @@ state.config={checks:['sessions'],sessions:{profile:'performance'}};state.jsonDr
 syncConfigView=syncSetupStep=syncTestControls=()=>{};
 switchConfigView=()=>{throw Error('Should stay in the form');};
 const cap=element(),ceiling=element(),workload=element(),details=element({tagName:'DETAILS',open:false});workload.parentElement=details;
-nodes['#new-run-form']={elements:{sessions_profile:{value:'performance'},sessions_max_tokens:cap,concurrency:ceiling,
+nodes['#new-run-form']={elements:{sessions_profile:{value:'performance'},profile_sessions_max_tokens:cap,profile_sessions_concurrency:ceiling,
   session_cap_1:workload,session_workload_count:{value:'2'},session_enabled_0:{checked:false},session_enabled_1:{checked:true}}};
 nodes['[data-test-card="sessions"]']=element();
 focusSetting('sessions.max_tokens');assert(cap.focused);
@@ -170,7 +172,7 @@ const input=element({name:'load_schedule_levels'});nodes['#field-load_schedule_l
 nodes['#new-run-form']={elements:{load_schedule_levels:input}};nodes['[data-test-card="concurrency"]']=element();
 readForm=()=>({config:structuredClone(state.config)});
 let fixed=false,calls=0;
-const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Maximum at once 40.'}];
+const errors=[{field:'concurrent_load.schedule.levels',fields:['concurrent_load.schedule.levels','concurrency'],msg:'Concurrency level 64 exceeds Limit simultaneous requests 40.'}];
 api=async()=>{calls++;if(!fixed)throw Object.assign(new Error(errors[0].msg),{errors});return {config:state.config,request_plan:{rows:[],warnings:[],count_kind:'exact',planned_total:10}};};
 navigateSetup(3);await Promise.resolve();await Promise.resolve();await Promise.resolve();
 assert.equal(calls,1);assert.equal(state.setupStep,2);assert(input.focused);
@@ -187,19 +189,42 @@ def test_time_estimate_and_warning_have_distinct_copy_and_edit_links_in_both_vie
     run_browser_logic(r"""
 state.config={checks:['access'],targets:[{}],concurrency:4,max_requests:100,max_duration_seconds:20};
 state.jsonDraft=state.jsonBase='synced';
-const plan={count_kind:'exact',planned_total:4,request_limit:100,rows:[],warnings:[],estimated_seconds:4,worst_case_seconds:120,
- time_estimate_assumptions:['Assumes one second per request.'],time_warnings:[{msg:'The limit may leave checks unfinished.',fields:['max_duration_seconds','request_timeout_seconds']}]};
+const plan={count_kind:'exact',planned_total:4,request_limit:100,rows:[],warnings:[],estimated_seconds:4,
+ estimated_low_seconds:3,estimated_high_seconds:5,confidence:'medium',estimate_exclusions:['setup/connection','AI evaluation','report generation'],
+ time_warnings:[{msg:'The limit may leave checks unfinished.',fields:['max_duration_seconds','request_timeout_seconds'],actions:[{label:'Use 30 s',field:'max_duration_seconds',value:30},{label:'Edit request timeout',field:'request_timeout_seconds'}]}],
+ request_warnings:[{msg:'Answer correctness will be cut.',fields:['max_requests'],actions:[{label:'Use 120 total requests',field:'max_requests',value:120}]}]};
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};nodes['#request-plan']=element();
 renderRequestPlan();
 for(const markup of [nodes['#request-plan'].innerHTML,renderRunBlueprint(state.config,plan)]){
-  assert.match(markup,/Usually about 4s/);assert.match(markup,/Up to 2m 0s if every request hits its timeout/);
-  assert.match(markup,/Edit traffic time limit/);assert.match(markup,/Edit request timeout/);
+  assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);
+  assert.match(markup,/about 3 s–5 s · test traffic only/);assert.match(markup,/Confidence: medium/);
+  assert.match(markup,/setup\/connection, AI evaluation, report generation/);
+  assert.match(markup,/Use 30 s/);assert.match(markup,/Edit request timeout/);
+  assert.match(markup,/Use 120 total requests/);assert.match(markup,/Answer correctness will be cut/);
+  assert.doesNotMatch(markup,/Usually about|one second per request/);
 }
 assert(canStartRun());
-plan.errors=[{field:'max_duration_seconds',fields:['max_duration_seconds','traffic.rates'],msg:'Fixed windows exceed Traffic time limit.'}];
+plan.errors=[{field:'max_duration_seconds',fields:['max_duration_seconds','traffic.rates'],msg:'Fixed windows exceed Stop test traffic after.'}];
 assert(!canStartRun());renderRequestPlan();assert.match(nodes['#request-plan'].innerHTML,/data-setting-path="traffic.rates"/);
-plan.estimated_seconds=plan.worst_case_seconds=null;plan.time_bound_reasons=['Local fixture size unknown.'];
-assert.match(renderPlanTime(plan),/Completion time unknown/);assert.match(renderPlanTime(plan),/Local fixture size unknown/);
+plan.estimated_seconds=plan.estimated_low_seconds=plan.estimated_high_seconds=null;plan.time_bound_reasons=['+ 120 requests at unknown speed (up to 1 h if every request hits its timeout).'];
+assert.match(renderPlanTime(plan),/awaiting comparable measurements/);assert.match(renderPlanTime(plan),/120 requests at unknown speed/);
+""")
+
+
+def test_budget_actions_apply_current_offer_and_enable_limit_without_changing_workload():
+    run_browser_logic(r"""
+state.config={checks:['capacity'],targets:[{}],max_requests:2,max_duration_seconds:9,traffic:{rates:[25],duration_seconds:20}};
+state.jsonDraft=state.jsonBase='synced';
+const elements={max_requests:element({value:'2'}),max_duration_seconds:element({value:'9'}),max_requests_enabled:{checked:false},max_duration_seconds_enabled:{checked:false}};
+nodes['#new-run-form']={elements};nodes['#config-error']=element();
+updateBounds=()=>{};configChanged=()=>{};
+const plan={request_limit:2,request_warnings:[{actions:[{field:'max_requests',value:500}]}],time_warnings:[{actions:[{field:'max_duration_seconds',value:20}]}]};
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
+async function use(action,budget){await listeners.click({target:{closest(selector){if(selector==='[data-action]')return {dataset:{action}};if(selector==='[data-budget]')return {dataset:{budget:String(budget)}};return null;}}});}
+await use('use-request-budget',500);assert.equal(elements.max_requests.value,500);assert(elements.max_requests_enabled.checked);
+await use('use-time-budget',20);assert.equal(elements.max_duration_seconds.value,20);assert(elements.max_duration_seconds_enabled.checked);
+assert.deepEqual(state.config.traffic,{rates:[25],duration_seconds:20});
+await use('use-time-budget',30);assert.equal(elements.max_duration_seconds.value,20);assert.match(nodes['#config-error'].textContent,/plan changed/);
 """)
 
 
@@ -324,7 +349,7 @@ assert.equal(state.setupStep,2);assert.equal(calls,0);assert.equal(validated.joi
 assert.equal(JSON.stringify(state.config),JSON.stringify(draft));assert.equal(state.prefillBaseline,'reference');
 assert(panels[0].hidden);assert(!panels[1].hidden);assert(nodes['#start-run'].hidden);
 assert(nodes['#test-selection h2'].focused);assert(scrolledToTop);assert(nodes['#setup-navigation-hint'].hidden);
-assert.equal(nodes['#setup-title'].textContent,'Choose your checks.');
+assert.equal(nodes['#setup-title'].textContent,'Set limits and choose checks.');
 assert(!nodes['#run-blueprint'].hidden);assert(nodes['#run-bar-summary'].hidden);
 navigateSetup(1);assert.equal(state.setupStep,1);assert.equal(JSON.stringify(state.config),JSON.stringify(draft));
 validated.length=0;navigateSetup(3);assert.equal(validated.join(','),'1,2');assert.equal(state.setupStep,3);

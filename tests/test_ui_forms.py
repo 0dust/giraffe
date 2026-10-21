@@ -48,11 +48,13 @@ const rate=renderTestCard(state.bootstrap.checks.find(check=>check.id==='capacit
 for(const name of ['traffic_rates','traffic_duration_seconds'])assert.equal((rate.match(new RegExp('name="'+name+'"','g'))||[]).length,1);
 state.setupPreset='concurrent';
 config.concurrent_load.profile.long.output_tokens=config.max_output_tokens+1;
-assert.match(renderLoadGuidance(config),/output cap.*run.*cap/i);
-assert.match(renderLoadGuidance(config),/data-setting-path="max_output_tokens"/);
+assert.doesNotMatch(renderLoadGuidance(config),/output cap.*run.*cap/i);
+assert.doesNotMatch(renderLoadGuidance(config),/data-setting-path="max_output_tokens"/);
 config.concurrent_load.profile.long.output_tokens=config.max_output_tokens;
 const plan={{count_kind:'exact',planned_per_target:164,planned_total:164,known_per_target:164,known_total:164,request_limit:20,required_request_limit:164,target_quotas:{{local:20}},rows:[{{id:'initial',title:'Connection check',requests_per_target:1,kind:'exact',source:'generated examples',summary:'One generated request checks the connection.'}},{{id:'access',title:'Shared accounting',requests_per_target:0,kind:'exact',source:'generated examples',summary:'Adds no requests.'}}],bucket_cases:[{{input_chars:64,actual_input_chars:96,output_tokens:16}}],bucket_levels:[],evaluator:{{active:true,ready:true,call_upper_bound:12,judge_count:1,readiness_errors:[]}},warnings:[]}};
 config.max_requests=20;
+plan.request_warnings=[{{kind:'incomplete_coverage',fields:['max_requests'],msg:'The request budget leaves checks unfinished.',actions:[{{label:'Use 164 total requests',field:'max_requests',value:164}}]}}];
+plan.estimated_seconds=0;plan.estimated_low_seconds=0;plan.estimated_high_seconds=0;plan.confidence='unknown';
 state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan,config}};
 renderRequestPlan();
 assert.match(nodes['#request-plan'].innerHTML,/164 requests/);
@@ -193,7 +195,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   const markup=nodes['#main'].innerHTML;
   assert.doesNotMatch(markup,/setup-side-summary|setup-planned-traffic|review-baseline/);
   const options=markup.slice(markup.indexOf('id="execution-settings"'),markup.indexOf('</details>',markup.indexOf('id="execution-settings"')));
-  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare baseline'));
+  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare with baseline'));
   assert(markup.indexOf('id="run-bounds"')<markup.indexOf('id="request-plan"'));
   for(const name of ['mode','restart_target','baseline_id','name'])assert(controls.some(input=>input.name===name));
   assert(markup.indexOf('id="setup-deployment"')<markup.indexOf('id="test-selection"'));assert(!markup.includes('name="setup_goal"'));
@@ -215,7 +217,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
     assert(primary.includes('name="traffic_rates"'));assert(primary.includes('name="test_capacity_limit_latency_ms"'));
     assert(!primary.includes('name="limit_latency_ms"'));
     assert.equal(form.elements.test_capacity_limit_latency_ms.value,String(config.test_options.capacity.limits.latency_ms ?? ''));
-    assert.equal(form.elements.limit_latency_ms.value,'2000');
+    assert.equal(form.elements.limit_latency_ms,undefined);
     assert(primary.includes('Pass criteria'));
   }}
   const result=readForm(true).config;
@@ -270,7 +272,7 @@ assert.equal(primary.value,2000);assert.equal(primary.dataset.inherited,'true');
 const firstOutput=form.elements.test_capacity_limit_first_output_ms;
 firstOutput.closest=q=>q==='[data-test-settings]'?{{dataset:{{testSettings:'capacity'}}}}:null;
 firstOutput.value='400';editTestField(firstOutput);
-form.elements.limit_latency_ms.value='2500';refreshInheritedFields('capacity',true);
+state.config.limits.latency_ms=2500;refreshInheritedFields('capacity',true);
 current=readForm(true).config;
 assert.equal(current.limits.latency_ms,2500);assert.equal(primary.value,2500);
 assert.equal(current.test_options.capacity.limits.first_output_ms,400);
@@ -381,14 +383,14 @@ let plan=renderConcurrentPlan(draft);
 assert.match(plan,/13 min 30 s/);assert.match(plan,/9 workloads × 3 levels × 30 s/);
 assert.match(plan,/27 test points/);assert.doesNotMatch(plan,/0 requests/);
 assert.doesNotMatch(renderLoadGuidance(draft),/data-action="use-request-budget"/);
-draft.concurrency=4;assert.match(renderLoadGuidance(draft),/exceed Maximum at once/);
+draft.concurrency=4;assert.match(renderLoadGuidance(draft),/exceed Limit simultaneous requests/);
 assert.match(renderLoadGuidance(draft),/data-setting-path="concurrent_load.schedule.levels"/);
 const values=new FormData();values.set('load_schedule_levels','8');
-const result=configureConcurrentLoad(draft,values,bootstrap.concurrent_load.defaults);
+const result=configureConcurrentLoad(draft,values,bootstrap.concurrent_load.defaults,{limits:bootstrap.limits});
 assert.equal(result.concurrent_load.schedule.levels.join(','),'8');
-assert.deepEqual(configureConcurrentLoad(result,new FormData(),bootstrap.concurrent_load.defaults),result);
-for(const invalid of ['', '0','2, 2','1.5','257','Infinity','oops']){
- values.set('load_schedule_levels',invalid);assert.throws(()=>configureConcurrentLoad(draft,values,bootstrap.concurrent_load.defaults),/Concurrency levels/);
+assert.deepEqual(structuredClone(configureConcurrentLoad(result,new FormData(),bootstrap.concurrent_load.defaults,{limits:bootstrap.limits})),structuredClone(result));
+for(const invalid of ['', '0','2, 2','1.5','1025','Infinity','oops']){
+ values.set('load_schedule_levels',invalid);assert.throws(()=>configureConcurrentLoad(draft,values,bootstrap.concurrent_load.defaults,{limits:bootstrap.limits}),/Concurrency levels/);
 }
 values.set('load_schedule_levels','1, oops');
 assert.doesNotThrow(()=>configureConcurrentLoad(draft,values,bootstrap.concurrent_load.defaults,{allowInvalid:true}));
@@ -397,6 +399,8 @@ settings.schedule.levels=['<img src=x>'];assert.doesNotMatch(renderTestCard(boot
 
 
 def test_concurrent_load_and_token_targets_roundtrip_through_real_form_serializer():
+    from giraffe.capabilities import capabilities
+
     module = (Path(__file__).parents[1] / "src/giraffe/static/form-config.mjs").as_uri()
     source = RunConfig.model_validate({
         "targets": [{"name": "local", "url": "http://localhost:1", "model": "test"}],
@@ -412,7 +416,7 @@ v.set('load_schedule_levels','2, 4');v.set('load_schedule_duration_seconds','10'
 v.set('load_profile_long_input_tokens','10000');v.set('load_profile_long_output_tokens','512');
 v.set('load_stress_min_output_percent','80');
 for(const [shape,share] of Object.entries(s.mixed.shares))v.set(`load_mixed_shares_${{shape}}`,share);
-console.log(JSON.stringify(configureConcurrentLoad(configureTests(source,v,[],source.traffic),v,s)));
+console.log(JSON.stringify(configureConcurrentLoad(configureTests(source,v,[],source.traffic),v,{json.dumps(capabilities()['concurrent_load']['defaults'])},{{limits:{json.dumps(capabilities()['limits'])}}})));
 """
     result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
                             capture_output=True, text=True, check=True)
@@ -450,7 +454,7 @@ tasks.forEach((task,i)=>{{
 }});
 values.set('session_turn_0_1','Custom follow-up with <literal> characters.');
 const result=configureSessions(source,values,defaults);
-assert.equal(result.sessions.concurrency,3);assert.equal(result.sessions.workloads.length,2);
+assert.equal(result.sessions.concurrency,2);assert.equal(result.sessions.workloads.length,2);
 assert.deepEqual(result.sessions.modes,['live']);
 assert.equal(result.sessions.workloads[0].turns[1],'Custom follow-up with <literal> characters.');
 assert.equal(result.sessions.workloads[0].max_tokens,64);
@@ -657,7 +661,7 @@ const context={{structuredClone,optionDefault,elements,assert,
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 vm.runInNewContext(source+`
-state.config={{samples:6,concurrency:4,limits:{{latency_ms:1000,first_output_ms:null}}}};
+state.config={{samples:6,default_concurrency:3,concurrency:4,limits:{{latency_ms:1000,first_output_ms:null}}}};
 state.bootstrap={{checks:[
   {{id:'correctness',option_fields:['samples','concurrency'],limit_fields:[],defaults:{{}}}},
   {{id:'capacity',option_fields:[],limit_fields:['latency_ms','first_output_ms'],defaults:{{}}}}
@@ -665,7 +669,7 @@ state.bootstrap={{checks:[
 refreshInheritedFields('correctness',true);
 refreshInheritedFields('capacity',true);
 assert.equal(elements.test_correctness_samples.value,'9');
-assert.equal(elements.test_correctness_concurrency.value,8);
+assert.equal(elements.test_correctness_concurrency.value,3);
 assert.equal(elements.test_capacity_limit_latency_ms.value,2000);
 assert.equal(elements.test_capacity_limit_first_output_ms.value,'500');
 refreshInheritedFields('correctness');
@@ -850,11 +854,14 @@ def test_form_json_views_validate_one_snapshot_and_preserve_unapplied_drafts():
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser configuration behavior")
+    from giraffe.capabilities import capabilities
+
     static = Path(__file__).parents[1] / "src/giraffe/static"
     script = rf"""
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {{positiveBoundErrors}} from {json.dumps((static / 'form-config.mjs').as_uri())};
 const nodes={{}},listeners={{}},downloads=[];
 for(const id of ['config-tab-form','config-tab-json','config-panel-form','config-panel-json',
   'config-draft-notice','config-editor','json-status','config-error','cli-fallback','cli-command','execution-settings']){{
@@ -865,12 +872,13 @@ nodes['#new-run-form']=form;
 nodes['[data-action="use-request-budget"]']={{disabled:false}};
 const document={{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn,
   createElement:()=>({{click(){{this.clicked=true;}}}})}};
-const context={{structuredClone,document,window:{{addEventListener(){{}}}},assert,nodes,form,listeners,
+const context={{positiveBoundErrors,structuredClone,document,window:{{addEventListener(){{}}}},assert,nodes,form,listeners,
   Blob,URL:{{createObjectURL(blob){{downloads.push(blob);return 'blob:config';}},revokeObjectURL(){{}}}},
   navigator:{{clipboard:{{async writeText(){{throw new Error('denied');}}}}}},setTimeout(){{}},downloads}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+`
+state.bootstrap={json.dumps(capabilities())};
 (async()=>{{
 let current={{config:{{targets:[{{name:'local',model:'a'}}],checks:[],concurrency:null,restart_target:null}},baseline_id:'before',mode:'normal',restart_target:null}};
 readForm=()=>structuredClone(current);toast=()=>{{}};
@@ -968,7 +976,7 @@ const budgetEvent={{target:{{closest(q){{
 }}}}}};
 state.requestPreview=null;await listeners.click(budgetEvent);
 assert.equal(form.elements.max_requests.value,'1');assert.match(nodes['#config-error'].textContent,/current request plan/);
-state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan:{{request_limit:2,required_request_limit:16}}}};
+state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan:{{request_limit:2,required_request_limit:16,request_warnings:[{{actions:[{{field:'max_requests',value:16}}]}}]}}}};
 await listeners.click(budgetEvent);assert.equal(form.elements.max_requests.value,'1');assert.match(nodes['#config-error'].textContent,/plan changed/);
 state.requestPreview.plan.request_limit=1;
 await listeners.click(budgetEvent);
@@ -986,17 +994,21 @@ def test_request_pack_import_preview_revision_guards_and_run_snapshot():
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser request pack behavior")
+    from giraffe.capabilities import capabilities
+
     static = Path(__file__).parents[1] / "src/giraffe/static"
     script = r"""
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {positiveBoundErrors} from MODULE_PATH;
 const nodes={},listeners={};
 for(const id of ['request-pack-preview','config-error','start-run','form-error','request-pack-file'])nodes['#'+id]={hidden:true,innerHTML:'',textContent:'',click(){this.clicked=true;}};
 const form={elements:{request_source:{value:'builtin'}}};nodes['#new-run-form']=form;
-const context={assert,structuredClone,nodes,form,fetch:async()=>({ok:false,status:404,json:async()=>({detail:'Not Found'})}),document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},window:{addEventListener(){}},location:{hash:'#new'}};
+const context={assert,positiveBoundErrors,structuredClone,nodes,form,fetch:async()=>({ok:false,status:404,json:async()=>({detail:'Not Found'})}),document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},window:{addEventListener(){}},location:{hash:'#new'}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+`
+state.bootstrap=BOOTSTRAP;
 (async()=>{
 const initial={request_source:'builtin',request_pack:null,targets:[{name:'local',model:''}],checks:[],traffic:{rates:[1]}};
 let current=structuredClone(initial),renders=0,calls=0;
@@ -1076,13 +1088,15 @@ assert.match(previewMarkup,/Other selected checks/);
 
 })()
 `,context);
-""".replace("APP_PATH", json.dumps(str(static / "app.js")))
+""".replace("MODULE_PATH", json.dumps((static / "form-config.mjs").as_uri())).replace("BOOTSTRAP", json.dumps(capabilities())).replace("APP_PATH", json.dumps(str(static / "app.js")))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
 
 
 def test_ai_judge_configuration_evidence_and_evaluation_phase():
+    from giraffe.capabilities import capabilities
+
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser judge behavior")
@@ -1109,7 +1123,9 @@ assert.equal(configureJudging(config,values,{allowInvalid:true}).judging.concurr
 const nodes={'#main':{innerHTML:''},'#request-pack-preview':{innerHTML:''},'#config-error':{hidden:true},'#request-dialog':{innerHTML:'',showModal(){this.shown=true;}}};
 const context={assert,structuredClone,nodes,config,draft,document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener(){}},window:{addEventListener(){}},location:{hash:'#new'}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+context.bootstrap=BOOTSTRAP;
 vm.runInNewContext(source+`
+state.bootstrap=bootstrap;
 state.config=draft;state.jsonDraft=state.jsonBase='synced';
 let captured=0,rendered=0;
 captureFormDraft=()=>{captured++;};renderNew=()=>{rendered++;};
@@ -1136,12 +1152,15 @@ state.detail.progress={event:'request_finished',attempted:20,completed:19};rende
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
+    script=script.replace("BOOTSTRAP", json.dumps(capabilities()))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
 
 
 def test_dataset_editor_preserves_canonical_cases_and_stages_imports():
+    from giraffe.capabilities import capabilities
+
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute dataset editing behavior")
@@ -1176,6 +1195,7 @@ const context={assert,structuredClone,nodes,listeners,datasetCaseFromValues,chan
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+`
 (async()=>{
+state.bootstrap=BOOTSTRAP;
 const initial={request_source:'builtin',request_pack:null,targets:[{name:'local',model:''},{name:'secondary',model:'m'}],checks:[],retention:'failures',max_requests:99,traffic:{rates:[1]}};
 state.config=structuredClone(initial);state.jsonDraft=state.jsonBase='synced';
 readForm=()=>({config:structuredClone(state.config),mode:'normal'});captureFormDraft=()=>{};
@@ -1243,6 +1263,7 @@ state.active=null;api=async(path,options)=>({config:JSON.parse(options.body)});a
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
+    script = script.replace("BOOTSTRAP", json.dumps(capabilities()))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -1304,6 +1325,8 @@ assert.match(renderEvaluationEvidence({fixture_id:'missing'},old),/not saved/);
 
 
 def test_dataset_readiness_and_contextual_controls():
+    from giraffe.capabilities import capabilities
+
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to exercise browser setup behavior")
@@ -1321,8 +1344,10 @@ const context={assert,nodes,structuredClone,
   document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener(){}},
   window:{addEventListener(){}},location:{hash:'#new'}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
+context.bootstrap=BOOTSTRAP;
 await vm.runInNewContext(source+`
 (async()=>{
+state.bootstrap=bootstrap;
 state.config={request_source:'request_pack',checks:['correctness','recovery'],request_pack:null};
 state.jsonDraft=state.jsonBase='synced';
 syncTestControls=()=>{};updateBounds=()=>{};renderRequestPreview=()=>{};
@@ -1352,6 +1377,7 @@ assert(!markup.includes('judge_count'));assert(!markup.includes('Configure evalu
 })()
 `,context);
 """.replace("APP_PATH", json.dumps(str(app)))
+    script=script.replace("BOOTSTRAP", json.dumps(capabilities()))
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -1404,22 +1430,22 @@ def test_tool_profile_serializer_preserves_custom_data_and_invalid_drafts():
     browser_logic(r"""
 config.tool_checks={fixtures:[{fixture_id:'custom',messages:[{role:'user',content:'ask'}],tools:[{custom:true}],expected_calls:[{name:'call',arguments:{x:1}}],options:{temperature:0}}],modes:['stream','complete']};
 const original=JSON.stringify(config),values=new Map();
-assert.equal(JSON.stringify(configureProfiles(config,values,{})),original);
+assert.equal(JSON.stringify(configureProfiles(config,values,{},{limits:bootstrap.limits})),original);
 values.set('profile_edits_tools','["forced_tool_diagnostic"]');values.set('profile_tools_forced_tool_diagnostic','true');
-const forced=configureProfiles(config,values,{});assert.equal(JSON.stringify(forced.tool_checks),JSON.stringify(config.tool_checks));assert(forced.forced_tool_diagnostic);
+const forced=configureProfiles(config,values,{},{limits:bootstrap.limits});assert.equal(JSON.stringify(forced.tool_checks),JSON.stringify(config.tool_checks));assert(forced.forced_tool_diagnostic);
 values.set('profile_edits_tools','["modes"]');values.set('profile_tools_modes','complete');
-const complete=configureProfiles(config,values,{});assert.equal(JSON.stringify(complete.tool_checks.fixtures),JSON.stringify(config.tool_checks.fixtures));assert.equal(complete.tool_checks.modes.join(','),'complete');
-values.set('profile_tools_modes','');assert.equal(configureProfiles(config,values,{}).tool_checks.modes,null);
+const complete=configureProfiles(config,values,{},{limits:bootstrap.limits});assert.equal(JSON.stringify(complete.tool_checks.fixtures),JSON.stringify(config.tool_checks.fixtures));assert.equal(complete.tool_checks.modes.join(','),'complete');
+values.set('profile_tools_modes','');assert.equal(configureProfiles(config,values,{},{limits:bootstrap.limits}).tool_checks.modes,null);
 values.set('profile_edits_tools','["fixtures"]');values.set('profile_tools_fixtures','[{"unfinished"');
-assert.throws(()=>configureProfiles(config,values,{}),/JSON array/);
+assert.throws(()=>configureProfiles(config,values,{},{limits:bootstrap.limits}),/JSON array/);
 const draft=configureProfiles(config,values,{}, {allowInvalid:true});assert.equal(draft.tool_checks.fixtures,'[{"unfinished"');
-assert.throws(()=>configureProfiles(draft,new Map(),{}),/JSON array/);
+assert.throws(()=>configureProfiles(draft,new Map(),{},{limits:bootstrap.limits}),/JSON array/);
 for(const raw of ['null','{}','[null]','[[]]','[1]','[true]',JSON.stringify(Array(17).fill({})),' '.repeat(65537)]){
-  values.set('profile_tools_fixtures',raw);assert.throws(()=>configureProfiles(config,values,{}));
+  values.set('profile_tools_fixtures',raw);assert.throws(()=>configureProfiles(config,values,{},{limits:bootstrap.limits}));
 }
-values.set('profile_tools_fixtures','[]');assert.equal(configureProfiles(config,values,{}).tool_checks.fixtures.length,0);
+values.set('profile_tools_fixtures','[]');assert.equal(configureProfiles(config,values,{},{limits:bootstrap.limits}).tool_checks.fixtures.length,0);
 assert.equal(JSON.stringify(config),original);
 config.tool_calling=true;config.stream=false;
-assert.throws(()=>configureProfiles(config,new Map(),{}),/Enable streaming/);
-config.tool_calling=false;assert.doesNotThrow(()=>configureProfiles(config,new Map(),{}));
+assert.throws(()=>configureProfiles(config,new Map(),{},{limits:bootstrap.limits}),/Enable streaming/);
+config.tool_calling=false;assert.doesNotThrow(()=>configureProfiles(config,new Map(),{},{limits:bootstrap.limits}));
 """)

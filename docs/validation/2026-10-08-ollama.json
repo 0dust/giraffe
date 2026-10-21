@@ -1,4 +1,5 @@
 {
+  "config_version": 2,
   "targets": [
     {
       "name": "ollama",
@@ -131,5 +132,6 @@
     "seed": 17
   },
   "tool_calling": true,
-  "forced_tool_diagnostic": true
+  "forced_tool_diagnostic": true,
+  "default_concurrency": 2
 }

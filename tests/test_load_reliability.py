@@ -17,7 +17,7 @@ from tests.test_runner import check, config
 class LoadClient:
     """An in-process streaming endpoint with independently controlled answer/close times."""
 
-    def __init__(self, target, configuration):
+    def __init__(self, target, configuration, *, max_connections=None):
         self.target = target
 
     async def __aenter__(self):

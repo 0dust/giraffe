@@ -7,6 +7,7 @@ import re
 import sqlite3
 import tempfile
 
+from .caps import MAX_REPORT_TOP_LEVEL_MEMBERS
 from .models import RequestRecord, RunReport
 from .report_inputs import verify_input
 
@@ -126,7 +127,7 @@ class _Reader:
                 raise ValueError("Invalid or duplicate saved report key")
             if unique:
                 seen.add(key)
-                if len(seen) > 64:
+                if len(seen) > MAX_REPORT_TOP_LEVEL_MEMBERS:
                     raise ValueError("Saved report exceeds 64 top-level members")
             self.consume(":")
             yield key

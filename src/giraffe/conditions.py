@@ -208,9 +208,9 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
         if check == "sessions" and config.sessions:
             parameters["concurrency"] = min(config.sessions.concurrency, config.sessions.sessions)
         if check == "capacity":
-            parameters["concurrency"] = min(config.effective_traffic().max_in_flight or config.concurrency, config.concurrency)
+            parameters["concurrency"] = config.effective_traffic().max_in_flight
         if check == "arrivals":
-            parameters["concurrency"] = config.concurrency
+            parameters["concurrency"] = config.effective_arrivals().max_in_flight
         if check == "recovery":
             parameters["concurrency"] = config.effective_check("recovery")["concurrency"] if scenario == "sustained" else 1
         if check in {"correctness", "json"}:

@@ -18,8 +18,11 @@ for(const type of ['combinations','mixed','interference','stress']){
 }
 assert.equal((html.match(/name="load_combinations_selected_/g)||[]).length,9);
 assert.equal((html.match(/name="load_mixed_shares_/g)||[]).length,9);
-assert.doesNotMatch(html,/Streaming fairness|Context length|Samples per|Pairs per|weight|Sustained load|stage|data-profile-settings|test_mode_concurrency/);
-assert.match(html,/aria-live="polite"/);
+assert.doesNotMatch(html,/Streaming fairness|Context length|Samples per|Pairs per|weight|Sustained load|stage|data-profile-settings/);
+assert.match(html,/name="test_mode_concurrency" value="default"/);
+assert.match(html,/name="test_concurrency_request_timeout_seconds"/);
+assert.doesNotMatch(html,/aria-live=/);
+assert.equal((renderRunBlueprint(config).match(/aria-live="polite"/g)||[]).length,1);
 assert.match(html,/At least 103 generated tokens/);
 assert.match(effectiveCheckSummary(bootstrap.checks.find(c=>c.id==='concurrency'),config),/2 load types · 1, 4 concurrent/);
 ''')
@@ -65,7 +68,7 @@ settings.interference.trigger='first_output';syncConcurrentDisplay({...config,co
 def test_every_structured_error_has_inline_and_focus_destination():
     browser_logic(r'''
 state.jsonDraft=state.jsonBase='synced';
-const paths=['concurrent_load.schedule.levels','concurrency','max_requests','max_output_tokens','stream','max_duration_seconds',
+const paths=['concurrent_load.schedule.levels','concurrency','max_requests','stream','max_duration_seconds',
 'concurrent_load.schedule.duration_seconds','concurrent_load.interference.enabled','concurrent_load.combinations.selected',
 'concurrent_load.mixed.shares','concurrent_load.stress.large_input','concurrent_load.combinations.enabled',
 'concurrent_load.interference.trigger','concurrent_load.interference.trigger_chunks','concurrent_load.interference.max_slowdown',
@@ -73,7 +76,10 @@ const paths=['concurrent_load.schedule.levels','concurrency','max_requests','max
 for(const size of loadSizes)for(const field of ['input_tokens','output_tokens'])paths.push('concurrent_load.profile.'+size+'.'+field);
 for(const field of ['first_output_p95_ms','response_p95_ms','max_error_percent','min_correct_percent','min_valid_responses'])paths.push('concurrent_load.pass_criteria.'+field);
 for(const shape of loadShapes)paths.push('concurrent_load.mixed.shares.'+shape);
-const markup=renderCheckSelection(config),focused=[];
+nodes['#main']={};nodes['#new-run-form']={elements:{mode:{value:'normal'}}};
+syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=()=>{};
+renderNew();
+const markup=nodes['#main'].innerHTML,focused=[];
 revealSetupStep=step=>state.setupStep=step;revealCatalogueCheck=id=>state.openTest=id;
 for(const path of paths){
  // A fresh, closed drawer and disclosure for each independent navigation.
@@ -93,12 +99,19 @@ for(const path of paths){
  assert.equal(input.attributes['aria-invalid'],'true',path);
  const issues=renderSettingIssues();assert(issues.includes('data-setting-path="'+path+'"'));assert.match(issues,/Edit /);
  await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:path}}:null}});
- assert.equal(state.setupStep,2,path);assert.equal(focused.at(-1),dest.name,path);
+ assert.equal(state.setupStep,path==='stream'?1:2,path);assert.equal(focused.at(-1),dest.name,path);
  if(path.includes('.pass_criteria.')||!path.startsWith('concurrent_load.'))assert(details.open,path);
  if(path.startsWith('concurrent_load.'))assert.equal(state.openTest,'concurrency',path);
  const type=path.split('.')[1];if(Object.hasOwn(loadTitles,type))assert.equal(nodes['#load-panel-'+type].hidden,false,path);
  if(path.endsWith('.trigger_chunks'))assert.equal(nodes['#load-trigger-chunks'].hidden,false);
 }
+// Suite request defaults are JSON-only; navigation still preserves their errors.
+let jsonFocused=false;
+nodes['#config-editor']={focus(){jsonFocused=true;}};
+switchConfigView=view=>state.configView=view;
+focusSetting('max_output_tokens');
+assert.equal(state.configView,'json');assert(jsonFocused);
+assert.match(renderSettingIssues([{fields:['max_output_tokens'],msg:'Invalid suite output default'}]),/data-setting-path="max_output_tokens"/);
 // Supply a fresh schedule input for the cross-field level-1 navigation.
 const schedule={parentElement:null,setAttribute(){},focus(){},closest(){return null;}};
 nodes['#new-run-form'].elements.load_schedule_levels=schedule;
@@ -120,18 +133,18 @@ let html=renderConcurrentPlan(config);
 assert.match(html,/13 min 30 s/);assert.match(html,/9 workloads × 3 levels × 30 s/);assert.match(html,/27 test points/);
 const plan={configured_load_seconds:60,concurrent_load:{interference:{title:loadTitles.interference,workloads:2,levels:[2,4,8],duration_seconds:10,test_points:3,configured_load_seconds:60}},
  rows:[{id:'load_interference',title:loadTitles.interference,kind:'duration',requests_per_target:null,summary:'Duration-based',source:'configured'}],
- load_warnings:[{fields:['max_requests'],msg:'Request allowance may shorten the windows.'},{fields:['concurrent_load.schedule.duration_seconds','concurrent_load.profile.long.output_tokens'],msg:'Throughput window may be too short.'}],estimated_seconds:200,worst_case_seconds:null};
+ load_warnings:[{fields:['max_requests'],msg:'Request allowance may shorten the windows.'},{fields:['concurrent_load.schedule.duration_seconds','concurrent_load.profile.long.output_tokens'],msg:'Throughput window may be too short.'}],estimated_seconds:200,estimated_low_seconds:180,estimated_high_seconds:220};
 html=renderRunBlueprint(config,plan);
 assert.match(html,/Configured load time/);assert.match(html,/1 workload \(alternating short\/long probe\) × 3 levels × 20 s/);assert.match(html,/3 test points/);
 assert.match(html,/Duration-based/);assert.doesNotMatch(html,/0 requests/);
-assert.match(html,/Usually about/);assert.match(html,/Edit request limit/);assert.match(html,/Edit duration per workload/);
+assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);assert.match(html,/Edit Stop after this many requests/);assert.match(html,/Edit duration per workload/);
 nodes['#request-plan']={innerHTML:''};state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan,config};
 renderRequestPlan(config);html=nodes['#request-plan'].innerHTML;
 assert.match(html,/Duration-based · as many as complete/);assert.match(html,/Configured load time/);assert.doesNotMatch(html,/0 requests/);
 const input={attributes:{},getAttribute(k){return this.attributes[k]||'';},setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];}};
 nodes['#field-max_requests']=input;nodes['#field-max_requests-warning']={hidden:true};
 syncInlineErrors();assert.equal(nodes['#field-max_requests-warning'].hidden,false);
-assert.match(nodes['#field-max_requests-warning'].innerHTML,/Request allowance.*Edit request limit/);
+assert.match(nodes['#field-max_requests-warning'].innerHTML,/Request allowance.*Edit Stop after this many requests/);
 assert.equal(input.attributes['aria-invalid'],undefined);assert.match(input.attributes['aria-describedby'],/field-max_requests-warning/);
 ''')
 

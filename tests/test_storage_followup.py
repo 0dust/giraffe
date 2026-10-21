@@ -164,6 +164,10 @@ def test_download_does_not_create_legacy_state_or_invent_existing_state(tmp_path
     source = tmp_path / "saved"
     write_report(synthetic_report(2, 10, "all"), source)
     marker = source / ".web.json"
+    metadata = json.loads(marker.read_text())
+    assert set(metadata) == {"latency_summary"}
+    assert "state" not in metadata
+    marker.unlink()  # A legacy report has no report-time observation metadata.
     with TestClient(create_app(tmp_path)) as client:
         assert client.get(f"/api/runs/saved/report.{extension}").status_code == 200
         assert not marker.exists()

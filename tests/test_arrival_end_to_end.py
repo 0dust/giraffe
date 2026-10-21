@@ -2,7 +2,7 @@
 
 import asyncio
 
-from giraffe.models import Limits, RunConfig, Target, TrafficConfig
+from giraffe.models import Limits, RunConfig, Target, TrafficConfig, required_concurrency
 from giraffe.reporting import compare_baseline
 from giraffe.runner import run_suite
 from tests.fake_endpoint import FakeEndpoint
@@ -18,7 +18,7 @@ def traffic_config(endpoint, **overrides):
         "request_timeout_seconds": 3,
         "stop_after_errors": 100,
         "traffic": TrafficConfig(
-            rates=[10, 50], duration_seconds=.6, drain_timeout_seconds=3,
+            rates=[10, 50], duration_seconds=.6, drain_timeout_seconds=3, max_in_flight=32,
             mix={"short": 1, "long_input": 0, "long_output": 0},
         ),
         "limits": Limits(latency_ms=250, min_samples=5),
@@ -35,11 +35,13 @@ async def test_arrivals_reach_http_server_before_prior_requests_complete():
         config = traffic_config(
             endpoint,
             traffic=TrafficConfig(
-                rates=[20], duration_seconds=.3,
+                rates=[20], duration_seconds=.3, max_in_flight=32,
                 mix={"short": 1, "long_input": 0, "long_output": 0},
             ),
             limits=Limits(latency_ms=1000, min_samples=5),
         )
+        assert config.effective_traffic().max_in_flight == 32
+        assert required_concurrency(config)["per_target_peak"] == 32
         report = await run_suite(config)
         assert endpoint.request_started_at[2] < min(endpoint.request_finished_at), (
             "The third arrival must reach the server while the first request is still running"
@@ -58,7 +60,7 @@ async def test_mixed_http_workload_scores_short_long_input_and_long_output():
         config = traffic_config(
             endpoint,
             traffic=TrafficConfig(
-                rates=[30], duration_seconds=1, seed=42,
+                rates=[30], duration_seconds=1, seed=42, max_in_flight=32,
                 long_input_chars=512, long_output_words=16,
             ),
             limits=Limits(latency_ms=1000, min_samples=5),
@@ -110,7 +112,7 @@ async def test_stop_during_http_arrivals_preserves_partial_accounting():
     with FakeEndpoint(first_token_delay=.3, chunk_delay=0) as endpoint:
         config = traffic_config(
             endpoint,
-            traffic=TrafficConfig(rates=[20], duration_seconds=2),
+            traffic=TrafficConfig(rates=[20], duration_seconds=2, max_in_flight=32),
         )
         report = await asyncio.wait_for(run_suite(config, progress=progress, stop_event=stop), 3)
 
@@ -145,7 +147,7 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
                 {"fixture_id": "beta", "messages": [{"role": "user", "content": "Copy exactly: PACK_BETA"}],
                  "scorer": "contains", "expected": "PACK_BETA"},
             ]},
-            traffic=TrafficConfig(rates=[5, 40], duration_seconds=.4),
+            traffic=TrafficConfig(rates=[5, 40], duration_seconds=.4, max_in_flight=32),
             limits=Limits(latency_ms=1000, min_samples=2),
         )
         report = await run_suite(config)
@@ -195,7 +197,7 @@ async def test_reference_judging_runs_after_http_traffic_without_extending_measu
             ]},
             judging={"judges": [{"name": "reviewer", "url": judge.url, "model": "judge-model"}],
                      "concurrency": 1, "max_duration_seconds": 3},
-            traffic=TrafficConfig(rates=[30], duration_seconds=.1),
+            traffic=TrafficConfig(rates=[30], duration_seconds=.1, max_in_flight=32),
             limits=Limits(latency_ms=1000, min_samples=2),
         )
         report = await run_suite(config)

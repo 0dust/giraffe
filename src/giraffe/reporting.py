@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 import errno
 from fractions import Fraction
 from html import escape
@@ -17,17 +18,23 @@ import tempfile
 from statistics import median
 from typing import Any
 
-from .deployment import deployment_diff, safe_config, sanitize
+from pydantic import ValidationError
+
+from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
+                   DEFAULT_HTML_REQUEST_DETAILS, MAX_FAILURE_SUMMARY_TITLE_CHARS,
+                   MAX_FAILURE_SUMMARY_CHARS)
+from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status, load_shape_label
-from .storage import format_size
+from .models import (CHECK_NAMES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+                     migrate_concurrent_load, migrate_run_limits)
+from .storage import DEFAULT_LIMITS, format_size
 from .workloads import WORKLOAD_CHECKS
 from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
 _MATCH_CONFIG = (
-    "concurrency", "max_requests", "max_duration_seconds", "request_timeout_seconds",
+    "request_timeout_seconds",
     "max_output_tokens", "context_limit", "samples", "sustained_seconds", "checks",
     "structured_json", "overlap_models", "stream", "request_options", "stop_after_errors",
     "unresponsive_after_failures", "unresponsive_for_seconds",
@@ -61,6 +68,167 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
     return groups
 
 
+def _comparison_config(value: dict) -> dict:
+    """Normalize saved config I/O without changing the recorded workload identity."""
+    config, _ = migrate_run_limits(deepcopy(value))
+    config, _ = migrate_concurrent_load(config)
+    if isinstance(config.get("limits"), dict):
+        config["limits"].pop("regression_percent", None)
+    default = config.setdefault("default_concurrency", 4)
+    ceiling = config.get("concurrency")
+    if isinstance(ceiling, int):
+        targets = len(config.get("targets", [])) if config.get("overlap_models") else 1
+        default = max(1, min(default, ceiling // max(1, targets)))
+    if isinstance(config.get("arrivals"), dict):
+        arrivals = config["arrivals"]
+        if arrivals.get("max_in_flight") is None:
+            arrivals["max_in_flight"] = default
+    if isinstance(config.get("traffic"), dict):
+        # The user-supplied response-time estimate affects preview advice only.
+        config["traffic"].pop("expected_response_seconds", None)
+        if config["traffic"].get("max_in_flight") is None:
+            config["traffic"]["max_in_flight"] = default
+    return config
+
+
+def _comparison_manifest(manifest: dict) -> dict:
+    config = _comparison_config(manifest.get("config", {}))
+    value = {**manifest, "config": config}
+    try:
+        resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
+    except ValidationError:
+        return value  # Preserve unknown/missing evidence rather than invent executed work.
+    for field, checks in WORKLOAD_CHECKS.items():
+        if checks.intersection(resolved.checks):
+            settings = resolved.effective_arrivals() if field == "arrivals" else getattr(resolved, field)
+            config[field] = settings.model_dump(mode="json") if hasattr(settings, "model_dump") else settings
+    effective = {name: resolved.effective_check(name) for name in resolved.checks}
+    if "effective_checks" not in value:
+        value["effective_checks"] = effective
+    elif isinstance(value.get("effective_checks"), dict):
+        # Phase 3 adds request defaults to the recorded check contract. Fill only
+        # those newly introduced fields; missing earlier evidence stays unknown.
+        added = {
+            "serving": {"samples", "max_output_tokens", "request_timeout_seconds"},
+            "first_output": {"max_output_tokens", "request_timeout_seconds"},
+            "generation": {"request_timeout_seconds"},
+            "context": {"max_output_tokens", "request_timeout_seconds"},
+            "correctness": {"max_output_tokens", "request_timeout_seconds"},
+            "json": {"max_output_tokens", "request_timeout_seconds"},
+            "cancellation": {"max_output_tokens", "request_timeout_seconds"},
+            "recovery": {"max_output_tokens", "request_timeout_seconds"},
+            "capacity": {"max_output_tokens", "request_timeout_seconds"},
+            "arrivals": {"max_output_tokens", "request_timeout_seconds"},
+            "prefix": {"context_limit", "request_timeout_seconds"},
+            "sessions": {"context_limit", "request_timeout_seconds"},
+            "consistency": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
+            "tools": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
+            "concurrency": {"request_timeout_seconds"},
+        }
+        value["effective_checks"] = {
+            check: {**{field: effective.get(check, {}).get(field)
+                        for field in added.get(check, set()) if field in effective.get(check, {})},
+                    **settings} if isinstance(settings, dict) else settings
+            for check, settings in value["effective_checks"].items()
+        }
+    if "capacity" in resolved.checks:
+        value.setdefault("effective_traffic", resolved.effective_traffic().model_dump(mode="json"))
+    return value
+
+
+def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | None:
+    """Reconstruct only identities whose generator revision is known exactly."""
+    raw = manifest.get("config", {})
+    legacy = revision == "legacy"
+    config, _ = migrate_run_limits(deepcopy(raw))
+    config, _ = migrate_concurrent_load(config)
+    try:
+        resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
+    except ValidationError:
+        return None
+    settings = {}
+    for field, checks in WORKLOAD_CHECKS.items():
+        if not checks.intersection(resolved.checks):
+            continue
+        if field not in raw:
+            return None  # A fingerprint cannot attest settings missing from the saved config.
+        value = raw[field] if legacy else getattr(resolved, field)
+        settings[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+    # These exact source revisions preserve default generated workloads across
+    # the bounds/request-setting split. Unknown revisions retain strict matching.
+    identity = {
+        "generator_source_sha256": {
+            "legacy": "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115eccb0",
+            "phase2": "c4edf02ed8db34d203da2328543acc3a49d98d3af41dc9471855b232c9ccf9f3",
+            "phase3": "e147840e6530a40c0ac1607ac05840a5aec5abeb2faaff31e53bd2613057eaec",
+            "review26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
+            "caps26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
+        }[revision] if any(settings.values()) else None,
+        "settings": settings,
+    }
+    if "concurrency" in resolved.checks:
+        identity["concurrent_load_source_sha256"] = {
+            "legacy": "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7",
+            "phase2": "5d4c4519c9f4b83dbec1286cd77287cfbeabbb1b9578b0d1365e9ea7480c5b88",
+            "phase3": "4124cfbd14b126c663cfa1e6f2e0a1cdc7146bfe415249e801e06049e3f79eb3",
+            "review26": "af6447cbef3456e303a590b430b3d11ea8d93a6c1a553d54f26e41086320f222",
+            # Named caps and readable remedies preserve the default requests.
+            "caps26": "5fed7f8033592e8392a51a598f6eddddf1462b74e963569527d793539f62ff88",
+        }[revision]
+    if "consistency" in resolved.checks and resolved.consistency and resolved.consistency.logprobs:
+        identity["logprob_source_sha256"] = {
+            "legacy": "1cecd981fea42d75a7abffbe8a069699b97cca73a273c2786c240b5a8c78b7b2",
+            "phase2": "1cecd981fea42d75a7abffbe8a069699b97cca73a273c2786c240b5a8c78b7b2",
+            "phase3": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
+            "review26": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
+            "caps26": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+        }[revision]
+    if "tools" in resolved.checks:
+        from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        identity["resolved_tool_checks"] = {
+            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
+            "modes": resolved_tool_modes(resolved),
+            **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
+                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in {"phase3", "review26", "caps26"} else
+                                               "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
+               if resolved.tool_checks and resolved.tool_checks.conversations else {}),
+        }
+    return identity
+
+
+def _same_run_limits_workload(current: dict, old: dict) -> bool:
+    if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
+        return False
+    for manifest in (current, old):
+        revisions = ("phase2", "phase3", "review26", "caps26") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
+        if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+                   for identity in identities):
+            return False
+    current_config = _comparison_manifest(current)["config"]
+    old_config = _comparison_manifest(old)["config"]
+    selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    return all(current_config.get(field) == old_config.get(field)
+               for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
+
+
+def _limits_reached(report: RunReport) -> set[str]:
+    reached = set(report.limits_reached)
+    if any("Global request budget exhausted" in warning for warning in report.warnings):
+        reached.add("max_requests")
+    load_metrics = [check.metrics for check in report.checks if check.id == "concurrency"]
+    load_metrics.extend(target.get("concurrent_load", {})
+                        for target in report.observations.get("targets", {}).values()
+                        if isinstance(target, dict))
+    if any(point.get("reason_code") == "budget_limited"
+           for metrics in load_metrics
+           if isinstance(metrics, dict)
+           for group in metrics.get("load_types", {}).values()
+           for point in group.get("points", [])):
+        reached.add("max_requests")
+    return reached
+
+
 def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     reasons = []
     if report.suite_version != baseline.suite_version:
@@ -75,8 +243,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for label, run in (("Current", report), ("Baseline", baseline)):
         if any(record.evaluation_error for record in run.requests):
             reasons.append(f"{label} answer evaluation failed; correctness and capacity cannot be compared.")
-    current_config = report.manifest.get("config", {})
-    old_config = baseline.manifest.get("config", {})
+    current_manifest = _comparison_manifest(report.manifest)
+    old_manifest = _comparison_manifest(baseline.manifest)
+    current_config = current_manifest["config"]
+    old_config = old_manifest["config"]
+    reached = _limits_reached(report) | _limits_reached(baseline)
+    for key in ("concurrency", "max_requests", "max_duration_seconds"):
+        if key in reached and current_config.get(key) != old_config.get(key):
+            reasons.append(f"Run setting {key} differs and its limit stopped work or constrained concurrency.")
     pack_modes = [config.get("request_source") == "request_pack"
                   and bool({"capacity", "correctness"}.intersection(config.get("checks", [])))
                   for config in (current_config, old_config)]
@@ -103,6 +277,15 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
     def effective_value(manifest, key):
         value = manifest.get(key)
+        if key == "effective_traffic" and isinstance(value, dict):
+            value = {name: setting for name, setting in value.items() if name != "expected_response_seconds"}
+        if key == "effective_checks" and isinstance(value, dict):
+            value = {check: {**settings, **({"limits": {
+                name: limit for name, limit in settings["limits"].items()
+                if name != "regression_percent"
+            }} if isinstance(settings.get("limits"), dict) else {})}
+                            if isinstance(settings, dict) else settings
+                     for check, settings in value.items()}
         if key == "effective_checks" and isinstance(value, dict):
             cancellation = value.get("cancellation")
             if isinstance(cancellation, dict) and cancellation.get("backend_verification", "off") == "off":
@@ -153,7 +336,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for key, effective in (("traffic", "effective_traffic"), ("test_options", "effective_checks")):
         if key == "traffic" and not traffic_selected:
             continue
-        if effective in report.manifest and effective in baseline.manifest:
+        if effective in current_manifest and effective in old_manifest:
             continue  # Saved drafts and explicit defaults do not change executed work.
         if key in current_config or key in old_config:
             if key not in current_config or key not in old_config:
@@ -161,19 +344,30 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
             elif current_config[key] != old_config[key]:
                 reasons.append(f"Run setting {key} differs.")
     for key in ("effective_checks", "effective_traffic"):
+        if key not in current_manifest and key not in old_manifest:
+            continue
+        if key == "effective_checks" and ((key in report.manifest) != (key in baseline.manifest)):
+            missing = baseline.manifest if key in report.manifest else report.manifest
+            if "config_version" in missing.get("config", {}):
+                reasons.append(f"Recorded {key} differs or is missing.")
+                continue
         if key == "effective_traffic" and not traffic_selected:
             continue
-        if key in report.manifest or key in baseline.manifest:
-            if effective_value(report.manifest, key) != effective_value(baseline.manifest, key):
+        if key in current_manifest or key in old_manifest:
+            if effective_value(current_manifest, key) != effective_value(old_manifest, key):
                 reasons.append(f"Recorded {key} differs or is missing.")
     # The suite version identifies bundled fixtures; custom packs also need a content identity.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
         reasons.append("Fixture pack identity is missing or unknown.")
-    elif ({key: value for key, value in current_pack.items() if key != "custom"}
-          != {key: value for key, value in old_pack.items() if key != "custom"}):
-        reasons.append("Fixture pack identity differs.")
+    else:
+        inactive = {"custom"}
+        if _same_run_limits_workload(report.manifest, baseline.manifest):
+            inactive.add("workload_fixture_sha256")
+        if ({key: value for key, value in current_pack.items() if key not in inactive}
+                != {key: value for key, value in old_pack.items() if key not in inactive}):
+            reasons.append("Fixture pack identity differs.")
     for label, config, pack in (("Current", current_config, current_pack),
                                 ("Baseline", old_config, old_pack)):
         if config.get("custom_fixtures") and "correctness" in config.get("checks", []):
@@ -184,8 +378,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for key in ("run_location", "load_shape"):
         if key not in report.manifest or key not in baseline.manifest:
             reasons.append(f"Recorded {key} is missing; comparability is unknown.")
-        elif report.manifest[key] != baseline.manifest[key]:
-            reasons.append(f"{key} differs.")
+        else:
+            current, old = report.manifest[key], baseline.manifest[key]
+            if key == "load_shape" and "max_requests" not in reached:
+                current, old = ({name: setting for name, setting in shape.items()
+                                 if name != "target_request_quotas"} if isinstance(shape, dict) else shape
+                                for shape in (current, old))
+            if current != old:
+                reasons.append(f"{key} differs.")
     return reasons
 
 
@@ -841,14 +1041,14 @@ def connection_summary(records: list[RequestRecord], url: str) -> str | None:
     return f"Could not connect to {url} ({', '.join(dict.fromkeys(errors))}); no checks could run"
 
 
-def _preview(value: Any, limit: int = 1200) -> str:
+def _preview(value: Any, limit: int = MAX_HTML_PREVIEW_CHARS) -> str:
     text = str(value)
     if len(text) <= limit:
         return _e(text)
     return _e(text[:limit]) + '… [Preview truncated; <a href="report.json">full evidence in report.json</a>]'
 
 
-def _json(value: Any, limit: int = 6000) -> str:
+def _json(value: Any, limit: int = MAX_HTML_JSON_PREVIEW_CHARS) -> str:
     return _preview(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), limit)
 
 
@@ -1061,7 +1261,7 @@ def _render(report: RunReport) -> str:
     ordered = sorted(report.requests, key=lambda r: (
         r.id not in evidence,
         not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error)))
-    detailed = ordered[:max(25, sum(r.id in evidence for r in report.requests))]
+    detailed = ordered[:max(DEFAULT_HTML_REQUEST_DETAILS, sum(r.id in evidence for r in report.requests))]
     anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
     disconnected = {target["name"]: summary for target in config.get("targets", [])
@@ -1245,7 +1445,7 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
-            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, 1200)}</pre>'
+            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>'
                          f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
             if evidence.tool_expectation is None:
                 if evidence.expected_provided:
@@ -1323,7 +1523,7 @@ def html_failure_warning(error: OSError) -> str:
     return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
 
 
-def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 256 * 1024**2,
+def write_report(report: RunReport, directory: Path, *, max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
                  html: bool = False) -> tuple[Path, Path | None]:
     """Save compact JSON; standalone HTML is an explicit optional export."""
     if isinstance(max_run_storage, bool) or not isinstance(max_run_storage, int) or max_run_storage < 0:
@@ -1335,6 +1535,24 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 2
         raise ReportWriteError(error, "report.json", json_complete=False) from error
     retained = _retained(report)
     json_path, html_path = directory / "report.json", directory / "report.html"
+    from .latency import latency_summary
+
+    metadata_path = directory / ".web.json"
+    try:
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (OSError, ValueError):
+            metadata = {}
+        metadata["latency_summary"] = latency_summary(report)
+        _atomic_write(metadata_path, json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+    except Exception as error:
+        reason = _write_failure_reason(error) if isinstance(error, OSError) else type(error).__name__
+        warning = f"Latency summary could not be saved: {reason}"
+        report.warnings.append(warning)
+        if retained.warnings is not report.warnings:
+            retained.warnings.append(warning)
     _storage_limited(retained, max_run_storage)
     try:
         _atomic_write_chunks(json_path, _report_json_chunks(retained))
@@ -1375,10 +1593,10 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
     summary = {"run_id": report.run_id, "overall": report.overall, "state": "error",
                "started_at": report.started_at, "finished_at": report.finished_at,
                "request_count": len(report.requests), "summary_saved": True, "error": message,
-               "checks": [{"id": check.id, "target": check.target, "title": check.title[:256],
+               "checks": [{"id": check.id, "target": check.target, "title": check.title[:MAX_FAILURE_SUMMARY_TITLE_CHARS],
                            "status": check.status, "summary": (
-                               text if len(text := _without_answer_excerpts(check.summary)) <= 2048
-                               else text[:2048] + " … [truncated]")}
+                               text if len(text := _without_answer_excerpts(check.summary)) <= MAX_FAILURE_SUMMARY_CHARS
+                               else text[:MAX_FAILURE_SUMMARY_CHARS] + " … [truncated]")}
                           for check in report.checks]}
     try:
         directory.mkdir(parents=True, exist_ok=True)

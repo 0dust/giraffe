@@ -12,6 +12,7 @@ import pytest
 
 from giraffe.models import ConcurrentLoad, RunConfig
 from giraffe.planning import request_plan
+from giraffe.open_files import open_file_guard
 from giraffe.runner import run_suite
 from giraffe.web import create_app
 from tests.fake_endpoint import FakeEndpoint
@@ -32,7 +33,7 @@ async def test_concurrent_setup_plan_matches_requests_with_saved_dataset_and_low
     with endpoint_context as endpoint:
         source = RunConfig(
             targets=[{"name": "local", "url": endpoint.url, "model": "fake-model"}],
-            checks=["access", "correctness"], concurrency=16,
+            checks=["access"], concurrency=16,
             max_requests=500, max_output_tokens=32, max_duration_seconds=30,
             request_timeout_seconds=3, limits={"min_samples": 2},
             request_source="request_pack",
@@ -65,7 +66,7 @@ process.stdout.write(JSON.stringify(config));
         )
         assert result.returncode == 0, result.stderr
         values = json.loads(result.stdout)
-        assert values["concurrency"] == 8
+        assert values["concurrency"] == source["concurrency"] == 16
         assert values["max_requests"] == 500
         assert values["max_output_tokens"] == 32
         assert values["request_pack"] == source["request_pack"]
@@ -92,7 +93,11 @@ process.stdout.write(JSON.stringify(config));
             assert endpoint.requests == []
 
         configuration = RunConfig.model_validate(preview.json()["config"])
-        assert request_plan(configuration) == plan
+        guard = open_file_guard(configuration, web=True)
+        assert plan == {**request_plan(configuration), "open_files": guard,
+                        "resource_warnings": guard["warnings"],
+                        "resource_issues": [dict(issue, blocking=True) for issue in guard["errors"]]
+                        + [dict(issue, blocking=False) for issue in guard["warnings"]]}
         # Keep the real client/runner traffic test short without changing form validation.
         configuration.concurrent_load.schedule.duration_seconds = .2
         report = await run_suite(configuration)

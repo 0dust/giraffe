@@ -5,11 +5,12 @@ from tests.test_ux_results import run_render_checks
 
 def test_ram_limit_field_is_required_nonnegative_and_keeps_zero_and_blank_values():
     run_render_checks(r"""
-state.bootstrap={limits_schema:{properties:{min_samples:{minimum:1}}},checks:[],config:{traffic:{}},session_workloads:{defaults:{}}};
+state.bootstrap={...state.bootstrap,limits_schema:{properties:{min_samples:{minimum:1}}},checks:[],config:{traffic:{}},session_workloads:{defaults:{}}};
 const config={targets:[{name:'local',model:'test',url:'http://localhost/v1'}],checks:[],limits:{max_error_rate:0,min_correctness:1,min_samples:1},max_requests:10,max_duration_seconds:30,concurrency:2,max_memory_mb:0};
 let html=renderSharedRunSettings(config);
-assert.match(html,/<label for="field-max_memory_mb">Memory limit \(RAM growth during this run\)<\/label>/);
-assert.match(html,/name="max_memory_mb" type="number" value="0" required min="0".*step="1"/);
+assert.match(html,/<label for="field-max_memory_mb">RAM growth \(MiB\)<\/label>/);
+assert.match(html,/name="max_memory_mb" type="number" value=""[^>]*min="0"[^>]*step="1"[^>]*disabled/);
+assert.doesNotMatch(html,/name="max_memory_mb"[^>]*required/);
 assert.match(html,/aria-describedby="field-max_memory_mb-hint"/);
 assert.match(html,/0 = off.*partial results.*inconclusive unless a check failed/);
 assert.match(html,/never reduces concurrency or request counts/);
@@ -17,13 +18,13 @@ assert.match(renderSharedRunSettings({...config,max_memory_mb:undefined}),/name=
 assert.equal(settingDestination('max_memory_mb').name,'max_memory_mb');
 assert.equal(settingDestination('max_memory_mb').label,'Memory limit (RAM growth during this run)');
 state.config=config;
-const values=new Map([['url','http://localhost/v1'],['model','test'],['name','local'],['max_memory_mb','0']]);
+const values=new Map([['max_memory_mb_enabled','off'],['url','http://localhost/v1'],['model','test'],['name','local'],['max_memory_mb','0']]);
 FormData=class {constructor(){} get(key){return values.get(key) ?? null;} has(key){return values.has(key);} set(key,value){values.set(key,value);}};
 nodes['#new-run-form']={elements:{metrics_url:{value:''}},querySelectorAll:()=>[]};
 configureTests=(c)=>c;configureConcurrentLoad=(c)=>c;configureJudging=(c)=>c;configureProfiles=(c)=>c;configureSessions=(c)=>c;concurrentFormDefaults=()=>({});
 let payload=readForm();assert.equal(payload.config.max_memory_mb,0);assert.equal(portableConfig(payload).max_memory_mb,0);
-values.set('max_memory_mb','512');payload=readForm();assert.equal(payload.config.max_memory_mb,512);
-values.set('max_memory_mb','');payload=readForm();assert.equal(payload.config.max_memory_mb,null);
+values.set('max_memory_mb_enabled','on');values.set('max_memory_mb','512');payload=readForm();assert.equal(payload.config.max_memory_mb,512);
+values.set('max_memory_mb','');assert.throws(()=>readForm(),/Enter a value or turn this limit off/);payload=readForm(true);assert.equal(payload.config.max_memory_mb,'');
 assert.equal(state.config.max_memory_mb,0);
 """)
 

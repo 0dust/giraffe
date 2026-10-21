@@ -31,18 +31,18 @@ for(const [name,value] of [['concurrency','40'],['max_output_tokens','256'],['re
   const input=elements[name];input.value=value;input.matches=()=>false;input.closest=q=>q==='#new-run-form'?form:null;
   listeners.input({target:input});assert.equal(form.elements[name],input);assert.equal(input.value,value);assert.equal(input.selectionStart,1);assert.equal(input.selectionEnd,2);
 }
-assert.match(nodes['#field-load_schedule_levels-hint'].textContent,/Maximum at once \(40\)/);
-assert.match(nodes['#field-traffic_max_in_flight-hint'].textContent,/Maximum at once \(40\)/);
+assert.match(nodes['#field-load_schedule_levels-hint'].textContent,/An accepted value is not demonstrated delivery capacity/);
+assert.match(nodes['#field-traffic_max_in_flight-hint'].textContent,/An accepted value is not demonstrated delivery capacity/);
 assert.match(nodes['#run-ceilings-summary'].textContent,/40 at once/);
-assert.equal(hints[0].textContent,'Custom · run default: 40 at a time');
+assert.equal(hints[0].textContent,'Custom · run default: 4 at a time');
 assert.equal(hints[1].textContent,'Custom · run default: 256 tokens');
 assert.equal(hints[2].textContent,'Custom · run default: 60 seconds');
-assert.equal(elements.profile_sessions_concurrency.max,'32'); // Preserve the session schema's own maximum.
-for(const name of ['profile_sessions_max_tokens','sessions_max_tokens','session_cap_0'])assert.equal(elements[name].max,'256');
-assert.equal(Number(elements.test_json_concurrency.value),40);
+assert.equal(bootstrap.limits['sessions.concurrency'].maximum,512);assert.equal(elements.profile_sessions_concurrency.max,String(bootstrap.limits['sessions.concurrency'].maximum)); // Preserve the session schema's own maximum.
+for(const name of ['profile_sessions_max_tokens','sessions_max_tokens','session_cap_0'])assert.equal(elements[name].max,bootstrap.limits[settingPath(name)].maximum==null?undefined:String(bootstrap.limits[settingPath(name)].maximum));
+assert.equal(Number(elements.test_json_concurrency.value),4);
 for(const [name,input,value] of snapshots){assert.equal(form.elements[name],input);assert.equal(input.value,value);assert.equal(input.selectionStart,1);assert.equal(input.selectionEnd,2);}
-elements.concurrency.value='2';listeners.input({target:elements.concurrency});assert.equal(elements.profile_sessions_concurrency.max,'2');assert.equal(Number(elements.test_json_concurrency.value),2);
-assert.match(nodes['#field-load_schedule_levels-hint'].textContent,/Maximum at once \(2\)/);assert.equal(elements.load_schedule_levels.value,'1, 64');
+elements.concurrency.value='2';listeners.input({target:elements.concurrency});assert.equal(bootstrap.limits['sessions.concurrency'].maximum,512);assert.equal(elements.profile_sessions_concurrency.max,String(bootstrap.limits['sessions.concurrency'].maximum));assert.equal(Number(elements.test_json_concurrency.value),2);
+assert.match(nodes['#field-load_schedule_levels-hint'].textContent,/An accepted value is not demonstrated delivery capacity/);assert.equal(elements.load_schedule_levels.value,'1, 64');
 """)
 
 
@@ -58,11 +58,10 @@ for(const id of ['correctness','capacity']){
 config.checks=['correctness'];config.request_source='request_pack';config.request_pack={cases:[]};
 config.test_options.correctness={samples:9,concurrency:2};
 const markup=renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config);
-const hidden=markup.slice(markup.indexOf('<div hidden data-inactive-question-settings>'),markup.indexOf('class="fields check-criteria-fields"'));
-assert.match(hidden,/name="test_correctness_samples"[^>]*value="9"/);
-assert.match(hidden,/name="test_correctness_concurrency"[^>]*value="2"/);
-assert.match(markup,/Sample count and requests-at-a-time settings are not used/);
-assert.match(markup,/name="test_correctness_limit_min_correctness"/);
+assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
+assert.match(markup,/Each saved case owns its output cap and request options/);
+assert.match(markup,/Concurrency: 4 \(default\)/);
+assert.match(markup,/Per-check request-setting overrides are unavailable. Per-check pass criteria remain supported./);
 assert.equal(config.test_options.correctness.samples,9);
 """)
 
@@ -71,7 +70,7 @@ def test_generic_transport_controls_are_secondary_and_pass_targets_remain_visibl
     browser_logic(r"""
 for(const [id,name] of [['access','request_timeout_seconds'],['correctness','concurrency'],['generation','max_output_tokens'],['recovery','concurrency']]){
   const markup=renderTestCard(bootstrap.checks.find(x=>x.id===id),config);
-  const disclosure=markup.match(/<details class="check-advanced check-run-overrides">([\s\S]*?)<\/details>/)[1];
+  const disclosure=markup.match(/<fieldset class="fields check-request-fields">([\s\S]*?)<\/fieldset>/)[1];
   assert.match(disclosure,new RegExp('name="test_'+id+'_'+name+'"'));
   assert.equal((markup.match(new RegExp('name="test_'+id+'_'+name+'"','g'))||[]).length,1);
   assert.match(markup,new RegExp('id="field-check_'+id+'-help"[^>]*popover="auto"'));
@@ -95,8 +94,8 @@ const correctness=bootstrap.checks.find(x=>x.id==='correctness'),cancel=bootstra
 config.samples=7;
 assert.equal(checkFieldHint(correctness,config,'samples'),'Run default');
 assert.equal(checkFieldHint(cancel,config,'cancel_after_ms'),'Check default');
-assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/cannot exceed the run request deadline/);
-assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/cannot exceed the run output cap/);
+assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/suite value is a default, not a ceiling/);
+assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/suite value is a default, not a ceiling/);
 config.test_options.correctness={samples:7};
 assert.equal(checkFieldHint(correctness,config,'samples'),'Custom · run default: 7 requests');
 const generation=bootstrap.checks.find(x=>x.id==='generation');config.limits.latency_ms=900;
@@ -122,8 +121,8 @@ def test_default_check_editor_keeps_only_actionable_copy_and_live_reset():
 const check=bootstrap.checks.find(x=>x.id==='correctness');config.checks=['correctness'];
 let markup=renderTestCard(check,config);
 assert.equal(testSettingsLabel(check,config),'');
-assert.match(markup,/class="test-settings simple-primary-settings"/);
-assert.doesNotMatch(markup,/Settings for this check|<h4>Requests<\/h4>|<h4>Pass criteria<\/h4>|Changes are kept as you edit|Shared by/);
+assert.match(markup,/class="test-settings"/);
+assert.doesNotMatch(markup,/Settings for this check|Changes are kept as you edit|Shared by/);
 assert.doesNotMatch(markup,/question-source-scope/);
 assert.match(markup,/data-reset-test="correctness"[^>]*hidden/);
 const reset={dataset:{resetTest:'correctness'},hidden:true};groups['[data-reset-test]']=[reset];
@@ -201,7 +200,9 @@ config.sessions={...bootstrap.profile_defaults.sessions,modes:['live','fixed']};
 const markup=renderProfileEditor(bootstrap.checks.find(x=>x.id==='sessions'),config);
 assert.match(markup,/<option value="live,fixed" selected>Saved selection/);
 const advanced=markup.match(/<details class="check-advanced">([\s\S]*?)<\/details>/)[1];
-assert.match(advanced,/name="profile_sessions_max_tokens"/);
+assert.doesNotMatch(advanced,/name="profile_sessions_max_tokens"/);
+assert.match(markup,/data-profile-settings="sessions" class="fields">[\s\S]*name="profile_sessions_max_tokens"/);
+assert.equal((markup.match(/name="profile_sessions_max_tokens"/g)||[]).length,1);
 assert.match(markup,/Conversations to run for each chosen history type/);
 const consistency=renderProfileEditor(bootstrap.checks.find(x=>x.id==='consistency'),config);
 assert(consistency.indexOf('name="profile_consistency_strict"')<consistency.indexOf('<details'));
@@ -220,26 +221,26 @@ config.test_options.generation={max_output_tokens:64};config.test_options.access
 const summary=effectiveCheckSummary(check,config);
 assert.match(summary,/8 at a time/);assert.doesNotMatch(summary,/exceeds run limit/);
 assert.doesNotMatch(summary,/ · 4 at a time/);
-assert.match(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config),/64 tokens exceeds run limit 32 tokens/);
-assert.match(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='access'),config),/10 seconds exceeds run limit 5 seconds/);
+assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config),'');
+assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='access'),config),'');
 const elements={test_correctness_concurrency:{value:'8'},test_generation_max_output_tokens:{value:'64'},
   test_access_request_timeout_seconds:{value:'10'},test_context_context_limit:{value:'2048',max:'65536'}};
+for(const input of Object.values(elements))input.removeAttribute=name=>delete input[name];
 nodes['#new-run-form']={elements};updateCheckFieldHints(config);
-assert.equal(elements.test_correctness_concurrency.max,'4');assert.equal(elements.test_correctness_concurrency.value,'8');
-assert.equal(elements.test_generation_max_output_tokens.max,'32');assert.equal(elements.test_generation_max_output_tokens.value,'64');
-assert.equal(elements.test_access_request_timeout_seconds.max,'5');assert.equal(elements.test_access_request_timeout_seconds.value,'10');
-assert.equal(elements.test_context_context_limit.max,'65536');
+assert.equal(elements.test_correctness_concurrency.max,String(bootstrap.limits['test_options.correctness.concurrency'].maximum));assert.equal(elements.test_correctness_concurrency.value,'8');
+assert.equal(elements.test_generation_max_output_tokens.max,bootstrap.limits['test_options.generation.max_output_tokens'].maximum==null?undefined:String(bootstrap.limits['test_options.generation.max_output_tokens'].maximum));assert.equal(elements.test_generation_max_output_tokens.value,'64');
+assert.equal(elements.test_access_request_timeout_seconds.max,undefined);assert.equal(elements.test_access_request_timeout_seconds.value,'10');
+assert.equal(elements.test_context_context_limit.max,bootstrap.limits['test_options.context.context_limit'].maximum==null?undefined:String(bootstrap.limits['test_options.context.context_limit'].maximum));
 assert.equal(config.test_options.correctness.concurrency,8);
 config.request_source='request_pack';config.request_pack={cases:[]};
-const recovery=checkOverrideWarning(check,config,true);
-assert.match(recovery,/Reset this check’s overrides or raise Maximum at once in Run limits/);
 const markup=renderTestCard(check,config);
-assert.match(markup,/data-check-override-warning="correctness" >/);
-assert(markup.indexOf('data-check-override-warning')<markup.indexOf('data-test-editor="correctness" hidden'));
-assert.equal((markup.match(/exceeds run limit/g)||[]).length,1);
+assert.match(markup,/data-pack-request-settings/);
+assert.doesNotMatch(markup,/exceeds run limit/);
+assert.doesNotMatch(markup,/name="test_correctness_concurrency"/);
 const warning={dataset:{checkOverrideWarning:'correctness'}};groups['[data-check-override-warning]']=[warning];
-updateCheckFieldHints(config);assert.equal(warning.hidden,false);assert.equal(warning.textContent,recovery);
-config.concurrency=8;updateCheckFieldHints(config);assert.equal(elements.test_correctness_concurrency.max,'8');
+updateCheckFieldHints(config);assert.equal(warning.hidden,true);assert.equal(warning.textContent,'');
+config.concurrency=8;updateCheckFieldHints(config);
+assert.equal(elements.test_correctness_concurrency.max,String(bootstrap.limits['concurrency'].maximum));
 assert.equal(warning.hidden,true);
 assert.doesNotMatch(effectiveCheckSummary(check,config),/exceeds run limit/);
 """)

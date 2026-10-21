@@ -1,3 +1,4 @@
+config_version: 2
 # Use a model and chat template that support text and tool calls in one response.
 # Giraffe sends requests to this existing endpoint; it never executes the tool.
 targets:

@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import pytest
+from pydantic import ValidationError
 
 from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport, Target
 from giraffe.reporting import compare_baseline, write_report
@@ -338,14 +339,35 @@ def test_tool_expectation_changes_only_block_selected_tool_comparisons(selected)
 
 
 @pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])
-async def test_executed_pack_rejects_unsupported_correctness_overrides(monkeypatch, checks):
+async def test_pack_rejects_unsupported_correctness_overrides_before_execution(monkeypatch, checks):
     from giraffe import runner
     from tests.test_runner import FakeClient, pack_config
 
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    with pytest.raises(ValueError, match="samples/concurrency overrides are unsupported"):
+    with pytest.raises(ValidationError) as error:
         await runner.run_suite(pack_config(checks=checks,
-            test_options={"correctness": {"samples": 9, "concurrency": 1}}))
+            test_options={"correctness": {"samples": 9, "concurrency": 1,
+                                          "limits": {"min_correctness": .5}}}))
+    detail = error.value.errors(include_input=False)[0]
+    assert detail["type"] == "request_pack_override"
+    assert detail["msg"] == ("Request-pack correctness does not support request-setting overrides: "
+                             "test_options.correctness.concurrency, test_options.correctness.samples. "
+                             "Per-check pass criteria are supported.")
+    # Cross-field model errors navigate using ctx.fields at the I/O boundary.
+    assert detail["loc"] == ()
+    assert detail["ctx"]["fields"] == ["test_options.correctness.concurrency", "test_options.correctness.samples"]
+    from giraffe.configuration_errors import configuration_errors
+    diagnostic, = configuration_errors([detail], {})
+    assert diagnostic["field"] == "test_options.correctness.concurrency"
+    assert diagnostic["fields"] == detail["ctx"]["fields"]
+
+
+@pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])
+def test_pack_accepts_correctness_pass_criteria(checks):
+    from tests.test_runner import pack_config
+
+    configured = pack_config(checks=checks, test_options={"correctness": {"limits": {"min_correctness": .5}}})
+    assert configured.effective_check("correctness")["limits"]["min_correctness"] == .5
 
 
 @pytest.mark.parametrize("field,value", [("samples", 9), ("context_limit", 1024), ("sustained_seconds", .1)])

@@ -29,7 +29,8 @@ def test_failed_preflight_stops_before_artifacts(tmp_path, monkeypatch, capsys, 
 
 
 def values(**updates):
-    return {"targets": [{"name": "local", "url": "http://server", "model": "tiny"}],
+    return {"config_version": 2,
+            "targets": [{"name": "local", "url": "http://server", "model": "tiny"}],
             "checks": ["correctness"], **updates}
 
 
@@ -116,7 +117,7 @@ def test_validate_text_summary_and_optional_config(flag, tmp_path, monkeypatch, 
     assert main(["validate", "--config", str(path), *flag]) == 0
     output = capsys.readouterr().out
     assert output.startswith("Configuration is valid. No traffic was sent.\nTargets: local\n")
-    assert "Checks: correctness\nmax_requests: 1\n" in output and "Warning: " in output
+    assert "Checks: correctness\nStop after this many requests: 1\n" in output and "Warning: " in output
     assert ('"targets":' in output) == bool(flag)
     if not flag:
         assert len(output.splitlines()) < 12
@@ -178,7 +179,9 @@ def test_cli_strips_assertion_prefix_but_keeps_field_location(output_format, mon
     assert "PRIVATE_INPUT" not in captured.out + captured.err
     if output_format == "json":
         assert json.loads(captured.out)["errors"] == [{
-            "loc": ["targets", 0, "url"], "message": "target url rejected", "type": "assertion_error"}]
+            "loc": ["targets", 0, "url"], "message": "target url rejected", "type": "assertion_error",
+            "field": "targets.0.url", "fields": ["targets.0.url"], "values": {},
+            "actions": [{"label": "Edit targets.0.url", "field": "targets.0.url"}]}]
     else:
         assert captured.err.strip() == "giraffe: targets.0.url: target url rejected"
 
@@ -197,7 +200,12 @@ def test_run_help_has_all_flags_examples_and_exit_codes(capsys):
     assert stopped.value.code == 0
     output = capsys.readouterr().out
     assert "--structured-output" in output and "--json " not in output
-    assert "(default: 300)" in output
+    assert "(default: 300)" not in output
+    help_text = " ".join(output.split())  # Argparse wraps the longer field labels.
+    assert help_text.count("(default: Not set)") == 3
+    for label in ["Limit simultaneous requests across the suite", "Stop after this many requests across all targets",
+                  "Stop test traffic after this many seconds"]:
+        assert label + " (default: Not set)" in help_text
     assert "--checks CHECKS" in output and "first_output" in output
     assert "llama3.2:3b" in output and "--config giraffe.yaml" in output and "--baseline runs/previous" in output
     assert "2  inconclusive" in output and "3  blocked" in output and "4  usage" in output

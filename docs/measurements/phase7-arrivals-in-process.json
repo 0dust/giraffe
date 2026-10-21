@@ -1,0 +1,356 @@
+{
+  "environment": {
+    "python": "3.12.1 | packaged by Anaconda, Inc. | (main, Jan 19 2024, 09:45:58) [Clang 14.0.6 ]",
+    "platform": "macOS-26.3.1-arm64-i386-64bit",
+    "httpx": "0.28.1",
+    "clock": "time.monotonic; CPU=time.process_time (includes in-process fake endpoint)",
+    "measured_at_utc": "2026-10-21T04:41:58Z"
+  },
+  "parameters": {
+    "requests": [
+      10000,
+      100000
+    ],
+    "rate": 1000,
+    "in_flight": 256,
+    "body_bytes": 1024,
+    "chunks": 4,
+    "chunk_interval_ms": 5,
+    "output": "/tmp/phase7-arrivals-final.json"
+  },
+  "gate_definitions": {
+    "lateness_ms": 50,
+    "well_under_4GiB": "sampled RSS growth below 1 GiB",
+    "storage_limit_bytes": 268435456
+  },
+  "limitations": [
+    "MockTransport excludes socket/TLS/connection-pool overhead.",
+    "RSS is sampled every 50 ms; unobserved spikes can occur between samples.",
+    "Memory/storage depends on actual answer and input sizes; this is a 1 KiB reasoning workload by default.",
+    "Web container test runs the production web progress tracker; no HTTP server is bound.",
+    "Accepted ceiling is not demonstrated delivery capacity."
+  ],
+  "measurements": [
+    {
+      "requested": 10000,
+      "offered_rate_rps": 1000,
+      "in_flight_limit": 256,
+      "issued": 10000,
+      "completed": 10000,
+      "score_failures": 1000,
+      "endpoint_peak": 51,
+      "wall_seconds": 10.053043833002448,
+      "cpu_seconds": 3.6471479999999996,
+      "cpu_ms_per_request": 0.36471479999999995,
+      "scheduler_lateness_ms": {
+        "count": 10000,
+        "p50": 0.13245921581983566,
+        "p95": 0.19575003534555435,
+        "p99": 6.551249884068966,
+        "max": 30.248125083744526
+      },
+      "scheduler_lateness_definition": "RequestRecord.client_wait_ms: actual runner dispatch minus independent scheduled arrival",
+      "timing_health": {
+        "schema_version": 1,
+        "interval_ms": 50,
+        "sample_count": 200,
+        "delayed_sample_count": 0,
+        "max_lag_ms": 14.735291060060263,
+        "delay_floor_ms": 100,
+        "windows": [],
+        "overflow_window": null,
+        "scope": "Client event-loop responsiveness; CPU, OS and other causes are not distinguished."
+      },
+      "arrivals_observation": {
+        "planned": 10000,
+        "issued": 10000,
+        "unissued": [],
+        "clock": "milliseconds since run start; schedule independent of concurrency",
+        "mode": "steady",
+        "seed": 0,
+        "max_pending": 256,
+        "incomplete": 0,
+        "client_wait_threshold_ms": 50,
+        "delayed": 0,
+        "max_client_wait_ms": 30.248125083744526,
+        "measurement_window_seconds": 10.024276334326714,
+        "completed_requests_per_second": 997.5782456990353,
+        "configured_rate_achieved": true
+      },
+      "rss_baseline_bytes": 89210880,
+      "rss_after_traffic_bytes": 162430976,
+      "sampled_rss_peaks_bytes": {
+        "traffic": 162512896,
+        "export_all": 162758656,
+        "export_failures": 199147520,
+        "export_none": 218284032
+      },
+      "sampled_peak_growth_bytes": 129073152,
+      "process_peak_rss_bytes": 218284032,
+      "rss_sample_interval_seconds": 0.05,
+      "live_web": {
+        "container_peaks": {
+          "requests": 4096,
+          "events": 100,
+          "conditions": 1,
+          "phases": 0,
+          "evicted_running": 0
+        },
+        "container_final": {
+          "requests": 4096,
+          "events": 100,
+          "conditions": 1,
+          "phases": 0,
+          "evicted_running": 0
+        },
+        "json_bytes": 1848420,
+        "summary": {
+          "evicted": 5904,
+          "through_slot": 5903,
+          "statuses": {
+            "completed": 5904
+          }
+        },
+        "scope": "production _track_live_progress (requests, conditions, events, phases)"
+      },
+      "exports": [
+        {
+          "retention": "all",
+          "report_json_bytes": 35401275,
+          "directory_bytes": 35403654,
+          "storage": {
+            "limit_bytes": 268435456,
+            "response_bodies_omitted": 0,
+            "reason": "Per-run JSON storage limit on disk.",
+            "limit_exceeded": false
+          },
+          "export_seconds": 0.46531587513163686,
+          "sampled_peak_rss_bytes": 162742272
+        },
+        {
+          "retention": "failures",
+          "report_json_bytes": 26149280,
+          "directory_bytes": 26151659,
+          "storage": {
+            "limit_bytes": 268435456,
+            "response_bodies_omitted": 0,
+            "reason": "Per-run JSON storage limit on disk.",
+            "limit_exceeded": false
+          },
+          "export_seconds": 0.4615564998239279,
+          "sampled_peak_rss_bytes": 199147520
+        },
+        {
+          "retention": "none",
+          "report_json_bytes": 25071276,
+          "directory_bytes": 25073655,
+          "storage": {
+            "limit_bytes": 268435456,
+            "response_bodies_omitted": 0,
+            "reason": "Per-run JSON storage limit on disk.",
+            "limit_exceeded": false
+          },
+          "export_seconds": 0.460082707926631,
+          "sampled_peak_rss_bytes": 218284032
+        }
+      ],
+      "gates": {
+        "all_requests_completed": true,
+        "no_local_drops": true,
+        "lateness_within_50ms": true,
+        "rss_growth_below_1GiB": true,
+        "exports_fit_256MiB": true,
+        "live_request_window_bounded": true,
+        "live_conditions_bounded": true,
+        "live_running_evictions_drained": true
+      },
+      "candidate_passes_all_gates": true
+    },
+    {
+      "requested": 100000,
+      "offered_rate_rps": 1000,
+      "in_flight_limit": 256,
+      "issued": 100000,
+      "completed": 100000,
+      "score_failures": 10000,
+      "endpoint_peak": 106,
+      "wall_seconds": 100.13699929183349,
+      "cpu_seconds": 38.717671,
+      "cpu_ms_per_request": 0.38717671000000004,
+      "scheduler_lateness_ms": {
+        "count": 100000,
+        "p50": 0.1716245897114277,
+        "p95": 0.22270763292908669,
+        "p99": 119.48062479496002,
+        "max": 271.7397906817496
+      },
+      "scheduler_lateness_definition": "RequestRecord.client_wait_ms: actual runner dispatch minus independent scheduled arrival",
+      "timing_health": {
+        "schema_version": 1,
+        "interval_ms": 50,
+        "sample_count": 1952,
+        "delayed_sample_count": 10,
+        "max_lag_ms": 258.1822502426803,
+        "delay_floor_ms": 100,
+        "windows": [
+          {
+            "start_ms": 38355.4746247828,
+            "end_ms": 38513.09679169208,
+            "lag_ms": 107.62216690927744
+          },
+          {
+            "start_ms": 45800.807000137866,
+            "end_ms": 45962.53591682762,
+            "lag_ms": 111.72891668975353
+          },
+          {
+            "start_ms": 54172.07212513313,
+            "end_ms": 54337.284832727164,
+            "lag_ms": 115.21270759403706
+          },
+          {
+            "start_ms": 58893.38441705331,
+            "end_ms": 59069.667832925916,
+            "lag_ms": 126.28341587260365
+          },
+          {
+            "start_ms": 63826.64841692895,
+            "end_ms": 64022.41220790893,
+            "lag_ms": 145.76379097998142
+          },
+          {
+            "start_ms": 69129.52070776373,
+            "end_ms": 69356.46841675043,
+            "lag_ms": 176.94770898669958
+          },
+          {
+            "start_ms": 75015.33445809036,
+            "end_ms": 75278.98895787075,
+            "lag_ms": 213.6544997803867
+          },
+          {
+            "start_ms": 81289.04762491584,
+            "end_ms": 81544.71791675314,
+            "lag_ms": 205.67029183730483
+          },
+          {
+            "start_ms": 88106.20329203084,
+            "end_ms": 88378.01862508059,
+            "lag_ms": 221.81533304974437
+          },
+          {
+            "start_ms": 95288.73904189095,
+            "end_ms": 95596.92129213363,
+            "lag_ms": 258.1822502426803
+          }
+        ],
+        "overflow_window": null,
+        "scope": "Client event-loop responsiveness; CPU, OS and other causes are not distinguished."
+      },
+      "arrivals_observation": {
+        "planned": 100000,
+        "issued": 100000,
+        "unissued": [],
+        "clock": "milliseconds since run start; schedule independent of concurrency",
+        "mode": "steady",
+        "seed": 0,
+        "max_pending": 256,
+        "incomplete": 0,
+        "client_wait_threshold_ms": 50,
+        "delayed": 2373,
+        "max_client_wait_ms": 271.7397906817496,
+        "measurement_window_seconds": 100.11464641569182,
+        "completed_requests_per_second": 998.8548487179809,
+        "configured_rate_achieved": false
+      },
+      "rss_baseline_bytes": 202211328,
+      "rss_after_traffic_bytes": 970506240,
+      "sampled_rss_peaks_bytes": {
+        "traffic": 972210176,
+        "export_all": 1321467904,
+        "export_failures": 1356857344,
+        "export_none": 1408434176
+      },
+      "sampled_peak_growth_bytes": 1206222848,
+      "process_peak_rss_bytes": 1408434176,
+      "rss_sample_interval_seconds": 0.05,
+      "live_web": {
+        "container_peaks": {
+          "requests": 4096,
+          "events": 100,
+          "conditions": 1,
+          "phases": 0,
+          "evicted_running": 0
+        },
+        "container_final": {
+          "requests": 4096,
+          "events": 100,
+          "conditions": 1,
+          "phases": 0,
+          "evicted_running": 0
+        },
+        "json_bytes": 1853574,
+        "summary": {
+          "evicted": 95904,
+          "through_slot": 95903,
+          "statuses": {
+            "completed": 95904
+          }
+        },
+        "scope": "production _track_live_progress (requests, conditions, events, phases)"
+      },
+      "exports": [
+        {
+          "retention": "all",
+          "report_json_bytes": 268435227,
+          "directory_bytes": 268437609,
+          "storage": {
+            "limit_bytes": 268435456,
+            "response_bodies_omitted": 83298,
+            "reason": "Response bodies omitted to fit the per-run JSON limit on disk.",
+            "limit_exceeded": false
+          },
+          "export_seconds": 8.143948499578983,
+          "sampled_peak_rss_bytes": 1321467904
+        },
+        {
+          "retention": "failures",
+          "report_json_bytes": 261545545,
+          "directory_bytes": 261547927,
+          "storage": {
+            "limit_bytes": 268435456,
+            "response_bodies_omitted": 0,
+            "reason": "Per-run JSON storage limit on disk.",
+            "limit_exceeded": false
+          },
+          "export_seconds": 4.979550375137478,
+          "sampled_peak_rss_bytes": 1356857344
+        },
+        {
+          "retention": "none",
+          "report_json_bytes": 250765541,
+          "directory_bytes": 250767923,
+          "storage": {
+            "limit_bytes": 268435456,
+            "response_bodies_omitted": 0,
+            "reason": "Per-run JSON storage limit on disk.",
+            "limit_exceeded": false
+          },
+          "export_seconds": 4.950088917277753,
+          "sampled_peak_rss_bytes": 1408434176
+        }
+      ],
+      "gates": {
+        "all_requests_completed": true,
+        "no_local_drops": true,
+        "lateness_within_50ms": false,
+        "rss_growth_below_1GiB": false,
+        "exports_fit_256MiB": true,
+        "live_request_window_bounded": true,
+        "live_conditions_bounded": true,
+        "live_running_evictions_drained": true
+      },
+      "candidate_passes_all_gates": false
+    }
+  ]
+}

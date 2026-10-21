@@ -9,10 +9,26 @@ export function sameConfig(left, right) {
 }
 
 export function optionDefault(config, check, name) {
+  if (name === 'concurrency') return inheritedConcurrency(config, config.default_concurrency ?? check.defaults[name]);
+  if (['serving','first_output'].includes(check.id) && ['samples','max_output_tokens','request_timeout_seconds'].includes(name)) {
+    const serving = config.checks?.includes('serving') ? config.test_options?.serving : null;
+    const first = config.checks?.includes('first_output') ? config.test_options?.first_output : null;
+    return serving?.[name] ?? (name !== 'samples' ? first?.[name] : null) ?? config[name] ?? check.defaults[name];
+  }
+  const rule = check.inheritance?.[name];
+  if (rule?.maximum_default != null) return Math.min(rule.maximum_default, config[rule.suite_field] ?? check.defaults[name]);
   return config[name] ?? check.defaults[name];
 }
 
+function inheritedConcurrency(config, value) {
+  return config.concurrency == null ? value : Math.max(1, Math.min(value,
+    Math.floor(config.concurrency / (config.overlap_models ? config.targets?.length || 1 : 1))));
+}
+
 export function optionValue(config, check, name) {
+  if (['serving','first_output'].includes(check.id) && ['samples','max_output_tokens','request_timeout_seconds'].includes(name)) {
+    return optionDefault(config, check, name);
+  }
   return config.test_options?.[check.id]?.[name] ?? optionDefault(config, check, name);
 }
 
@@ -32,20 +48,45 @@ function numeric(value, label, allowInvalid=false) {
   return result;
 }
 
-function validLoadLevels(levels) {
-  return Array.isArray(levels) && levels.length >= 1 && levels.length <= 16 &&
-    new Set(levels).size === levels.length &&
-    levels.every(level => Number.isInteger(level) && level >= 1 && level <= 256);
+// Checkboxes carry an explicit on/off sentinel because disabled inputs are not
+// submitted by FormData. Empty enabled values remain invalid, rather than
+// accidentally becoming an unchecked limit.
+export function configureRunLimits(source, values, {allowInvalid=false}={}) {
+  const config = structuredClone(source);
+  for (const name of ['max_duration_seconds','max_requests','concurrency','max_memory_mb']) {
+    if (!values.has(`${name}_enabled`)) continue;
+    if (values.get(`${name}_enabled`) !== 'on') {
+      config[name] = name === 'max_memory_mb' ? 0 : null;
+      continue;
+    }
+    let value = numeric(values.get(name), name, allowInvalid);
+    if (value === null) {
+      const msg = 'Enter a value or turn this limit off.';
+      if (!allowInvalid) throw Object.assign(new Error(msg), {errors:[{fields:[name],msg}]});
+      value = '';
+    }
+    if (name === 'max_duration_seconds' && typeof value === 'number') {
+      value *= {s:1,min:60,h:3600}[values.get('max_duration_unit') || 's'] ?? 1;
+    }
+    config[name] = value;
+  }
+  return config;
 }
 
-export function inferSetupPreset(config) {
+function validLoadLevels(levels, limits={}) {
+  const bounds = limits['concurrent_load.schedule.levels'] || {}, item = bounds.items || {};
+  return Array.isArray(levels) && levels.length >= (bounds.minItems ?? 1) && levels.length <= (bounds.maxItems ?? Infinity) &&
+    new Set(levels).size === levels.length &&
+    levels.every(level => Number.isInteger(level) && level >= (item.minimum ?? 1) && level <= (item.maximum ?? Infinity));
+}
+
+export function inferSetupPreset(config, {limits={}}={}) {
   const checks = config.checks;
   const matches = expected => Array.isArray(checks) && checks.length === expected.length &&
     new Set(checks).size === checks.length && expected.every(id => checks.includes(id));
   if (matches(['access','correctness'])) return 'answers';
   if (matches(['access','correctness','capacity'])) return 'arrival';
-  if (matches(['access','concurrency']) && validLoadLevels(config.concurrent_load?.schedule?.levels) &&
-      config.concurrency === Math.max(...config.concurrent_load.schedule.levels) &&
+  if (matches(['access','concurrency']) && (config.concurrent_load?.schedule?.levels === undefined || validLoadLevels(config.concurrent_load.schedule.levels, limits)) &&
       checks.every(id => !Object.keys(config.test_options?.[id] || {}).length)) return 'concurrent';
   return 'custom';
 }
@@ -63,41 +104,55 @@ export function applySetupPreset(source, preset, defaults) {
   config.tool_calling = config.checks.includes('tools');
   if (preset === 'concurrent') {
     config.concurrent_load ||= structuredClone(defaults);
-    if (validLoadLevels(config.concurrent_load.schedule?.levels)) config.concurrency = Math.max(...config.concurrent_load.schedule.levels);
   }
   return config;
 }
 
-// Basic concurrent testing has one load control: the tested levels. Advanced
-// configurations retain their independently chosen run ceiling.
-export function configureSetupLoad(source, preset, {allowInvalid=false}={}) {
+// Tested levels and the optional suite ceiling are independent settings.
+export function configureSetupLoad(source, preset, {allowInvalid=false, limits={}}={}) {
   const config = structuredClone(source);
   if (preset !== 'concurrent') return config;
-  if (!validLoadLevels(config.concurrent_load?.schedule?.levels)) {
+  if (config.concurrent_load?.schedule?.levels !== undefined && !validLoadLevels(config.concurrent_load.schedule.levels, limits)) {
     if (allowInvalid) return config;
-    throw new Error('Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+    throw new Error(loadLevelsMessage(limits));
   }
-  config.concurrency = Math.max(...config.concurrent_load.schedule.levels);
   return config;
 }
 
-export function configureConcurrentLoad(source, values, defaults, {allowInvalid=false}={}) {
+function loadLevelsMessage(limits) {
+  const bounds = limits['concurrent_load.schedule.levels'] || {}, item = bounds.items || {};
+  return `Concurrency levels must contain ${bounds.minItems ?? 1}${bounds.maxItems == null ? ' or more' : ` to ${bounds.maxItems}`} distinct whole numbers from ${item.minimum ?? 1}${item.maximum == null ? ' upwards' : ` to ${item.maximum}`}.`;
+}
+
+export function configureConcurrentLoad(source, values, defaults, {allowInvalid=false, limits={}}={}) {
   const config = structuredClone(source);
   if (![...values.keys()].some(name => name.startsWith('load_'))) return config;
-  const settings = structuredClone(source.concurrent_load || defaults);
+  const settings = structuredClone(defaults);
+  for (const [group, value] of Object.entries(config.concurrent_load || {})) {
+    settings[group] = value && typeof value === 'object' && !Array.isArray(value) ? {...settings[group], ...value} : value;
+  }
+  for (const size of ['short','medium','long']) {
+    settings.profile[size] = {...defaults.profile[size], ...source.concurrent_load?.profile?.[size]};
+  }
+  const inheritedLevels = defaults.schedule.levels.filter(level => level <= inheritedConcurrency(config, Math.max(...defaults.schedule.levels)));
+  if (!inheritedLevels.length) inheritedLevels.push(1);
+  if (source.concurrent_load?.schedule?.levels === undefined) settings.schedule.levels = inheritedLevels;
   const validate = !allowInvalid && config.checks.includes('concurrency');
   const invalid = (fields, msg) => {throw Object.assign(new Error(msg), {errors:[{fields, msg}]});};
   const rendered = values.has('load_rendered');
   const sizes = ['short','medium','long'];
   const shapes = sizes.flatMap(input => sizes.map(output => `${input}_${output}`));
-  const number = (group, key, label, {minimum=0, maximum=Infinity, integer=false, nullable=false}={}) => {
+  const number = (group, key, label, {integer=false, nullable=false}={}) => {
     const name = `load_${group}_${key}`;
     if (!values.has(name)) return;
     const value = numeric(values.get(name), label, true);
+    const bounds = limits[`concurrent_load.${group}.${key}`] || {};
+    const minimum = bounds.minimum ?? bounds.exclusiveMinimum ?? -Infinity, maximum = bounds.maximum ?? Infinity;
     if (validate && !(nullable && value === null) &&
         (typeof value !== 'number' || !Number.isFinite(value) || value < minimum || value > maximum ||
+         (bounds.exclusiveMinimum != null && value === bounds.exclusiveMinimum) ||
          (integer && !Number.isInteger(value)))) {
-      const range = Number.isFinite(maximum) ? `from ${minimum} to ${maximum}` : `of at least ${minimum}`;
+      const range = bounds.exclusiveMinimum != null ? `greater than ${minimum}${Number.isFinite(maximum)?` and at most ${maximum}`:''}` : Number.isFinite(maximum) ? `from ${minimum} to ${maximum}` : `of at least ${minimum}`;
       invalid([`concurrent_load.${group}.${key}`], `${label} must be ${integer ? 'a whole number' : 'a number'} ${range}.`);
     }
     settings[group] ||= {};
@@ -108,9 +163,9 @@ export function configureConcurrentLoad(source, values, defaults, {allowInvalid=
     if (!values.has(name)) continue;
     const label = `${size[0].toUpperCase()+size.slice(1)} ${field === 'input_tokens' ? 'input target' : 'output cap'}`;
     const value = numeric(values.get(name), label, true);
-    const maximum = field === 'input_tokens' ? 131072 : 65536;
-    if (validate && (!Number.isInteger(value) || value < 1 || value > maximum)) {
-      invalid([`concurrent_load.profile.${size}.${field}`], `${label} must be a whole number from 1 to ${maximum}.`);
+    const bounds = limits[`concurrent_load.profile.${size}.${field}`] || {};
+    if (validate && (!Number.isInteger(value) || value < (bounds.minimum ?? 1) || value > (bounds.maximum ?? Infinity))) {
+      invalid([`concurrent_load.profile.${size}.${field}`], `${label} must be a whole number from ${bounds.minimum ?? 1}${bounds.maximum == null ? ' upwards' : ` to ${bounds.maximum}`}.`);
     }
     settings.profile[size][field] = value;
   }
@@ -128,40 +183,38 @@ export function configureConcurrentLoad(source, values, defaults, {allowInvalid=
     if (!rendered && !values.has(name)) continue;
     const raw = values.get(name);
     const value = raw == null || String(raw).trim() === '' ? 0 : numeric(raw, 'Share of requests', true);
-    if (validate && (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100)) {
-      invalid([`concurrent_load.mixed.shares.${shape}`], 'Share of requests must be a number from 0 to 100.');
+    const bounds = limits[`concurrent_load.mixed.shares.${shape}`] || limits['concurrent_load.mixed.shares.*'] || {};
+    if (validate && (typeof value !== 'number' || !Number.isFinite(value) || value < (bounds.minimum ?? 0) || value > (bounds.maximum ?? Infinity))) {
+      invalid([`concurrent_load.mixed.shares.${shape}`], `Share of requests must be a number from ${bounds.minimum ?? 0}${bounds.maximum == null ? ' upwards' : ` to ${bounds.maximum}`}.`);
     }
     if (value === 0) delete settings.mixed.shares[shape];
     else settings.mixed.shares[shape] = value;
   }
   if (values.has('load_interference_trigger')) settings.interference.trigger = values.get('load_interference_trigger');
-  number('interference','trigger_chunks','Chunk count',{minimum:1,maximum:1000,integer:true});
-  number('interference','max_slowdown','Maximum slowdown',{minimum:1,nullable:true});
+  number('interference','trigger_chunks','Chunk count',{integer:true});
+  number('interference','max_slowdown','Maximum slowdown',{nullable:true});
   for (const key of ['large_input','large_output']) {
     if (rendered || values.has(`load_stress_${key}`)) settings.stress[key] = values.get(`load_stress_${key}`) === 'on';
   }
-  number('stress','min_output_percent','Minimum output length',{minimum:1,maximum:100});
+  number('stress','min_output_percent','Minimum output length');
   if (values.has('load_schedule_levels')) {
     settings.schedule.levels = String(values.get('load_schedule_levels') || '').trim().split(/[\s,]+/)
       .filter(Boolean).map(value => numeric(value, 'Concurrency levels', true));
-    if (validate && !validLoadLevels(settings.schedule.levels)) {
-      invalid(['concurrent_load.schedule.levels'], 'Concurrency levels must contain 1 to 16 distinct whole numbers from 1 to 256.');
+    if (validate && !validLoadLevels(settings.schedule.levels, limits)) {
+      invalid(['concurrent_load.schedule.levels'], loadLevelsMessage(limits));
     }
-    if (validLoadLevels(settings.schedule.levels)) settings.schedule.levels.sort((left,right) => left-right);
+    if (validLoadLevels(settings.schedule.levels, limits)) settings.schedule.levels.sort((left,right) => left-right);
   }
-  number('schedule','duration_seconds','Duration per workload',{minimum:1,maximum:3600,integer:true});
+  number('schedule','duration_seconds','Duration per workload',{integer:true});
   for (const key of ['first_output_p95_ms','response_p95_ms']) {
     number('pass_criteria',key,key === 'first_output_p95_ms' ? 'First answer p95' : 'Response p95',
-      {minimum:1,integer:true,nullable:true});
+      {integer:true,nullable:true});
   }
   for (const key of ['max_error_percent','min_correct_percent']) {
-    number('pass_criteria',key,key === 'max_error_percent' ? 'Maximum errors' : 'Minimum correct answers',{maximum:100});
+    number('pass_criteria',key,key === 'max_error_percent' ? 'Maximum errors' : 'Minimum correct answers');
   }
-  number('pass_criteria','min_valid_responses','Minimum valid responses',{minimum:2,integer:true});
+  number('pass_criteria','min_valid_responses','Minimum valid responses',{integer:true});
   if (validate) {
-    for (const size of sizes) if (settings.profile[size].output_tokens > config.max_output_tokens) {
-      invalid([`concurrent_load.profile.${size}.output_tokens`, 'max_output_tokens'], `Each output cap must be ${config.max_output_tokens} tokens or less. Lower the output cap or edit Maximum answer length under Shared run settings → Request defaults.`);
-    }
     if (!Object.values(settings).some(value => value?.enabled)) invalid(['concurrent_load.combinations.enabled'], 'Enable at least one load type.');
     if (settings.combinations.enabled && !settings.combinations.selected.length) invalid(['concurrent_load.combinations.selected'], 'Select at least one combination.');
     if (settings.mixed.enabled && Math.abs(Object.values(settings.mixed.shares).reduce((sum,share) => sum+share,0)-100) > 1e-6) {
@@ -173,6 +226,9 @@ export function configureConcurrentLoad(source, values, defaults, {allowInvalid=
     }
   }
   config.concurrent_load = settings;
+  if (source.concurrent_load?.schedule?.levels === undefined && sameConfig(settings.schedule.levels, inheritedLevels)) {
+    delete settings.schedule.levels;
+  }
   return config;
 }
 
@@ -185,50 +241,63 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
   config.tool_calling = config.checks.includes('tools');
   config.test_options ||= {};
   for (const check of checks) {
-    if (check.id === 'concurrency' || values.get(`test_mode_${check.id}`) !== 'custom') {
+    const packCorrectness = config.request_source === 'request_pack' && check.id === 'correctness';
+    if (!values.has(`test_mode_${check.id}`)) continue;
+    if (values.get(`test_mode_${check.id}`) !== 'custom') {
       delete config.test_options[check.id];
       continue;
     }
     const previous = source.test_options?.[check.id] || {};
-    const options = {};
-    for (const name of check.option_fields) {
-      if (config.request_source === 'request_pack' && check.id === 'correctness' && ['samples','concurrency'].includes(name)) {
-        if (Object.hasOwn(previous, name)) options[name] = previous[name];
-        continue;
-      }
+    const options = {...previous};
+    for (const name of packCorrectness ? [] : check.option_fields) {
+      if (!values.has(`test_${check.id}_${name}`)) continue;
       const raw = values.get(`test_${check.id}_${name}`);
       const value = ['trace_file','server_log','backend_verification'].includes(name) ? (String(raw || '').trim() || null) : numeric(raw, name, allowInvalid);
+      if (value !== null && value === optionValue(source, check, name)) continue;
       // A saved override still owns its value when the global setting happens
       // to match it. Blank options and Reset remain explicit ways to inherit.
       if (value !== null && (value !== optionDefault(config, check, name) ||
           (Object.hasOwn(previous, name) && previous[name] != null))) options[name] = value;
+      else delete options[name];
     }
-    const limits = {};
+    const limits = {...previous.limits};
     for (const name of check.limit_fields) {
+      if (!values.has(`test_${check.id}_limit_${name}`)) continue;
       let value = numeric(values.get(`test_${check.id}_limit_${name}`), name, allowInvalid);
       if (percentageInputs && ['min_correctness','max_error_rate'].includes(name) && typeof value === 'number') value /= 100;
       const inherited = Object.hasOwn(config.limits || {}, name) ?
         config.limits[name] : check.defaults.limits[name];
       if (value !== inherited || Object.hasOwn(previous.limits || {}, name)) limits[name] = value;
+      else delete limits[name];
     }
     if (Object.keys(limits).length) options.limits = limits;
+    else delete options.limits;
     if (Object.keys(options).length) config.test_options[check.id] = options;
     else delete config.test_options[check.id];
   }
   if (values.get('traffic_mode') === 'default') config.traffic = structuredClone(trafficDefaults);
-  else {
+  else if (values.has('traffic_mode')) {
     config.traffic = structuredClone(source.traffic || trafficDefaults);
     for (const name of Object.keys(trafficDefaults)) {
       if (name === 'mix') {
         for (const kind of Object.keys(trafficDefaults.mix)) {
+          if (!values.has(`traffic_mix_${kind}`)) continue;
           config.traffic.mix[kind] = numeric(values.get(`traffic_mix_${kind}`), `${kind} weight`, allowInvalid);
         }
-      } else if (name === 'rates') {
+      } else if (!values.has(`traffic_${name}`)) continue;
+      else if (name === 'rates') {
         const parts = String(values.get('traffic_rates') || '').trim().split(/[\s,]+/);
         if (parts.some(part => !part) && !allowInvalid) throw new Error('Enter at least one arrival rate.');
         config.traffic.rates = parts.filter(Boolean).map(part => numeric(part, 'Arrival rate', allowInvalid));
       } else if (name === 'arrival') config.traffic.arrival = values.get('traffic_arrival');
-      else config.traffic[name] = numeric(values.get(`traffic_${name}`), name, allowInvalid);
+      else {
+        const value = numeric(values.get(`traffic_${name}`), name, allowInvalid);
+        if (name === 'max_in_flight' && source.traffic?.max_in_flight == null &&
+            value === inheritedConcurrency(config, config.default_concurrency)) {
+          if (Object.hasOwn(source.traffic || {}, name)) config.traffic[name] = null;
+          else delete config.traffic[name];
+        } else config.traffic[name] = value;
+      }
     }
   }
   if (config.request_source === 'request_pack' && source.traffic) {
@@ -267,15 +336,19 @@ export function configureSessions(source, values, defaults, {allowInvalid=false}
   if (!values.has('sessions_profile')) return config;
   if (values.get('sessions_profile') === 'correctness' && !config.sessions) return config;
   const settings = config.sessions ||= {...structuredClone(defaults),
-    concurrency:Math.min(defaults.concurrency,config.concurrency),
     max_tokens:Math.min(defaults.max_tokens,config.max_output_tokens)};
   settings.profile = values.get('sessions_profile');
   if (settings.profile !== 'performance') return config;
   settings.modes = ['live'];
   settings.sessions = numeric(values.get('sessions_count'), 'Total conversations', allowInvalid);
-  settings.concurrency = Math.min(config.concurrency,settings.sessions);
   settings.delay_seconds = numeric(values.get('sessions_delay'), 'Pause between turns', allowInvalid);
-  settings.max_tokens = numeric(values.get('sessions_max_tokens'), 'Conversation output cap', allowInvalid);
+  if (values.has('profile_sessions_concurrency')) {
+    const value = numeric(values.get('profile_sessions_concurrency'), 'Concurrent conversations', allowInvalid);
+    const edited = JSON.parse(values.get('profile_edits_sessions') || '[]').includes('concurrency');
+    if (edited || Object.hasOwn(source.sessions || {}, 'concurrency') || value !== inheritedConcurrency(config, defaults.concurrency)) settings.concurrency = value;
+    else delete settings.concurrency;
+  }
+  settings.max_tokens = numeric(values.get(values.has('profile_sessions_max_tokens') ? 'profile_sessions_max_tokens' : 'sessions_max_tokens'), 'Conversation output cap', allowInvalid);
   settings.workloads = [];
   for (let i=0;i<Number(values.get('session_workload_count'));i++) {
     if (values.get(`session_enabled_${i}`) !== 'on') continue;
@@ -342,36 +415,38 @@ export function convertExpectedAnswer(value, from, to) {
 export function effectiveProfileDefaults(config, defaults, key) {
   const profile = structuredClone(defaults[key] || {});
   if (key === 'sessions') {
-    profile.concurrency = Math.min(profile.concurrency, config.concurrency);
     profile.max_tokens = Math.min(profile.max_tokens, config.max_output_tokens);
+    profile.concurrency = inheritedConcurrency(config, Math.min(profile.concurrency, profile.sessions));
   }
-  if (key === 'consistency') profile.levels = (profile.levels || []).filter(level => level <= config.concurrency);
+  if (key === 'consistency') profile.levels = [...new Set(profile.levels.map(level => inheritedConcurrency(config, level)))].sort((left,right) => left-right);
+  if (key === 'arrivals') profile.max_in_flight = inheritedConcurrency(config, config.default_concurrency ?? profile.max_in_flight);
   return profile;
 }
 
 export function parseLogprobSettings(raw) {
-  if (raw.length > 4096) throw new Error('Logprob settings must fit within 4096 characters.');
   let value;
   try { value = JSON.parse(raw); } catch { throw new Error('Logprob settings must be a JSON object or null.'); }
   if (value !== null && (typeof value !== 'object' || Array.isArray(value))) throw new Error('Logprob settings must be a JSON object or null.');
   return value;
 }
 
-export function parseToolFixtures(raw) {
-  if (raw.length > 65536) throw new Error('Tool fixtures must fit within 65,536 characters.');
+export function parseToolFixtures(raw, limits={}) {
+  const maximum = limits['tool_checks.bytes']?.maximum;
+  if (maximum != null && new TextEncoder().encode(raw).length > maximum) throw new Error(`Tool fixtures must fit within ${maximum.toLocaleString('en-US')} bytes.`);
   let fixtures;
   try { fixtures = JSON.parse(raw); }
   catch { throw new Error('Tool fixtures must be a JSON array. Use [] for an empty list.'); }
   if (!Array.isArray(fixtures) || fixtures.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
     throw new Error('Tool fixtures must be a JSON array of fixture objects.');
   }
-  if (fixtures.length > 16) throw new Error('Configure at most 16 tool fixtures.');
+  const maxItems = limits['tool_checks.fixtures']?.maxItems;
+  if (maxItems != null && fixtures.length > maxItems) throw new Error(`Configure at most ${maxItems} tool fixtures.`);
   return fixtures;
 }
 
 // Catalog profile forms patch only fields the operator edited. Viewing a null
 // profile or filtering a check must not materialize defaults or erase JSON data.
-export function configureProfiles(source, values, defaults, {allowInvalid=false}={}) {
+export function configureProfiles(source, values, defaults, {allowInvalid=false, limits={}}={}) {
   const config = structuredClone(source);
   const arrayFields = new Set(['modes', 'shapes', 'levels']);
   const textFields = new Set(['mode', 'equality']);
@@ -394,7 +469,7 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
         for (const name of ['fixtures', 'conversations']) {
           if (!edits.includes(name)) continue;
           const raw = String(values.get(`profile_tools_${name}`) ?? '[]');
-          try { profile[name] = parseToolFixtures(raw); }
+          try { profile[name] = parseToolFixtures(raw, limits); }
           catch (error) {
             if (!allowInvalid) throw error;
             profile[name] = raw;
@@ -420,16 +495,40 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false}
       else if (textFields.has(name)) profile[name] = String(raw || '');
       else profile[name] = numeric(raw, name, allowInvalid);
     }
+    const inheritedField = {arrivals:'max_in_flight',sessions:'concurrency',consistency:'levels'}[key];
+    if (inheritedField && !edits.includes(inheritedField) && !Object.hasOwn(config[key] || {}, inheritedField)) {
+      delete profile[inheritedField];
+    }
     config[key] = profile;
   }
   if (!allowInvalid && typeof config.consistency?.logprobs === 'string') config.consistency.logprobs = parseLogprobSettings(config.consistency.logprobs);
   for (const name of ['fixtures', 'conversations']) {
     if (!allowInvalid && typeof config.tool_checks?.[name] === 'string') {
-      config.tool_checks[name] = parseToolFixtures(config.tool_checks[name]);
+      config.tool_checks[name] = parseToolFixtures(config.tool_checks[name], limits);
     }
   }
   if (!allowInvalid && config.tool_calling && config.tool_checks?.modes?.includes('stream') && !config.stream) {
-    throw new Error('Enable streaming in Run limits or choose complete tool requests.');
+    throw Object.assign(new Error('Enable streaming on Connect or choose complete tool requests.'), {
+      errors:[{fields:['tool_checks.modes','stream'],msg:'Enable streaming on Connect or choose complete tool requests.'}],
+    });
   }
   return config;
+}
+
+// HTML has no exclusive min attribute. Apply the same schema rule to positive
+// numeric fields and array entries before preview/validation makes an API call.
+export function positiveBoundErrors(config, limits={}, explanations={}) {
+  const errors=[];
+  function walk(value,path,parent=null) {
+    const canonical=path.replace(/\.\d+(?=\.|$)/g,'[]');
+    const bound=limits[canonical]||{},policy=explanations[canonical]||{};
+    if(typeof value==='number'&&Number.isFinite(value)&&bound.exclusiveMinimum!=null&&value<=bound.exclusiveMinimum){
+      const field=/\.\d+$/.test(path)?path.replace(/\.\d+$/,''):path;
+      const arrayItem=Array.isArray(parent),parentPolicy=explanations[canonical.replace(/\[\]$/,'')];
+      errors.push({fields:[field],values:{[field]:arrayItem?parent:value},msg:(arrayItem?parentPolicy?.errors?.item_exclusiveMinimum:null)||policy.errors?.exclusiveMinimum||`${policy.label||path} must be greater than ${bound.exclusiveMinimum}.`});
+    }
+    if(Array.isArray(value))value.forEach((item,index)=>walk(item,`${path}.${index}`,value));
+    else if(value&&typeof value==='object')for(const [key,item] of Object.entries(value))walk(item,path?`${path}.${key}`:key);
+  }
+  walk(config,'');return errors;
 }

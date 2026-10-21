@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from giraffe.capabilities import capabilities
+
 
 def run_render_checks(assertions: str) -> None:
     node = shutil.which("node")
@@ -17,13 +19,16 @@ def run_render_checks(assertions: str) -> None:
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import * as formConfig from FORM_PATH;
+const bootstrap=BOOTSTRAP;
 const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}},listeners={};
-const context={assert,structuredClone,nodes,listeners,
+const context={assert,structuredClone,...formConfig,bootstrap,nodes,listeners,
   document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},
   window:{addEventListener(){}}};
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 vm.runInNewContext(source+`
+state.bootstrap=bootstrap;
 function check(id,status,extra={}) {
   return {id,target:'local',title:id+' check',status,required:true,
     summary:'Recorded '+status+' reason',metrics:{},evidence_ids:[],...extra};
@@ -41,7 +46,7 @@ function detail(value,extra={}) {
 `+ASSERTIONS,context);
 """.replace("APP_PATH", json.dumps(str(app))).replace(
         "ASSERTIONS", json.dumps(assertions)
-    )
+    ).replace("BOOTSTRAP", json.dumps(capabilities())).replace("FORM_PATH", json.dumps(app.with_name("form-config.mjs").as_uri()))
     result = subprocess.run(
         [node, "--input-type=module", "-"],
         input=script,
@@ -201,7 +206,7 @@ assert.match(html,/Mission control/);
 assert.match(html,/Requests finished \/ started/);
 assert.match(html,/Active requests<\/dt><dd>3/);
 assert.match(html,/Requests started · 12 \/ 100 limit/);
-assert.match(html,/Request ceiling, not completion/);
+assert.match(html,/Request starts, not completions/);
 assert.match(html,/Scheduled requests can also use budget without reaching the server/);
 assert.doesNotMatch(html,/Request budget used/);
 state.detail.state='stopping';renderLive();html=nodes['#main'].innerHTML;

@@ -1,0 +1,182 @@
+{
+  "environment": {
+    "python": "3.12.1 | packaged by Anaconda, Inc. | (main, Jan 19 2024, 09:45:58) [Clang 14.0.6 ]",
+    "platform": "macOS-26.3.1-arm64-i386-64bit",
+    "httpx": "0.28.1",
+    "clock": "time.monotonic; CPU=time.process_time (includes in-process fake endpoint)",
+    "measured_at_utc": "2026-10-21T04:36:41Z"
+  },
+  "parameters": {
+    "mode": "in-process",
+    "levels": [
+      256,
+      512,
+      1024
+    ],
+    "rounds": 3,
+    "chunks": 4,
+    "chunk_interval_ms": 50,
+    "body_bytes": 1024,
+    "url": null,
+    "output": "/tmp/phase7-concurrency.json"
+  },
+  "limitations": [
+    "Fake endpoint is in the measured process; CPU includes its SSE production.",
+    "In-process MockTransport exercises parsing/runner, not sockets/TLS/HTTP connection pooling.",
+    "Accepted ceiling is not demonstrated delivery capacity."
+  ],
+  "measurements": [
+    {
+      "mode": "in-process",
+      "level": 256,
+      "rounds": 3,
+      "requests": 768,
+      "completed": 768,
+      "failed": 0,
+      "wall_seconds": 0.766847416292876,
+      "cpu_seconds": 0.202295,
+      "cpu_ms_per_request": 0.2634049479166667,
+      "runner_peak": 256,
+      "endpoint_peak": 256,
+      "timing_health": {
+        "schema_version": 1,
+        "interval_ms": 50,
+        "sample_count": 14,
+        "delayed_sample_count": 0,
+        "max_lag_ms": 33.429708145558834,
+        "delay_floor_ms": 100,
+        "windows": [],
+        "overflow_window": null,
+        "scope": "Client event-loop responsiveness; CPU, OS and other causes are not distinguished."
+      },
+      "scheduler_lateness_ms": {
+        "count": 768,
+        "p50": 16.98354072868824,
+        "p95": 34.470584243535995,
+        "p99": 41.20708303526044,
+        "max": 42.13070776313543
+      },
+      "scheduler_lateness_definition": "request coroutine start minus common cohort release; includes cohort launch serialization",
+      "fake_chunk_lateness_ms": {
+        "count": 3072,
+        "p50": 2.311917021870613,
+        "p95": 13.31387460231781,
+        "p99": 15.855832491070032,
+        "max": 16.918040812015533
+      },
+      "fake_chunk_lateness_definition": "actual minus scheduled per-stream chunk emission, fixed cadence",
+      "elapsed_ms": {
+        "count": 768,
+        "p50": 230.3906250745058,
+        "p95": 241.4117082953453,
+        "p99": 241.79020803421736,
+        "max": 242.00820829719305
+      }
+    },
+    {
+      "mode": "in-process",
+      "level": 512,
+      "rounds": 3,
+      "requests": 1536,
+      "completed": 1536,
+      "failed": 0,
+      "wall_seconds": 0.9694395419210196,
+      "cpu_seconds": 0.406161,
+      "cpu_ms_per_request": 0.264427734375,
+      "runner_peak": 512,
+      "endpoint_peak": 512,
+      "timing_health": {
+        "schema_version": 1,
+        "interval_ms": 50,
+        "sample_count": 16,
+        "delayed_sample_count": 0,
+        "max_lag_ms": 30.303791910409927,
+        "delay_floor_ms": 100,
+        "windows": [],
+        "overflow_window": null,
+        "scope": "Client event-loop responsiveness; CPU, OS and other causes are not distinguished."
+      },
+      "scheduler_lateness_ms": {
+        "count": 1536,
+        "p50": 41.47200006991625,
+        "p95": 70.4570421949029,
+        "p99": 73.42779217287898,
+        "max": 74.50441690161824
+      },
+      "scheduler_lateness_definition": "request coroutine start minus common cohort release; includes cohort launch serialization",
+      "fake_chunk_lateness_ms": {
+        "count": 6144,
+        "p50": 3.8202498108148575,
+        "p95": 25.593499653041363,
+        "p99": 31.402666587382555,
+        "max": 33.56729168444872
+      },
+      "fake_chunk_lateness_definition": "actual minus scheduled per-stream chunk emission, fixed cadence",
+      "elapsed_ms": {
+        "count": 1536,
+        "p50": 247.1128748729825,
+        "p95": 272.70508371293545,
+        "p99": 273.8217916339636,
+        "max": 274.2709997110069
+      }
+    },
+    {
+      "mode": "in-process",
+      "level": 1024,
+      "rounds": 3,
+      "requests": 3072,
+      "completed": 3072,
+      "failed": 0,
+      "wall_seconds": 1.32543154200539,
+      "cpu_seconds": 0.894033,
+      "cpu_ms_per_request": 0.2910263671875,
+      "runner_peak": 1024,
+      "endpoint_peak": 1024,
+      "timing_health": {
+        "schema_version": 1,
+        "interval_ms": 50,
+        "sample_count": 15,
+        "delayed_sample_count": 2,
+        "max_lag_ms": 131.39541614800692,
+        "delay_floor_ms": 100,
+        "windows": [
+          {
+            "start_ms": 407.6927499845624,
+            "end_ms": 589.0881661325693,
+            "lag_ms": 131.39541614800692
+          },
+          {
+            "start_ms": 851.2003752402961,
+            "end_ms": 1012.6048750244081,
+            "lag_ms": 111.40449978411198
+          }
+        ],
+        "overflow_window": null,
+        "scope": "Client event-loop responsiveness; CPU, OS and other causes are not distinguished."
+      },
+      "scheduler_lateness_ms": {
+        "count": 3072,
+        "p50": 77.17558275908232,
+        "p95": 140.66941710188985,
+        "p99": 166.70270822942257,
+        "max": 170.0821672566235
+      },
+      "scheduler_lateness_definition": "request coroutine start minus common cohort release; includes cohort launch serialization",
+      "fake_chunk_lateness_ms": {
+        "count": 12288,
+        "p50": 8.986291941255331,
+        "p95": 55.12658413499594,
+        "p99": 64.76212525740266,
+        "max": 66.00150000303984
+      },
+      "fake_chunk_lateness_definition": "actual minus scheduled per-stream chunk emission, fixed cadence",
+      "elapsed_ms": {
+        "count": 3072,
+        "p50": 316.5250001475215,
+        "p95": 363.36083384230733,
+        "p99": 367.5229591317475,
+        "max": 368.672083131969
+      }
+    }
+  ]
+}

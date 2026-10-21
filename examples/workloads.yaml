@@ -1,3 +1,4 @@
+config_version: 2
 # Match the URL, model and server limits to your deployment.
 targets:
 - name: local
@@ -10,6 +11,7 @@ targets:
       context_limit: 4096
   metrics_profile: ollama
 concurrency: 2
+default_concurrency: 2
 max_requests: 2000
 max_duration_seconds: 1800
 request_timeout_seconds: 120

@@ -1,0 +1,5321 @@
+{
+  "cases": {
+    "default": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a30a81ed2b798df3700b37a6a1e5ab534599a2efc27e4677c76d9d8c3aad3466",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b190d2b31e2daec4ba99c54f06df931d89ac3f700dcaecd6f6e75d2553b6b498",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "e2358c3b08762d8aa2bd5106841ab930f19e4af7ee6c4f47466a2966d474ab43",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "2a7d24c7380bc0329342d9e751d5e5e69e0b2189ae778ca7f11e0dcdcbe18a87",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7378d9f6a5587801708b592cbb1f158c599c22e51a332fbf07b3585d66166ea8",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f21c13d0c5c9b6391b007f0cf29ba430e4dda1b3bb7b69f9d0e007a9fcf3b97c",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3970f0fd6fcb8d18f188a9cd7370e3512052642c11d79601b536d974b9f9396e",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "ce44c5403f274b8e63ac6553a7960e3d10cf82019478180d1a1ace09b31d19e5",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1d451c7a194d3496ec9711147d0ce07c280fb9a5b091995cdbb5844f0de383b1",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "d13a8cded778a605ec4fc2026584912c246a17a5fe03f6e85fe8411adea9d371",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d9162594e3cac84dbd6a754ac1224012a73780d29b2fb63bb1ff27f2cd2e12c7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "5a17fa43d4b61084418e2549e2cca3fdc0999841284eac165c3f441c8bc54e2f",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "edafe6f084af3beffec2a6c632f7c28aa1da2f6be32a81d8c1de9ee703e728c6",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9c11aa75e968aea0cd8b8ece80512f8287c1d6118829577a0105dd93c9107a15",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "bd5dcd58e00e845ffc90fa4cae15a63bbcf8e09c16d2965a5d81bd41b5b52598",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d3770fec56bab1bc027a40eb4beaacbfcc1467bee18ee5247e797cc395af93d3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "adad75013a0199de1c4ac4cf1574f50b53b21bf41bd293866878a1253ed3ead3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d9162594e3cac84dbd6a754ac1224012a73780d29b2fb63bb1ff27f2cd2e12c7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "5a17fa43d4b61084418e2549e2cca3fdc0999841284eac165c3f441c8bc54e2f",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "edafe6f084af3beffec2a6c632f7c28aa1da2f6be32a81d8c1de9ee703e728c6",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d3770fec56bab1bc027a40eb4beaacbfcc1467bee18ee5247e797cc395af93d3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "adad75013a0199de1c4ac4cf1574f50b53b21bf41bd293866878a1253ed3ead3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a30a81ed2b798df3700b37a6a1e5ab534599a2efc27e4677c76d9d8c3aad3466",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b190d2b31e2daec4ba99c54f06df931d89ac3f700dcaecd6f6e75d2553b6b498",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "e2358c3b08762d8aa2bd5106841ab930f19e4af7ee6c4f47466a2966d474ab43",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "2a7d24c7380bc0329342d9e751d5e5e69e0b2189ae778ca7f11e0dcdcbe18a87",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7378d9f6a5587801708b592cbb1f158c599c22e51a332fbf07b3585d66166ea8",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f21c13d0c5c9b6391b007f0cf29ba430e4dda1b3bb7b69f9d0e007a9fcf3b97c",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3970f0fd6fcb8d18f188a9cd7370e3512052642c11d79601b536d974b9f9396e",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "ce44c5403f274b8e63ac6553a7960e3d10cf82019478180d1a1ace09b31d19e5",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1d451c7a194d3496ec9711147d0ce07c280fb9a5b091995cdbb5844f0de383b1",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "d13a8cded778a605ec4fc2026584912c246a17a5fe03f6e85fe8411adea9d371",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d3770fec56bab1bc027a40eb4beaacbfcc1467bee18ee5247e797cc395af93d3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "adad75013a0199de1c4ac4cf1574f50b53b21bf41bd293866878a1253ed3ead3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "bd5dcd58e00e845ffc90fa4cae15a63bbcf8e09c16d2965a5d81bd41b5b52598",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "targets": [
+          {
+            "model": "m",
+            "name": "local",
+            "url": "http://local"
+          }
+        ]
+      }
+    },
+    "examples/concurrent-workloads.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "0b79c97fa7578e92421533e1ad978a94a8a1004df84dc0a9b98d6d22678a935a",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "818b17f799a58bda8a4785492ec1cbb4881b62e9f5926359cf01f32d9e96ebe3",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "d4735e257fc8aecdca6b5342a3fae4841e9d920834d6bc8876f48883f068e747",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "ec32f45c2f9fe8ba56591844613d70c009543f3c6db1302f6e95f43489076e4c",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4ee8a3c9b5e8a537d44897f194676f430019bdadb1d3f7dc0aa6fd53bea0a4e6",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "ba40d15037b3dc75a7f78539fbf7c54d1a5987a1320f238a14fa6da57142e2a9",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a90a5566cad8292e994d73f17c3b276b85a102493a5427c436e8a3f80ea9571e",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "11a12dd968574157768eb7bb4656ea949b2e1d7d9a45dfa79aa8923ef3e56341",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "6d3c596041305ba9d998a2bdb16f77c29ead393fae7455a4fa8885268db9117c",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 10000,
+              "payload_sha256": "8d0897eae8e76ca551b83d4557c4ec8987a069995de48d34e08494de5d7a6b24",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "e5a4f3f4b46f0d000ef2ef91a326936b009c50b2f962bf191042c474ce58c247",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "63415cce922d8df90d8417ed9e8e003729033623fe8bf43f35496fde4dcc5827",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 10000,
+              "payload_sha256": "310ca7626ad25be96b06277d93928d62577ce9574a463e8488a7498e05a95ea3",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "76dd05a8d0f48da817e1e1bb17e5bc56a795cdf14cb06c5d1a44f025e5efb504",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f5765c4d4899cb69952252cdfa184b112a0f7e283834f02efc21b9d153db58a0",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "46b8d0a3708aaf75a28e44ca131febaf8edab87ccfb4f7ed3508a05da73929d0",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 10000,
+              "payload_sha256": "2d684875f7372385537eff5659ecba415a1d3597959df77f96c0186006b2c7a6",
+              "request_timeout_seconds": 900.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b2d50903f0f976830aec6d2eba17988477ae8620e1484860461414f2c981e9aa",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 10000,
+              "payload_sha256": "7fa73387652eed554b181d53ef3c89b1a9c4e4302492d84333757634e0f63e02",
+              "request_timeout_seconds": 900.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f5765c4d4899cb69952252cdfa184b112a0f7e283834f02efc21b9d153db58a0",
+              "request_timeout_seconds": 900.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "46b8d0a3708aaf75a28e44ca131febaf8edab87ccfb4f7ed3508a05da73929d0",
+              "request_timeout_seconds": 900.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "concurrency"
+        ],
+        "concurrency": 2,
+        "concurrent_load": {
+          "calibration_attempts": 3,
+          "combinations": {
+            "enabled": true,
+            "selected": [
+              "short_short",
+              "long_short",
+              "short_long"
+            ]
+          },
+          "input_token_tolerance": 0.1,
+          "interference": {
+            "enabled": false,
+            "max_slowdown": 1.5,
+            "trigger": "first_output",
+            "trigger_chunks": 5
+          },
+          "mixed": {
+            "enabled": true,
+            "shares": {
+              "long_short": 20,
+              "short_long": 20,
+              "short_short": 60
+            }
+          },
+          "pass_criteria": {
+            "first_output_p95_ms": 60000,
+            "max_error_percent": 0,
+            "min_correct_percent": 100,
+            "min_valid_responses": 2,
+            "response_p95_ms": 900000
+          },
+          "profile": {
+            "long": {
+              "input_tokens": 10000,
+              "output_tokens": 10000
+            },
+            "medium": {
+              "input_tokens": 512,
+              "output_tokens": 128
+            },
+            "short": {
+              "input_tokens": 128,
+              "output_tokens": 32
+            }
+          },
+          "schedule": {
+            "duration_seconds": 10,
+            "levels": [
+              1,
+              2
+            ]
+          },
+          "stress": {
+            "enabled": true,
+            "large_input": true,
+            "large_output": true,
+            "min_output_percent": 80
+          }
+        },
+        "context_limit": 16384,
+        "limits": {
+          "first_output_ms": 60000,
+          "latency_ms": 900000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_samples": 2,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 3600,
+        "max_output_tokens": 10000,
+        "max_requests": 1000,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 900,
+        "retention": "failures",
+        "samples": 2,
+        "targets": [
+          {
+            "deployment": {
+              "serving": {
+                "context_limit": 16384
+              }
+            },
+            "model": "replace-with-served-model-id",
+            "name": "local",
+            "url": "http://127.0.0.1:8080/v1"
+          }
+        ],
+        "test_options": {}
+      }
+    },
+    "examples/llamacpp.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "cea15088d6027e30bd13f950411bdbc138bb8c3d6ea627ed9f9a29741de264f0",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "json": {
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "access",
+          "serving",
+          "first_output",
+          "generation",
+          "capacity",
+          "concurrency",
+          "context",
+          "correctness",
+          "json",
+          "cancellation",
+          "recovery",
+          "gpu",
+          "arrivals",
+          "prefix",
+          "sessions",
+          "consistency",
+          "tools"
+        ],
+        "concurrency": 2,
+        "concurrent_load": {
+          "calibration_attempts": 3,
+          "combinations": {
+            "enabled": true,
+            "selected": [
+              "short_short",
+              "short_medium",
+              "short_long",
+              "medium_short",
+              "medium_medium",
+              "medium_long",
+              "long_short",
+              "long_medium",
+              "long_long"
+            ]
+          },
+          "input_token_tolerance": 0.1,
+          "interference": {
+            "enabled": false,
+            "max_slowdown": 1.5,
+            "trigger": "first_output",
+            "trigger_chunks": 5
+          },
+          "mixed": {
+            "enabled": false,
+            "seed": null,
+            "shares": {
+              "long_short": 20,
+              "short_long": 20,
+              "short_short": 60
+            }
+          },
+          "pass_criteria": {
+            "first_output_p95_ms": null,
+            "max_error_percent": 0,
+            "min_correct_percent": 100,
+            "min_valid_responses": 5,
+            "response_p95_ms": null
+          },
+          "profile": {
+            "long": {
+              "input_tokens": 2048,
+              "output_tokens": 96
+            },
+            "medium": {
+              "input_tokens": 512,
+              "output_tokens": 48
+            },
+            "short": {
+              "input_tokens": 128,
+              "output_tokens": 16
+            }
+          },
+          "schedule": {
+            "duration_seconds": 10,
+            "levels": [
+              1,
+              2
+            ]
+          },
+          "stress": {
+            "enabled": true,
+            "large_input": true,
+            "large_output": true,
+            "min_output_percent": 80
+          }
+        },
+        "context_limit": 4096,
+        "limits": {
+          "first_output_ms": 10000,
+          "latency_ms": 60000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_output_tokens_per_second": 1,
+          "min_samples": 5,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 1800,
+        "max_output_tokens": 128,
+        "max_requests": 700,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 60,
+        "retention": "failures",
+        "samples": 5,
+        "sustained_seconds": 5,
+        "targets": [
+          {
+            "deployment": {
+              "discovery": "llamacpp",
+              "runtime": {
+                "engine": "llamacpp"
+              }
+            },
+            "metrics_profile": "llamacpp",
+            "metrics_url": "http://127.0.0.1:8080/metrics",
+            "model": "replace-with-served-model-id",
+            "name": "llamacpp",
+            "url": "http://127.0.0.1:8080/v1"
+          }
+        ],
+        "test_options": {}
+      }
+    },
+    "examples/lmdeploy.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "cea15088d6027e30bd13f950411bdbc138bb8c3d6ea627ed9f9a29741de264f0",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "json": {
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "access",
+          "serving",
+          "first_output",
+          "generation",
+          "capacity",
+          "concurrency",
+          "context",
+          "correctness",
+          "json",
+          "cancellation",
+          "recovery",
+          "gpu",
+          "arrivals",
+          "prefix",
+          "sessions",
+          "consistency",
+          "tools"
+        ],
+        "concurrency": 2,
+        "concurrent_load": {
+          "calibration_attempts": 3,
+          "combinations": {
+            "enabled": true,
+            "selected": [
+              "short_short",
+              "short_medium",
+              "short_long",
+              "medium_short",
+              "medium_medium",
+              "medium_long",
+              "long_short",
+              "long_medium",
+              "long_long"
+            ]
+          },
+          "input_token_tolerance": 0.1,
+          "interference": {
+            "enabled": false,
+            "max_slowdown": 1.5,
+            "trigger": "first_output",
+            "trigger_chunks": 5
+          },
+          "mixed": {
+            "enabled": false,
+            "seed": null,
+            "shares": {
+              "long_short": 20,
+              "short_long": 20,
+              "short_short": 60
+            }
+          },
+          "pass_criteria": {
+            "first_output_p95_ms": null,
+            "max_error_percent": 0,
+            "min_correct_percent": 100,
+            "min_valid_responses": 5,
+            "response_p95_ms": null
+          },
+          "profile": {
+            "long": {
+              "input_tokens": 2048,
+              "output_tokens": 96
+            },
+            "medium": {
+              "input_tokens": 512,
+              "output_tokens": 48
+            },
+            "short": {
+              "input_tokens": 128,
+              "output_tokens": 16
+            }
+          },
+          "schedule": {
+            "duration_seconds": 10,
+            "levels": [
+              1,
+              2
+            ]
+          },
+          "stress": {
+            "enabled": true,
+            "large_input": true,
+            "large_output": true,
+            "min_output_percent": 80
+          }
+        },
+        "context_limit": 4096,
+        "limits": {
+          "first_output_ms": 10000,
+          "latency_ms": 60000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_output_tokens_per_second": 1,
+          "min_samples": 5,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 1800,
+        "max_output_tokens": 128,
+        "max_requests": 700,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 60,
+        "retention": "failures",
+        "samples": 5,
+        "sustained_seconds": 5,
+        "targets": [
+          {
+            "deployment": {
+              "discovery": "lmdeploy",
+              "runtime": {
+                "engine": "lmdeploy"
+              }
+            },
+            "metrics_profile": "lmdeploy",
+            "metrics_url": "http://127.0.0.1:23333/metrics",
+            "model": "replace-with-served-model-id",
+            "name": "lmdeploy",
+            "url": "http://127.0.0.1:23333/v1"
+          }
+        ],
+        "test_options": {}
+      }
+    },
+    "examples/local.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "84636cffdb54866aea12b8e6561697d491f6925442fc096eac1ebbdde695e007",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "d0c3a654e8c0cc4b4ca2986be9e9881c95e294d447dd20f3002316583d121bb7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "72607b072b5388cadaed4cddd656caf06c2dba534ebde3dd4b81279f93777d5a",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "570884ff92e69878acf096911ba5b2e21013e19b226d0ffd776900f265d25285",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "20fd73ec76ad72b0f5e70ab1dafd3627c0924062ce609d62aeffd2f9094c0c62",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "556cea42e6fecad2c5bddb014d0501936ed3648e742a2191f0da5f9e3edcb962",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "620d32034302ebad19d99ddc3cc810a137c1a0cdfca25a3c80395781594e12bc",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b637605e5825de8f6e2f2d0e5591f5263b5d73e22db344906bc7c4a2874d8718",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "56375964e54a055928e64843199f7ad76dd0dde9e155b118de51184fe16c20bc",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "d13a8cded778a605ec4fc2026584912c246a17a5fe03f6e85fe8411adea9d371",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "b522c7fec45ff130fc92bb0ccbf022a00dc5bd1689df82bdeb5fccf85a618d7c",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "11f9de423a4f124f869c631d1926d66d8ada3416b352e855668c9756cc97c7ac",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "5a17fa43d4b61084418e2549e2cca3fdc0999841284eac165c3f441c8bc54e2f",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "3d8452770fe2dd160414ec95c9af99f48d4a620e3d5533464b24fe9962d4e4b8",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a532f4d7f036423b013951aa248dfc3fd8d02d8ca5a404428c765adb7896d3c4",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "4c29e20f9055b73a08996f1611d64c9d7da49e6652673e4a9eb2daf4dc89c266",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1f70f94f24f1786e039a0177577b66ce28a854fe3aefc622a8e5299164e46a76",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "f5ffa859ea96a901d6e8383e86aa5dbe9492c5cba666d10243366580d2054e50",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "11f9de423a4f124f869c631d1926d66d8ada3416b352e855668c9756cc97c7ac",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "5a17fa43d4b61084418e2549e2cca3fdc0999841284eac165c3f441c8bc54e2f",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "3d8452770fe2dd160414ec95c9af99f48d4a620e3d5533464b24fe9962d4e4b8",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1f70f94f24f1786e039a0177577b66ce28a854fe3aefc622a8e5299164e46a76",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "f5ffa859ea96a901d6e8383e86aa5dbe9492c5cba666d10243366580d2054e50",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "84636cffdb54866aea12b8e6561697d491f6925442fc096eac1ebbdde695e007",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "d0c3a654e8c0cc4b4ca2986be9e9881c95e294d447dd20f3002316583d121bb7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "72607b072b5388cadaed4cddd656caf06c2dba534ebde3dd4b81279f93777d5a",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "570884ff92e69878acf096911ba5b2e21013e19b226d0ffd776900f265d25285",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "20fd73ec76ad72b0f5e70ab1dafd3627c0924062ce609d62aeffd2f9094c0c62",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "556cea42e6fecad2c5bddb014d0501936ed3648e742a2191f0da5f9e3edcb962",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "620d32034302ebad19d99ddc3cc810a137c1a0cdfca25a3c80395781594e12bc",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b637605e5825de8f6e2f2d0e5591f5263b5d73e22db344906bc7c4a2874d8718",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "56375964e54a055928e64843199f7ad76dd0dde9e155b118de51184fe16c20bc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "d13a8cded778a605ec4fc2026584912c246a17a5fe03f6e85fe8411adea9d371",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "json": {
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "b522c7fec45ff130fc92bb0ccbf022a00dc5bd1689df82bdeb5fccf85a618d7c",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1f70f94f24f1786e039a0177577b66ce28a854fe3aefc622a8e5299164e46a76",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "f5ffa859ea96a901d6e8383e86aa5dbe9492c5cba666d10243366580d2054e50",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "4c29e20f9055b73a08996f1611d64c9d7da49e6652673e4a9eb2daf4dc89c266",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "concurrency": 2,
+        "concurrent_load": {
+          "schedule": {
+            "levels": [
+              1,
+              2
+            ]
+          }
+        },
+        "context_limit": 4096,
+        "limits": {
+          "first_output_ms": 5000,
+          "latency_ms": 15000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_samples": 5,
+          "recovery_max_ratio": 2,
+          "regression_percent": 20,
+          "stream_gap_ms": 3000
+        },
+        "max_duration_seconds": 300,
+        "max_output_tokens": 128,
+        "max_requests": 400,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 30,
+        "retention": "failures",
+        "samples": 6,
+        "structured_json": true,
+        "sustained_seconds": 5,
+        "targets": [
+          {
+            "model": "qwen2.5:7b-instruct",
+            "name": "local",
+            "url": "http://127.0.0.1:11434/v1"
+          }
+        ]
+      }
+    },
+    "examples/logprob-consistency.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "2ef7bacafe83a49cd49c327213dd017e158f4585b76fe789d0bdf5c602fa504a",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9e1ae4eacc528a0ceec8e4f58df4e43c54090eb75cd9ea75c568550442fe1ede",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "e9f2526649a8006b382b4f9beaa88f80df77fb6dbe8e378184983536dff63592",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "cd5eb01aca8f2ca5754206fe6f57579fade3c09e8508c5c91bbfcab44820cb19",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a49a91aadfe30869c6eeffb81c5704b210d4a6a711346cf574223406f0b81d46",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "5ae502ed577c112083707dc18806a745811985d8b594782c618e7f6bc65d9e22",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "e8de20186cf10e7bcc99c33efdcdb52e93aa2c5aba59c16c6a0a275d19f0e220",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "7b16048bf46826daa61389ba640582548338cd5bd3b6ada6b1baf0d874271bfe",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "c71f591321ccd58bb44f8102c9d99b01c228d53764cea12cdac2bc2e9b74d352",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 64,
+              "payload_sha256": "7845de65b87edb37c558881b6f1fe8f0583ab98e031dfba5bab1d82c8098b226",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "95fd894862bac4d630a1d480a1abca51f6b950568a99beb37bf4ae1c00fab93c",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "ac8a7929bce9a457e40c8dd22e50e5551eafdca607e60025d012d3ea9c63f2bb",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 64,
+              "payload_sha256": "84a53ad877f285de5d9dac04680396195b97cc043f69d22510dbe5927af449b8",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "95e39515540b9075bc22cacd370b907b7dd4d717b5b47fe4a13d704b3d3478a9",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "65a267c0dba0dfa199911d158fae31923b34d72e299ea366daaa99740df63c56",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "d376b44b426980f7b0ea5a3350ec7e9a9d007f9914db0ff65c4be1f73b08b06e",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 64,
+              "payload_sha256": "f872cf6b3d81bb098c6b993009462cfa49bd0f6d6b08298e6ffcaf7596f36dcf",
+              "request_timeout_seconds": 90.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "382c4b1b43f90a1256c7c03e5cc1850ccd2779a9c2577aa1f224135dbe1622e6",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 64,
+              "payload_sha256": "80a8533413c5641c142f49560a3f53c1d98efadcec8fd3ab200a08937a39d388",
+              "request_timeout_seconds": 90.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "65a267c0dba0dfa199911d158fae31923b34d72e299ea366daaa99740df63c56",
+              "request_timeout_seconds": 90.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "d376b44b426980f7b0ea5a3350ec7e9a9d007f9914db0ff65c4be1f73b08b06e",
+              "request_timeout_seconds": 90.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "consistency"
+        ],
+        "consistency": {
+          "levels": [
+            1,
+            4
+          ],
+          "logprobs": {
+            "compare_levels": true,
+            "priming_rounds": 1,
+            "response_mode": "complete",
+            "strict": false,
+            "support": "discover",
+            "top_logprobs": 5
+          },
+          "repetitions": 5,
+          "seed": 17,
+          "shapes": [
+            "short"
+          ],
+          "strict": false,
+          "temperature": 0
+        },
+        "context_limit": 4096,
+        "limits": {
+          "min_samples": 5
+        },
+        "max_duration_seconds": 600,
+        "max_output_tokens": 64,
+        "max_requests": 64,
+        "request_timeout_seconds": 90,
+        "retention": "all",
+        "targets": [
+          {
+            "identity": {
+              "runtime": "vllm"
+            },
+            "model": "your-served-model",
+            "name": "vllm",
+            "url": "http://127.0.0.1:8000/v1"
+          }
+        ]
+      }
+    },
+    "examples/tensorrt-llm.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "cea15088d6027e30bd13f950411bdbc138bb8c3d6ea627ed9f9a29741de264f0",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "json": {
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "access",
+          "serving",
+          "first_output",
+          "generation",
+          "capacity",
+          "concurrency",
+          "context",
+          "correctness",
+          "json",
+          "cancellation",
+          "recovery",
+          "gpu",
+          "arrivals",
+          "prefix",
+          "sessions",
+          "consistency",
+          "tools"
+        ],
+        "concurrency": 2,
+        "concurrent_load": {
+          "calibration_attempts": 3,
+          "combinations": {
+            "enabled": true,
+            "selected": [
+              "short_short",
+              "short_medium",
+              "short_long",
+              "medium_short",
+              "medium_medium",
+              "medium_long",
+              "long_short",
+              "long_medium",
+              "long_long"
+            ]
+          },
+          "input_token_tolerance": 0.1,
+          "interference": {
+            "enabled": false,
+            "max_slowdown": 1.5,
+            "trigger": "first_output",
+            "trigger_chunks": 5
+          },
+          "mixed": {
+            "enabled": false,
+            "seed": null,
+            "shares": {
+              "long_short": 20,
+              "short_long": 20,
+              "short_short": 60
+            }
+          },
+          "pass_criteria": {
+            "first_output_p95_ms": null,
+            "max_error_percent": 0,
+            "min_correct_percent": 100,
+            "min_valid_responses": 5,
+            "response_p95_ms": null
+          },
+          "profile": {
+            "long": {
+              "input_tokens": 2048,
+              "output_tokens": 96
+            },
+            "medium": {
+              "input_tokens": 512,
+              "output_tokens": 48
+            },
+            "short": {
+              "input_tokens": 128,
+              "output_tokens": 16
+            }
+          },
+          "schedule": {
+            "duration_seconds": 10,
+            "levels": [
+              1,
+              2
+            ]
+          },
+          "stress": {
+            "enabled": true,
+            "large_input": true,
+            "large_output": true,
+            "min_output_percent": 80
+          }
+        },
+        "context_limit": 4096,
+        "limits": {
+          "first_output_ms": 10000,
+          "latency_ms": 60000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_output_tokens_per_second": 1,
+          "min_samples": 5,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 1800,
+        "max_output_tokens": 128,
+        "max_requests": 700,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 60,
+        "retention": "failures",
+        "samples": 5,
+        "sustained_seconds": 5,
+        "targets": [
+          {
+            "deployment": {
+              "discovery": "tensorrt-llm",
+              "runtime": {
+                "engine": "tensorrt-llm"
+              }
+            },
+            "metrics_profile": "tensorrt-llm",
+            "model": "replace-with-served-model-id",
+            "name": "tensorrt-llm",
+            "url": "http://127.0.0.1:8000/v1"
+          }
+        ],
+        "test_options": {}
+      }
+    },
+    "examples/tgi.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "cea15088d6027e30bd13f950411bdbc138bb8c3d6ea627ed9f9a29741de264f0",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "3cf1acd14f4153d69fb3e328c95fae66007aef24975f18428b10f860f45f0641",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "305e828a18c4e544dbb2da2684b13329d8fb5d70f1b24e11066912203cf3394f",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "b86ca7b5fff16e34c588f710d3b65a60160d5bb47d1a1cbda0ccbe9018e4d034",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "2b1cae28f79ac5ffa561d17a8e20c7daa5242a2210415bff14114298843acdc2",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b7d2b47aa22ae675cf54b3f1e073c22db3424396557102d43b089b9a21c63d72",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9ef64dee9ba73619a73223c6133af4c8447f46220d56ddcb8220e5231441670a",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "6b932c7dcdc282ae6cdf70c8142f6e787a3960359033b01a7ad0eb87b02b8ac6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4bcad46181e1fc5e355afdd9094343b6f9182795e517bb70f5f02adf2a91826c",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1ca5401e097724bcc55fc61f23e6077631d56be5a9dd8a1c34c4e4ac581acad3",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "fcc31c6c45dec0d9e2b7d17a6b65474df3f96dbaef63c6c442fa44e5d0fecaf3",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "984d6a043b57556e5e346971dbc3196b63637d014eb6153844f4bb213d2d7e94",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "41e390e9557b58f7748ea44c97222af3c6502efc58efaaa48e3d3ecf8511f2a6",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b56e13e1d7a9978904f530abcbf0669dcc44aea96886f2aa09ea3cbcb5aa7d71",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "33cd4edffc5b708f6393fcf41851424928f865a2cd375332b7e2358fbb504605",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "json": {
+          "json": [
+            {
+              "fixture_id": "json.record.v2",
+              "max_tokens": 64,
+              "payload_sha256": "cd51feef59e059f55cbf2d51d2434085155240449c4a0c456493d9acd128810e",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b4e8cfae19421104dd8db456d23548185680c5f537ab3e9c3b5d5f4035cecbe7",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "c7c296e68daed9695d1647ac01d176def1e386305ff25d28457f28bf5fb2f273",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "88ff950a2135cb14a8641be2d4e7053b4b070417e3f5f8c67b544b4f9b9d9789",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7af6f546a0417f93d2470c5a58abb38a32b57b5f28a5213f4c2b7261c2976aab",
+              "request_timeout_seconds": 60.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "6b9dbf854221c1eba39c0e3f692d29b53d856768f8ccfc05aa651f2850120935",
+              "request_timeout_seconds": 60.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "access",
+          "serving",
+          "first_output",
+          "generation",
+          "capacity",
+          "concurrency",
+          "context",
+          "correctness",
+          "json",
+          "cancellation",
+          "recovery",
+          "gpu",
+          "arrivals",
+          "prefix",
+          "sessions",
+          "consistency",
+          "tools"
+        ],
+        "concurrency": 2,
+        "concurrent_load": {
+          "calibration_attempts": 3,
+          "combinations": {
+            "enabled": true,
+            "selected": [
+              "short_short",
+              "short_medium",
+              "short_long",
+              "medium_short",
+              "medium_medium",
+              "medium_long",
+              "long_short",
+              "long_medium",
+              "long_long"
+            ]
+          },
+          "input_token_tolerance": 0.1,
+          "interference": {
+            "enabled": false,
+            "max_slowdown": 1.5,
+            "trigger": "first_output",
+            "trigger_chunks": 5
+          },
+          "mixed": {
+            "enabled": false,
+            "seed": null,
+            "shares": {
+              "long_short": 20,
+              "short_long": 20,
+              "short_short": 60
+            }
+          },
+          "pass_criteria": {
+            "first_output_p95_ms": null,
+            "max_error_percent": 0,
+            "min_correct_percent": 100,
+            "min_valid_responses": 5,
+            "response_p95_ms": null
+          },
+          "profile": {
+            "long": {
+              "input_tokens": 2048,
+              "output_tokens": 96
+            },
+            "medium": {
+              "input_tokens": 512,
+              "output_tokens": 48
+            },
+            "short": {
+              "input_tokens": 128,
+              "output_tokens": 16
+            }
+          },
+          "schedule": {
+            "duration_seconds": 10,
+            "levels": [
+              1,
+              2
+            ]
+          },
+          "stress": {
+            "enabled": true,
+            "large_input": true,
+            "large_output": true,
+            "min_output_percent": 80
+          }
+        },
+        "context_limit": 4096,
+        "limits": {
+          "first_output_ms": 10000,
+          "latency_ms": 60000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_output_tokens_per_second": 1,
+          "min_samples": 5,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 1800,
+        "max_output_tokens": 128,
+        "max_requests": 700,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 60,
+        "retention": "failures",
+        "samples": 5,
+        "sustained_seconds": 5,
+        "targets": [
+          {
+            "deployment": {
+              "discovery": "tgi",
+              "runtime": {
+                "engine": "tgi"
+              }
+            },
+            "metrics_profile": "tgi",
+            "metrics_url": "http://127.0.0.1:8080/metrics",
+            "model": "replace-with-served-model-id",
+            "name": "tgi",
+            "url": "http://127.0.0.1:8080/v1"
+          }
+        ],
+        "test_options": {}
+      }
+    },
+    "examples/tool-choice.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a30a81ed2b798df3700b37a6a1e5ab534599a2efc27e4677c76d9d8c3aad3466",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b190d2b31e2daec4ba99c54f06df931d89ac3f700dcaecd6f6e75d2553b6b498",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "e2358c3b08762d8aa2bd5106841ab930f19e4af7ee6c4f47466a2966d474ab43",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "2a7d24c7380bc0329342d9e751d5e5e69e0b2189ae778ca7f11e0dcdcbe18a87",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7378d9f6a5587801708b592cbb1f158c599c22e51a332fbf07b3585d66166ea8",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f21c13d0c5c9b6391b007f0cf29ba430e4dda1b3bb7b69f9d0e007a9fcf3b97c",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3970f0fd6fcb8d18f188a9cd7370e3512052642c11d79601b536d974b9f9396e",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "ce44c5403f274b8e63ac6553a7960e3d10cf82019478180d1a1ace09b31d19e5",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1d451c7a194d3496ec9711147d0ce07c280fb9a5b091995cdbb5844f0de383b1",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "d13a8cded778a605ec4fc2026584912c246a17a5fe03f6e85fe8411adea9d371",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d9162594e3cac84dbd6a754ac1224012a73780d29b2fb63bb1ff27f2cd2e12c7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "5a17fa43d4b61084418e2549e2cca3fdc0999841284eac165c3f441c8bc54e2f",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9c11aa75e968aea0cd8b8ece80512f8287c1d6118829577a0105dd93c9107a15",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "bd5dcd58e00e845ffc90fa4cae15a63bbcf8e09c16d2965a5d81bd41b5b52598",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d3770fec56bab1bc027a40eb4beaacbfcc1467bee18ee5247e797cc395af93d3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "adad75013a0199de1c4ac4cf1574f50b53b21bf41bd293866878a1253ed3ead3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "tools"
+        ],
+        "max_duration_seconds": 120,
+        "max_output_tokens": 128,
+        "max_requests": 8,
+        "request_timeout_seconds": 30,
+        "retention": "failures",
+        "stream": true,
+        "targets": [
+          {
+            "model": "your-tool-capable-model",
+            "name": "local",
+            "url": "http://127.0.0.1:8000/v1"
+          }
+        ],
+        "tool_checks": {
+          "fixtures": [
+            {
+              "choice": {
+                "mode": "none"
+              },
+              "fixture_id": "none",
+              "messages": [
+                {
+                  "content": "Use get_weather to check the weather in Delhi.",
+                  "role": "user"
+                }
+              ],
+              "options": {
+                "temperature": 0
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Look up current weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "city"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "description": "Look up the current time.",
+                    "name": "get_time",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {},
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "choice": {
+                "mode": "required"
+              },
+              "fixture_id": "required",
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "options": {
+                "temperature": 0
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Look up current weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "city"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "description": "Look up the current time.",
+                    "name": "get_time",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {},
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "choice": {
+                "mode": "named",
+                "name": "get_time"
+              },
+              "fixture_id": "named",
+              "messages": [
+                {
+                  "content": "Use get_weather to check the weather in Delhi.",
+                  "role": "user"
+                }
+              ],
+              "options": {
+                "temperature": 0
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Look up current weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "city"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "description": "Look up the current time.",
+                    "name": "get_time",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {},
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "choice": {
+                "mode": "auto"
+              },
+              "fixture_id": "auto",
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "options": {
+                "temperature": 0
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Look up current weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "city"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "description": "Look up the current time.",
+                    "name": "get_time",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {},
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          ],
+          "modes": [
+            "complete",
+            "stream"
+          ]
+        }
+      }
+    },
+    "examples/tool-content.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a30a81ed2b798df3700b37a6a1e5ab534599a2efc27e4677c76d9d8c3aad3466",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "b190d2b31e2daec4ba99c54f06df931d89ac3f700dcaecd6f6e75d2553b6b498",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "e2358c3b08762d8aa2bd5106841ab930f19e4af7ee6c4f47466a2966d474ab43",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "2a7d24c7380bc0329342d9e751d5e5e69e0b2189ae778ca7f11e0dcdcbe18a87",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "7378d9f6a5587801708b592cbb1f158c599c22e51a332fbf07b3585d66166ea8",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f21c13d0c5c9b6391b007f0cf29ba430e4dda1b3bb7b69f9d0e007a9fcf3b97c",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3970f0fd6fcb8d18f188a9cd7370e3512052642c11d79601b536d974b9f9396e",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "ce44c5403f274b8e63ac6553a7960e3d10cf82019478180d1a1ace09b31d19e5",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1d451c7a194d3496ec9711147d0ce07c280fb9a5b091995cdbb5844f0de383b1",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 256,
+              "payload_sha256": "a2718b36b8bcf23d717f19d7a6134ce96edde59a62b26b4b254b161041dd4c7a",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d9162594e3cac84dbd6a754ac1224012a73780d29b2fb63bb1ff27f2cd2e12c7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 256,
+              "payload_sha256": "77c2a6bc9a394ef6ec6a1be774048118e1e742f3d8ad8dfdb7984be380021c26",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9c11aa75e968aea0cd8b8ece80512f8287c1d6118829577a0105dd93c9107a15",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 256,
+              "payload_sha256": "d3ea0c71da4a9f0b87a763b62edb2595dcb9561bb0ac811863256f8c389bd92c",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "d3770fec56bab1bc027a40eb4beaacbfcc1467bee18ee5247e797cc395af93d3",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 256,
+              "payload_sha256": "49a84d276e1e4b35479b656537fd96ae0b5669b42c4eea0253683ebedeb453bb",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "9315c21bd227cc0627bfd25381c074a09c82650650e0f262a0cfcae75de7e5f0",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "bd8cc465be97d513a5f75fb36769c5bfdac482694d528b536db4d7f69933133b",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "tools"
+        ],
+        "limits": {
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_samples": 3
+        },
+        "max_duration_seconds": 120,
+        "max_output_tokens": 256,
+        "max_requests": 20,
+        "request_timeout_seconds": 30,
+        "retention": "failures",
+        "samples": 3,
+        "stream": true,
+        "targets": [
+          {
+            "model": "your-tool-capable-model",
+            "name": "local",
+            "url": "http://127.0.0.1:8000/v1"
+          }
+        ],
+        "tool_checks": {
+          "fixtures": [
+            {
+              "expected_calls": [
+                {
+                  "arguments": {
+                    "city": "Delhi"
+                  },
+                  "name": "get_weather"
+                }
+              ],
+              "expected_content": {
+                "mode": "exact",
+                "normalization": "none",
+                "value": "Checking Delhi weather."
+              },
+              "fixture_id": "weather-with-text",
+              "messages": [
+                {
+                  "content": "In the same assistant response, write exactly \"Checking Delhi weather.\" as assistant text and call get_weather with city Delhi. Do not write any other text. Do not invent weather results.",
+                  "role": "user"
+                }
+              ],
+              "options": {
+                "temperature": 0
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Look up the current weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "city"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          ],
+          "modes": [
+            "complete",
+            "stream"
+          ]
+        }
+      }
+    },
+    "examples/tool-result-conversation.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "1fd67efef7e720b0ff011f7bb7ff93b898af10f8e06d5c0e537c023755da9a83",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "4a766ff3a4c2bf0058ae7d65406efa4e6e40333b5a6e232e351e2b3709a59717",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f88da1b7d7aae1f0fd9b2674d958cf88b7da57fbda7ab0b542c052adcc292dde",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "16644f649dd0558e7f9c6893f41d1a89c0dbac817d174f9b2a678a370107d2d6",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "8487c4430797557136d5fa416d7148dc3239726558f4e841541f1da86d0dc4d4",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "84d405336f865dcfc723c8a7a3b0ef47f1f3f7252d8ac57a1097904a4a6420d0",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "f08b05412a53066bc56aef2902bb0b7ef2c2fcd822b00b37a1bc62cfca02cb76",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "000d4d4513326e77e58b739bfc45a601de9849bf5267a6e699208ed3c62ad421",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "e40120437a64b340ced9e614cb62882c43447a2bc28e584e3ffd992bebbcec1f",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 256,
+              "payload_sha256": "52808f5d13e08c846851713d93f31e6e2d0070636e974238961703ab75a5a7e1",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "b287d5991b5acf95277000c1ceff257e9af445410d40a25f0198ba13d972da9a",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "fb1a0fd51df04e2a5b11b1654c5345dbdcbbc225ccf7691b5415191b4f231564",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 256,
+              "payload_sha256": "5cf37e2a7d517aa04721f2303e686065f2da1d5c5c5b163ab6883f65179d28ea",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "07b3bc26f9852f80dad39443c961cb6fdec4f78e4f81a0b678253932bcd02bc8",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "34107c73c7fc758ec4e6a708a982e934117dae08102a6389928f951e74054c14",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "2559f24b161236ede77dd4f472dd749b4f868f9eff1ab0ce115c1669cb9e9511",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 256,
+              "payload_sha256": "d430caffe31023f9a596d91a59ebfd47cbdbaef2c402391a9f64e85ef8fc1c2f",
+              "request_timeout_seconds": 45.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "07ca88e4825bd75f8f08f7ddf4a9cc4ad89aef3b1002159100f3f5ca8cdb9b63",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 256,
+              "payload_sha256": "4469acec8b995295bc7afb4807cf2acf9d8661557e840e82c4da752f77f79c91",
+              "request_timeout_seconds": 45.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "34107c73c7fc758ec4e6a708a982e934117dae08102a6389928f951e74054c14",
+              "request_timeout_seconds": 45.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "2559f24b161236ede77dd4f472dd749b4f868f9eff1ab0ce115c1669cb9e9511",
+              "request_timeout_seconds": 45.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "tools"
+        ],
+        "context_limit": 8192,
+        "max_duration_seconds": 120,
+        "max_output_tokens": 256,
+        "max_requests": 4,
+        "request_timeout_seconds": 45,
+        "retention": "failures",
+        "stream": true,
+        "targets": [
+          {
+            "model": "qwen2.5:7b-instruct",
+            "name": "local",
+            "url": "http://127.0.0.1:11434/v1"
+          }
+        ],
+        "tool_checks": {
+          "conversations": [
+            {
+              "final_content": [
+                {
+                  "mode": "contains",
+                  "value": "15"
+                },
+                {
+                  "mode": "contains",
+                  "value": "sunny"
+                },
+                {
+                  "mode": "contains",
+                  "value": "{{observation_id}}"
+                }
+              ],
+              "fixture_id": "weather-result",
+              "messages": [
+                {
+                  "content": "Call get_weather for Warsaw. After receiving the result, report the temperature in Celsius, the conditions, and the exact observation_id from the result. Use the supplied result; do not invent values.",
+                  "role": "user"
+                }
+              ],
+              "options": {
+                "temperature": 0
+              },
+              "steps": [
+                {
+                  "expected_calls": [
+                    {
+                      "arguments": {
+                        "city": "Warsaw"
+                      },
+                      "name": "get_weather",
+                      "result": {
+                        "conditions": "sunny",
+                        "observation_id": "{{observation_id}}",
+                        "temperature_c": 15
+                      }
+                    }
+                  ]
+                }
+              ],
+              "tools": [
+                {
+                  "function": {
+                    "description": "Get the current weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "city"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          ],
+          "modes": [
+            "complete",
+            "stream"
+          ]
+        }
+      }
+    },
+    "examples/traffic.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "84636cffdb54866aea12b8e6561697d491f6925442fc096eac1ebbdde695e007",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "d0c3a654e8c0cc4b4ca2986be9e9881c95e294d447dd20f3002316583d121bb7",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "72607b072b5388cadaed4cddd656caf06c2dba534ebde3dd4b81279f93777d5a",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "570884ff92e69878acf096911ba5b2e21013e19b226d0ffd776900f265d25285",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "20fd73ec76ad72b0f5e70ab1dafd3627c0924062ce609d62aeffd2f9094c0c62",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "556cea42e6fecad2c5bddb014d0501936ed3648e742a2191f0da5f9e3edcb962",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "620d32034302ebad19d99ddc3cc810a137c1a0cdfca25a3c80395781594e12bc",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b637605e5825de8f6e2f2d0e5591f5263b5d73e22db344906bc7c4a2874d8718",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "56375964e54a055928e64843199f7ad76dd0dde9e155b118de51184fe16c20bc",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "d13a8cded778a605ec4fc2026584912c246a17a5fe03f6e85fe8411adea9d371",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "91c4633d8d9af034591b2b38cb6226c64567022b9fe9f2eec27a4f6348f3715b",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "11f9de423a4f124f869c631d1926d66d8ada3416b352e855668c9756cc97c7ac",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "5a17fa43d4b61084418e2549e2cca3fdc0999841284eac165c3f441c8bc54e2f",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a532f4d7f036423b013951aa248dfc3fd8d02d8ca5a404428c765adb7896d3c4",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "4c29e20f9055b73a08996f1611d64c9d7da49e6652673e4a9eb2daf4dc89c266",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1f70f94f24f1786e039a0177577b66ce28a854fe3aefc622a8e5299164e46a76",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "f5ffa859ea96a901d6e8383e86aa5dbe9492c5cba666d10243366580d2054e50",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1f70f94f24f1786e039a0177577b66ce28a854fe3aefc622a8e5299164e46a76",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "f5ffa859ea96a901d6e8383e86aa5dbe9492c5cba666d10243366580d2054e50",
+              "request_timeout_seconds": 30.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "3064eb773b8b06a814049da5ace134582acb9651f9b23cda4e4fc7e593a4b833",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "1124f7b5c3368ed48887ffc48455140261acbd7a8d25f98e4765a5cfa6c82ffc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "620d32034302ebad19d99ddc3cc810a137c1a0cdfca25a3c80395781594e12bc",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b637605e5825de8f6e2f2d0e5591f5263b5d73e22db344906bc7c4a2874d8718",
+              "request_timeout_seconds": 30.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "56375964e54a055928e64843199f7ad76dd0dde9e155b118de51184fe16c20bc",
+              "request_timeout_seconds": 30.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "checks": [
+          "capacity",
+          "correctness"
+        ],
+        "concurrency": 32,
+        "max_duration_seconds": 300,
+        "max_output_tokens": 128,
+        "max_requests": 600,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 30,
+        "retention": "failures",
+        "targets": [
+          {
+            "model": "qwen2.5:7b-instruct",
+            "name": "local",
+            "url": "http://127.0.0.1:11434/v1"
+          }
+        ],
+        "test_options": {
+          "capacity": {
+            "limits": {
+              "first_output_ms": 1500,
+              "latency_ms": 10000,
+              "max_error_rate": 0,
+              "min_correctness": 1,
+              "min_samples": 5
+            }
+          },
+          "correctness": {
+            "concurrency": 4,
+            "samples": 12
+          }
+        },
+        "traffic": {
+          "arrival": "poisson",
+          "drain_timeout_seconds": 30,
+          "duration_seconds": 20,
+          "long_input_chars": 4096,
+          "long_output_words": 32,
+          "mix": {
+            "long_input": 0.2,
+            "long_output": 0.2,
+            "short": 0.6
+          },
+          "rates": [
+            1,
+            2,
+            4
+          ],
+          "seed": 42
+        }
+      }
+    },
+    "examples/vllm.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "278a0b5e1d5620093f9264a700f556a2ca845147686866d7e91c9e53e44fa118",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "629bb8c40d898ee9a85d8d4d7b53d840508b2c33e1a1f923038500ee09c630fb",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "29a3080286c84d746c817716adab73a153d95534b04f2ff9232260348cfaa147",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89aedb7c32cf0ef0f3c06b263368950804780d9d61ebf6098af82d6730066d5c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89a10dbc178652064e40a20541d22acdfefbf590144afc8e83f62bb5ecca89f8",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "c712d0969f282743b613f9b6b563f588fbdae1951c1c2f126ac5ecad21fc63c6",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a2c5a56ce9cf66b4e8d927460081a0b9ad6ee37d1675e6dc43930bde22b0a915",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "052a170b6ace3cb385488fafd73e8b0ca0c46f4ff2e4109193d98fd2122f2888",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "e0d460767940131dfd4b7f7d12796654d143d22fa983b3434d5df58fea7cb5ad",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "9a5629c707caab4a2f68fcefa9c487c84b96e57ad6b80cf101d58c268836a24f",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "335beb6eb0a47e7eef479780fac4a072938d7dd02d98ea9769a6d83bd0499809",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1df8734371310d3236642e3119a4984e60cfcc36cf6c1da77f3edd69fb6efc2c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "78c8c5315698738a03f6200952544646bd24fe66f6a57355c3ef5a9df4afdc28",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b1082f439acb306913cd80296027fcdd8d4de21a1a69f71ac2a68180f69b186d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "ace7563f6e90938c6850b2dee5176c322f7bd57bf4a8556df6cad6160fab3971",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "cbafcdd4e5a98c5efcdba5d42586c5ef376dd1a757b5903593229667346c548a",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "f97abc787a2c2d01909225beaf472a5d09418c048b95ba413d10ca014c6090cf",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "0033f2597b648520baaa7f8bd4dbfe9c9e56c6832d50f1f74bf428a1363e3c4d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "335beb6eb0a47e7eef479780fac4a072938d7dd02d98ea9769a6d83bd0499809",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1df8734371310d3236642e3119a4984e60cfcc36cf6c1da77f3edd69fb6efc2c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "78c8c5315698738a03f6200952544646bd24fe66f6a57355c3ef5a9df4afdc28",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b1082f439acb306913cd80296027fcdd8d4de21a1a69f71ac2a68180f69b186d",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "f97abc787a2c2d01909225beaf472a5d09418c048b95ba413d10ca014c6090cf",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "0033f2597b648520baaa7f8bd4dbfe9c9e56c6832d50f1f74bf428a1363e3c4d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "278a0b5e1d5620093f9264a700f556a2ca845147686866d7e91c9e53e44fa118",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "629bb8c40d898ee9a85d8d4d7b53d840508b2c33e1a1f923038500ee09c630fb",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "29a3080286c84d746c817716adab73a153d95534b04f2ff9232260348cfaa147",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89aedb7c32cf0ef0f3c06b263368950804780d9d61ebf6098af82d6730066d5c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89a10dbc178652064e40a20541d22acdfefbf590144afc8e83f62bb5ecca89f8",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "c712d0969f282743b613f9b6b563f588fbdae1951c1c2f126ac5ecad21fc63c6",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a2c5a56ce9cf66b4e8d927460081a0b9ad6ee37d1675e6dc43930bde22b0a915",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "052a170b6ace3cb385488fafd73e8b0ca0c46f4ff2e4109193d98fd2122f2888",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "e0d460767940131dfd4b7f7d12796654d143d22fa983b3434d5df58fea7cb5ad",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "9a5629c707caab4a2f68fcefa9c487c84b96e57ad6b80cf101d58c268836a24f",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "f97abc787a2c2d01909225beaf472a5d09418c048b95ba413d10ca014c6090cf",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "0033f2597b648520baaa7f8bd4dbfe9c9e56c6832d50f1f74bf428a1363e3c4d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "cbafcdd4e5a98c5efcdba5d42586c5ef376dd1a757b5903593229667346c548a",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "concurrency": 2,
+        "concurrent_load": {
+          "schedule": {
+            "levels": [
+              1,
+              2
+            ]
+          }
+        },
+        "context_limit": 4096,
+        "limits": {
+          "first_output_ms": 60000,
+          "latency_ms": 90000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_output_tokens_per_second": 1,
+          "min_samples": 5,
+          "recovery_max_ratio": 2,
+          "regression_percent": 20,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 900,
+        "max_output_tokens": 128,
+        "max_requests": 400,
+        "metrics": false,
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 120,
+        "retention": "failures",
+        "samples": 6,
+        "structured_json": false,
+        "sustained_seconds": 30,
+        "targets": [
+          {
+            "identity": {
+              "runtime": "vllm"
+            },
+            "model": "your-served-model",
+            "name": "vllm",
+            "url": "http://127.0.0.1:8000/v1"
+          }
+        ]
+      }
+    },
+    "examples/workloads.yaml": {
+      "requests": {
+        "_suite_builtin": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "278a0b5e1d5620093f9264a700f556a2ca845147686866d7e91c9e53e44fa118",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "629bb8c40d898ee9a85d8d4d7b53d840508b2c33e1a1f923038500ee09c630fb",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "29a3080286c84d746c817716adab73a153d95534b04f2ff9232260348cfaa147",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89aedb7c32cf0ef0f3c06b263368950804780d9d61ebf6098af82d6730066d5c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89a10dbc178652064e40a20541d22acdfefbf590144afc8e83f62bb5ecca89f8",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "c712d0969f282743b613f9b6b563f588fbdae1951c1c2f126ac5ecad21fc63c6",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a2c5a56ce9cf66b4e8d927460081a0b9ad6ee37d1675e6dc43930bde22b0a915",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "052a170b6ace3cb385488fafd73e8b0ca0c46f4ff2e4109193d98fd2122f2888",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "e0d460767940131dfd4b7f7d12796654d143d22fa983b3434d5df58fea7cb5ad",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "9a5629c707caab4a2f68fcefa9c487c84b96e57ad6b80cf101d58c268836a24f",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "json": [],
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "335beb6eb0a47e7eef479780fac4a072938d7dd02d98ea9769a6d83bd0499809",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1df8734371310d3236642e3119a4984e60cfcc36cf6c1da77f3edd69fb6efc2c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "78c8c5315698738a03f6200952544646bd24fe66f6a57355c3ef5a9df4afdc28",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b1082f439acb306913cd80296027fcdd8d4de21a1a69f71ac2a68180f69b186d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long": [
+            {
+              "fixture_id": "long.prefill.v2",
+              "max_tokens": 24,
+              "payload_sha256": "ace7563f6e90938c6850b2dee5176c322f7bd57bf4a8556df6cad6160fab3971",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "cbafcdd4e5a98c5efcdba5d42586c5ef376dd1a757b5903593229667346c548a",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "_suite_traffic": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "f97abc787a2c2d01909225beaf472a5d09418c048b95ba413d10ca014c6090cf",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "0033f2597b648520baaa7f8bd4dbfe9c9e56c6832d50f1f74bf428a1363e3c4d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "cancellation": {
+          "limits": [
+            {
+              "fixture_id": "limits.output_cap.v1",
+              "max_tokens": 8,
+              "payload_sha256": "335beb6eb0a47e7eef479780fac4a072938d7dd02d98ea9769a6d83bd0499809",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop.v1",
+              "max_tokens": 24,
+              "payload_sha256": "1df8734371310d3236642e3119a4984e60cfcc36cf6c1da77f3edd69fb6efc2c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.client_cancel.v1",
+              "max_tokens": 128,
+              "payload_sha256": "78c8c5315698738a03f6200952544646bd24fe66f6a57355c3ef5a9df4afdc28",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "limits.stop_control.v1",
+              "max_tokens": 24,
+              "payload_sha256": "b1082f439acb306913cd80296027fcdd8d4de21a1a69f71ac2a68180f69b186d",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "capacity": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "f97abc787a2c2d01909225beaf472a5d09418c048b95ba413d10ca014c6090cf",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "0033f2597b648520baaa7f8bd4dbfe9c9e56c6832d50f1f74bf428a1363e3c4d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "context": {
+          "context": [
+            {
+              "fixture_id": "context.short.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "278a0b5e1d5620093f9264a700f556a2ca845147686866d7e91c9e53e44fa118",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "629bb8c40d898ee9a85d8d4d7b53d840508b2c33e1a1f923038500ee09c630fb",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.short.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "29a3080286c84d746c817716adab73a153d95534b04f2ff9232260348cfaa147",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.beginning.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89aedb7c32cf0ef0f3c06b263368950804780d9d61ebf6098af82d6730066d5c",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.middle.v2",
+              "max_tokens": 24,
+              "payload_sha256": "89a10dbc178652064e40a20541d22acdfefbf590144afc8e83f62bb5ecca89f8",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "context.long.end.v2",
+              "max_tokens": 24,
+              "payload_sha256": "c712d0969f282743b613f9b6b563f588fbdae1951c1c2f126ac5ecad21fc63c6",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "correctness": {
+          "correctness": [
+            {
+              "fixture_id": "correctness.extraction.v2",
+              "max_tokens": 24,
+              "payload_sha256": "a2c5a56ce9cf66b4e8d927460081a0b9ad6ee37d1675e6dc43930bde22b0a915",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.arithmetic.v1",
+              "max_tokens": 24,
+              "payload_sha256": "052a170b6ace3cb385488fafd73e8b0ca0c46f4ff2e4109193d98fd2122f2888",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "correctness.classification.v1",
+              "max_tokens": 24,
+              "payload_sha256": "e0d460767940131dfd4b7f7d12796654d143d22fa983b3434d5df58fea7cb5ad",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "first_output": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "generation": {
+          "generation": [
+            {
+              "fixture_id": "generation.copy.v1",
+              "max_tokens": 128,
+              "payload_sha256": "9a5629c707caab4a2f68fcefa9c487c84b96e57ad6b80cf101d58c268836a24f",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "recovery": {
+          "long_input": [
+            {
+              "fixture_id": "traffic.long_input.v1",
+              "max_tokens": 24,
+              "payload_sha256": "f97abc787a2c2d01909225beaf472a5d09418c048b95ba413d10ca014c6090cf",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "long_output": [
+            {
+              "fixture_id": "traffic.long_output.v1",
+              "max_tokens": 128,
+              "payload_sha256": "0033f2597b648520baaa7f8bd4dbfe9c9e56c6832d50f1f74bf428a1363e3c4d",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ],
+          "sustained": [
+            {
+              "fixture_id": "sustained.copy.v3",
+              "max_tokens": 128,
+              "payload_sha256": "cbafcdd4e5a98c5efcdba5d42586c5ef376dd1a757b5903593229667346c548a",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        },
+        "serving": {
+          "short": [
+            {
+              "fixture_id": "short.code.v2",
+              "max_tokens": 24,
+              "payload_sha256": "47d4dac535c0c656d7139260fee936bc5669dcc85e0f717fe379f045c337ea0a",
+              "request_timeout_seconds": 120.0
+            },
+            {
+              "fixture_id": "short.copy.v2",
+              "max_tokens": 64,
+              "payload_sha256": "001e61a7f75973e0ed29e5da7177c843a3b9e31f77bd2ea1cbe87abc07d03766",
+              "request_timeout_seconds": 120.0
+            }
+          ]
+        }
+      },
+      "source": {
+        "arrivals": {
+          "max_pending": 4,
+          "mode": "steady",
+          "requests": 12,
+          "requests_per_second": 0.5
+        },
+        "concurrency": 2,
+        "concurrent_load": {
+          "calibration_attempts": 3,
+          "combinations": {
+            "enabled": true,
+            "selected": [
+              "short_short",
+              "short_medium",
+              "short_long",
+              "medium_short",
+              "medium_medium",
+              "medium_long",
+              "long_short",
+              "long_medium",
+              "long_long"
+            ]
+          },
+          "input_token_tolerance": 0.1,
+          "interference": {
+            "enabled": false,
+            "max_slowdown": 1.5,
+            "trigger": "first_output",
+            "trigger_chunks": 5
+          },
+          "mixed": {
+            "enabled": false,
+            "seed": null,
+            "shares": {
+              "long_short": 20,
+              "short_long": 20,
+              "short_short": 60
+            }
+          },
+          "pass_criteria": {
+            "first_output_p95_ms": null,
+            "max_error_percent": 0,
+            "min_correct_percent": 100,
+            "min_valid_responses": 5,
+            "response_p95_ms": null
+          },
+          "profile": {
+            "long": {
+              "input_tokens": 2048,
+              "output_tokens": 128
+            },
+            "medium": {
+              "input_tokens": 512,
+              "output_tokens": 64
+            },
+            "short": {
+              "input_tokens": 128,
+              "output_tokens": 24
+            }
+          },
+          "schedule": {
+            "duration_seconds": 10,
+            "levels": [
+              1,
+              2
+            ]
+          },
+          "stress": {
+            "enabled": false,
+            "large_input": true,
+            "large_output": true,
+            "min_output_percent": 80
+          }
+        },
+        "consistency": {
+          "equality": "bytes",
+          "levels": [
+            1,
+            2
+          ],
+          "prompts_per_shape": 3,
+          "repetitions": 6,
+          "seed": 17,
+          "shapes": [
+            "short",
+            "long"
+          ],
+          "strict": false,
+          "temperature": 0
+        },
+        "context_limit": 4096,
+        "forced_tool_diagnostic": false,
+        "limits": {
+          "first_output_ms": 60000,
+          "latency_ms": 90000,
+          "max_error_rate": 0,
+          "min_correctness": 1,
+          "min_output_tokens_per_second": 1,
+          "min_samples": 5,
+          "recovery_max_ratio": 2,
+          "stream_gap_ms": 10000
+        },
+        "max_duration_seconds": 1800,
+        "max_output_tokens": 128,
+        "max_requests": 2000,
+        "metrics": true,
+        "metrics_interval_seconds": 2,
+        "metrics_max_samples": 1024,
+        "prefix": {
+          "history_turns": 3,
+          "prefix_chars": 8192,
+          "repeats": 6
+        },
+        "request_options": {
+          "temperature": 0
+        },
+        "request_timeout_seconds": 120,
+        "retention": "failures",
+        "samples": 6,
+        "sessions": {
+          "concurrency": 2,
+          "delay_seconds": 0.05,
+          "max_tokens": 64,
+          "modes": [
+            "fixed",
+            "live"
+          ],
+          "sessions": 5
+        },
+        "sustained_seconds": 30,
+        "targets": [
+          {
+            "deployment": {
+              "discovery": "ollama",
+              "scope": "local configured endpoint; other replicas unverified",
+              "serving": {
+                "context_limit": 4096
+              }
+            },
+            "metrics_profile": "ollama",
+            "model": "llama3.2:3b",
+            "name": "local",
+            "url": "http://127.0.0.1:11434/v1"
+          }
+        ],
+        "test_options": {},
+        "tool_calling": false
+      }
+    }
+  },
+  "provenance": "Old main archived at rv26/old; effective transport caps and timeouts included; generated by issue26-freeze-main.py."
+}

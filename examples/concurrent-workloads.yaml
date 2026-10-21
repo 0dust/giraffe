@@ -1,3 +1,4 @@
+config_version: 2
 # Match the URL, model and server limits to your deployment.
 targets:
 - name: local
@@ -9,6 +10,7 @@ targets:
 checks:
 - concurrency
 concurrency: 2
+default_concurrency: 2
 context_limit: 16384
 max_output_tokens: 10000
 max_requests: 1000

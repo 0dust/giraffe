@@ -105,7 +105,7 @@ def window_cause(reason):
     return "run_stopped"
 
 
-def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=False):
+def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=False, request_timeout_seconds=None):
     input_size, output_size = shape.split("_")
     variant = "short_answer" if output_size == "short" else "long_output"
     text = prompt(filler_chars, variant)
@@ -116,10 +116,13 @@ def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=Fal
     return RequestSpec(condition_id=condition_id, fixture_id=f"load.{shape}.{variant}", scenario=scenario, check_ids=["concurrency"],
         messages=[{"role": "user", "content": text}], scorer="none" if calibration else "label", expected=None if calibration else "K7P4",
         input_chars=len(text), max_tokens=cap, requested_input_tokens=getattr(settings.profile, input_size).input_tokens,
-        requested_output_tokens=cap, load_point=point)
+        requested_output_tokens=cap, request_timeout_seconds=request_timeout_seconds, load_point=point)
 
 
 async def calibrate(run, target, client, settings, size, variant):
+    from giraffe.runner import _check_config
+
+    config = _check_config(run.config, "concurrency")
     target_tokens = getattr(settings.profile, size).input_tokens
     overhead = len(prompt(0, variant))
     filler = max(0, target_tokens * 4 - overhead)
@@ -135,7 +138,8 @@ async def calibrate(run, target, client, settings, size, variant):
             if not run.allowed(target.name):
                 result.update(reason=run.condition_reason(target.name), reason_code=window_cause(run.condition_reason(target.name)))
                 break
-            spec = make_spec(settings, shape, scenario, {"type": "calibration", "input_size": size, "variant": variant}, filler, calibration=True)
+            spec = make_spec(settings, shape, scenario, {"type": "calibration", "input_size": size, "variant": variant}, filler, calibration=True,
+                             request_timeout_seconds=config.request_timeout_seconds)
             spec.stream = run.config.stream
             spec.options = deterministic_options(run.config)
             record = await run.request(target, client, spec)
@@ -196,6 +200,9 @@ def _conditions(point):
 
 
 async def sending_window(run, target, client, settings, point, calibration, allowance, rng):
+    from giraffe.runner import _check_config
+
+    config = _check_config(run.config, "concurrency")
     duration, level = point["configured_window_seconds"], point["level"]
     begin = cutoff = None
     sent, records, active_short = 0, [], {}
@@ -208,6 +215,8 @@ async def sending_window(run, target, client, settings, point, calibration, allo
         nonlocal cutoff, stop_reason
         if cutoff is None:
             cutoff, stop_reason = time.monotonic() if now is None else now, reason
+            if window_cause(reason) == "budget_limited":
+                run.limits_reached.add("max_requests")
 
     def ended():
         nonlocal stop_reason
@@ -232,7 +241,7 @@ async def sending_window(run, target, client, settings, point, calibration, allo
                 waiting.add(slot_wait)
                 async with run.slot(False, end) as admitted:
                     waiting.discard(slot_wait)
-                    if not admitted or ended() or sent >= allowance:
+                    if not admitted or ended() or (allowance is not None and sent >= allowance):
                         return None
                     slot_wait.reschedule(None)
                     input_size, output_size = shape.split("_")
@@ -243,7 +252,8 @@ async def sending_window(run, target, client, settings, point, calibration, allo
                         scenario = f"load_interference_c{level}." + ("short_stream" if role == "short_stream" else "long_probe" if sub_window % 2 else "short_probe")
                     details = {"point_id": point["id"], "type": point["type"], "workload": point["workload"],
                                "level": level, "shape": shape, "sub_window": sub_window, "role": role}
-                    spec = make_spec(settings, shape, scenario, details, calibration[(input_size, variant)]["filler_chars"])
+                    spec = make_spec(settings, shape, scenario, details, calibration[(input_size, variant)]["filler_chars"],
+                                     request_timeout_seconds=config.request_timeout_seconds)
                     spec.stream = run.config.stream
                     spec.options = deterministic_options(run.config)
                     def started():
@@ -254,7 +264,7 @@ async def sending_window(run, target, client, settings, point, calibration, allo
                             for waiter in waiting:
                                 waiter.reschedule(min(run.deadline, begin + duration))
                         sent += 1
-                        if sent >= allowance:
+                        if allowance is not None and sent >= allowance:
                             close("point request allowance used", now)
                     record = await run.request(target, client, spec, event=progress, on_start=started, slot_reserved=True)
                     if record is not None:
@@ -294,7 +304,7 @@ async def sending_window(run, target, client, settings, point, calibration, allo
         while not ended():
             trigger_start = time.monotonic()
             triggered = False
-            while not ended() and time.monotonic() - trigger_start < run.config.request_timeout_seconds:
+            while not ended() and time.monotonic() - trigger_start < config.request_timeout_seconds:
                 changed.clear()
                 streams = list(active_short.values())
                 triggered = len(streams) == level - 1 and all(
@@ -302,7 +312,7 @@ async def sending_window(run, target, client, settings, point, calibration, allo
                     for p in streams)
                 if triggered:
                     break
-                end = min(run.deadline, trigger_start + run.config.request_timeout_seconds,
+                end = min(run.deadline, trigger_start + config.request_timeout_seconds,
                           begin + duration if begin is not None else run.deadline)
                 try:
                     await asyncio.wait_for(changed.wait(), max(.0001, end - time.monotonic()))
@@ -619,8 +629,8 @@ async def execute(run, target, client):
                 point["input_not_calibrated"] = incomplete["reason_code"] == "input_not_calibrated"
                 point["window_reason"] = incomplete["reason"]
             else:
-                remaining = min(run.config.max_requests - run.budget_used, run.quotas[target.name] - run.budget_counts[target.name])
-                allowance = max(1, (remaining - reserved) // (len(points) - index))
+                remaining = run.remaining(target.name)
+                allowance = max(1, (remaining - reserved) // (len(points) - index)) if remaining is not None else None
                 point["reserved_later_requests"] = reserved
                 records = await sending_window(run, target, client, settings, point, calibration, allowance, rng)
         else:
@@ -692,15 +702,15 @@ def remedies(metrics, config):
     points = [p for g in metrics.get("load_types", {}).values() for p in g["points"]]
     codes = {p.get("reason_code") for p in points if p.get("status") != "pass"}
     guidance = []
-    if "budget_limited" in codes:
+    if "budget_limited" in codes and config.max_requests is not None:
         rates = [p["sent"] / p["delivered_window_seconds"] / p["level"] for p in points if p.get("delivered_window_seconds", 0) > 0]
         remaining = sum(p["level"] * max(0, p["configured_window_seconds"] - p.get("delivered_window_seconds", 0)) for p in points)
         suggested = config.max_requests + math.ceil(median(rates) * remaining) if rates else None
-        guidance.append(f"raise the total request limit to approximately {suggested} (observed requests/second × remaining concurrency-seconds) and allow the configured load time" if suggested else "raise the total request limit (max_requests) to allow the configured load windows")
-    if "time_limited" in codes:
-        guidance.append("raise Total time limit (max_duration_seconds) to allow the configured load windows")
+        guidance.append(f"raise Stop after this many requests to approximately {suggested:,} (observed requests/second × remaining concurrency-seconds) and allow the configured load time" if suggested else "raise Stop after this many requests (max_requests) to allow the configured load windows")
+    if "time_limited" in codes and config.max_duration_seconds is not None:
+        guidance.append("raise Stop test traffic after (max_duration_seconds) to allow the configured load windows")
     if "load_not_delivered" in codes:
-        guidance.append("raise Maximum at once or server concurrency (OLLAMA_NUM_PARALLEL or vLLM --max-num-seqs); disable response buffering")
+        guidance.append("raise Limit simultaneous requests or server concurrency (OLLAMA_NUM_PARALLEL or vLLM --max-num-seqs); disable response buffering")
     if "insufficient_coverage" in codes:
         guidance.append("raise the output cap or lower Minimum output length")
     if "context_exceeded" in codes:

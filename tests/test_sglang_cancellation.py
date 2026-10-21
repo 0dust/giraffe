@@ -207,7 +207,7 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
     path.touch()
 
     class Client:
-        def __init__(self, *args):
+        def __init__(self, *args, max_connections=None):
             pass
 
         async def __aenter__(self):

@@ -192,8 +192,9 @@ async def test_condition_and_live_dialog_metadata_use_effective_output_cap(reque
     events = []
     run = _Run(config, events.append, None)
     await run.request(config.targets[0], Client(), spec("hi", "generation", "generation", max_tokens=requested))
-    assert run.observations["local"]["conditions"][0]["condition"]["parameters"]["output_tokens"] == config.max_output_tokens
-    assert next(e for e in events if e["event"] == "request_started")["requested_max_tokens"] == config.max_output_tokens
+    effective = config.max_output_tokens if requested is None else requested
+    assert run.observations["local"]["conditions"][0]["condition"]["parameters"]["output_tokens"] == effective
+    assert next(e for e in events if e["event"] == "request_started")["requested_max_tokens"] == effective
 
 
 def test_partial_condition_card_and_global_spots_use_the_same_request_total():

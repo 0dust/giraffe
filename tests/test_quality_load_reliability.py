@@ -1,5 +1,6 @@
 """Known-answer verdicts include loaded outcomes and qualify actual overlap."""
 import pytest
+from pydantic import ValidationError
 
 from giraffe import runner
 from tests.test_runner import FakeClient, check, config, pack_config
@@ -43,8 +44,9 @@ async def test_pack_case_failure_cannot_hide_in_aggregate_allowance(client, monk
 
 @pytest.mark.parametrize("field,value", [("samples", 9), ("concurrency", 1)])
 async def test_pack_correctness_overrides_are_explicitly_rejected(client, field, value):
-    with pytest.raises(ValueError, match="samples/concurrency overrides are unsupported"):
+    with pytest.raises(ValidationError, match="does not support request-setting overrides") as error:
         await runner.run_suite(pack_config(test_options={"correctness": {field: value}}))
+    assert error.value.errors()[0]["ctx"]["fields"] == [f"test_options.correctness.{field}"]
 
 
 async def test_pack_without_capacity_covers_all_cases_quietly_and_concurrently(client):

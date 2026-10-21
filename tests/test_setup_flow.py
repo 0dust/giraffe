@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from giraffe.capabilities import capabilities
 from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, ConcurrentLoad, RunConfig
 
 
@@ -28,7 +29,14 @@ def run_setup_script(script):
     ]
     prelude = f"""
 import assert from 'node:assert/strict';
-import * as setup from {json.dumps(MODULE)};
+import * as form from {json.dumps(MODULE)};
+// Supply the same schema-derived bounds as the production workbench.
+const limits = {json.dumps(capabilities()['limits'])};
+const setup = {{...form,
+  inferSetupPreset:config=>form.inferSetupPreset(config,{{limits}}),
+  configureSetupLoad:(config,preset,options={{}})=>form.configureSetupLoad(config,preset,{{...options,limits}}),
+  configureConcurrentLoad:(config,values,defaults,options={{}})=>form.configureConcurrentLoad(config,values,defaults,{{...options,limits}}),
+}};
 const source = {json.dumps(config.model_dump(mode='json'))};
 const defaults = {json.dumps(ConcurrentLoad().model_dump(mode='json'))};
 const checks = {json.dumps(checks)};
@@ -59,17 +67,19 @@ source.concurrency = 8;
 assert.equal(setup.inferSetupPreset(source), 'concurrent');
 source.concurrency = 16;
 const imported = structuredClone(source);
-assert.equal(setup.inferSetupPreset(source), 'custom');
+assert.equal(setup.inferSetupPreset(source), 'concurrent');
 assert.deepEqual(source, imported);
 source.concurrency = 4;
-assert.equal(setup.inferSetupPreset(source), 'custom');
+assert.equal(setup.inferSetupPreset(source), 'concurrent');
 source.concurrency = 8;
 source.test_options = {correctness:{samples:9}};
 assert.equal(setup.inferSetupPreset(source), 'concurrent');
 source.test_options.access = {request_timeout_seconds:12};
 assert.equal(setup.inferSetupPreset(source), 'custom');
 source.test_options = {};
-for (const levels of [[], ['8'], [1, 1], [0], [257], null]) {
+source.concurrent_load.schedule.levels=[limits['concurrent_load.schedule.levels'].items.maximum];
+assert.equal(setup.inferSetupPreset(source),'concurrent');
+for (const levels of [[], ['8'], [1, 1], [0], [limits['concurrent_load.schedule.levels'].items.maximum+1], null]) {
   source.concurrent_load.schedule.levels = levels;
   assert.equal(setup.inferSetupPreset(source), 'custom');
 }
@@ -100,7 +110,7 @@ assert.equal(concurrent.structured_json, false);
 assert.equal(concurrent.metrics, false);
 assert.equal(concurrent.tool_calling, false);
 assert.equal(concurrent.concurrent_load.pass_criteria.min_valid_responses, 5);
-assert.equal(concurrent.concurrency, 4);
+assert.equal(concurrent.concurrency, 16);
 assert.equal(concurrent.max_requests, 100);
 assert.equal(concurrent.max_output_tokens, 128);
 assert.deepEqual(defaults.schedule.levels,[1,4]);
@@ -121,7 +131,7 @@ assert.equal(custom.metrics,true);
 assert.equal(custom.tool_calling,true);
 source.concurrent_load = {...defaults,schedule:{levels:[1,4,8],duration_seconds:3},profile:{short:{input_tokens:25,output_tokens:5},medium:{input_tokens:50,output_tokens:20},long:{input_tokens:100,output_tokens:40}}};
 const existing = setup.applySetupPreset(source,'concurrent',defaults);
-assert.equal(existing.concurrency,8);
+assert.equal(existing.concurrency,16);
 assert.deepEqual(existing.concurrent_load,source.concurrent_load);
 assert.equal(existing.concurrent_load.schedule.duration_seconds,3);
 source.concurrent_load = null;
@@ -143,7 +153,7 @@ const before = structuredClone(load);
 const configured = setup.configureSetupLoad(load,'concurrent');
 assert.deepEqual(load,before);
 assert.deepEqual(configured.concurrent_load.schedule.levels,[1,4,8]);
-assert.equal(configured.concurrency,8);
+assert.equal(configured.concurrency,null);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
 for (const mode of ['answers','arrival','custom']) {
@@ -153,14 +163,14 @@ for (const mode of ['answers','arrival','custom']) {
 console.log(JSON.stringify(configured));
 """)
     configured = RunConfig.model_validate(result)
-    assert configured.concurrency == 8
+    assert configured.concurrency is None
     assert configured.max_requests == 100
 
 
 def test_setup_load_keeps_invalid_drafts_and_rejects_them_when_running():
     run_setup_script("""
 const preset = setup.applySetupPreset(source,'concurrent',defaults);
-for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']) {
+for (const raw of ['', 'oops', '1, nope', '1, 1', '0', String(limits['concurrent_load.schedule.levels'].items.maximum+1), '1.5', 'Infinity']) {
   const values = new FormData();
   values.set('load_schedule_levels',raw);
   values.set('load_pass_criteria_min_valid_responses','5');
@@ -175,7 +185,7 @@ for (const raw of ['', 'oops', '1, nope', '1, 1', '0', '257', '1.5', 'Infinity']
 """)
 
 
-def test_load_profile_is_editable_and_keeps_explicit_output_safety_limit():
+def test_load_profile_is_editable_and_suite_output_cap_is_a_default():
     result = run_setup_script("""
 source.checks = ['access','concurrency'];
 source.concurrency = 8;
@@ -196,7 +206,9 @@ assert.equal(configured.concurrent_load.calibration_attempts,2);
 assert.equal(configured.max_requests,100);
 assert.equal(configured.max_output_tokens,128);
 values.set('load_profile_long_output_tokens','256');
-assert.throws(()=>setup.configureConcurrentLoad(source,values,defaults),/output cap must be 128 tokens or less/i);
+const ownCap = setup.configureConcurrentLoad(source,values,defaults);
+assert.equal(ownCap.concurrent_load.profile.long.output_tokens,256);
+assert.equal(ownCap.max_output_tokens,128);
 const draft = setup.configureConcurrentLoad(source,values,defaults,{allowInvalid:true});
 assert.equal(draft.concurrent_load.profile.long.output_tokens,256);
 assert.equal(draft.max_output_tokens,128);
@@ -204,7 +216,7 @@ const inactive = {...source,checks:['access','correctness']};
 assert.equal(setup.configureConcurrentLoad(inactive,values,defaults).concurrent_load.profile.long.output_tokens,256);
 for (const size of ['short','medium','long']) for (const field of ['input_tokens','output_tokens']) {
   const name = `load_profile_${size}_${field}`;
-  const maximum = field === 'input_tokens' ? 131072 : 65536;
+  const maximum = limits[`concurrent_load.profile.${size}.${field}`].maximum;
   for (const raw of ['', '0', String(maximum+1), '1.5', 'oops', 'Infinity']) {
     const invalid = new FormData(); invalid.set(name,raw);
     assert.throws(()=>setup.configureConcurrentLoad(source,invalid,defaults),/whole number/);
@@ -236,7 +248,7 @@ assert.equal(inactive.concurrent_load.mixed.seed,9);
 """)
 
 
-def test_setup_preset_never_rewrites_existing_or_default_profile_to_fit_global_cap():
+def test_setup_preset_preserves_profile_above_suite_output_default():
     run_setup_script("""
 source.max_output_tokens = 32;
 const configured = setup.applySetupPreset(source,'concurrent',defaults);
@@ -245,7 +257,9 @@ assert.equal(configured.max_output_tokens,32);
 assert.equal(configured.max_requests,100);
 assert.equal(defaults.profile.long.output_tokens,128);
 const values = new FormData(); values.set('load_schedule_duration_seconds','10');
-assert.throws(()=>setup.configureConcurrentLoad(configured,values,defaults),/output cap must be 32 tokens or less/);
+const ownProfile = setup.configureConcurrentLoad(configured,values,defaults);
+assert.deepEqual(ownProfile.concurrent_load.profile,defaults.profile);
+assert.equal(ownProfile.max_output_tokens,32);
 const draft = setup.configureConcurrentLoad(configured,values,defaults,{allowInvalid:true});
 assert.equal(draft.concurrent_load.profile.long.output_tokens,128);
 assert.equal(draft.max_output_tokens,32);
@@ -282,8 +296,8 @@ assert.equal(configured.concurrent_load.pass_criteria.response_p95_ms,1200);
 const testValues = new FormData(); testValues.append('check','concurrency');
 testValues.set('test_mode_concurrency','custom'); testValues.set('test_concurrency_samples','17');
 testValues.set('traffic_mode','default');
-const oldChecks = [...checks.filter(check=>check.id!=='concurrency'),{id:'concurrency',option_fields:['samples'],limit_fields:['min_samples'],defaults:{samples:5,limits:{min_samples:5}}}];
-assert.equal(setup.configureTests(configured,testValues,oldChecks,source.traffic).test_options.concurrency,undefined);
+assert.deepEqual(checks.find(check=>check.id==='concurrency').option_fields,['request_timeout_seconds']);
+assert.equal(setup.configureTests(configured,testValues,checks,source.traffic).test_options.concurrency,undefined);
 console.log(JSON.stringify(configured));
 """)
     configured = RunConfig.model_validate(result)
@@ -333,7 +347,7 @@ for (const mode of ['answers','arrival','custom']) {
   assert.deepEqual(switched.judging,source.judging);
   assert.deepEqual(switched.request_pack,source.request_pack);
   assert.deepEqual(switched.concurrent_load,source.concurrent_load);
-  assert.equal(switched.concurrency,8);
+  assert.equal(switched.concurrency,null);
 }
 console.log(JSON.stringify(configured));
 """)
@@ -369,7 +383,7 @@ source.test_options = {
 source.concurrent_load = {...defaults,schedule:{...defaults.schedule,levels:[1,4,8]}};
 const before = structuredClone(source);
 const concurrent = setup.applySetupPreset(source,'concurrent',defaults);
-assert.equal(concurrent.concurrency,8);
+assert.equal(concurrent.concurrency,16);
 const captured = setup.configureTests(concurrent,valuesFor(concurrent),checks,source.traffic);
 assert.deepEqual(captured.test_options,source.test_options);
 assert.deepEqual(source,before);
@@ -436,11 +450,13 @@ for (const [fields,message] of [
 ]) {
   const values = new FormData();
   for (const [key,value] of Object.entries(fields)) values.set(key,value);
+  const before=structuredClone(source),originalDefaults=structuredClone(defaults);
   assert.throws(()=>setup.configureConcurrentLoad(source,values,defaults),message);
   const draft = setup.configureConcurrentLoad(source,values,defaults,{allowInvalid:true});
   assert.deepEqual(draft.checks,source.checks);
   assert.equal(draft.max_requests,source.max_requests);
   assert.equal(draft.concurrency,source.concurrency);
+  assert.deepEqual(source,before);assert.deepEqual(defaults,originalDefaults);
 }
 const sorted = new FormData(); sorted.set('load_schedule_levels','8, 1, 4');
 assert.deepEqual(setup.configureConcurrentLoad(source,sorted,defaults).concurrent_load.schedule.levels,[1,4,8]);

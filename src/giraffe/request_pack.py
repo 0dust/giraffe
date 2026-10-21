@@ -46,6 +46,16 @@ def active_pack(config: RunConfig) -> bool:
             and bool({"capacity", "correctness"}.intersection(config.checks)))
 
 
+def pack_settings(config: RunConfig) -> dict[str, Any]:
+    """Read-only request settings for the dataset correctness panel."""
+    return {
+        "read_only": True,
+        "concurrency": config.inherited_concurrency(config.default_concurrency),
+        "fields": ["default_concurrency", "max_output_tokens", "request_timeout_seconds"],
+        "explanation": "Dataset correctness uses every case once for serial controls, then default_concurrency for its loaded pass. Case output budgets and suite request defaults supply request settings; per-check request overrides are unsupported. When Capacity is selected, its requests provide the shared loaded pass.",
+    }
+
+
 def pack_specs(config: RunConfig) -> list[RequestSpec]:
     if not active_pack(config):
         return []
@@ -63,7 +73,7 @@ def pack_specs(config: RunConfig) -> list[RequestSpec]:
             check_ids=[check for check in ("capacity", "correctness") if check in config.checks],
             messages=messages, scorer=case.scorer, expected=case.expected, schema=case.schema_,
             expected_provided="expected" in case.model_fields_set, rubric=case.rubric,
-            max_tokens=min(case.max_tokens or cap, cap), stream=config.stream, options=options,
+            max_tokens=case.max_tokens or cap, stream=config.stream, options=options,
             request_timeout_seconds=effective.get("request_timeout_seconds", config.request_timeout_seconds),
             input_chars=sum(len(message.content) for message in case.messages),
             workload={"case_id": case.fixture_id, "request_source": "request_pack"},
@@ -171,8 +181,11 @@ def _pack_summary(config: RunConfig, stages: list[dict[str, Any]]) -> dict[str, 
     cases = config.request_pack.cases if active_pack(config) else []
     quiet = len(cases)
     planned = quiet + sum(stage["planned"] for stage in stages)
-    base, extra = divmod(config.max_requests, len(config.targets))
-    quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
+    if config.max_requests is None:
+        quotas = {target.name: None for target in config.targets}
+    else:
+        base, extra = divmod(config.max_requests, len(config.targets))
+        quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
     judge_ids = {case.fixture_id for case in cases if case.scorer == "judge"}
     planned_judged = len(judge_ids) + sum(
         sum(stage["counts"].get(case_id, 0) for case_id in judge_ids) for stage in stages)
@@ -189,7 +202,7 @@ def _pack_summary(config: RunConfig, stages: list[dict[str, Any]]) -> dict[str, 
                "ready": not readiness_errors, "readiness_errors": readiness_errors,
                "planned_requests_per_target": planned_judged,
                "planned_call_upper_bound": planned_judged * len(config.targets) * judge_count,
-               "quota_call_upper_bound": sum(min(planned_judged, quota) for quota in quotas.values()) * judge_count}
+               "quota_call_upper_bound": sum(planned_judged if quota is None else min(planned_judged, quota) for quota in quotas.values()) * judge_count}
     return {"quiet_requests": quiet, "stages": stages, "planned_requests_per_target": planned,
             "per_target_request_quota": quotas, "request_cap": config.max_requests, "judging": judging}
 
@@ -217,13 +230,13 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
             warnings.append("Unscored cases prevent a full-pack correct-capacity claim, including cases with zero offers.")
         if any(any(amount == 0 for amount in stage["counts"].values()) for stage in stages):
             warnings.append("Some stages do not offer every case; full-pack coverage cannot be established at those rates.")
-        if any(planned > quota for quota in quotas.values()):
+        if any(quota is not None and planned > quota for quota in quotas.values()):
             warnings.append("Planned pack requests exceed a target request quota; the bounded run may have incomplete coverage.")
-        if sum(config.traffic.duration_seconds for _ in stages) > config.max_duration_seconds:
+        if config.max_duration_seconds is not None and sum(config.traffic.duration_seconds for _ in stages) > config.max_duration_seconds:
             warnings.append("Planned traffic duration exceeds the run time budget before quiet requests or draining.")
         if not config.stream and config.effective_check("capacity" if stages else "correctness")["limits"].get("stream_gap_ms") is not None:
             warnings.append("Streaming is disabled; the configured stream-gap limit will lack evidence.")
-        if set(config.checks) - {"capacity", "correctness"}:
+        if set(config.checks) - {"capacity", "correctness"} and (config.max_requests is not None or config.max_duration_seconds is not None):
             warnings.append("Other selected checks consume additional shared request and time budget; their requests are not included in the pack subtotal.")
     if judging["active"]:
         warnings.append("AI judging runs after target traffic. Messages, golden answers and generated answers are sent to every configured judge.")
@@ -244,6 +257,8 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
             "per_target_request_quota": quotas, "request_cap": config.max_requests,
             "unique_effective_requests": len(effective_requests),
             "repeated_requests_per_target": max(0, planned - len(effective_requests)),
-            "inapplicable_settings": ["correctness.samples", "correctness.concurrency"] if active else [],
+            "inapplicable_settings": ["correctness.samples", "correctness.concurrency",
+                                      "correctness.max_output_tokens", "correctness.request_timeout_seconds"] if active else [],
+            "correctness_settings": pack_settings(config) if active else None,
             "identity": pack_identity(config), "judging": judging, "warnings": warnings,
             "input_retention_notice": INPUT_RETENTION_NOTICE}

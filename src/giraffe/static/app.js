@@ -1,4 +1,4 @@
-import {inferSetupPreset, configureConcurrentLoad, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261020-concurrent-load-browser-qa';
+import {positiveBoundErrors, inferSetupPreset, configureConcurrentLoad, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261021-run-limits-final';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -25,7 +25,7 @@ function updateAPIKeySummary() {
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not needed for most local servers';
   $('.row-action',summary).textContent=key||ref?'Change':'Add';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 const statusLabels = {pass:'Passed',fail:'Failed',inconclusive:'Inconclusive',skipped:'Not run',blocked:'Blocked',running:'Running',queued:'Queued',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',inconclusive:'?',skipped:'–',blocked:'!',running:'·',queued:'·',stopping:'·',error:'×',completed:'✓',cancelled:'–',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -123,7 +123,8 @@ function orderedRequests(report) {
   });
 }
 function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length}={}) {
-  const total=Math.max(records.length,budget || 0);
+  const countOnly=live&&budget==null;
+  const total=countOnly?records.reduce((total,record)=>Math.max(total,record.slot+1),0):Math.max(records.length,budget || 0);
   if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
   const pages=Math.ceil(total/mosaicPageSize);
   let page=Math.max(0,Math.min(state.mosaicPage || 0,pages-1)),frontier=-1;
@@ -138,14 +139,17 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const offset=page*mosaicPageSize,liveOffset=state.mosaicLivePage*mosaicPageSize;
   state.mosaicPage=page;
   const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count,pages>1?mosaicPageSize:count);
+  if(countOnly&&records.length&&!records.some(record=>record.slot>=offset&&record.slot<offset+count))return `<section class="request-viz"><h2>Requests</h2><p class="hint">Earlier request evidence was evicted from the live window. ${number(state.detail?.live_request_summary?.evicted||0)} earlier requests; ${Object.entries(state.detail?.live_request_summary?.statuses||{}).map(([status,n])=>`${number(n)} ${escape(human(status))}`).join(' · ')}.</p><div class="mosaic-pages"><button type="button" class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''}>←</button><span>${offset+1}–${offset+count} / ${number(total)}</span><button type="button" class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''}>→</button></div></section>`;
   const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
   const positions=requestPositions(records);
+  const firstVisibleSlot=countOnly?records.reduce((slot,record)=>record.slot>=offset&&record.slot<offset+count?Math.min(slot,record.slot):slot,Infinity):offset;
   const bySlot=new Map(records.map((r,i)=>[live?r.slot:i,r]));
-  const statuses=live?['pass','fail','inconclusive','running','idle']:['pass','fail','inconclusive'];
-  return `<section class="request-viz"><div class="viz-heading"><h2>${live?'Request budget':'Requests'}</h2><span class="mono hint">${number(records.length)} ${live?'started':'recorded'}</span>${live&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
-    const r=bySlot.get(offset+i),status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',current=live&&status==='running'&&offset+i===frontier,label=r?requestLabel(r,records,undefined,positions):status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
+  const statuses=live?['pass','fail','inconclusive','running',...(countOnly?[]:['idle'])]:['pass','fail','inconclusive'];
+  return `<section class="request-viz"><div class="viz-heading"><h2>${live&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${countOnly?`${number(total)} started · ${number(records.length)} in live window`:`${number(records.length)} ${live?'started':'recorded'}`}</span>${live&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
+    const r=bySlot.get(offset+i);if(countOnly&&!r)return '';
+    const status=r?requestOutcome(r):live&&offset+i<budgetUsed?'inconclusive':'idle',current=live&&status==='running'&&offset+i===frontier,label=r?requestLabel(r,records,undefined,positions):status==='inconclusive'?`Budget slot ${offset+i+1}: used or reserved, request evidence unavailable`:`Budget slot ${offset+i+1}: not used`;
     const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
-    return `<g class="request-spot ${status}${current?' current':''}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${i===0?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/></g>`;
+    return `<g class="request-spot ${status}${current?' current':''}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${offset+i===firstVisibleSlot?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/></g>`;
   }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}"></i>${status==='idle'?'Unused':statusLabels[status]}${live?'':`<b>${number(records.filter(r=>requestOutcome(r)===status).length)}</b>`}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed request, invalid completion or incorrect answer. Unscored answers, cancellations and intentional probes stay inconclusive. Check verdicts also consider timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}${live&&page!==state.mosaicLivePage?' · live on another page':''}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
 }
 const conditionViews=new Map(),conditionSpots=new Map(),conditionOpen=new Set();
@@ -548,7 +552,7 @@ function keepButton() {return `<button type="button" class="button small" data-a
 function openStorageDialog() {
   state.cleanup={revision:0,preview:null,busy:false};
   const dialog=$('#storage-dialog');
-  dialog.innerHTML=`<div class="dialog-head"><h2 id="storage-title">Clean up saved runs on disk</h2><button type="button" class="button ghost" data-action="close-storage" aria-label="Close cleanup">✕</button></div><div class="dialog-body"><p>Preview which runs to delete. Runs matching any criterion are included. Protected runs and baselines stay on disk.</p><form id="cleanup-form" novalidate><div class="fields"><label for="cleanup-age">Older than (days)<input id="cleanup-age" name="older_than_days" type="number" min="0" step="1" placeholder="Disabled"></label><label for="cleanup-latest">Keep newest runs (counts protected runs too)<input id="cleanup-latest" name="keep_latest" type="number" min="0" step="1" placeholder="Disabled"></label><label for="cleanup-total">Maximum saved runs on disk (MiB)<input id="cleanup-total" name="max_total_mib" type="number" min="0.000001" step="0.000001" placeholder="Disabled"></label></div><button type="submit" class="button" id="cleanup-preview-button">Preview</button></form><div id="cleanup-error" class="error-message" role="alert" hidden></div><div id="cleanup-preview" aria-live="polite"></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-storage">Cancel</button><button type="button" class="button danger" id="cleanup-confirm" data-action="cleanup-confirm" disabled>Delete runs</button></div>`;
+  dialog.innerHTML=`<div class="dialog-head"><h2 id="storage-title">Clean up saved runs on disk</h2><button type="button" class="button ghost" data-action="close-storage" aria-label="Close cleanup">✕</button></div><div class="dialog-body"><p>Preview which runs to delete. Runs matching any criterion are included. Protected runs and baselines stay on disk.</p><form id="cleanup-form" novalidate><div class="fields"><label for="cleanup-age">Older than (days)<input id="cleanup-age" name="older_than_days" type="number" min="${state.bootstrap.limits['cleanup.older_than_days'].minimum}" step="1" placeholder="Disabled"></label><label for="cleanup-latest">Keep newest runs (counts protected runs too)<input id="cleanup-latest" name="keep_latest" type="number" min="${state.bootstrap.limits['cleanup.keep_latest'].minimum}" step="1" placeholder="Disabled"></label><label for="cleanup-total">Maximum saved runs on disk (MiB)<input id="cleanup-total" name="max_total_mib" type="number" min="${(state.bootstrap.limits['cleanup.max_total_bytes'].minimum/1024**2).toFixed(6)}" step="0.000001" placeholder="Disabled"></label></div><button type="submit" class="button" id="cleanup-preview-button">Preview</button></form><div id="cleanup-error" class="error-message" role="alert" hidden></div><div id="cleanup-preview" aria-live="polite"></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-storage">Cancel</button><button type="button" class="button danger" id="cleanup-confirm" data-action="cleanup-confirm" disabled>Delete runs</button></div>`;
   dialog.showModal();$('#cleanup-age').focus();
 }
 function invalidateCleanup() {
@@ -621,7 +625,7 @@ function renderRuns() {
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
 }
-const numericFields=[['context_limit','Context limit','tokens',128,1],['concurrency','Maximum at once','requests at once across all endpoints',1,1],['max_requests','Total request limit','Requests allowed during the whole run.',1,1],['max_memory_mb','Memory limit (RAM growth during this run)','MiB; 0 = off',0,1],['max_duration_seconds','Traffic time limit','seconds of target traffic',.1,'any'],['request_timeout_seconds','Request timeout','seconds per request',.1,'any'],['max_output_tokens','Output cap','tokens / request',1,1]];
+const numericFields=['context_limit','concurrency','max_requests','max_memory_mb','max_duration_seconds','request_timeout_seconds','max_output_tokens'].map(name=>[name]);
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output (estimate)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
 const fieldDescriptions={
   url:{hint:'Address of your LLM server.',help:'Use the address Giraffe can reach, such as http://localhost:11434/v1 for Ollama or http://localhost:8000/v1 for vLLM. Giraffe connects to an existing server; it does not start or install a model.'},
@@ -629,17 +633,17 @@ const fieldDescriptions={
   api_key_env:{hint:'Variable name, such as OPENAI_API_KEY. Do not paste the key.',help:'Giraffe reads this environment variable from the machine running giraffe ui. Set it before starting Giraffe. The secret key is never stored in this form.'},
   name:{hint:'A name for this endpoint in results.',help:'Choose a unique name such as local or staging. Giraffe uses it to identify this endpoint in reports and comparisons.'},
   context_limit:{help:'The server’s configured limit for the question and answer together, measured in tokens. A token is a small piece of text. Use the context length configured on your server, which can be lower than the model’s advertised maximum.'},
-  concurrency:{hint:'Requests running at the same time.',help:'The most requests Giraffe can run at the same time across all servers. You set this number; Giraffe does not detect your hardware limit. Individual tests can use fewer requests. Raising this does not change Total request limit or Concurrency levels.'},
+  concurrency:{hint:'Requests running at the same time.',help:'The most requests Giraffe can run at the same time across all servers. You set this number; Giraffe does not detect your hardware limit. Individual tests can use fewer requests. Raising this does not change Stop after this many requests or Concurrency levels.'},
   max_memory_mb:{hint:'MiB of RAM growth since the run started; 0 = off. Exceeding the limit stops unfinished work with partial results; unfinished required checks make the verdict inconclusive unless a check failed. Completed checks keep their results. The requested workload stays unchanged.'},
   max_requests:{help:'The most target requests Giraffe may use during the whole run, shared across all tests and endpoints. Some scheduled requests can use budget without reaching the server. The run can stop with fewer completed requests. AI evaluator calls have separate limits.'},
   max_duration_seconds:{help:'Maximum seconds of target traffic, including connection, readiness and warm-up requests. AI evaluator calls and report saving happen outside this limit. Reaching it may leave checks unfinished.'},
   request_timeout_seconds:{help:'How long a single request may take before Giraffe times it out. This covers waiting for the answer and receiving it. A shorter test-specific or remaining run deadline can stop it sooner.'},
   max_output_tokens:{help:'The most tokens Giraffe asks the model to generate for one request. A token is a small piece of text. The model can stop before reaching this number; the cap does not guarantee a long answer.'},
-  buckets_levels:{help:'For 1, 4, 8, Giraffe tests one request at a time, then four together, then eight together. It repeats each load with every combination of your three question lengths and three answer caps. Each level must be no higher than Maximum at once in Run limits. Changing levels does not change that limit.'},
+  buckets_levels:{help:'For 1, 4, 8, Giraffe tests one request at a time, then four together, then eight together. It repeats each load with every combination of your three question lengths and three answer caps. Each level must be no higher than Limit simultaneous requests in Run limits. Changing levels does not change that limit.'},
   buckets_samples_per_bucket:{help:'The minimum requests for each test with short, medium or long questions and answers, repeated at every concurrency level. Giraffe sends the larger of this number and the load being tested. For example, a minimum of 4 still sends 8 requests when testing 8 at a time.'},
   buckets_window_seconds:{help:'The time limit for each test with short, medium or long questions and answers, at one concurrency level. Waiting for an available request slot uses this time too. When time runs out, Giraffe records any missing coverage.'},
   buckets_input:{help:'The target question length in characters, including repeated background text. Giraffe keeps the labeled-box instruction intact, so very small questions and the longer-answer instruction can make the actual request longer. The request plan shows the characters sent for every combination.'},
-  buckets_output:{help:'The maximum answer tokens requested for this case. The first answer case asks for a box label; the other two ask for the label followed by numbers. The server can finish before reaching the cap. Every answer cap must fit within the run output cap.'},
+  buckets_output:{help:'The maximum answer tokens requested for this case. The first answer case asks for a box label; the other two ask for the label followed by numbers. The server can finish before reaching the cap. Each case owns its answer cap; the suite value is a default.'},
   metrics_url:{hint:'Optional server metrics address.',help:'Use an existing Prometheus metrics URL, such as http://localhost:9400/metrics. Giraffe reads measurements from it; it does not install an exporter. Missing metrics remain unknown.'},
   mode:{help:'Use running server tests the server as it is. Restart one server first runs its configured restart command before testing. Choose this only when you intend to restart that server.'},
   restart_target:{help:'Only this endpoint’s configured restart command runs. Other endpoints keep running. A restart command must already be configured for the selected endpoint.'},
@@ -648,15 +652,15 @@ const fieldDescriptions={
   traffic_rates:{hint:'Requests per second, for example 1, 2, 4.',help:'Each number is a separate load stage, from lowest to highest. Giraffe starts new requests at that rate without waiting for previous answers. Requests it cannot start because its in-flight limit is full are counted as local drops.'},
   traffic_duration_seconds:{hint:'Seconds to spend at each rate.',help:'Keep sending new requests at each selected rate for this long. After each stage, Giraffe waits for started requests to finish, up to the completion wait limit.'},
   traffic_arrival:{hint:'Even spacing or uneven arrivals.',help:'Steady spreads requests evenly over time. Poisson varies the gaps between requests to simulate uneven traffic. The random seed lets you repeat the same arrival pattern.'},
-  traffic_max_in_flight:{hint:'Leave blank to use the run limit.',help:'The most requests this traffic test may run at once. The run’s Maximum at once still applies if it is lower. When all slots are occupied, extra arrivals count as dropped rather than queued.'},
+  traffic_max_in_flight:{hint:'Leave blank to inherit this check’s default.',help:'The most unfinished requests this traffic check allows. An accepted value is not demonstrated delivery capacity. When all slots are occupied, extra arrivals count as dropped rather than queued.'},
   traffic_seed:{hint:'Use the same number to repeat a pattern.',help:'Controls the repeatable arrival pattern and request mix. Keeping this number the same makes runs easier to compare; it does not force the model to produce the same answers.'},
   traffic_long_input_chars:{hint:'Question length in characters.',help:'Size of the long questions used by built-in traffic tests. Characters and model tokens are different units. This setting is not used when testing your own questions.'},
-  traffic_long_output_words:{hint:'Words to request in a long answer.',help:'Built-in long-answer requests ask the model to copy this many words. The run’s output token cap still applies, and a model may stop early. This setting is not used for your own questions.'},
+  traffic_long_output_words:{hint:'Words to request in a long answer.',help:'Built-in long-answer requests ask the model to copy this many words. This check’s output token cap applies, and a model may stop early. This setting is not used for your own questions.'},
   traffic_drain_timeout_seconds:{hint:'Seconds to wait for remaining answers.',help:'After each traffic stage stops sending new requests, allow already-started requests this much time to finish.'},
   traffic_scheduler_lag_tolerance_ms:{hint:'Allowed delay when starting a request, in ms.',help:'If Giraffe starts a planned request too late, it records a load-generator limitation. This helps separate delays on your computer from delays in the LLM server.'},
   traffic_mix_short:{hint:'Relative share of short requests.',help:'These three weights control how often each request type is used. Weights of 2, 1, 1 mean roughly half short requests, a quarter long-question requests, and a quarter long-answer requests. They are shares, not request counts.'},
   traffic_mix_long_input:{hint:'Relative share of long questions.',help:'Increase this weight to send more long questions. The three weights are scaled to shares automatically. For example, 2, 1, 1 means about half short requests and a quarter of each long type.'},
-  traffic_mix_long_output:{hint:'Relative share of long answers.',help:'Increase this weight to request more long answers. The three weights are scaled to shares automatically. The global output cap still applies to each answer.'},
+  traffic_mix_long_output:{hint:'Relative share of long answers.',help:'Increase this weight to request more long answers. The three weights are scaled to shares automatically. This check’s output cap applies to each answer.'},
   limit_first_output_ms:{help:'The longest acceptable wait for the first useful answer text, in milliseconds. Reasoning text is measured separately. Leave blank if you do not want to require a particular first-answer time.'},
   limit_latency_ms:{help:'The longest acceptable time for a complete answer, in milliseconds. Leave blank if you do not want to require a particular response time.'},
   limit_stream_gap_ms:{help:'The longest acceptable pause between streamed answer chunks, in milliseconds. Network buffering can affect this measurement.'},
@@ -667,10 +671,10 @@ const fieldDescriptions={
   limit_regression_percent:{help:'How much a result may worsen compared with a saved baseline before Giraffe flags a material regression. Timing changes use percent; rate changes use percentage points. Too few comparable samples can leave the comparison inconclusive.'},
   limit_min_samples:{help:'The minimum number of usable measurements needed to judge a result. Fewer samples produce an inconclusive result rather than a pass.'},
   test_samples:{help:'How many sample requests this test should try. Some tests need extra requests to cover every case. Leave blank to use the run setting.'},
-  test_concurrency:{help:'How many requests this test asks to run at the same time. The run’s Maximum at once still applies if it is lower. Leave blank to use the run setting.'},
+  test_concurrency:{help:'How many requests this test asks to run at the same time. An accepted value is not demonstrated delivery capacity. Leave blank to inherit this check’s default.'},
   test_context_limit:{help:'The context length this test should exercise, in tokens. Use the length configured on the server. Leave blank to use the run setting.'},
-  test_max_output_tokens:{help:'The answer token cap for this test. The run’s output cap still applies if it is lower. Leave blank to use the run setting.'},
-  test_request_timeout_seconds:{help:'The deadline for a request in this test, in seconds. The run’s request deadline still applies if it is shorter. Leave blank to use the run setting.'},
+  test_max_output_tokens:{help:'The answer token cap for this test. The suite value is a default, not a ceiling. Leave blank to use the run setting.'},
+  test_request_timeout_seconds:{help:'The deadline for a request in this test, in seconds. The suite value is a default, not a ceiling. Leave blank to use the run setting.'},
   test_sustained_seconds:{help:'How long to keep sending sustained traffic before checking whether the server recovers. Shared request and time limits can stop it sooner.'},
   test_metrics_max_age_seconds:{help:'How old a server metric may be before Giraffe treats it as stale. Missing or stale measurements cannot confirm healthy GPU behavior.'},
   test_backend_verification:{help:'Choose Required to check server logs or traces for proof that cancelled work stopped. It needs a supported runtime and the required logs or traces. A client disconnect alone does not prove the server stopped generation. Choose Off to skip this extra check.'},
@@ -685,13 +689,13 @@ const fieldDescriptions={
   judge_url:{help:'OpenAI-compatible API address of the AI evaluator. Questions, expected answers and generated answers are sent to this endpoint.'},
   judge_name:{help:'A unique name for this evaluator, used to identify its votes and errors in the results.'},
   judge_api_key_env:{hint:'Environment variable name, not the key itself.',help:'Enter the name of an environment variable containing the evaluator’s API key, such as JUDGE_API_KEY. Set it on the machine running Giraffe. Do not paste the secret key into this field.'},
-  judging_concurrency:{help:'The most evaluator requests Giraffe may run at once. This is separate from target-test concurrency and does not affect inference timing.'},
+  judging_concurrency:{help:'The most evaluator requests Giraffe may run at once. This is separate from target-test concurrency and does not affect inference timing. An accepted value is not demonstrated delivery capacity.'},
   judging_request_timeout_seconds:{help:'Seconds allowed for one evaluator response. An evaluator timeout leaves that vote missing; it is not treated as an incorrect target answer.'},
   judging_max_duration_seconds:{help:'Seconds allowed for the complete post-run AI evaluation. Unfinished evaluations remain inconclusive.'},
   judging_max_output_tokens:{help:'The maximum answer tokens allowed for each evaluator response. This cap applies to evaluator output, not the answers being tested.'},
   example_id:{help:'A unique name for this question, used to find it in results and comparisons. Keep the same ID when comparing later runs of the same question.'},
   example_weight:{hint:'A larger number uses this question more often.',help:'Controls how often this question appears in arrival traffic compared with other questions. A weight of 2 gives it about twice the share of a question weighted 1. It does not make the question count twice when scoring an individual answer.'},
-  example_max_tokens:{hint:'Leave blank to use the run’s output cap.',help:'Maximum answer tokens to request for this question. The run’s output cap still applies if it is lower.'},
+  example_max_tokens:{hint:'Leave blank to use the run’s output cap.',help:'Maximum answer tokens to request for this question. The suite value is a default, not a ceiling.'},
   example_scorer:{help:'AI evaluation compares meaning against your expected answer. Exact match compares text, including punctuation, after normalizing whitespace. Contains checks for the expected text inside the answer. JSON checks its structure and optional reference value. No answer check sends traffic without judging correctness.'},
   example_expected:{help:'The answer you want the model to give. AI evaluation accepts answers with the same meaning. Exact match also requires matching punctuation and wording. For JSON checks, enter a JSON value; leaving it blank checks only the schema.'},
   example_schema:{help:'A JSON Schema describing the allowed answer structure, field types and required fields. The answer must parse as JSON and match this schema.'},
@@ -720,9 +724,11 @@ function settingDestination(path) {
   if(parts[1]==='levels')parts.splice(2);
   let name=path,check=null,step=2;
   if(['checks','request_pack','judging'].includes(path))return {name:path,label:{checks:'checks',request_pack:'questions',judging:'AI evaluator'}[path],step};
+  if(['samples','max_output_tokens','request_timeout_seconds','context_limit','default_concurrency'].includes(path))return {name:'config_editor',label:human(path).toLowerCase(),step};
   const sections={concurrent_load:'concurrency',sessions:'sessions',consistency:'consistency',arrivals:'arrivals',prefix:'prefix',traffic:'capacity',tool_checks:'tools'};
   if(parts.length===1&&sections[root]||root==='test_options'&&parts.length===2)return {section:true,check:sections[root]||parts[1],step,label:root==='test_options'?`${human(parts[1]).toLowerCase()} settings`:`${human(sections[root]).toLowerCase()} settings`};
-  if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2];step=1;}
+  if(root==='stream'){step=1;}
+  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2];step=1;}
   else if(root==='concurrent_load'){
     check='concurrency';
     if(parts[1]==='schedule'&&parts[2]==='levels')parts.splice(3);
@@ -730,43 +736,71 @@ function settingDestination(path) {
     if(parts[1]==='mixed'&&parts[2]==='shares'&&parts.length===3)parts.push('short_short');
     name='load_'+parts.slice(1).join('_');
   }
-  else if(root==='test_options'){check=parts[1];name=`test_${check}_${parts.slice(2).join('_').replace('limits_','limit_')}`;}
-  else if(root==='sessions'&&parts[1]==='workloads'&&parts[3]==='max_tokens'){
+  else if(root==='test_options'){check=parts[1];name=check==='correctness'&&state.config?.request_source==='request_pack'&&parts[2]!=='limits'?'request_pack_correctness':`test_${check}_${parts.slice(2).join('_').replace('limits_','limit_')}`;}
+  else if(root==='sessions'&&parts[1]==='workloads'&&parts.length===2)return {section:true,check:'sessions',step,label:'Conversation sessions'};
+  else if(root==='sessions'&&parts[1]==='workloads'){
     check='sessions';const form=$('#new-run-form'),count=Number(form?.elements?.session_workload_count?.value),selected=[];
     for(let index=0;index<count;index++)if(form.elements[`session_enabled_${index}`]?.checked)selected.push(index);
-    name=`session_cap_${selected[Number(parts[2])]??parts[2]}`;
+    const index=selected[Number(parts[2])]??parts[2];
+    name=parts[3]==='turns'?`session_turn_${index}_${parts[4]||0}`:`session_${parts[3]==='max_tokens'?'cap':parts[3]}_${index}`;
   }
   else if(root==='sessions'&&($('#new-run-form')?.elements?.sessions_profile?.value||state.config?.sessions?.profile)==='performance'){
-    name={max_tokens:'sessions_max_tokens',sessions:'sessions_count',delay_seconds:'sessions_delay',concurrency:'concurrency'}[parts[1]]||`profile_sessions_${parts[1]}`;check=name==='concurrency'?null:'sessions';
+    name={max_tokens:'profile_sessions_max_tokens',sessions:'sessions_count',delay_seconds:'sessions_delay',concurrency:'profile_sessions_concurrency'}[parts[1]]||`profile_sessions_${parts[1]}`;check=name==='concurrency'?null:'sessions';
   }
   else if(['arrivals','prefix','sessions','consistency'].includes(root)){check=root;name=`profile_${root}_${parts[1]}`;}
   else if(root==='traffic'){check='capacity';name=`traffic_${parts[1]}`;}
-  else if(root==='limits')name=`limit_${parts[1]}`;
+  else if(root==='tool_checks'){check='tools';name=`profile_tools_${parts[1]}`;}
+  else if(root==='limits'){name=`limit_${parts[1]}`;if(parts[1]==='regression_percent')step=3;}
   else if(root==='judging')name=parts[1]==='judges'?`judge_${parts[2]}_${parts[3]}`:`judging_${parts[1]}`;
   else if(root==='config')name='config_editor';
-  const labels={max_memory_mb:'Memory limit (RAM growth during this run)',concurrency:'maximum at once',max_duration_seconds:'traffic time limit',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'request limit',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'duration per workload',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
+  const labels={max_memory_mb:'Memory limit (RAM growth during this run)',concurrency:'Limit simultaneous requests',max_duration_seconds:'Stop test traffic after',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'Stop after this many requests',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'duration per workload',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
   if(name.startsWith('session_cap_'))return {name,check,step,label:'task output cap'};
   return {name,check,step,label:labels[name]||human(name.replace(/^load_|^profile_|^test_/,'')).toLowerCase()};
 }
 function currentSettingErrors() {
+  if(hasJsonChanges()){const saved=state.jsonValidation;return saved?.draft===state.jsonDraft&&saved.revision===state.configRevision&&saved.route===state.routeVersion?saved.errors:[];}
   const saved=state.requestPreview;
   return !hasJsonChanges()&&saved?.revision===state.configRevision&&saved.route===state.routeVersion?(saved.status==='error'?saved.errors||[]:saved.status==='current'?saved.plan?.errors||[]:[]):[];
+}
+function currentResourceErrors() {
+  return (currentRequestPlan()?.resource_issues || []).filter(issue=>issue.blocking);
 }
 function settingActions(fields) {
   return [...new Set(fields)].map(path=>`<button type="button" class="text-button" data-action="edit-setting" data-setting-path="${escape(path)}">Edit ${escape(settingDestination(path).label)}</button>`).join(' ');
 }
+function concurrencySetting(check) {
+  return {capacity:'traffic.max_in_flight',arrivals:'arrivals.max_in_flight',sessions:'sessions.concurrency',consistency:'consistency.levels',concurrency:'concurrent_load.schedule.levels'}[check]||`test_options.${check}.concurrency`;
+}
+function inheritedConcurrencyNotice(issue) {
+  return issue.check&&Number.isFinite(issue.effective_concurrency);
+}
+function concurrencyNoticeActions(issue) {
+  if(issue.check==='correctness'&&state.config?.request_source==='request_pack')return `<button type="button" class="text-button" data-action="edit-setting" data-setting-path="concurrency">Raise limit</button><button type="button" class="text-button" data-action="edit-setting" data-setting-path="default_concurrency">Edit default concurrency (JSON)</button>`;
+  return `<button type="button" class="text-button" data-action="edit-setting" data-setting-path="concurrency">Raise limit</button><button type="button" class="button small" data-action="use-check-concurrency" data-concurrency-check="${escape(issue.check)}" data-concurrency="${escape(issue.effective_concurrency)}">Use ${number(issue.effective_concurrency)} for ${escape(catalogTitle(issue.check))}</button>`;
+}
+function issueFields(issue) {
+  return [...new Set([...(issue.fields||[issue.field||'config']),...(issue.check?[concurrencySetting(issue.check)]:[])])];
+}
 function renderSettingIssues(errors=currentSettingErrors(),kind='error') {
-  return errors.map(error=>`<div class="notice ${kind} setting-issue" ${kind==='error'?'role="alert"':''}><p>${escape(error.msg)}</p><div class="actions">${settingActions(error.fields||[error.field||'config'])}</div></div>`).join('');
+  return errors.map(error=>{
+    const actions=inheritedConcurrencyNotice(error)?concurrencyNoticeActions(error):error.actions?.map(action=>Object.hasOwn(action,'value')&&['max_requests','max_duration_seconds'].includes(action.field)
+      ?`<button type="button" class="button small" data-action="${action.field==='max_requests'?'use-request-budget':'use-time-budget'}" data-budget="${escape(action.value)}">${escape(action.label)}</button>`
+      :Object.hasOwn(action,'value')&&action.field==='traffic.duration_seconds'
+        ?`<button type="button" class="button small" data-action="use-setting-correction" data-setting-path="${escape(action.field)}" data-setting-value="${escape(action.value)}">${escape(action.label)}</button>`
+        :action.fields?settingActions(action.fields):`<button type="button" class="text-button" data-action="edit-setting" data-setting-path="${escape(action.field)}">${escape(action.label)}</button>`).join(' ') ?? settingActions(error.fields||[error.field||'config']);
+    return `<div class="notice ${kind} setting-issue" ${kind==='error'?'role="alert"':''}><p>${escape(error.msg)}</p>${error.note?`<p class="hint">${escape(error.note)}</p>`:''}<div class="actions">${actions}</div></div>`;
+  }).join('');
 }
 function syncInlineErrors() {
   const messages=new Map();
-  for(const error of currentSettingErrors())for(const path of error.fields||[error.field||'config']){
-    const {name}=settingDestination(path);messages.set(name,[...(messages.get(name)||[]),error.msg]);
+  for(const error of [...currentSettingErrors(),...currentResourceErrors()])for(const path of error.fields||[error.field||'config']){
+    const {name}=state.configView==='json'?{name:'config_editor'}:settingDestination(path);messages.set(name,[...(messages.get(name)||[]),[error.msg,error.note].filter(Boolean).join(' ')]);
   }
   for(const name of new Set([...(state.inlineErrorFields||[]),...messages.keys()])){
-    const input=$(`#field-${name}`),message=$(`#field-${name}-error`);if(!input||!message)continue;
+    const input=name==='config_editor'?$('#config-editor'):$(`#field-${name}`),message=$(`#field-${name}-error`);if(!input||!message)continue;
     const text=[...new Set(messages.get(name)||[])].join(' ');message.textContent=text;message.hidden=!text;
     if(text){
+      for(let details=input.closest?.('details');details;details=details.parentElement?.closest?.('details'))details.open=true;
       if(input.dataset.validationDescription===undefined)input.dataset.validationDescription=input.getAttribute?.('aria-describedby')||'';
       input.setAttribute('aria-invalid','true');input.setAttribute('aria-describedby',[input.dataset.validationDescription,`field-${name}-error`].filter(Boolean).join(' '));
     }else{
@@ -777,20 +811,22 @@ function syncInlineErrors() {
   }
   state.inlineErrorFields=[...messages.keys()];
   const warnings=new Map(),plan=currentRequestPlan();
-  for(const warning of [...(plan?.load_warnings || []),...(plan?.time_warnings || [])])for(const path of warning.fields || []){
+  for(const warning of [...(plan?.load_warnings || []),...(plan?.concurrency_warnings || []),...(plan?.capacity_warnings || []),...(plan?.time_warnings || []),...(plan?.request_warnings || []),...(plan?.resource_warnings || [])])for(const path of issueFields(warning)){
     const {name}=settingDestination(path);warnings.set(name,[...(warnings.get(name) || []),warning]);
   }
   for(const name of new Set([...(state.inlineWarningFields || []),...warnings.keys()])){
-    const input=$(`#field-${name}`),message=$(`#field-${name}-warning`);if(!input||!message)continue;
+    const input=name==='config_editor'?$('#config-editor'):$(`#field-${name}`),message=$(`#field-${name}-warning`);if(!input||!message)continue;
     const rows=warnings.get(name) || [],id=`field-${name}-warning`;
-    message.innerHTML=rows.map(row=>`${escape(row.msg)} ${settingActions(row.fields || [])}`).join(' ');message.hidden=!rows.length;
+    message.innerHTML=rows.map(row=>`${escape(row.msg)} ${inheritedConcurrencyNotice(row)?concurrencyNoticeActions(row):settingActions(row.fields || [])}`).join(' ');message.hidden=!rows.length;
     const described=(input.getAttribute('aria-describedby') || '').split(/\s+/).filter(value=>value&&value!==id);
     if(rows.length)described.push(id);
     if(described.length)input.setAttribute('aria-describedby',described.join(' '));else input.removeAttribute('aria-describedby');
   }
   state.inlineWarningFields=[...warnings.keys()];
+  for(const element of $$('[data-check-runtime-warning]')){const notices=(plan?.concurrency_warnings||[]).filter(issue=>issue.check===element.dataset.checkRuntimeWarning);element.innerHTML=renderSettingIssues(notices,'warning');element.hidden=!notices.length;}
 }
 function focusSetting(path) {
+  if(hasJsonChanges()&&currentSettingErrors().length){const input=$('#config-editor');input?.scrollIntoView?.({block:'center'});input?.focus?.();return;}
   assertAppliedConfig();const destination=settingDestination(path),{name,check}=destination;
   state.returnToReview ||= state.setupStep===3;
   if(['checks','request_pack','judging'].includes(path)){
@@ -800,6 +836,7 @@ function focusSetting(path) {
     const input=path==='request_pack'?$('[data-action="add-example"]'):$('#check-search');input?.scrollIntoView?.({block:'center'});input?.focus?.({preventScroll:true});return;
   }
   const form=$('#new-run-form');let input=form?.elements?.[name]||$(`#field-${name}`);
+  if(input?.disabled&&form?.elements?.[`${name}_enabled`])input=form.elements[`${name}_enabled`];
   if(destination.section){
     revealSetupStep(destination.step);revealCatalogueCheck(check);input=$(`#settings-${check} [data-editor-title]`)||$(`#settings-${check}`);input?.setAttribute?.('tabindex','-1');
   }else if(!input||name==='config_editor'){
@@ -826,16 +863,53 @@ function focusFirstSettingError(error=null) {
 }
 function renderPlanTime(plan) {
   if(!plan||!Object.hasOwn(plan,'estimated_seconds'))return '';
-  return `<div class="plan-time"><p>${plan.estimated_seconds==null?'Completion time unknown':`Usually about ${escape(elapsed(plan.estimated_seconds))}`}</p>${plan.worst_case_seconds==null?`<p class="hint">${(plan.time_bound_reasons||[]).map(escape).join(' ')}</p>`:`<p class="hint">Up to ${escape(elapsed(plan.worst_case_seconds))} if every request hits its timeout.</p>`}<p class="hint">${(plan.time_estimate_assumptions||[]).map(escape).join(' ')}</p>${renderSettingIssues(plan.time_warnings||[],'warning')}</div>`;
+  const low=plan.estimated_low_seconds,high=plan.estimated_high_seconds;
+  const duration=value=>value<60?`${new Intl.NumberFormat('en',{maximumSignificantDigits:2}).format(value)} s`:elapsed(value);
+  const lower=low==null?null:duration(low),upper=high==null?null:duration(high);
+  const estimate=lower==null||upper==null?'awaiting comparable measurements':`about ${lower}${lower===upper?'':`–${upper}`}`;
+  const assumptions=[...(plan.confidence_details?.insufficient_observations||[]),...(plan.time_estimate_assumptions||[])];
+  return `<div class="plan-time"><p>Estimated duration: ${escape(estimate)} · test traffic only</p><p class="hint">Confidence: ${escape(plan.confidence||'low')}. Excludes ${(plan.estimate_exclusions||['setup/connection','AI evaluation','report generation']).map(escape).join(', ')}.</p>${(plan.time_bound_reasons||[]).length?`<div class="unknown-time-components"><p class="hint">Additional work at unknown speed:</p><ul>${plan.time_bound_reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></div>`:''}${assumptions.length?`<details class="estimate-assumptions"><summary>Estimate assumptions</summary><ul>${assumptions.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></details>`:''}${renderSettingIssues([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])],'warning')}${renderSettingIssues((plan.resource_issues||[]).filter(issue=>issue.blocking))}</div>`;
 }
-function renderField(name,label,control,{hint,help,helpKey=name,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`}={}) {
+function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false}={}) {
   const copy=fieldDescription(helpKey);hint ??= copy.hint || '';help ??= copy.help || '';
-  return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label for="${escape(controlId)}">${escape(label)}</label>${infoHelp(name,label,help)}</div>${control}${hint?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}<span class="field-error" id="field-${escape(name)}-error" hidden></span><span class="hint field-warning" id="field-${escape(name)}-warning" hidden></span></div>`;
+  help=[help,state.bootstrap?.cap_explanations?.[settingPath(name)]?.help].filter(Boolean).join(' ');
+  return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label ${hiddenLabel?'class="sr-only" ':''}for="${escape(controlId)}">${escape(label)}</label>${infoHelp(name,label,help)}</div>${control}${hint||hintAlways?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}<span class="field-error" id="field-${escape(name)}-error" hidden></span><span class="hint field-warning" id="field-${escape(name)}-warning" hidden></span></div>`;
 }
-function field(name,label,value,{type='text',hint,help,helpKey=name,min,max,step,placeholder='',required=false,full=false}={}) {
+function settingPath(name) {
+  const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
+  if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
+  if(name.startsWith('load_')){
+    const value=name.slice(5);
+    for(const section of ['profile','schedule','mixed','interference','stress','pass_criteria'])if(value.startsWith(section+'_')){
+      let rest=value.slice(section.length+1);
+      if(section==='profile')rest=rest.replace(/^(short|medium|long)_/,'$1.');
+      if(section==='mixed')rest=rest.replace(/^shares_/,'shares.');
+      return `concurrent_load.${section}.${rest}`;
+    }
+  }
+  const profile=name.match(/^profile_(arrivals|prefix|sessions|consistency|tools)_(.+)$/);
+  if(profile)return `${profile[1]==='tools'?'tool_checks':profile[1]}.${profile[2]}`;
+  const aliases={sessions_count:'sessions.sessions',sessions_delay:'sessions.delay_seconds',sessions_max_tokens:'sessions.max_tokens',example_max_tokens:'request_pack.cases[].max_tokens',example_weight:'request_pack.cases[].weight'};
+  if(aliases[name])return aliases[name];
+  if(/^session_turn_/.test(name))return 'sessions.workloads[].turns[]';
+  if(/^session_(name|weight|cap)_/.test(name))return 'sessions.workloads[].'+({name:'name',weight:'weight',cap:'max_tokens'})[name.split('_')[1]];
+  if(name.startsWith('traffic_'))return 'traffic.'+name.slice(8).replace(/^mix_/,'mix.');
+  if(name.startsWith('judging_'))return 'judging.'+name.slice(8);
+  if(name.startsWith('limit_'))return 'limits.'+name.slice(6);
+  return name;
+}
+function settingBounds(name) {
+  const path=settingPath(name),bounds=state.bootstrap?.limits?.[path]||{};
+  const scale=/^test_.*_limit_(min_correctness|max_error_rate)$/.test(name)?100:1;
+  return {...bounds,minimum:bounds.minimum==null?undefined:bounds.minimum*scale,maximum:bounds.maximum==null?undefined:bounds.maximum*scale};
+}
+function field(name,label,value,{type='text',hint,help,helpKey=name,min,max,step,placeholder='',required=false,hintAlways=false,full=false,hiddenLabel=false}={}) {
+  const bounds=settingBounds(name);
+  min=bounds.minimum ?? (bounds.exclusiveMinimum==null?undefined:bounds.type==='integer'?Math.floor(bounds.exclusiveMinimum)+1:bounds.exclusiveMinimum+Math.max(Number.MIN_VALUE,Math.abs(bounds.exclusiveMinimum)*Number.EPSILON));max=bounds.maximum;
+
   const description=hint ?? fieldDescription(helpKey).hint;
-  const control=`<input id="field-${escape(name)}" name="${escape(name)}" type="${type}" value="${escape(value ?? '')}" ${required?'required':''} ${min!==undefined?`min="${min}"`:''} ${max!==undefined?`max="${max}"`:''} ${step!==undefined?`step="${step}"`:''} placeholder="${escape(placeholder)}" autocomplete="off" ${description?`aria-describedby="field-${escape(name)}-hint"`:''}>`;
-  return renderField(name,label,control,{hint,help,helpKey,full});
+  const control=`<input id="field-${escape(name)}" name="${escape(name)}" type="${type}" value="${escape(value ?? '')}" ${required?'required':''} ${min!==undefined?`min="${min}"`:''} ${max!==undefined?`max="${max}"`:''} ${step!==undefined?`step="${step}"`:''} placeholder="${escape(placeholder)}" autocomplete="off" ${description||hintAlways?`aria-describedby="field-${escape(name)}-hint"`:''}>`;
+  return renderField(name,label,control,{hint,help,helpKey,hintAlways,full,hiddenLabel});
 }
 function selectField(name,label,options,{hint,help,helpKey=name,wrapperId='',controlId=`field-${name}`}={}) {
   const description=hint ?? fieldDescription(helpKey).hint;
@@ -863,7 +937,7 @@ function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder
   if(valueSchema.enum)return selectField(name,label,valueSchema.enum.map(item=>`<option value="${escape(item)}" ${item===value?'selected':''}>${escape(item==='poisson'?'Uneven (Poisson)':item==='steady'?'Even spacing':human(item))}</option>`).join(''),{hint,help,helpKey});
   if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,help,helpKey,required:true});
   if(valueSchema.type==='string')return field(name,label,value,{hint,help,helpKey,required:!nullable,placeholder});
-  return field(name,label,value,{type:'number',hint,help,helpKey,min:valueSchema.minimum ?? (valueSchema.exclusiveMinimum===undefined?undefined:valueSchema.exclusiveMinimum+(valueSchema.type==='integer'?1:.001)),max:valueSchema.maximum,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
+  return field(name,label,value,{type:'number',hint,help,helpKey,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
 }
 const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
@@ -904,25 +978,25 @@ function renderProfileEditor(check,config) {
     if(!modes.some(([value])=>value===selected))modes.push([selected,'Saved selection']);
     const fixtures=typeof profile.fixtures==='string'?profile.fixtures:JSON.stringify(profile.fixtures || [],null,2);
     const conversations=typeof profile.conversations==='string'?profile.conversations:JSON.stringify(profile.conversations || [],null,2);
-    return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_modes','Response modes',modes.map(([value,label])=>`<option value="${escape(value)}" ${value===selected?'selected':''}>${label}</option>`).join(''),{hint:'Run default tests both modes when streaming is enabled, otherwise complete responses. Explicit streaming requires streaming in Run limits.'})}${selectField('profile_tools_forced_tool_diagnostic','Force tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Applies to fixtures without an explicit choice rule. Giraffe never executes tools.'})}${textField('profile_tools_fixtures','Tool fixtures (JSON)',fixtures,{rows:10,maxLength:65536,hint:'Use [] for the built-in weather check, or up to 16 fixture objects with fixture_id, messages, tools, expected_calls (task assertions) or choice (mode: none, auto, required, named; named also needs name), and optional expected_content. choice.support is required or discover; max_calls defaults to 16; parallel_tool_calls is optional. Exact content checks the combined assistant text. The server validates fixture schemas and the 64 KiB configuration limit.'})}${textField('profile_tools_conversations','Tool-result conversations (JSON)',conversations,{rows:10,maxLength:65536,hint:'Optional bounded conversations: fixture_id, messages, tools, steps, final_content. Each step declares expected_calls with name, arguments, result and optional outcome (success or error). Put {{observation_id}} in a result and a final_content check. Up to 4 steps; all final checks must pass. Tools stay available to detect repeated operations. With conversations configured, an empty fixture list skips the built-in check.'})}</div>`;
+    return `<input type="hidden" name="profile_edits_tools" value="[]"><div data-profile-settings="tools" class="fields">${selectField('profile_tools_modes','Response modes',modes.map(([value,label])=>`<option value="${escape(value)}" ${value===selected?'selected':''}>${label}</option>`).join(''),{hint:'Run default tests both modes when streaming is enabled, otherwise complete responses. Explicit streaming requires streaming on Connect.'})}${selectField('profile_tools_forced_tool_diagnostic','Force tool choice',`<option value="false" ${config.forced_tool_diagnostic?'':'selected'}>No · test normal tool selection</option><option value="true" ${config.forced_tool_diagnostic?'selected':''}>Yes · include forced choice diagnostic</option>`,{hint:'Applies to fixtures without an explicit choice rule. Giraffe never executes tools.'})}${textField('profile_tools_fixtures','Tool fixtures (JSON)',fixtures,{rows:10,maxLength:state.bootstrap.limits['tool_checks.bytes'].maximum,hint:`Use [] for the built-in weather check, or up to ${state.bootstrap.limits['tool_checks.fixtures'].maxItems} fixture objects with fixture_id, messages, tools, expected_calls (task assertions) or choice (mode: none, auto, required, named; named also needs name), and optional expected_content. choice.support is required or discover; max_calls defaults to 16; parallel_tool_calls is optional. Exact content checks the combined assistant text. The server validates fixture schemas and the ${diskSize(state.bootstrap.limits['tool_checks.bytes'].maximum)} configuration limit.`})}${textField('profile_tools_conversations','Tool-result conversations (JSON)',conversations,{rows:10,maxLength:state.bootstrap.limits['tool_checks.bytes'].maximum,hint:`Optional bounded conversations: fixture_id, messages, tools, steps, final_content. Each step declares expected_calls with name, arguments, result and optional outcome (success or error). Put {{observation_id}} in a result and a final_content check. Up to ${state.bootstrap.limits['tool_checks.conversations[].steps'].maxItems} steps; all final checks must pass. Tools stay available to detect repeated operations. With conversations configured, an empty fixture list skips the built-in check.`})}</div>`;
   }
   const profiles={
-    arrivals:{schema:'Arrival',fields:['mode','requests','requests_per_second','burst_size'],advanced:['interval_seconds','max_pending','seed']},
+    arrivals:{schema:'Arrival',fields:['mode','requests','requests_per_second','burst_size','max_in_flight'],advanced:['interval_seconds','max_pending','seed']},
     prefix:{schema:'Prefix',fields:['prefix_chars','repeats','history_turns']},
-    sessions:{schema:'Sessions',fields:['modes','sessions','concurrency'],advanced:['max_tokens','delay_seconds','turns','saved_answers']},
+    sessions:{schema:'Sessions',fields:['modes','sessions'],advanced:['delay_seconds','turns','saved_answers']},
     consistency:{schema:'Consistency',fields:['repetitions','levels','shapes','equality','strict'],advanced:['temperature','seed','logprobs']},
   };
   const descriptor=profiles[key];if(!descriptor)return '';
   const values={...profileDefaults(key,config),...config[key]},schema=state.bootstrap.config_schema.$defs[descriptor.schema];
-  const labels={mode:'Arrival pattern',requests:'Scheduled requests',requests_per_second:'Requests per second',burst_size:'Requests per burst',interval_seconds:'Seconds between bursts',max_pending:'Maximum pending requests',seed:'Random seed',prefix_chars:'Shared prefix (characters)',repeats:'Repeated requests',history_turns:'Conversation history turns',modes:'Conversation history',sessions:'Conversations',concurrency:'Concurrent conversations',max_tokens:'Turn cap (tokens)',delay_seconds:'Turn pause (seconds)',turns:'Conversation questions',saved_answers:'Prepared answers',repetitions:'Repetitions per case',levels:'Concurrent requests',shapes:'Question sizes',equality:'Compare answers',temperature:'Temperature',strict:'Require unanimous answers'};
-  const hints={mode:'Choose even spacing or bursts of requests.',requests:'Total scheduled requests before the run limits apply.',requests_per_second:'Used only with even spacing.',burst_size:'Used only with bursts; requests scheduled together in each burst.',interval_seconds:'Used only with bursts; time between groups.',max_pending:'Maximum scheduled requests waiting for an available slot.',seed:'Keep this number to repeat the same arrival pattern.',prefix_chars:'Repeated opening text length; characters are different from tokens.',repeats:'Repeat each shared-prefix case this many times.',history_turns:'Prepared conversation turns included in the history comparison.',modes:'Prepared uses saved replies; earlier model replies uses answers from this run.',sessions:'Conversations to run for each chosen history type.',concurrency:'Conversations allowed at once, within Maximum at once (requests).',max_tokens:'Answer cap for each turn, within the run output cap.',delay_seconds:'Wait this long before the next turn in a conversation.',repetitions:'Answers per question-size and load combination.',levels:'For example: 1, 2, 4. Each level must fit within Maximum at once (requests).',shapes:'Repeat the selected question sizes at every load.',equality:'Exact text compares characters; ignore extra whitespace normalizes spacing.',temperature:'Sampling temperature sent with repeated questions.',strict:'Require agreement fails if repeated answers differ. Wrong known answers can still fail either mode.'};
+  const labels={mode:'Arrival pattern',requests:'Arrival count',requests_per_second:'Sending rate (requests/second)',burst_size:'Burst size (requests)',interval_seconds:'Seconds between bursts',max_pending:'Pending queue (requests)',seed:'Random seed',prefix_chars:'Shared prefix (characters)',repeats:'Repeated requests',history_turns:'Conversation history turns',modes:'Conversation history',sessions:'Conversations',concurrency:'Concurrent conversations',max_tokens:'Turn cap (tokens)',delay_seconds:'Turn pause (seconds)',turns:'Conversation questions',saved_answers:'Prepared answers',repetitions:'Repetitions per case',levels:'Concurrent requests',shapes:'Question sizes',equality:'Compare answers',temperature:'Temperature',strict:'Require unanimous answers'};
+  const hints={mode:'Choose even spacing or bursts of requests.',requests:'Exact number of arrivals to schedule. This is a count, not a sending rate or an in-flight limit.',requests_per_second:'Used only with even spacing.',burst_size:'Used only with bursts; requests scheduled together in each burst.',interval_seconds:'Used only with bursts; time between groups.',max_pending:'Arrivals wait in this bounded queue for an in-flight slot; overflow is dropped locally. Capacity rate-based traffic drops immediately instead of queueing.',seed:'Keep this number to repeat the same arrival pattern.',prefix_chars:'Repeated opening text length; characters are different from tokens.',repeats:'Repeat each shared-prefix case this many times.',history_turns:'Prepared conversation turns included in the history comparison.',modes:'Prepared uses saved replies; earlier model replies uses answers from this run.',sessions:'Conversations to run for each chosen history type.',concurrency:'Conversations allowed at once. An accepted value is not demonstrated delivery capacity.',max_tokens:'Answer cap for each turn; the suite output cap is a default, not a ceiling.',delay_seconds:'Wait this long before the next turn in a conversation.',repetitions:'Answers per question-size and load combination.',levels:'For example: 1, 2, 4. Each level is the check’s own parallelism. An accepted value is not demonstrated delivery capacity.',shapes:'Repeat the selected question sizes at every load.',equality:'Exact text compares characters; ignore extra whitespace normalizes spacing.',temperature:'Sampling temperature sent with repeated questions.',strict:'Require agreement fails if repeated answers differ. Wrong known answers can still fail either mode.'};
   const render=name=>{
-    const fieldName=`profile_${key}_${name}`,value=values[name];
-    if(key==='consistency'&&name==='logprobs')return textField(fieldName,'Token logprob comparison (JSON)',typeof value==='string'?value:JSON.stringify(value ?? null,null,2),{rows:6,maxLength:4096,hint:'null disables it. {} enables complete-response diagnostics. Options: top_logprobs (0–20), strict, tolerance (logprob units; required for strict), support (discover/required), priming_rounds (0–2), compare_levels. Repetitions become corpus rounds using the existing load levels; see the request estimate. This measures token probabilities, not tokens per second.'});
+    const fieldName=`profile_${key}_${name}`,value=key==='arrivals'&&name==='max_in_flight'?(values[name]??effectiveParallelism(config)):values[name];
+    if(key==='consistency'&&name==='logprobs')return textField(fieldName,'Token logprob comparison (JSON)',typeof value==='string'?value:JSON.stringify(value ?? null,null,2),{rows:6,hint:`null disables it. {} enables complete-response diagnostics. Options: top_logprobs (${state.bootstrap.limits['consistency.logprobs.top_logprobs'].minimum}–${state.bootstrap.limits['consistency.logprobs.top_logprobs'].maximum}), strict, tolerance (logprob units; required for strict), support (discover/required), priming_rounds (${state.bootstrap.limits['consistency.logprobs.priming_rounds'].minimum}–${state.bootstrap.limits['consistency.logprobs.priming_rounds'].maximum}), compare_levels. Repetitions become corpus rounds using the existing load levels; see the request estimate. This measures token probabilities, not tokens per second.`});
     const choices=name==='modes'?[['fixed','Prepared history'],['live','Earlier model replies'],['fixed,live','Both history types']]:name==='shapes'?[['short','Short questions'],['long','Long questions'],['short,long','Short and long questions']]:name==='strict'?[['false','Report consistency'],['true','Require agreement']]:name==='equality'?[['bytes','Exact text'],['whitespace','Ignore extra whitespace']]:null;
     if(choices){const selected=Array.isArray(value)?value.join(','):String(value);if(!choices.some(([item])=>item===selected))choices.push([selected,'Saved selection']);return selectField(fieldName,labels[name],choices.map(([item,label])=>`<option value="${escape(item)}" ${item===selected?'selected':''}>${label}</option>`).join(''),{hint:hints[name]});}
     if(['turns','saved_answers'].includes(name))return textField(fieldName,labels[name],(value || []).join('\n'),{hint:'Editing replaces this list. Keep prepared answers aligned with the saved conversation questions.'});
-    return schemaField(fieldName,value,schema.properties[name],{label:labels[name],hint:hints[name]});
+    return schemaField(fieldName,value,schema.properties[name],{label:labels[name] || human(name),hint:name==='max_in_flight'?`Inherited default ${effectiveParallelism(config)}. An accepted value is not demonstrated delivery capacity.`:hints[name]});
   };
   return `${key==='sessions'?renderSessionEditor(config):''}<input type="hidden" name="profile_edits_${key}" value="[]"><button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="${key}">Reset this profile</button><div data-profile-settings="${key}" ${key==='sessions'?`data-session-fixed ${config.sessions?.profile==='performance'?'hidden':''}`:''}><fieldset class="fields">${descriptor.fields.map(render).join('')}</fieldset>${descriptor.advanced?`<details class="check-advanced"><summary>More ${escape(checkGuide[key].name.toLowerCase())} settings</summary><fieldset class="fields">${descriptor.advanced.map(render).join('')}</fieldset></details>`:''}</div>`;
 }
@@ -932,19 +1006,12 @@ function checkCoverageWarning(check,config) {
   const planned=check.id==='consistency'?(config.consistency || profileDefaults('consistency',config)).repetitions:null;
   return planned!=null&&planned<minimum?`Too few planned samples for coverage: ${planned} in a group; ${minimum} required.`:'';
 }
-function checkOverrideWarning(check,config,recovery=false) {
-  const messages=[];
-  for(const [name,label,setting] of [['concurrency','Requested concurrency','Maximum at once'],['max_output_tokens','Requested answer cap','Output cap (tokens)'],['request_timeout_seconds','Requested deadline','Request timeout (seconds)']]){
-    const value=config.test_options?.[check.id]?.[name];
-    if(value!=null&&value>config[name])messages.push(`${label} ${checkSettingValue(name,value)} exceeds run limit ${checkSettingValue(name,config[name])}.${recovery?` Reset this check’s overrides or raise ${setting} in Run limits.`:''}`);
-  }
-  return messages.join(' ');
-}
+function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
   const parts=[];
   if(check.id==='access')parts.push('1 short request');
   else if(check.id==='capacity')parts.push(`${config.traffic.rates.join(' → ')} requests/s`,`${config.traffic.duration_seconds}s at each rate`);
-  else if(check.id==='concurrency'){const settings=config.concurrent_load || concurrentFormDefaults();parts.push(`${counted(Object.keys(loadTitles).filter(type=>settings[type].enabled).length,'load type')}`,validConcurrentLevels(settings.schedule.levels)?`${settings.schedule.levels.join(', ')} concurrent`:'Enter valid concurrency levels');}
+  else if(check.id==='concurrency'){const settings=concurrentSettings(config);parts.push(`${counted(Object.keys(loadTitles).filter(type=>settings[type].enabled).length,'load type')}`,validConcurrentLevels(settings.schedule.levels)?`${settings.schedule.levels.join(', ')} concurrent`:'Enter valid concurrency levels');}
   else if(check.id==='gpu')parts.push(config.targets[0].metrics_url?'Metrics URL configured':'Metrics URL needed');
   else if(check.id==='tools'){
     const fixtures=config.tool_checks?.fixtures,conversations=config.tool_checks?.conversations;
@@ -989,41 +1056,51 @@ function updateCheckRow(check,config,card) {
   const summary=$('[data-load-card-summary]',card);if(summary)summary.textContent=effectiveCheckSummary(check,config);
 }
 function sharedLimitsSummary(config) {
-  return `Up to ${number(config.max_requests)} requests · ${elapsed(config.max_duration_seconds)} · ${number(config.concurrency)} at once`;
+  const parts=[];
+  if(config.max_requests!=null)parts.push(`${number(config.max_requests)} requests`);
+  if(config.max_duration_seconds!=null)parts.push(elapsed(config.max_duration_seconds));
+  if(config.concurrency!=null)parts.push(`${number(config.concurrency)} at once`);
+  return parts.length?`Up to ${parts.join(' · ')}`:'No suite limits set';
 }
 function updateSharedSettingsSummaries(config) {
-  const ceilings=$('#run-ceilings-summary');if(ceilings)ceilings.textContent=sharedLimitsSummary(config);
-  const requests=$('#request-defaults-summary');if(requests)requests.textContent=`· ${number(config.samples)} samples · ${number(config.max_output_tokens)} answer tokens · ${config.stream?'streaming':'complete answers'}`;
-  const acceptance=$('#acceptance-summary');if(acceptance)acceptance.textContent=`· ${number((config.limits.min_correctness ?? 1)*100,1)}% correct · ${config.limits.latency_ms==null?'response time not set':ms(config.limits.latency_ms)}`;
+  const summary=$('#run-ceilings-summary');if(summary)summary.textContent=sharedLimitsSummary(config);
 }
 function renderSharedRunSettings(config) {
-  const primary=[
-    ['max_requests','Max requests','Across all selected checks and endpoints. Reaching this budget can leave checks unfinished. AI evaluator calls have separate limits.'],
-    ['max_duration_seconds','Traffic time limit (seconds)','Stop test traffic after this long. This does not include AI evaluation or saving the report.'],
-    ['concurrency','Maximum at once','Maximum target requests at once across all endpoints. Per-check Concurrency levels must be no higher than this limit.'],
-    ['max_memory_mb','Memory limit (RAM growth during this run)','The guardrail measures process RAM growth since this run started, excluding earlier allocations in the web server. It never reduces concurrency or request counts.'],
+  const rows=[
+    ['max_duration_seconds','Stop test traffic after','Stops target traffic; excludes AI evaluation and saving the report. Tests also have their own durations and per-request timeouts.'],
+    ['max_requests','Stop after this many requests','Shared by all selected checks and split into per-endpoint quotas. Scheduled requests may use budget without reaching the server. AI evaluator calls have separate limits.'],
+    ['concurrency','Limit simultaneous requests','Ceiling on unfinished target requests across all endpoints. Each check keeps its own parallelism. An accepted value is not demonstrated delivery capacity.'],
   ];
-  const requestLabels={samples:'Samples per check',max_output_tokens:'Output cap (tokens)',request_timeout_seconds:'Request timeout (seconds)',context_limit:'Context window (tokens)'};
-  const requestHelp={samples:'Default for checks that use a sample count; not the total run size. Explicit check overrides stay unchanged.',max_output_tokens:'Default and maximum answer length. Checks can request less; answers may finish sooner. Explicit check overrides stay unchanged.',request_timeout_seconds:'Default and maximum wait for one request. A check can use a shorter timeout. Explicit check overrides stay unchanged.',context_limit:'Use the context size configured on your server. Giraffe does not detect it.'};
-  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Edit run limits</h2><span class="run-ceilings-values" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit" aria-hidden="true">⌄</span></summary><div class="setup-body">
-  <div class="fields three run-limit-fields">${primary.map(([key,label,help])=>field(key,label,key==='max_memory_mb'?(config[key] ?? 4096):config[key],{type:'number',hint:key==='max_memory_mb'?fieldDescriptions.max_memory_mb.hint:'',help,min:key==='max_memory_mb'?0:key==='max_duration_seconds'?.1:1,max:key==='concurrency'?256:undefined,step:key==='max_duration_seconds'?'any':1,required:true})).join('')}</div>
-  <details class="setup-disclosure" id="shared-run-limits"><summary>Request settings <span class="dim" id="request-defaults-summary"></span></summary><div class="fields">${['samples','max_output_tokens','request_timeout_seconds','context_limit'].map(key=>field(key,requestLabels[key],config[key],{type:'number',min:key==='request_timeout_seconds'?.1:key==='context_limit'?128:1,step:key==='request_timeout_seconds'?'any':1,required:true,hint:'',help:requestHelp[key]})).join('')}${selectField('stream','How answers arrive',`<option value="true" ${config.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${config.stream?'':'selected'}>Wait for the complete answer</option>`,{hint:'',help:'First-answer timing and interruption checks need streaming.'})}</div></details>
-  <details class="setup-disclosure" id="global-acceptance"><summary>Pass rules <span class="dim" id="acceptance-summary"></span></summary><div class="fields">${field('limit_max_error_rate','Errors allowed (%)',config.limits.max_error_rate*100,{type:'number',hint:'',help:'0% allows no request errors. Used by checks that support this criterion; a check-specific value takes priority.',min:0,max:100,step:'any'})}${field('limit_min_correctness','Correct answers (%)',config.limits.min_correctness*100,{type:'number',hint:'',help:'100% requires every scored answer to be correct. Used by checks that support this criterion. A check-specific value takes priority; diagnostics with fixed criteria still require every tested case to pass.',min:0,max:100,step:'any'})}${field('limit_min_samples','Minimum usable answers',config.limits.min_samples,{type:'number',hint:'',help:'Required per measured group where used. Too few leaves the result inconclusive.',min:state.bootstrap.limits_schema.properties.min_samples.minimum,step:1,required:true})}</div><h4>Timing, slowdown & comparison targets</h4><div class="fields">${limitFields.map(([key,label,unit])=>field(`limit_${key}`,label,config.limits[key],{type:'number',hint:unit,min:key==='fairness_max_ratio'?1.001:.001,step:'any',placeholder:'Measure only'})).join('')}${field('limit_regression_percent','Regression threshold (%)',config.limits.regression_percent,{type:'number',hint:'',help:'Used when comparing runs; percentage points for rates.',min:0,step:'any'})}</div></details></div></details><p class="checks-plan-summary sr-only" id="checks-plan-summary" role="status">Preparing request estimate…</p></section>`;
+  const row=(name,label,help,memory=false)=>{
+    const enabled=memory?config[name]!==0:config[name]!=null;
+    const unit=state.timeUnit||'s',factor=name==='max_duration_seconds'?({s:1,min:60,h:3600}[unit]):1;
+    const value=enabled?(config[name]??(memory?state.bootstrap.defaults.max_memory_mb:null))/factor:null;
+    const input=field(name,memory?'RAM growth (MiB)':name==='max_duration_seconds'?'Duration':name==='max_requests'?'Request count':name==='concurrency'?'Simultaneous request count':label,value,{type:'number',step:name==='max_duration_seconds'?'any':1,required:enabled,hiddenLabel:['max_requests','concurrency'].includes(name),help,hintAlways:true,hint:enabled?'':memory?'Off':'Not set'}).replace('autocomplete="off"',`autocomplete="off" ${enabled?'':'disabled'}`);
+    return `<div class="optional-run-limit" data-run-limit="${name}"><label class="test-selection"><input type="checkbox" name="${name}_enabled" data-limit-toggle="${name}" aria-controls="field-${name}" aria-describedby="field-${name}-hint" ${enabled?'checked':''}><span>${label}</span></label>${input}${name==='max_duration_seconds'?selectField('max_duration_unit','Time unit',['s','min','h'].map(value=>`<option value="${value}" ${value===unit?'selected':''}>${value}</option>`).join('')):''}</div>`;
+  };
+  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits</h2><span class="run-ceilings-values" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit" aria-hidden="true">⌄</span></summary><div class="setup-body"><div class="fields three run-limit-fields">${rows.map(args=>row(...args)).join('')}</div><h3>Resource protection</h3>${row('max_memory_mb','Memory guardrail','Stops when process RAM growth since the run started reaches this amount. It never reduces concurrency or request counts. 0 = off. Exceeding the guardrail stops unfinished work with partial results; unfinished required checks make the verdict inconclusive unless a check failed. Completed checks keep their results.',true)}</div></details><p class="checks-plan-summary sr-only" id="checks-plan-summary">Preparing request estimate…</p></section>`;
+}
+function toggleRunLimit(name,enabled) {
+  const form=$('#new-run-form'),input=form?.elements[name];if(!input)return;
+  state.limitValues ||= {};
+  if(enabled){input.value=state.limitValues[name] ?? '';input.disabled=false;input.required=true;}
+  else {if(input.value!=='')state.limitValues[name]=input.value;input.value='';input.disabled=true;input.required=false;input.removeAttribute?.('aria-invalid');}
+  const hint=$(`#field-${name}-hint`);if(hint)hint.textContent=enabled?'':name==='max_memory_mb'?'Off':'Not set';
 }
 function renderCheckSelection(config) {
-  return `<section class="setup-section check-selection" id="test-selection"><h2 class="sr-only" tabindex="-1">Check selection</h2><div class="setup-body">
+  return `<section class="setup-section check-selection" id="test-selection"><h2 tabindex="-1">Choose your checks</h2><div class="setup-body">
 
   <div class="catalogue-toolbar"><div class="filter-group" aria-label="Show checks"><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="selected" aria-pressed="${state.catalogueFilter==='selected'}">Selected (<span id="catalogue-selected-count">${config.checks.length}</span>)</button><button type="button" class="text-button" data-action="catalogue-filter" data-catalogue-filter="all" aria-pressed="${state.catalogueFilter!=='selected'}">All checks</button></div><div class="catalogue-bulk"><button type="button" class="text-button" data-action="select-tests">Select all</button><button type="button" class="text-button" data-action="clear-tests">Clear</button></div></div>
-  <p class="sr-only" id="selection-summary" role="status">${config.checks.length} checks selected</p>
+  <p class="sr-only" id="selection-summary" >${config.checks.length} checks selected</p>
   <div id="catalogue-browse-tools" ${state.catalogueFilter==='selected'?'hidden':''}><div class="catalogue-browse-header"><label class="catalogue-search"><span class="sr-only">Find a check</span><input type="search" id="check-search" placeholder="Find a check" value="${escape(state.catalogueSearch || '')}" autocomplete="off"></label><button type="button" class="text-button" data-action="quick-checks">Reset to defaults</button></div><div class="catalogue-categories" aria-label="Check categories"><button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="all" aria-pressed="${!state.catalogueCategory||state.catalogueCategory==='all'}">All categories</button>${checkGroups.map(group=>`<button type="button" class="catalogue-filter" data-action="catalogue-category" data-category="${group.id}" aria-pressed="${state.catalogueCategory===group.id}">${group.title}</button>`).join('')}</div></div>
   <div id="test-catalogue"><div class="test-cards check-catalogue" id="test-cards">${checkGroups.map(group=>{const chosen=group.checks.filter(id=>config.checks.includes(id)).length;return `<section class="catalogue-group${chosen?' has-selection':''}" data-catalogue-group="${group.id}" aria-labelledby="group-${group.id}-title"><div class="catalogue-group-heading"><div class="group-title"><h3 id="group-${group.id}-title">${group.title}</h3><p class="group-blurb">${group.blurb}</p></div><span class="group-count" data-group-count>${chosen} of ${group.checks.length}</span><button type="button" class="text-button group-toggle" data-action="select-group" data-category="${group.id}" data-group-toggle>${chosen===group.checks.length?'Clear':'Select all'}</button></div><div class="catalogue-group-cards">${group.checks.map(id=>renderTestCard(state.bootstrap.checks.find(check=>check.id===id),config)).join('')}</div></section>`;}).join('')}</div><p class="hint catalogue-empty" id="catalogue-empty" role="status" hidden></p></div>
   <p class="hint" id="no-tests-selected" ${config.checks.length?'hidden':''}>Choose at least one check before reviewing the run.</p>
-  </div></section>${renderSharedRunSettings(config)}`;
+  </div></section>`;
 }
 function testSettingsLabel(check,config) {
   const custom=Object.keys(config.test_options?.[check.id] || {}).length>0||
     (check.id==='capacity'&&!sameConfig(config.traffic,state.bootstrap.config.traffic))||
-    (check.id==='concurrency'&&!sameConfig(config.concurrent_load,concurrentFormDefaults()));
+    (check.id==='concurrency'&&!sameConfig(concurrentSettings(config),concurrentSettings({...config,concurrent_load:null})));
   return custom?(config.checks.includes(check.id)?'Overrides':'Saved overrides'):'';
 }
 function checkSettingValue(name,value) {
@@ -1035,10 +1112,10 @@ function checkSettingValue(name,value) {
 function checkFieldHelp(check,name,kind='option') {
   const descriptions={
     samples:({generation:'Repeat the generated long-answer request.',concurrency:'Short-only baseline samples and paired trials for the streaming-fairness scenario. Other scenarios have their own sample counts.',context:'Minimum requests across the generated context cases. Calibration and retries can add requests.',correctness:'Minimum generated questions; every built-in case is covered.',json:'Minimum generated JSON questions; every built-in case is covered.',cancellation:'Requests for normal controls and again for follow-up health checks.',recovery:'Short health requests after the load period.'})[check.id] || 'Requests used by this check.',
-    concurrency:'Requests sent together in this check. Maximum at once still applies.',
+    concurrency:'Requests sent together by this check. An accepted value is not demonstrated delivery capacity.',
     context_limit:'Declared server context length, used to size generated questions. This does not change the server.',
-    max_output_tokens:'A lower answer cap for this check. It cannot exceed the run output cap.',
-    request_timeout_seconds:'A shorter deadline for the connection request. It cannot exceed the run request deadline.',
+    max_output_tokens:'Answer cap for this check. The suite value is a default, not a ceiling.',
+    request_timeout_seconds:'Timeout for each request in this check. The suite value is a default, not a ceiling.',
     sustained_seconds:'Send load for this long, then check recovery. The run budget can stop load earlier.',
     metrics_max_age_seconds:'Older server measurements are reported as stale.',
     backend_verification:'Required needs supported server logs or traces to prove cancelled work stopped.',
@@ -1057,6 +1134,7 @@ function checkFieldHelp(check,name,kind='option') {
 }
 function checkFieldHint(check,config,name,kind='option',showValue=false) {
   const saved=config.test_options?.[check.id] || {},overrides=kind==='limit'?(saved.limits || {}):saved;
+  if(kind==='option'&&check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)return `Endpoint response owns this shared request setting: ${checkSettingValue(name,optionValue(config,check,name))}. Change it in Endpoint response; the saved First answer override stays a draft.`;
   const overridden=Object.hasOwn(overrides,name)&&(kind==='limit'||overrides[name]!=null);
   const defaultValue=kind==='limit'?(Object.hasOwn(config.limits || {},name)?config.limits[name]:check.defaults.limits[name]):optionDefault(config,check,name);
   const value=kind==='limit'?limitValue(config,check,name):optionValue(config,check,name);
@@ -1067,24 +1145,22 @@ function checkFieldHint(check,config,name,kind='option',showValue=false) {
   return `${human(origin)}${showValue?`: ${checkSettingValue(name,value)}`:''}`;
 }
 function runLimitHint(name,config) {
-  if(name==='load_schedule_levels')return `Requests at once for each test, separated by commas. Each level must be at most Maximum at once (${config.concurrency}).`;
-  if(name==='traffic_max_in_flight')return `Requests at once for this check. Leave blank to use Maximum at once (${config.concurrency}); this check cannot exceed it.`;
+  const explanation='An accepted value is not demonstrated delivery capacity.';
+  if(name==='load_schedule_levels')return `Requests at once for each workload, separated by commas. ${explanation}`;
+  if(name==='traffic_max_in_flight')return `Own in-flight bound; inherited default ${effectiveParallelism(config)}. When slots are busy, arrivals are dropped locally. ${explanation}`;
 }
+function effectiveParallelism(config) {return Math.min(config.default_concurrency,config.concurrency==null?Infinity:Math.max(1,Math.floor(config.concurrency/(config.overlap_models?config.targets.length:1))));}
 function updateRunLimitHints(config) {
   for(const name of ['load_schedule_levels','traffic_max_in_flight']){const hint=$(`#field-${name}-hint`);if(hint)hint.textContent=runLimitHint(name,config);}
-  const form=$('#new-run-form');if(!form)return;
-  const concurrency=form.elements.profile_sessions_concurrency;
-  if(concurrency)concurrency.max=String(Math.min(Number.isFinite(config.concurrency)?config.concurrency:32,state.bootstrap.config_schema?.$defs?.Sessions?.properties?.concurrency?.maximum??32));
-  for(const input of [form.elements.profile_sessions_max_tokens,form.elements.sessions_max_tokens,...$$('[name^="session_cap_"]')].filter(Boolean)){
-    if(Number.isFinite(config.max_output_tokens))input.max=String(config.max_output_tokens);else input.removeAttribute?.('max');
-  }
 }
 function updateCheckFieldHints(config) {
   updateRunLimitHints(config);
   const form=$('#new-run-form');
-  if(form)for(const check of state.bootstrap.checks)for(const name of ['concurrency','max_output_tokens','request_timeout_seconds']){
-    const input=form.elements[`test_${check.id}_${name}`];if(!input)continue;
-    if(typeof config[name]==='number'&&Number.isFinite(config[name]))input.max=String(config[name]);
+  if(form)for(const id of ['serving','first_output']){const check=state.bootstrap.checks.find(check=>check.id===id);for(const name of ['samples','max_output_tokens','request_timeout_seconds']){const input=form.elements[`test_${id}_${name}`];if(!input)continue;const owned=id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null;input.readOnly=owned;if(input.dataset?.inherited==='true'||owned)input.value=optionValue(config,check,name)??'';}}
+  if(form)for(const [name,input] of Object.entries(form.elements)){
+    if(!input||input.type&&input.type!=='number')continue;
+    const bounds=settingBounds(input.name||name);
+    if(bounds.maximum!=null)input.max=String(bounds.maximum);
     else input.removeAttribute?.('max');
   }
   for(const warning of $$('[data-check-override-warning]')){
@@ -1114,14 +1190,14 @@ function renderTestCard(check,config) {
   const guide=checkGuide[check.id],selected=config.checks?.includes(check.id),custom=Object.keys(config.test_options?.[check.id] || {}).length>0;
   const warningsVisible=selected||state.openTest===check.id;
   const ownQuestions=check.id==='correctness'&&config.request_source==='request_pack';
-  const optionLabels={samples:'Sample requests',concurrency:'Concurrent requests',context_limit:'Context length (tokens)',max_output_tokens:'Answer cap (tokens)',request_timeout_seconds:'Connection timeout (seconds)',sustained_seconds:'Load duration (seconds)',metrics_max_age_seconds:'Metric freshness (seconds)',backend_verification:'Verify server cancellation',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Probe deadline (ms)',cancel_after_chunks:'Chunks before cancellation',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
+  const optionLabels={samples:'Sample requests',concurrency:'Concurrent requests',context_limit:'Context length (tokens)',max_output_tokens:'Output cap (tokens)',request_timeout_seconds:'Request timeout (seconds)',sustained_seconds:'Load duration (seconds)',metrics_max_age_seconds:'Metric freshness (seconds)',backend_verification:'Verify server cancellation',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Probe deadline (ms)',cancel_after_chunks:'Chunks before cancellation',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
   const advancedOptions=new Set(['backend_verification','server_log','trace_file','cancel_after_chunks','cleanup_seconds','trace_wait_seconds']);
-  const runOptions=new Set(['concurrency','max_output_tokens','request_timeout_seconds']);
-  const option=name=>markCheckHint(schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Minimum questions':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default'}),check,name,'option');
+  const runOptions=new Set();
+  const option=name=>{let markup=schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Minimum questions':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default'});if(check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)markup=markup.replace('autocomplete="off"','autocomplete="off" readonly');return markCheckHint(markup,check,name,'option');};
   const limitLabels={first_output_ms:'First answer (ms)',latency_ms:'Completion limit (ms)',stream_gap_ms:'Stream pause (ms)',min_output_tokens_per_second:'Minimum rate (tok/s)',fairness_max_ratio:'Maximum slowdown (ratio)',max_error_rate:'Errors allowed (%)',min_correctness:'Correct answers (%)',min_samples:'Minimum usable answers'};
   const primaryLimits=new Set(['first_output_ms','latency_ms','min_correctness','max_error_rate','fairness_max_ratio','min_samples']);
-  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',min:0,max:100,step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit')}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
-  const inactive=name=>ownQuestions&&['samples','concurrency'].includes(name);
+  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit')}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
+  const inactive=()=>ownQuestions;
   const requestFields=check.option_fields.filter(name=>!inactive(name)&&!advancedOptions.has(name)&&!runOptions.has(name));
   const requests=requestFields.map(option).join('');
   const inherited=check.option_fields.filter(name=>!inactive(name)&&runOptions.has(name)).map(option).join('');
@@ -1132,12 +1208,12 @@ function renderTestCard(check,config) {
   const hostsQuestions=check.id===(config.checks.includes('correctness')?'correctness':config.checks.includes('capacity')?'capacity':null);
   const sharedQuestions=config.checks.includes('correctness')&&config.checks.includes('capacity');
   const questionSource=hostsQuestions?`<div class="catalogue-question-source">${sharedQuestions?`<p class="hint question-source-scope">Also used by ${escape(catalogTitle('capacity'))}.</p>`:''}${renderRequestSource(config)}</div>`:'';
-  const inactiveControls=ownQuestions?`<div hidden data-inactive-question-settings>${check.option_fields.filter(inactive).map(option).join('')}</div>`:'';
+  const inactiveControls=ownQuestions?`<p class="hint" id="field-request_pack_correctness" tabindex="-1" data-pack-request-settings>Each saved case owns its output cap and request options. Request timeout: ${elapsed(config.request_timeout_seconds)}. Concurrency: ${effectiveParallelism(config)} (default). Per-check request-setting overrides are unavailable. Per-check pass criteria remain supported.</p><span class="field-error" id="field-request_pack_correctness-error" hidden></span><span class="hint field-warning" id="field-request_pack_correctness-warning" hidden></span>`:'';
   return `<section class="test-card catalogue-row" data-test-card="${check.id}" data-category="${checkGroups.find(group=>group.checks.includes(check.id))?.id || ''}" data-search="${escape(`${guide.name} ${guide.purpose} ${check.title} ${check.id}`.toLowerCase())}">
   <div class="test-card-heading"><div class="test-row-copy"><div class="test-selection-line"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(guide.name)}</span></label>${renderCheckInfo(check,config)}</div><p class="test-description">${escape(guide.purpose)}</p>${check.id==='concurrency'?`<p class="hint" data-load-card-summary>${escape(effectiveCheckSummary(check,config))}</p>`:''}</div><div class="test-row-actions"><span class="test-setting-state" data-setting-state>${escape(testSettingsLabel(check,config))}</span><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Settings for ${escape(guide.name)}" aria-expanded="false" aria-controls="settings-${check.id}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h7M15 6h1M4 14h1M9 14h7"/><circle cx="13" cy="6" r="2"/><circle cx="7" cy="14" r="2"/></svg>Settings</button></div></div>
   <p class="hint check-row-warning" data-check-override-warning="${check.id}" ${warningsVisible&&checkOverrideWarning(check,config)?'':'hidden'}>${escape(checkOverrideWarning(check,config,true))}</p>
-  <p class="hint check-row-warning" data-check-coverage="${check.id}" ${warningsVisible&&checkCoverageWarning(check,config)?'':'hidden'}>${escape(checkCoverageWarning(check,config))}</p>
-  ${check.id==='concurrency'?'':`<input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}">`}
+  <div data-check-runtime-warning="${check.id}" hidden></div><p class="hint check-row-warning" data-check-coverage="${check.id}" ${warningsVisible&&checkCoverageWarning(check,config)?'':'hidden'}>${escape(checkCoverageWarning(check,config))}</p>
+  <input type="hidden" name="test_mode_${check.id}" value="${custom?'custom':'default'}">
   <div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden>
   <div class="test-editor-head"><span class="eyebrow">${escape(checkGroups.find(group=>group.checks.includes(check.id))?.title || 'Check')}</span><h3 tabindex="-1" data-editor-title>${escape(guide.name)}</h3><button type="button" class="button ghost icon-button" data-close-test="${check.id}" aria-label="Close ${escape(guide.name)} settings"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div>
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
@@ -1155,9 +1231,8 @@ function renderTestCard(check,config) {
 
 function renderLoadGuidance(config) {
   if(!config.checks.includes('concurrency'))return '';
-  const settings=config.concurrent_load || concurrentFormDefaults(),messages=[];
-  if(Math.max(...settings.schedule.levels)>config.concurrency)messages.push({msg:'Concurrency levels exceed Maximum at once.',fields:['concurrent_load.schedule.levels','concurrency']});
-  for(const size of loadSizes)if(settings.profile[size].output_tokens>config.max_output_tokens)messages.push({msg:'A selected output cap exceeds the run output cap.',fields:[`concurrent_load.profile.${size}.output_tokens`,'max_output_tokens']});
+  const settings=concurrentSettings(config),messages=[];
+  if(config.concurrency!=null&&Math.max(...settings.schedule.levels)>config.concurrency)messages.push({msg:'Concurrency levels exceed Limit simultaneous requests.',fields:['concurrent_load.schedule.levels','concurrency']});
   return renderSettingIssues(messages,'warning');
 }
 const loadSizes=['short','medium','long'];
@@ -1165,18 +1240,27 @@ const loadShapes=loadSizes.flatMap(input=>loadSizes.map(output=>`${input}_${outp
 const loadTitles={combinations:'Input → output combinations',mixed:'Mixed load',interference:'Long input during an active short stream',stress:'Large-input / large-output stress'};
 function loadShapeLabel(shape) {const [input,output]=shape.split('_');return `${human(input)} input → ${human(output)} output`;}
 function concurrentFormDefaults() {return clone(state.bootstrap.concurrent_load.defaults);}
+function concurrentSettings(config) {
+  const settings=config.concurrent_load || concurrentFormDefaults();
+  if(settings.schedule.levels!==undefined)return settings;
+  const targets=config.overlap_models?Math.max(1,config.targets.length):1;
+  const ceiling=config.concurrency==null?Infinity:Math.max(1,Math.floor(config.concurrency/targets));
+  const levels=[1,4].filter(level=>level<=ceiling);
+  return {...settings,schedule:{...settings.schedule,levels}};
+}
 function loadCheckbox(name,label,checked,{controls='',extra=''}={}) {
   return `<div class="form-field load-checkbox"><label for="field-${name}"><input type="checkbox" id="field-${name}" name="${name}" ${checked?'checked':''} ${controls?`aria-controls="${controls}"`:''} ${extra}>${label}</label><span class="field-error" id="field-${name}-error" hidden></span><span class="hint field-warning" id="field-${name}-warning" hidden></span></div>`;
 }
 function validConcurrentLevels(levels) {
-  return Array.isArray(levels)&&levels.length>=1&&levels.length<=16&&new Set(levels).size===levels.length&&levels.every(level=>Number.isInteger(level)&&level>=1&&level<=256);
+  const bounds=state.bootstrap.limits['concurrent_load.schedule.levels'],item=bounds.items;
+  return Array.isArray(levels)&&levels.length>=bounds.minItems&&levels.length<=bounds.maxItems&&new Set(levels).size===levels.length&&levels.every(level=>Number.isInteger(level)&&level>=item.minimum&&level<=item.maximum);
 }
 function concurrentDisplay(settings) {
   const {profile,schedule,combinations,mixed,stress}=settings,levels=schedule.levels,seconds=schedule.duration_seconds;
-  const shares=Object.values(mixed.shares),validShares=shares.every(share=>typeof share==='number'&&Number.isFinite(share)&&share>=0&&share<=100);
+  const shares=Object.values(mixed.shares),validShares=shares.every(share=>typeof share==='number'&&Number.isFinite(share)&&share>=state.bootstrap.limits['concurrent_load.mixed.shares.*'].minimum&&share<=state.bootstrap.limits['concurrent_load.mixed.shares.*'].maximum);
   const total=shares.reduce((sum,share)=>sum+Number(share),0),validTotal=validShares&&Math.abs(total-100)<=1e-6;
-  const validLevels=validConcurrentLevels(levels),validDuration=Number.isFinite(seconds)&&seconds>=1;
-  const cap=profile.long.output_tokens,percent=stress.min_output_percent,coverage=Number.isInteger(cap)&&cap>=1&&Number.isFinite(percent)&&percent>=1&&percent<=100;
+  const validLevels=validConcurrentLevels(levels),validDuration=Number.isFinite(seconds)&&seconds>=state.bootstrap.limits['concurrent_load.schedule.duration_seconds'].minimum;
+  const cap=profile.long.output_tokens,percent=stress.min_output_percent,coverage=Number.isInteger(cap)&&cap>=state.bootstrap.limits['concurrent_load.profile.long.output_tokens'].minimum&&Number.isFinite(percent)&&percent>=state.bootstrap.limits['concurrent_load.stress.min_output_percent'].minimum&&percent<=state.bootstrap.limits['concurrent_load.stress.min_output_percent'].maximum;
   const shape=combinations.selected.includes('long_short')?'long_short':combinations.selected[0];
   const example=combinations.enabled&&shape?loadShapeLabel(shape):mixed.enabled?'Mixed load':settings.interference.enabled?'Short-only control':stress.large_input?'Large-input stress':'Large-output stress';
   return {
@@ -1189,7 +1273,7 @@ function concurrentDisplay(settings) {
 }
 function renderMigrationNotes() {
   const notes=(state.migrationNotes || []).filter(note=>!(state.dismissedMigrationNotes || []).includes(note));
-  return notes.length?`<section class="notice migration-notes" aria-label="Configuration migration notes"><strong>Concurrent load settings migrated</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss migration notes</button></section>`:'';
+  return notes.length?`<section class="notice migration-notes" aria-label="Configuration migration notes"><strong>Saved settings migrated</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss migration notes</button></section>`:'';
 }
 function acceptMigrationNotes(notes=[]) {
   state.migrationNotes=[...new Set([...(state.migrationNotes || []),...notes])];
@@ -1200,20 +1284,20 @@ function replaceMigrationNotes(notes=[]) {
   acceptMigrationNotes(notes);
 }
 function renderConcurrentEditor(config) {
-  const settings=config.concurrent_load || concurrentFormDefaults(),live=concurrentDisplay(settings);
+  const settings=concurrentSettings(config),live=concurrentDisplay(settings);
   const numberField=(path,label,value,options={})=>field(`load_${path}`,label,value,{type:'number',step:1,...options});
   const shapeTokens=shape=>{const [input,output]=shape.split('_');return `${counted(settings.profile[input].input_tokens,'input token')} · ${counted(settings.profile[output].output_tokens,'output token')}`;};
   const cards={
-    combinations:`<div class="load-grid-actions"><strong>Size combinations</strong><button type="button" class="text-button" data-action="load-select-all">Select all</button><button type="button" class="text-button" data-action="load-clear">Clear</button></div><p class="hint">Rows: input size · columns: output size.</p><div class="load-shape-grid">${loadShapes.map(shape=>loadCheckbox(`load_combinations_selected_${shape}`,`<span>${escape(loadShapeLabel(shape))}<small data-load-tokens="${shape}">${escape(shapeTokens(shape))}</small></span>`,settings.combinations.selected.includes(shape))).join('')}</div><p class="hint" id="load-combination-count" aria-live="polite">${escape(live.count)}</p>`,
-    mixed:`<h4>Share of requests (%)</h4><p class="hint">Rows: input size · columns: output size.</p><div class="load-share-grid">${loadShapes.map(shape=>numberField(`mixed_shares_${shape}`,loadShapeLabel(shape),settings.mixed.shares[shape] ?? '',{min:0,max:100,step:'any',placeholder:'0',hint:''})).join('')}</div><p id="load-share-total" class="hint${live.validTotal?'':' invalid-total'}" aria-live="polite">${escape(live.total)}</p><p class="hint">Percentages describe request frequency, not size or time. Shapes use seeded random selection; the observed mix is reported by requests sent and in-flight time.</p>`,
-    interference:`${selectField('load_interference_trigger','Introduce the long input',`<option value="first_output" ${settings.interference.trigger==='first_output'?'selected':''}>After the short streams begin responding</option><option value="after_chunks" ${settings.interference.trigger==='after_chunks'?'selected':''}>After a number of answer chunks per short stream</option>`)}<div id="load-trigger-chunks" ${settings.interference.trigger==='after_chunks'?'':'hidden'}>${numberField('interference_trigger_chunks','Answer chunks per short stream',settings.interference.trigger_chunks,{min:1,max:1000})}</div><p class="hint load-allocation" id="load-interference-allocation" aria-live="polite">${escape(live.allocation)}</p>${numberField('interference_max_slowdown','Maximum slowdown vs short-only control',settings.interference.max_slowdown,{min:1,step:'any',placeholder:'Measure only',hint:'1.5× allows short answers to take at most 50% longer to stream. Blank measures without a slowdown limit.'})}`,
-    stress:`${loadCheckbox('load_stress_large_input','Long input → Short output',settings.stress.large_input)}${loadCheckbox('load_stress_large_output','Short input → Long output',settings.stress.large_output)}${numberField('stress_min_output_percent','Minimum output length (% of cap)',settings.stress.min_output_percent,{min:1,max:100,step:'any'})}<p class="hint" id="load-output-coverage" aria-live="polite">${escape(live.coverage)}</p>`
+    combinations:`<div class="load-grid-actions"><strong>Size combinations</strong><button type="button" class="text-button" data-action="load-select-all">Select all</button><button type="button" class="text-button" data-action="load-clear">Clear</button></div><p class="hint">Rows: input size · columns: output size.</p><div class="load-shape-grid">${loadShapes.map(shape=>loadCheckbox(`load_combinations_selected_${shape}`,`<span>${escape(loadShapeLabel(shape))}<small data-load-tokens="${shape}">${escape(shapeTokens(shape))}</small></span>`,settings.combinations.selected.includes(shape))).join('')}</div><p class="hint" id="load-combination-count">${escape(live.count)}</p>`,
+    mixed:`<h4>Share of requests (%)</h4><p class="hint">Rows: input size · columns: output size.</p><div class="load-share-grid">${loadShapes.map(shape=>numberField(`mixed_shares_${shape}`,loadShapeLabel(shape),settings.mixed.shares[shape] ?? '',{step:'any',placeholder:'0',hint:''})).join('')}</div><p id="load-share-total" class="hint${live.validTotal?'':' invalid-total'}">${escape(live.total)}</p><p class="hint">Percentages describe request frequency, not size or time. Shapes use seeded random selection; the observed mix is reported by requests sent and in-flight time.</p>`,
+    interference:`${selectField('load_interference_trigger','Introduce the long input',`<option value="first_output" ${settings.interference.trigger==='first_output'?'selected':''}>After the short streams begin responding</option><option value="after_chunks" ${settings.interference.trigger==='after_chunks'?'selected':''}>After a number of answer chunks per short stream</option>`)}<div id="load-trigger-chunks" ${settings.interference.trigger==='after_chunks'?'':'hidden'}>${numberField('interference_trigger_chunks','Answer chunks per short stream',settings.interference.trigger_chunks,{})}</div><p class="hint load-allocation" id="load-interference-allocation">${escape(live.allocation)}</p>${numberField('interference_max_slowdown','Maximum slowdown vs short-only control',settings.interference.max_slowdown,{step:'any',placeholder:'Measure only',hint:'1.5× allows short answers to take at most 50% longer to stream. Blank measures without a slowdown limit.'})}`,
+    stress:`${loadCheckbox('load_stress_large_input','Long input → Short output',settings.stress.large_input)}${loadCheckbox('load_stress_large_output','Short input → Long output',settings.stress.large_output)}${numberField('stress_min_output_percent','Minimum output length (% of cap)',settings.stress.min_output_percent,{step:'any'})}<p class="hint" id="load-output-coverage">${escape(live.coverage)}</p>`
   };
   const descriptions={combinations:'Compare selected sizes separately at each concurrency level.',mixed:'Interleave request shapes in one running workload.',interference:'Measure whether long input interrupts short-answer streaming.',stress:'Exercise long inputs and verify long generated answers.'};
-  return `<div class="concurrent-editor" data-concurrent-settings><input type="hidden" name="load_rendered" value="1"><div data-migration-notes aria-live="polite">${renderMigrationNotes()}</div><section class="load-section"><h3>Data profile</h3><table class="load-profile"><thead><tr><th scope="col">Size</th><th scope="col">Input tokens · target</th><th scope="col">Output tokens · cap</th></tr></thead><tbody>${loadSizes.map(size=>`<tr><th scope="row">${human(size)}</th>${['input_tokens','output_tokens'].map(kind=>`<td>${numberField(`profile_${size}_${kind}`,`${human(size)} ${kind==='input_tokens'?'input token target':'output token cap'}`,settings.profile[size][kind],{min:1,max:kind==='input_tokens'?131072:65536,hint:''})}</td>`).join('')}</tr>`).join('')}</tbody></table><p class="hint">Used by the load types below. Actual token lengths are reported; answers can finish before their cap.</p></section>
+  return `<div class="concurrent-editor" data-concurrent-settings><input type="hidden" name="load_rendered" value="1"><div data-migration-notes>${renderMigrationNotes()}</div><section class="load-section"><h3>Data profile</h3><table class="load-profile"><thead><tr><th scope="col">Size</th><th scope="col">Input tokens · target</th><th scope="col">Output tokens · cap</th></tr></thead><tbody>${loadSizes.map(size=>`<tr><th scope="row">${human(size)}</th>${['input_tokens','output_tokens'].map(kind=>`<td>${numberField(`profile_${size}_${kind}`,`${human(size)} ${kind==='input_tokens'?'input token target':'output token cap'}`,settings.profile[size][kind],{hint:''})}</td>`).join('')}</tr>`).join('')}</tbody></table><p class="hint">Used by the load types below. Actual token lengths are reported; answers can finish before their cap.</p></section>
   <section class="load-section"><h3>Load types</h3><div class="load-types">${Object.entries(loadTitles).map(([type,title])=>{const open=state.loadPanels?.[type] ?? settings[type].enabled;return `<section class="load-type${settings[type].enabled?' is-selected':''}" data-load-type="${type}"><div class="load-type-heading">${loadCheckbox(`load_${type}_enabled`,`<span><strong>${escape(title)}</strong><small>${descriptions[type]}</small></span>`,settings[type].enabled,{controls:`load-panel-${type}`,extra:`data-load-enable="${type}"`})}<button type="button" class="button ghost load-collapse" data-load-collapse="${type}" aria-expanded="${open}" aria-controls="load-panel-${type}" aria-label="${open?'Collapse':'Expand'} ${escape(title)} settings">${open?'⌃':'⌄'}</button></div><div class="load-type-panel" id="load-panel-${type}" ${open?'':'hidden'}>${cards[type]}</div></section>`;}).join('')}</div></section>
-  <section class="load-section"><h3>Load schedule</h3><div class="fields">${field('load_schedule_levels','Concurrency levels',settings.schedule.levels.join(', '),{hint:runLimitHint('load_schedule_levels',config)})}${numberField('schedule_duration_seconds','Duration per workload at each concurrency level (seconds)',settings.schedule.duration_seconds,{min:1,max:3600,hint:'Each selected combination gets this full duration. Interference uses twice this duration.'})}</div><p class="hint">Replenish each free slot throughout the sending window. Requests in flight can finish afterward. Samples are measured; reaching a sample count does not stop the workload.</p></section>
-  <details class="load-section load-pass-criteria"><summary>Pass criteria</summary><div class="fields">${numberField('pass_criteria_first_output_p95_ms','First answer p95 at most (ms)',settings.pass_criteria.first_output_p95_ms,{min:1,placeholder:'Measure only'})}${numberField('pass_criteria_response_p95_ms','Response p95 at most (ms)',settings.pass_criteria.response_p95_ms,{min:1,placeholder:'Measure only'})}${numberField('pass_criteria_max_error_percent','Errors allowed (%)',settings.pass_criteria.max_error_percent,{min:0,max:100,step:'any'})}${numberField('pass_criteria_min_correct_percent','Correct answers required (%)',settings.pass_criteria.min_correct_percent,{min:0,max:100,step:'any'})}${numberField('pass_criteria_min_valid_responses','Minimum valid responses per test point',settings.pass_criteria.min_valid_responses,{min:2})}</div><p class="hint" id="load-test-point-example" aria-live="polite">${escape(live.example)}</p><p class="hint">Blank timing targets mean measure only. Correctness applies where an expected answer exists. Failures and timeouts count against the error limit.</p></details><section class="load-section load-drawer-plan" aria-label="Concurrent load plan">${renderConcurrentPlan(config,currentRequestPlan())}${renderSettingIssues()}</section></div>`;
+  <section class="load-section"><h3>Load schedule</h3><div class="fields">${field('load_schedule_levels','Concurrency levels',settings.schedule.levels.join(', '),{hint:runLimitHint('load_schedule_levels',config)})}${numberField('schedule_duration_seconds','Duration per workload at each concurrency level (seconds)',settings.schedule.duration_seconds,{hint:'Each selected combination gets this full duration. Interference uses twice this duration.'})}</div><p class="hint">Replenish each free slot throughout the sending window. Requests in flight can finish afterward. Samples are measured; reaching a sample count does not stop the workload.</p></section>
+  <details class="load-section load-pass-criteria"><summary>Pass criteria</summary><div class="fields">${numberField('pass_criteria_first_output_p95_ms','First answer p95 at most (ms)',settings.pass_criteria.first_output_p95_ms,{placeholder:'Measure only'})}${numberField('pass_criteria_response_p95_ms','Response p95 at most (ms)',settings.pass_criteria.response_p95_ms,{placeholder:'Measure only'})}${numberField('pass_criteria_max_error_percent','Errors allowed (%)',settings.pass_criteria.max_error_percent,{step:'any'})}${numberField('pass_criteria_min_correct_percent','Correct answers required (%)',settings.pass_criteria.min_correct_percent,{step:'any'})}${numberField('pass_criteria_min_valid_responses','Minimum valid responses per test point',settings.pass_criteria.min_valid_responses,{})}</div><p class="hint" id="load-test-point-example">${escape(live.example)}</p><p class="hint">Blank timing targets mean measure only. Correctness applies where an expected answer exists. Failures and timeouts count against the error limit.</p></details><section class="load-section load-drawer-plan" aria-label="Concurrent load plan">${renderConcurrentPlan(config,currentRequestPlan())}${renderSettingIssues()}</section></div>`;
 }
 function setLoadPanel(type,open) {
   state.loadPanels ||= {};state.loadPanels[type]=open;
@@ -1227,7 +1311,7 @@ function selectLoadShapes(selected) {
 }
 function syncConcurrentDisplay(config) {
   if(!config.concurrent_load)return;
-  const settings=config.concurrent_load,live=concurrentDisplay(settings);
+  const settings=concurrentSettings(config),live=concurrentDisplay(settings);
   for(const [id,text] of Object.entries({'load-share-total':live.total,'load-output-coverage':live.coverage,'load-interference-allocation':live.allocation,'load-combination-count':live.count,'load-test-point-example':live.example})){
     const node=$(`#${id}`);if(node&&node.textContent!==text)node.textContent=text;
   }
@@ -1249,7 +1333,7 @@ function concurrentPlanRows(settings) {
 }
 function renderConcurrentPlan(config,plan=null) {
   if(!config?.checks?.includes('concurrency'))return '';
-  const settings=config.concurrent_load || concurrentFormDefaults(),levels=settings.schedule.levels;
+  const settings=concurrentSettings(config),levels=settings.schedule.levels;
   if(!validConcurrentLevels(levels)||!Number.isFinite(settings.schedule.duration_seconds))return '<div class="configured-load-plan"><h4>Configured load time</h4><p>Enter valid concurrency levels and a duration per workload.</p></div>';
   const rows=plan?.concurrent_load || concurrentPlanRows(settings);
   const total=plan?.configured_load_seconds ?? Object.values(rows).reduce((sum,row)=>sum+row.configured_load_seconds,0),points=Object.values(rows).reduce((sum,row)=>sum+row.test_points,0);
@@ -1306,15 +1390,16 @@ function renderSessionResults(performance) {
 }
 
 function renderSessionEditor(config) {
-  const defaults=state.bootstrap.session_workloads,settings=config.sessions || defaults.defaults;
+  const defaults=state.bootstrap.session_workloads,settings={...defaults.defaults,...profileDefaults('sessions',config),...config.sessions};
   const mixed=settings.profile==='performance',saved=settings.workloads || [];
   const workloads=[...saved,...defaults.presets.filter(item=>!saved.some(row=>row.name===item.name))];
   return `<div data-session-settings><label>Conversation test<select name="sessions_profile"><option value="correctness" ${mixed?'':'selected'}>Exact-repeat correctness</option><option value="performance" ${mixed?'selected':''}>Mixed workload performance</option></select></label>
-  <p class="hint">Mixed performance runs use actual replies as conversation history. Concurrent users share Maximum at once with other target requests. Answer quality is not scored.</p>
-  <div data-session-mix ${mixed?'':'hidden'}><div class="fields">${field('sessions_count','Total conversations',mixed?settings.sessions:Math.max(6,settings.sessions),{type:'number',min:1,max:32,step:1})}${field('sessions_delay','Pause between turns (seconds)',settings.delay_seconds,{type:'number',min:0,max:60,step:'any'})}${field('sessions_max_tokens','Output cap per turn',mixed?settings.max_tokens:Math.min(128,config.max_output_tokens),{type:'number',min:1,max:config.max_output_tokens,step:1})}</div>
+  <p class="hint">Mixed performance runs use actual replies as conversation history. Concurrent users share Limit simultaneous requests with other target requests. Answer quality is not scored.</p>
+  <div data-profile-settings="sessions" class="fields">${schemaField('profile_sessions_concurrency',settings.concurrency,state.bootstrap.config_schema.$defs.Sessions.properties.concurrency,{label:'Concurrent conversations',hint:'An accepted value is not demonstrated delivery capacity.'})}${schemaField('profile_sessions_max_tokens',settings.max_tokens,state.bootstrap.config_schema.$defs.Sessions.properties.max_tokens,{label:'Output cap per turn',hint:'Own answer cap for every turn. The suite default is not a ceiling.'})}</div>
+  <div data-session-mix ${mixed?'':'hidden'}><div class="fields">${field('sessions_count','Total conversations',mixed?settings.sessions:Math.max(6,settings.sessions),{type:'number',step:1})}${field('sessions_delay','Pause between turns (seconds)',settings.delay_seconds,{type:'number',step:'any'})}</div>
   <p class="hint">Weights divide the total conversation budget among selected tasks. Each conversation keeps its task and history. Output caps limit length; actual input/output tokens are reported.</p>
-  <input type="hidden" name="session_workload_count" value="${workloads.length}">${workloads.map((item,i)=>`<details class="setup-disclosure"><summary>${escape(human(item.name))} · ${item.turns.length} turns</summary><label class="test-selection"><input type="checkbox" name="session_enabled_${i}" ${(saved.length?saved.some(row=>row.name===item.name):true)?'checked':''}><span>Include this task</span></label><div class="fields">${field(`session_name_${i}`,'Task name',item.name,{required:true})}${field(`session_weight_${i}`,'Conversation weight',item.weight,{type:'number',min:.001,max:10000,step:'any',required:true})}${field(`session_cap_${i}`,'Task output cap (optional)',item.max_tokens,{type:'number',min:1,max:config.max_output_tokens,step:1,placeholder:'Use conversation output cap'})}</div><input type="hidden" name="session_turn_count_${i}" value="${item.turns.length}">${item.turns.map((turn,j)=>`<label>Turn ${j+1}<textarea name="session_turn_${i}_${j}" rows="3" maxlength="8192" required>${escape(turn)}</textarea></label>`).join('')}<button type="button" class="text-button" data-action="add-session-turn" data-session-index="${i}">Add turn</button>${item.turns.length>2?`<button type="button" class="text-button" data-action="remove-session-turn" data-session-index="${i}">Remove last turn</button>`:''}</details>`).join('')}
-  <button type="button" class="text-button" data-action="add-session-workload" ${workloads.length>=16?'disabled':''}>Add custom task</button></div>
+  <input type="hidden" name="session_workload_count" value="${workloads.length}">${workloads.map((item,i)=>`<details class="setup-disclosure"><summary>${escape(human(item.name))} · ${item.turns.length} turns</summary><label class="test-selection"><input type="checkbox" name="session_enabled_${i}" ${(saved.length?saved.some(row=>row.name===item.name):true)?'checked':''}><span>Include this task</span></label><div class="fields">${field(`session_name_${i}`,'Task name',item.name,{required:true})}${field(`session_weight_${i}`,'Conversation weight',item.weight,{type:'number',step:'any',required:true})}${field(`session_cap_${i}`,'Task output cap (optional)',item.max_tokens,{type:'number',step:1,placeholder:'Use conversation output cap'})}</div><input type="hidden" name="session_turn_count_${i}" value="${item.turns.length}">${item.turns.map((turn,j)=>renderField(`session_turn_${i}_${j}`,`Turn ${j+1}`,`<textarea id="field-session_turn_${i}_${j}" name="session_turn_${i}_${j}" rows="3" maxlength="${state.bootstrap.limits['sessions.workloads[].turns']?.items?.maxLength||state.bootstrap.limits['sessions.turns']?.items?.maxLength}" required>${escape(turn)}</textarea>`)).join('')}<button type="button" class="text-button" data-action="add-session-turn" data-session-index="${i}">Add turn</button>${item.turns.length>state.bootstrap.limits['sessions.workloads[].turns'].minItems?`<button type="button" class="text-button" data-action="remove-session-turn" data-session-index="${i}">Remove last turn</button>`:''}</details>`).join('')}
+  <p class="hint">${escape(state.bootstrap.cap_explanations?.['sessions.workloads']?.help||'')} ${escape(state.bootstrap.cap_explanations?.['sessions.workloads[].turns']?.help||'')}</p><button type="button" class="text-button" data-action="add-session-workload" ${workloads.length>=state.bootstrap.limits['sessions.workloads'].maxItems?'disabled':''}>Add custom task</button></div>
   <p class="hint" data-session-legacy ${mixed?'hidden':''}>Uses the saved fixed/live exact-repeat conversations. Their prompts, modes and concurrency can be changed below.</p></div>`;
 }
 
@@ -1328,8 +1413,8 @@ function editSessionWorkload(action,index) {
     settings.workloads.push({name:`custom-${suffix}`,weight:1,max_tokens:null,turns:['Explain a topic relevant to your users in detail.','Build on your previous answer with a detailed example.']});
   }else{
     const item=settings.workloads.find(row=>row.name===name);if(!item)return;
-    if(action==='add-session-turn'&&item.turns.length<32)item.turns.push('Build on your previous answer and explain the next step in detail.');
-    if(action==='remove-session-turn'&&item.turns.length>2)item.turns.pop();
+    if(action==='add-session-turn'&&item.turns.length<state.bootstrap.limits['sessions.workloads[].turns'].maxItems)item.turns.push('Build on your previous answer and explain the next step in detail.');
+    if(action==='remove-session-turn'&&item.turns.length>state.bootstrap.limits['sessions.workloads[].turns'].minItems)item.turns.pop();
   }
   configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
   state.openTest='sessions';syncTestControls();
@@ -1337,9 +1422,9 @@ function editSessionWorkload(action,index) {
 
 function renderTrafficEditor(config) {
   const traffic=config.traffic || state.bootstrap.config.traffic,custom=!sameConfig(traffic,state.bootstrap.config.traffic),schema=state.bootstrap.traffic_schema;
-  const labels={rates:'Rates (requests/second)',duration_seconds:'Seconds per rate',arrival:'Arrival pattern',max_in_flight:'Capacity requests at once',seed:'Random seed',long_input_chars:'Long question (characters)',long_output_words:'Long answer (words)',drain_timeout_seconds:'Completion wait (seconds)',scheduler_lag_tolerance_ms:'Start delay (ms)'};
-  const primary=new Set(['rates','duration_seconds','max_in_flight']);
-  const control=([name,fieldSchema])=>schemaField(`traffic_${name}`,traffic[name],fieldSchema,{label:labels[name] || human(name),hint:name==='max_in_flight'?runLimitHint('traffic_max_in_flight',config):undefined});
+  const labels={rates:'Rates (requests/second)',duration_seconds:'Seconds per rate',arrival:'Arrival pattern',max_in_flight:'Capacity in-flight limit',expected_response_seconds:'Expected response time (seconds, estimate only)',seed:'Random seed',long_input_chars:'Long question (characters)',long_output_words:'Long answer (words)',drain_timeout_seconds:'Completion wait (seconds)',scheduler_lag_tolerance_ms:'Start delay (ms)'};
+  const primary=new Set(['rates','duration_seconds','max_in_flight','expected_response_seconds']);
+  const control=([name,fieldSchema])=>schemaField(`traffic_${name}`,name==='max_in_flight'?(traffic[name]??effectiveParallelism(config)):traffic[name],fieldSchema,{label:labels[name] || human(name),hint:name==='max_in_flight'?runLimitHint('traffic_max_in_flight',config):name==='expected_response_seconds'?'Optional estimate: sending rate × your expected response time estimates unfinished requests. Extra arrivals are dropped locally.':undefined,placeholder:name==='expected_response_seconds'?'No estimate':'Use default'});
   const entries=Object.entries(schema.properties).filter(([name])=>name!=='mix'),mix=schema.$defs.TrafficMix;
   return `<div class="traffic-editor"><input type="hidden" name="traffic_mode" value="${custom?'custom':'default'}"><div class="test-editor-heading"><h3>Traffic to send</h3><button class="text-button reset-test" type="button" data-action="reset-traffic">Restore traffic defaults</button></div><p class="hint">Each rate is a separate stage. If all request slots are busy, extra arrivals count as dropped.</p><div data-traffic-settings><fieldset class="fields">${entries.filter(([name])=>primary.has(name)).map(control).join('')}</fieldset><details class="check-advanced"><summary>Arrival pattern, request mix & timing</summary><fieldset class="fields">${entries.filter(([name])=>!primary.has(name)).map(control).join('')}<div class="full traffic-mix-heading"><h4>Request mix</h4><p class="hint">Higher weights mean a larger share of traffic. For example, weights 3, 1 and 1 send about 60% short requests, 20% long questions and 20% long answers.</p></div>${Object.entries(mix.properties).map(([name,s])=>schemaField(`traffic_mix_${name}`,traffic.mix[name],s,{label:({short:'Short requests',long_input:'Long questions',long_output:'Long answers'})[name]})).join('')}</fieldset></details></div></div>`;
 }
@@ -1408,8 +1493,8 @@ function toggleTestEditor(id,close=false) {
 }
 function editTestField(input) {
   const form=$('#new-run-form'),settings=input.closest('[data-test-settings]');
-  if(settings&&settings.dataset.testSettings!=='concurrency'){input.dataset.inherited='false';form.elements[`test_mode_${settings.dataset.testSettings}`].value='custom';}
-  if(input.closest('[data-traffic-settings]'))form.elements.traffic_mode.value='custom';
+  if(settings){input.dataset.inherited='false';form.elements[`test_mode_${settings.dataset.testSettings}`].value='custom';}
+  if(input.closest('[data-traffic-settings]')){form.elements.traffic_mode.value='custom';if(input.name==='traffic_max_in_flight')input.dataset.inherited='false';}
   syncTestControls();
 }
 function savedProfileInput(input,form) {
@@ -1422,7 +1507,7 @@ function validateProfileDrafts(form,id=null) {
   for(const input of form.querySelectorAll('input, select, textarea')){
     const profile=input.closest('[data-profile-settings]');if(!profile||id&&profile.dataset.profileSettings!==id||!savedProfileInput(input,form))continue;
     if(['profile_consistency_logprobs','profile_tools_fixtures','profile_tools_conversations'].includes(input.name)){
-      let message='';try{(input.name==='profile_consistency_logprobs'?parseLogprobSettings:parseToolFixtures)(input.value);}catch(error){message=error.message;}
+      let message='';try{(input.name==='profile_consistency_logprobs'?parseLogprobSettings:parseToolFixtures)(input.value,state.bootstrap.limits);}catch(error){message=error.message;}
       input.setCustomValidity?.(message);
     }
     const fieldset=input.closest('fieldset'),disabled=input.disabled,fieldsetDisabled=fieldset?.disabled;
@@ -1439,10 +1524,9 @@ function validateProfileDrafts(form,id=null) {
 function refreshDefaultProfileFields(config) {
   const form=$('#new-run-form');if(!form)return;
   for(const key of ['arrivals','prefix','sessions','consistency']){
-    if(state.config[key])continue;
     const edits=new Set(JSON.parse(form.elements[`profile_edits_${key}`]?.value || '[]'));
     for(const [name,value] of Object.entries(profileDefaults(key,config))){
-      const input=form.elements[`profile_${key}_${name}`];if(!input||edits.has(name))continue;
+      const input=form.elements[`profile_${key}_${name}`];if(!input||edits.has(name)||state.config[key]?.[name]!=null)continue;
       if(key==='consistency'&&name==='logprobs'){input.value=JSON.stringify(value ?? null);continue;}
       input.value=Array.isArray(value)?value.join(['turns','saved_answers'].includes(name)?'\n':['modes','shapes'].includes(name)?',':', '):value ?? '';
     }
@@ -1454,7 +1538,7 @@ function validateRunForm(form,step=null) {
   // Inspect selected drafts here, revealing the field before asking the browser to focus it.
   for(const input of form.querySelectorAll('input, select, textarea')){
     if(step&&Number(input.closest('[data-setup-panel]')?.dataset.setupPanel)!==step)continue;
-    if(packSettingInactive(input.name))continue;
+    if(packSettingInactive(input.name)||input.disabled&&input.closest('[data-run-limit]'))continue;
     if(input.closest('[data-session-settings]')&&input.name!=='sessions_profile'){
       if(form.elements.sessions_profile.value!=='performance')continue;
       const match=input.name.match(/^session_(?:name|weight|cap|turn)_([0-9]+)_?/);
@@ -1464,7 +1548,7 @@ function validateRunForm(form,step=null) {
     if(card){
       const id=card.dataset.testCard;
       if(!$('input[name="check"]',card).checked)continue;
-      if(input.closest('[data-test-settings]')&&!input.closest('[data-concurrent-settings]')&&!input.closest('[data-profile-settings]')&&form.elements[`test_mode_${id}`].value!=='custom')continue;
+      if(input.closest('[data-test-settings]')&&!input.closest('[data-concurrent-settings]')&&!input.closest('[data-profile-settings]')&&form.elements[`test_mode_${id}`]?.value!=='custom')continue;
       if(input.closest('[data-traffic-settings]')&&form.elements.traffic_mode.value!=='custom')continue;
     }
     if(['url','model','name'].includes(input.name))input.setCustomValidity?.(String(input.value || '').trim()?'':`Enter ${input.name==='url'?'an endpoint URL':input.name==='model'?'a model name, or use Test connection to detect it':'a target name'}.`);
@@ -1486,12 +1570,12 @@ function refreshInheritedFields(id,onlyInherited=false) {
   const check=state.bootstrap.checks.find(item=>item.id===id),form=$('#new-run-form');
   const config=clone(state.config);for(const [name] of numericFields)if(form.elements[name])config[name]=form.elements[name].value===''?null:Number(form.elements[name].value);if(form.elements.samples)config.samples=Number(form.elements.samples.value);
   config.limits={...config.limits};for(const name of check.limit_fields){const input=form.elements[`limit_${name}`];if(input)config.limits[name]=input.value===''?null:Number(input.value)/(['max_error_rate','min_correctness'].includes(name)?100:1);}
-  for(const name of check.option_fields){const input=form.elements[`test_${id}_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=optionDefault(config,check,name) ?? '';input.dataset.inherited='true';}}
-  for(const name of check.limit_fields){const input=form.elements[`test_${id}_limit_${name}`];if(!onlyInherited||input.dataset.inherited==='true'){input.value=config.limits[name]==null?'':config.limits[name]*(['max_error_rate','min_correctness'].includes(name)?100:1);input.dataset.inherited='true';}}
+  for(const name of check.option_fields){const input=form.elements[`test_${id}_${name}`];if(input&&(!onlyInherited||input.dataset.inherited==='true')){input.value=optionDefault(config,check,name) ?? '';input.dataset.inherited='true';}}
+  for(const name of check.limit_fields){const input=form.elements[`test_${id}_limit_${name}`];if(input&&(!onlyInherited||input.dataset.inherited==='true')){input.value=config.limits[name]==null?'':config.limits[name]*(['max_error_rate','min_correctness'].includes(name)?100:1);input.dataset.inherited='true';}}
 }
 const inputRetentionNotice='Questions and expected answers are saved with the run. Retention all / failures / none controls whether response text and evaluator reasons are kept. Request metadata (timings, status, scores) is always saved. Retention does not cap disk usage; storage limits do.';
 function configChanged() {
-  state.configRevision++;
+  state.jsonValidation=null;state.configRevision++;
   if(state.requestPreview)state.requestPreview.status='stale';
   renderRequestPreview();
 }
@@ -1507,16 +1591,16 @@ function syncPackControls() {
 }
 function renderJudging(config) {
   if(config.request_source!=='request_pack'||!config.request_pack?.cases.some(item=>item.scorer==='judge'))return '';
-  const settings={judges:[],concurrency:2,request_timeout_seconds:30,max_duration_seconds:300,max_output_tokens:256,...config.judging};
-  return `<div class="judging-editor"><div class="test-editor-heading"><h3>AI evaluator</h3><button type="button" class="text-button" data-action="add-judge" ${settings.judges.length>=8?'disabled':''}>Add evaluator</button></div><p class="hint">An AI model compares each answer with your expected answer and accepts correct paraphrases.</p><input type="hidden" name="judge_count" value="${settings.judges.length}">${settings.judges.map((judge,index)=>`<fieldset class="judge-row"><legend>Evaluator ${index+1}</legend><div class="fields">${field(`judge_${index}_model`,'Model',judge.model)}${field(`judge_${index}_url`,'Endpoint URL',judge.url,{type:'url',full:true,placeholder:'http://localhost:9000/v1'})}</div><details class="evaluator-options"><summary>Credentials & evaluator name</summary><div class="fields">${field(`judge_${index}_name`,'Name',judge.name)}${field(`judge_${index}_api_key_env`,'API key environment variable (optional)',judge.api_key_env,{full:true,placeholder:'JUDGE_API_KEY'})}</div></details><button type="button" class="text-button" data-action="remove-judge" data-judge-index="${index}" aria-label="Remove evaluator ${index+1}">Remove</button></fieldset>`).join('')}<details class="judge-limits"><summary>Evaluation limits</summary><div class="fields">${field('judging_concurrency','Evaluator concurrency',settings.concurrency,{type:'number',min:1,max:256,step:1})}${field('judging_request_timeout_seconds','Evaluator timeout (seconds)',settings.request_timeout_seconds,{type:'number',min:0,step:'any'})}${field('judging_max_duration_seconds','Evaluation duration (seconds)',settings.max_duration_seconds,{type:'number',min:0,step:'any'})}${field('judging_max_output_tokens','Evaluator cap (tokens)',settings.max_output_tokens,{type:'number',min:1,step:1})}</div><p class="hint">More connection and authentication settings are available in JSON.</p></details><p class="hint judge-disclosure">Questions, expected answers and model answers are sent to your configured evaluators. With several evaluators, more than half must agree. A tie or missing vote leaves the result inconclusive.</p></div>`;
+  const settings={...state.bootstrap.judging.defaults,...config.judging};
+  return `<div class="judging-editor"><div class="test-editor-heading"><h3>AI evaluator</h3><button type="button" class="text-button" data-action="add-judge" ${settings.judges.length>=state.bootstrap.limits['judging.judges'].maxItems?'disabled':''}>Add evaluator</button></div><p class="hint">An AI model compares each answer with your expected answer and accepts correct paraphrases.</p><input type="hidden" name="judge_count" value="${settings.judges.length}">${settings.judges.map((judge,index)=>`<fieldset class="judge-row"><legend>Evaluator ${index+1}</legend><div class="fields">${field(`judge_${index}_model`,'Model',judge.model)}${field(`judge_${index}_url`,'Endpoint URL',judge.url,{type:'url',full:true,placeholder:'http://localhost:9000/v1'})}</div><details class="evaluator-options"><summary>Credentials & evaluator name</summary><div class="fields">${field(`judge_${index}_name`,'Name',judge.name)}${field(`judge_${index}_api_key_env`,'API key environment variable (optional)',judge.api_key_env,{full:true,placeholder:'JUDGE_API_KEY'})}</div></details><button type="button" class="text-button" data-action="remove-judge" data-judge-index="${index}" aria-label="Remove evaluator ${index+1}">Remove</button></fieldset>`).join('')}<details class="judge-limits"><summary>Evaluation limits</summary><div class="fields">${field('judging_concurrency','Evaluator concurrency',settings.concurrency,{type:'number',step:1})}${field('judging_request_timeout_seconds','Evaluator timeout (seconds)',settings.request_timeout_seconds,{type:'number',step:'any'})}${field('judging_max_duration_seconds','Evaluation duration (seconds)',settings.max_duration_seconds,{type:'number',step:'any'})}${field('judging_max_output_tokens','Evaluator cap (tokens)',settings.max_output_tokens,{type:'number',step:1})}</div><p class="hint">More connection and authentication settings are available in JSON.</p></details><p class="hint judge-disclosure">Questions, expected answers and model answers are sent to your configured evaluators. With several evaluators, more than half must agree. A tie or missing vote leaves the result inconclusive.</p></div>`;
 }
 function changeJudge(action,index) {
   try {
     assertAppliedConfig();captureFormDraft();
-    state.config.judging ||= {judges:[],concurrency:2,request_timeout_seconds:30,max_duration_seconds:300,max_output_tokens:256,ca_bundle:null,proxy:null};
+    state.config.judging ||= clone(state.bootstrap.judging.defaults);
     const judges=state.config.judging.judges;
     if(action==='add'){
-      if(judges.length>=8)return;
+      if(judges.length>=state.bootstrap.limits['judging.judges'].maxItems)return;
       let suffix=1;while(judges.some(judge=>judge.name===`judge-${suffix}`))suffix++;
       judges.push({name:`judge-${suffix}`,url:'',model:'',api_key_env:null,headers_env:{}});
     } else if(Number.isInteger(index)&&index>=0&&index<judges.length)judges.splice(index,1);
@@ -1581,7 +1665,7 @@ function openExampleEditor(index=null) {
     let suffix=1;while(datasetCases().some(item=>item.fixture_id===`example-${suffix}`))suffix++;
     const item=clone(previous || {fixture_id:`example-${suffix}`,messages:[{role:'user',content:''}],scorer:'judge',expected:'',weight:1,options:{},max_tokens:null});
     state.datasetEditor={index,item,expectedFormat:item.scorer==='json'?'json':'text',scorer:item.scorer,revision:state.configRevision,route:state.routeVersion};
-    datasetDialog(previous?'Edit question':'Add question',`<form id="dataset-example-form"><div class="dialog-body"><div id="example-messages">${renderExampleMessages(item.messages)}</div><button type="button" class="text-button" data-action="add-message">Add conversation message</button><div class="example-check">${selectField('example_scorer','Answer check',Object.entries(answerChecks).map(([key,label])=>`<option value="${key}" ${item.scorer===key?'selected':''}>${label}</option>`).join(''))}</div>${textField('example_expected','Expected answer',Object.hasOwn(item,'expected')?(item.scorer==='json'?JSON.stringify(item.expected,null,2):item.expected):'',{wrapperId:'example-expected-label',hintId:'example-expected-hint',hint:'The answer you want the model to give.'})}${textField('example_schema','JSON schema',JSON.stringify(item.schema || {},null,2),{wrapperId:'example-schema-label'})}<details class="example-advanced"><summary>Advanced question settings</summary>${textField('example_rubric','Evaluator instructions (optional)',item.rubric,{rows:2,wrapperId:'example-rubric-label'})}<div class="fields">${field('example_id','Question ID',item.fixture_id,{full:true})}${field('example_weight','Traffic weight',item.weight,{type:'number',min:0,step:'any'})}${field('example_max_tokens','Output cap (optional)',item.max_tokens,{type:'number',min:1,step:1})}</div>${textField('example_options','Extra request options · JSON',JSON.stringify(item.options || {},null,2))}</details><div id="dataset-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary">Save question</button></div></form>`);
+    datasetDialog(previous?'Edit question':'Add question',`<form id="dataset-example-form"><div class="dialog-body"><div id="example-messages">${renderExampleMessages(item.messages)}</div><button type="button" class="text-button" data-action="add-message">Add conversation message</button><div class="example-check">${selectField('example_scorer','Answer check',Object.entries(answerChecks).map(([key,label])=>`<option value="${key}" ${item.scorer===key?'selected':''}>${label}</option>`).join(''))}</div>${textField('example_expected','Expected answer',Object.hasOwn(item,'expected')?(item.scorer==='json'?JSON.stringify(item.expected,null,2):item.expected):'',{wrapperId:'example-expected-label',hintId:'example-expected-hint',hint:'The answer you want the model to give.'})}${textField('example_schema','JSON schema',JSON.stringify(item.schema || {},null,2),{wrapperId:'example-schema-label'})}<details class="example-advanced"><summary>Advanced question settings</summary>${textField('example_rubric','Evaluator instructions (optional)',item.rubric,{rows:2,wrapperId:'example-rubric-label'})}<div class="fields">${field('example_id','Question ID',item.fixture_id,{full:true})}${field('example_weight','Traffic weight',item.weight,{type:'number',step:'any'})}${field('example_max_tokens','Output cap (optional)',item.max_tokens,{type:'number',step:1})}</div>${textField('example_options','Extra request options · JSON',JSON.stringify(item.options || {},null,2))}</details><div id="dataset-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary">Save question</button></div></form>`);
     syncExampleScorer();$('#dataset-example-form').elements.message_0_content.focus();
   }catch(error){configError(error);}
 }
@@ -1639,7 +1723,7 @@ async function importRequestPack(file) {
   if(!file||state.configBusy)return;
   const version=state.routeVersion,revision=state.configRevision,sequence=++state.datasetImportSequence;
   try{
-    datasetEditingAllowed();if(file.size>1024*1024)throw new Error('Dataset exceeds 1 MiB.');
+    datasetEditingAllowed();if(file.size>state.bootstrap.limits['request_pack.bytes'].maximum)throw new Error(`Dataset exceeds ${diskSize(state.bootstrap.limits['request_pack.bytes'].maximum)}.`);
     const text=await file.text();if(version!==state.routeVersion||revision!==state.configRevision||sequence!==state.datasetImportSequence)return;
     state.datasetImport={name:file.name || 'dataset.json',text,format:/\.csv$/i.test(file.name || '')?'csv':'json',route:version,revision,sequence:0,preview:null,mapping:null,mappingDirty:false};
     await previewDatasetMapping({initial:true});
@@ -1680,7 +1764,7 @@ function currentRequestPlan() {
   return !hasJsonChanges()&&saved?.status==='current'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?saved.plan:null;
 }
 function canStartRun() {
-  return Boolean(currentRequestPlan())&&!currentSettingErrors().length&&!state.submitting&&!state.configBusy&&!state.active&&state.modelDiscovery?.status!=='pending';
+  return Boolean(currentRequestPlan())&&!currentSettingErrors().length&&!currentResourceErrors().length&&!state.submitting&&!state.configBusy&&!state.active&&state.modelDiscovery?.status!=='pending';
 }
 function renderReviewPassCriteria(config) {
   if(!config?.limits||!state.bootstrap?.checks)return '';
@@ -1709,8 +1793,8 @@ function renderReviewPassCriteria(config) {
 }
 function renderReviewLoad(config) {
   if(!config?.checks.includes('capacity')||!config.traffic)return '';
-  const traffic=config.traffic,concurrency=Math.min(traffic.max_in_flight ?? config.concurrency,config.concurrency);
-  return `<p class="hint review-load">Capacity target rates: ${escape(traffic.rates.join(' → '))} requests/s · ${escape(traffic.duration_seconds)}s per rate · up to ${number(concurrency)} at once${traffic.arrival==='poisson'?' · random arrivals':''}.</p>`;
+  const traffic=config.traffic,concurrency=traffic.max_in_flight ?? effectiveParallelism(config);
+  return `<p class="hint review-load">Capacity target rates: ${escape(traffic.rates.join(' → '))} requests/s · ${escape(traffic.duration_seconds)}s per rate · up to ${number(concurrency)} at once${traffic.arrival==='poisson'?' · exact count; seeded random timing':''}.</p>`;
 }
 function renderRequestPlan(config=null) {
   const element=$('#request-plan');if(!element)return;
@@ -1719,22 +1803,23 @@ function renderRequestPlan(config=null) {
   config ||= (plan?saved.config:null) || state.config;
   syncRunBlueprint(config,plan);
   const start=$('#start-run');if(start)start.disabled=!canStartRun();
-  const checkPlan=$('#checks-plan-summary');if(checkPlan){const text=plan?`${setupPlanCount(plan)}${plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';if(checkPlan.textContent!==text)checkPlan.textContent=text;checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.required_request_limit>plan.request_limit));}
+  const checkPlan=$('#checks-plan-summary');if(checkPlan){const text=plan?`${setupPlanCount(plan)}${plan.request_limit!=null&&plan.required_request_limit>plan.request_limit?' · budget is too small for full coverage':''}`:saved?.status==='error'?`Request estimate unavailable: ${saved.error}`:'Updating request estimate…';if(checkPlan.textContent!==text)checkPlan.textContent=text;checkPlan.classList.toggle('budget-warning',Boolean(plan&&plan.request_limit!=null&&plan.required_request_limit>plan.request_limit));}
   const issues=currentSettingErrors().length,planStatus=issues?`${number(issues)} ${issues===1?'setting':'settings'} to fix`:plan?setupPlanCount(plan):saved?.status==='error'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?'Plan unavailable':'Planning…';
-  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;const baselineName=(state.baselines || []).find(item=>item.id===$('#new-run-form')?.elements?.baseline_id?.value)?.name;dock.innerHTML=state.setupStep===3?`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> stops at ${number(config.max_requests)} requests or ${escape(elapsed(config.max_duration_seconds))}${baselineName?` <span>·</span> compared with <strong>${escape(baselineName)}</strong>`:''}`:`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${escape(planStatus)}`;}
+  const dock=$('#dock-summary');if(dock&&config){const selected=config.checks?.length || 0;const baselineName=(state.baselines || []).find(item=>item.id===$('#new-run-form')?.elements?.baseline_id?.value)?.name;dock.innerHTML=state.setupStep===3?`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${escape(sharedLimitsSummary(config))}${baselineName?` <span>·</span> compared with <strong>${escape(baselineName)}</strong>`:''}`:`<strong>${number(selected)}</strong> ${selected===1?'check':'checks'} <span>·</span> ${escape(planStatus)}`;}
   const heading='<div class="review-section-heading"><h3>Traffic</h3><button type="button" class="text-button" data-action="edit-run-limits">Edit limits</button></div>';
-  const limits=config?`<dl class="review-limits"><div><dt>Request limit</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div><div><dt>Memory limit (RAM growth during this run)</dt><dd>${config.max_memory_mb===0?'Off':`${number(config.max_memory_mb ?? 4096)} MiB`}</dd></div></dl>`:'';
+  const limits=config?renderPlanBounds(config,'review-limits'):'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
     element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderConcurrentPlan(config)}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
   }
   const count=setupPlanCount(plan);
   const evaluator=plan.evaluator || {},needed=plan.required_request_limit;
-  const raise=Number.isInteger(needed)&&needed>plan.request_limit;
+  const raise=plan.request_limit!=null&&Number.isInteger(needed)&&needed>plan.request_limit;
   const evaluatorScope='AI judge calls run separately from the target request budget and send cases and generated answers to each judge.';
-  const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>!evaluator.active||warning!==evaluatorScope);
-  const filled=Math.min(100,(plan.planned_total ?? plan.known_total ?? 0)/Math.max(1,plan.request_limit)*100);
-  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p><div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>${limits}${renderReviewLoad(config)}${renderConcurrentPlan(config,plan)}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${raise?`<div class="notice warning">The request budget is too small to complete the planned checks.</div><div class="actions"><button type="button" class="button small" data-action="use-request-budget" data-budget="${needed}" data-revision="${state.configRevision}" data-route="${state.routeVersion}">Use ${number(needed)} total requests</button><button type="button" class="text-button" data-action="edit-load">Reduce load or checks</button></div>`:''}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${renderFlightPlan(plan)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?(row.kind==='duration'?'Duration-based · as many as complete':'Adaptive / bounded'):`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details></div>${renderReviewPassCriteria(config)}`;
+  const explained=new Set([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])].map(item=>item.msg));
+  const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>(!evaluator.active||warning!==evaluatorScope)&&!explained.has(warning));
+  const filled=plan.request_limit==null?0:Math.min(100,(plan.planned_total ?? plan.known_total ?? 0)/plan.request_limit*100);
+  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderReviewLoad(config)}${renderConcurrentPlan(config,plan)}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${renderFlightPlan(plan)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`:`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.requests_per_target==null?(row.kind==='duration'?`Duration-based${row.estimated_requests_per_target!=null?` · ~${number(row.estimated_requests_per_target)} (estimate, ${escape(row.estimate_source||'from your last run')})`:' · as many as complete'}`:'Adaptive / bounded'):`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details></div>${renderReviewPassCriteria(config)}`;
 }
 function scheduleRequestPlan() {
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
@@ -1770,6 +1855,8 @@ async function refreshRequestPreview(snapshot,{draft=false}={}) {
   if(payload.mode==='cold-start')config.restart_target=payload.restart_target;
   state.requestPreview={...state.requestPreview,status:'pending',revision,route:version};renderRequestPreview();
   try{
+    const localErrors=positiveBoundErrors(config,state.bootstrap.limits,state.bootstrap.cap_explanations);
+    if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});
     const result=await api(draft?'/api/config/draft':'/api/config/preview',{method:'POST',body:JSON.stringify(config)});
     if(version!==state.routeVersion||revision!==state.configRevision||sequence!==state.previewSequence)throw new Error('Configuration changed during preview. Refresh the current settings before running.');
     assertAppliedConfig();
@@ -1805,11 +1892,11 @@ function syncSetupIdentity() {
 function syncSetupStep({focus=false}={}) {
   if(!$('#setup-panel-1'))return;
   const step=state.setupStep;
-  const titles=['Point Giraffe at an endpoint.','Choose your checks.','Ready for launch.'];
+  const titles=['Point Giraffe at an endpoint.','Set limits and choose checks.','Ready for launch.'];
   const heading=$('#setup-title');if(heading)heading.textContent=titles[step-1];
   const lede=$('#setup-lede');if(lede)lede.textContent=['Paste your model server’s address. Giraffe sends one tiny request to check it.','Pick what to test. Each check sends a limited number of requests.','Nothing is sent until you press Launch. You can stop at any time.'][step-1];
   syncSetupIdentity();
-  const blueprint=$('#run-blueprint');if(blueprint)blueprint.hidden=step!==2||state.configView==='json';
+  const blueprint=$('#run-blueprint');if(blueprint)blueprint.hidden=step!==2&&state.configView!=='json';
   for(const panel of $$('[data-setup-panel]'))panel.hidden=Number(panel.dataset.setupPanel)!==step;
   for(const button of $$('.setup-stepper [data-setup-step]')){
     const index=Number(button.dataset.setupStep);
@@ -1825,8 +1912,8 @@ function syncSetupStep({focus=false}={}) {
   const navigationHint=$('#setup-navigation-hint');navigationHint.textContent=step===3?'Press ⌘↵ to launch. You can stop at any time.':'';navigationHint.hidden=step!==3;
   const tools=$('.configuration-tools');if(tools)tools.hidden=step!==3&&!json;
   const runSummary=$('#run-bar-summary');if(runSummary)runSummary.hidden=true;
-  $('.new-run-layout')?.classList.toggle('connecting',step===1||json);
-  $('.new-run-layout')?.classList.toggle('configuring',step===2&&!json);
+  $('.new-run-layout')?.classList.toggle('connecting',step===1&&!json);
+  $('.new-run-layout')?.classList.toggle('configuring',step===2||json);
   if(focus){const target=step===3?$('#setup-title'):step===2?$('#test-selection h2'):$(`[data-setup-panel="${step}"] h2`);if(step!==2)target?.setAttribute('tabindex','-1');target?.focus({preventScroll:true});window.scrollTo?.({top:0,left:0,behavior:'instant'});}
 }
 function revealSetupStep(step,{focus=false}={}) {
@@ -1979,28 +2066,49 @@ async function testConnection() {
     state.modelDiscovery={key,route,status:'error',models:[],message:error.message};renderModelDiscovery();
   }
 }
+function renderPlanBounds(config,className='workload-bounds') {
+  return `<dl class="${className}"><div><dt>Stop after this many requests</dt><dd>${config.max_requests==null?'Not set':number(config.max_requests)}</dd></div><div><dt>Stop test traffic after</dt><dd>${config.max_duration_seconds==null?'Not set':elapsed(config.max_duration_seconds)}</dd></div><div><dt>Limit simultaneous requests</dt><dd>${config.concurrency==null?'Not set':number(config.concurrency)}</dd></div><div><dt>Memory guardrail</dt><dd>${config.max_memory_mb===0?'Off':`${number(config.max_memory_mb)} MiB`}</dd></div></dl>`;
+}
+function planRowCount(row) {
+  return row.requests_per_target==null?(row.kind==='duration'?`Duration-based${row.estimated_requests_per_target!=null?` · ~${number(row.estimated_requests_per_target)} (estimate, ${escape(row.estimate_source||'from your last run')})`:''}`:'Adaptive'):`${row.kind==='estimate'?'~ ':''}${number(row.requests_per_target)}`;
+}
+function planRowDescriptor(row,config) {
+  if(row.id==='arrivals'&&config.arrivals?.mode==='burst')return `in ${number(Math.ceil(config.arrivals.requests/config.arrivals.burst_size))} bursts`;
+  if(row.id==='capacity'&&config.traffic?.arrival==='poisson')return 'exact count; seeded random timing';
+  return '';
+}
 function renderRunBlueprint(config,plan=null) {
   const traffic=(plan?.rows || []).filter(row=>row.requests_per_target!==0);
-  const waiting=state.requestPreview?.status==='error'?'Resolve the settings below to calculate traffic.':hasJsonChanges()?'Apply JSON changes to update this plan.':'Calculating traffic…';
-  return `<header class="blueprint-heading"><h2>Run plan</h2></header>
-  <p class="blueprint-intro">${escape(plan?setupPlanCount(plan):waiting)}</p>
-  <dl class="workload-bounds"><div><dt>Request ceiling</dt><dd>${number(config.max_requests)}</dd></div><div><dt>Traffic time limit</dt><dd>${elapsed(config.max_duration_seconds)}</dd></div><div><dt>Maximum at once</dt><dd>${number(config.concurrency)}</dd></div><div><dt>Memory limit (RAM growth during this run)</dt><dd>${config.max_memory_mb===0?'Off':`${number(config.max_memory_mb ?? 4096)} MiB`}</dd></div></dl>
-  <p class="hint workload-help">Upper limits for the whole run, not predictions.</p><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits">Edit limits</button>
-  ${traffic.length?`<details class="workload-breakdown"><summary>Request breakdown</summary><div>${traffic.map(row=>`<details data-plan-row="${escape(row.id)}"><summary><strong>${row.requests_per_target==null?(row.kind==='duration'?'Duration-based':'Adaptive'):`${row.kind==='estimate'?'~ ':''}${number(row.requests_per_target)}`}</strong> ${escape(row.title)}</summary><p>${escape(row.summary)}</p><small>${escape(row.source)} · ${row.requests_per_target==null?'bounded by your limits':'per endpoint, before run limits'}</small></details>`).join('')}</div></details>`:''}
-  ${renderConcurrentPlan(config,plan)}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}${plan&&plan.required_request_limit>plan.request_limit?'<p class="blueprint-note">The request limit is below the planned workload; some checks may remain incomplete.</p>':''}`;
+  const waiting=currentSettingErrors().length||state.requestPreview?.status==='error'?'Resolve the settings below to calculate traffic.':hasJsonChanges()?'Apply JSON changes to update this plan.':'Calculating traffic…';
+  const split=config.max_requests!=null&&config.targets.length>1?`<p class="hint">Request budget split per endpoint: ${Object.entries(plan?.target_quotas||{}).map(([name,quota])=>`${escape(name)}: ${number(quota)}`).join(' · ')||'calculated in the current plan'}.</p>`:'';
+  const status=currentSettingErrors().length||plan?.errors?.length||(plan?.resource_issues||[]).some(issue=>issue.blocking)?'error':plan?'valid':state.requestPreview?.status==='error'?'error':'pending';
+  return `<header class="blueprint-heading"><h2>Run plan</h2></header><p class="blueprint-intro" data-plan-state="${status}" role="status" aria-live="polite">${escape(plan?setupPlanCount(plan):waiting)}</p>${hasJsonChanges()?'':renderPlanBounds(config)+split}
+  <p class="hint workload-help">Optional limits you set. Tests also stop at their own durations, request counts and per-request timeouts.</p><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits" ${hasJsonChanges()?'disabled':''}>Edit limits</button>
+  ${traffic.length?`<details class="workload-breakdown"><summary>Request breakdown</summary><div>${traffic.map(row=>`<details data-plan-row="${escape(row.id)}"><summary><strong>${planRowCount(row)}</strong> ${escape(row.title)}</summary><p>${escape(row.summary)}${planRowDescriptor(row,config)?` · ${escape(planRowDescriptor(row,config))}`:''}</p><small>${escape(row.source)} · ${row.requests_per_target==null?(config.max_requests==null&&config.max_duration_seconds==null?'bounded by this test’s own settings':'bounded by your limits'):'per endpoint'}</small></details>`).join('')}</div></details>`:''}
+  ${renderConcurrentPlan(config,plan)}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
 }
 function syncRunBlueprint(config,plan=null) {
   const element=$('#run-blueprint');if(!element)return;
-  const open=[...element.querySelectorAll('details[open]')].map(item=>item.dataset.planRow?['planRow',item.dataset.planRow]:['planCheck',item.dataset.planCheck]);
-  const focused=document.activeElement?.closest?.('[data-plan-row], [data-plan-check]');
-  const focusKey=focused?(focused.dataset.planRow?['planRow',focused.dataset.planRow]:['planCheck',focused.dataset.planCheck]):null;
+  const expansion=state.blueprintExpansion ||= {outer:false,rows:[],checks:[],assumptions:false};
+  const previousOuter=element.querySelector('.workload-breakdown'),previousAssumptions=element.querySelector('.estimate-assumptions');
+  if(previousOuter){expansion.outer=previousOuter.open;expansion.rows=[...element.querySelectorAll('details[data-plan-row][open]')].map(item=>item.dataset.planRow);}
+  const previousChecks=[...element.querySelectorAll('details[data-plan-check]')];
+  if(previousChecks.length)expansion.checks=previousChecks.filter(item=>item.open).map(item=>item.dataset.planCheck);
+  if(previousAssumptions)expansion.assumptions=previousAssumptions.open;
+  const openRows=new Set(expansion.rows),openChecks=new Set(expansion.checks);
+  const focused=document.activeElement?.closest?.('[data-plan-row], [data-plan-check], .workload-breakdown');
+  const focusRow=focused?.dataset?.planRow,focusCheck=focused?.dataset?.planCheck,focusOuter=focused?.classList?.contains('workload-breakdown');
   element.innerHTML=renderRunBlueprint(config,plan);
-  for(const node of element.querySelectorAll('details')){
-    if(open.some(([key,value])=>node.dataset[key]===value))node.open=true;
-    if(focusKey&&node.dataset[focusKey[0]]===focusKey[1])node.querySelector('summary')?.focus({preventScroll:true});
+  const outer=element.querySelector('.workload-breakdown');if(outer)outer.open=expansion.outer;else if(plan)expansion.outer=false;
+  const assumptions=element.querySelector('.estimate-assumptions');if(assumptions)assumptions.open=expansion.assumptions;else if(plan)expansion.assumptions=false;
+  for(const node of element.querySelectorAll('details[data-plan-row], details[data-plan-check]')){
+    node.open=node.dataset.planRow?openRows.has(node.dataset.planRow):openChecks.has(node.dataset.planCheck);
+    if(node.dataset.planRow&&node.dataset.planRow===focusRow||node.dataset.planCheck&&node.dataset.planCheck===focusCheck)node.querySelector('summary')?.focus({preventScroll:true});
   }
+  if(plan){const rows=new Set([...element.querySelectorAll('details[data-plan-row]')].map(node=>node.dataset.planRow));expansion.rows=expansion.rows.filter(id=>rows.has(id));const checks=new Set([...element.querySelectorAll('details[data-plan-check]')].map(node=>node.dataset.planCheck));expansion.checks=expansion.checks.filter(id=>checks.has(id));}
+  if(focusOuter)outer?.querySelector('summary')?.focus({preventScroll:true});
 }
-function renderNew(preset=inferSetupPreset(state.config)) {
+function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?.limits})) {
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
@@ -2017,15 +2125,15 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   <div class="connection-details" id="connection-options">
   <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model || '',{required:true,placeholder:'Found when you connect',hint:''})}</div><p class="hint" id="model-options-label"></p></div></div>
   <details class="connection-row connection-auth" id="connection-auth" ${target.api_key_env||apiKeyFor(target.url)?'open':''}><summary><span class="row-label">API key</span><span class="row-value">${apiKeyFor(target.url)?'Set for this tab':target.api_key_env?`<code>${escape(target.api_key_env)}</code>`:'Not needed for most local servers'}</span><span class="row-action">${target.api_key_env||apiKeyFor(target.url)?'Change':'Add'}</span></summary><div class="row-control">${field('api_key','API key','',{type:'password',placeholder:'Paste your API key',hint:'Kept in memory for this tab. Never included in saved setups or reports. Paste it again after reloading. Leave blank for an open endpoint.'})}<button type="button" class="text-button" data-action="clear-api-key">Clear key</button><details><summary>Use an environment variable instead</summary>${field('api_key_env','Environment variable name',apiKeyFor(target.url)?'':target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Advanced: use a variable already set on the machine running Giraffe. Saved setups and terminal commands require this variable or a freshly pasted key.'})}</details></div></details>
-  </div>
+  ${selectField('stream','How answers arrive',`<option value="true" ${c.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${c.stream?'':'selected'}>Wait for the complete answer</option>`,{help:'Applies to every check. First-answer timing, cancellation and stream interference need streaming.'})}</div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
   </div></section></div>
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
-  ${renderCheckSelection(c)}</section>
+  ${renderSharedRunSettings(c)}${renderCheckSelection(c)}</section>
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Response text retention',['all','failures','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention || 'failures')?'selected':''}>${mode}</option>`).join(''),{hint:inputRetentionNotice})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare baseline',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Response text retention',['all','failures','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention || 'failures')?'selected':''}>${mode}</option>`).join(''),{hint:inputRetentionNotice})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',c.limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:'Timing changes use percent; rate changes use percentage points.'})}</div></div></details>
   </div><section id="request-plan" class="request-plan review-section"></section><div id="load-guidance"></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Edit run settings and extra options here. Apply changes before returning to the form or starting a run.</p><p class="hint">${inputRetentionNotice}</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor'})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" aria-label="Preview of this run" hidden></aside>
@@ -2036,10 +2144,10 @@ function renderNew(preset=inferSetupPreset(state.config)) {
   </form>`;
   for(const check of state.bootstrap.checks){
     const options=c.test_options?.[check.id] || {};
-    for(const name of check.option_fields)$('#new-run-form').elements[`test_${check.id}_${name}`].dataset.inherited=String(options[name]==null);
-    for(const name of check.limit_fields)$('#new-run-form').elements[`test_${check.id}_limit_${name}`].dataset.inherited=String(!Object.hasOwn(options.limits || {},name));
+    for(const name of check.option_fields){const input=$('#new-run-form').elements[`test_${check.id}_${name}`];if(input)input.dataset.inherited=String(options[name]==null);}
+    for(const name of check.limit_fields){const input=$('#new-run-form').elements[`test_${check.id}_limit_${name}`];if(input)input.dataset.inherited=String(!Object.hasOwn(options.limits || {},name));}
   }
-  const form=$('#new-run-form');form.elements.mode.value=state.formMode;
+  const form=$('#new-run-form');if(form.elements.traffic_max_in_flight)form.elements.traffic_max_in_flight.dataset.inherited=String(c.traffic?.max_in_flight==null);form.elements.mode.value=state.formMode;
   if(form.elements.api_key)form.elements.api_key.value=apiKeyFor(target.url);
   if(state.formRestartTarget&&c.targets.some(t=>t.name===state.formRestartTarget))form.elements.restart_target.value=state.formRestartTarget;
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
@@ -2054,28 +2162,36 @@ function readForm(allowEmpty=false) {
   if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
   first.metrics_url=form.elements.metrics_url.value.trim() || null;
   for(const [key] of numericFields)if(data.has(key))config[key]=data.get(key)===''?null:Number(data.get(key));
+  for(const name of ['max_requests','max_duration_seconds','concurrency','max_memory_mb'])if(form.elements[`${name}_enabled`])data.set(`${name}_enabled`,form.elements[`${name}_enabled`].checked?'on':'off');
+  config=configureRunLimits(config,data,{allowInvalid:allowEmpty});
   config.limits ||= {};
   for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
   if(form.elements.samples)config.samples=Number(form.elements.samples.value);
   if(form.elements.retention)config.retention=form.elements.retention.value;
   if(form.elements.stream)config.stream=form.elements.stream.value==='true';
-  config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty,percentageInputs:true});
-  config=configureConcurrentLoad(config,data,concurrentFormDefaults(config),{allowInvalid:allowEmpty});
+  config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty,percentageInputs:true,limits:state.bootstrap.limits});
+  config=configureConcurrentLoad(config,data,concurrentFormDefaults(config),{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureJudging(config,data,{allowInvalid:allowEmpty});
-  config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty});
+  config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
+function refreshTrafficDefault() {
+  const form=$('#new-run-form'),input=form?.elements.traffic_max_in_flight;if(!input)return;
+  if(form.elements.traffic_mode?.value!=='default'&&input.dataset.inherited!=='true')return;
+  const config={...state.config};
+  if(form.elements.concurrency_enabled)config.concurrency=form.elements.concurrency_enabled.checked&&form.elements.concurrency.value!==''?Number(form.elements.concurrency.value):null;
+  input.value=effectiveParallelism(config);input.dataset.inherited='true';
+}
 function updateBounds() {
+  refreshTrafficDefault();
   let payload;try{payload=readForm(true);}catch{return;}
   const c=payload.config;
   syncSetupIdentity();
   refreshDefaultProfileFields(c);
   const derived=$('#derived-concurrency');if(derived){
     derived.textContent=`At most ${number(c.concurrency)} ${c.concurrency===1?'request':'requests'} at once.`;
-    const ceiling=$('#new-run-form').elements.concurrency;
-    if(ceiling.value!==String(c.concurrency)){ceiling.value=c.concurrency;for(const check of state.bootstrap.checks)refreshInheritedFields(check.id,true);}
   }
   $('#load-guidance').innerHTML=renderLoadGuidance(c);
   updateDatasetReadiness(c);
@@ -2123,6 +2239,7 @@ async function startRun(event) {
     state.submitting=true;$('#start-run').disabled=true;$('#start-run').textContent='Validating settings…';
     const payload=await validatedSnapshot();
     await refreshRequestPreview(payload.config);
+    if(currentResourceErrors().length)throw new Error(currentResourceErrors()[0].msg);
     if(payload.mode==='cold-start'&&!payload.config.targets.find(t=>t.name===payload.restart_target)?.restart_command?.length)throw new Error('Cold start requires a configured restart_command for the selected target.');
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Starting suite…';
@@ -2349,11 +2466,11 @@ function renderLive() {
   const stopReasons=liveStopReasons(d);
   const title=judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Mission control';
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Requests appear as they start. Select a spot for evidence.';
-  const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Maximum at once',c.concurrency],['Total request limit',c.max_requests],['Traffic time limit',elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
+  const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Limit simultaneous requests',c.concurrency??'Not set'],['Stop after this many requests',c.max_requests??'Not set'],['Stop test traffic after',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
   $('#main').innerHTML=`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p></div><button class="button danger" data-action="stop" ${stopping?'disabled':''}>${icon('stop')}${stopping?'Stopping…':'Stop run'}</button></div>
-  ${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderLiveLoadResults(d)}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started})}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
+  ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderLiveLoadResults(d)}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started})}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
   <dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Requests finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl>
-  <div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/(c.max_requests || 1)*100)}%"></span></div><div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`Requests started · ${number(started)} / ${number(c.max_requests)} limit`}</span><span>${judging?'Inference timing is unchanged':'Request ceiling, not completion'}</span></div></section>
+  ${judging||c.max_requests!=null?`<div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/c.max_requests*100)}%"></span></div>`:''}<div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:c.max_requests==null?'No request limit set':`Requests started · ${number(started)} / ${number(c.max_requests)} limit`}</span><span>${judging?'Inference timing is unchanged':c.max_requests==null?`${number(started)} requests started`:'Request starts, not completions'}</span></div></section>
   <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Activity</h2><span class="hint">Updates live</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" hidden></div>`;
 }
@@ -2432,7 +2549,7 @@ async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
   let notes=[];
-  if('concurrent_workloads' in source || 'buckets' in source || source.test_options?.concurrency || (source.checks || []).some(id=>['fairness','buckets','mixed','token_stress'].includes(id))){
+  if(source.config_version==null || 'concurrent_workloads' in source || 'buckets' in source || source.test_options?.concurrency || (source.checks || []).some(id=>['fairness','buckets','mixed','token_stress'].includes(id))){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
@@ -2447,11 +2564,16 @@ function captureFormDraft() {
   state.formMode=form.elements.mode.value;state.formRestartTarget=form.elements.restart_target.value;
   try{state.config=readForm(true).config;}catch{}
 }
-function restoreDraft() {
+async function restoreDraft() {
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
-    if(draft&&sameConfig(draft.bootstrap,state.bootstrap.config)&&draft.config?.targets?.length){state.config=draft.config;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes])];}
-    else sessionStorage.removeItem('giraffe-draft-v1');
+    const legacy=draft?.config?.config_version==null;
+    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap,state.bootstrap.config))){
+      let config=draft.config,notes=[];
+      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
+      state.config=config;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
+    }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
 }
 function saveDraft() {
@@ -2470,7 +2592,7 @@ function syncConfigView() {
   $('#config-panel-form').classList.toggle('config-locked',dirty);
   $('#config-draft-notice').hidden=!dirty;
   $('#json-status').textContent=dirty?'Unapplied changes':'In sync with the form';
-  syncSetupStep();renderModelDiscovery();
+  syncSetupStep();renderModelDiscovery();syncInlineErrors();
 }
 function switchConfigView(view) {
   if(view===state.configView)return;
@@ -2500,6 +2622,8 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
   try{
     if(importing)assertAppliedConfig();
     const parsed=JSON.parse(text);
+    const localErrors=positiveBoundErrors(parsed,state.bootstrap.limits,state.bootstrap.cap_explanations);
+    if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(parsed)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     captureFormDraft();
@@ -2510,7 +2634,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     state.config.restart_target=null;
     state.jsonDraft=null;state.jsonBase=null;configChanged();
     renderNew();toast(importing?'Configuration imported.':'Configuration applied.');
-  }catch(error){if(version===state.routeVersion&&revision===state.configRevision)configError(error);}
+  }catch(error){if(version===state.routeVersion&&revision===state.configRevision){configError(error);if(!importing&&text===state.jsonDraft){state.jsonValidation={draft:text,revision,route:version,errors:error.errors?.length?error.errors:[{fields:['config'],msg:error.message}]};renderRequestPreview();}}}
   finally{state.configBusy=false;}
 }
 async function importConfig(file) {
@@ -2532,7 +2656,7 @@ async function validatedSnapshot({draft=false}={}) {
       throw new Error(`Enter a model for target "${payload.config.targets[missing].name}" before running or copying a CLI command. You can still apply or export this draft.`);
     }
   }
-  try{const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes);payload.config=result.config;}
+  try{const localErrors=positiveBoundErrors(payload.config,state.bootstrap.limits,state.bootstrap.cap_explanations);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes);payload.config=result.config;}
   catch(error){if(version===state.routeVersion&&revision===state.configRevision&&error.errors?.length){state.requestPreview={status:'error',revision,route:version,error:error.message,errors:error.errors};renderRequestPreview();focusFirstSettingError(error);}throw error;}
   if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed during validation. Try again with the current settings.');
   assertAppliedConfig();return {...payload,migration_notes:[...(state.migrationNotes || [])]};
@@ -2613,17 +2737,65 @@ document.addEventListener('click',async(event)=>{
   if(done){toggleTestEditor(done,true);return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
   if(reset==='concurrency'){captureFormDraft();replaceMigrationNotes();state.config.concurrent_load=concurrentFormDefaults();delete state.config.test_options?.concurrency;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
-  if(reset==='sessions'){captureFormDraft();state.config.sessions=clone(state.bootstrap.session_workloads.defaults);state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
   if(reset){configChanged();if(state.config.test_options)delete state.config.test_options[reset];const form=$('#new-run-form');form.elements[`test_mode_${reset}`].value='default';refreshInheritedFields(reset);syncTestControls();updateBounds();return;}
-  if(action==='use-request-budget'){
+  if(action==='use-check-concurrency'){
+    try{
+      assertAppliedConfig();
+      const button=event.target.closest('[data-concurrency-check]'),check=button?.dataset.concurrencyCheck,value=Number(button?.dataset.concurrency);
+      const offered=(currentRequestPlan()?.concurrency_warnings||[]).find(issue=>inheritedConcurrencyNotice(issue)&&issue.check===check&&issue.effective_concurrency===value);
+      if(!offered)throw new Error('The request plan changed. Review the updated concurrency before applying it.');
+      if(check==='correctness'&&state.config.request_source==='request_pack')throw new Error('Request-pack correctness uses default_concurrency; per-check overrides are unavailable.');
+      captureFormDraft();const path=concurrencySetting(check),parts=path.split('.');let target=state.config;
+      const setting=check==='consistency'?profileDefaults('consistency',state.config).levels:check==='concurrency'?concurrentSettings(state.config).schedule.levels:value;
+      for(const part of parts.slice(0,-1))target=target[part] ||= {};
+      target[parts.at(-1)]=clone(setting);
+      state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();focusSetting(path);
+    }catch(error){configError(error);}return;
+  }
+  if(action==='use-setting-correction'){
+    try{
+      if(hasJsonChanges()){
+        const button=event.target.closest('[data-setting-value]'),field=button.dataset.settingPath,value=Number(button.dataset.settingValue);
+        const issue=currentSettingErrors().find(error=>error.actions?.some(action=>action.field===field&&action.value===value));
+        if(!issue)throw new Error('Apply or discard JSON changes, or validate the current JSON before using this correction.');
+        const candidate=JSON.parse(state.jsonDraft);
+        if(field!=='traffic.duration_seconds'||!Number.isFinite(value)||value<=0||!issue||candidate.traffic?.duration_seconds!==issue.values?.[field]||JSON.stringify(candidate.traffic?.rates)!==JSON.stringify(issue.values?.['traffic.rates']))throw new Error('The request plan changed. Review the updated correction before applying it.');
+        candidate.traffic.duration_seconds=value;state.jsonDraft=JSON.stringify(candidate,null,2);$('#config-editor').value=state.jsonDraft;
+        configChanged();await applyConfig();return;
+      }
+      assertAppliedConfig();
+      const button=event.target.closest('[data-setting-value]'),field=button.dataset.settingPath,value=Number(button.dataset.settingValue);
+      const issue=currentSettingErrors().find(error=>error.actions?.some(item=>item.field===field&&item.value===value));
+      const input=$('#new-run-form')?.elements?.[settingDestination(field).name];
+      if(field!=='traffic.duration_seconds'||!Number.isFinite(value)||value<=0||!input||!issue||
+          Number(input.value)!==Number(issue.values?.[field])||
+          issue.values?.['traffic.rates']&&JSON.stringify(readForm(true).config.traffic?.rates)!==JSON.stringify(issue.values['traffic.rates']))throw new Error('The request plan changed. Review the updated correction before applying it.');
+      input.value=value;
+      const mode=$('#new-run-form')?.elements?.traffic_mode;if(mode)mode.value='custom';
+      configChanged();updateBounds();
+      if(state.configView==='json'){
+        state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;
+        $('#config-editor').value=state.jsonDraft;
+      }
+    }catch(error){configError(error);}
+    return;
+  }
+  if(action==='use-request-budget'||action==='use-time-budget'){
     try{
       assertAppliedConfig();
       const plan=currentRequestPlan();
       if(!plan)throw new Error('Wait for the current request plan before changing the budget.');
-      const budget=Number(event.target.closest('[data-budget]').dataset.budget),input=$('#new-run-form').elements.max_requests;
-      if(budget!==plan.required_request_limit||Number(input.value)!==plan.request_limit)throw new Error('The request plan changed. Review the updated budget before applying it.');
-      if(Number.isInteger(budget)&&budget>Number(input.value)){
-        input.value=budget;configChanged();updateBounds();
+      const field=action==='use-request-budget'?'max_requests':'max_duration_seconds';
+      const budget=Number(event.target.closest('[data-budget]').dataset.budget),form=$('#new-run-form'),input=form.elements[field];
+      const offered=[...(plan.request_warnings||[]),...(plan.time_warnings||[])].some(warning=>warning.actions?.some(item=>item.field===field&&item.value===budget));
+      const factor=field==='max_duration_seconds'?({s:1,min:60,h:3600}[form.elements.max_duration_unit?.value||'s']):1;
+      const current=Number(input.value)*factor;
+      if(!offered||current!==Number(field==='max_requests'?plan.request_limit:(state.requestPreview?.config||state.config).max_duration_seconds))throw new Error('The request plan changed. Review the updated budget before applying it.');
+      if(Number.isFinite(budget)&&budget>current){
+        input.value=budget/factor;input.disabled=false;input.required=true;
+        state.limitValues ||= {};state.limitValues[field]=input.value;
+        const enabled=form.elements[`${field}_enabled`];if(enabled)enabled.checked=true;
+        configChanged();updateBounds();
         if(state.configView==='json'){
           state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;
           $('#config-editor').value=state.jsonDraft;
@@ -2633,11 +2805,11 @@ document.addEventListener('click',async(event)=>{
     return;
   }
   if(action==='edit-output-cap'){
-    try{assertAppliedConfig();revealSetupStep(2);$('#shared-settings').open=true;$('#shared-run-limits').open=true;$('#new-run-form').elements.max_output_tokens.focus();}catch(error){configError(error);}
+    try{assertAppliedConfig();focusSetting('max_output_tokens');}catch(error){configError(error);}
     return;
   }
   if(action==='edit-run-limits'){
-    try{assertAppliedConfig();state.returnToReview=state.setupStep===3;captureFormDraft();revealSetupStep(2);updateBounds();$('#shared-settings').open=true;$('#new-run-form').elements.max_requests.focus();}catch(error){configError(error);}
+    try{assertAppliedConfig();state.returnToReview=state.setupStep===3;captureFormDraft();revealSetupStep(2);updateBounds();$('#shared-settings').open=true;($('#new-run-form').elements.max_requests_enabled||$('#new-run-form').elements.max_requests).focus();}catch(error){configError(error);}
     return;
   }
   if(action==='edit-load'){
@@ -2711,6 +2883,7 @@ document.addEventListener('input',event=>{
   if(['url','api_key_env','api_key'].includes(event.target.name)&&state.autoModel&&$('#new-run-form').elements.model.value===state.autoModel){$('#new-run-form').elements.model.value='';state.autoModel=null;}
   if(event.target.name==='model')state.autoModel=null;
   if(['url','model','api_key_env','api_key'].includes(event.target.name))invalidateModelDiscovery();
+  if(['max_requests','max_duration_seconds','concurrency','max_memory_mb'].includes(event.target.name)){state.limitValues ||= {};state.limitValues[event.target.name]=event.target.value;}
   if(event.target.id==='config-editor')state.jsonDraft=event.target.value;
   configChanged();$('#cli-fallback').hidden=true;
   if(event.target.id==='config-editor'){syncConfigView();return;}
@@ -2728,6 +2901,8 @@ document.addEventListener('change',event=>{
     for(const input of $$('[data-dataset-select]'))input.checked=state.datasetSelection.includes(input.dataset.datasetSelect);
     const section=$('.answer-checks');if(section){captureFormDraft();section.outerHTML=renderAnswerChecks(state.config);}return;
   }
+  if(event.target.dataset?.limitToggle){toggleRunLimit(event.target.dataset.limitToggle,event.target.checked);configChanged();for(const check of state.bootstrap.checks)refreshInheritedFields(check.id,true);updateBounds();return;}
+  if(event.target.name==='max_duration_unit'){state.timeUnit=event.target.value;const input=$('#new-run-form').elements.max_duration_seconds,bounds=settingBounds('max_duration_seconds'),factor=event.target.value==='min'?60:event.target.value==='h'?3600:1;if(bounds.exclusiveMinimum!=null)input.min=String(bounds.exclusiveMinimum/factor);configChanged();updateBounds();return;}
   if(event.target.id==='connection-model-choice'){
     const input=$('#new-run-form').elements.model,value=event.target.value;
     input.value=value==='__manual__'?'':value;input.setCustomValidity('');state.autoModel=value==='__manual__'?null:value;
@@ -2803,5 +2978,5 @@ document.addEventListener('pointermove',event=>{
 },{passive:true});
 window.addEventListener('hashchange',()=>{if(state.bootstrap)return route();});
 window.addEventListener('pagehide',saveDraft);
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);restoreDraft();state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
 init();

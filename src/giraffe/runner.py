@@ -22,14 +22,14 @@ from .conditions import condition_for
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
-from .overlap import NEEDS_STREAM, answer_window, max_evidenced_overlap, scheduling_delay_windows
+from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
 from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
 from .timing import TimingHealth, configured_metrics, exceeded_unfinished, qualified_violations, run_quality
 from .models import (
     INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
     CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
-    overall_status,
+    overall_status, required_concurrency,
 )
 
 
@@ -158,6 +158,77 @@ def _check_config(config: RunConfig, check_id: str) -> RunConfig:
     })
 
 
+class _Peak:
+    __slots__ = ("parent", "rank", "value", "live")
+
+    def __init__(self, value):
+        self.parent = self
+        self.rank = 0
+        self.value = value
+        self.live = 1
+
+    def root(self):
+        node = self
+        while node.parent is not node:
+            node.parent = node.parent.parent
+            node = node.parent
+        return node
+
+
+class _InflightPeaks:
+    """Share lifetime peaks between requests instead of updating every request.
+
+    Before a start at N, every live peak is at least N-1. Only that one
+    cohort can change. Union by rank and path compression keep end lookups
+    bounded (the number of distinct live cohorts cannot exceed the admitted
+    concurrency); starts do constant work, without iterating active requests.
+    """
+
+    def __init__(self):
+        self.counts = Counter()
+        self.peaks = {}
+        self.total = 0
+
+    def __len__(self):
+        return self.total
+
+    def start(self, target):
+        self.total += 1
+        count = self.counts[target] + 1
+        self.counts[target] = count
+        peaks = self.peaks.setdefault(target, {})
+        previous = peaks.pop(count - 1, None)
+        current = peaks.get(count)
+        token = _Peak(count)
+        if current is None:
+            current = token
+        else:
+            token.parent = current
+            current.live += 1
+        if previous is not None:
+            if current.rank < previous.rank:
+                current, previous = previous, current
+            previous.parent = current
+            current.live += previous.live
+            current.rank += current.rank == previous.rank
+        current.value = count
+        peaks[count] = current
+        return token
+
+    def finish(self, target, token):
+        root = token.root()
+        peak = root.value
+        root.live -= 1
+        if not root.live:
+            del self.peaks[target][peak]
+        self.total -= 1
+        self.counts[target] -= 1
+        if not self.counts[target]:
+            del self.counts[target]
+            del self.peaks[target]
+        return peak
+
+
 class _Run:
     def __init__(self, config: RunConfig, progress, stop_event):
         self.config = config
@@ -166,9 +237,14 @@ class _Run:
         self.progress = progress
         self.stop = stop_event or asyncio.Event()
         self.start = time.monotonic()
-        self.deadline = self.start + config.max_duration_seconds
-        self.slots = asyncio.Queue(maxsize=config.concurrency)
-        for _ in range(config.concurrency):
+        self.deadline = self.start + config.max_duration_seconds if config.max_duration_seconds is not None else math.inf
+        peak = required_concurrency(config)
+        pool_size = min(peak["peak"], config.concurrency) if config.concurrency is not None else peak["peak"]
+        self.ceiling_constrains_pool = config.concurrency is not None and peak["peak"] > config.concurrency
+        self.max_connections = min(peak["per_target_peak"], pool_size)
+        self.connection_limits = {target.name: self.max_connections for target in config.targets}
+        self.slots = asyncio.Queue(maxsize=pool_size)
+        for _ in range(pool_size):
             self.slots.put_nowait(None)
         self.records: list[RequestRecord] = []
         from giraffe.logprobs import LogprobBudget
@@ -178,6 +254,7 @@ class _Run:
         self.budget_counts = Counter()
         self.errors = 0
         self.reason: str | None = None
+        self.limits_reached = set()
         self.memory_limit_reached = False
         self.memory_stop_reason = None
         self.memory_measured = False
@@ -187,8 +264,11 @@ class _Run:
         self.pending_checks = {(target.name, check) for target in config.targets for check in config.checks}
         self.judging_pending = any(spec.scorer == "judge" for spec in self.pack_specs)
         self.counts = Counter()
-        base, extra = divmod(config.max_requests, len(config.targets))
-        self.quotas = {t.name: base + (i < extra) for i, t in enumerate(config.targets)}
+        if config.max_requests is None:
+            self.quotas = {}
+        else:
+            base, extra = divmod(config.max_requests, len(config.targets))
+            self.quotas = {t.name: base + (i < extra) for i, t in enumerate(config.targets)}
         self.unfinished = defaultdict(set)
         self.observations = {t.name: {
                                      "restart": None, "metrics": [], "capacity": []}
@@ -197,7 +277,7 @@ class _Run:
         self.peak = Counter()
         self.max_lag_ms = 0.0
         self.timing_health = TimingHealth(self.start)
-        self.inflight = {}
+        self.inflight = _InflightPeaks()
         self.conditions = {}
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
@@ -274,8 +354,7 @@ class _Run:
             return "run stopped"
         if time.monotonic() >= self.deadline or self.reason == "maximum run duration reached":
             return "time limit reached"
-        if (self.budget_used >= self.config.max_requests or self.budget_counts[target] >= self.quotas[target]
-                or self.reason == "maximum request budget reached"):
+        if self.remaining(target) == 0 or self.reason == "maximum request budget reached":
             return "request budget reached"
         return fallback
 
@@ -345,6 +424,7 @@ class _Run:
         if self.stop.is_set():
             self.reason = self.reason or "cancelled by user"
         if time.monotonic() >= self.deadline:
+            self.limits_reached.add("max_duration_seconds")
             self.reason = self.reason or "maximum run duration reached"
         for name, health in self.endpoint_health.items():
             since = health["last_response_seconds"]
@@ -389,12 +469,20 @@ class _Run:
             health["failure_request_ids"].append(record_id)
         self.stop_reason()
 
+    def remaining(self, target: str) -> int | None:
+        if self.config.max_requests is None:
+            return None
+        return max(0, min(self.config.max_requests - self.budget_used,
+                          self.quotas[target] - self.budget_counts[target]))
+
     def allowed(self, target: str) -> bool:
         reason = self.stop_reason(target)
-        if self.budget_used >= self.config.max_requests:
+        remaining = self.remaining(target)
+        if remaining == 0:
+            self.limits_reached.add("max_requests")
+        if self.config.max_requests is not None and self.budget_used >= self.config.max_requests:
             self.reason = self.reason or "maximum request budget reached"
-        return not reason and not self.reason and self.budget_used < self.config.max_requests and (
-            self.budget_counts[target] < self.quotas[target])
+        return not reason and not self.reason and (remaining is None or remaining > 0)
 
     def reserve_offer(self, target: str) -> bool:
         if not self.allowed(target):
@@ -408,6 +496,8 @@ class _Run:
             self.slots.get_nowait()
             return True
         except asyncio.QueueEmpty:
+            if self.ceiling_constrains_pool:
+                self.limits_reached.add("concurrency")
             return False
 
     def release_slot(self) -> None:
@@ -416,6 +506,8 @@ class _Run:
     @asynccontextmanager
     async def slot(self, reserved: bool, deadline: float | None = None):
         if not reserved:
+            if self.slots.empty() and self.ceiling_constrains_pool:
+                self.limits_reached.add("concurrency")
             if deadline is None:
                 await self.slots.get()
             else:
@@ -451,7 +543,7 @@ class _Run:
                 self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
             self.attempted += 1
-            output_cap = min(spec.max_tokens or self.config.max_output_tokens, self.config.max_output_tokens)
+            output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
             request_parameters = {**(request_parameters or {}),
                 "input_chars": spec.input_chars or sum(len(str(message.get("content") or "")) for message in spec.messages),
                 "output_tokens": output_cap, "requested_input_tokens": spec.requested_input_tokens}
@@ -476,13 +568,7 @@ class _Run:
             self.peak[key] = max(self.peak[key], self.active[key])
             global_deadline = False
             started, started_at = time.monotonic(), _now()
-            slot = {"target": target.name, "peak": 1}
-            token = object()
-            self.inflight[token] = slot
-            concurrent = sum(item["target"]==target.name for item in self.inflight.values())
-            for item in self.inflight.values():
-                if item["target"]==target.name:
-                    item["peak"] = max(item["peak"], concurrent)
+            token = self.inflight.start(target.name)
             try:
                 if on_start:
                     on_start()
@@ -491,12 +577,12 @@ class _Run:
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
+                request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
+                                   else self.config.request_timeout_seconds)
                 if deadline_override is not None:
-                    timeout_override = min(timeout_override or self.config.request_timeout_seconds,
+                    timeout_override = min(timeout_override or request_timeout,
                                            deadline_override - time.monotonic())
                 remaining = self.deadline - time.monotonic()
-                request_timeout = min(self.config.request_timeout_seconds,
-                                      spec.request_timeout_seconds or self.config.request_timeout_seconds)
                 global_deadline = remaining <= min(request_timeout, timeout_override or request_timeout)
                 timeout = max(.001, min(request_timeout,
                                         timeout_override or request_timeout,
@@ -528,7 +614,7 @@ class _Run:
                 )
             finally:
                 self.active[key] -= 1
-                self.inflight.pop(token, None)
+                overlap = self.inflight.finish(target.name, token)
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
@@ -544,7 +630,7 @@ class _Run:
             record.requested_output_tokens = spec.requested_output_tokens
             record.scheduled_ms = spec.workload.get("scheduled_ms")
             record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
-            record.overlap = slot["peak"]
+            record.overlap = overlap
             try:
                 record = score_response(spec, record)
                 if evaluate_record is not None:
@@ -761,10 +847,11 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
     if source is None:
         run.observations[target.name]["context_calibration"] = {"status": "unavailable", "reason": "Server input token usage unavailable"}
         return fixtures["context"]
-    desired_tokens = max(1, int((config.context_limit - min(24, config.max_output_tokens)) * .85))
+    output_budget = fixtures["context"][0].max_tokens
+    desired_tokens = max(1, int((config.context_limit - output_budget) * .85))
     character_budget = int(source.input_chars * desired_tokens / source.input_tokens)
     fixture_context_limit = max(128, min(config.context_limit * 16,
-                                        character_budget + min(24, config.max_output_tokens) + 32))
+                                        character_budget + output_budget + 32))
     calibration = {
         "status": "sized_from_observed_usage", "source_request_id": source.id,
         "source_input_tokens": source.input_tokens, "source_input_chars": source.input_chars,
@@ -776,7 +863,7 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
         previous.setdefault("adjustments", []).append(calibration)
     else:
         run.observations[target.name]["context_calibration"] = calibration
-    specs = builtin_fixtures(config.model_copy(update={"context_limit": fixture_context_limit}))["context"]
+    specs = builtin_fixtures(config.model_copy(update={"context_limit": fixture_context_limit}), check_id="context")["context"]
     for spec in specs:
         # Density is extrapolated from another fixture; rejection needs a margin.
         spec.workload["calibrated_input_tokens"] = int(spec.input_chars * source.input_tokens / source.input_chars)
@@ -801,7 +888,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         if enabled == {"gpu"} and config.restart_target != target.name:
             await _metrics(run, target, "start")
             return
-        async with LLMClient(target, config) as client:
+        async with LLMClient(target, config, max_connections=run.connection_limits[target.name]) as client:
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
             if "gpu" in enabled and not config.metrics:
@@ -814,11 +901,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
             restart = run.observations[target.name]["restart"]
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
-                initial_timeout = (config.effective_check("access")["request_timeout_seconds"]
-                                   if "access" in enabled else config.request_timeout_seconds)
-                initial_specs = [spec.model_copy(update={"request_timeout_seconds":
-                    initial_timeout})
-                    for spec in fixtures["short"]]
+                response = config.effective_initial()
+                response_config = config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")})
+                initial_specs = builtin_fixtures(response_config, check_id="serving")["short"]
                 if restart and restart["status"] == "hook_completed":
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     backoff = .1
@@ -853,12 +938,13 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
             if enabled & {"serving", "first_output"}:
-                warm_count = config.samples
-                await run.group(target, client, fixtures["short"], "warm", count=warm_count)
+                response = config.effective_response()
+                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}), check_id="serving")["short"]
+                await run.group(target, client, response_specs, "warm", count=response["samples"])
             run.finish_checks(target.name, {"serving", "first_output"})
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
-                await run.group(target, client, builtin_fixtures(effective)["generation"], "generation",
+                await run.group(target, client, builtin_fixtures(effective, check_id="generation")["generation"], "generation",
                                 count=effective.samples, checks=["generation"])
             run.finish_checks(target.name, {"generation"})
             if "capacity" in enabled:
@@ -870,7 +956,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
 
                 traffic = config.effective_traffic()
                 effective = _check_config(config, "capacity")
-                mixed_fixtures = {} if run.pack_specs else traffic_fixtures(config)
+                mixed_fixtures = {} if run.pack_specs else traffic_fixtures(effective, check_id="capacity")
 
                 async def execute(spec):
                     spec = _spec(spec, spec.scenario, ["capacity"])
@@ -922,7 +1008,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             run.finish_checks(target.name, {"capacity"})
             if "context" in enabled:
                 effective = _check_config(config, "context")
-                check_fixtures = builtin_fixtures(effective)
+                check_fixtures = builtin_fixtures(effective, check_id="context")
                 context_fixtures = await _context_fixtures(run, target, client, check_fixtures)
                 count = max(effective.samples, len(check_fixtures["context"]))
                 for attempt in range(3):
@@ -932,9 +1018,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                   and r.input_chars), key=lambda r: r.input_tokens, default=None)
                     if source is None or source.input_tokens >= effective.context_limit * .8:
                         break
-                    remaining = min(config.max_requests - run.budget_used,
-                                    run.quotas[target.name] - run.budget_counts[target.name])
-                    if attempt == 2 or len(records) < count or remaining < count:
+                    remaining = run.remaining(target.name)
+                    if attempt == 2 or len(records) < count or (remaining is not None and remaining < count):
                         break
                     context_fixtures = await _context_fixtures(
                         run, target, client, check_fixtures, source=source,
@@ -953,8 +1038,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         run.finish_checks(target.name, {check_id})
                         continue
                     effective = _check_config(config, check_id)
-                    specs = [spec.model_copy(update={"options": deterministic_options(config, spec.options)})
-                             for spec in fixtures[check_id]]
+                    check_fixtures = builtin_fixtures(effective, check_id=check_id)
+                    if check_id == "correctness":
+                        # Explicit custom request settings belong to their fixture.
+                        check_fixtures[check_id].extend(spec.model_copy(update={
+                            "max_tokens": spec.max_tokens if spec.max_tokens is not None else effective.max_output_tokens,
+                            "request_timeout_seconds": (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
+                                                        else effective.request_timeout_seconds)})
+                            for spec in fixtures[check_id] if spec.workload.get("request_source") == "custom_fixtures")
+                    specs = [spec.model_copy(update={"options": deterministic_options(effective, spec.options)})
+                             for spec in check_fixtures[check_id]]
                     await run.group(target, client, specs, f"{check_id}_c{effective.concurrency}",
                                     count=max(effective.samples, len(specs)),
                                     concurrency=effective.concurrency, checks=[check_id])
@@ -962,47 +1055,49 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             if "cancellation" in enabled:
                 effective = _check_config(config, "cancellation")
                 options = config.effective_check("cancellation")
+                cancellation_fixtures = builtin_fixtures(effective, check_id="cancellation")
                 normal = [spec.model_copy(update={"scorer": "none", "options": deterministic_options(config, spec.options)})
                                  if spec.fixture_id.startswith("limits.stop.") else spec
-                                 for spec in fixtures["limits"] if spec.cancel_after_ms is None
+                                 for spec in cancellation_fixtures["limits"] if spec.cancel_after_ms is None
                                  and not spec.fixture_id.startswith("limits.stop_control")]
                 cancel = [spec.model_copy(update={"cancel_after_ms": None,
                                                  "cancel_after_chunks": options["cancel_after_chunks"]})
-                          for spec in fixtures["limits"] if spec.cancel_after_ms is not None]
-                await run.group(target, client, [spec for spec in fixtures["limits"]
+                          for spec in cancellation_fixtures["limits"] if spec.cancel_after_ms is not None]
+                await run.group(target, client, [spec for spec in cancellation_fixtures["limits"]
                                 if spec.fixture_id.startswith("limits.stop_control")], "stop_control",
                                 count=1, checks=["cancellation"])
                 await run.group(target, client, normal, "limits",
                                 count=max(effective.samples, len(normal)), checks=["cancellation"])
                 if cancel:
                     # Same-fixture baseline: a follow-up queued behind leaked generation shows as delay.
-                    await run.group(target, client, fixtures["short"][:1], "cancellation_baseline",
+                    await run.group(target, client, cancellation_fixtures["short"][:1], "cancellation_baseline",
                                     count=1, checks=["cancellation"])
                 await run.group(target, client, cancel, "client_cancel", count=len(cancel),
                                 checks=["cancellation"])
                 # Follow-ups go immediately after the disconnect, while leaked work would still run.
-                await run.group(target, client, fixtures["short"], "cancellation_probe",
+                await run.group(target, client, cancellation_fixtures["short"], "cancellation_probe",
                                 count=effective.samples, checks=["cancellation"])
                 if cancel:
                     deadline_spec = _spec(cancel[0].model_copy(update={"cancel_after_ms": None, "cancel_after_chunks": None}),
                                           "client_deadline", ["cancellation"])
-                    probe_timeout = min(options["deadline_probe_ms"] / 1000, config.request_timeout_seconds)
+                    probe_timeout = min(options["deadline_probe_ms"] / 1000, effective.request_timeout_seconds)
                     run.observations[target.name]["deadline_probe_ms"] = probe_timeout * 1000
                     await run.request(target, client, deadline_spec, timeout_override=probe_timeout)
                 if options["backend_verification"] == "required":
                     from giraffe.backend_cancellation import exercise
-                    await exercise(run, target, client, fixtures)
+                    await exercise(run, target, client, cancellation_fixtures)
             run.finish_checks(target.name, {"cancellation"})
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
-                probe_specs = fixtures["sustained"]
+                probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
                 from .planning import request_plan
                 later = [name for name in config.checks if name not in CORE_CHECKS or name == "concurrency"]
                 later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
                 if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
                     await asyncio.sleep(max(0, min(5, cleanup, run.deadline - time.monotonic())))
-                if min(config.max_requests-run.budget_used, run.quotas[target.name]-run.budget_counts[target.name]) > (
+                remaining = run.remaining(target.name)
+                if remaining is None or remaining > (
                         later_plan["minimum_reserved_per_target"] + 2 * effective.samples
                         + max(effective.limits.min_samples, effective.concurrency*2)):
                     # Uncounted warm-up so the baseline is not the probe fixture's cold first use.
@@ -1010,23 +1105,25 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         "scenario": "recovery_prime", "check_ids": []}))
                 await run.group(target, client, probe_specs, "recovery_baseline",
                                 count=effective.samples, checks=["recovery"])
-                remaining = min(config.max_requests-run.budget_used,
-                                run.quotas[target.name]-run.budget_counts[target.name])
+                remaining = run.remaining(target.name)
                 reserved = later_plan["minimum_reserved_per_target"] + effective.samples
                 # Preserve later fixed work and probes; cap the remaining share
                 # only when another selected check still needs request budget.
-                allowance = max(0, min(remaining // 2 if later else remaining, remaining-reserved))
+                allowance = (max(0, min(remaining // 2 if later else remaining, remaining-reserved))
+                             if remaining is not None else None)
                 run.observations[target.name]["sustained_budget"] = {
                     "allowance": allowance, "reserved_later": reserved,
                     "policy": "reserve fixed later work and probes; half quota cap only with later checks"}
-                heavy = traffic_fixtures(config)
+                heavy = traffic_fixtures(effective, check_id="recovery")
                 heavy_specs = heavy["long_input"] + heavy["long_output"]
                 end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
                 dispatched, exhausted = 0, False
                 async def worker():
                     nonlocal dispatched, exhausted
                     while time.monotonic() < end:
-                        if dispatched >= allowance or not run.allowed(target.name):
+                        if (allowance is not None and dispatched >= allowance) or not run.allowed(target.name):
+                            if allowance is not None and dispatched >= allowance:
+                                run.limits_reached.add("max_requests")
                             exhausted = True
                             return
                         index = dispatched
@@ -1037,7 +1134,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 run.emit("scenario_started", target.name, "sustained")
                 await asyncio.gather(*(worker() for _ in range(effective.concurrency)))
                 run.emit("scenario_finished", target.name, "sustained")
-                run.finish_condition(target.name, "sustained", reason="sending window ended" if dispatched < allowance else None)
+                run.finish_condition(target.name, "sustained", reason="sending window ended" if allowance is None or dispatched < allowance else None)
                 run.observations[target.name]["sustained_batches"] = dispatched
                 sustained = [r for r in run.records if r.target == target.name and r.scenario == "sustained"]
                 window_ms = max((r.completed_ms for r in sustained), default=0) - min(
@@ -1197,9 +1294,10 @@ def _pack_results(run: _Run, target: Target) -> dict:
         failed = accuracy is not None and accuracy < limits.min_correctness
         observed = bool(loaded) and all(r.valid and r.score is not None for r in loaded)
         evidenced = max_evidenced_overlap((r for r in loaded if r.score is not None), target_records, delays)
-        concurrent = run.config.concurrency == 1 or evidenced >= 2
+        concurrency = run.config.effective_check("correctness")["concurrency"]
+        concurrent = concurrency == 1 or evidenced >= 2
         case["loaded"] = {**stats, "accuracy": accuracy, "evidenced_overlap": evidenced, "evidenced_overlap_capped_at": 2,
-                          "configured_concurrency": run.config.concurrency,
+                          "configured_concurrency": concurrency,
                           "concurrency_reason": None if concurrent else NEEDS_STREAM
                               if not any(r.stream for r in loaded) else "No streamed responses overlapped outside client scheduling delays.",
                           "status": "fail" if failed else "pass" if observed and concurrent else "inconclusive"}
@@ -1709,7 +1807,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     for check in result + workload_results:
         if check.status not in {"fail", "inconclusive", "blocked"}:
             continue
-        config = _check_config(run.config, check.id) if check.id in CORE_CHECKS else run.config
+        config = _check_config(run.config, check.id)
         evidence = set(check.evidence_ids)
         records = [r for r in all_records if r.id in evidence]
         if check.id != "concurrency":
@@ -1721,11 +1819,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
 
 
 def _budget_guidance(config, check_id=None):
+    if config.max_requests is None:
+        return ""
     from .planning import request_plan
     plan = request_plan(config)
     if check_id == "concurrency":
         return ("Allow the configured Concurrent load sending windows plus calibration and drain; "
-                "choose the total request limit from observed throughput. Duration-based requests have no fixed count.")
+                "set the request limit (Stop after this many requests) using observed throughput. Duration-based requests have no fixed count.")
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
@@ -1734,13 +1834,38 @@ def _budget_guidance(config, check_id=None):
             f"or select fewer checks. The plan needs at least {plan['known_total']} fixed requests; adaptive traffic may need more.")
 
 
-def _output_budget_guidance(config, records):
+def _output_budget_guidance(config, records, check_id):
     capped = [r for r in records if _reasoning_budget(r) or r.finish_reason == "length"]
-    if capped and all(r.requested_max_tokens < config.max_output_tokens for r in capped):
+    owner = "capacity" if config.request_source == "request_pack" and "capacity" in config.checks else check_id
+    options = config.test_options.get(owner)
+    field = f"test_options.{owner}.max_output_tokens" if options and options.max_output_tokens is not None else "max_output_tokens"
+    value = config.max_output_tokens
+    if check_id == "sessions":
+        field, value = "sessions.max_tokens", config.sessions.max_tokens
+        for index, workload in enumerate(config.sessions.workloads):
+            if workload.max_tokens is not None and capped and all(
+                    record.workload.get("task_type") == workload.name for record in capped):
+                field, value = f"sessions.workloads.{index}.max_tokens", workload.max_tokens
+                break
+    if capped and all(record.workload.get("request_source") == "request_pack" for record in capped):
+        cases = {case.fixture_id: (index, case) for index, case in enumerate(config.request_pack.cases)}
+        explicit = {cases[record.workload["case_id"]][0] for record in capped
+                    if record.workload.get("case_id") in cases
+                    and cases[record.workload["case_id"]][1].max_tokens is not None}
+        if explicit and len(explicit) == 1:
+            index = explicit.pop()
+            field, value = f"request_pack.cases.{index}.max_tokens", config.request_pack.cases[index].max_tokens
+    elif capped and all(record.workload.get("request_source") == "custom_fixtures" for record in capped):
+        if config.legacy_custom_fixture_max_output_tokens is not None:
+            field, value = "legacy_custom_fixture_max_output_tokens", config.legacy_custom_fixture_max_output_tokens
+        else:
+            field, value = "custom_fixtures request max_tokens", max(record.requested_max_tokens for record in capped)
+    if capped and all(r.requested_max_tokens < value for r in capped):
         caps = ", ".join(str(value) for value in sorted({r.requested_max_tokens for r in capped}))
-        return (f"the affected fixtures request {caps} tokens below the current ceiling; increasing max_output_tokens alone will not "
+        return (f"the affected fixtures request {caps} tokens below the configured default; increasing {field} alone will not "
                 "change those requests. Configure the model to return the final fixture answer without extra reasoning within its requested cap, then rerun")
-    return (f"raise max_output_tokens (or --max-output-tokens) above {config.max_output_tokens} for fixtures capped by that ceiling, "
+    setting = field + (" (or --max-output-tokens)" if field == "max_output_tokens" else "")
+    return (f"raise {setting} above {value} for requests using that output cap, "
             "or configure the model to produce the final answer within its requested cap, then rerun")
 
 
@@ -1751,7 +1876,7 @@ def _verdict_summary(check, config, records, budget):
         from .concurrent_load import remedies
         guidance = remedies(check.metrics, config)
         return check.summary if not guidance or "To conclude," in check.summary else check.summary.rstrip(".") + ". To conclude, " + guidance + "."
-    answer_failed = timing_failed = False
+    answer_failed = False
     reason = metrics.get("reason_code")
     text = summary.lower() if check.status != "fail" else ""
     if check.status == "fail":
@@ -1853,7 +1978,7 @@ def _verdict_summary(check, config, records, budget):
             reason is None and "scheduling delay" in text and metrics.get("timing_quality", {}).get("status") == "client_delayed")):
         remedy = "rerun from an idle load-generator machine and reduce competing client work so streaming timing can be measured"
     elif check.status == "inconclusive" and metrics.get("reasoning_budget_exhausted"):
-        remedy = _output_budget_guidance(config, records)
+        remedy = _output_budget_guidance(config, records, check.id)
     elif reason == "insufficient_timing_samples":
         setting = "samples (or --samples)" + (" and any test_options.generation.samples override" if check.id == "generation" else "")
         remedy = (f"set {setting} to at least {limits.min_samples}, "
@@ -1880,7 +2005,7 @@ def _verdict_summary(check, config, records, budget):
                   "set limits.first_output_ms or limits.latency_ms, enable stream/token measurements, "
                   f"and allow the whole rate plan to finish. {budget}")
     elif check.status == "inconclusive" and any(_reasoning_budget(r) for r in records):
-        remedy = _output_budget_guidance(config, records)
+        remedy = _output_budget_guidance(config, records, check.id)
     elif check.id == "context":
         remedy = (f"set context_limit to the server's actual token window (currently {config.context_limit}), "
                   "enable prompt token usage reporting and rerun all fact positions with enough output tokens for complete answers")
@@ -1889,9 +2014,11 @@ def _verdict_summary(check, config, records, budget):
             "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."}:
         remedy = (f"allow {config.sustained_seconds:g} seconds of sustained traffic with at least {limits.min_samples} successful sustained requests "
                   f"and {config.samples} successful requests in each baseline and recovery batch; "
-                  f"raise max_duration_seconds (or --max-duration) above {config.max_duration_seconds:g} if the deadline stops the run. {budget}")
+                  + (f"raise max_duration_seconds (or --max-duration) above {config.max_duration_seconds:g} if the deadline stops the run. "
+                     if config.max_duration_seconds is not None else "") + budget)
     elif any(word in text for word in ("run budget", "run deadline", "no applicable")):
-        remedy = f"{budget} Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
+        remedy = budget + (" Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
+                          if config.max_duration_seconds is not None else "")
     elif any(word in text for word in ("overlap", "concurrent")) and check.status == "inconclusive":
         remedy = ("enable parallel serving on the server and streaming (stream: true, omit --nonstream), "
                   "disable response buffering along the route, and rerun the same workload; raising client concurrency alone cannot make a serial server process requests in parallel")
@@ -1940,9 +2067,9 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     config = public_config.model_copy(deep=True)
     if config.request_source == "request_pack" and "correctness" in config.checks:
         options = config.test_options.get("correctness")
-        if options and options.model_fields_set & {"samples", "concurrency"}:
-            raise ValueError("Request-pack correctness uses every case and the global concurrency; "
-                             "per-check samples/concurrency overrides are unsupported.")
+        if options and options.model_fields_set & {"samples", "concurrency", "max_output_tokens", "request_timeout_seconds", "context_limit"}:
+            raise ValueError("Request-pack correctness uses every case and default_concurrency; "
+                             "per-check request setting overrides are unsupported.")
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     run.run_id = run_id
@@ -1969,7 +2096,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                 for key, value in fixtures.items()}
     custom_hash = None
     if config.custom_fixtures and "correctness" in config.checks:
-        fixtures["correctness"].extend(load_custom_fixtures(config.custom_fixtures))
+        fixtures["correctness"].extend(load_custom_fixtures(config.custom_fixtures,
+            legacy_max_output_tokens=config.legacy_custom_fixture_max_output_tokens))
         custom_hash = hashlib.sha256(Path(config.custom_fixtures).read_bytes()).hexdigest()
     sampler.sample()
     consume_samples()
@@ -2089,7 +2217,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
         warnings.append("Some checks have too few successful samples for confident timing conclusions.")
     if run.max_lag_ms > 100:
         warnings.append("Client scheduling delay was observed. Timing quality is qualified by overlapping request/stage intervals; raw measurements are retained. Its cause is not established.")
-    if run.budget_used >= config.max_requests:
+    if config.max_requests is not None and run.budget_used >= config.max_requests:
+        run.limits_reached.add("max_requests")
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
     cancellation_options = config.test_options.get("cancellation")
     if ("cancellation" in config.checks and cancellation_options
@@ -2165,6 +2294,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
         for spec in specs:
+            if spec["request_timeout_seconds"] == config.request_timeout_seconds:
+                spec["request_timeout_seconds"] = None
             for field, default in (("condition_id", None), ("cancel_after_chunks", None),
                                    ("expected_provided", False), ("rubric", None),
                                    ("tool_expectation", None), ("load_point", None),
@@ -2178,6 +2309,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
                 "effective_checks": {name: public_config.effective_check(name) for name in public_config.checks},
+                "effective_initial": public_config.effective_initial(),
                 "effective_traffic": (config.effective_traffic().model_dump(mode="json")
                                       if "capacity" in config.checks else None),
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
@@ -2214,4 +2346,4 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                      overall=overall_status(checks, verdict_reason or next(iter(target_abort_reasons.values()), None),
                                             memory_limit_interrupted=memory_required_interrupted), manifest=manifest, checks=checks,
                      requests=run.records, warnings=warnings, observations=observations,
-                     abort_reason=verdict_reason)
+                     abort_reason=verdict_reason, limits_reached=sorted(run.limits_reached))

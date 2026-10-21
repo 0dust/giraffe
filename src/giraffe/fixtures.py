@@ -78,13 +78,23 @@ def _request(
     )
 
 
-def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec:
+def _fixture_budget(config: RunConfig, default: int, check_id: str | None = None) -> int:
+    """Resolve built-in defaults once; explicit check settings are their own values."""
+    owners = (tuple(owner for owner in ("serving", "first_output") if owner in config.checks)
+              if check_id == "serving" else (check_id,))
+    if any(config.test_options.get(owner) is not None
+           and config.test_options[owner].max_output_tokens is not None for owner in owners):
+        return config.max_output_tokens
+    return min(default, config.max_output_tokens)
+
+
+def _context_request(config: RunConfig, size: str, position: str, check_id: str | None = None) -> RequestSpec:
     """Reserve output/template space and bound ASCII input conservatively.
 
     A character budget deliberately avoids claiming an exact token budget. Even
     an ASCII prompt's token usage depends on the model and its chat template.
     """
-    output_budget = min(24, config.max_output_tokens)
+    output_budget = _fixture_budget(config, 24, check_id)
     character_budget = config.context_limit - output_budget - 32
     # Keep the expected labels stable across prompt wording revisions.
     label = hashlib.sha256(f"context-v1-{size}-{position}".encode()).hexdigest()[:6].upper()
@@ -111,15 +121,15 @@ def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec
         ["context", "serving"],
         prefix + body + suffix,
         expected=label,
-        max_tokens=output_budget,
-        version=2,
+        max_tokens=output_budget, request_timeout_seconds=config.request_timeout_seconds,
+        stream=config.stream, version=2,
         context_position=position,
         workload={"position_coverage": {"positions": positions, "reduced": len(positions) < 3,
                                         "minimum_separation_chars": _CONTEXT_POSITION_SEPARATION}},
     )
 
 
-def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
+def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[str, list[RequestSpec]]:
     """Return reproducible fixtures; the runner reuses them across load levels.
 
     The runner must enforce the shared request/time/concurrency budget. Fixtures
@@ -129,13 +139,18 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     by the runner. Exact scorers intentionally reject explanatory extra text.
     Identifiers are box labels so prompts do not imply access credentials.
     """
+    def request(*args, own_cap=False, **kwargs):
+        budget = kwargs.pop("max_tokens", 24)
+        return _request(*args, max_tokens=(budget if own_cap else _fixture_budget(config, budget, check_id)),
+                        request_timeout_seconds=config.request_timeout_seconds, **kwargs)
+
     short = [
-        _request(
+        request(
             "short.code", "short", ["serving", "first_output", "generation", "capacity"],
             "The box label is K7P4. Reply with the box label only.", expected="K7P4",
             version=2,
         ),
-        _request(
+        request(
             "short.copy", "short", ["serving", "first_output", "generation", "capacity"],
             "Copy exactly, with no extra text:\n"
             "The blue box holds seven red cards. The label on each card is K7P4.",
@@ -144,7 +159,7 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         ),
     ]
     context = [
-        _context_request(config, size, position)
+        _context_request(config, size, position, check_id)
         for size in ("short", "long")
         for position in ("beginning", "middle", "end")
     ]
@@ -157,17 +172,17 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         })
     ]
     correctness = [
-        _request(
+        request(
             "correctness.extraction", "correctness", ["correctness", "serving"],
             "Name: Mira. Box label: T8R2. Color: blue. Return the box label only.",
             expected="T8R2", version=2,
         ),
-        _request(
+        request(
             "correctness.arithmetic", "correctness", ["correctness", "serving"],
             "A box has 17 cards. Add 8 cards. How many cards? Return only the number.",
             expected="25",
         ),
-        _request(
+        request(
             "correctness.classification", "correctness", ["correctness", "serving"],
             "Rule: dax means A; mip means B. Label mip. Reply with A or B only.", expected="B",
         ),
@@ -185,7 +200,7 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
             "required": ["label", "count", "ready"],
             "additionalProperties": False,
         }
-        json_fixtures.append(_request(
+        json_fixtures.append(request(
             "json.record", "json", ["json", "serving"],
             "Convert this box record to JSON.\nlabel: J6Q2\ncount: 3\nready: true\n"
             "Output only the JSON object, with no explanation or markdown.",
@@ -193,17 +208,17 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         ))
     cap = min(8, config.max_output_tokens)
     limits = [
-        _request(
+        request(
             "limits.output_cap", "limits", ["cancellation"],
             "Write the numbers from 1 to 100 separated by spaces. No other text.",
-            scorer="none", expected={"maximum_output_tokens": cap}, max_tokens=cap,
+            scorer="none", expected={"maximum_output_tokens": cap}, max_tokens=cap, own_cap=True,
         ),
-        _request(
+        request(
             "limits.stop", "limits", ["cancellation"],
             "Copy exactly, with no extra text: blue [END] green",
             expected="blue", options={"stop": ["[END]"]},
         ),
-        _request(
+        request(
             "limits.client_cancel", "client_cancel", ["cancellation"],
             "Write the numbers from 1 to 100 separated by spaces. No other text.",
             scorer="none", expected={"client_disconnect_after_ms": 100},
@@ -211,14 +226,14 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         ),
     ]
     sustained = [
-        _request(
+        request(
             "sustained.copy", "sustained", ["recovery", "serving"],
             "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
             expected=GENERATION_PASSAGE, max_tokens=config.max_output_tokens, version=3,
         ),
     ]
     generation = [
-        _request(
+        request(
             "generation.copy", "generation", ["generation", "serving"],
             "Copy exactly, with no extra text:\n" + GENERATION_PASSAGE,
             scorer="none", expected={"purpose": "observe sustained answer generation"},
@@ -230,7 +245,7 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         "json": json_fixtures, "limits": limits, "sustained": sustained, "generation": generation,
     }
     if "cancellation" in config.checks:
-        fixtures["limits"].append(_request(
+        fixtures["limits"].append(request(
             "limits.stop_control", "stop_control", ["cancellation"],
             "Copy exactly, with no extra text: blue [END] green",
             scorer="none", expected={"text": "blue [END] green"},
@@ -239,12 +254,12 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     if "cancellation" in config.checks and config.effective_check("cancellation")["backend_verification"] == "required":
         chunks = config.effective_check("cancellation")["cancel_after_chunks"]
         fixtures["backend_cancellation"] = [
-            _request(
+            request(
                 "limits.backend_cancel", "backend_cancel", ["cancellation"],
                 "Write the numbers from 1 to 100, one per line.", scorer="none",
                 max_tokens=128, options=deterministic_options(config), cancel_after_chunks=chunks,
             ),
-            _request(
+            request(
                 "limits.backend_cancel.followup", "backend_cancel_followup", ["cancellation"],
                 "Reply with just OK.", scorer="none", max_tokens=8, options=deterministic_options(config),
             ),
@@ -253,12 +268,11 @@ def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
         for spec in group:
             if spec.scorer in {"exact", "contains", "json"}:
                 spec.options = deterministic_options(config, spec.options)
-            spec.max_tokens = min(spec.max_tokens or config.max_output_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return fixtures
 
 
-def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
+def traffic_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[str, list[RequestSpec]]:
     """Three reproducible request shapes with complete local answer scoring.
 
     Lengths describe characters and words, not tokenizer-dependent token counts.
@@ -274,17 +288,19 @@ def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     answer = " ".join(word_bank[index % len(word_bank)]
                       for index in range(traffic.long_output_words))
     groups = {
-        "short": builtin_fixtures(config)["short"],
+        "short": builtin_fixtures(config, check_id=check_id)["short"],
         "long_input": [_request("traffic.long_input", "capacity", ["capacity"],
-                                prefix + filler + suffix, expected="L8N2")],
+                                prefix + filler + suffix, expected="L8N2",
+                                max_tokens=_fixture_budget(config, 24, check_id),
+                                request_timeout_seconds=config.request_timeout_seconds)],
         "long_output": [_request("traffic.long_output", "capacity", ["capacity"],
                                  "Copy exactly, with no extra text:\n" + answer,
-                                 expected=answer, max_tokens=config.max_output_tokens)],
+                                 expected=answer, max_tokens=config.max_output_tokens,
+                                 request_timeout_seconds=config.request_timeout_seconds)],
     }
     for specs in groups.values():
         for spec in specs:
             spec.options = deterministic_options(config, spec.options)
-            spec.max_tokens = min(spec.max_tokens, config.max_output_tokens)
             spec.stream = config.stream
     return groups
 
@@ -782,14 +798,14 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     return record.model_copy(update={"score": score, "score_message": message})
 
 
-def load_custom_fixtures(path: str) -> list[RequestSpec]:
+def load_custom_fixtures(path: str, *, legacy_max_output_tokens: int | None = None) -> list[RequestSpec]:
     """Read a local JSON list of RequestSpec objects with convenient defaults.
 
     Required fields are fixture_id, messages and scorer. Exact/contains scorers
     require a non-empty string expected answer; JSON requires an inline schema.
     Scenario defaults to custom and check_ids to correctness. Request options
     cannot override target, messages, streaming, token budgets or response count.
-    The transport still caps each explicit max_tokens at the run's ceiling.
+    Explicit request token budgets and timeouts are independent of suite defaults.
     """
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -834,6 +850,8 @@ def load_custom_fixtures(path: str) -> list[RequestSpec]:
             if spec.schema_ is not None:
                 validated_json_schema(spec.schema_)
             spec.input_chars = sum(len(message["content"]) for message in spec.messages)
+            if legacy_max_output_tokens is not None:
+                spec.max_tokens = min(spec.max_tokens or legacy_max_output_tokens, legacy_max_output_tokens)
             spec.workload = {**spec.workload, "request_source": "custom_fixtures"}
             ids.add(spec.fixture_id)
             fixtures.append(spec)

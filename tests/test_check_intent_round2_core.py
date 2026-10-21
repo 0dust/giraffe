@@ -258,7 +258,7 @@ async def test_v15_deadline_only_marks_scenario_owners(scenario, unfinished):
 
 async def test_v15_json_deadline_preserves_completed_core_verdicts(monkeypatch):
     class Client(FakeClient):
-        def __init__(self, *args):
+        def __init__(self, *args, max_connections=None):
             super().__init__()
         async def __aenter__(self):
             return self

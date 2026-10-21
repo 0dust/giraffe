@@ -248,7 +248,7 @@ def test_incomparable_baseline_never_labels_regression(change):
     if change in {"route", "model", "url"}:
         previous.manifest["config"]["targets"][0][change] = "different"
     elif change == "load":
-        previous.manifest["config"]["concurrency"] = 8
+        previous.manifest["config"]["default_concurrency"] = 8
     elif change == "fixture":
         previous.manifest["fixture_pack"]["version"] = "unknown"
     elif change == "aborted":

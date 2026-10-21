@@ -18,30 +18,45 @@ def plan(configuration):
     return request_plan(configuration)
 
 
-def test_time_plan_adds_sequential_phases_and_check_timeouts():
+def test_time_plan_separates_unmeasured_sequential_phases_and_check_timeouts():
     result = plan(config(checks=["access", "generation", "correctness"], samples=2,
                          request_timeout_seconds=10, test_options={
                              "access": {"request_timeout_seconds": 4},
                              "generation": {"samples": 3},
                              "correctness": {"samples": 4, "concurrency": 2}}))
-    assert result["estimated_seconds"] == 6
-    assert result["worst_case_seconds"] == 54  # 1*4 + 3*10 + ceil(4/2)*10
+    assert result["estimated_seconds"] is result["worst_case_seconds"] is None
+    assert [(row["id"], row["timeout_bound_seconds"]) for row in result["unknown_time_components"]] == [
+        ("generation", 30), ("correctness", 20)]
     assert result["minimum_seconds"] == 0
     assert result["errors"] == []
+    assert "setup/connection" in result["estimate_exclusions"]
 
 
-def test_time_plan_capacity_windows_block_but_timeouts_only_warn():
+def test_time_plan_partial_capacity_windows_warn_and_timeouts_warn_separately():
+    # #36/#45 formerly blocked partial windows. Phase 4 makes coverage explicit.
     values = dict(checks=["capacity"], request_timeout_seconds=10,
                   traffic={"rates": [1, 2], "duration_seconds": 5,
                            "drain_timeout_seconds": 3})
     result = plan(config(**values, max_duration_seconds=9))
     assert result["minimum_seconds"] == 10
-    assert result["worst_case_seconds"] == 16
-    assert result["errors"][0]["fields"] == ["max_duration_seconds", "traffic.duration_seconds", "traffic.rates"]
+    assert result["worst_case_seconds"] == 2 * (5 + 3)  # Windows plus drain; setup is excluded.
+    assert result["errors"] == []
+    coverage, risk = result["time_warnings"]
+    assert coverage["fields"] == ["max_duration_seconds", "traffic.duration_seconds"]
+    assert coverage["cut_checks"] == ["local · Capacity under load 2"]
+    assert coverage["actions"][0] == {"label": "Use 16 s", "field": "max_duration_seconds", "value": 16}
+    assert risk["kind"] == "estimate_risk"
     result = plan(config(**values, max_duration_seconds=12))
     assert result["errors"] == []
-    assert result["time_warnings"][0]["fields"] == ["max_duration_seconds", "request_timeout_seconds"]
-    assert "unfinished" in result["time_warnings"][0]["msg"]
+    # Both fixed windows fit; only possible timeout drains exceed 12 seconds.
+    risk, = result["time_warnings"]
+    assert risk == {"kind": "estimate_risk", "fields": ["max_duration_seconds"],
+                    "msg": "The estimated traffic duration may exceed the time limit, leaving checks unfinished.",
+                    "components": [],
+                    "actions": [{"label": "Edit settings", "fields": ["max_duration_seconds"]}],
+                    "values": {"max_duration_seconds": 12}}
+    assert result["minimum_seconds"] == 10
+    assert result["worst_case_seconds"] == 16
 
 
 def test_adaptive_work_reports_unknown_time_with_reason():
@@ -51,62 +66,64 @@ def test_adaptive_work_reports_unknown_time_with_reason():
     assert result["time_bound_reasons"]
 
 
-
-
-def test_readiness_warmup_and_multiple_targets_have_finite_bounds():
+def test_readiness_is_excluded_and_unmeasured_target_work_stays_separate():
     values = dict(checks=["access", "serving"], samples=2, restart_target="local",
                   request_timeout_seconds=10, readiness_timeout_seconds=20,
                   targets=[{"name": "local", "url": "http://localhost:1", "model": "a"},
                            {"name": "other", "url": "http://localhost:2", "model": "b"}])
     result = plan(config(**values))
-    # One connection, restart/readiness budget and two sequential warm requests.
-    assert result["worst_case_seconds"] == 2 * (10 + 30 + 20)
-    assert result["estimated_seconds"] == 8
+    assert result["worst_case_seconds"] is result["estimated_seconds"] is None
+    assert [(row["target"], row["id"], row["timeout_bound_seconds"])
+            for row in result["unknown_time_components"]] == [("local", "warm", 20), ("other", "warm", 20)]
+    assert "setup/connection" in result["estimate_exclusions"]
     overlap = plan(config(**values, overlap_models=True))
-    assert overlap["worst_case_seconds"] == result["worst_case_seconds"]
-    assert overlap["estimated_seconds"] == 4
+    assert overlap["unknown_time_components"] == result["unknown_time_components"]
 
 
-def test_context_batches_do_not_assume_parallel_dispatch_and_sessions_include_pauses():
+def test_context_unknown_timeout_bounds_and_sessions_include_fixed_pauses():
     result = plan(config(checks=["context"], samples=2, request_timeout_seconds=10))
     first = next(row["requests_per_target"] for row in result["rows"] if row["id"] == "context_first_batch")
-    assert result["worst_case_seconds"] == (3 * first + 1) * 10
+    assert sum(row["timeout_bound_seconds"] for row in result["unknown_time_components"]) == (3 * first + 1) * 10
+    assert result["estimated_seconds"] is None
     sessions = plan(config(checks=["sessions"], request_timeout_seconds=10,
                            sessions={"modes": ["live"], "sessions": 2, "delay_seconds": 3}))
-    assert sessions["worst_case_seconds"] == 4 * (10 + 3)
+    assert sessions["estimated_seconds"] == 3  # Only known conversation pauses enter the headline.
+    assert sessions["unknown_time_components"][0]["timeout_bound_seconds"] == 20
 
 
-def test_empty_poisson_stage_still_needs_its_sending_window():
+def test_empty_poisson_stage_still_warns_about_its_cut_sending_window():
     result = plan(config(checks=["capacity"], max_duration_seconds=1,
                          traffic={"rates": [.01], "duration_seconds": 2, "arrival": "poisson"}))
     assert result["planned_total"] == 0
     assert result["minimum_seconds"] == 2
-    assert result["errors"]
+    assert result["errors"] == []
+    assert result["time_warnings"][0]["kind"] == "incomplete_coverage"
 
 
-def test_arrivals_estimate_follows_the_schedule_without_serially_adding_all_requests():
+def test_arrivals_estimate_follows_schedule_with_one_timeout_drain():
     result = plan(config(checks=["arrivals"], concurrency=16,
                          arrivals={"requests": 600, "requests_per_second": 10}))
-    assert result["estimated_seconds"] == 60.9
-    assert result["worst_case_seconds"] == 59.9 + 600 * 30
+    assert result["estimated_low_seconds"] == 59.9
+    assert result["estimated_high_seconds"] == 59.9 + 30  # Last offer plus one timeout drain.
 
 
-def test_consistency_estimate_uses_each_levels_pool_and_keeps_sequential_phases():
+def test_consistency_unknown_bounds_use_each_levels_pool_and_sequential_phases():
     result = plan(config(checks=["consistency"], concurrency=8, consistency={"levels": [1, 8]}))
     assert result["planned_total"] == 78
-    assert result["estimated_seconds"] == 36  # 6 prompt/shape pairs * (5 quiet + 1 loaded batch).
+    assert result["estimated_seconds"] is None
+    assert sum(row["timeout_bound_seconds"] for row in result["unknown_time_components"]) == 36 * 30
 
 
-
-
-def test_sessions_estimate_pools_conversations_but_keeps_turns_and_pauses_in_order():
+def test_sessions_fixed_pauses_pool_conversations_and_keep_turns_in_order():
     result = plan(config(checks=["sessions"], concurrency=4, sessions={"sessions": 8,
         "concurrency": 4, "modes": ["fixed", "live"], "delay_seconds": 3}))
-    assert result["estimated_seconds"] == 2 * 2 * (2 + 3)  # Two modes, two waves, two turns/one pause.
+    assert result["estimated_seconds"] == 12  # Fixed pauses exclude unknown request durations.
+    assert result["unknown_time_components"][0]["timeout_bound_seconds"] == 8 * 30
     result = plan(config(checks=["sessions"], concurrency=4, sessions={"profile": "performance",
         "modes": ["live"], "sessions": 8, "concurrency": 4, "delay_seconds": 3,
         "workloads": [{"name": "chat", "turns": ["First", "Second", "Third"]}]}))
-    assert result["estimated_seconds"] == 2 * (3 + 2 * 3)
+    assert result["estimated_seconds"] == 12  # Fixed pauses exclude unknown request durations.
+    assert result["unknown_time_components"][0]["timeout_bound_seconds"] == 6 * 30
 
 
 @pytest.mark.parametrize("checks,expected", [
@@ -119,13 +136,13 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     assert result["planned_per_target"] == result["known_per_target"] == expected
     assert result["planned_total"] == result["required_request_limit"] == expected
     assert result["request_limit"] == 2
-    assert any("share of the run limit" in warning for warning in result["warnings"])
+    assert any("share of the request limit (Stop after this many requests:" in warning for warning in result["warnings"])
 
 
 @pytest.mark.parametrize("check,updates,expected", [
-    ("serving", {}, 6),
+    ("serving", {}, 7),
     ("first_output", {}, 7),
-    ("generation", {"test_options": {"generation": {"samples": 3}}}, 3),
+    ("generation", {"test_options": {"generation": {"samples": 3}}}, 4),
     ("correctness", {"test_options": {"correctness": {"samples": 1}}}, 3),
     ("json", {}, 6),
     ("cancellation", {}, 16),
@@ -202,7 +219,7 @@ def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
         {"name": "first", "url": "http://localhost:1", "model": "a"},
         {"name": "second", "url": "http://localhost:2", "model": "b"},
     ])
-    assert any("share the maximum requests at a time" in warning and "overlap" in warning
+    assert any("share Limit simultaneous requests" in warning and "overlap" in warning
                for warning in plan(configuration)["warnings"])
 
 
@@ -301,6 +318,9 @@ async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview
         "judging": {"judges": [{"name": "judge"}]}, "max_requests": 3,
     })
     expected = request_plan(configuration, pack_details=request_pack.pack_preview(configuration))
+    guard = {"supported": True, "need": 64, "errors": [], "warnings": []}
+    monkeypatch.setattr(web, "open_file_guard", lambda *args, **kwargs: guard)
+    expected.update(open_files=guard, resource_warnings=[], resource_issues=[])
 
     def forbidden(*args, **kwargs):
         pytest.fail("Draft plan constructed full request-pack preview details or identities")
@@ -342,8 +362,8 @@ async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch
     counts = Counter(record.scenario for record in report.requests)
     preview = plan(configured)
     scenarios = {'context_first_batch': ['context'],
-                 'correctness': [f'correctness_c{configured.concurrency}'],
-                 'json': [f'json_c{configured.concurrency}'],
+                 'correctness': [f'correctness_c{configured.effective_check("correctness")["concurrency"]}'],
+                 'json': [f'json_c{configured.effective_check("json")["concurrency"]}'],
                  'capacity': [name for name in counts if name.startswith('traffic_stage_')],
                  'cancellation': ['limits', 'cancellation_baseline', 'client_cancel', 'client_deadline', 'cancellation_probe'],
                  'limits.stop_control': ['stop_control'],
@@ -362,9 +382,11 @@ def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
     configured = config(checks=['access', 'concurrency', 'recovery'], max_requests=28,
                         concurrency=4, samples=4)
     preview = plan(configured)
-    assert preview['known_per_target'] <= 28 < preview['conservative_requests_per_target']
+    assert preview['known_per_target'] == 9
+    assert preview['conservative_requests_per_target'] == 26
     assert preview['adaptive_estimates']['sustained'] >= 8
-    assert any('likely to be starved' in warning for warning in preview['warnings'])
+    assert preview["request_warnings"][-1]["kind"] == "adaptive_risk"
+    assert "unfinished" in preview["request_warnings"][-1]["msg"]
 
 
 @pytest.mark.parametrize("quota", [300, 400, 1000])
@@ -379,8 +401,10 @@ def test_local_recovery_warmup_is_reserved_once_in_adaptive_estimate(quota):
     assert warmup["kind"] == "bounded" and warmup["requests_per_target"] == 1
     assert result["known_per_target"] == 94
     assert result["minimum_reserved_per_target"] > result["known_per_target"]
-    assert result["conservative_requests_per_target"] == max(302, quota)
-    assert any("starved" in warning for warning in result["warnings"]) is (quota < 302)
+    # Unknown-speed load no longer invents a request count at 1 request/second.
+    assert result["conservative_requests_per_target"] == 122
+    assert result["adaptive_estimates"] == {"context": 13, "sustained": 5}
+    assert result["request_warnings"][-1]["kind"] == "adaptive_risk"
     assert not any("Some tests may be incomplete" in warning for warning in result["warnings"])
 
 

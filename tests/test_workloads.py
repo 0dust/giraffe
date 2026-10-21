@@ -31,8 +31,7 @@ def config(endpoint, **extra):
         if extra.get("buckets") is not None:
             selected.append("mixed")
         extra["checks"] = selected
-    return RunConfig.model_validate(
-        {
+    values = {
             "targets": [{"name": "local", "url": endpoint.url, "model": "fake-model"}],
             "checks": ["serving"],
             "concurrency": 2,
@@ -45,7 +44,10 @@ def config(endpoint, **extra):
             "limits": {"min_samples": 2},
             **extra,
         }
-    )
+    if "buckets" in values or "concurrent_workloads" in values:
+        from giraffe.cli import migrated_configuration
+        return migrated_configuration(values)
+    return RunConfig.model_validate(values)
 
 
 def check(report, name):
@@ -457,7 +459,7 @@ async def test_tools_disabled_and_forced_diagnostic_remain_separate():
         {"sessions": {"concurrency": 3}},
         {"sessions": {"turns": ["one"]}},
         {"consistency": {"repetitions": 1}},
-        {"concurrent_load": {"profile": {"long": {"output_tokens": 256}}}},
+        {"concurrent_load": {"profile": {"long": {"output_tokens": 65537}}}},
     ],
 )
 def test_invalid_workloads_rejected_before_network(extra):

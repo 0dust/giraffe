@@ -27,6 +27,9 @@ def _answer_matches(content, output):
 
 
 async def run_conversation(run, target, client, fixture, mode):
+    from giraffe.runner import _check_config
+
+    config = _check_config(run.config, "tools")
     session_id = uuid.uuid4().hex
     marker = "obs_" + uuid.uuid4().hex
     session = {"session_id": session_id, "fixture_id": fixture.fixture_id, "mode": mode,
@@ -56,7 +59,7 @@ async def run_conversation(run, target, client, fixture, mode):
                 return
             serialized_history = json.dumps(messages, ensure_ascii=False)
             input_chars = len(serialized_history)
-            if len(serialized_history.encode()) + tools_bytes + run.config.max_output_tokens + 32 > run.config.context_limit:
+            if len(serialized_history.encode()) + tools_bytes + config.max_output_tokens + 32 > config.context_limit:
                 session["reason"] = "history_limit"
                 run.unfinished[target.name].add("tools")
                 return
@@ -66,7 +69,8 @@ async def run_conversation(run, target, client, fixture, mode):
             scenario = f"tools_{fixture.fixture_id}_{mode}_turn{turn}"
             spec = RequestSpec(fixture_id=scenario, scenario=scenario, check_ids=["tools"],
                 messages=messages, scorer="tool", stream=mode == "stream", tool_expectation=expectation,
-                input_chars=input_chars, max_tokens=run.config.max_output_tokens, options=fixture.options,
+                input_chars=input_chars, max_tokens=config.max_output_tokens,
+                request_timeout_seconds=config.request_timeout_seconds, options=fixture.options,
                 workload={"selection": "conversation", "tool_fixture_id": fixture.fixture_id,
                           "mode": mode, "session_id": session_id, "turn_id": turn,
                           "stage": "call" if step else "final"})
@@ -134,7 +138,7 @@ async def run_conversation(run, target, client, fixture, mode):
                     if record.score is not True:
                         finish("fail", "unexpected_call", "Calls differ from the declared conversation step.")
                         return
-                    if record.input_tokens is not None and record.input_tokens + run.config.max_output_tokens > run.config.context_limit:
+                    if record.input_tokens is not None and record.input_tokens + config.max_output_tokens > config.context_limit:
                         finish("inconclusive", "history_limit", "Observed conversation context exceeds the configured limit.")
                         return
                     messages = [*messages, record.assistant_message]

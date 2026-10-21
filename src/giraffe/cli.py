@@ -20,7 +20,9 @@ import yaml
 from pydantic import ValidationError
 
 from giraffe import __version__
-from giraffe.models import CHECK_NAMES, ConfigDraft, RunConfig, RunReport
+from giraffe.configuration_errors import configuration_errors
+from giraffe.models import (CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
+                           migrate_concurrent_load, migrate_run_limits)
 from giraffe.storage import DEFAULT_LIMITS, format_size as _disk_size, parse_size
 from giraffe.resources import PhaseSampler, SAMPLING
 
@@ -128,9 +130,11 @@ def parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
     validate.add_argument("--output-format", choices=["text", "json"], default="text")
     validate.add_argument("--show-config", action="store_true", help="Print the normalized configuration in text mode")
+    validate.add_argument("--runs-dir", type=Path, help="Use recent run observations from this directory")
     preview = commands.add_parser("preview", help="Preview a draft configuration without traffic")
     preview.add_argument("--config", required=True, type=Path, help="YAML/JSON configuration; - reads stdin")
     preview.add_argument("--output-format", choices=["text", "json"], default="json")
+    preview.add_argument("--runs-dir", type=Path, help="Use recent run observations from this directory")
     importer = commands.add_parser("import-dataset", help="Preview CSV or JSON dataset import as JSON without traffic")
     importer.add_argument("--file", required=True, type=Path)
     importer.add_argument("--input-field")
@@ -186,14 +190,18 @@ Exit codes:
         run.add_argument("--url", help="OpenAI-compatible origin, API base, or chat-completions URL")
         run.add_argument("--model", help="Model name served by the endpoint")
         run.add_argument("--api-key-env", help="Name of an environment variable containing the key")
-        run.add_argument("--concurrency", type=int, help="Maximum requests in flight")
-        run.add_argument("--max-requests", type=int, help="Maximum suite request budget across all targets "
-                         f"(default: {RunConfig.model_fields['max_requests'].default})")
+        run.add_argument("--concurrency", type=int, help="Set both the simultaneous-request limit and default check concurrency (legacy)")
+        run.add_argument("--simultaneous-limit", type=int, help="Limit simultaneous requests across the suite (default: Not set)")
+        run.add_argument("--default-concurrency", type=int, help="Default parallelism for checks (default: 4)")
+        run.add_argument("--no-simultaneous-limit", action="store_true", help="Leave simultaneous target requests without a suite ceiling")
+        run.add_argument("--max-requests", type=int, help="Stop after this many requests across all targets (default: Not set)")
+        run.add_argument("--no-max-requests", action="store_true", help="Leave the suite request budget Not set")
+        run.add_argument("--no-max-duration", action="store_true", help="Leave the suite traffic duration Not set")
         run.add_argument("--max-memory", type=int, dest="max_memory_mb",
                          help="Memory limit (RAM growth during this run) in MiB (default: 4096); 0 disables. Only unfinished work stops when sampled RAM growth exceeds the limit; completed checks keep their results")
-        run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Maximum suite duration in seconds")
-        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Per-request timeout in seconds")
-        run.add_argument("--max-output-tokens", type=int, help="Maximum output tokens per request")
+        run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Stop test traffic after this many seconds (default: Not set)")
+        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Default per-request timeout in seconds")
+        run.add_argument("--max-output-tokens", type=int, help="Default output-token budget per request")
         run.add_argument("--context-limit", type=int, help="Context window for context and history checks; Concurrent load uses profile token targets")
         run.add_argument("--samples", type=int, help="Samples for count-based checks; Concurrent load uses its configured duration")
         run.add_argument("--sustained-seconds", type=float, help="Duration of sustained recovery load in seconds")
@@ -228,6 +236,7 @@ Exit codes:
             run.add_argument("--" + option, type=float, help="Threshold for " + option.replace("-", " "))
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
+        run.add_argument("--save-config", type=Path, help="Write the normalized version-2 run configuration as JSON")
         run.add_argument("--output-format", choices=["text", "json"], default="text", help="Result format on stdout; progress is written to stderr")
         _storage_flags(run)
         _auto_cleanup_flags(run)
@@ -266,19 +275,37 @@ def load_configuration(path: Path) -> dict:
     return values
 
 
-def migrated_configuration(values, model=RunConfig):
-    config = model.model_validate(values)
-    for note in config._migration_notes:
+def _migrated_values(values):
+    values, limit_notes = migrate_run_limits(values)
+    values, load_notes = migrate_concurrent_load(values)
+    return values, limit_notes + load_notes
+
+
+def _configuration_notes(config, notes):
+    config._migration_notes = notes
+    for note in notes:
         print(f"Migration: {note}", file=sys.stderr)
     return config
 
 
+def migrated_configuration(values, model=RunConfig):
+    values, notes = _migrated_values(values)
+    return _configuration_notes(model.model_validate(values), notes)
+
+
 def configuration(args: argparse.Namespace) -> RunConfig:
-    values = {}
+    values, notes = {}, []
     if args.config:
         values = load_configuration(args.config)
     elif args.manifest:
         values = dict(load_report(args.manifest).manifest["config"])
+    else:
+        values["config_version"] = 2
+    if args.concurrency is not None and is_legacy_config(values):
+        # Rebuild inherited legacy parallelism from the overridden limit while
+        # preserving settings the saved input explicitly assigned to checks.
+        values["concurrency"] = args.concurrency
+    values, notes = _migrated_values(values)
     if values.get("restart_target"):
         if args.command != "cold-start":
             raise ValueError("Restart requires the explicit cold-start --restart TARGET command")
@@ -296,6 +323,18 @@ def configuration(args: argparse.Namespace) -> RunConfig:
         value = getattr(args, name, None)
         if value is not None and name not in {"checks", "limits"}:
             values[name] = value
+    if args.concurrency is not None:
+        values["default_concurrency"] = args.concurrency
+        notes.append(f"--concurrency {args.concurrency} sets both the simultaneous-request limit and default_concurrency; use --simultaneous-limit to set only the ceiling.")
+    if args.default_concurrency is not None:
+        values["default_concurrency"] = args.default_concurrency
+    if args.simultaneous_limit is not None:
+        values["concurrency"] = args.simultaneous_limit
+    for flag, field in (("no_max_requests", "max_requests"),
+                        ("no_max_duration", "max_duration_seconds"),
+                        ("no_simultaneous_limit", "concurrency")):
+        if getattr(args, flag):
+            values[field] = None
     if args.checks is not None:
         values["checks"] = [part.strip() for part in args.checks.split(",") if part.strip()]
     elif "checks" in values:
@@ -330,7 +369,8 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     for key in ("metrics_url", "metrics_api_key_env", "metrics_profile"):
         if getattr(args, key, None) is not None:
             values["targets"][0][key] = getattr(args, key)
-    return migrated_configuration(values)
+    args._configuration_input = values
+    return _configuration_notes(RunConfig.model_validate(values), notes)
 
 
 async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
@@ -355,8 +395,10 @@ async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
             return
         current = (event.get("target"), event.get("scenario"))
         if current[1] and (current != last or time.monotonic() - last_update >= 5):
+            budget = (f"{event.get('completed', 0)} requests; no request limit set" if config.max_requests is None
+                      else f"{event.get('completed', 0)}/{config.max_requests} request budget")
             print(f"  {current[0]}: {current[1]} · "
-                  f"{event.get('completed', 0)}/{config.max_requests} request budget · "
+                  f"{budget} · "
                   f"{event.get('elapsed_seconds', 0):g}s", file=sys.stderr, flush=True)
             last = current
             last_update = time.monotonic()
@@ -399,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     ) for index, value in enumerate(arguments)):
         json_output = False
     kind = arguments[0] if arguments else "usage"
+    validation_input = {}
 
     def emit(outcome: str, exit_code: int, **details) -> None:
         print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
@@ -432,10 +475,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(capabilities(), allow_nan=False))
             return 0
         if args.command == "validate":
-            config = migrated_configuration(load_configuration(args.config))
+            validation_input = load_configuration(args.config)
+            config = migrated_configuration(validation_input)
             from giraffe.planning import request_plan
+            from giraffe.latency import load_observations
 
-            plan = request_plan(config)
+            plan = request_plan(config, observations=load_observations(args.runs_dir or Path("runs"), config))
             if plan["errors"]:
                 raise ValueError(plan["errors"][0]["msg"])
             warnings = plan["warnings"]
@@ -445,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Configuration is valid. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"max_requests: {config.max_requests}")
+                print(f"Stop after this many requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in warnings:
                     print(f"Warning: {warning}")
                 if args.show_config:
@@ -454,10 +499,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "preview":
             from giraffe.request_pack import pack_preview
             from giraffe.planning import request_plan
+            from giraffe.latency import load_observations
+            from giraffe.open_files import open_file_guard
 
-            config = migrated_configuration(load_configuration(args.config), ConfigDraft)
+            validation_input = load_configuration(args.config)
+            config = migrated_configuration(validation_input, ConfigDraft)
             preview = pack_preview(config)
-            plan = request_plan(config, pack_details=preview)
+            plan = request_plan(config, pack_details=preview,
+                                observations=load_observations(args.runs_dir or Path("runs"), config))
+            guard = open_file_guard(config)
+            plan["open_files"] = guard
+            plan["resource_issues"] = ([dict(issue, blocking=True) for issue in guard["errors"]]
+                                       + [dict(issue, blocking=False) for issue in guard["warnings"]])
+            plan["resource_warnings"] = guard["warnings"]
+            plan["warnings"].extend(item["msg"] for item in guard["warnings"])
             if args.output_format == "json":
                 print(json.dumps({"config": config.model_dump(mode="json"),
                                   "migration_notes": config._migration_notes, "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
@@ -465,8 +520,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"Known requests per target: {plan['known_per_target']}")
-                print(f"max_requests: {config.max_requests}")
+                print(f"Known requests per target: {plan['known_per_target']:,}")
+                print(f"Stop after this many requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in plan["warnings"]:
                     print(f"Warning: {warning}")
             return 0
@@ -594,12 +649,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "try-example":
             from giraffe.dataset_import import try_example_config
 
-            config = try_example_config(migrated_configuration(load_configuration(args.config), ConfigDraft),
+            validation_input = load_configuration(args.config)
+            config = try_example_config(migrated_configuration(validation_input, ConfigDraft),
                                         args.fixture_id, args.target_name)
             baseline = None
         else:
             config = configuration(args)
             baseline = load_report(args.baseline) if args.baseline else None
+        if getattr(args, "save_config", None):
+            args.save_config.write_text(json.dumps(config.model_dump(mode="json"), indent=2, allow_nan=False) + "\n")
         runs_root = getattr(args, "runs_dir", None) or Path("runs")
         directory = args.output or runs_root / datetime.now(timezone.utc).strftime(
             "%Y%m%dT%H%M%S.%fZ"
@@ -615,8 +673,27 @@ def main(argv: list[str] | None = None) -> int:
         check_start(directory.parent, _storage_limits(args))
         from giraffe.planning import request_plan
         from giraffe.preflight import PreflightError, check_target
+        from giraffe.latency import load_observations
+
+        plan = request_plan(config, observations=load_observations(runs_root, config))
+        if plan["errors"]:
+            raise ValueError(plan["errors"][0]["msg"])
 
         warnings = []
+        guard = None
+        if args.command in {"run", "cold-start", "try-example"}:
+            from giraffe.open_files import open_file_guard
+
+            guard = open_file_guard(config, raise_limit=True)
+            if guard["errors"]:
+                message = guard["errors"][0]["msg"]
+                print(f"giraffe: {message}", file=sys.stderr)
+                if json_output:
+                    emit("blocked", 3, message=message, errors=guard["errors"])
+                return 3
+            warnings.extend(item["msg"] for item in guard["warnings"])
+            for item in guard["warnings"]:
+                print(f"Warning: {item['msg']}", file=sys.stderr)
         if args.command == "run" and not args.skip_preflight:
             async def preflight():
                 for target in config.targets:
@@ -637,7 +714,7 @@ def main(argv: list[str] | None = None) -> int:
                 if json_output:
                     emit("blocked", 3, target=target, message=message)
                 return 3
-        planning_warnings = request_plan(config)["warnings"]
+        planning_warnings = plan["warnings"]
         for warning in planning_warnings:
             print(f"Warning: {warning}", file=sys.stderr)
         warnings = planning_warnings + warnings
@@ -647,13 +724,21 @@ def main(argv: list[str] | None = None) -> int:
         def save_state(state: str, **details) -> None:
             from giraffe.reporting import _atomic_write
 
+            try:
+                saved = json.loads((directory / ".web.json").read_text())
+            except (OSError, ValueError):
+                saved = {}
             _atomic_write(directory / ".web.json", json.dumps(
                 {"id": directory.name, "state": state, "started_at": started_at,
+                 **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
                  "owner_pid": os.getpid(), "owner_host": socket.gethostname(), **details}, allow_nan=False, separators=(",", ":")) + "\n")
 
         save_state("running")
-        print(f"Giraffe: {len(config.targets)} target(s), at most {config.max_requests} requests, "
-              f"{config.concurrency} in flight, {config.max_duration_seconds:g}s total, "
+        requests = f"{config.max_requests:,}" if config.max_requests is not None else "Not set"
+        simultaneous = f"{config.concurrency:,}" if config.concurrency is not None else "Not set"
+        duration = f"{config.max_duration_seconds:,g}s" if config.max_duration_seconds is not None else "Not set"
+        print(f"Giraffe: {len(config.targets)} target(s), Stop after this many requests: {requests}, "
+              f"Limit simultaneous requests: {simultaneous}, Stop test traffic after: {duration}, "
               f"{config.request_timeout_seconds:g}s/request, {config.max_output_tokens} output "
               "tokens/request. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
         from giraffe.reporting import _retained, compare_baseline, html_failure_warning, save_failure_summary, write_report
@@ -662,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
         with _heartbeat(directory / ".web.json") as stop_heartbeat:
             try:
                 report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
+                if guard is not None:
+                    report.manifest["open_files"] = guard
                 if baseline:
                     report = compare_baseline(report, baseline)
             except BaseException as error:
@@ -766,11 +853,17 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as error:
         return failure([{"loc": [], "message": str(error), "type": "UsageError"}])
     except ValidationError as error:
-        # Pydantic's full repr contains raw input; only print locations/messages.
-        return failure([{"loc": list(item["loc"]), "message": ("Target name is required; add e.g. name: local"
-                          if item["type"] == "missing" and item["loc"][-1:] == ("name",)
-                          and "targets" in item["loc"] else item["msg"]), "type": item["type"]}
-                        for item in error.errors(include_input=False, include_url=False, include_context=False)])
+        # One safe formatter owns both API and CLI messages and destinations.
+        items = error.errors(include_input=False, include_url=False)
+        formatted = configuration_errors(items, getattr(args, "_configuration_input", validation_input))
+        errors = []
+        for item, diagnostic in zip(items, formatted):
+            entry = {"loc": list(item["loc"]), "message": diagnostic["msg"], "type": item["type"]}
+            entry.update({key: diagnostic[key] for key in ("field", "fields", "values", "actions")})
+            if "note" in diagnostic:
+                entry["note"] = diagnostic["note"]
+            errors.append(entry)
+        return failure(errors)
     except yaml.YAMLError as error:
         mark = getattr(error, "problem_mark", None)
         location = ["config", mark.line + 1, mark.column + 1] if mark else []

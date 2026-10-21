@@ -42,7 +42,7 @@ def test_explicit_checks_override_legacy_flags_and_round_trip():
     assert RunConfig.model_validate(selected.model_dump()) == selected
 
 
-def test_sparse_check_options_inherit_and_cannot_escape_global_ceilings():
+def test_sparse_check_options_inherit_suite_defaults_without_request_ceilings():
     target = Target(name="local", url="http://localhost", model="example")
     config = RunConfig(targets=[target], checks=["first_output"], concurrency=2, max_output_tokens=64,
                        limits={"latency_ms": 1000, "first_output_ms": 100},
@@ -50,23 +50,21 @@ def test_sparse_check_options_inherit_and_cannot_escape_global_ceilings():
                                                     "limits": {"latency_ms": None}},
                                      "correctness": {"concurrency": 8}})
     generation = config.effective_check("generation")
-    assert generation["samples"] == 9 and generation["max_output_tokens"] == 64
+    assert generation["samples"] == 9 and generation["max_output_tokens"] == 256
     assert generation["limits"]["latency_ms"] is None
     assert generation["limits"]["first_output_ms"] == 100
-    assert config.effective_check("correctness")["concurrency"] == 2
+    assert config.effective_check("correctness")["concurrency"] == 8
     assert RunConfig.model_validate(config.model_dump()).model_dump() == config.model_dump()
     assert config.model_dump()["test_options"]["generation"]["limits"] == {"latency_ms": None}
 
 
 @pytest.mark.parametrize("check_id,options", [
-    ("generation", {"max_output_tokens": 129}),
     ("correctness", {"concurrency": 5}),
-    ("access", {"request_timeout_seconds": 31}),
 ])
 def test_selected_overrides_above_global_ceiling_are_rejected_but_disabled_drafts_survive(check_id, options):
     target = Target(name="local", url="http://localhost", model="example")
-    with pytest.raises(ValidationError, match="must not exceed global"):
-        RunConfig(targets=[target], checks=[check_id], test_options={check_id: options})
+    with pytest.raises(ValidationError, match="above Limit"):
+        RunConfig(targets=[target], checks=[check_id], concurrency=4, test_options={check_id: options})
     saved = RunConfig(targets=[target], checks=["serving"], test_options={check_id: options})
     assert saved.model_dump()["test_options"][check_id] == options
 
@@ -74,7 +72,7 @@ def test_selected_overrides_above_global_ceiling_are_rejected_but_disabled_draft
 def test_selected_traffic_limit_cannot_exceed_global_concurrency():
     target = Target(name="local", url="http://localhost", model="example")
     with pytest.raises(ValidationError, match="traffic.max_in_flight"):
-        RunConfig(targets=[target], checks=["capacity"], traffic={"max_in_flight": 5})
+        RunConfig(targets=[target], checks=["capacity"], concurrency=4, traffic={"max_in_flight": 5})
     saved = RunConfig(targets=[target], checks=["serving"], traffic={"max_in_flight": 5})
     assert saved.traffic.max_in_flight == 5
 
@@ -111,13 +109,14 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
     target = Target(name="local", url="http://localhost", model="example")
     default = RunConfig(targets=[target])
     assert not (set(default.checks) - ((set(CORE_CHECKS) - {"fairness"}) | {"concurrency"}))
-    implicit = RunConfig(targets=[target], sessions={}, buckets={}, tool_calling=True)
+    from giraffe.cli import migrated_configuration
+    implicit = migrated_configuration(dict(targets=[target], sessions={}, buckets={}, tool_calling=True))
     assert {"sessions", "concurrency", "tools"} <= set(implicit.checks)
     assert implicit.concurrent_load.combinations.enabled
     assert implicit.concurrent_load.stress.enabled
     assert not implicit.concurrent_load.mixed.enabled
-    explicit = RunConfig(targets=[target], checks=["serving"], sessions={}, buckets={},
-                         tool_calling=True)
+    explicit = migrated_configuration(dict(targets=[target], checks=["serving"], sessions={}, buckets={},
+                         tool_calling=True))
     assert explicit.checks == ["serving"]
     assert explicit.sessions is not None and explicit.concurrent_load is not None
     assert not explicit.tool_calling

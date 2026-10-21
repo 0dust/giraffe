@@ -31,8 +31,8 @@ state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
 assert.match(visible,/<h3>Traffic<\/h3>/);assert(visible.includes(setupPlanCount(plan)));
-assert.match(visible,/<dt>Request limit<\/dt>/);assert.match(visible,/<dt>Traffic time limit<\/dt>/);
-assert(visible.includes(`<dd>${number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${elapsed(config.max_duration_seconds)}</dd>`));
+assert.match(visible,/<dt>Stop after this many requests<\/dt>/);assert.match(visible,/<dt>Stop test traffic after<\/dt>/);
+assert(visible.includes(`<dd>${config.max_requests==null?'Not set':number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${config.max_duration_seconds==null?'Not set':elapsed(config.max_duration_seconds)}</dd>`));
 assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass criteria|requests per endpoint/);
 assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
 assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
@@ -51,8 +51,9 @@ def test_budget_warning_and_fix_actions_remain_outside_breakdown():
 const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
-assert.match(visible,/budget is too small/);assert.match(visible,/data-action="use-request-budget"/);
-assert(visible.includes('data-budget="'+plan.required_request_limit+'"'));assert.match(visible,/data-action="edit-load"/);
+assert.match(visible,/incomplete coverage/);assert.match(visible,/data-action="use-request-budget"/);
+assert(visible.includes('data-budget="'+plan.required_request_limit+'"'));assert.match(visible,/data-action="edit-setting"/);
+assert.match(visible,/Answer correctness/);
 for(const warning of plan.warnings)assert(visible.includes(escape(warning)));
 assert(markup.indexOf('Endpoint request budgets')>markup.indexOf('Request breakdown'));
 assert.match(markup,/local: up to 2 requests/);
@@ -84,8 +85,8 @@ def test_evaluator_destinations_and_scope_stay_visible_and_thresholds_stay_separ
     config = configuration(checks=["correctness", "capacity"], request_source="request_pack",
                            request_pack={"version": 1, "cases": [{"fixture_id": "one", "messages": [{"role": "user", "content": "Question"}], "expected": "Answer", "scorer": "judge"}]},
                            judging={"judges": [{"name": "reviewer", "url": "https://judge.example/v1", "model": "judge-model"}]},
-                           test_options={"correctness": {"limits": {"min_correctness": .95}},
-                                         "capacity": {"limits": {"min_correctness": .8}}})
+                           limits={"min_correctness": .95},
+                           test_options={"capacity": {"limits": {"min_correctness": .8}}})
     plan = request_plan(config)
     assert plan["evaluator"]["active"]
     browser_logic(r"""
@@ -145,10 +146,10 @@ const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 const original=JSON.stringify(config);renderRequestPlan();
 const visible=nodes['#request-plan'].innerHTML.split('<details class="request-planning">')[0];
-assert.match(visible,/Capacity target rates: 0.125 → 2 → 8 requests\/s · 2.5s per rate · up to 3 at once · random arrivals/);
+assert.match(visible,/Capacity target rates: 0.125 → 2 → 8 requests\/s · 2.5s per rate · up to 3 at once · exact count; seeded random timing/);
 assert.equal(JSON.stringify(config),original); // The summary does not rewrite a saved load profile.
 config.traffic.max_in_flight=2;config.traffic.arrival='steady';
-assert.match(renderReviewLoad(config),/up to 2 at once/);assert.doesNotMatch(renderReviewLoad(config),/random arrivals/);
+assert.match(renderReviewLoad(config),/up to 2 at once/);assert.doesNotMatch(renderReviewLoad(config),/random arrivals|seeded random timing/);
 config.checks=['access','correctness'];assert.equal(renderReviewLoad(config),'');
 """.replace("PLAN", json.dumps(plan)), config)
 

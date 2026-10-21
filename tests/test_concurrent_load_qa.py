@@ -48,8 +48,8 @@ assert.equal(renderConcurrentPlan(config,currentRequestPlan()).split(warning.msg
 
 
 @pytest.mark.parametrize('levels,overlap,expected', [
-    ([8], False, 'Concurrency level 8 exceeds Maximum at once (4).'),
-    ([4], True, 'Concurrency level 4 × 2 endpoints exceeds Maximum at once (4).'),
+    ([8], False, 'Concurrent load runs 8 at once, above Limit simultaneous requests (4).'),
+    ([4], True, 'Concurrent load runs 4 at once × 2 endpoints, above Limit simultaneous requests (4).'),
 ])
 def test_allocation_errors_are_readable_and_keep_edit_destinations(levels, overlap, expected):
     values = {'targets': [TARGET], 'checks': ['concurrency'], 'concurrency': 4,
@@ -76,8 +76,8 @@ def test_interference_error_explains_how_to_fix_level_one():
 
 @pytest.mark.parametrize('path,value,fragment', [
     ('profile.medium.input_tokens', 1, 'Medium input target'),
-    ('profile.long.output_tokens', 256, 'Long output cap'),
-    ('schedule.levels', [2, 2], 'whole numbers from 1 to 256'),
+    ('profile.long.output_tokens', 0, 'Long output token cap'),
+    ('schedule.levels', [2, 2], 'whole numbers from 1 to 512'),
     ('interference.trigger', 'bad', 'Introduce the long input'),
     ('interference.trigger_chunks', 0, 'Answer chunks per short stream'),
     ('mixed.shares', {'wrong_shape': 100}, 'Share of requests'),

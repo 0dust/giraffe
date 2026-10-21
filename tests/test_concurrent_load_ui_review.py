@@ -1,9 +1,10 @@
 """User-visible regressions from the Concurrent load UI review."""
 import pytest
 import httpx
+from pydantic import TypeAdapter
 
 from giraffe.models import ConfigDraft, migrate_concurrent_load
-from giraffe.web import create_app
+from giraffe.web import ConfigDraftInput, create_app
 from tests.test_concurrent_load import TARGET
 from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_results import run_render_checks
@@ -16,7 +17,7 @@ const controls=[],form={elements:{},querySelectorAll:selector=>selector.includes
 const details={tagName:'DETAILS',open:false};
 function mount(source=state.config){
  controls.length=0;form.elements={};
- const markup=renderConcurrentEditor(source);
+ const markup=renderTestCard(bootstrap.checks.find(check=>check.id==='concurrency'),source);
  const decode=value=>(value||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&');
  const attr=(tag,key)=>decode(tag.match(new RegExp('(?:^|\\s)'+key+'="([^"]*)"'))?.[1]);
  function add(name,value,type='text',checked=false){
@@ -34,7 +35,7 @@ function mount(source=state.config){
  for(const key of ['url','model','name'])add(key,source.targets[0][key]);
  for(const [key] of numericFields)add(key,source[key]);
  for(const [key,value] of Object.entries({metrics_url:'',baseline_id:'',mode:'normal',restart_target:'',stream:'true',traffic_mode:'default'}))add(key,value);
- for(const id of source.checks)add('check',id,'checkbox',true);
+ for(const id of source.checks)if(!controls.some(input=>input.name==='check'&&input.value===id))add('check',id,'checkbox',true);
  nodes['#new-run-form']=form;
  for(const type of Object.keys(loadTitles)){nodes['#load-panel-'+type]={hidden:true};nodes['[data-load-collapse="'+type+'"]']={setAttribute(){}};}
  return markup;
@@ -69,7 +70,7 @@ assert.deepEqual(Object.keys(read.concurrent_load.mixed.shares).sort(),Object.ke
     ('load_schedule_levels','bad','concurrent_load.schedule.levels'),
     ('load_profile_short_input_tokens','0','concurrent_load.profile.short.input_tokens'),
     ('load_profile_long_output_tokens','999999','concurrent_load.profile.long.output_tokens'),
-    ('load_profile_long_output_tokens','256','concurrent_load.profile.long.output_tokens'),
+    ('load_profile_long_output_tokens','0','concurrent_load.profile.long.output_tokens'),
     ('load_mixed_shares_short_short','bad','concurrent_load.mixed.shares.short_short'),
     ('load_stress_min_output_percent','0','concurrent_load.stress.min_output_percent'),
     ('load_pass_criteria_min_valid_responses','1','concurrent_load.pass_criteria.min_valid_responses'),
@@ -99,13 +100,24 @@ assert.equal(readForm(false).config.checks.join(','),'access');
 ''')
 
 
+def test_concurrent_output_cap_can_exceed_suite_default():
+    browser_logic(FORM + r'''
+form.elements.load_profile_long_output_tokens.value='256';
+const read=readForm(false).config;
+assert.equal(config.max_output_tokens,128);
+assert.equal(read.max_output_tokens,128);
+assert.equal(read.concurrent_load.profile.long.output_tokens,256);
+''')
+
+
 def test_actual_input_events_recalculate_ceil_coverage_without_broad_live_region():
     browser_logic(FORM + r'''
 for(const id of ['load-share-total','load-output-coverage','load-interference-allocation','load-combination-count','load-test-point-example','load-trigger-chunks'])nodes['#'+id]={classList:{toggle(){}}};
 const html=renderConcurrentEditor(state.config);
 assert.doesNotMatch(html,/<section[^>]*load-drawer-plan[^>]*aria-live/);
-assert.match(html,/id="load-share-total"[^>]*aria-live="polite"/);
-assert.match(html,/id="load-output-coverage"[^>]*aria-live="polite"/);
+assert.match(html,/id="load-share-total"/);assert.match(html,/id="load-output-coverage"/);
+assert.doesNotMatch(html,/aria-live=/);
+assert.equal((renderRunBlueprint(config).match(/aria-live="polite"/g)||[]).length,1);
 const percent=form.elements.load_stress_min_output_percent,cap=form.elements.load_profile_long_output_tokens;
 percent.value='80';cap.value='128';listeners.input({target:percent});
 assert.match(nodes['#load-output-coverage'].textContent,/At least 103 generated tokens/);
@@ -164,10 +176,12 @@ assert.match(html,/Large-input stress at 4 concurrent requests/);assert.match(ht
 @pytest.mark.parametrize('key', ['concurrent_workloads', 'buckets'])
 @pytest.mark.parametrize('checks', [['access'], ['concurrency']])
 async def test_null_legacy_blocks_are_absent_without_notes(key, checks, tmp_path):
-    source={'targets':[TARGET], 'checks':checks, key:None}
+    source={'targets':[TARGET], 'checks':checks, key:None,
+            'max_requests':None, 'max_duration_seconds':None, 'concurrency':None}
     migrated,notes=migrate_concurrent_load(source)
     assert not notes and key not in migrated
-    assert not ConfigDraft.model_validate(source)._migration_notes
+    assert not ConfigDraft.model_validate(migrated)._migration_notes
+    assert not TypeAdapter(ConfigDraftInput).validate_python(source)._migration_notes
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),base_url='http://test') as client:
         response=await client.post('/api/config/draft',json=source)
     assert response.status_code==200 and response.json()['migration_notes']==[]
@@ -260,7 +274,9 @@ def test_server_interference_plan_wording_matches_one_point_per_level():
 
 
 async def test_bootstrap_preserves_notes_from_prevalidated_launcher(tmp_path):
-    config=ConfigDraft(targets=[TARGET],checks=['buckets'],buckets={'samples_per_bucket':7})
+    config=TypeAdapter(ConfigDraftInput).validate_python({
+        'targets':[TARGET], 'checks':['buckets'], 'buckets':{'samples_per_bucket':7}})
+    assert any('samples_per_bucket=7' in note for note in config._migration_notes)
     app=create_app(tmp_path,defaults=config.model_dump(mode='json'),migration_notes=config._migration_notes)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
         response=await client.get('/api/bootstrap')

@@ -1104,7 +1104,7 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 
 /* Run limits apply to every check, so they sit above the list as one clear summary bar. */
 #setup-panel-2:not([hidden]) { display: flex; flex-direction: column; }
-#setup-panel-2 > .shared-run-settings { order: -1; margin: 0 0 22px; border: 1px solid var(--line-2); background: var(--surface); }
+#setup-panel-2 > .shared-run-settings { margin: 0 0 22px; border: 1px solid var(--line-2); background: var(--surface); }
 #setup-panel-2 > .shared-run-settings .shared-settings-summary { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; gap: 14px; align-items: center; }
 #setup-panel-2 > .shared-run-settings .shared-settings-summary::before { content: ''; width: 18px; height: 18px; background: var(--text-2); -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round'%3E%3Cpath d='M4 6h7M15 6h1M4 14h1M9 14h7'/%3E%3Ccircle cx='13' cy='6' r='2'/%3E%3Ccircle cx='7' cy='14' r='2'/%3E%3C/svg%3E") center/contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round'%3E%3Cpath d='M4 6h7M15 6h1M4 14h1M9 14h7'/%3E%3Ccircle cx='13' cy='6' r='2'/%3E%3Ccircle cx='7' cy='14' r='2'/%3E%3C/svg%3E") center/contain no-repeat; }
 #setup-panel-2 > .shared-run-settings .shared-settings-summary > h2 { grid-column: 2; grid-row: 1; }

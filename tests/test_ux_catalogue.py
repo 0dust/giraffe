@@ -1,6 +1,7 @@
 """Catalogue behavior, honest summaries and lossless specialist settings."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,11 +36,17 @@ const context={assert,structuredClone,FormData,...formConfig,nodes,groups,listen
 context.bootstrap=BOOTSTRAP;context.config=CONFIG;
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;state.bootstrap.config=config;state.config=config;\n(async()=>{'+BODY+'\n})()',context);
-""".replace("MODULE_PATH", json.dumps((STATIC / "form-config.mjs").as_uri()))
-    script = script.replace("APP_PATH", json.dumps(str(STATIC / "app.js")))
-    script = script.replace("BOOTSTRAP", json.dumps(capabilities()))
-    script = script.replace("CONFIG", json.dumps(config.model_dump(mode="json")))
-    script = script.replace("BODY", json.dumps(body))
+"""
+    substitutions = {
+        "MODULE_PATH": json.dumps((STATIC / "form-config.mjs").as_uri()),
+        "APP_PATH": json.dumps(str(STATIC / "app.js")),
+        "BOOTSTRAP": json.dumps(capabilities()),
+        "CONFIG": json.dumps(config.model_dump(mode="json")),
+        "BODY": json.dumps(body),
+    }
+    # Replace template tokens once; injected constants can contain CONFIG/BODY.
+    script = re.sub(r"\b(?:MODULE_PATH|APP_PATH|BOOTSTRAP|CONFIG|BODY)\b",
+                    lambda match: substitutions[match[0]], script)
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -185,7 +192,8 @@ assert.equal(warnings.generation.override.hidden,true);
 state.openTest='consistency';syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.consistency.coverage.hidden,false);
 state.openTest='generation';syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.consistency.coverage.hidden,true);assert.equal(warnings.generation.override.hidden,false);
+assert.equal(warnings.consistency.coverage.hidden,true);assert.equal(warnings.generation.override.hidden,true); // Suite output is a default, not a ceiling.
+assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config,true),'');
 state.openTest=null;syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.generation.override.hidden,true);
 assert.equal(JSON.stringify(config),original);
@@ -215,8 +223,8 @@ assert.equal(saved.prefix.repeats,9);
 values.clear();values.set('profile_edits_sessions','["sessions"]');values.set('profile_sessions_sessions','3');
 values.set('profile_edits_consistency','["repetitions"]');values.set('profile_consistency_repetitions','3');
 const bounded=configureProfiles(config,values,bootstrap.profile_defaults);
-assert.equal(bounded.sessions.concurrency,1);assert.equal(bounded.sessions.max_tokens,16);
-assert.equal(bounded.consistency.levels.join(','),'1');assert.equal(bounded.sessions.sessions,3);
+assert.equal(effectiveProfileDefaults(bounded,bootstrap.profile_defaults,'sessions').concurrency,1);assert.equal(effectiveProfileDefaults(bounded,bootstrap.profile_defaults,'sessions').max_tokens,16);
+assert.equal(effectiveProfileDefaults(bounded,bootstrap.profile_defaults,'consistency').levels.join(','),'1');assert.equal(bounded.sessions.sessions,3);
 assert.equal(JSON.stringify(config),original);console.log(JSON.stringify(bounded));
 """, config)
     valid = RunConfig.model_validate(payload)
@@ -307,26 +315,27 @@ def test_run_limits_are_collapsed_and_keep_controls_without_repeating_workload()
 config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
 assert.match(markup,/<details class="shared-settings-editor" id="shared-settings">/);
-assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Edit run limits<\/h2>/);
+assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits<\/h2>/);
 assert.match(markup,/Up to 160 requests · 5m 0s · 4 at once/);assert.match(markup,/class="shared-settings-edit" aria-hidden="true">⌄/);
 assert(markup.lastIndexOf('</details>')<markup.indexOf('id="checks-plan-summary"'));
 assert.match(markup,/class="run-ceilings-values" id="run-ceilings-summary"/);
-assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary" role="status"/);
-const expected=['max_requests','max_duration_seconds','concurrency','samples','max_output_tokens','request_timeout_seconds','context_limit','stream',
-  ...limitFields.map(([name])=>'limit_'+name),'limit_max_error_rate','limit_min_correctness','limit_min_samples','limit_regression_percent'];
+assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary"/);
+assert.doesNotMatch(markup,/aria-live=/);
+const expected=['max_requests','max_duration_seconds','concurrency','max_memory_mb','max_requests_enabled','max_duration_seconds_enabled','concurrency_enabled','max_memory_mb_enabled','max_duration_unit'];
 for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 let depth=0,maximumDepth=0;
 for(const tag of markup.matchAll(/<(\/?)details\b[^>]*>/g)){depth+=tag[1]?-1:1;maximumDepth=Math.max(maximumDepth,depth);}
-assert.equal(depth,0);assert.equal(maximumDepth,2); // Outer shared settings plus request or pass defaults.
+assert.equal(depth,0);assert.equal(maximumDepth,1); // One disclosure; request settings and pass criteria live in check panels.
 assert.doesNotMatch(markup,/Set the limits once|run-limit-note|<p class="hint">/);
-for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.doesNotMatch(markup,new RegExp('id="field-'+name+'-hint"'));
+for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.match(markup,new RegExp('id="field-'+name+'-hint"></span>')); // Empty enabled-state hint receives Not set when unchecked.
 assert.match(markup,/AI evaluator calls have separate limits/); // Available through the field help.
 assert.equal(JSON.stringify(config),before);
 for(const id of ['run-ceilings-summary','request-defaults-summary','acceptance-summary'])nodes['#'+id]={};
 config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
 assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
-assert(catalogue.indexOf('id="test-selection"')<catalogue.indexOf('id="shared-settings"'));
+assert(!catalogue.includes('id="shared-settings"')); // Run limits is a preceding sibling in renderNew.
+assert.doesNotMatch(markup,/name="samples"|name="max_output_tokens"|name="request_timeout_seconds"|name="context_limit"|name="stream"|name="limit_/);
 assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
 assert.doesNotMatch(catalogue,/catalogue-view-hint/);

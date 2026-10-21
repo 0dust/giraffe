@@ -95,15 +95,15 @@ def test_source_selection_and_legacy_conflict():
     assert pack_preview(draft)["quiet_requests"] == 0
 
 
-def test_effective_payload_obeys_cap_and_option_precedence():
+def test_explicit_case_output_budget_overrides_suite_default_and_options_merge():
     configured = config([case(max_tokens=999, options={"temperature": .2})],
                         max_output_tokens=32, stream=False,
                         request_options={"temperature": .8, "stop": ["END"]})
     spec = pack_specs(configured)[0]
-    assert spec.max_tokens == 32 and spec.stream is False
+    assert spec.max_tokens == 999 and spec.stream is False
     assert spec.options == {"temperature": .2, "stop": ["END"]}
     preview = pack_preview(configured)
-    assert preview["cases"][0]["effective"]["max_tokens"] == 32
+    assert preview["cases"][0]["effective"]["max_tokens"] == 999
     assert preview["cases"][0]["requested"]["max_tokens"] == 999
     assert preview["quiet_requests"] == 1
 
@@ -113,7 +113,7 @@ def test_effective_identity_ignores_order_weight_scale_and_inactive_settings():
     second = config([case("b", weight=6), case("a", weight=2)],
                     traffic={"mix": {"short": 0, "long_input": 1, "long_output": 0},
                              "long_input_chars": 5000},
-                    test_options={"correctness": {"samples": 8}})
+                    test_options={"json": {"samples": 8}})
     assert pack_identity(first) == pack_identity(second)
     for updates in ({"expected": "B"}, {"weight": 2}, {"options": {"temperature": .3}},
                     {"messages": [{"role": "user", "content": "Return B"}]}):
@@ -284,7 +284,7 @@ def test_judge_preview_is_read_only_draft_readiness_and_panel_bounds(monkeypatch
 
 
 @pytest.mark.parametrize("arrival", ["steady", "poisson"])
-@pytest.mark.parametrize("checks", [["capacity", "correctness"], ["correctness"], ["buckets"]])
+@pytest.mark.parametrize("checks", [["capacity", "correctness"], ["correctness"], ["concurrency"]])
 @pytest.mark.parametrize("ready", [True, False])
 def test_pack_summary_matches_full_preview_counts_and_evaluator_bounds(arrival, checks, ready):
     from giraffe.request_pack import case_counts, pack_summary
@@ -325,7 +325,7 @@ def test_pack_summary_matches_full_preview_counts_and_evaluator_bounds(arrival, 
     judged = int(active) + staged_judged
     if active:
         assert {item["fixture_id"]: item["effective"]["max_tokens"] for item in preview["cases"]} == {
-            "exact": 16, "judged": 32}
+            "exact": 16, "judged": 128}
     assert summary["judging"]["planned_call_upper_bound"] == judged * 2 * (2 if active else 0)
     assert summary["judging"]["quota_call_upper_bound"] == (min(judged, 2) + min(judged, 1)) * (2 if active else 0)
     assert summary["judging"]["ready"] == (ready or not active)

@@ -103,6 +103,9 @@ giraffe run --config my-ollama.yaml --output runs/ollama-first
 ```
 
 Review the traffic budgets, acceptance limits and enabled checks before running.
+
+Saved run configurations use `config_version: 2`. The request, traffic-duration and simultaneous-request limits are optional; `null` means **Not set**. Older files with omitted limits load without those limits and show migration notes. `default_concurrency` keeps check parallelism separate from the simultaneous-request ceiling. The legacy `--concurrency N` flag sets both; use `--simultaneous-limit N` to set only the ceiling. Version-2 exports are rejected by older Giraffe versions because their configuration schema forbids unknown fields.
+
 This broader example uses concurrency 2; configure server parallelism before
 expecting concurrent checks to qualify. For a sequential first run, use the
 three-check command above. The example's 300-request budget covers the planned

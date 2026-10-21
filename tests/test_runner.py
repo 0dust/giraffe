@@ -25,7 +25,7 @@ class FakeClient:
     bad_mixed_gap = False
     initial_slow = False
 
-    def __init__(self, target, config):
+    def __init__(self, target, config, *, max_connections=None):
         self.target, self.config = target, config
 
     async def __aenter__(self):
@@ -2194,7 +2194,7 @@ async def test_serving_transport_diagnostics_do_not_classify_requests_as_workloa
 
     mock_inference_transport(monkeypatch, handler)
     report = await runner.run_suite(config(checks=["serving"], stream=stream,
-        arrivals={}, prefix={}, buckets={}, sessions={}, consistency={}, tool_calling=True))
+        arrivals={}, prefix={}, concurrent_load={}, sessions={}, consistency={}, tool_calling=True))
     assert {r.scenario for r in report.requests} == {"initial", "warm"}
     assert all(r.valid for r in report.requests)
     assert not any(r.workload for r in report.requests)

@@ -1,5 +1,4 @@
 import asyncio
-import copy
 import random
 import time
 from contextlib import asynccontextmanager
@@ -98,6 +97,7 @@ def scored_point():
 @pytest.mark.parametrize('enough', [False, True])
 def test_window_reason_codes_and_remedies_are_cause_specific(reason, code, enough):
     c, p = scored_point()
+    c.max_duration_seconds = 300
     p['window_reason'] = reason
     if not enough:
         p['delivered_window_seconds'] = .01
@@ -110,7 +110,7 @@ def test_window_reason_codes_and_remedies_are_cause_specific(reason, code, enoug
     elif code == 'time_limited':
         assert 'max_duration_seconds' in guidance and 'request limit' not in guidance
     else:
-        assert 'request limit' in guidance
+        assert 'Stop after this many requests' in guidance
 
 
 def test_failed_reasoning_exhaustion_is_not_an_error():
@@ -128,8 +128,16 @@ def test_request_warning_reserves_later_consistency_budget():
         consistency={'repetitions': 2, 'levels': [1], 'shapes': ['short'], 'prompts_per_shape': 2},
         load={'schedule': {'duration_seconds': 10}})
     assert load.later_reservation(c) == 4
-    warnings = request_plan(c)['load_warnings']
-    assert any(w['fields'] == ['max_requests'] and 'expected allowance 9' in w['msg'] for w in warnings)
+    plan = request_plan(c)
+    run = _Run(c, None, None)
+    assert run.quotas == plan['target_quotas'] == {'local': 16}
+    assert run.quotas['local'] - load.later_reservation(c) - 3 == 9
+    warning, = plan['request_warnings']
+    assert warning == {'kind': 'adaptive_risk', 'fields': ['max_requests'],
+        'msg': 'local: duration-based or adaptive traffic can exhaust the request budget and leave checks unfinished.',
+        'actions': [{'label': 'Edit settings', 'fields': ['max_requests']}], 'values': {'max_requests': 16}}
+    assert plan['known_per_target'] == 4
+    assert plan['load_warnings'] == []
 
 
 @pytest.mark.parametrize('buffered,total,expected', [(1, 4, False), (2, 4, False), (3, 4, True)])
@@ -338,4 +346,13 @@ def test_plan_warning_uses_executor_target_quota(overlap, allowance):
         load={'schedule': {'duration_seconds': 10}})
     run = _Run(c, None, None)
     assert min(run.quotas.values()) - load.later_reservation(c) - 3 == allowance
-    assert any(f'expected allowance {allowance}' in w['msg'] for w in request_plan(c)['load_warnings'])
+    plan = request_plan(c)
+    assert plan['target_quotas'] == run.quotas == {'local': 8, 'other': 8}
+    warning, = plan['request_warnings']
+    assert warning['kind'] == 'adaptive_risk' and warning['fields'] == ['max_requests']
+    assert warning['msg'] == ' '.join(
+        f'{target}: duration-based or adaptive traffic can exhaust the request budget and leave checks unfinished.'
+        for target in ('local', 'other'))
+    assert warning['values'] == {'max_requests': 16}
+    assert warning['actions'] == [{'label': 'Edit settings', 'fields': ['max_requests']}]
+    assert plan['load_warnings'] == []

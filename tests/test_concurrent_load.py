@@ -121,7 +121,8 @@ def test_defaults_and_planning_numbers():
     assert load.profile.long.output_tokens == 128
     assert load.schedule.duration_seconds == 15
     assert sum(v["configured_load_seconds"] for v in load_time_plan(load).values()) == 120
-    assert "concurrency" not in CHECK_OPTION_FIELDS and "concurrency" not in CHECK_LIMIT_FIELDS
+    assert CHECK_OPTION_FIELDS["concurrency"] == {"request_timeout_seconds"}
+    assert CHECK_LIMIT_FIELDS["concurrency"] == set()
     c = configuration(concurrency=8, max_duration_seconds=1000,
         load={"combinations": {"selected": list(SHAPES)}, "schedule": {"levels": [8, 1, 4], "duration_seconds": 30}})
     assert c.concurrent_load.schedule.levels == [1, 4, 8]
@@ -129,7 +130,10 @@ def test_defaults_and_planning_numbers():
     assert plan["configured_load_seconds"] == plan["minimum_seconds"] == 810
     assert plan["concurrent_load"]["combinations"]["test_points"] == 27
     assert next(r for r in plan["rows"] if r["id"] == "load_combinations")["requests_per_target"] is None
-    assert plan["load_warnings"][0]["fields"] == ["max_requests"]
+    # Response-dependent work gets a risk warning, without assuming 1 s/request.
+    assert plan["request_warnings"][0]["fields"] == ["max_requests"]
+    assert plan["request_warnings"][0]["kind"] == "adaptive_risk"
+    assert not plan["load_warnings"]
     i = configuration(load={"combinations": {"enabled": False}, "interference": {"enabled": True}, "schedule": {"levels": [2], "duration_seconds": 30}})
     assert request_plan(i)["configured_load_seconds"] == 60
     assert minimum_reservation(i.concurrent_load) == 3
@@ -137,7 +141,7 @@ def test_defaults_and_planning_numbers():
 
 @pytest.mark.parametrize("path,value,fields", [
     ("schedule.levels", [8], ["concurrent_load.schedule.levels", "concurrency"]),
-    ("profile.long.output_tokens", 256, ["concurrent_load.profile.long.output_tokens", "max_output_tokens"]),
+    ("profile.long.output_tokens", 65537, ["concurrent_load.profile.long.output_tokens"]),
     ("combinations.selected", [], ["concurrent_load.combinations.selected"]),
     ("profile.medium.input_tokens", 1, ["concurrent_load.profile.medium.input_tokens"]),
     ("profile.long.input_tokens", 131073, ["concurrent_load.profile.long.input_tokens"]),
@@ -147,7 +151,7 @@ def test_defaults_and_planning_numbers():
     ("combinations.enabled", False, ["concurrent_load.combinations.enabled"]),
 ])
 def test_structured_errors(path, value, fields):
-    values = configuration().model_dump()
+    values = configuration(concurrency=4).model_dump()
     node = values["concurrent_load"]
     parts = path.split(".")
     for key in parts[:-1]:
@@ -173,7 +177,7 @@ def test_other_structured_errors(updates, fields):
     assert _configuration_errors(exc.value.errors(), values)[0]["fields"] == fields
 
 
-@pytest.mark.parametrize("which", ["stream", "overlap", "time", "context"])
+@pytest.mark.parametrize("which", ["stream", "overlap", "context"])
 def test_cross_field_errors(which):
     values = configuration().model_dump()
     expected = []
@@ -186,9 +190,6 @@ def test_cross_field_errors(which):
         values.update(overlap_models=True, targets=[TARGET, {**TARGET, "name": "other"}], concurrency=3)
         values["concurrent_load"]["schedule"]["levels"] = [2]
         expected = ["concurrent_load.schedule.levels", "concurrency"]
-    if which == "time":
-        values["max_duration_seconds"] = .5
-        expected = ["concurrent_load.schedule.duration_seconds", "max_duration_seconds"]
     if which == "context":
         values["targets"][0]["deployment"]["serving"]["context_limit"] = 50
         expected = ["concurrent_load.profile.short.input_tokens"]
@@ -367,7 +368,7 @@ async def test_migration_metadata_endpoints(endpoint, tmp_path):
 async def test_suite_wires_new_check_and_manifest_notes(monkeypatch):
     from giraffe import runner
     class ContextClient(Client):
-        def __init__(self, target, config):
+        def __init__(self, target, config, *, max_connections=None):
             super().__init__()
         async def __aenter__(self):
             return self
