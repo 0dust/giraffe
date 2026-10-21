@@ -126,6 +126,7 @@ def configuration_limits(schema: dict) -> dict:
         limits[f"load_test.workloads.mixed.shares.{shape}"] = deepcopy(share_bounds)
     limits["traffic.rates"]["items"] = {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_TRAFFIC_RATE}
     limits["traffic.planned_arrivals"] = {"maximum": MAX_PLANNED_ARRIVALS}
+    limits["load_test.planned_arrivals"] = {"maximum": MAX_PLANNED_ARRIVALS}
     limits["request_pack.bytes"] = {"maximum": MAX_REQUEST_PACK_BYTES}
     limits["request_pack.case_count"] = {"maximum": MAX_REQUEST_PACK_CASES}
     limits["tool_checks.bytes"] = {"maximum": MAX_TOOL_CONFIG_BYTES}

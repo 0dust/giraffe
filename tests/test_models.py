@@ -71,10 +71,15 @@ def test_selected_overrides_above_global_ceiling_are_rejected_but_disabled_draft
 
 def test_selected_traffic_limit_cannot_exceed_global_concurrency():
     target = Target(name="local", url="http://localhost", model="example")
-    with pytest.raises(ValidationError, match="traffic.max_in_flight"):
-        RunConfig(targets=[target], checks=["capacity"], concurrency=4, traffic={"max_in_flight": 5})
-    saved = RunConfig(targets=[target], checks=["serving"], traffic={"max_in_flight": 5})
-    assert saved.traffic.max_in_flight == 5
+    with pytest.raises(ValidationError) as caught:
+        RunConfig(targets=[target], checks=["load"], concurrency=4,
+            load_test={"patterns": {"concurrent": {"levels": [5]}}})
+    assert caught.value.errors()[0]["ctx"]["fields"] == ["load_test.patterns.concurrent.levels", "concurrency"]
+    # Legacy local admission caps have no second control in the merged check.
+    legacy = RunConfig(targets=[target], checks=["capacity"], concurrency=4, traffic={"max_in_flight": 5})
+    assert legacy.checks == ["load"]
+    assert legacy.concurrency == 4
+    assert any("max_in_flight dropped" in note for note in legacy._migration_notes)
 
 
 @pytest.mark.parametrize("options", [
@@ -108,28 +113,28 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
 
     target = Target(name="local", url="http://localhost", model="example")
     default = RunConfig(targets=[target])
-    assert not (set(default.checks) - ((set(CORE_CHECKS) - {"fairness"}) | {"concurrency"}))
+    assert not (set(default.checks) - ((set(CORE_CHECKS) - {"fairness"}) | {"load"}))
     from giraffe.cli import migrated_configuration
     implicit = migrated_configuration(dict(targets=[target], sessions={}, buckets={}, tool_calling=True))
-    assert {"sessions", "concurrency", "tools"} <= set(implicit.checks)
-    assert implicit.concurrent_load.combinations.enabled
-    assert implicit.concurrent_load.stress.enabled
-    assert not implicit.concurrent_load.mixed.enabled
+    assert {"sessions", "load", "tools"} <= set(implicit.checks)
+    assert implicit.load_test.workloads.combinations.enabled
+    assert implicit.load_test.workloads.stress.enabled
+    assert not implicit.load_test.workloads.mixed.enabled
     explicit = migrated_configuration(dict(targets=[target], checks=["serving"], sessions={}, buckets={},
                          tool_calling=True))
     assert explicit.checks == ["serving"]
-    assert explicit.sessions is not None and explicit.concurrent_load is not None
+    assert explicit.sessions is not None and explicit.load_test is not None
     assert not explicit.tool_calling
     assert RunConfig.model_validate(explicit.model_dump()).model_dump() == explicit.model_dump()
     draft = ConfigDraft.model_validate({**implicit.model_dump(), "checks": []})
     assert draft.checks == []
     assert not draft.tool_calling
     assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
-        "arrivals", "prefix", "sessions", "consistency", "tools"}
+        "prefix", "sessions", "consistency", "tools"}
 
 
 @pytest.mark.parametrize("check_id,field", [
-    ("arrivals", "arrivals"), ("prefix", "prefix"), ("sessions", "sessions"), ("consistency", "consistency"),
+    ("load", "load_test"), ("prefix", "prefix"), ("sessions", "sessions"), ("consistency", "consistency"),
     ("tools", "tool_calling"),
 ])
 def test_selected_extended_workloads_get_safe_defaults(check_id, field):

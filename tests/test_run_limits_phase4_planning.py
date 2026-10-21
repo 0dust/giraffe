@@ -146,14 +146,14 @@ def test_time_limit_warns_when_cancellation_work_starts_before_cleanup_wait():
 
 
 def test_concurrent_load_partial_fixed_windows_warn_instead_of_old_45_block():
-    configured = config(checks=["concurrency"], max_duration_seconds=.5,
-        concurrent_load={"combinations": {"selected": ["short_short"]}, "mixed": {"enabled": False},
-                         "schedule": {"levels": [1], "duration_seconds": 1}})
+    from tests.test_planning import load_config
+    configured = load_config(duration=1, finish=30, concurrent=True, max_duration_seconds=.5)
+    configured.load_test.patterns.constant.enabled = False
     plan = request_plan(configured)
     assert plan["errors"] == []
     coverage, risk = plan["time_warnings"]
-    assert coverage["actions"][0] == {"label": "Use 31 s (covers fixed windows only)", "field": "max_duration_seconds", "value": 31}
-    assert "Concurrent load" in coverage["msg"]
+    assert coverage["actions"][0] == {"label": "Use 31 s", "field": "max_duration_seconds", "value": 31}
+    assert "Load test" in coverage["msg"]
     assert risk["kind"] == "estimate_risk"
 
 
@@ -173,11 +173,12 @@ def test_request_limit_names_cut_checks_and_provides_identical_action_data():
 
 
 def test_duration_requests_only_show_observation_counts_with_fully_comparable_measurements():
-    configured = config(checks=["concurrency"], concurrent_load={
-        "combinations": {"selected": ["short_short"]}, "mixed": {"enabled": False},
-        "schedule": {"levels": [2], "duration_seconds": 5}})
-    profile = configured.concurrent_load.profile.short
-    measured = {"service": [{"family": "concurrency", "concurrency": 2, "stream": configured.stream,
+    from tests.test_planning import load_config
+    configured = load_config(duration=5, concurrent=True)
+    configured.load_test.patterns.concurrent.levels = [2]
+    configured.load_test.patterns.constant.enabled = False
+    profile = configured.load_test.profile.short
+    measured = {"local": [{"family": "load.combinations.concurrent", "concurrency": 2, "stream": configured.stream,
         "output_cap": profile.output_tokens, "input_bucket": input_bucket(profile.input_tokens * 4),
         "n": 30, "p50_ms": 100, "p90_ms": 200}]}
     row = request_plan(configured, observations=measured)["rows"][0]
@@ -186,14 +187,14 @@ def test_duration_requests_only_show_observation_counts_with_fully_comparable_me
     assert row["estimated_requests_per_target"] == 100
     assert row["estimate_source"] == "from your last run"
     for key, value in [("output_cap", profile.output_tokens * 2), ("input_bucket", "chars:0-255")]:
-        changed = {"service": [{**measured["service"][0], key: value}]}
+        changed = {"local": [{**measured["local"][0], key: value}]}
         assert "estimated_requests_per_target" not in request_plan(configured, observations=changed)["rows"][0]
     assert "estimated_requests_per_target" not in request_plan(configured)["rows"][0]
     configured.targets.append(configured.targets[0].model_copy(update={"name": "other"}))
     assert "estimated_requests_per_target" not in request_plan(configured, observations=measured)["rows"][0]
-    both = measured | {"other": measured["service"]}
+    both = measured | {"other": measured["local"]}
     assert request_plan(configured, observations=both)["rows"][0]["estimated_requests_per_target"] == 100
-    differing = both | {"other": [{**measured["service"][0], "p50_ms": 200}]}
+    differing = both | {"other": [{**measured["local"][0], "p50_ms": 200}]}
     assert "estimated_requests_per_target" not in request_plan(configured, observations=differing)["rows"][0]
 
 
@@ -225,8 +226,8 @@ def test_fixed_latency_inprocess_traffic_finishes_inside_estimated_range(monkeyp
 
         monkeypatch.setattr(runner, "LLMClient", FixedLatency)
         if confidence == "high":
-            configured = config(checks=["capacity"], request_timeout_seconds=.05,
-                                traffic={"rates": [50], "duration_seconds": 1, "drain_timeout_seconds": .05})
+            from tests.test_planning import load_config
+            configured = load_config(duration=1, finish=.05, rates=[50], request_timeout_seconds=.05)
         else:
             configured = config(test_options={"correctness": {"samples": 192, "concurrency": 4}})
         previous = await runner.run_suite(configured)
@@ -267,8 +268,8 @@ def test_fixed_latency_httpx_endpoint_finishes_inside_estimated_range(monkeypatc
         monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
             transport=httpx.MockTransport(endpoint), **kwargs))
         if confidence == "high":
-            configured = config(checks=["capacity"], stream=False, request_timeout_seconds=.2,
-                                traffic={"rates": [10], "duration_seconds": 1, "drain_timeout_seconds": .2})
+            from tests.test_planning import load_config
+            configured = load_config(duration=1, finish=.2, rates=[10], stream=False, request_timeout_seconds=.2)
         else:
             configured = config(stream=False, test_options={"correctness": {"samples": 192, "concurrency": 4}})
         previous = await runner.run_suite(configured)
@@ -304,38 +305,36 @@ async def test_report_latency_summary_drives_next_finite_plan(monkeypatch):
 
 
 def test_long_traffic_plan_cap_and_optional_budgets_are_independent():
-    configured = config(checks=["capacity"], traffic={"rates": [25], "duration_seconds": 3600},
-                        max_duration_seconds=300, max_requests=100)
+    from tests.test_planning import load_config
+    configured = load_config(duration=3600, finish=30, rates=[25], max_duration_seconds=300, max_requests=100)
     plan = request_plan(configured)
     assert plan["planned_total"] == 90000
     assert plan["errors"] == []
     assert plan["time_warnings"][0]["kind"] == "incomplete_coverage"
-    assert plan["time_warnings"][0]["actions"][0] == {"label": "Use 3,630 s",
-        "field": "max_duration_seconds", "value": 3630}
+    assert plan["time_warnings"][0]["actions"][0] == {"label": "Use 3,630 s", "field": "max_duration_seconds", "value": 3630}
     assert plan["request_warnings"][0]["kind"] == "incomplete_coverage"
     assert plan["request_warnings"][0]["actions"][0]["value"] == 90000
-    assert configured.traffic.rates == [25]
-    assert configured.traffic.duration_seconds == 3600
+    assert configured.load_test.patterns.rates == [25]
+    assert configured.load_test.schedule.duration_seconds == 3600
     configured.max_requests = configured.max_duration_seconds = None
     assert request_plan(configured)["request_warnings"] == request_plan(configured)["time_warnings"] == []
 
 
 def test_budget_action_counts_other_checks_and_all_endpoints():
-    configured = config(checks=["capacity", "correctness"], max_requests=20,
-                        targets=[TARGET, {**TARGET, "name": "other"}],
-                        traffic={"rates": [25], "duration_seconds": 2})
+    from tests.test_planning import load_config
+    configured = load_config(duration=2, rates=[25], max_requests=20,
+        targets=[TARGET, {**TARGET, "name": "other"}])
+    configured.checks = ["load", "correctness"]
     plan = request_plan(configured)
-    assert plan["planned_per_target"] == 56
-    assert plan["planned_total"] == plan["required_request_limit"] == 112
+    assert plan["planned_per_target"] == 51
+    assert plan["planned_total"] == plan["required_request_limit"] == 102
     assert plan["target_quotas"] == {"service": 10, "other": 10}
     notice, = plan["request_warnings"]
-    assert notice["cut_checks"] == ["capacity", "correctness"]
-    assert notice["targets"] == [{"target": target, "quota": 10, "cut_checks": ["capacity", "correctness"]}
-                                 for target in ("service", "other")]
+    assert notice["cut_checks"] == ["load_combinations"]
+    assert notice["targets"] == [{"target": target, "quota": 10, "cut_checks": ["load_combinations"]} for target in ("service", "other")]
     assert "service:" in notice["msg"] and "other:" in notice["msg"]
-    assert notice["actions"] == [{"label": "Use 112 total requests", "field": "max_requests", "value": 112},
-        {"label": "Edit Capacity under load", "field": "traffic.rates"},
-        {"label": "Edit Answer correctness", "field": "test_options.correctness"}]
+    assert notice["actions"] == [{"label": "Use 102 total requests", "field": "max_requests", "value": 102},
+        {"label": "Edit Load test", "field": "load_test.schedule.duration_seconds"}]
     assert plan["errors"] == []
     assert configured.max_requests == 20
 
@@ -372,20 +371,20 @@ async def test_issue_example_suite_fixed_counts_match_inprocess_run(monkeypatch)
 
 
 async def test_concurrent_load_plan_windows_and_calibration_bounds_match_inprocess_run():
-    from tests.test_concurrent_load import Client, configuration, perform
-
-    configured = configuration()
-    configured.max_requests = None
-    configured.concurrent_load.schedule.duration_seconds = .2
+    from giraffe.load_test import execute
+    from giraffe.runner import _Run
+    from tests.test_load_test_phase_a import Client, config as load_configuration
+    configured = load_configuration()
+    configured.load_test.schedule.duration_seconds = .06
     preview = request_plan(configured)
-    run, _, _, _ = await perform(configured, Client())
+    run = _Run(configured, None, None)
+    load = await execute(run, configured.targets[0], Client())
     rows = {row["id"]: row for row in preview["rows"]}
     calibration_count = sum("calibration" in record.scenario for record in run.records)
     assert 0 < calibration_count <= rows["load_calibration"]["requests_per_target"]
     assert rows["load_calibration"]["kind"] == "bounded"
-    load = run.observations["local"]["concurrent_load"]
-    assert load["configured_load_seconds"] == preview["configured_load_seconds"] == .2
-    assert len(load["load_types"]["combinations"]["points"]) == 1
+    assert load["plan"]["configured_load_seconds"] == preview["configured_load_seconds"] == .06
+    assert len(load["points"]) == 1
     assert rows["load_combinations"]["kind"] == "duration"
     assert rows["load_combinations"]["requests_per_target"] is None
     assert len(run.records) > calibration_count
@@ -504,38 +503,25 @@ async def test_overlapping_targets_preserve_configured_gather_batch_barriers(mon
 
 
 async def test_arrival_pending_queue_needs_multiple_drain_waves(monkeypatch):
-    from giraffe import runner
-    from tests.test_runner import FakeClient
-
-    class FixedLatency(FakeClient):
-        delay = .01
-
-    monkeypatch.setattr(runner, "LLMClient", FixedLatency)
-    configured = config(checks=["arrivals"], request_timeout_seconds=.2,
-        arrivals={"mode": "burst", "requests": 20, "burst_size": 20, "max_in_flight": 1, "max_pending": 20})
-    unmeasured = request_plan(configured)
-    assert unmeasured["estimated_high_seconds"] == .2
-    queued, = unmeasured["unknown_time_components"]
-    assert queued["id"] == "arrivals_pending"
-    assert queued["requests"] == 19
-    assert queued["upper_bound"] is True
-    assert queued["timeout_bound_seconds"] == pytest.approx(3.8)
-    assert "up to 19 requests at unknown speed" in unmeasured["time_bound_reasons"][0]
-    spec = builtin_fixtures(configured, check_id="arrivals")["short"][0]
-    measured = {"service": [{"family": "arrivals", "concurrency": 1, "stream": configured.stream,
-        "output_cap": spec.max_tokens, "input_bucket": input_bucket(spec.input_chars),
-        **tail(9, 15)}]}
-    preview = request_plan(configured, observations=measured)
-    assert preview["estimated_low_seconds"] == .178  # Legacy quantiles have no minimum: zero lower initial drain.
-    assert preview["estimated_high_seconds"] == .434
+    from giraffe.load_test import execute
+    from giraffe.runner import _Run
+    from tests.test_load_test_phase_a import Client
+    from tests.test_planning import load_config
+    configured = load_config(duration=1, finish=.2, rates=[10000], concurrency=1)
+    preview = request_plan(configured)
+    assert preview["estimated_low_seconds"] == 1
+    assert preview["estimated_high_seconds"] == 1.2
     assert preview["unknown_time_components"] == []
-    previous = await runner.run_suite(configured)
-    summary = latency_summary(previous)
-    measured = {target["name"]: target["measurements"] for target in summary["targets"]}
-    preview = request_plan(configured, observations=measured)
-    report = await runner.run_suite(configured)
-    assert len(report.requests) == 20
-    assert preview["estimated_low_seconds"] <= report.observations["inference_duration_seconds"] <= preview["estimated_high_seconds"]
+    assert not any(item["id"] == "arrivals_pending" for item in preview["time_timeline"])
+    # Admission never queues full-slot arrivals. Run a tiny point after validating
+    # its one-second public config so this regression does not wait on wall time.
+    configured.load_test.schedule.duration_seconds = .02
+    run = _Run(configured, None, None)
+    observation = await execute(run, configured.targets[0], Client((.01,)))
+    point = observation["points"][0]
+    assert point["local_drops"] > 0
+    assert point["dispatched"] + point["not_sent"] == point["scheduled"]
+    assert all(record.overlap <= 1 for record in run.records)
 
 
 def test_canonical_warnings_include_time_coverage_and_estimate_risk_once():
@@ -577,31 +563,22 @@ def test_more_endpoints_than_slots_accounts_for_serial_finite_traffic(monkeypatc
 
 
 async def test_spaced_arrivals_do_not_assume_the_pending_queue_is_full(monkeypatch):
-    from giraffe import runner
-    from tests.test_runner import FakeClient
-
-    class FixedLatency(FakeClient):
-        delay = .01
-
-    monkeypatch.setattr(runner, "LLMClient", FixedLatency)
-    configured = config(checks=["arrivals"], request_timeout_seconds=.2,
-        arrivals={"requests": 6, "requests_per_second": 25, "max_in_flight": 1, "max_pending": 20})
-    spec = builtin_fixtures(configured, check_id="arrivals")["short"][0]
-    measured = {"service": [{"family": "arrivals", "concurrency": 1, "stream": configured.stream,
-        "output_cap": spec.max_tokens, "input_bucket": input_bucket(spec.input_chars),
-        **tail(9, 15)}]}
-    preview = request_plan(configured, observations=measured)
-    drain = next(item for item in preview["time_components"] if item["id"] == "arrivals_pending")
-    assert drain["upper_bound"] is True
-    assert drain["low_seconds"] == 0
-    assert preview["estimated_low_seconds"] == .2  # No recorded minimum in this legacy cohort.
-    previous = await runner.run_suite(configured)
-    summary = latency_summary(previous)
-    measured = {target["name"]: target["measurements"] for target in summary["targets"]}
-    preview = request_plan(configured, observations=measured)
-    report = await runner.run_suite(configured)
-    assert len(report.requests) == 6
-    assert preview["estimated_low_seconds"] <= report.observations["inference_duration_seconds"] <= preview["estimated_high_seconds"]
+    from giraffe.load_test import execute
+    from giraffe.runner import _Run
+    from tests.test_load_test_phase_a import Client
+    from tests.test_planning import load_config
+    configured = load_config(duration=1, finish=.2, rates=[25], concurrency=1)
+    preview = request_plan(configured)
+    assert preview["unknown_time_components"] == []
+    assert preview["estimated_low_seconds"] == 1
+    assert preview["estimated_high_seconds"] == 1.2
+    configured.load_test.schedule.duration_seconds = .1
+    run = _Run(configured, None, None)
+    observation = await execute(run, configured.targets[0], Client((.005,)))
+    point = observation["points"][0]
+    assert point["local_drops"] == point["not_sent"] == 0
+    assert point["dispatched"] == point["scheduled"] == 3
+    assert not any(item["id"] == "arrivals_pending" for item in preview["time_timeline"])
 
 
 def test_logprob_consistency_uses_exact_nonstream_fixture_observations():

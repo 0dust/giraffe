@@ -92,11 +92,11 @@ def test_capabilities_publish_every_schema_bound():
             visit(node["additionalProperties"], path + ".*")
 
     visit(schema)
-    assert limits["concurrent_load.schedule.levels"]["items"]["maximum"] == 512
+    assert limits["load_test.patterns.concurrent.levels"]["items"]["maximum"] == 512
     assert limits["consistency.levels"]["items"]["maximum"] == 512
     assert limits["judging.concurrency"]["maximum"] == 512
     assert limits["sessions.concurrency"]["maximum"] == 512
-    assert limits["traffic.planned_arrivals"]["maximum"] == 100000
+    assert limits["load_test.planned_arrivals"]["maximum"] == 100000
     from giraffe import caps
     for name, maximum in vars(caps).items():
         if name.startswith("MAX_"):
@@ -126,13 +126,17 @@ def test_arrival_and_session_decisions():
     from giraffe.planning import request_plan
 
     assert Arrival(requests=10000, burst_size=1024, max_pending=256).burst_size == 1024
-    plan = request_plan(RunConfig(targets=[TARGET], checks=["arrivals"], arrivals={
+    # Legacy bursts load under their old safety settings; the merged run uses
+    # the global admission ceiling and reports drops without a pending queue.
+    config = RunConfig(targets=[TARGET], checks=["arrivals"], arrivals={
         "mode": "burst", "requests": 1024, "burst_size": 1024,
-        "max_in_flight": 512, "max_pending": 256}))
-    warning = next(row for row in plan["concurrency_warnings"]
-                   if "arrivals.burst_size" in row["fields"])
-    assert warning["values"]["dropped"] == 256
-    assert "dropped locally" in warning["msg"] and not plan["errors"]
+        "max_in_flight": 512, "max_pending": 256})
+    assert config.checks == ["load"]
+    assert config.load_test.patterns.bursts.size == 1024
+    plan = request_plan(config)
+    assert plan['load_test']['expected_scheduled_requests'] == 1024
+    assert any('max_pending' in note and 'no pending queue' in note for note in config._migration_notes)
+    assert not plan['errors']
     for field, value in (("requests", 10001), ("burst_size", 1025), ("max_pending", 257)):
         with pytest.raises(ValidationError):
             Arrival(**{field: value})

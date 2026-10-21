@@ -41,34 +41,32 @@ def test_inherited_parallelism_notices_and_explicit_overlap_warning():
 
 def test_legacy_omissions_and_explicit_concurrency_preserve_parallelism():
     migrated, notes = migrate_run_limits({'targets': [TARGET]})
-    assert len(notes) == 4
+    assert len(notes) == 3
     assert all(migrated[field] is None for field in ('concurrency', 'max_requests', 'max_duration_seconds'))
     migrated, notes = migrate_run_limits({'targets': [TARGET], 'checks': ['correctness'], 'concurrency': 40,
                                         'max_requests': None, 'max_duration_seconds': 17})
     assert migrated['default_concurrency'] == 40 and len(notes) == 1
     assert migrated['max_duration_seconds'] == 17
-    assert RunConfig(**migrated).effective_traffic().max_in_flight == 40
+    assert RunConfig(**migrated).effective_check('correctness')['concurrency'] == 40
 
 
 def test_arrivals_capacity_and_own_load_profile_defaults():
-    config = RunConfig(targets=[TARGET], checks=['arrivals', 'capacity', 'concurrency'],
-                       default_concurrency=8, max_output_tokens=1)
-    assert config.effective_arrivals().max_in_flight == 8
-    assert config.effective_traffic().max_in_flight == 8
-    assert config.concurrent_load.schedule.levels == [1, 4]
-    assert config.concurrent_load.profile.long.output_tokens == 128
-    assert required_concurrency(config)['peak'] == 8
+    config = RunConfig(targets=[TARGET], checks=['load'], default_concurrency=8, max_output_tokens=1)
+    assert config.load_test.patterns.concurrent.levels == [1, 4]
+    assert config.load_test.profile.long.output_tokens == 512
+    assert required_concurrency(config)['peak'] == 120
+    assert config.load_test.patterns.constant.enabled
 
 
 @pytest.mark.parametrize('check,setting,field', [
     ('correctness', {'test_options': {'correctness': {'concurrency': 64}}}, 'test_options.correctness.concurrency'),
     ('json', {'test_options': {'json': {'concurrency': 64}}}, 'test_options.json.concurrency'),
     ('recovery', {'test_options': {'recovery': {'concurrency': 64}}}, 'test_options.recovery.concurrency'),
-    ('capacity', {'traffic': {'max_in_flight': 64}}, 'traffic.max_in_flight'),
-    ('arrivals', {'arrivals': {'max_in_flight': 64}}, 'arrivals.max_in_flight'),
+    ('load', {'load_test': {'patterns': {'concurrent': {'levels': [64]}}}}, 'load_test.patterns.concurrent.levels'),
+    ('load', {'load_test': {'patterns': {'bursts': {'enabled': True, 'size': 64, 'first_seconds': 0}}}}, 'load_test.patterns.bursts.size'),
     ('sessions', {'sessions': {'concurrency': 8}}, 'sessions.concurrency'),
     ('consistency', {'consistency': {'levels': [1, 64]}}, 'consistency.levels'),
-    ('concurrency', {'concurrent_load': {'schedule': {'levels': [64]}}}, 'concurrent_load.schedule.levels'),
+    ('load', {'load_test': {'patterns': {'concurrent': {'levels': [64]}}}}, 'load_test.patterns.concurrent.levels'),
 ])
 def test_all_explicit_check_conflicts_name_the_setting(check, setting, field):
     ceiling = 4 if check == 'sessions' else 40
@@ -78,7 +76,7 @@ def test_all_explicit_check_conflicts_name_the_setting(check, setting, field):
     assert context['fields'] == [field, 'concurrency']
     assert context['values']['concurrency'] == ceiling
     assert context['values'][field] == ([1, 64] if check == 'consistency' else
-                                       [64] if check == 'concurrency' else
+                                       [64] if field.endswith('levels') else
                                        8 if check == 'sessions' else 64)
 
 
@@ -91,6 +89,12 @@ def test_all_explicit_check_conflicts_name_the_setting(check, setting, field):
 def test_explicit_overlap_work_is_preserved_with_a_warning(check, setting):
     config = RunConfig(targets=[TARGET, {**TARGET, 'name': 'two'}], checks=[check],
                        concurrency=4, overlap_models=True, **setting)
+    if check in {'capacity', 'arrivals'}:
+        assert config.checks == ['load']
+        assert required_concurrency(config)['per_target_peak'] == 4
+        assert config.concurrency == 4
+        assert any('max_in_flight dropped' in note for note in config._migration_notes)
+        return
     assert required_concurrency(config)['per_target_peak'] == 4
     assert len(config.concurrency_notices()) == 1
     message = config.concurrency_notices()[0]['msg']
@@ -101,21 +105,22 @@ def test_explicit_overlap_work_is_preserved_with_a_warning(check, setting):
 
 def test_concurrent_load_overlap_blocks_even_when_minimum_inherited_level_cannot_fit():
     with pytest.raises(ValidationError) as error:
-        RunConfig(targets=[TARGET, {**TARGET, 'name': 'two'}], checks=['concurrency'],
+        RunConfig(targets=[TARGET, {**TARGET, 'name': 'two'}], checks=['load'],
                   concurrency=1, overlap_models=True)
-    assert error.value.errors()[0]['ctx']['fields'] == ['concurrent_load.schedule.levels', 'concurrency']
+    assert error.value.errors()[0]['ctx']['fields'] == ['load_test.patterns.concurrent.levels', 'concurrency']
 
 
-@pytest.mark.parametrize('check', ['sessions', 'consistency', 'concurrency'])
+@pytest.mark.parametrize('check', ['sessions', 'consistency', 'load'])
 def test_inherited_settings_round_trip_and_restore_after_raising_limit(check):
-    config = RunConfig(targets=[TARGET], checks=[check], concurrency=1)
+    config = RunConfig(targets=[TARGET], checks=[check], concurrency=1,
+        **({'load_test': {'patterns': {'constant': {'enabled': False}}}} if check == 'load' else {}))
     restored = RunConfig.model_validate(config.model_dump())
     assert restored == config
     assert restored.concurrency_notices() == config.concurrency_notices()
     values = restored.model_dump()
     values['concurrency'] = 16
     raised = RunConfig.model_validate(values)
-    assert required_concurrency(raised)['peak'] == (4 if check == 'concurrency' else 2)
+    assert required_concurrency(raised)['peak'] == (4 if check == 'load' else 2)
     assert raised.concurrency_notices() == []
 
 
@@ -158,9 +163,9 @@ def test_legacy_overlap_fixture_preserves_per_endpoint_work():
     assert config.concurrency == config.default_concurrency == 40
     assert all(config.effective_check(check)['concurrency'] == 40
                for check in ('correctness', 'json', 'recovery'))
-    assert config.effective_arrivals().max_in_flight == 40
-    assert config.effective_traffic().max_in_flight == 40
-    assert len(config.concurrency_notices()) == 5
+    assert config.checks.count('load') == 1
+    assert len(config.load_test.migrated_tests) == 1
+    assert len(config.concurrency_notices()) == 3
     reloaded = RunConfig.model_validate(config.model_dump())
     assert required_concurrency(reloaded)['peak'] == 80
 

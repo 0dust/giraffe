@@ -187,14 +187,17 @@ def _pack_summary(config: RunConfig, stages: list[dict[str, Any]]) -> dict[str, 
         base, extra = divmod(config.max_requests, len(config.targets))
         quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
     judge_ids = {case.fixture_id for case in cases if case.scorer == "judge"}
-    planned_judged = len(judge_ids) + sum(
+    planned_judged = (len(judge_ids) if quiet else 0) + sum(
         sum(stage["counts"].get(case_id, 0) for case_id in judge_ids) for stage in stages)
     load_plan = None
     if "load" in config.checks and active_pack(config):
         from giraffe.load_test import load_time_plan
         load_plan = load_time_plan(config.load_test)
         planned += load_plan["expected_scheduled_requests"]
-        planned_judged += math.ceil(load_plan["expected_scheduled_requests"] * len(judge_ids)/max(1,len(cases)))
+        # Random weighted selection can choose a judged case on every offer.
+        # A proportional expectation is not a safe evaluator-call upper bound.
+        if judge_ids:
+            planned_judged += load_plan["expected_scheduled_requests"]
     judge_count = len(config.judging.judges) if judge_ids else 0
     readiness_errors = []
     if judge_ids:

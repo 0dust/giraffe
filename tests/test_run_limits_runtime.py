@@ -65,10 +65,14 @@ def test_check_config_copies_effective_parallelism_never_ceiling():
 
 
 def test_condition_parameters_use_effective_inflight_values():
-    configured = RunConfig(targets=[TARGET], checks=["arrivals", "capacity"], concurrency=40,
-                           default_concurrency=3, arrivals={"max_in_flight": 2})
-    assert condition_for("arrival", {}, configured)["parameters"]["concurrency"] == 2
-    assert condition_for("traffic_stage_0", {}, configured)["parameters"]["concurrency"] == 3
+    from tests.test_planning import load_config
+    from giraffe.load_test import test_points
+    configured = load_config(concurrent=True, concurrency=40, default_concurrency=3)
+    configured.load_test.patterns.concurrent.levels = [2]
+    point = next(p for p in test_points(configured.load_test) if p["pattern"] == "concurrent")
+    condition = condition_for(point["id"], {}, configured, request_parameters={"concurrency": point["level"]})
+    assert condition["check"] == "load"
+    assert condition["parameters"]["concurrency"] == 2
 
 
 def test_http_client_uses_same_explicit_connection_and_keepalive_limits(monkeypatch):
@@ -100,11 +104,16 @@ async def test_all_limits_unset_completes_finite_checks(client):
 
 @pytest.mark.parametrize("ceiling,expected", [(None, 6), (4, 4)])
 async def test_mixed_overlap_peak_stays_inside_required_slot_pool(client, ceiling, expected):
-    configured = RunConfig(targets=[TARGET, {**TARGET, "name": "two"}],
-                           checks=["correctness", "arrivals"], overlap_models=True,
-                           concurrency=ceiling, default_concurrency=1,
-                           test_options={"correctness": {"concurrency": 3}},
-                           arrivals={"requests": 4, "requests_per_second": 1000, "max_in_flight": 2})
+    from tests.test_planning import load_config
+    # One maintained group and finite correctness share one global slot pool.
+    configured = load_config(concurrent=True, concurrency=ceiling, default_concurrency=1,
+        targets=[TARGET, {**TARGET, "name": "two"}], overlap_models=True,
+        test_options={"correctness": {"concurrency": 3}})
+    configured.request_source = "generated"
+    configured.request_pack = None
+    configured.load_test.patterns.constant.enabled = False
+    configured.load_test.schedule.duration_seconds = .04
+    configured.checks = ["correctness", "load"]
     assert required_concurrency(configured)["peak"] == 6
     assert runner._Run(configured, None, None).slots.maxsize == expected
     report = await runner.run_suite(configured)
@@ -114,13 +123,15 @@ async def test_mixed_overlap_peak_stays_inside_required_slot_pool(client, ceilin
 
 
 async def test_arrivals_own_inflight_bound_is_smaller_than_shared_pool(client):
-    configured = RunConfig(targets=[TARGET], checks=["correctness", "arrivals"], default_concurrency=4,
-                           arrivals={"requests": 8, "requests_per_second": 1000, "max_in_flight": 2})
+    from giraffe.load_test import admission_limit, execute
+    from tests.test_planning import load_config
+    configured = load_config(duration=1, rates=[1000], concurrency=2, default_concurrency=4)
+    configured.load_test.schedule.duration_seconds = .02
     run = runner._Run(configured, None, None)
-    assert run.slots.maxsize == 4
-    target = configured.targets[0]
-    await workloads.arrivals(run, target, client(target, configured, max_connections=4), builtin_fixtures(configured))
-    assert len(run.records) == 8
+    assert run.slots.maxsize == admission_limit(configured, configured.load_test) == 2
+    await execute(run, configured.targets[0], client(configured.targets[0], configured, max_connections=2))
+    point = run.observations[configured.targets[0].name]["load_test"]["points"][0]
+    assert point["local_drops"] > 0
     assert client.peak == 2
 
 
@@ -152,13 +163,16 @@ async def test_recovery_unlimited_allowance_prime_and_effective_windows(client):
 
 
 async def test_concurrent_load_unlimited_allowance_ends_at_own_window():
-    configured = short_windows(configuration(max_requests=None, max_duration_seconds=None))
-    run, check, _, _ = await perform(configured, Client())
-    result = point(check)
-    assert result["request_allowance"] is None
-    assert result["sent"] >= 2
-    assert result["window_reason"] != "point request allowance used"
+    from giraffe.load_test import execute
+    from tests.test_load_test_phase_a import Client, config as load_configuration
+    configured = load_configuration()
+    configured.load_test.schedule.duration_seconds = .04
+    run = runner._Run(configured, None, None)
+    result = (await execute(run, configured.targets[0], Client()))["points"][0]
+    assert result["dispatched"] >= 2
+    assert not result["cut_short"]
     assert math.isinf(run.deadline)
+    assert run.remaining("local") is None
 
 
 def test_load_budget_remedies_are_silent_when_limits_unset():

@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from giraffe.cli import configuration, main, migrated_configuration, parser
-from giraffe.models import RunReport
+from giraffe.models import RunConfig, RunReport
 
 
 TARGET = {"name": "local", "url": "http://localhost", "model": "tiny"}
@@ -88,25 +88,31 @@ def test_a19_explicit_null_is_not_set_without_notes(capsys):
 
 
 def test_a19_legacy_concurrency_preserves_arrival_and_capacity_parallelism(capsys):
+    from giraffe.load_test import admission_limit
     config = migrated_configuration({"targets": [TARGET], "checks": ["arrivals", "capacity"],
                                     "arrivals": {}, "concurrency": 40,
                                     "max_requests": 300, "max_duration_seconds": 300})
     assert config.concurrency == config.default_concurrency == 40
-    assert config.effective_arrivals().max_in_flight == 40
-    assert config.effective_traffic().max_in_flight == 40
-    assert len(config._migration_notes) == 1
-    assert capsys.readouterr().err == (
-        "Migration: concurrency: 40 now limits simultaneous requests; default_concurrency=40; "
-        "Scheduled arrivals, Arrival traffic capacity retain legacy 40-request parallelism.\n")
+    assert config.checks == ['load']
+    assert admission_limit(config, config.load_test) == 40
+    assert len(config.load_test.migrated_tests) == 1
+    capacity = config.load_test.migrated_tests[0]
+    assert capacity.source == 'capacity'
+    assert admission_limit(config, capacity.settings) == 40
+    assert config.load_test.patterns.constant.enabled
+    assert capacity.settings.patterns.rates == [1, 2, 4]
+    assert any('retain legacy 40-request parallelism' in note for note in config._migration_notes)
+    stderr = capsys.readouterr().err
+    assert all('Migration: ' + note in stderr for note in config._migration_notes)
 
 
 def test_a19_d2_runs_before_load_migration_without_imposing_300_second_limit():
     config = migrated_configuration({"targets": [TARGET], "checks": ["buckets"],
                                     "buckets": {"levels": list(range(1, 17))}})
     assert config.max_duration_seconds is None and config.concurrency is None
-    assert config.concurrent_load.schedule.duration_seconds == 15
-    assert config.concurrent_load.schedule.levels == [1, 2, 3, 4]
-    assert "concurrency" in config.checks
+    assert config.load_test.schedule.duration_seconds == 15
+    assert config.load_test.patterns.concurrent.levels == [1, 2, 3, 4]
+    assert "load" in config.checks
     assert not any("duration reduced" in note or "cannot fit" in note for note in config._migration_notes)
 
 
@@ -186,4 +192,6 @@ def test_validation_suite_keeps_legacy_compatible_configs_valid(identifier):
     assert config.default_concurrency == config.concurrency == scenario["concurrency"]
     assert config.max_requests == values["max_requests"]
     assert config.max_duration_seconds == values["max_duration_seconds"]
-    assert config.checks == values["checks"]
+    assert config.checks == list(dict.fromkeys("load" if check in {"capacity", "arrivals", "concurrency"} else check for check in values["checks"]))
+    assert config._migration_notes
+    assert RunConfig.model_validate(config.model_dump()).model_dump() == config.model_dump()

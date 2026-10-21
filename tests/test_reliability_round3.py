@@ -289,31 +289,19 @@ async def test_consistency_summary_discloses_incorrect_answers(monkeypatch):
 
 
 @pytest.mark.parametrize('threshold,wait,achieved', [(None, 17, True), (10, 17, False), (50, 60, False)])
-async def test_arrivals_dispatch_wait_tolerance(threshold, wait, achieved):
-    arrival = {'mode': 'burst', 'requests': 16, 'burst_size': 16, 'max_pending': 16}
-    if threshold is not None:
-        arrival['max_client_wait_ms'] = threshold
-    configured = config(arrivals=arrival)
-    target = configured.targets[0]
-    run = SimpleNamespace(config=configured, records=[], start=time.monotonic(),
-        deadline=time.monotonic() + 2, observations={target.name: {}}, allowed=lambda _: True,
-        start_condition=lambda *args, **kwargs: None, finish_condition=lambda *args, **kwargs: None)
-
-    async def request(target, client, spec, on_start):
-        on_start()
-        run.records.append(record(spec, '4', target=target.name, client_wait_ms=wait))
-
-    conditions, finished = [], []
-    run.start_condition = lambda *args: conditions.append(args)
-    run.finish_condition = lambda *args, **kwargs: finished.append((args, kwargs))
-    run.request = request
-    await workloads.arrivals(run, target, None, builtin_fixtures(configured))
-    assert conditions == [(target.name, "arrival", {"requests_per_second": configured.arrivals.requests_per_second}, 16)]
-    assert finished == [((target.name, "arrival", {"requests_per_second": configured.arrivals.requests_per_second}), {"reason": None})]
-    observation = run.observations[target.name]['arrivals']
-    assert observation['issued'] == 16
-    assert observation['configured_rate_achieved'] is achieved
-    assert observation['client_wait_threshold_ms'] == (threshold if threshold is not None else 50)
+async def test_arrivals_dispatch_wait_tolerance(threshold,wait,achieved):
+    from giraffe import load_test
+    from tests.test_concurrent_load import configuration
+    from tests.test_load_executor_regressions import record as load_record
+    c=configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[16]},'pass_criteria':{'max_first_answer_ms':None,'max_completion_ms':threshold if threshold is not None else 1000}})
+    run=runner._Run(c,None,None); p=load_test.test_points(c.load_test)[0]
+    p.update(sending_start_ms=0,sending_end_ms=1000,delivered_window_seconds=1,observation_seconds=1,cut_short=False,not_run=False)
+    rows=[load_record(str(i),arrival_elapsed_ms=wait+2,arrival_first_output_ms=wait+1,dispatch_lag_ms=wait,load_point={'shape':'short_short'}) for i in range(16)]
+    load_test.assess_point(run,c.targets[0],c.load_test,p,rows)
+    assert p['dispatched'] == 16
+    assert (p['status'] == 'pass') is achieved
+    assert p['groups'][0]['timing_clock'] == 'planned arrival (includes dispatch delay)'
+    assert p['groups'][0]['dispatch_delay_ms']['median'] == wait
 
 
 @pytest.mark.parametrize('tokens,stream,missing', [(1, True, False), (2, True, False),
@@ -325,20 +313,22 @@ def test_single_chunk_gap_is_inapplicable_only_for_known_short_stream(tokens, st
 
 
 @pytest.mark.parametrize('tokens,expected', [(2, 'pass'), (3, 'inconclusive')])
-async def test_capacity_single_chunk_gap_qualification(monkeypatch, tokens, expected):
-    class Client(FakeClient):
-        async def execute(self, spec, **kwargs):
-            result = await super().execute(spec, **kwargs)
-            result.completion_tokens, result.answer_chunks, result.max_stream_gap_ms = tokens, 1, None
-            result.answer_reads = 1
-            return result
-
-    monkeypatch.setattr(runner, 'LLMClient', Client)
-    outcome = check(await runner.run_suite(config(checks=['capacity'],
-        traffic={'rates': [20], 'duration_seconds': .2,
-                 'mix': {'short': 1, 'long_input': 0, 'long_output': 0}},
-        limits=Limits(min_samples=2, first_output_ms=1000, stream_gap_ms=50))), 'capacity')
+async def test_capacity_single_chunk_gap_qualification(monkeypatch,tokens,expected):
+    from giraffe import load_test
+    from tests.test_concurrent_load import Client as TokenClient,configuration,short_windows
+    class Client(TokenClient):
+        async def execute(self,spec,**kwargs):
+            r=await super().execute(spec,**kwargs)
+            r.completion_tokens,r.output_tokens,r.answer_chunks,r.max_stream_gap_ms=tokens,tokens,1,None
+            r.answer_reads=1
+            return r
+    c=short_windows(configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[20]},'pass_criteria':{'max_first_answer_ms':1000,'max_stream_pause_ms':50}}),.2)
+    run=runner._Run(c,None,None)
+    await load_test.execute(run,c.targets[0],Client())
+    outcome=load_test.result(run,c.targets[0])
     assert outcome.status == expected
+    g=outcome.metrics['points'][0]['groups'][0]
+    assert ('stream_gap_ms' in g['missing_timing']) is (tokens > 2)
 
 
 @pytest.mark.parametrize('tag', ['think', 'thinking', 'reasoning', 'ThInK'])

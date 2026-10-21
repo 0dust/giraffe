@@ -6,15 +6,16 @@ import yaml
 
 from giraffe.caps import MAX_SIMULTANEOUS_REQUESTS
 from giraffe.cli import main
-from giraffe.models import Deployment, RunConfig, migrate_concurrent_load, migrate_run_limits
+from giraffe.models import Deployment, RunConfig, migrate_concurrent_load, migrate_load_test, migrate_run_limits
 from tests.test_concurrent_load import TARGET, configuration
 
 
 def load_saved(value):
     value, limit_notes = migrate_run_limits(value)
     value, load_notes = migrate_concurrent_load(value)
+    value, combined_notes = migrate_load_test(value)
     config = RunConfig.model_validate(value)
-    config._migration_notes = [*limit_notes, *load_notes]
+    config._migration_notes = list(dict.fromkeys([*limit_notes, *load_notes, *combined_notes, *config._migration_notes]))
     return config
 
 
@@ -35,15 +36,16 @@ def test_migration_notes_actual_values_and_no_input_mutation(source, old_value, 
     migrated, notes = migrate_concurrent_load(limited)
     assert json.dumps(values) == before
     config = load_saved(values)
-    assert config._migration_notes == [*limit_notes, *notes]
+    _, combined_notes = migrate_load_test(migrated)
+    assert config._migration_notes == list(dict.fromkeys([*limit_notes, *notes, *combined_notes]))
     assert fragment in '\n'.join(notes)
-    assert config.concurrent_load.mixed.enabled is False
+    assert config.load_test.workloads.mixed.enabled is False
     assert 'concurrent_workloads' not in config.model_dump() and 'buckets' not in config.model_dump()
     assert not load_saved(config.model_dump())._migration_notes
     if source == 'stress_cases':
-        assert config.concurrent_load.stress.large_output and not config.concurrent_load.stress.large_input
+        assert config.load_test.workloads.stress.cases == ['short_long']
     if source == 'levels':
-        assert config.concurrent_load.interference.enabled
+        assert config.load_test.workloads.interference.enabled
 
 
 @pytest.mark.parametrize('scenario', ['streaming_fairness', 'mixed_interference'])
@@ -51,8 +53,8 @@ def test_migration_notes_actual_values_and_no_input_mutation(source, old_value, 
 def test_interference_migration_never_produces_invalid_allocation(scenario, stream, levels, enabled):
     c = load_saved({'targets': [TARGET], 'checks': ['concurrency'], 'stream': stream,
         'concurrent_workloads': {'scenarios': [scenario], 'levels': levels}})
-    assert c.concurrent_load.interference.enabled is enabled
-    assert ('concurrency' in c.checks) is enabled
+    assert c.load_test.workloads.interference.enabled is enabled
+    assert ('load' in c.checks) is enabled
     text = ' '.join(c._migration_notes)
     assert '2 concurrent requests' in text
     if not enabled:
@@ -71,7 +73,8 @@ def test_legacy_limits_and_options_are_explicitly_dropped(field, actual):
     assert f'limits.{field}={actual}' in notes
     assert 'test_options.concurrency.samples=17' in notes and 'test_options.concurrency.limits.first_output_ms=10' in notes
     assert c.test_options == {}
-    assert c.concurrent_load.pass_criteria.first_output_p95_ms is None
+    assert c.load_test.pass_criteria.max_first_answer_ms == 2000
+    assert c.load_test.pass_criteria.max_completion_ms == 30000
     if field in ('stream_gap_ms', 'min_output_tokens_per_second'):
         assert 'no replacement criterion here' in notes and 'other checks as before' in notes
 
@@ -79,13 +82,14 @@ def test_legacy_limits_and_options_are_explicitly_dropped(field, actual):
 def test_disabled_block_stays_disabled_and_absent_checks_preserve_legacy_default():
     values = {'targets': [TARGET], 'concurrent_workloads': {}}
     default = load_saved(values)
-    assert default.concurrent_load.combinations.selected == list(__import__('giraffe.models', fromlist=['SHAPES']).SHAPES)
-    assert default.concurrent_load.stress.enabled
-    assert not default.concurrent_load.interference.enabled
+    assert default.load_test.workloads.combinations.selected == list(__import__('giraffe.models', fromlist=['SHAPES']).SHAPES)
+    assert default.load_test.workloads.stress.enabled
+    assert not default.load_test.workloads.interference.enabled
     disabled = load_saved({**values, 'checks': ['serving']})
     assert disabled.checks == ['serving'] and disabled._migration_notes
     advanced = load_saved({**values, 'concurrent_workloads': {'input_token_tolerance': .2, 'calibration_attempts': 4}})
-    assert advanced.concurrent_load.input_token_tolerance == .2 and advanced.concurrent_load.calibration_attempts == 4
+    assert advanced.load_test.input_token_tolerance == .1 and advanced.load_test.calibration_attempts == 3
+    assert any('input_token_tolerance' in note and 'calibration_attempts' in note for note in advanced._migration_notes)
 
 
 @pytest.mark.parametrize('changes,checks,note', [
@@ -97,12 +101,12 @@ def test_disabled_block_stays_disabled_and_absent_checks_preserve_legacy_default
 ])
 def test_migration_bounds_settings_or_turns_off_unrunnable_load(changes, checks, note):
     c = load_saved({'targets': [TARGET], 'checks': ['buckets', 'concurrency'], 'concurrent_workloads': {}, **changes})
-    assert c.checks == checks and note in c._migration_notes
+    assert c.checks == ['load' if check == 'concurrency' else check for check in checks] and note in c._migration_notes
     if not checks:
         assert 'Concurrent load unselected because no migrated load type can run with these settings.' in c._migration_notes
     else:
-        assert c.concurrent_load.schedule.levels == ([1] if changes.get('concurrency') == 1 else [1, 2])
-        assert c.concurrent_load.profile.long.output_tokens == (8 if changes.get('max_output_tokens') == 8 else 96)
+        assert c.load_test.patterns.concurrent.levels == ([1] if changes.get('concurrency') == 1 else [1, 2])
+        assert c.load_test.profile.long.output_tokens == (8 if changes.get('max_output_tokens') == 8 else 96)
 
 
 def test_legacy_fixture_and_validation_configs_load_with_expected_notes():
@@ -186,7 +190,10 @@ def test_unrunnable_legacy_default_keeps_automatic_check_selection(arrivals):
     values = {'targets': [TARGET], 'concurrent_workloads': {'scenarios': ['streaming_fairness']},
         'structured_json': True, 'arrivals': arrivals}
     config = load_saved(values)
-    assert config.checks == [*[check for check in DEFAULT_CHECKS if check != 'concurrency'], 'json', 'arrivals']
+    # The unrunnable old stream comparison cannot hide independent arrivals.
+    assert config.checks == [*[check for check in DEFAULT_CHECKS if check != 'load'], 'json', 'load']
+    assert config.load_test.workloads.combinations.selected == ['short_short']
+    assert config.load_test.patterns.constant.enabled
     assert any('streaming_fairness ran at 2 concurrent requests; interference left off' in note for note in config._migration_notes)
     assert any('Concurrent load unselected because no migrated load type can run' in note for note in config._migration_notes)
 
@@ -199,8 +206,15 @@ def test_migration_accepts_nullable_sustained_duration_and_workload_models(model
         arrivals, traffic = Arrival(**arrivals), TrafficConfig(**traffic)
     config = load_saved(dict(targets=[TARGET], checks=['capacity', 'recovery', 'arrivals', 'concurrency'],
         sustained_seconds=None, arrivals=arrivals, traffic=traffic, concurrent_workloads={}))
-    assert config.sustained_seconds == 5 and config.arrivals.requests == 2
-    assert config.traffic.rates == [1]
+    assert config.sustained_seconds == 5
+    assert config.checks == ['load', 'recovery']
+    assert config.load_test.patterns.rates == [1]
+    assert config.load_test.schedule.duration_seconds == 1
+    assert [test.source for test in config.load_test.migrated_tests] == ['arrivals', 'concurrency']
+    arrivals_test = config.load_test.migrated_tests[0].settings
+    assert arrivals_test.workloads.combinations.selected == ['short_short']
+    assert arrivals_test.patterns.constant.enabled
+    assert arrivals_test.schedule.duration_seconds == 2
 
 
 @pytest.mark.parametrize('sustained,status', [(None, 200), ('not-a-number', 422)])
@@ -270,8 +284,8 @@ def test_valid_legacy_values_above_global_limits_preserve_old_bounding(field):
     assert 'levels=[3] moved to schedule.levels=[2] (bounded by Limit simultaneous requests).' in notes
     assert 'output_tokens.long=256 copied to profile.long.output_tokens=128; clipped to max_output_tokens=128.' in notes
     config = RunConfig.model_validate(migrated)
-    assert config.concurrent_load.schedule.levels == [2]
-    assert config.concurrent_load.profile.long.output_tokens == 128
+    assert config.load_test.patterns.concurrent.levels == [2]
+    assert config.load_test.profile.long.output_tokens == 128
 
 
 @pytest.mark.parametrize('field,settings', [('buckets', {'output_tokens': {'short': 16, 'medium': 48, 'long': 'wrong'}}),

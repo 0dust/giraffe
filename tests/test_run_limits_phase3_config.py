@@ -17,8 +17,15 @@ def config(**updates):
 
 
 @pytest.mark.parametrize("check", ["serving", "first_output", "generation", "context", "correctness",
-                                  "json", "cancellation", "recovery", "capacity", "arrivals", "consistency", "tools"])
+                                  "json", "cancellation", "recovery", "load", "consistency", "tools"])
 def test_per_check_request_settings_can_exceed_suite_defaults(check):
+    if check == "load":
+        configured = config(checks=[check], max_output_tokens=16, request_timeout_seconds=1,
+            load_test={"profile": {"long": {"output_tokens": 1024}}, "request_timeout_seconds": 7})
+        assert configured.load_test.profile.long.output_tokens == 1024
+        assert configured.load_test.request_timeout_seconds == 7
+        assert RunConfig.model_validate(configured.model_dump()).load_test == configured.load_test
+        return
     configured = config(checks=[check], max_output_tokens=16, request_timeout_seconds=1,
                         test_options={check: {"max_output_tokens": 64, "request_timeout_seconds": 7}})
     effective = configured.effective_check(check)
@@ -52,8 +59,19 @@ def test_endpoint_response_owns_warm_samples_and_shared_request_settings():
     assert first["max_output_tokens"] == 256 and first["request_timeout_seconds"] == 60
 
 
-@pytest.mark.parametrize("check", ["arrivals", "prefix", "sessions", "consistency", "tools"])
+@pytest.mark.parametrize("check", ["load", "prefix", "sessions", "consistency", "tools"])
 def test_extended_pass_criteria_inventory_is_derived_from_actual_verdicts(check):
+    if check == "load":
+        from giraffe.models import ResponseCriteria
+        expected = {"max_first_answer_ms", "max_completion_ms", "max_error_percent",
+            "min_correct_percent", "max_stream_pause_ms", "min_generation_tokens_per_second", "min_valid_responses"}
+        assert set(ResponseCriteria.model_fields) == expected
+        configured = config(checks=[check], limits={"latency_ms": 100},
+            load_test={"pass_criteria": {"max_completion_ms": 20, "min_valid_responses": 2}})
+        assert configured.load_test.pass_criteria.max_completion_ms == 20
+        assert configured.load_test.pass_criteria.min_valid_responses == 2
+        assert configured.limits.latency_ms == 100
+        return
     expected = {"first_output_ms", "latency_ms", "stream_gap_ms",
                 "min_output_tokens_per_second", "max_error_rate", "min_samples"}
     if check == "tools":
@@ -91,13 +109,23 @@ def test_pack_correctness_has_read_only_explanation_in_preview_plan_and_capabili
 
 
 def test_pack_case_cap_and_capacity_overrides_are_resolved_without_suite_clamp():
-    configured = pack_config([case("own", max_tokens=96), case("default")], max_output_tokens=16,
-                             request_timeout_seconds=1,
-                             test_options={"capacity": {"max_output_tokens": 64, "request_timeout_seconds": 5}})
-    specs = {spec.workload["case_id"]: spec for spec in pack_specs(configured)}
-    assert specs["own"].max_tokens == 96
-    assert specs["default"].max_tokens == 64
-    assert {spec.request_timeout_seconds for spec in specs.values()} == {5}
+    from giraffe.load_test import build_spec, test_points
+    from giraffe.runner import _Run
+
+    configured = config(checks=["load"], request_source="request_pack",
+        request_pack={"version": 1, "cases": [case("own", max_tokens=96), case("default")]},
+        max_output_tokens=16, request_timeout_seconds=1,
+        load_test={"request_timeout_seconds": 5})
+    run = _Run(configured, None, None)
+    point = test_points(configured.load_test)[0]
+    source_specs = {spec.workload["case_id"]: spec for spec in pack_specs(configured)}
+    for name, cap in (("own", 96), ("default", 16)):
+        run.pack_specs = [source_specs[name]]
+        spec = build_spec(run, configured.load_test, point, "short_short", {})
+        assert spec.max_tokens == cap
+        assert spec.request_timeout_seconds == 5
+        assert spec.messages == source_specs[name].messages
+        assert spec.expected == "A"
 
 
 def test_regression_threshold_is_baseline_metadata_and_not_workload_identity():
@@ -206,7 +234,7 @@ def test_load_migration_preserves_current_timeout_while_noting_only_legacy_overr
     assert values["test_options"]["concurrency"] == {"request_timeout_seconds": 90, "samples": 9}
     assert any("test_options.concurrency.samples=9 dropped" in note for note in notes)
     assert not any("test_options.concurrency.request_timeout_seconds" in note for note in notes)
-    assert RunConfig.model_validate(migrated).effective_check("concurrency")["request_timeout_seconds"] == 90
+    assert RunConfig.model_validate(migrated).load_test.request_timeout_seconds == 90
 
 
 def test_load_timeout_above_suite_default_survives_cli_save_and_reload(tmp_path, monkeypatch, capsys):
@@ -215,13 +243,13 @@ def test_load_timeout_above_suite_default_survives_cli_save_and_reload(tmp_path,
     from giraffe.cli import configuration, main, parser
     from giraffe.models import RunReport
 
-    initial = config(checks=["concurrency"], request_timeout_seconds=1,
-                     test_options={"concurrency": {"request_timeout_seconds": 90}})
+    initial = config(checks=["load"], request_timeout_seconds=1,
+                     load_test={"request_timeout_seconds": 90})
     source, saved = tmp_path / "input.json", tmp_path / "saved.json"
     source.write_text(initial.model_dump_json())
 
     async def run(configuration, **kwargs):
-        assert configuration.effective_check("concurrency")["request_timeout_seconds"] == 90
+        assert configuration.load_test.request_timeout_seconds == 90
         return RunReport(run_id="timeout", started_at="now", finished_at="now", overall="pass",
                          manifest={"config": configuration.model_dump(mode="json")})
 
@@ -230,9 +258,9 @@ def test_load_timeout_above_suite_default_survives_cli_save_and_reload(tmp_path,
                  "--output", str(tmp_path / "run")]) == 0
     assert "dropped" not in capsys.readouterr().err
     values = json.loads(saved.read_text())
-    assert values["test_options"]["concurrency"] == {"request_timeout_seconds": 90}
+    assert values["load_test"]["request_timeout_seconds"] == 90
     reloaded = configuration(parser().parse_args(["run", "--config", str(saved)]))
-    assert reloaded.effective_check("concurrency")["request_timeout_seconds"] == 90
+    assert reloaded.load_test.request_timeout_seconds == 90
     assert reloaded._migration_notes == []
     assert not capsys.readouterr().err
 
@@ -241,15 +269,15 @@ def test_load_timeout_above_suite_default_survives_cli_save_and_reload(tmp_path,
 async def test_load_timeout_above_suite_default_survives_web_round_trip(tmp_path, endpoint):
     from tests.test_web import browser
 
-    values = config(checks=["concurrency"], request_timeout_seconds=1,
-                    test_options={"concurrency": {"request_timeout_seconds": 90}}).model_dump(mode="json")
+    values = config(checks=["load"], request_timeout_seconds=1,
+                    load_test={"request_timeout_seconds": 90}).model_dump(mode="json")
     async with browser(tmp_path) as client:
         first = await client.post(f"/api/config/{endpoint}", json=values)
         assert first.status_code == 200, first.text
         result = first.json()
-        assert result["config"]["test_options"]["concurrency"] == {"request_timeout_seconds": 90}
+        assert result["config"]["load_test"]["request_timeout_seconds"] == 90
         assert result["migration_notes"] == []
-        assert result["request_plan"]["request_settings"]["concurrency"]["request_timeout_seconds"] == 90
+        assert result["request_plan"]["request_settings"]["load"]["request_timeout_seconds"] == 90
         second = await client.post(f"/api/config/{endpoint}", json=result["config"])
         assert second.status_code == 200, second.text
         assert second.json()["config"] == result["config"]

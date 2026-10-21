@@ -140,22 +140,21 @@ def test_seeded_variable_batch_ranges_cover_independent_runs(monkeypatch, case):
 
 
 @pytest.mark.parametrize("sigma", [0, .6])
-async def test_seeded_high_confidence_open_loop_ranges(monkeypatch, sigma):
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    config = RunConfig.model_validate({
-        "targets": [TARGET], "checks": ["capacity"], "request_timeout_seconds": .004,
-        "traffic": {"rates": [200], "duration_seconds": .04, "drain_timeout_seconds": .004},
-    })
-    results = []
-    for seed in range(20 if sigma else 5):
-        result, _, _, _ = await observed_range(config, seed=seed, milliseconds=1, sigma=sigma)
-        assert result["unknowns"] == 0
-        assert result["confidence"] == "high"
-        results.append(result)
-    assert sum(result["hit"] for result in results) >= math.ceil(.9 * len(results)), results
-    assert statistics.median(row["high"] / row["actual"] for row in results) <= 1.6, results
-    assert statistics.median(row["low"] / row["actual"] for row in results) >= .6, results
-
+def test_seeded_high_confidence_open_loop_ranges(monkeypatch, sigma):
+    async def scenario():
+        monkeypatch.setattr(runner, "LLMClient", FakeClient)
+        from tests.test_planning import load_config
+        config = load_config(duration=1, finish=.004, rates=[200], request_timeout_seconds=.004)
+        results = []
+        for seed in range(20 if sigma else 5):
+            result, _, _, _ = await observed_range(config, seed=seed, milliseconds=1, sigma=sigma)
+            assert result["unknowns"] == 0
+            assert result["confidence"] == "high"
+            results.append(result)
+        assert sum(result["hit"] for result in results) >= math.ceil(.9 * len(results)), results
+        assert statistics.median(row["high"] / row["actual"] for row in results) <= 1.6, results
+        assert statistics.median(row["low"] / row["actual"] for row in results) >= .6, results
+    run_virtual(monkeypatch, scenario())
 
 @pytest.mark.parametrize("samples", [6, 40, 100])
 async def test_sparse_observed_cohorts_cannot_claim_medium(monkeypatch, samples):

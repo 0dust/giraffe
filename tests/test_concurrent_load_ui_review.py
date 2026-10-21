@@ -5,7 +5,7 @@ from pydantic import TypeAdapter
 
 from giraffe.models import ConfigDraft, migrate_load_test, migrate_concurrent_load
 from giraffe.web import ConfigDraftInput, create_app
-from tests.test_concurrent_load import TARGET
+TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_results import run_render_checks
 

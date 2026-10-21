@@ -27,7 +27,7 @@ class Client:
 async def test_equal_inflight_entries_never_lose_records_or_leak_overlap():
     cfg = config()
     run = runner._Run(cfg, None, None)
-    spec = runner._spec(builtin_fixtures(cfg)["short"][0], "traffic_stage_0", ["capacity"])
+    spec = runner._spec(builtin_fixtures(cfg)["short"][0], "load_primary_test", ["load"])
     for _ in range(5):
         records = await asyncio.gather(*(run.request(cfg.targets[0], Client(), spec) for _ in range(8)))
         assert len(records) == 8
@@ -44,9 +44,9 @@ async def test_stress_errors_are_scoped_and_do_not_abort_later_checks():
             record = await super().execute(spec, **kwargs)
             record.status, record.valid, record.http_status = "timeout", False, None
             return record
-    spec = runner._spec(builtin_fixtures(cfg)["short"][0], "traffic_stage_0", ["capacity"])
+    spec = runner._spec(builtin_fixtures(cfg)["short"][0], "load_primary_test", ["load"])
     record = await run.request(cfg.targets[0], Failed(), spec)
-    assert record.check_ids == ["capacity"]
+    assert record.check_ids == ["load"]
     assert run.errors == 0 and run.stop_reason() is None
     assert await run.request(cfg.targets[0], Client(), runner._spec(spec, "warm"))
 
@@ -62,24 +62,34 @@ async def test_preheader_timeout_is_not_authentication_or_transport_failure():
 
 
 @pytest.mark.parametrize("acceptance,highest,non_monotonic", [
-    ([True, False, True], 1, True), ([False, True, True], None, True),
+    ([True, False, True], 4, True), ([False, True, True], 4, True),
     ([True, True, True], 4, False), ([False, False, False], None, False),
 ])
-def test_capacity_highest_rate_requires_contiguous_acceptance(acceptance, highest, non_monotonic):
-    cfg = config(checks=["capacity"], traffic={"rates": [1, 2, 4]})
-    run = runner._Run(cfg, None, None)
-    run.observations["t"]["capacity"] = [
-        {"rate_rps": rate, "accepted": accepted, "status": "pass" if accepted else "fail"}
-        for rate, accepted in zip([1, 2, 4], acceptance)]
-    result = next(c for c in runner._checks(run, cfg.targets[0]) if c.id == "capacity")
-    assert result.metrics["highest_acceptable_rate_rps"] == highest
-    assert result.metrics["non_monotonic_results"] is non_monotonic
+def test_capacity_highest_rate_requires_contiguous_acceptance(acceptance,highest,non_monotonic):
+    # Final #45 reports the highest tested passing point, not a monotonic proof.
+    from giraffe import load_test
+    from tests.test_concurrent_load import configuration
+    from tests.test_load_executor_regressions import record
+    cfg=configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1,2,4]}})
+    run=runner._Run(cfg,None,None)
+    points=load_test.test_points(cfg.load_test)
+    for p,accepted in zip(points,acceptance):
+        p.update(sending_start_ms=0,sending_end_ms=1000,delivered_window_seconds=1,observation_seconds=1,cut_short=False,not_run=False)
+        for i in range(2):
+            run.records.append(record(f'{p["rate"]}-{i}',score=accepted,arrival_elapsed_ms=35,arrival_first_output_ms=10,load_point={'point_id':p['id'],'shape':'short_short'}))
+        load_test.assess_point(run,cfg.targets[0],cfg.load_test,p,[r for r in run.records if r.load_point.get('point_id') == p['id']])
+    run.observations['local']['load_test']={'points':points}
+    result=load_test.result(run,cfg.targets[0])
+    assert [p['status']=='pass' for p in points] == acceptance
+    values=result.metrics['highest_accepted']
+    assert (values[0]['value'] if values else None) == highest
+    if values: assert values[0]['qualification'] == 'highest tested, not an absolute capacity limit'
 
 
 async def test_out_of_order_completions_during_refill_preserve_every_record():
     cfg = config()
     run = runner._Run(cfg, None, None)
-    fixture = runner._spec(builtin_fixtures(cfg)["short"][0], "traffic_stage_0", ["capacity"])
+    fixture = runner._spec(builtin_fixtures(cfg)["short"][0], "load_primary_test", ["load"])
     gates = [asyncio.Event() for _ in range(6)]
     started = [asyncio.Event() for _ in range(6)]
     class Controlled(Client):
@@ -166,30 +176,20 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
 
 
 async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch):
-    class Healthy(Client):
-        count = 0
-        def __init__(self, *args, max_connections=None):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def execute(self, spec, **kwargs):
-            index = type(self).count
-            type(self).count += 1
-            await asyncio.sleep(.004 + (index % 7) * .002)
-            return await super().execute(spec, **kwargs)
-    monkeypatch.setattr(runner, "LLMClient", Healthy)
-    cfg = config(checks=["capacity", "correctness"], concurrency=64,
-        test_options={"correctness": {"concurrency": 1}}, stop_after_errors=1,
-        traffic={"rates": [1000], "duration_seconds": .06, "max_in_flight": 64},
-        limits={"latency_ms": 200, "min_samples": 2})
-    report = await runner.run_suite(cfg)
-    stage = next(c for c in report.checks if c.id == "capacity").metrics["traffic_stages"][0]
-    assert stage["started"] == stage["completed"] == 60
-    assert stage["failed"] == stage["error_rate"] == 0
-    assert len(report.requests) == 63 and report.abort_reason is None
-    assert all(r.overlap == 1 for r in report.requests if r.scenario == "correctness_c1")
+    from tests.test_concurrent_load import configuration,short_windows,Client as TokenClient
+    class Healthy(TokenClient):
+        def __init__(self,*args,max_connections=None): super().__init__()
+        async def __aenter__(self): return self
+        async def __aexit__(self,*args): pass
+    monkeypatch.setattr(runner,'LLMClient',Healthy)
+    cfg=short_windows(configuration(checks=['load','correctness'],concurrency=64,max_requests=200,test_options={'correctness':{'concurrency':1}},load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.06)
+    report=await runner.run_suite(cfg)
+    p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
+    g=p['groups'][0]
+    assert p['scheduled'] == p['dispatched'] == g['completed'] == 60
+    assert g['failed'] == g['error_percent'] == 0
+    assert len(report.requests) == 67 and report.abort_reason is None
+    assert all(r.overlap == 1 for r in report.requests if r.scenario == 'correctness_c1')
 
 
 async def test_scorer_failure_preserves_attempt_record_and_clears_inflight(monkeypatch):

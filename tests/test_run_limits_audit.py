@@ -61,7 +61,9 @@ async def test_pack_per_check_criteria_actually_change_verdict(monkeypatch, thre
 
 
 def test_unsupported_pack_request_settings_name_only_actual_fields_and_error_type():
-    values = pack_config(checks=["correctness"]).model_dump(mode="json")
+    values = RunConfig(targets=[TARGET], checks=["correctness"], request_source="request_pack",
+        request_pack={"version": 1, "cases": [{"fixture_id": "one", "scorer": "none",
+            "messages": [{"role": "user", "content": "Question"}]}]}).model_dump(mode="json")
     values["test_options"] = {"correctness": {"samples": 9, "concurrency": 1,
                                                "limits": {"min_correctness": .5}}}
     with pytest.raises(ValidationError) as caught:
@@ -75,40 +77,200 @@ def test_unsupported_pack_request_settings_name_only_actual_fields_and_error_typ
     assert issue["values"] == {"test_options.correctness.concurrency": 1, "test_options.correctness.samples": 9}
 
 
-CAP_CASES = [
-    ("arrivals", {"arrivals": {"requests": 10001}}, "arrivals.requests", "maximum", "10,000"),
-    ("arrivals", {"arrivals": {"burst_size": 1025}}, "arrivals.burst_size", "maximum", "1,024"),
-    ("arrivals", {"arrivals": {"max_pending": 257}}, "arrivals.max_pending", "maximum", "256"),
-    ("arrivals", {"arrivals": {"requests_per_second": 1001}}, "arrivals.requests_per_second", "maximum", "1,000"),
-    ("capacity", {"traffic": {"rates": [10001]}}, "traffic.rates", "item_maximum", "10,000"),
-    ("capacity", {"traffic": {"rates": list(range(1, 18))}}, "traffic.rates", "maxItems", "16"),
-    ("capacity", {"traffic": {"duration_seconds": 3601}}, "traffic.duration_seconds", "maximum", "3,600"),
-    ("correctness", {"concurrency": 513}, "concurrency", "maximum", "512"),
-    ("correctness", {"default_concurrency": 513}, "default_concurrency", "maximum", "512"),
-    ("correctness", {"test_options": {"correctness": {"concurrency": 513}}}, "test_options.correctness.concurrency", "maximum", "512"),
-    ("arrivals", {"arrivals": {"max_in_flight": 513}}, "arrivals.max_in_flight", "maximum", "512"),
-    ("capacity", {"traffic": {"max_in_flight": 513}}, "traffic.max_in_flight", "maximum", "512"),
-    ("sessions", {"sessions": {"concurrency": 513}}, "sessions.concurrency", "maximum", "512"),
-    ("sessions", {"sessions": {"sessions": 33}}, "sessions.sessions", "maximum", "32"),
-    ("sessions", {"sessions": {"turns": ["a"] * 33}}, "sessions.turns", "maxItems", "32"),
-    ("sessions", {"sessions": {"turns": ["a", "x" * 8193]}}, "sessions.turns.1", "maxLength", "8,192"),
-    ("sessions", {"sessions": {"workloads": [{"name": f"task{i}", "turns": ["a", "b"]} for i in range(17)]}}, "sessions.workloads", "maxItems", "16"),
-    ("sessions", {"sessions": {"workloads": [{"name": "x" * 65, "turns": ["a", "b"]}]}}, "sessions.workloads.0.name", "maxLength", "64"),
-    ("sessions", {"sessions": {"workloads": [{"name": "task", "weight": 10001, "turns": ["a", "b"]}]}}, "sessions.workloads.0.weight", "maximum", "10,000"),
-    ("sessions", {"sessions": {"workloads": [{"name": "task", "turns": ["a"] * 33}]}}, "sessions.workloads.0.turns", "maxItems", "32"),
-    ("sessions", {"sessions": {"delay_seconds": 61}}, "sessions.delay_seconds", "maximum", "60"),
-    ("prefix", {"prefix": {"prefix_chars": 65537}}, "prefix.prefix_chars", "maximum", "65,536"),
-    ("prefix", {"prefix": {"repeats": 101}}, "prefix.repeats", "maximum", "100"),
-    ("prefix", {"prefix": {"history_turns": 33}}, "prefix.history_turns", "maximum", "32"),
-    ("consistency", {"consistency": {"repetitions": 101}}, "consistency.repetitions", "maximum", "100"),
-    ("consistency", {"consistency": {"prompts_per_shape": 17}}, "consistency.prompts_per_shape", "maximum", "16"),
-    ("consistency", {"consistency": {"levels": [513]}}, "consistency.levels.0", "maximum", "512"),
-    ("concurrency", {"concurrent_load": {"schedule": {"levels": [513]}}}, "concurrent_load.schedule.levels.0", "maximum", "512"),
-    ("concurrency", {"concurrent_load": {"schedule": {"levels": list(range(1, 18))}}}, "concurrent_load.schedule.levels", "maxItems", "16"),
-    ("concurrency", {"concurrent_load": {"schedule": {"duration_seconds": 3601}}}, "concurrent_load.schedule.duration_seconds", "maximum", "3,600"),
-    ("concurrency", {"concurrent_load": {"profile": {"short": {"input_tokens": 131073}}}}, "concurrent_load.profile.short.input_tokens", "maximum", "131,072"),
-    ("concurrency", {"concurrent_load": {"profile": {"long": {"output_tokens": 65537}}}}, "concurrent_load.profile.long.output_tokens", "maximum", "65,536"),
-]
+CAP_CASES = [('load',
+  {'load_test': {'patterns': {'bursts': {'enabled': True, 'size': 1025, 'first_seconds': 0}}}},
+  'load_test.patterns.bursts.size',
+  'maximum',
+  '1,024'),
+ ('load',
+  {'load_test': {'patterns': {'rates': [10001]}}},
+  'load_test.patterns.rates.0',
+  'item_maximum',
+  '10,000'),
+ ('load',
+  {'load_test': {'patterns': {'rates': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]}}},
+  'load_test.patterns.rates',
+  'maxItems',
+  '16'),
+ ('load',
+  {'load_test': {'schedule': {'duration_seconds': 3601}}},
+  'load_test.schedule.duration_seconds',
+  'maximum',
+  '3,600'),
+ ('correctness', {'concurrency': 513}, 'concurrency', 'maximum', '512'),
+ ('correctness', {'default_concurrency': 513}, 'default_concurrency', 'maximum', '512'),
+ ('correctness',
+  {'test_options': {'correctness': {'concurrency': 513}}},
+  'test_options.correctness.concurrency',
+  'maximum',
+  '512'),
+ ('sessions', {'sessions': {'concurrency': 513}}, 'sessions.concurrency', 'maximum', '512'),
+ ('sessions', {'sessions': {'sessions': 33}}, 'sessions.sessions', 'maximum', '32'),
+ ('sessions',
+  {'sessions': {'turns': ['a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a',
+                          'a']}},
+  'sessions.turns',
+  'maxItems',
+  '32'),
+ ('sessions',
+  {'sessions': {'turns': ['a',
+                          'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx']}},
+  'sessions.turns.1',
+  'maxLength',
+  '8,192'),
+ ('sessions',
+  {'sessions': {'workloads': [{'name': 'task0', 'turns': ['a', 'b']},
+                              {'name': 'task1', 'turns': ['a', 'b']},
+                              {'name': 'task2', 'turns': ['a', 'b']},
+                              {'name': 'task3', 'turns': ['a', 'b']},
+                              {'name': 'task4', 'turns': ['a', 'b']},
+                              {'name': 'task5', 'turns': ['a', 'b']},
+                              {'name': 'task6', 'turns': ['a', 'b']},
+                              {'name': 'task7', 'turns': ['a', 'b']},
+                              {'name': 'task8', 'turns': ['a', 'b']},
+                              {'name': 'task9', 'turns': ['a', 'b']},
+                              {'name': 'task10', 'turns': ['a', 'b']},
+                              {'name': 'task11', 'turns': ['a', 'b']},
+                              {'name': 'task12', 'turns': ['a', 'b']},
+                              {'name': 'task13', 'turns': ['a', 'b']},
+                              {'name': 'task14', 'turns': ['a', 'b']},
+                              {'name': 'task15', 'turns': ['a', 'b']},
+                              {'name': 'task16', 'turns': ['a', 'b']}]}},
+  'sessions.workloads',
+  'maxItems',
+  '16'),
+ ('sessions',
+  {'sessions': {'workloads': [{'name': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+                               'turns': ['a', 'b']}]}},
+  'sessions.workloads.0.name',
+  'maxLength',
+  '64'),
+ ('sessions',
+  {'sessions': {'workloads': [{'name': 'task', 'weight': 10001, 'turns': ['a', 'b']}]}},
+  'sessions.workloads.0.weight',
+  'maximum',
+  '10,000'),
+ ('sessions',
+  {'sessions': {'workloads': [{'name': 'task',
+                               'turns': ['a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a',
+                                         'a']}]}},
+  'sessions.workloads.0.turns',
+  'maxItems',
+  '32'),
+ ('sessions', {'sessions': {'delay_seconds': 61}}, 'sessions.delay_seconds', 'maximum', '60'),
+ ('prefix', {'prefix': {'prefix_chars': 65537}}, 'prefix.prefix_chars', 'maximum', '65,536'),
+ ('prefix', {'prefix': {'repeats': 101}}, 'prefix.repeats', 'maximum', '100'),
+ ('prefix', {'prefix': {'history_turns': 33}}, 'prefix.history_turns', 'maximum', '32'),
+ ('consistency', {'consistency': {'repetitions': 101}}, 'consistency.repetitions', 'maximum', '100'),
+ ('consistency',
+  {'consistency': {'prompts_per_shape': 17}},
+  'consistency.prompts_per_shape',
+  'maximum',
+  '16'),
+ ('consistency', {'consistency': {'levels': [513]}}, 'consistency.levels.0', 'item_maximum', '512'),
+ ('load',
+  {'load_test': {'patterns': {'concurrent': {'levels': [513]}}}},
+  'load_test.patterns.concurrent.levels.0',
+  'item_maximum',
+  '512'),
+ ('load',
+  {'load_test': {'patterns': {'concurrent': {'levels': [1,
+                                                        2,
+                                                        3,
+                                                        4,
+                                                        5,
+                                                        6,
+                                                        7,
+                                                        8,
+                                                        9,
+                                                        10,
+                                                        11,
+                                                        12,
+                                                        13,
+                                                        14,
+                                                        15,
+                                                        16,
+                                                        17]}}}},
+  'load_test.patterns.concurrent.levels',
+  'maxItems',
+  '16'),
+ ('load',
+  {'load_test': {'schedule': {'duration_seconds': 3601}}},
+  'load_test.schedule.duration_seconds',
+  'maximum',
+  '3,600'),
+ ('load',
+  {'load_test': {'profile': {'short': {'input_tokens': 131073}}}},
+  'load_test.profile.short.input_tokens',
+  'maximum',
+  '131,072'),
+ ('load',
+  {'load_test': {'profile': {'long': {'output_tokens': 65537}}}},
+  'load_test.profile.long.output_tokens',
+  'maximum',
+  '65,536')]
 
 
 @pytest.mark.parametrize("selected,settings,path,key,maximum", CAP_CASES)
@@ -120,7 +282,7 @@ async def test_cap_errors_share_field_help_values_and_api_cli_copy(tmp_path, cap
         response = await client.post("/api/config/preview", json=values)
     assert response.status_code == 422, response.text
     issue, = response.json()["detail"]
-    canonical = re.sub(r"\.\d+(?=\.|$)", "[]", path)
+    canonical = path.rsplit(".", 1)[0] if key.startswith("item_") else re.sub(r"\.\d+(?=\.|$)", "[]", path)
     policy = capabilities()["cap_explanations"][canonical]
     assert issue["msg"] == policy["errors"][key]
     assert issue["msg"] in policy["help"]
@@ -141,48 +303,54 @@ async def test_cap_errors_share_field_help_values_and_api_cli_copy(tmp_path, cap
 def test_retained_cap_help_is_present_at_actual_rendered_fields():
     tree = Markup(rendered_form())
     paths = {
-        "profile_arrivals_requests": "arrivals.requests", "profile_arrivals_burst_size": "arrivals.burst_size",
-        "profile_arrivals_max_pending": "arrivals.max_pending", "profile_arrivals_requests_per_second": "arrivals.requests_per_second",
-        "traffic_rates": "traffic.rates", "traffic_duration_seconds": "traffic.duration_seconds",
         "concurrency": "concurrency", "test_correctness_concurrency": "test_options.correctness.concurrency",
-        "traffic_max_in_flight": "traffic.max_in_flight", "profile_arrivals_max_in_flight": "arrivals.max_in_flight",
         "sessions_count": "sessions.sessions", "profile_sessions_concurrency": "sessions.concurrency",
         "profile_prefix_repeats": "prefix.repeats", "profile_consistency_repetitions": "consistency.repetitions",
-        "profile_consistency_levels": "consistency.levels", "load_schedule_levels": "concurrent_load.schedule.levels",
-        "load_profile_long_input_tokens": "concurrent_load.profile.long.input_tokens",
-        "load_profile_long_output_tokens": "concurrent_load.profile.long.output_tokens",
+        "profile_consistency_levels": "consistency.levels",
+        "load_patterns_rates": "load_test.patterns.rates",
+        "load_schedule_duration_seconds": "load_test.schedule.duration_seconds",
+        "load_patterns_concurrent_levels": "load_test.patterns.concurrent.levels",
+        "load_patterns_bursts_size": "load_test.patterns.bursts.size",
+        "load_profile_long_input_tokens": "load_test.profile.long.input_tokens",
+        "load_profile_long_output_tokens": "load_test.profile.long.output_tokens",
     }
     policies = capabilities()["cap_explanations"]
     for name, path in paths.items():
-        help_text, = [node for node in tree.nodes if node.get("id") == f"field-{name}-help-text"]
+        node_id = f"field-{name}-help" if name.startswith('load_') else f"field-{name}-help-text"
+        help_text, = [node for node in tree.nodes if node.get("id") == node_id]
         assert policies[path]["help"] in help_text["text"], (name, help_text["text"])
 
 
 @pytest.mark.parametrize("settings,path,name", [
-    ({"arrivals": {"requests_per_second": 0}}, "arrivals.requests_per_second", "profile_arrivals_requests_per_second"),
-    ({"traffic": {"duration_seconds": 0}}, "traffic.duration_seconds", "traffic_duration_seconds"),
-    ({"traffic": {"rates": [0]}}, "traffic.rates", "traffic_rates"),
+    ({"load_test": {"patterns": {"constant": {"enabled": True}, "rates": [0]}}}, "load_test.patterns.rates", "load_patterns_rates"),
+    ({"load_test": {"patterns": {"bursts": {"enabled": True, "first_seconds": 0, "gap_seconds": 0}}}}, "load_test.patterns.bursts.gap_seconds", "load_patterns_bursts_gap_seconds"),
+    ({"load_test": {"patterns": {"constant": {"enabled": True}, "rates": [-1]}}}, "load_test.patterns.rates", "load_patterns_rates"),
 ])
 def test_positive_settings_show_inline_errors_before_api_call(settings, path, name):
     browser_logic(r"""
-state.jsonDraft=state.jsonBase='synced';Object.assign(config,SETTINGS);
+state.jsonDraft=state.jsonBase='synced';config.checks=['load'];Object.assign(config,SETTINGS);
 readForm=()=>({config,mode:'normal'});api=()=>assert.fail('Invalid positive value reached the API');
 const input={dataset:{},setAttribute(k,v){this[k]=v;},getAttribute(){return '';}};
 nodes['#field-'+NAME]=input;nodes['#field-'+NAME+'-error']={};
 await assert.rejects(refreshRequestPreview(),error=>error.errors.some(issue=>issue.fields.includes(PATH)));
 assert.equal(input['aria-invalid'],'true');assert.equal(nodes['#field-'+NAME+'-error'].hidden,false);
-assert.match(nodes['#field-'+NAME+'-error'].textContent,/must be greater than 0/);
-assert.match(renderRunBlueprint(config),/must be greater than 0/);
+const expected=PATH.endsWith('rates')?'Enter positive, increasing rates separated by commas.':'Enter a number greater than 0 for Time between burst starts (seconds).';
+assert.equal(nodes['#field-'+NAME+'-error'].textContent,expected);
+assert(renderRunBlueprint(config).includes(expected));
 """.replace("SETTINGS", json.dumps(settings)).replace("NAME", json.dumps(name)).replace("PATH", json.dumps(path)))
 
 
 def test_positive_numeric_fields_keep_small_positive_values_and_have_positive_minimum():
     tree = Markup(rendered_form())
-    for name in ("profile_arrivals_requests_per_second", "traffic_duration_seconds"):
-        control, = tree.named(name)
-        assert float(control["min"]) > 0
-        assert control["step"] == "any"
-    browser_logic("assert.equal(positiveBoundErrors({...config,traffic:{...config.traffic,rates:[1e-9],duration_seconds:1e-9}},bootstrap.limits,bootstrap.cap_explanations).length,0);")
+    duration, = tree.named("load_schedule_duration_seconds")
+    assert duration["min"] == "1" and duration["step"] == "1"
+    gap, = tree.named("load_patterns_bursts_gap_seconds")
+    assert float(gap["min"]) > 0 and gap["step"] == "any"
+    configured = RunConfig.model_validate(config(checks=['load'], load_test={
+        'patterns': {'rates': [1e-9], 'bursts': {'gap_seconds': 1e-9}},
+        'schedule': {'duration_seconds': 1}}))
+    assert configured.load_test.patterns.rates == [1e-9]
+    assert configured.load_test.patterns.bursts.gap_seconds == 1e-9
 
 
 def test_warning_titles_use_catalogue_names_without_changing_breakdown():
@@ -218,13 +386,13 @@ const section=settingDestination('sessions.workloads');assert.equal(section.sect
 
 
 @pytest.mark.parametrize("settings,path,name", [
-    ({"arrivals": {"requests_per_second": 0}}, "arrivals.requests_per_second", "profile_arrivals_requests_per_second"),
-    ({"traffic": {"duration_seconds": 0}}, "traffic.duration_seconds", "traffic_duration_seconds"),
-    ({"traffic": {"rates": [0]}}, "traffic.rates", "traffic_rates"),
+    ({"load_test": {"patterns": {"constant": {"enabled": True}, "rates": [0]}}}, "load_test.patterns.rates", "load_patterns_rates"),
+    ({"load_test": {"patterns": {"bursts": {"enabled": True, "first_seconds": 0, "gap_seconds": 0}}}}, "load_test.patterns.bursts.gap_seconds", "load_patterns_bursts_gap_seconds"),
+    ({"load_test": {"patterns": {"constant": {"enabled": True}, "rates": [-1]}}}, "load_test.patterns.rates", "load_patterns_rates"),
 ])
 def test_json_positive_settings_show_same_inline_errors_before_api_call(settings, path, name):
     browser_logic(r"""
-state.jsonDraft=JSON.stringify({...config,...SETTINGS});state.jsonBase='unchanged';
+config.checks=['load'];state.jsonDraft=JSON.stringify({...config,...SETTINGS});state.jsonBase='unchanged';
 nodes['#config-error']={};renderRequestPreview=()=>{};
 api=()=>assert.fail('Invalid JSON positive value reached the API');
 await applyConfig();
@@ -233,3 +401,30 @@ assert(issue);assert.match(issue.msg,/must be greater than 0/);
 assert.match(nodes['#config-error'].textContent,/must be greater than 0/);
 assert.equal(settingDestination(PATH).name,NAME);
 """.replace("SETTINGS", json.dumps(settings)).replace("NAME", json.dumps(name)).replace("PATH", json.dumps(path)))
+
+
+@pytest.mark.parametrize('check,section,field,value,maximum', [
+    ('arrivals', 'arrivals', 'requests', 10001, 10000),
+    ('arrivals', 'arrivals', 'max_pending', 257, 256),
+    ('arrivals', 'arrivals', 'requests_per_second', 1001, 1000),
+    ('arrivals', 'arrivals', 'max_in_flight', 513, 512),
+    ('capacity', 'traffic', 'max_in_flight', 513, 512),
+])
+async def test_legacy_load_cap_errors_keep_the_original_field_and_safe_evidence(tmp_path, capsys, check, section, field, value, maximum):
+    values = config(checks=[check], **{section: {field: value}})
+    path = section + '.' + field
+    async with browser(tmp_path) as client:
+        response = await client.post('/api/config/preview', json=values)
+    assert response.status_code == 422, response.text
+    issue, = response.json()['detail']
+    assert issue['fields'] == [path]
+    assert issue['values'] == {path: value}
+    assert str(maximum) in issue['msg'].replace(',', '')
+    assert issue['actions'][0]['field'] == path
+    saved = tmp_path / 'legacy-cap.json'
+    saved.write_text(json.dumps(values))
+    assert cli.main(['validate', '--config', str(saved), '--output-format', 'json']) == 4
+    cli_issue, = json.loads(capsys.readouterr().out)['errors']
+    assert cli_issue['message'] == issue['msg']
+    for key in ('fields', 'values', 'actions'):
+        assert cli_issue[key] == issue[key]

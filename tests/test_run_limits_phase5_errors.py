@@ -44,11 +44,11 @@ async def test_traffic_cap_is_identical_at_every_config_boundary_and_action_fixe
         fixed = await client.post("/api/config/preview", json=values)
         assert fixed.status_code == 200, fixed.text
     resolved = fixed.json()["config"]
-    assert resolved["traffic"]["rates"] == [250]
-    assert resolved["traffic"]["duration_seconds"] == 400
+    assert resolved["load_test"]["patterns"]["rates"] == [250]
+    assert resolved["load_test"]["schedule"]["duration_seconds"] == 400
     assert resolved["max_requests"] == 12
     assert resolved["max_duration_seconds"] == 10
-    assert fixed.json()["request_plan"]["planned_total"] == 100000
+    assert fixed.json()["request_plan"]["load_test"]["expected_scheduled_requests"] == 100000
     assert fixed.json()["request_plan"]["time_warnings"]
     assert fixed.json()["request_plan"]["request_warnings"]
 
@@ -59,8 +59,8 @@ CONFLICTS = [
     config(traffic={"rates": [250], "duration_seconds": 3600}),
     config(traffic={"rates": [50, 100, 250], "duration_seconds": 300}),
     config(checks=["correctness"], concurrency=40, test_options={"correctness": {"concurrency": 64}}),
-    config(checks=["arrivals"], concurrency=40, arrivals={"max_in_flight": 64}),
-    config(concurrency=40, traffic={"max_in_flight": 64}),
+    config(checks=["load"], concurrency=40, load_test={"patterns": {"concurrent": {"levels": [64]}}}),
+    config(checks=["load"], concurrency=40, load_test={"patterns": {"bursts": {"enabled": True, "size": 64, "first_seconds": 0}}}),
     config(checks=["sessions"], concurrency=16, sessions={"sessions": 64, "concurrency": 32}),
     config(checks=["consistency"], concurrency=40, consistency={"levels": [64]}),
     config(checks=["concurrency"], concurrency=40, concurrent_load={"schedule": {"levels": [64]}}),
@@ -173,8 +173,8 @@ async def test_capacity_estimate_is_advisory_for_actual_requests_and_baseline_ma
            (record.fixture_id, record.scenario, record.input_chars, record.requested_max_tokens)
             for record in reference.requests]
     if legacy_metadata:
-        reference.manifest["config"]["traffic"].pop("expected_response_seconds")
-        reference.manifest["effective_traffic"].pop("expected_response_seconds")
+        reference.manifest["config"]["traffic"] = dict(values["traffic"])
+        reference.manifest["effective_traffic"] = dict(values["traffic"])
     before = reference.model_dump_json()
     assert _settings_reasons(current, reference) == []
     assert reference.model_dump_json() == before
@@ -235,7 +235,7 @@ async def test_a13_valid_long_traffic_has_separate_nonblocking_budget_guidance(t
         response = await client.post("/api/config/validate", json=values)
     assert response.status_code == 200, response.text
     plan = response.json()["request_plan"]
-    assert plan["planned_total"] == 90000
+    assert plan["load_test"]["expected_scheduled_requests"] == 90000
     assert plan["errors"] == []
     assert bool(plan["time_warnings"]) == (time_budget is not None)
     assert bool(plan["request_warnings"]) == (request_budget is not None)
@@ -243,8 +243,8 @@ async def test_a13_valid_long_traffic_has_separate_nonblocking_budget_guidance(t
     path.write_text(json.dumps(values))
     assert main(["validate", "--config", str(path), "--output-format", "json"]) == 0
     cli = json.loads(capsys.readouterr().out)
-    assert cli["config"]["traffic"]["rates"] == [25]
-    assert cli["config"]["traffic"]["duration_seconds"] == 3600
+    assert cli["config"]["load_test"]["patterns"]["rates"] == [25]
+    assert cli["config"]["load_test"]["schedule"]["duration_seconds"] == 3600
     for warning in [*plan["time_warnings"], *plan["request_warnings"]]:
         assert warning["msg"] in cli["warnings"]
 
@@ -262,5 +262,36 @@ async def test_a14_aggregate_correction_applies_to_duration_only(tmp_path):
         values["traffic"][action["field"].split(".")[1]] = action["value"]
         accepted = await client.post("/api/config/preview", json=values)
     assert accepted.status_code == 200, accepted.text
-    assert accepted.json()["config"]["traffic"]["rates"] == [50, 100, 250]
-    assert accepted.json()["request_plan"]["planned_total"] == 100000
+    assert accepted.json()["config"]["load_test"]["patterns"]["rates"] == [50, 100, 250]
+    assert accepted.json()["request_plan"]["load_test"]["expected_scheduled_requests"] == 100000
+
+
+@pytest.mark.parametrize('endpoint', ['draft', 'preview', 'validate', 'plan', 'start', 'cli'])
+async def test_merged_arrival_cap_preserves_arithmetic_and_a_duration_only_correction(tmp_path, endpoint):
+    values = config(checks=['load'], load_test={
+        'workloads': {'combinations': {'selected': ['short_short']}},
+        'patterns': {'concurrent': {'enabled': False}, 'constant': {'enabled': True}, 'rates': [250]},
+        'schedule': {'duration_seconds': 3600}})
+    route = '/api/runs' if endpoint == 'start' else '/api/config/' + endpoint
+    async with browser(tmp_path) as client:
+        response = await client.post(route, json={'config': values} if endpoint in {'start', 'cli'} else values)
+        assert response.status_code == 422, response.text
+        issue, = response.json()['detail']
+        assert issue['msg'] == SINGLE + ' This bounds scheduled traffic only; run budgets are separate.'
+        assert issue['fields'] == ['load_test.patterns.rates', 'load_test.schedule.duration_seconds']
+        assert issue['values'] == {'load_test.patterns.rates': [250], 'load_test.schedule.duration_seconds': 3600,
+            'planned_arrivals': 900000, 'maximum_planned_arrivals': 100000, 'longest_stage_seconds': 400}
+        assert issue['actions'] == [
+            {'label': 'Use 400 seconds', 'field': 'load_test.schedule.duration_seconds', 'value': 400},
+            {'label': 'Edit Rates (requests/second)', 'field': 'load_test.patterns.rates'}]
+        action = issue['actions'][0]
+        owner = values
+        *parents, field = action['field'].split('.')
+        for parent in parents:
+            owner = owner[parent]
+        owner[field] = action['value']
+        fixed = await client.post('/api/config/preview', json=values)
+    assert fixed.status_code == 200, fixed.text
+    assert fixed.json()['config']['load_test']['patterns']['rates'] == [250]
+    assert fixed.json()['config']['load_test']['schedule']['duration_seconds'] == 400
+    assert fixed.json()['request_plan']['load_test']['expected_scheduled_requests'] == 100000

@@ -85,6 +85,16 @@ def cap_policy(path):
     path = path.removesuffix("[]")
     name = path.rsplit(".", 1)[-1]
     label = _CAP_LABELS.get(name, name.replace("_", " ").capitalize())
+    if path.startswith("load_test."):
+        label = {"rates": "Rates (requests/second)", "size": "Burst size (requests)",
+                 "first_seconds": "First burst after (seconds)", "gap_seconds": "Time between bursts (seconds)",
+                 "finish_seconds": "Finish allowance (seconds)", "seed": "Random seed",
+                 "max_first_answer_ms": "First answer within (ms)", "max_completion_ms": "Completion within (ms)",
+                 "max_error_percent": "Errors allowed (%)", "min_correct_percent": "Correct answers required (%)",
+                 "min_valid_responses": "Minimum valid responses per result group",
+                 "max_slowdown": "Maximum allowed slowdown of short answers (×)"}.get(name, label)
+        if ".profile." in path and name in {"input_tokens", "output_tokens"}:
+            label = path.split(".")[-2].capitalize() + (" input token target" if name == "input_tokens" else " output token cap")
     if name in {"concurrency", "default_concurrency", "max_in_flight", "levels"}:
         return label, "product policy", "the measured reliable client-load ceiling"
     if path == "arrivals.max_pending":

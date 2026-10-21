@@ -56,7 +56,7 @@ await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;state.bootstrap.con
 def test_all_checks_have_local_settings_and_one_question_source():
     browser_logic(r"""
 const original=JSON.stringify(config),markup=renderCheckSelection(config);
-assert.equal((markup.match(/data-test-card="/g)||[]).length,17);
+assert.equal((markup.match(/data-test-card="/g)||[]).length,15);
 for(const check of bootstrap.checks){
   assert.equal((markup.match(new RegExp('data-test-card="'+check.id+'"','g'))||[]).length,1);
   const row=renderTestCard(check,config);assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
@@ -64,10 +64,10 @@ for(const check of bootstrap.checks){
 for(const group of checkGroups)assert(markup.includes('data-action="catalogue-category" data-category="'+group.id+'"'));
 assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);
 assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config),/id="setup-dataset"/);
-const capacity={...config,checks:['capacity']};
-assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='capacity'),capacity),/id="setup-dataset"/);
+const capacity={...config,checks:['load']};
+assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='load'),capacity),/id="setup-dataset"/);
 assert.doesNotMatch(renderCheckSelection({...config,checks:['access']}),/id="setup-dataset"/);
-for(const name of ['traffic_rates','traffic_duration_seconds','load_schedule_levels','load_profile_short_input_tokens','profile_sessions_concurrency']){
+for(const name of ['load_patterns_rates','load_schedule_duration_seconds','load_patterns_concurrent_levels','load_profile_short_input_tokens','profile_sessions_concurrency']){
   assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 }
 assert.doesNotMatch(markup,/name="setup_goal"|name="setup_load"/);
@@ -127,15 +127,15 @@ for(const check of bootstrap.checks){
     dataset:{category:checkGroups.find(x=>x.checks.includes(check.id)).id,search:(checkGuide[check.id].name+' '+checkGuide[check.id].purpose).toLowerCase()}};
   nodes['[data-test-card="'+check.id+'"]']=card;cards.push(card);
 }
-syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,17);
-state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,17);
+syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,15);
+state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,15);
 state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 // Browse filters must not hide selected checks when returning to the run.
 state.catalogueCategory='server';state.catalogueSearch='gpu';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 state.catalogueCategory='all';
 state.catalogueFilter='all';state.catalogueSearch='concurrent conversations';syncTestControls();assert.equal(cards.filter(x=>!x.hidden)[0].id,'sessions');
-revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,17);
+revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,15);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -151,10 +151,10 @@ state.catalogueCategory='server';state.catalogueFilter='selected';state.catalogu
 assert.throws(()=>validateSetupChecks(),/Add a question/);
 assert.equal(state.openTest,'correctness');assert.equal(state.setupStep,2);assert.equal(state.catalogueCategory,'all');
 assert(nodes['[data-action="add-example"]'].focused);
-state.config.checks=['capacity'];state.config.judging={judges:[{}]};state.openTest=null;state.setupStep=3;
-configureEvaluator();assert.equal(state.openTest,'capacity');assert.equal(state.setupStep,2);assert(details.open);
+state.config.checks=['load'];state.config.judging={judges:[{}]};state.openTest=null;state.setupStep=3;
+configureEvaluator();assert.equal(state.openTest,'load');assert.equal(state.setupStep,2);assert(details.open);
 assert(nodes['[name="judge_0_url"]'].focused);
-state.config.judging=null;let added=false;changeJudge=action=>{added=action==='add';assert.equal(state.openTest,'capacity');};
+state.config.judging=null;let added=false;changeJudge=action=>{added=action==='add';assert.equal(state.openTest,'load');};
 state.openTest=null;configureEvaluator();assert(added);
 """)
 
@@ -162,7 +162,7 @@ state.openTest=null;configureEvaluator();assert(added);
 def test_browse_warnings_follow_selection_and_open_draft_without_losing_values():
     browser_logic(r"""
 config.limits.min_samples=5;config.max_output_tokens=32;
-config.concurrent_load=structuredClone(bootstrap.concurrent_load.defaults);config.concurrent_load.schedule.levels=[1];
+config.load_test=structuredClone(bootstrap.load_test.defaults);config.load_test.patterns.concurrent.levels=[1];
 config.consistency={...bootstrap.profile_defaults.consistency,repetitions:4,levels:[1,2],shapes:['short','long']};
 config.test_options.generation={max_output_tokens:64};
 state.catalogueFilter='all';state.openTest=null;
@@ -186,7 +186,7 @@ for(const id of ['consistency']){
   assert(warnings[id].coverage.textContent.length>0);
 }
 syncTestControls();updateCheckFieldHints(config);
-for(const id of ['concurrency','consistency'])assert.equal(warnings[id].coverage.hidden,true);
+for(const id of ['load','consistency'])assert.equal(warnings[id].coverage.hidden,true);
 assert.equal(warnings.generation.override.hidden,true);
 // An unselected draft gets feedback only while the user is editing it.
 state.openTest='consistency';syncTestControls();updateCheckFieldHints(config);
@@ -198,12 +198,12 @@ state.openTest=null;syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.generation.override.hidden,true);
 assert.equal(JSON.stringify(config),original);
 // Selected checks keep warnings visible with their editor closed.
-config.checks.push('concurrency');selections.concurrency.checked=true;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.concurrency.coverage.hidden,true); // Duration windows have no planned sample target.
-config.checks=config.checks.filter(id=>id!=='concurrency');selections.concurrency.checked=false;
-state.openTest='concurrency';syncTestControls();assert.equal(warnings.concurrency.coverage.hidden,true); // Duration windows have no planned sample target.
+config.checks.push('load');selections.load.checked=true;syncTestControls();updateCheckFieldHints(config);
+assert.equal(warnings.load.coverage.hidden,true); // Duration windows have no planned sample target.
+config.checks=config.checks.filter(id=>id!=='load');selections.load.checked=false;
+state.openTest='load';syncTestControls();assert.equal(warnings.load.coverage.hidden,true); // Duration windows have no planned sample target.
 state.openTest=null;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.concurrency.coverage.hidden,true);
+assert.equal(warnings.load.coverage.hidden,true);
 assert.equal(config.test_options.generation.max_output_tokens,64);
 """)
 

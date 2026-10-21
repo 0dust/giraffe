@@ -118,6 +118,15 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
         absolute = destinations(path, structured) if structured else lambda field: field
         if structured:
             fields = list(dict.fromkeys(absolute(field) for field in structured))
+        elif path.startswith("load_test."):
+            from giraffe.caps import cap_policy
+            label = cap_policy(path)[0]
+            if message.startswith("Input should be "):
+                message = label + " must be " + message.removeprefix("Input should be ").rstrip(".") + "."
+            elif item["type"] == "extra_forbidden":
+                message = "Remove the unrecognized setting under Load test."
+            elif item["type"] != "value_error":
+                message = label + ": " + message
         elif path.startswith("concurrent_load."):
             parts = path.split(".")[1:]
             label = {"schedule.levels": "Concurrency levels", "schedule.duration_seconds": "Duration per workload at each concurrency level",
@@ -182,6 +191,13 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
                 supplied_setting[int(part)] if isinstance(supplied_setting, list) and part.isdigit() and int(part) < len(supplied_setting) else None)
         cap_key = {"less_than_equal": "maximum", "too_long": "maxItems" if isinstance(supplied_setting, list) else "maxLength",
                    "greater_than": "exclusiveMinimum", "string_too_long": "maxLength"}.get(item["type"])
+        if canonical.endswith("[]") and cap_key in {"maximum", "exclusiveMinimum"}:
+            # Indexed array diagnostics retain the same each-entry policy as
+            # the list editor; its maximum is not a maximum for the whole list.
+            array_policy = policies.get(canonical[:-2], {})
+            item_message = array_policy.get("errors", {}).get("item_" + cap_key)
+            if item_message:
+                policy = {**policy, "errors": {**policy.get("errors", {}), cap_key: item_message}}
         if not cap_key and isinstance(setting, list):
             items = bounds.get("items", {})
             if "maximum" in items and any(numeric(n) and n > items["maximum"] for n in setting):

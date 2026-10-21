@@ -32,6 +32,8 @@ def test_legacy_request_settings_match_old_main(name):
     config = migrated_configuration(case['source'])
     expected = case['expected']
     for check, settings in expected['settings'].items():
+        if check in {'capacity', 'arrivals', 'concurrency'}:
+            continue  # Their traffic is intentionally replaced by issue #45.
         # Sections 1.3 and 2.1 resolve read-only pack parallelism per endpoint.
         if name in PACK_OVERLAP_CASES and check == 'correctness':
             assert settings['concurrency'] == 4
@@ -39,23 +41,26 @@ def test_legacy_request_settings_match_old_main(name):
         effective = config.effective_check(check)
         assert {field: effective[field] for field in settings} == settings, check
     for check, groups in expected['fixtures'].items():
+        if check in {'capacity', 'arrivals', 'concurrency'}:
+            continue
         effective = _check_config(config, check)
         actual = builtin_fixtures(effective, check_id=check)
         assert {group: request_values(actual[group]) for group in groups} == groups, check
-    if 'traffic' in expected:
-        actual = traffic_fixtures(_check_config(config, 'capacity'), check_id='capacity')
-        assert {group: request_values(specs) for group, specs in actual.items()} == expected['traffic']
     if 'pack' in expected:
         assert request_values(pack_specs(config)) == expected['pack']
-    if 'concurrent_load' in expected:
-        assert {
-            'levels': config.concurrent_load.schedule.levels,
-            'profile': config.concurrent_load.profile.model_dump(mode='json'),
-        } == expected['concurrent_load']
-    if 'arrivals_max_in_flight' in expected:
-        assert config.effective_arrivals().max_in_flight == expected['arrivals_max_in_flight']
-    if 'capacity_max_in_flight' in expected:
-        assert config.effective_traffic().max_in_flight == expected['capacity_max_in_flight']
+    old_checks = set(case['source'].get('checks', []))
+    replaced = old_checks & {'concurrency', 'capacity', 'arrivals', 'buckets', 'fairness', 'mixed', 'token_stress'}
+    if replaced or case['source'].get('arrivals') is not None:
+        assert 'load' in config.checks
+        assert not set(config.checks) & {'concurrency', 'capacity', 'arrivals'}
+        sources = [config.load_test.legacy_source, *[test.source for test in config.load_test.migrated_tests]]
+        assert len(sources) == len(set(sources))
+        assert all(source in {'concurrency', 'capacity', 'arrivals'} for source in sources)
+        assert any('migrated' in note.lower() for note in config._migration_notes)
+        # A saved normalized migration must remain runnable, including legacy
+        # token ceilings that made profile sizes equal.
+        repeated = type(config).model_validate(config.model_dump())
+        assert repeated.load_test == config.load_test
     if 'sessions_concurrency' in expected:
         assert config.sessions.concurrency == expected['sessions_concurrency']
     if 'consistency_levels' in expected:

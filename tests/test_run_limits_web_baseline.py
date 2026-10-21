@@ -173,7 +173,7 @@ def test_a23_legacy_arrivals_inflight_default_normalizes_without_losing_workload
 
 @pytest.mark.parametrize("endpoint", ["draft", "preview", "validate", "plan"])
 async def test_inherited_parallelism_survives_api_roundtrip_and_raising_limit(tmp_path, endpoint):
-    values = config(checks=["sessions", "consistency", "concurrency"], concurrency=1)
+    values = config(checks=["sessions", "consistency", "load"], concurrency=1)
     async with browser(tmp_path) as client:
         response = await client.post(f"/api/config/{endpoint}", json=values)
         assert response.status_code == 200, response.text
@@ -182,11 +182,11 @@ async def test_inherited_parallelism_survives_api_roundtrip_and_raising_limit(tm
             normalized = initial["config"]
             assert "concurrency" not in normalized["sessions"]
             assert "levels" not in normalized["consistency"]
-            assert "levels" not in normalized["concurrent_load"]["schedule"]
+            assert "levels" not in normalized["load_test"]["patterns"]["concurrent"]
             assert initial["request_plan"]["required_concurrency"]["by_check"] == {
-                "sessions": 1, "consistency": 1, "concurrency": 1}
+                "sessions": 1, "consistency": 1, "load": 1}
             notices = initial["request_plan"]["concurrency_warnings"]
-            assert {notice["check"] for notice in notices} == {"sessions", "consistency", "concurrency"}
+            assert {notice["check"] for notice in notices} == {"sessions", "consistency", "load"}
             assert all(notice["effective_concurrency"] == 1 for notice in notices)
             repeated = await client.post(f"/api/config/{endpoint}", json=normalized)
             assert repeated.status_code == 200, repeated.text
@@ -198,12 +198,12 @@ async def test_inherited_parallelism_survives_api_roundtrip_and_raising_limit(tm
     result = raised.json()
     assert result["request_plan"]["concurrency_warnings"] == []
     assert result["request_plan"]["required_concurrency"]["by_check"] == {
-        "sessions": 2, "consistency": 2, "concurrency": 4}
-    assert all(load["levels"] == [1, 4] for load in result["request_plan"]["concurrent_load"].values())
+        "sessions": 2, "consistency": 2, "load": 4}
+    assert result["request_plan"]["load_test"]["scheduled_tests"] == 12
     resolved = RunConfig.model_validate(result["config"])
     assert resolved.sessions.concurrency == 2
     assert resolved.consistency.levels == [1, 2]
-    assert resolved.concurrent_load.schedule.levels == [1, 4]
+    assert resolved.load_test.patterns.concurrent.levels == [1, 4]
 
 
 @pytest.mark.parametrize("reached", [False, True])

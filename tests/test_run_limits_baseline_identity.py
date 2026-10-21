@@ -22,10 +22,13 @@ IDENTITY_TABLE_GUIDANCE = (
     "in src/giraffe/reporting.py after editing concurrent_load.py, workloads.py or logprobs.py; "
     "see Comparability source identities in docs/limits.md. Do not bridge changed workloads.")
 
-def reports(check="arrivals", *, arrivals=None):
+def reports(check="sessions", *, arrivals=None):
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost:8000", "model": "test"}],
-                       checks=[check], max_output_tokens=2048,
+                       checks=[check if check not in {"arrivals", "concurrency"} else "access"], max_output_tokens=2048,
                        **({"arrivals": arrivals} if arrivals else {}))
+    if check in {"arrivals", "concurrency"}:
+        from giraffe.models import Arrival
+        config = config.model_copy(update={"checks": [check], **({"arrivals": Arrival.model_validate(arrivals or {})} if check == "arrivals" else {})})
     current, old = make_report(), make_report("baseline")
     current.manifest["config"] = config.model_dump(mode="json")
     old.manifest["config"] = deepcopy(current.manifest["config"])
@@ -36,6 +39,9 @@ def reports(check="arrivals", *, arrivals=None):
     settings = {field: (getattr(config, field).model_dump(mode="json")
                         if hasattr(getattr(config, field), "model_dump") else getattr(config, field))
                 for field, checks in workloads.WORKLOAD_CHECKS.items() if check in checks}
+    if check in {'arrivals', 'concurrency'}:
+        field = 'arrivals' if check == 'arrivals' else 'concurrent_load'
+        settings[field] = getattr(config, field).model_dump(mode='json')
     old_settings = deepcopy(settings)
     if check == "arrivals":
         old_settings["arrivals"].pop("max_in_flight")
@@ -57,7 +63,7 @@ def reports(check="arrivals", *, arrivals=None):
     return current, old, settings, old_settings
 
 
-@pytest.mark.parametrize("check", ["arrivals", "sessions", "consistency", "concurrency"])
+@pytest.mark.parametrize("check", ["sessions", "consistency"])
 def test_a23_real_workload_fingerprints_match_legacy_baseline_after_limit_split(check):
     current, old, _, _ = reports(check)
     before = old.model_dump_json()
@@ -91,7 +97,7 @@ def test_unknown_concurrent_load_source_is_not_normalized(which):
 
 @pytest.mark.parametrize("change", ["requests", "max_in_flight"])
 def test_actual_arrival_workload_change_remains_noncomparable(change):
-    current, old, settings, _ = reports()
+    current, old, settings, _ = reports("arrivals")
     current.manifest["config"]["arrivals"][change] = 16
     settings["arrivals"][change] = 16
     current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
@@ -122,11 +128,10 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 
 def test_current_generator_sources_have_reviewed_identity_table_entries():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
-                           checks=["concurrency", "consistency"], consistency={"logprobs": {}})
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="caps26")
+                           checks=["consistency"], consistency={"logprobs": {}})
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue45")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
-        "concurrent_load_source_sha256": hashlib.sha256(Path(concurrent_load.__file__).read_bytes()).hexdigest(),
         "logprob_source_sha256": hashlib.sha256(Path(logprobs.__file__).read_bytes()
                                               + Path(logprob_workload.__file__).read_bytes()).hexdigest(),
     }
@@ -136,3 +141,16 @@ def test_current_generator_sources_have_reviewed_identity_table_entries():
             f"{field} changed: review request-level compatibility and update/extend "
             "_run_limits_workload_identity in src/giraffe/reporting.py. See the "
             "Comparability source identities section in docs/limits.md; do not bridge changed workloads.")
+
+
+@pytest.mark.parametrize("check", ["arrivals", "concurrency"])
+def test_replaced_load_generator_is_not_bridged_to_historical_workload(check):
+    _, old, _, _ = reports(check)
+    current = make_report()
+    config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}], checks=["load"])
+    current.manifest["config"] = config.model_dump(mode="json")
+    current.manifest["fixture_pack"] = deepcopy(old.manifest["fixture_pack"])
+    current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({"load_test": config.load_test.model_dump()})
+    before = old.model_dump_json()
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+    assert old.model_dump_json() == before

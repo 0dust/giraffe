@@ -53,7 +53,7 @@ class Client:
 
 
 @pytest.mark.parametrize("check,callback,output", [
-    ("arrivals", arrivals, 96), ("prefix", prefixes, 24),
+    ("prefix", prefixes, 24),
     ("sessions", sessions, 48), ("consistency", consistency, 96), ("tools", tools, 96),
 ])
 async def test_extended_specs_resolve_local_settings_without_mutating_suite(check, callback, output):
@@ -78,7 +78,7 @@ async def test_extended_specs_resolve_local_settings_without_mutating_suite(chec
     assert run.config is config
 
 
-@pytest.mark.parametrize("check", ["arrivals", "prefix", "sessions", "consistency", "tools"])
+@pytest.mark.parametrize("check", ["prefix", "sessions", "consistency", "tools"])
 def test_extended_check_pass_criteria_change_verdict_and_remain_isolated(check):
     config = configuration(check)
     fixture = default_tool_fixture()
@@ -196,7 +196,7 @@ async def test_concurrent_load_profile_caps_and_timeout_are_own_settings():
 
 @pytest.mark.parametrize("suite_cap", [16, 512])
 @pytest.mark.parametrize("check,callback", [
-    ("arrivals", arrivals), ("prefix", prefixes), ("sessions", sessions),
+    ("prefix", prefixes), ("sessions", sessions),
     ("consistency", consistency), ("tools", tools),
 ])
 async def test_inherited_extended_request_budgets_preserve_fixture_defaults(suite_cap, check, callback):
@@ -295,3 +295,41 @@ def test_default_and_example_tool_payloads_still_fit_context_admission():
             assert history_bytes + tools_bytes + effective.max_output_tokens + 32 <= effective.context_limit
             seen += 1
     assert seen >= 10
+
+
+@pytest.mark.parametrize("suite_cap", [16, 512])
+def test_load_profile_caps_and_timeout_remain_independent_of_suite_defaults(suite_cap):
+    from giraffe.load_test import build_spec, test_points as load_points
+    from tests.test_load_test_phase_a import config as load_configuration
+
+    configured = load_configuration()
+    configured.max_output_tokens = suite_cap
+    configured.request_timeout_seconds = .01
+    configured.load_test.profile.short.output_tokens = 96
+    configured.load_test.request_timeout_seconds = .5
+    run = _Run(configured, None, None)
+    point = load_points(configured.load_test)[0]
+    spec = build_spec(run, configured.load_test, point, "short_short",
+                      {("short", "short_answer"): {"filler_chars": 256}})
+    assert spec.max_tokens == 96
+    assert spec.request_timeout_seconds == .5
+    assert configured.max_output_tokens == suite_cap
+    assert configured.request_timeout_seconds == .01
+
+
+def test_load_per_response_criteria_change_verdict_without_changing_suite_limits():
+    from giraffe.load_test import score_group
+    from tests.test_load_test_phase_a import config as load_configuration, group_fixture, record
+
+    configured = load_configuration()
+    rows = [record()]
+    point, group = group_fixture(configured, rows)
+    assert score_group(configured.load_test, point, group, rows)["status"] == "pass"
+    before = configured.limits.model_dump()
+    changed = configured.model_copy(deep=True)
+    changed.load_test.pass_criteria.max_completion_ms = 5
+    point, group = group_fixture(changed, rows)
+    assert score_group(changed.load_test, point, group, rows)["status"] == "fail"
+    assert changed.limits.model_dump() == configured.limits.model_dump() == before
+    point, group = group_fixture(configured, rows)
+    assert score_group(configured.load_test, point, group, rows)["status"] == "pass"

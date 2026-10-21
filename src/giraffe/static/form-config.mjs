@@ -113,7 +113,11 @@ export function loadTestIssues(config, defaults, limits={}) {
   const issue=(path,msg)=>issues.push({fields:[path.startsWith('load_test.')||['concurrency','max_requests','max_duration_seconds'].includes(path)?path:'load_test.'+path],msg});
   const valid=(path,value,min,{integer=false,max=Infinity,label=path,exclusive=false}={})=>{
     const bounds=limits['load_test.'+path]||{};
-    if(typeof value!=='number'||!Number.isFinite(value)||value<min||value>Math.min(max,bounds.maximum??Infinity)||(exclusive&&value===min)||(integer&&!Number.isInteger(value)))issue(path,`Check ${label}.`);
+    const maximum=Math.min(max,bounds.maximum??Infinity);
+    if(typeof value!=='number'||!Number.isFinite(value)||value<min||value>maximum||(exclusive&&value===min)||(integer&&!Number.isInteger(value))){
+      const message=path==='workloads.interference.max_slowdown'?'Enter a slowdown greater than 1×; 1.5× means up to 50% longer.':`Enter ${integer?'a whole number':'a number'} ${exclusive?'greater than ':'of at least '}${min}${Number.isFinite(maximum)?` and no more than ${maximum}`:''} for ${label}.`;
+      issue(path,message);
+    }
   };
   for(const kind of ['input_tokens','output_tokens'])for(let i=0;i<3;i++){
     const value=s.profile[loadSizes[i]][kind],path=`profile.${loadSizes[i]}.${kind}`,bounds=limits['load_test.'+path]||{};
@@ -145,7 +149,7 @@ export function loadTestIssues(config, defaults, limits={}) {
   if(standard&&p.bursts.enabled){
     valid('patterns.bursts.size',p.bursts.size,1,{integer:true,label:'Requests per burst'});
     valid('patterns.bursts.first_seconds',p.bursts.first_seconds,0,{label:'First burst after (seconds)'});
-    valid('patterns.bursts.gap_seconds',p.bursts.gap_seconds,0.01,{label:'Time between burst starts (seconds)'});
+    valid('patterns.bursts.gap_seconds',p.bursts.gap_seconds,0,{exclusive:true,label:'Time between burst starts (seconds)'});
     if(p.bursts.first_seconds>=s.schedule.duration_seconds)issue('patterns.bursts.first_seconds','The first burst must start before the sending window ends.');
     if(config.concurrency!=null&&p.bursts.size>config.concurrency)issue('concurrency','One burst exceeds the concurrency ceiling and cannot be dispatched in full.');
   }

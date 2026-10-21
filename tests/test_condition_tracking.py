@@ -171,15 +171,16 @@ async def test_saved_condition_failures_include_post_run_judging(monkeypatch):
 
 
 async def test_arrivals_have_rate_condition_and_exact_plan():
-    from giraffe.workloads import arrivals
-    config = configuration(arrivals={"requests": 2, "requests_per_second": 1000})
-    config.checks = ["arrivals"]
-    run = _Run(config, None, None)
-    await arrivals(run, config.targets[0], Client(), {"short": [spec("x", "short", "arrivals")]})
-    row = run.observations["local"]["conditions"][0]
-    assert row["condition"]["id"] == "arrival_r1000"
-    assert row["planned"] == row["sent"] == 2 and row["not_sent"] == 0
-    assert {record.condition_id for record in run.records} == {"arrival_r1000"}
+    from giraffe import load_test
+    from tests.test_concurrent_load import configuration as load_configuration,short_windows
+    cfg=short_windows(load_configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.002)
+    run=_Run(cfg,None,None)
+    await load_test.execute(run,cfg.targets[0],Client())
+    p=load_test.result(run,cfg.targets[0]).metrics['points'][0]
+    row=next(r for r in run.observations['local']['conditions'] if r['condition']['id'] == p['id'])
+    assert row['condition']['id'].endswith('_constant_r1000')
+    assert row['planned'] == row['sent'] == 2 and row['not_sent'] == 0
+    assert {r.condition_id for r in run.records if r.load_point.get('type') != 'calibration'} == {p['id']}
 
 
 async def test_logprob_consistency_plan_includes_priming_and_measured_rounds():

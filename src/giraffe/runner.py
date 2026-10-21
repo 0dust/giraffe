@@ -979,7 +979,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                             await run.group(target, client, run.pack_specs, "pack_control",
                                             count=len(run.pack_specs), checks=["correctness"])
                             effective = _check_config(config, "correctness")
-                            await run.group(target, client, run.pack_specs, "pack_loaded",
+                            if "load" not in enabled:
+                                await run.group(target, client, run.pack_specs, "pack_loaded",
                                             count=max(len(run.pack_specs), effective.concurrency),
                                             concurrency=effective.concurrency, checks=["correctness"])
                         run.finish_checks(target.name, {check_id})
@@ -1235,7 +1236,7 @@ def _pack_results(run: _Run, target: Target) -> dict:
     delays = scheduling_delay_windows(run)
     for case, spec in zip(cases, run.pack_specs, strict=True):
         loaded = [r for r in run.records if r.target == target.name and r.fixture_id == spec.fixture_id
-                  and (r.traffic_stage is not None or r.scenario == "pack_loaded")]
+                  and (r.traffic_stage is not None or r.scenario == "pack_loaded" or bool(r.load_point))]
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
         failed = accuracy is not None and accuracy < limits.min_correctness
@@ -1275,8 +1276,11 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         title = CHECK_NAMES[check_id]
         if check_id == "load":
             from giraffe.load_test import result as load_result
-            result.append(load_result(run, target) if check_id in run.config.checks else CheckResult(
-                id=check_id, title=title, target=target.name, required=False, status="skipped", summary="Not selected."))
+            item = load_result(run, target) if check_id in run.config.checks else CheckResult(
+                id=check_id, title=title, target=target.name, required=False, status="skipped", summary="Not selected.")
+            if item.status == "inconclusive":
+                item.summary += " To conclude, complete every selected sending window and collect the required valid, scored responses with complete delivery and timing evidence."
+            result.append(item)
             continue
         config = _check_config(run.config, check_id)
         limits = config.limits
@@ -1284,7 +1288,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         records = [r for r in ordinary if check_id in r.check_ids]
         if check_id == "correctness" and run.pack_specs:
             records = [r for r in all_records if r.scenario in {"pack_control", "pack_loaded"}
-                       or r.traffic_stage is not None]
+                       or r.traffic_stage is not None or bool(r.load_point)]
             limits = limits.model_copy(update={"min_samples": 1})
         if check_id == "capacity":
             records = [r for r in records if r.traffic_stage is not None]
@@ -2175,7 +2179,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     if run.pack_specs:
         warnings.append("Repeated, warmed workload: quiet controls and traffic repeat the same requests and may benefit caches.")
         warnings.append("Request-pack correctness covers every case; global samples does not select case count. "
-                        "Without capacity, one quiet pass and a concurrent pass of at least global concurrency run. "
+                        "With Load test, the selected traffic supplies the loaded pass. Otherwise one quiet pass and a concurrent pass of at least default concurrency run. "
                         "Legacy request previews omit this extra concurrent pass.")
     observations = {"resources": {
                         "sampled_peak_rss_bytes": dict(sampler.peaks),
@@ -2261,7 +2265,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                                       if "capacity" in config.checks else None),
                 "fixture_pack": {"version": FIXTURE_VERSION, "custom": config.custom_fixtures,
                                  "custom_sha256": custom_hash,
-                                 "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"capacity", "correctness"}
+                                 "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"load", "capacity", "correctness"}
                                                     else fixture_hash(fixture_values)),
                                  "workload_fixture_sha256": fixture_hash(workload_identity)},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),

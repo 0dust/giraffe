@@ -135,9 +135,10 @@ def load_shape_label(shape):
     return f"{a.capitalize()} input → {b.capitalize()} output"
 
 
-def load_validation_error(fields, message):
+def load_validation_error(fields, message, values=None, actions=None):
     raise ValidationError.from_exception_data("Load test", [{
-        "type": PydanticCustomError("load_test", message, {"fields": fields}),
+        "type": PydanticCustomError("load_test", message, {"fields": fields,
+            **({"values": values} if values is not None else {}), **({"actions": actions} if actions is not None else {})}),
         "loc": tuple(fields[0].split(".")), "input": None}])
 
 
@@ -267,7 +268,11 @@ class LoadTestProfile(DataProfile):
     long: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=2048, output_tokens=512))
 
     @model_validator(mode="after")
-    def strictly_increasing(self):
+    def strictly_increasing(self, info: ValidationInfo):
+        # Saved token ceilings could collapse two or three profile sizes. Keep
+        # those imported targets readable without weakening the new editor.
+        if info.context and info.context.get("legacy_load_source"):
+            return self
         for field in ("input_tokens", "output_tokens"):
             for previous, size in zip(SIZES, SIZES[1:]):
                 if getattr(getattr(self, size), field) <= getattr(getattr(self, previous), field):
@@ -337,7 +342,7 @@ class ConcurrentPattern(Model):
 
 
 class PoissonPattern(PatternToggle):
-    seed: StrictInt = Field(default=42, ge=0)
+    seed: StrictInt = Field(default=42, ge=0, le=2**53 - 1)
 
 
 class BurstPattern(PatternToggle):
@@ -381,12 +386,23 @@ class ResponseCriteria(Model):
 
 
 class LoadTestSettings(Model):
+    legacy_source: Literal["concurrency", "capacity", "arrivals"] | None = Field(
+        default=None, description="Imported schedule provenance; preserves legacy truncation and clamped profile targets.")
     profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
     workloads: LoadWorkloads = Field(default_factory=LoadWorkloads)
     patterns: LoadPatterns = Field(default_factory=LoadPatterns)
     schedule: LoadWindow = Field(default_factory=LoadWindow)
     request_timeout_seconds: float = Field(default=60, gt=0)
     pass_criteria: ResponseCriteria = Field(default_factory=ResponseCriteria)
+
+    @field_validator("profile", mode="plain", json_schema_input_type=LoadTestProfile)
+    @classmethod
+    def imported_profile(cls, value, info: ValidationInfo):
+        return LoadTestProfile.model_validate(value, context={"legacy_load_source": info.data.get("legacy_source")})
+
+    @field_serializer("profile")
+    def serialize_profile(self, value) -> dict[str, Any]:
+        return value.model_dump()
 
     @model_validator(mode="before")
     @classmethod
@@ -439,7 +455,7 @@ def migrate_load_test(value):
     notes = []
     old_checks = list(value.get("checks", []))
     older = {"fairness", "buckets", "mixed", "token_stress"}.intersection(old_checks)
-    if older or value.get("concurrent_workloads") or value.get("buckets"):
+    if older or value.get("concurrent_workloads") is not None or value.get("buckets") is not None:
         value, earlier_notes = migrate_concurrent_load(value)
         notes.extend(earlier_notes)
         old_checks = list(value.get("checks", []))
@@ -452,9 +468,23 @@ def migrate_load_test(value):
     options = value.get("test_options") or {}
     def plain(v):
         return v.model_dump(exclude_unset=True) if isinstance(v, BaseModel) else v or {}
+    def validate_legacy(model, raw, prefix):
+        try:
+            return model.model_validate(raw)
+        except ValidationError as error:
+            details = []
+            for item in error.errors(include_url=False):
+                context = dict(item.get("ctx") or {})
+                if context.get("fields"):
+                    context["fields"] = [field if field.startswith(prefix + ".") else prefix + "." + field
+                                         for field in context["fields"]]
+                details.append({"type": PydanticCustomError(item["type"], item["msg"], context),
+                                "loc": (prefix, *item["loc"]), "input": item.get("input")})
+            raise ValidationError.from_exception_data("Legacy load configuration", details) from None
     timeout = value.get("request_timeout_seconds", 30)
     for check in dict.fromkeys(selected):
         settings = LoadTestSettings().model_dump()
+        settings["legacy_source"] = check
         w, patterns = settings["workloads"], settings["patterns"]
         for k in w:
             w[k]["enabled"] = False
@@ -466,7 +496,12 @@ def migrate_load_test(value):
         if check == "concurrency":
             old_input = plain(value.get("concurrent_load"))
             explicit_levels = "levels" in plain(old_input.get("schedule"))
-            old = ConcurrentLoad.model_validate(old_input).model_dump()
+            if isinstance(old_input.get("profile"), dict):
+                defaults = DataProfile().model_dump()
+                old_input["profile"] = {size: {**defaults.get(size, {}), **dimensions}
+                    if isinstance(dimensions, dict) else dimensions
+                    for size, dimensions in old_input["profile"].items()}
+            old = validate_legacy(ConcurrentLoad, old_input, "concurrent_load").model_dump()
             settings["profile"] = old["profile"]
             w["combinations"] = old["combinations"]
             shares = old["mixed"]["shares"]
@@ -482,9 +517,11 @@ def migrate_load_test(value):
             patterns["poisson"]["seed"] = old["mixed"]["seed"] if old["mixed"]["seed"] is not None else 42
             settings["schedule"]["duration_seconds"] = old["schedule"]["duration_seconds"]
             settings["pass_criteria"].update({k: v for k,v in old["pass_criteria"].items() if k in settings["pass_criteria"]})
+            if old["input_token_tolerance"] != .1 or old["calibration_attempts"] != 3:
+                notes.append(f"Legacy input_token_tolerance={old['input_token_tolerance']} and calibration_attempts={old['calibration_attempts']} replaced by the Load test calibration policy (0.1 tolerance, 3 attempts). Review calibration coverage in the results.")
             notes.append("Concurrent load migrated to Load test. Finish allowance uses the old request timeout (drain bound). Old p95 limits were not converted to per-response limits; new per-response defaults (2,000 ms first answer / 30,000 ms completion) apply. Review per-response criteria. Old mixed seed is now the shared schedule/mix seed; interference uses full baseline/probe windows and a five-chunk trigger.")
         elif check == "capacity":
-            old = TrafficConfig.model_validate(plain(value.get("traffic")))
+            old = validate_legacy(TrafficConfig, plain(value.get("traffic")), "traffic")
             patterns["poisson" if old.arrival == "poisson" else "constant"]["enabled"] = True
             patterns["rates"], patterns["poisson"]["seed"] = old.rates, old.seed
             settings["schedule"].update(duration_seconds=math.ceil(old.duration_seconds), finish_seconds=old.drain_timeout_seconds)
@@ -498,7 +535,7 @@ def migrate_load_test(value):
                 w["mixed"].update(enabled=True, selected=shapes, share_mode="custom", shares=shares)
             notes.append(f"Capacity traffic migrated as an independent {old.arrival} test with the equivalent short/long-input/long-output request shares. long_input_chars={old.long_input_chars} and long_output_words={old.long_output_words} were not converted into tokens; review the explicit data profile. max_in_flight dropped: Run limits concurrency ceiling now governs admission. Fractional durations round up to whole seconds.")
         else:
-            old = Arrival.model_validate(plain(value.get("arrivals")))
+            old = validate_legacy(Arrival, plain(value.get("arrivals")), "arrivals")
             w["combinations"].update(enabled=True, selected=["short_short"])
             patterns["poisson"]["seed"] = max(0, old.seed)
             if old.mode == "steady":
@@ -642,7 +679,7 @@ def migrate_run_limits(value):
                 own = own.model_dump(exclude_unset=True) if isinstance(own, BaseModel) else own
                 same = own.get("max_in_flight") in (None, value["concurrency"])
             if same:
-                users.append(CHECK_NAMES[check])
+                users.append(CHECK_NAMES.get(check, {"capacity": "Capacity", "arrivals": "Arrival traffic"}.get(check, check)))
         kept = (f"{', '.join(users)} retain legacy {value['default_concurrency']}-request parallelism"
                 if users else "no selected check inherits that parallelism")
         notes.append(f"concurrency: {value['concurrency']} now limits simultaneous requests; default_concurrency={value['default_concurrency']}; {kept}.")
@@ -769,7 +806,8 @@ def required_concurrency(config) -> dict[str, Any]:
         elif check == "capacity":
             peak = config.effective_traffic().max_in_flight
         elif check == "arrivals":
-            peak = config.effective_arrivals().max_in_flight
+            arrival = config.effective_arrivals()
+            peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -825,6 +863,10 @@ def migrate_concurrent_load(value):
            "mixed_pairs": 5, "heavy_weights": {"long_input": 1, "long_output": 1}, "window_seconds": 30, **old}
     if checks is not None:
         value["checks"] = list(dict.fromkeys("concurrency" if c in legacy_checks else c for c in checks))
+    elif legacy:
+        # The final catalogue's Load test defaults must not replace an old
+        # implicit workload block before its actual scenarios are converted.
+        value["checks"] = list(dict.fromkeys("concurrency" if c == "load" else c for c in DEFAULT_CHECKS))
     for name in ("concurrency", *legacy_checks):
         removed = options.pop(name, None)
         if removed:
@@ -932,6 +974,7 @@ def migrate_concurrent_load(value):
                              ("consistency", "consistency"), ("tool_calling", "tools"), ("tool_checks", "tools")):
             if value.get(field) is not None and (field != "tool_calling" or value[field]):
                 selected_checks.append(check)
+        value["checks"] = list(dict.fromkeys(selected_checks))
     fixed = 0
     if "capacity" in selected_checks:
         traffic = value.get("traffic") or {}
@@ -2117,6 +2160,8 @@ class RunConfig(Model):
                         effective_levels = [n for n in levels if n <= self.inherited_concurrency(max(levels))] or [1]
                         if levels != effective_levels:
                             self._concurrency_warnings.append({"fields":[prefix+"patterns.concurrent.levels","concurrency"],"check":"load",
+                                "values": {prefix+"patterns.concurrent.levels": levels, "concurrency": self.concurrency},
+                                "effective_concurrency": max(effective_levels),
                                 "msg":f"Load test inherits concurrency levels {levels}; the run ceiling allows {effective_levels} per endpoint."})
                         pattern.levels = effective_levels
                         pattern.__pydantic_fields_set__.discard("levels")

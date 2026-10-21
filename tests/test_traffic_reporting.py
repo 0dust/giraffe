@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
-from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport, Target
+from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport, Target, TrafficConfig
 from giraffe.reporting import compare_baseline, write_report
 
 
@@ -13,6 +13,8 @@ def traffic_report(run_id="current", *, high_failure=None):
         checks=["capacity"], traffic={"rates": [1, 4], "duration_seconds": 5},
         limits={"latency_ms": 150},
     )
+    # This fixture represents an already saved pre-#45 report, not runnable input.
+    config = config.model_copy(update={"checks": ["capacity"], "traffic": TrafficConfig(rates=[1, 4], duration_seconds=5)})
     records, stages = [], []
     for index, rate in enumerate(config.traffic.rates):
         count = int(rate * config.traffic.duration_seconds)
@@ -286,7 +288,6 @@ def test_portable_report_explains_traffic_accounting_and_capacity_change(tmp_pat
 def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, value):
     current, old = traffic_report(), traffic_report("baseline")
     current.manifest["config"][field] = value
-    current.manifest["config"] = RunConfig.model_validate(current.manifest["config"]).model_dump()
     assert compare_baseline(current, old).baseline["status"] == "pass"
 
 
@@ -300,9 +301,7 @@ def test_selected_workload_settings_still_block_comparison(field, check, value):
     current, old = traffic_report(), traffic_report("baseline")
     for report in (current, old):
         report.manifest["config"]["checks"].append(check)
-        report.manifest["config"] = RunConfig.model_validate(report.manifest["config"]).model_dump()
     current.manifest["config"][field] = value
-    current.manifest["config"] = RunConfig.model_validate(current.manifest["config"]).model_dump()
     result = compare_baseline(current, old)
     assert result.baseline["status"] == "inconclusive"
     assert f"Run setting {field} differs." in result.baseline["targets"][0]["reasons"]
@@ -330,7 +329,6 @@ def test_tool_expectation_changes_only_block_selected_tool_comparisons(selected)
         if selected:
             report.manifest["config"]["checks"].append("tools")
         report.manifest["config"]["tool_checks"] = deepcopy(tool_checks)
-        report.manifest["config"] = RunConfig.model_validate(report.manifest["config"]).model_dump()
     current.manifest["config"]["tool_checks"]["fixtures"][0]["expected_content"]["value"] = "Finished."
     result = compare_baseline(current, old)
     reasons = result.baseline["targets"][0]["reasons"]

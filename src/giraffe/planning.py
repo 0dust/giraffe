@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
+from giraffe.concurrent_load import prompt_overhead
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets
 from giraffe.models import CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, required_concurrency
@@ -827,7 +828,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         if not pack:
             warnings.append("The selected dataset is empty; request counts and run readiness are incomplete.")
 
-    if pack_selected and "correctness" in selected and "capacity" not in selected and pack:
+    if pack_selected and "correctness" in selected and not selected & {"load", "capacity"} and pack:
         count = max(len(config.request_pack.cases), config.effective_check("correctness")["concurrency"])
         add("pack_loaded", count, "Concurrent answer pass over your questions.", source="your dataset")
 
@@ -943,9 +944,23 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 title=detail["title"], kind="duration" if detail["unknown_requests"] else "estimate" if detail["approximate"] else "exact",
                 source="your dataset" if config.request_source == "request_pack" else "saved questions" if config.custom_fixtures else "generated token-target prompts")
             rows[-1]["expected_scheduled_requests"] = detail["expected_requests"]
+            rows[-1]["known_scheduled_requests"] = detail["known_scheduled_requests"]
+            rows[-1]["approximate"] = detail["approximate"]
         if config.request_source != "request_pack" and not config.custom_fixtures:
             calibration_count = sum(len(calibration_keys(own))*own.calibration_attempts for _,own in settings_sets(config.load_test))
             add("load_calibration", calibration_count, "Up to three token-calibration attempts per input size and instruction variant; separate from scheduled load.", title="Input token calibration", kind="bounded")
+            for source, own in settings_sets(config.load_test):
+                floors = {}
+                for size, variant in calibration_keys(own):
+                    floors[size] = max(floors.get(size, 0), prompt_overhead(variant))
+                prefix = ("load_test" if source == "primary" else
+                          f"load_test.migrated_tests.{source.split('_')[1]}.settings")
+                for size, floor in floors.items():
+                    target = getattr(own.profile, size).input_tokens
+                    if target < floor:
+                        load_warnings.append({"fields": [f"{prefix}.profile.{size}.input_tokens"],
+                            "msg": f"{size.capitalize()} input target {target} is below the minimum prompt length "
+                                   f"(≈{floor} tokens); calibration reports the actual input length."})
         criteria = config.load_test.pass_criteria
         if criteria.max_first_answer_ms is None and criteria.max_completion_ms is None:
             load_warnings.append({"fields":["load_test.pass_criteria.max_first_answer_ms","load_test.pass_criteria.max_completion_ms"],
@@ -1027,12 +1042,14 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append("Your dataset is inactive: select Answer correctness or Capacity under load to use it.")
     if config.overlap_models and target_count > 1:
         warnings.append("Models run at the same time and share Limit simultaneous requests. Their actual overlap depends on when request slots become free.")
-    known = sum(row["requests_per_target"] or 0 for row in rows if row["kind"] == "exact")
+    known = sum(row.get("known_scheduled_requests", row["requests_per_target"] or 0
+                        if row["kind"] == "exact" else 0) for row in rows)
     unknown = any(row["requests_per_target"] is None for row in rows)
     estimated = any(row["kind"] == "estimate" for row in rows)
     kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
     planned = None if unknown else sum(row["requests_per_target"] for row in rows)
-    counted = sum(row["requests_per_target"] or 0 for row in rows)
+    counted = sum(row["requests_per_target"] if row["requests_per_target"] is not None
+                  else row.get("expected_scheduled_requests", 0) for row in rows)
     adaptive_estimates = {}
     if "context" in selected:
         adaptive_estimates["context"] = 1 + 2 * context_count
@@ -1040,6 +1057,15 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         adaptive_estimates["sustained"] = max(config.effective_check("recovery")["limits"]["min_samples"],
             config.effective_check("recovery")["concurrency"] * 2)
     estimated_total = counted + sum(adaptive_estimates.values())
+    # A workload row may contain both unknown refills and a known arrival
+    # schedule. Preserve the additive schedule in the run headline as well as
+    # in the drawer; Poisson expectations remain explicitly approximate.
+    scheduled_extra = sum(row.get("expected_scheduled_requests", 0)
+                          - row.get("known_scheduled_requests", 0) for row in rows)
+    headline_count = (known + scheduled_extra) * target_count
+    request_count_label = ("Unknown + " if unknown and headline_count else "Unknown" if unknown else "")
+    if headline_count or not unknown:
+        request_count_label += f"{'≈ ' if scheduled_extra or estimated else ''}{headline_count:,.0f}"
     def edit_field(row):
         identifier = row["id"]
         if identifier.startswith("load_"):
@@ -1067,18 +1093,28 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         if known > quota or planned is not None and planned > quota:
             elapsed, cut = 0, []
             for row in rows:
-                elapsed += row["requests_per_target"] or 0
-                if elapsed > quota and row["requests_per_target"]:
+                row_count = row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+                elapsed += row_count
+                if elapsed > quota and row_count:
                     cut.append(row)
             required = planned * target_count if kind == "exact" else known * target_count
+            if load_plan:
+                # Calibration has a finite attempt allowance. A suggested
+                # budget must cover that allowance as well as scheduled work.
+                required = math.ceil(planned if planned is not None else known + sum(
+                    row["requests_per_target"] or 0 for row in rows
+                    if row["id"] == "load_calibration")) * target_count
             fields = list(dict.fromkeys(["max_requests", *[edit_field(row) for row in cut]]))
-            message = (f"{target}: incomplete coverage for {', '.join(_warning_title(row) for row in cut)}; "
+            titles = list(dict.fromkeys(_warning_title(row) for row in cut))
+            edits = list({(action["label"], action["field"]): action for action in [
+                {"label": f"Edit {_warning_title(row)}", "field": edit_field(row)} for row in cut]}.values())
+            message = (f"{target}: incomplete coverage for {', '.join(titles)}; "
                        f"the planned requests exceed this endpoint's share of the request limit (Stop after this many requests: {quota:,}).")
             request_warnings.append({"kind": "incomplete_coverage", "fields": fields,
                 "values": {"max_requests": config.max_requests, "required_request_limit": required, "quota": quota},
                 "cut_checks": [row["id"] for row in cut], "msg": message,
                 "actions": [{"label": f"Use {required:,} total requests", "field": "max_requests", "value": required},
-                            *[{"label": f"Edit {_warning_title(row)}", "field": edit_field(row)} for row in cut]]})
+                            *edits]})
             warnings.append(message)
         if unknown or kind != "exact":
             message = f"{target}: duration-based or adaptive traffic can exhaust the request budget and leave checks unfinished."
@@ -1128,6 +1164,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                         values[field] = setting
                 notice["values"] = values
     return {**timing, "count_kind": kind, "planned_per_target": planned,
+            **({"request_count_label": request_count_label} if load_plan else {}),
             "planned_total": planned * target_count if planned is not None else None,
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,
             "load_test": load_plan,

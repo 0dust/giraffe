@@ -64,7 +64,15 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
         if (record.target == target and getattr(record, "traffic_stage", None) is None
                 and record.scenario not in {"client_cancel", "client_deadline", "sglang_cancel", "backend_cancel"}):
             for check in record.check_ids:
-                groups[(check, record.scenario)].append(record)
+                if check == "load" and not (record.load_point or {}).get("point_id"):
+                    continue  # Setup calibration is not a workload result group.
+                scenario = record.scenario
+                if check == "load" and record.load_point:
+                    # A mixed test has one sending window but distinct shape cohorts.
+                    scenario += "." + str(record.load_point.get("shape", "unknown"))
+                    if record.load_point.get("role") != "request":
+                        scenario += "." + str(record.load_point.get("role", "unknown"))
+                groups[(check, scenario)].append(record)
     return groups
 
 
@@ -146,6 +154,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
+    if revision == "issue45" and not set(resolved.checks) <= {"sessions", "consistency"}:
+        return None  # Load generators changed; this attestation covers unchanged specialists only.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
         if not checks.intersection(resolved.checks):
@@ -163,6 +173,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "phase3": "e147840e6530a40c0ac1607ac05840a5aec5abeb2faaff31e53bd2613057eaec",
             "review26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
             "caps26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
+            "issue45": "9c47aa627a061bd90f0e181ce26b7faa912be790ae75547348c72445c4144b35",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -182,6 +193,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "phase3": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
             "review26": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
             "caps26": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "issue45": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -200,7 +212,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
@@ -252,7 +264,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         if key in reached and current_config.get(key) != old_config.get(key):
             reasons.append(f"Run setting {key} differs and its limit stopped work or constrained concurrency.")
     pack_modes = [config.get("request_source") == "request_pack"
-                  and bool({"capacity", "correctness"}.intersection(config.get("checks", [])))
+                  and bool({"load", "capacity", "correctness"}.intersection(config.get("checks", [])))
                   for config in (current_config, old_config)]
     if any(pack_modes):
         identities = [run.manifest.get("request_pack") for run in (report, baseline)]
@@ -304,7 +316,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
             if isinstance(correctness, dict):
                 # A pack always uses one serial quiet pass. Capacity, when
                 # selected, also owns the payload used by that shared pass.
-                shared = "capacity" in manifest.get("config", {}).get("checks", [])
+                shared = bool({"load", "capacity"}.intersection(manifest.get("config", {}).get("checks", [])))
                 inactive = {"samples", "concurrency"}
                 if shared:
                     inactive.update({"max_output_tokens", "request_timeout_seconds",
@@ -316,8 +328,11 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
     inactive_pack_globals = ({"context_limit", "samples", "sustained_seconds"}
-                             if all(pack_modes) and selected <= {"capacity", "correctness"} else set())
-    workload_fields = [key for key, checks in WORKLOAD_CHECKS.items() if checks & selected]
+                             if all(pack_modes) and selected <= {"load", "capacity", "correctness"} else set())
+    comparison_workloads = {**WORKLOAD_CHECKS, "concurrent_load": {"concurrency"},
+                            "arrivals": {"arrivals"}, "buckets": {"buckets", "mixed"},
+                            "concurrent_workloads": {"token_stress"}}
+    workload_fields = [key for key, checks in comparison_workloads.items() if checks & selected]
     for key in (*_MATCH_CONFIG, *workload_fields):
         if key in inactive_pack_globals:
             continue
@@ -402,12 +417,15 @@ def _timing_quality(report, target, records, metrics):
 
 def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
     completed = [r for r in records if r.status == "completed" and r.valid]
+    def clock_value(record, arrival_field, dispatch_field):
+        arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
+        return getattr(record, arrival_field if arrival else dispatch_field)
     return {
         "valid_completion_rate": [float(r.status == "completed" and r.valid) for r in records],
         "error_rate": [float(r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
-        "latency_ms": [r.elapsed_ms for r in completed],
-        "first_output_ms": [r.first_output_ms for r in completed if r.first_output_ms is not None],
+        "latency_ms": [v for r in completed if (v := clock_value(r, "arrival_elapsed_ms", "elapsed_ms")) is not None],
+        "first_output_ms": [v for r in completed if (v := clock_value(r, "arrival_first_output_ms", "first_output_ms")) is not None],
         "max_stream_gap_ms": [
             r.max_stream_gap_ms for r in completed if r.max_stream_gap_ms is not None
         ],
@@ -596,6 +614,9 @@ def _compare_traffic(
 
 def _load_test_html(metrics):
     parts = ['<h4>Load test</h4><p>Sequential workload × traffic tests. Highest accepted values are highest tested, not absolute capacity limits. Burst overlays are separate from steady-arrival capacity.</p>']
+    for calibration in metrics.get("calibrations", []):
+        if calibration.get("reason"):
+            parts.append('<p>Input token calibration: ' + _e(calibration["reason"]) + '</p>')
     if metrics.get("workload_source"):
         parts.append('<p>Active workload source: '+_e(metrics["workload_source"])+'. '+_e(metrics.get("context_note", ""))+'</p>')
     for row in metrics.get("highest_accepted", []):
@@ -776,6 +797,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         if delayed_runs:
                             row.update(status="inconclusive", reason=" / ".join(delayed_runs) +
                                        " client scheduling delay overlaps these metric samples; endpoint timing attribution is uncertain.")
+                        if check == "load" and metric in {"latency_ms", "first_output_ms"}:
+                            completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
+                                                for cohort in (current_records, old_records)]
+                            if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
+                                row.update(status="inconclusive", reason="Per-response timing evidence is incomplete; missing clocks remain unknown.")
                         if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
                             row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
                     row.update(check=check, scenario=scenario,

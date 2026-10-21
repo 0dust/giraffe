@@ -23,9 +23,9 @@ def test_legacy_concurrent_load_inherited_levels_match_old_main(ceiling, targets
     if ceiling is not None:
         values["concurrency"] = ceiling
     config, notes = saved(**values)
-    assert config.concurrent_load.schedule.levels == levels
+    assert config.load_test.patterns.concurrent.levels == levels
     assert any(f"legacy schedule.levels={levels!r}" in note for note in notes)
-    assert RunConfig.model_validate(config.model_dump()).concurrent_load.schedule.levels == levels
+    assert RunConfig.model_validate(config.model_dump()).load_test.patterns.concurrent.levels == levels
 
 
 @pytest.mark.parametrize("default,ceiling,levels", [(40, None, [1, 4]), (40, 2, [1]),
@@ -33,7 +33,7 @@ def test_legacy_concurrent_load_inherited_levels_match_old_main(ceiling, targets
 def test_v2_default_load_levels_do_not_follow_default_parallelism(default, ceiling, levels):
     config = RunConfig(targets=[TARGET], checks=["concurrency"], default_concurrency=default,
                        concurrency=ceiling)
-    assert config.concurrent_load.schedule.levels == levels
+    assert config.load_test.patterns.concurrent.levels == levels
 
 
 @pytest.mark.parametrize("ceiling,targets,levels", [(2, 1, [2]), (None, 1, [3, 4]),
@@ -44,18 +44,19 @@ def test_old_load_migration_bounds_explicit_levels(ceiling, targets, levels):
     if ceiling is not None:
         values["concurrency"] = ceiling
     config, notes = saved(**values)
-    assert config.concurrent_load.schedule.levels == levels
+    assert config.load_test.patterns.concurrent.levels == levels
     assert any("bounded by Limit simultaneous requests" in note for note in notes)
 
 
 @pytest.mark.parametrize("cap,outputs", [(8, [8, 8, 8]), (64, [32, 64, 64])])
 def test_legacy_inherited_profile_output_budgets_retain_old_cap(cap, outputs):
     config, notes = saved(checks=["concurrency"], max_output_tokens=cap)
-    assert [getattr(config.concurrent_load.profile, size).output_tokens
+    assert [getattr(config.load_test.profile, size).output_tokens
             for size in ("short", "medium", "long")] == outputs
     assert any("clipped to legacy max_output_tokens" in note for note in notes)
+    assert RunConfig.model_validate(config.model_dump()).load_test.profile == config.load_test.profile
     fresh = RunConfig(targets=[TARGET], checks=["concurrency"], max_output_tokens=cap)
-    assert [getattr(fresh.concurrent_load.profile, size).output_tokens
+    assert [getattr(fresh.load_test.profile, size).output_tokens
             for size in ("short", "medium", "long")] == [32, 64, 128]
 
 
@@ -63,7 +64,7 @@ def test_legacy_inherited_profile_output_budgets_retain_old_cap(cap, outputs):
 def test_legacy_migrated_profile_explicit_output_budgets_retain_old_cap(check):
     config, notes = saved(checks=[check], max_output_tokens=64,
                          concurrent_workloads={"output_tokens": {"short": 16, "medium": 48, "long": 256}})
-    assert [getattr(config.concurrent_load.profile, size).output_tokens
+    assert [getattr(config.load_test.profile, size).output_tokens
             for size in ("short", "medium", "long")] == [16, 48, 64]
     assert any("output_tokens.long=256 copied to profile.long.output_tokens=64; clipped" in note for note in notes)
 
@@ -99,8 +100,9 @@ def test_inherited_load_overlap_error_reports_effective_level_and_levels_field()
         RunConfig(targets=[TARGET, {**TARGET, "name": "two"}], checks=["concurrency"],
                   overlap_models=True, concurrency=1)
     detail = error.value.errors()[0]
-    assert detail["ctx"]["fields"] == ["concurrent_load.schedule.levels", "concurrency"]
-    assert "runs 1 at once × 2 endpoints" in detail["msg"]
+    assert detail["ctx"]["fields"] == ["load_test.patterns.concurrent.levels", "concurrency"]
+    assert detail["msg"] == "Concurrency 1 × 2 endpoints exceeds the run ceiling (1). Update Run limits or lower the levels."
+    assert detail["ctx"]["values"] == {"load_test.patterns.concurrent.levels": [1], "concurrency": 1}
 
 
 @pytest.mark.parametrize("options", [{"samples": 3}, {"concurrency": 4},
@@ -137,7 +139,7 @@ def test_legacy_session_output_budgets_retain_old_runtime_cap(settings):
 def test_legacy_sparse_profile_inherits_neighbor_constrained_output_values():
     config, notes = saved(checks=["concurrency"],
                          concurrent_load={"profile": {"medium": {"output_tokens": 24}}})
-    assert [getattr(config.concurrent_load.profile, size).output_tokens
+    assert [getattr(config.load_test.profile, size).output_tokens
             for size in ("short", "medium", "long")] == [24, 24, 128]
     assert any("legacy neighboring profile values" in note for note in notes)
 
@@ -146,7 +148,7 @@ def test_legacy_note_names_only_checks_actually_inheriting_parallelism():
     _, notes = saved(checks=["correctness", "sessions", "consistency", "capacity"], concurrency=40,
                      test_options={"correctness": {"concurrency": 2}})
     note = next(note for note in notes if note.startswith("concurrency: 40"))
-    assert "Arrival traffic capacity retain legacy 40-request parallelism" in note
+    assert "Capacity retain legacy 40-request parallelism" in note
     assert "Known-answer correctness" not in note and "Multi-turn sessions" not in note
 
 

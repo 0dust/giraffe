@@ -62,6 +62,10 @@ def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[
     workload = workload or {}
     if calibration := re.fullmatch(r"load_calibration_v45_(short|medium|long)_(short_answer|long_output)", scenario):
         return {"id": scenario, "label": f"Calibrating {calibration[1]} input tokens", "check": "load", "load_type": "calibration"}
+    if comparison := re.fullmatch(r"load_(?:primary|legacy_.+?)_interference_c(\d+)\.(baseline|probe)(?:\..+)?", scenario):
+        level, phase = comparison.groups()
+        name = "Short answers alone" if phase == "baseline" else "Short answers with a long request"
+        return {"id": scenario, "label": f"{name} at {int(level)} concurrent requests", "check": "load", "load_type": "interference", "level": int(level)}
     if scenario.startswith(("load_primary_", "load_legacy_")):
         condition = {"id": scenario, "label": _plain(scenario.removeprefix("load_primary_")), "check": "load"}
         if level := re.search(r"_c(\d+)(?:\.|$)", scenario):
@@ -217,10 +221,10 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
                                   prompts_per_shape=1)
         if check == "sessions" and config.sessions:
             parameters["concurrency"] = min(config.sessions.concurrency, config.sessions.sessions)
-        if check == "capacity":
-            parameters["concurrency"] = config.effective_traffic().max_in_flight
-        if check == "arrivals":
-            parameters["concurrency"] = config.effective_arrivals().max_in_flight
+        if check == "capacity" and (traffic := config.effective_traffic()) is not None:
+            parameters["concurrency"] = traffic.max_in_flight
+        if check == "arrivals" and (arrivals := config.effective_arrivals()) is not None:
+            parameters["concurrency"] = arrivals.max_in_flight
         if check == "recovery":
             parameters["concurrency"] = config.effective_check("recovery")["concurrency"] if scenario == "sustained" else 1
         if check in {"correctness", "json"}:

@@ -21,7 +21,7 @@ def test_unbounded_plan_has_no_quota_or_time_budget_warning(checks):
     configured = config(checks=checks, max_requests=None, max_duration_seconds=None, concurrency=None)
     result = request_plan(configured)
     assert result["request_limit"] is None
-    assert result["required_concurrency"]["peak"] == 4
+    assert result["required_concurrency"]["peak"] == (120 if checks == ["capacity"] else 30 if checks == ["arrivals"] else 4)
     assert result["target_quotas"] == {"local": None}
     assert result["errors"] == result["time_warnings"] == []
     assert not any("quota" in warning or "Raise the total request limit" in warning
@@ -67,16 +67,18 @@ def test_inherited_concurrency_notice_is_structured_and_nonblocking_in_plan():
 
 
 def test_burst_warning_shows_inflight_and_queue_arithmetic():
-    result = request_plan(config(checks=["arrivals"], arrivals={
-        "mode": "burst", "requests": 20, "burst_size": 20, "max_in_flight": 4, "max_pending": 6}))
-    notice = next(warning for warning in result["concurrency_warnings"]
-                  if "arrivals.burst_size" in warning["fields"])
-    assert notice["fields"] == ["arrivals.burst_size", "arrivals.max_in_flight", "arrivals.max_pending"]
-    assert notice["values"] == {"arrivals.burst_size": 20, "arrivals.max_in_flight": 4,
-                                 "arrivals.max_pending": 6, "dropped": 10}
-    assert "4 in-flight + 6 pending = 10" in notice["msg"]
-    assert "10 excess requests will be dropped locally" in notice["msg"]
-    assert result["errors"] == []
+    from pydantic import ValidationError
+    from tests.test_planning import load_config
+    configuration = load_config(concurrency=4)
+    configuration.load_test.patterns.bursts.enabled = True
+    configuration.load_test.patterns.bursts.size = 20
+    configuration.load_test.patterns.bursts.first_seconds = 0
+    with pytest.raises(ValidationError) as raised:
+        RunConfig.model_validate(configuration.model_dump())
+    error = raised.value.errors(include_url=False)[0]
+    assert error["type"] == "load_test"
+    assert error["ctx"]["fields"] == ["load_test.patterns.bursts.size", "concurrency"]
+    assert "concurrency ceiling" in error["msg"]
 
 
 def test_burst_that_fits_inflight_and_pending_needs_no_drop_warning():

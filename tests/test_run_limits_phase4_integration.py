@@ -158,7 +158,7 @@ def test_cli_announces_time_coverage_and_estimate_risk_without_changing_budget(t
 
     async def run(configuration, **kwargs):
         assert configuration.max_duration_seconds == 5
-        assert configuration.traffic.duration_seconds == 20
+        assert configuration.load_test.schedule.duration_seconds == 20
         return report(configuration)
 
     monkeypatch.setattr("giraffe.cli._run", run)
@@ -166,6 +166,6 @@ def test_cli_announces_time_coverage_and_estimate_risk_without_changing_budget(t
     assert main([command, "--config", str(path), *flags]) == 0
     captured = capsys.readouterr()
     assert "Incomplete coverage" in captured.out + captured.err
-    assert "Capacity under load" in captured.out + captured.err
+    assert "Load test" in captured.out + captured.err
     assert "estimated traffic duration may exceed" in captured.out + captured.err
     assert json.loads(path.read_text())["max_duration_seconds"] == 5

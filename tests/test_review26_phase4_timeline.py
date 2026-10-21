@@ -23,33 +23,34 @@ def observations(report):
     return {target["name"]: target["measurements"] for target in latency_summary(report)["targets"]}
 
 
-async def test_full_timeline_remedy_completes_windows_and_later_finite_work(monkeypatch):
-    class FixedLatency(FakeClient):
-        delay = .005
-
-    monkeypatch.setattr(runner, "LLMClient", FixedLatency)
-    configured = config(checks=["generation", "capacity", "json"], request_timeout_seconds=.1,
-        test_options={"generation": {"samples": 220}, "json": {"samples": 4}},
-        traffic={"rates": [40], "duration_seconds": .06, "drain_timeout_seconds": .1})
-    reference = await runner.run_suite(configured)
-    measured = observations(reference)
-    limited = configured.model_copy(update={"max_duration_seconds": .03})
-    plan = request_plan(limited, observations=measured)
-    assert plan["errors"] == []  # Generation can start immediately.
-    timeline = plan["time_timeline"]
-    assert [item["id"] for item in timeline] == ["initial", "generation", "capacity", "json"]
-    notice = next(item for item in plan["time_warnings"] if item["kind"] == "incomplete_coverage")
-    assert notice["values"]["fully_known"] is True
-    assert "service · JSON correctness" in notice["cut_checks"]
-    action = notice["actions"][0]
-    assert action["value"] >= 2
-    assert action == {"label": f"Use {action['value']} s", "field": "max_duration_seconds", "value": action["value"]}
-    completed = await runner.run_suite(configured.model_copy(update={"max_duration_seconds": action["value"]}))
-    assert Counter(record.scenario for record in completed.requests) == Counter(record.scenario for record in reference.requests)
-    assert completed.limits_reached == []
-    assert completed.observations["targets"]["service"]["capacity"][0]["not_offered"] == 0
-    assert request_plan(configured.model_copy(update={"max_duration_seconds": action["value"]}),
-                        observations=measured)["time_warnings"] == []
+def test_full_timeline_remedy_completes_windows_and_later_finite_work(monkeypatch):
+    from tests.test_planning import load_config
+    from tests.test_review26_phase4_accuracy import run_virtual
+    async def scenario():
+        class FixedLatency(FakeClient):
+            delay = .005
+        monkeypatch.setattr(runner, "LLMClient", FixedLatency)
+        configured = load_config(duration=1, finish=.1, rates=[40], request_timeout_seconds=.1,
+            test_options={"generation": {"samples": 220}, "json": {"samples": 4}})
+        configured.checks = ["generation", "load", "json"]
+        configured.structured_json = True
+        reference = await runner.run_suite(configured)
+        measured = observations(reference)
+        limited = configured.model_copy(update={"max_duration_seconds": .03})
+        plan = request_plan(limited, observations=measured)
+        assert plan["errors"] == []
+        assert [item["id"] for item in plan["time_timeline"]] == ["initial", "generation", "json", "load_combinations"]
+        notice = next(item for item in plan["time_warnings"] if item["kind"] == "incomplete_coverage")
+        assert notice["values"]["fully_known"] is True
+        assert "local · Load test" in notice["cut_checks"]
+        action = notice["actions"][0]
+        assert action["value"] >= 2
+        assert action == {"label": f"Use {action['value']} s", "field": "max_duration_seconds", "value": action["value"]}
+        completed = await runner.run_suite(configured.model_copy(update={"max_duration_seconds": action["value"]}))
+        assert Counter(record.scenario for record in completed.requests) == Counter(record.scenario for record in reference.requests)
+        assert completed.limits_reached == []
+        assert request_plan(configured.model_copy(update={"max_duration_seconds": action["value"]}), observations=measured)["time_warnings"] == []
+    run_virtual(monkeypatch, scenario())
 
 
 def test_unknown_after_covered_windows_is_risk_without_a_lower_budget_action():
@@ -70,7 +71,8 @@ def test_default_suite_cut_detection_uses_known_highs_and_unknown_lower_bounds(b
         for action in notice.get("actions", []):
             if action.get("field") == "max_duration_seconds":
                 assert action["value"] > budget
-    assert not any(notice["kind"] == "incomplete_coverage" for notice in plan["time_warnings"])
+    # Default #45 load windows add finish allowances to the configured timeline.
+    assert any(notice["kind"] == "incomplete_coverage" for notice in plan["time_warnings"]) == (budget == 300)
     assert any(notice["kind"] == "estimate_risk" for notice in plan["time_warnings"])
 
 
@@ -192,14 +194,14 @@ def test_context_precedes_pack_controls_when_capacity_is_not_selected():
 
 
 def test_initial_timeout_is_reserved_for_budget_action_but_excluded_from_headline():
-    configured = config(checks=["access", "capacity"], max_duration_seconds=.5,
-                        request_timeout_seconds=.15,
-                        traffic={"rates": [10], "duration_seconds": .8, "drain_timeout_seconds": .15})
+    from tests.test_planning import load_config
+    configured = load_config(duration=1, finish=.15, rates=[10], max_duration_seconds=.5, request_timeout_seconds=.15)
+    configured.checks = ["access", "load"]
     plan = request_plan(configured)
-    assert plan["estimated_high_seconds"] == .95  # .8 + .15, without batch padding.
-    assert plan["budget_high_seconds"] == pytest.approx(1.1)
+    assert plan["estimated_high_seconds"] == 1.15
+    assert plan["budget_high_seconds"] == pytest.approx(1.3)
     assert plan["time_timeline"][0]["kind"] == "setup"
-    assert {item["id"] for item in plan["time_components"]} == {"capacity"}
+    assert {item["id"] for item in plan["time_components"]} == {"load_combinations"}
     action = plan["time_warnings"][0]["actions"][0]
     assert action == {"label": "Use 2 s", "field": "max_duration_seconds", "value": 2}
     assert plan["time_warnings"][0]["values"]["setup_allowance_seconds"] == .15

@@ -11,11 +11,12 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from giraffe.concurrent_load import (
+from giraffe.load_test import (
     aggregate, calibration_keys, execute, interference_measurements, load_time_plan, measurements,
-    minimum_reservation, point_shapes, prompt, result, score_point, test_points as load_points,
+    minimum_reservation, point_shapes, result, assess_point, score_group, test_points as load_points,
 )
-from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, ConcurrentLoad, RequestRecord, RunConfig, SHAPES, migrate_concurrent_load
+from giraffe.concurrent_load import prompt
+from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES, migrate_concurrent_load
 from giraffe.planning import request_plan
 from giraffe.runner import _Run, run_suite
 from giraffe.web import _configuration_errors, create_app
@@ -25,19 +26,54 @@ TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 
 
 def configuration(**values):
-    load = {"profile": {s: {"input_tokens": n, "output_tokens": o} for s, n, o in
+    # Compact fixture API; build the final load schema directly.
+    settings = {"profile": {s: {"input_tokens": n, "output_tokens": o} for s, n, o in
                          [("short", 64, 8), ("medium", 96, 16), ("long", 128, 32)]},
-            "combinations": {"selected": ["short_short"]}, "mixed": {"enabled": False},
-            "schedule": {"levels": [1], "duration_seconds": 1}, "pass_criteria": {"min_valid_responses": 2}}
+        "workloads": {"combinations": {"selected": ["short_short"]}},
+        "patterns": {"concurrent": {"levels": [1]}, "constant": {"enabled": False}},
+        "schedule": {"duration_seconds": 1, "finish_seconds": .1},
+        "pass_criteria": {"min_valid_responses": 2}}
     extra = values.pop("load", {})
-    for k, v in extra.items():
-        load[k] = {**load.get(k, {}), **v} if isinstance(v, dict) else v
-    return RunConfig.model_validate({"targets": [TARGET], "checks": ["concurrency"], "max_requests": 500,
-                                     "concurrent_load": load, **values})
+    def merge(dst, src):
+        for key, value in src.items():
+            if isinstance(value, dict):
+                merge(dst.setdefault(key, {}), value)
+            else:
+                dst[key] = value
+    for key in ("combinations", "mixed", "stress", "interference"):
+        if key in extra:
+            entry = dict(extra.pop(key))
+            if key == "mixed":
+                if "seed" in entry:
+                    settings["patterns"]["poisson"] = {"seed": entry.pop("seed")}
+                if "shares" in entry:
+                    entry.update(share_mode="custom", selected=[s for s, v in entry["shares"].items() if v > 0])
+            if key == "stress":
+                entry["cases"] = (["long_short"] if entry.pop("large_input", True) else []) + (["short_long"] if entry.pop("large_output", True) else [])
+            if key == "interference":
+                if entry.get("trigger") == "after_chunks":
+                    entry["trigger"] = "after_five_chunks"
+                entry.pop("trigger_chunks", None)
+            settings["workloads"][key] = entry
+    if "levels" in extra.get("schedule", {}):
+        settings["patterns"]["concurrent"]["levels"] = extra["schedule"].pop("levels")
+    old_criteria = {"response_p95_ms": "max_completion_ms", "first_output_p95_ms": "max_first_answer_ms"}
+    criteria = extra.get("pass_criteria", {})
+    for old, new in old_criteria.items():
+        if old in criteria:
+            criteria[new] = criteria.pop(old)
+    merge(settings, extra)
+    if "request_timeout_seconds" in values:
+        settings["request_timeout_seconds"] = values["request_timeout_seconds"]
+    if "checks" in values:
+        values["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in values["checks"]))
+    return RunConfig.model_validate({"targets": [TARGET], "checks": ["load"], "max_requests": 500,
+        "load_test": settings, **values})
 
 
 def short_windows(config, seconds=.2):
-    config.concurrent_load.schedule.duration_seconds = seconds
+    for settings in [config.load_test, *[v.settings for v in config.load_test.migrated_tests]]:
+        settings.schedule.duration_seconds = seconds
     return config
 
 
@@ -75,14 +111,15 @@ class Client:
                 if hasattr(first_output_event, "on_answer_chunk"):
                     first_output_event.on_answer_chunk()
             record.first_output_ms = 2
-            for _ in range(3):
+            for _ in range(5):
                 await asyncio.sleep(.004 if index % 2 else .007)
                 if first_output_event is not None and hasattr(first_output_event, "on_answer_chunk"):
                     first_output_event.on_answer_chunk()
             record.elapsed_ms = (time.monotonic() - start) * 1000
             record.last_output_ms = record.elapsed_ms - 1
             record.stream_end_ms = record.elapsed_ms
-            record.answer_chunks = 1 if self.buffered else 4
+            record.answer_chunks = 1 if self.buffered else 6
+            record.answer_reads = record.answer_chunks
             record.max_stream_gap_ms = 7
         if self.serial:
             async with self.lock:
@@ -113,46 +150,45 @@ async def perform(config=None, client=None):
 
 
 def point(check):
-    return next(iter(check.metrics["load_types"].values()))["points"][0]
+    return check.metrics["points"][0]
 
 
 def test_defaults_and_planning_numbers():
-    load = ConcurrentLoad()
-    assert load.profile.long.output_tokens == 128
-    assert load.schedule.duration_seconds == 15
-    assert sum(v["configured_load_seconds"] for v in load_time_plan(load).values()) == 120
-    assert CHECK_OPTION_FIELDS["concurrency"] == {"request_timeout_seconds"}
-    assert CHECK_LIMIT_FIELDS["concurrency"] == set()
+    settings = LoadTest()
+    assert settings.profile.long.output_tokens == 512
+    assert settings.schedule.duration_seconds == settings.schedule.finish_seconds == 15
+    default = load_time_plan(settings)
+    assert default['scheduled_tests'] == 12 and default['configured_load_seconds'] == 180
+    assert default['time_with_allowances_seconds'] == 360
+    assert CHECK_OPTION_FIELDS['load'] == set()
+    assert CHECK_LIMIT_FIELDS['load'] == set()
     c = configuration(concurrency=8, max_duration_seconds=1000,
-        load={"combinations": {"selected": list(SHAPES)}, "schedule": {"levels": [8, 1, 4], "duration_seconds": 30}})
-    assert c.concurrent_load.schedule.levels == [1, 4, 8]
+        load={'combinations': {'selected': list(SHAPES)}, 'schedule': {'levels': [1, 4, 8], 'duration_seconds': 30}})
     plan = request_plan(c)
-    assert plan["configured_load_seconds"] == plan["minimum_seconds"] == 810
-    assert plan["concurrent_load"]["combinations"]["test_points"] == 27
-    assert next(r for r in plan["rows"] if r["id"] == "load_combinations")["requests_per_target"] is None
-    # Response-dependent work gets a risk warning, without assuming 1 s/request.
-    assert plan["request_warnings"][0]["fields"] == ["max_requests"]
-    assert plan["request_warnings"][0]["kind"] == "adaptive_risk"
-    assert not plan["load_warnings"]
-    i = configuration(load={"combinations": {"enabled": False}, "interference": {"enabled": True}, "schedule": {"levels": [2], "duration_seconds": 30}})
-    assert request_plan(i)["configured_load_seconds"] == 60
-    assert minimum_reservation(i.concurrent_load) == 3
+    assert plan['configured_load_seconds'] == 810
+    assert plan['load_test']['workloads']['combinations']['test_points'] == 27
+    assert next(r for r in plan['rows'] if r['id'] == 'load_combinations')['requests_per_target'] is None
+    assert plan['request_warnings'][0]['fields'] == ['max_requests']
+    assert plan['request_warnings'][0]['kind'] == 'adaptive_risk'
+    i = configuration(load={'combinations': {'enabled': False}, 'interference': {'enabled': True}, 'schedule': {'levels': [2], 'duration_seconds': 30}})
+    assert request_plan(i)['configured_load_seconds'] == 60
+    assert minimum_reservation(i.load_test) == 3
 
 
 @pytest.mark.parametrize("path,value,fields", [
-    ("schedule.levels", [8], ["concurrent_load.schedule.levels", "concurrency"]),
-    ("profile.long.output_tokens", 65537, ["concurrent_load.profile.long.output_tokens"]),
-    ("combinations.selected", [], ["concurrent_load.combinations.selected"]),
-    ("profile.medium.input_tokens", 1, ["concurrent_load.profile.medium.input_tokens"]),
-    ("profile.long.input_tokens", 131073, ["concurrent_load.profile.long.input_tokens"]),
-    ("profile.short.output_tokens", 0, ["concurrent_load.profile.short.output_tokens"]),
-    ("schedule.duration_seconds", 3601, ["concurrent_load.schedule.duration_seconds"]),
-    ("schedule.levels", [2, 2], ["concurrent_load.schedule.levels"]),
-    ("combinations.enabled", False, ["concurrent_load.combinations.enabled"]),
+    ("patterns.concurrent.levels", [8], ["load_test.patterns.concurrent.levels", "concurrency"]),
+    ("profile.long.output_tokens", 65537, ["load_test.profile.long.output_tokens"]),
+    ("workloads.combinations.selected", [], ["load_test.workloads.combinations.selected"]),
+    ("profile.medium.input_tokens", 1, ["load_test.profile.medium.input_tokens"]),
+    ("profile.long.input_tokens", 131073, ["load_test.profile.long.input_tokens"]),
+    ("profile.short.output_tokens", 0, ["load_test.profile.short.output_tokens"]),
+    ("schedule.duration_seconds", 3601, ["load_test.schedule.duration_seconds"]),
+    ("patterns.concurrent.levels", [2, 2], ["load_test.patterns.concurrent.levels"]),
+    ("workloads.combinations.enabled", False, ["load_test.workloads.combinations.enabled"]),
 ])
 def test_structured_errors(path, value, fields):
     values = configuration(concurrency=4).model_dump()
-    node = values["concurrent_load"]
+    node = values["load_test"]
     parts = path.split(".")
     for key in parts[:-1]:
         node = node[key]
@@ -164,17 +200,24 @@ def test_structured_errors(path, value, fields):
 
 
 @pytest.mark.parametrize("updates,fields", [
-    ({"mixed": {"enabled": True, "shares": {"short_short": 99}}}, ["concurrent_load.mixed.shares.short_short"]),
-    ({"stress": {"enabled": True, "large_input": False, "large_output": False}}, ["concurrent_load.stress.large_input"]),
-    ({"interference": {"enabled": True}}, ["concurrent_load.schedule.levels", "concurrent_load.interference.enabled"]),
+    ({"mixed": {"enabled": True, "shares": {"short_short": 99}}}, ["load_test.mixed.shares.short_short"]),
+    ({"stress": {"enabled": True, "large_input": False, "large_output": False}}, ["load_test.stress.large_input"]),
+    ({"interference": {"enabled": True}}, ["load_test.patterns.concurrent.levels", "load_test.workloads.interference.enabled"]),
 ])
 def test_other_structured_errors(updates, fields):
     values = configuration().model_dump()
-    for k, v in updates.items():
-        values["concurrent_load"][k].update(v)
+    if 'mixed' in updates:
+        values['load_test']['workloads']['mixed'].update(enabled=True, selected=['short_short','long_short'], share_mode='custom', shares={'short_short':99, 'long_short':1.1})
+        fields = ['load_test.workloads.mixed.shares', 'load_test.workloads.mixed.share_mode']
+    elif 'stress' in updates:
+        values['load_test']['workloads']['stress'].update(enabled=True, cases=[])
+        fields = ['load_test.workloads.stress.cases']
+    else:
+        values['load_test']['workloads']['interference']['enabled'] = True
+        fields = ['load_test.patterns.concurrent.levels']
     with pytest.raises(ValidationError) as exc:
         RunConfig.model_validate(values)
-    assert _configuration_errors(exc.value.errors(), values)[0]["fields"] == fields
+    assert _configuration_errors(exc.value.errors(), values)[0]['fields'] == fields
 
 
 @pytest.mark.parametrize("which", ["stream", "overlap", "context"])
@@ -183,16 +226,16 @@ def test_cross_field_errors(which):
     expected = []
     if which == "stream":
         values["stream"] = False
-        values["concurrent_load"]["schedule"]["levels"] = [2]
-        values["concurrent_load"]["interference"]["enabled"] = True
-        expected = ["concurrent_load.interference.enabled", "stream"]
+        values["load_test"]["patterns"]["concurrent"]["levels"] = [2]
+        values["load_test"]["workloads"]["interference"]["enabled"] = True
+        expected = ["load_test.workloads.interference.enabled", "stream"]
     if which == "overlap":
         values.update(overlap_models=True, targets=[TARGET, {**TARGET, "name": "other"}], concurrency=3)
-        values["concurrent_load"]["schedule"]["levels"] = [2]
-        expected = ["concurrent_load.schedule.levels", "concurrency"]
+        values["load_test"]["patterns"]["concurrent"]["levels"] = [2]
+        expected = ["load_test.patterns.concurrent.levels", "concurrency"]
     if which == "context":
         values["targets"][0]["deployment"]["serving"]["context_limit"] = 50
-        expected = ["concurrent_load.profile.short.input_tokens"]
+        expected = ["load_test.profile.short.input_tokens", "load_test.profile.short.output_tokens"]
     with pytest.raises(ValidationError) as exc:
         RunConfig.model_validate(values)
     assert _configuration_errors(exc.value.errors(), values)[0]["fields"] == expected
@@ -201,11 +244,11 @@ def test_cross_field_errors(which):
 async def test_individual_refill_duration_drain_nonce_and_conditions():
     run, check, client, events = await perform(configuration(load={"schedule": {"levels": [2]}}))
     p = point(check)
-    assert p["sent"] > 2 and p["delivered_window_seconds"] >= .199
+    assert p["dispatched"] > 2 and p["delivered_window_seconds"] >= .199
     assert client.started[2] < client.finished[1]  # faster slot refills before slow slot completes
-    assert p["drain_seconds"] > 0 and p["completed"] == p["sent"]
+    assert p["drain_seconds"] > 0 and p["groups"][0]["completed"] == p["dispatched"]
     assert p["client_mean_inflight"] >= 1.8 and p["server_evidenced_concurrency"] == 2
-    assert check.status == "pass" and p["requests_per_second"] > 0
+    assert check.status == "pass" and p["groups"][0]["completed_requests_per_second"] > 0
     assert len(set(client.prompts)) == len(client.prompts)
     assert len({len(p) for p in client.prompts}) == 1
     assert all(r.load_point and r.requested_input_tokens and not r.workload for r in run.records)
@@ -225,7 +268,7 @@ async def test_evidence_and_failure_classification(client, code):
     else:
         assert check.status == "inconclusive"
     if code == "insufficient_responses":
-        assert point(check)["reasoning_budget_exhausted"] == point(check)["sent"]
+        assert point(check)["reasoning_budget_exhausted"] == point(check)["dispatched"]
         assert point(check)["failed"] == 0
 
 
@@ -233,22 +276,26 @@ async def test_unknown_tokens_and_stress_never_report_zero():
     _, check, _, _ = await perform(configuration(load={"combinations": {"enabled": False}, "stress": {"enabled": True, "large_output": False}}), Client(unknown=True))
     p = point(check)
     assert p["status"] == "inconclusive" and p["reason_code"] == "input_not_verified"
-    assert p["token_lengths"]["long_short"]["input_tokens"] == {"median": None, "min": None, "max": None}
-    assert p["output_tokens_per_second"] is not None
+    assert p["groups"][0]["lengths"]["input_tokens"] == {"median": None, "min": None, "max": None}
+    assert p["groups"][0]["aggregate_output_tokens_per_second"] is not None
     assert check.metrics["calibrations"][0]["reason"].startswith("estimated")
 
 
 async def test_mixed_seed_and_scenarios():
-    c = configuration(load={"combinations": {"enabled": False}, "mixed": {"enabled": True, "seed": 7,
+    c = configuration(load={"combinations": {"enabled": False}, "schedule": {"levels": [2]}, "mixed": {"enabled": True, "seed": 7,
         "shares": {"short_short": 60, "long_short": 40}}})
     r1, a, _, _ = await perform(c)
     r2, b, _, _ = await perform(c)
-    seq = lambda run: [r.load_point["shape"] for r in run.records if r.load_point["type"] == "mixed"]
+    # Seed controls dispatched request choices. Concurrent completions can reorder.
+    def seq(run):
+        rows = sorted((r for r in run.records if r.load_point["type"] == "mixed"), key=lambda r: r.dispatch_ms)
+        return [r.load_point["shape"] for r in rows]
+    assert len(seq(r1)) >= 8 and len(seq(r2)) >= 8
     assert seq(r1)[:8] == seq(r2)[:8]
-    assert a.metrics["mixed_seed"] == 7
+    assert a.metrics["seed"] == 7
     assert set(point(a)["observed_mix"]) == {"short_short", "long_short"}
-    assert all(r.scenario == f"load_mixed_c1.{r.load_point['shape']}" and r.condition_id == "load_mixed_c1" for r in r1.records if r.load_point["type"] == "mixed")
-    assert math.isclose(sum(x["inflight_percent"] for x in point(a)["observed_mix"].values()), 100)
+    assert all(r.scenario == point(a)["id"] and r.condition_id == point(a)["id"] for r in r1.records if r.load_point["type"] == "mixed")
+    assert math.isclose(sum(x["observed_percent"] for x in point(a)["observed_mix"].values()), 100)
 
 
 @pytest.mark.parametrize("cap,threshold", [(512, 410), (128, 103)])
@@ -257,67 +304,70 @@ async def test_stress_ceil_and_coverage_alone_does_not_pass(cap, threshold):
         [("short", 64, 8), ("medium", 96, 16), ("long", 128, cap)]}, "combinations": {"enabled": False},
         "stress": {"enabled": True, "large_input": False}, "pass_criteria": {"response_p95_ms": 1}})
     _, check, _, _ = await perform(c)
-    assert point(check)["coverage"]["threshold_tokens"] == threshold
-    assert point(check)["coverage"]["covered_valid_responses"] >= 2
+    assert point(check)["groups"][0]["coverage"]["threshold_tokens"] == threshold
+    assert point(check)["groups"][0]["coverage"]["output_covered"] >= 2
     assert check.status == "fail" and point(check)["reason_code"] == "timing"
 
 
 async def test_interference_alternates_and_triggers_after_chunks():
-    c = configuration(load={"combinations": {"enabled": False}, "interference": {"enabled": True, "trigger": "after_chunks", "trigger_chunks": 2},
-                            "schedule": {"levels": [2]}})
+    # Issue 45 replaces A/B alternation with two independent full windows.
+    c = configuration(load={'combinations': {'enabled': False}, 'interference': {'enabled': True, 'trigger': 'after_five_chunks'}, 'schedule': {'levels': [2]}})
     run, check, _, _ = await perform(c)
-    probes = [r for r in run.records if r.load_point.get("role") == "probe"]
-    assert {r.load_point["sub_window"] for r in probes} == {0, 1, 2, 3}
-    assert all(r.load_point["shape"] == ("long_short" if r.load_point["sub_window"] % 2 else "short_short") for r in probes)
-    data = point(check)["interference"]
-    assert data["control"]["matched_count"] and data["probe"]["matched_count"]
-    assert data["trigger_latency_ms"]["median"] > 0
+    p = point(check)
+    assert [w['phase'] for w in p['measurement_windows']] == ['baseline', 'probe']
+    assert all(w['delivered_window_seconds'] >= .199 for w in p['measurement_windows'])
+    probes = [r for r in run.records if r.load_point.get('role') == 'probe']
+    assert probes and all(r.load_point['phase'] == 'probe' and r.load_point['shape'] == 'long_short' for r in probes)
+    assert p['interference']['baseline']['matched_count'] and p['interference']['probe']['matched_count']
+    assert p['interference']['actual_overlap_request_ids']
 
 
 @pytest.mark.parametrize("slowdown,limit,status", [(2, 1.5, "fail"), (1.1, 1.5, "pass"), (1.1, None, "inconclusive")])
 async def test_interference_slowdown_scoring(slowdown, limit, status):
-    run, check, _, _ = await perform()
-    p = copy.deepcopy(point(check))
-    settings = run.config.concurrent_load.model_copy(deep=True)
-    settings.interference.max_slowdown = limit
-    p["type"] = "interference"
-    p["interference"] = {"control": {"matched_count": 2}, "probe": {"matched_count": 2}, "slowdown": slowdown, "buffered_stream": False}
-    score_point(settings, p, [])
-    assert p["status"] == status
-    p["interference"]["buffered_stream"] = True
-    p["interference"]["slowdown"] = 1
-    assert score_point(settings, p, [])["reason_code"] == "buffered_stream"
+    # Slowdown now compares matched completion times in independent windows.
+    c = configuration(load={'combinations': {'enabled': False}, 'interference': {'enabled': True}, 'schedule': {'levels': [2]}})
+    if limit is None:
+        with pytest.raises(ValidationError):
+            type(c.load_test.workloads.interference)(max_slowdown=None)
+        return
+    c.load_test.workloads.interference.max_slowdown = limit
+    run, check, _, _ = await perform(c)
+    p = point(check)
+    rows = [r for r in run.records if r.load_point.get('point_id') == p['id']]
+    # Change completion measurements only; retain actual overlap and occupancy.
+    baseline = p['interference']['baseline']['completion_median_ms']
+    for r in rows:
+        if r.load_point.get('phase') == 'probe' and r.load_point.get('role') == 'short_stream':
+            r.elapsed_ms = baseline * slowdown
+    assess_point(run, c.targets[0], c.load_test, p, rows)
+    assert p['interference']['slowdown'] == pytest.approx(slowdown)
+    assert p['status'] == status
 
 
 async def test_budget_cut_short_failures_precede_evidence_and_later_reservation():
-    c = configuration(max_requests=8, checks=["concurrency", "consistency"], consistency={"repetitions": 2, "levels": [1], "shapes": ["short"], "prompts_per_shape": 2})
+    c = configuration(max_requests=8, checks=['load','consistency'], consistency={'repetitions':2,'levels':[1],'shapes':['short'],'prompts_per_shape':2})
     run, check, _, _ = await perform(c)
     p = point(check)
-    assert p["request_allowance"] == 3 and p["reserved_later_requests"] == 4
-    assert p["cut_short"] and check.status == "inconclusive"
-    for kind in ("error", "wrong", "timing"):
-        q = copy.deepcopy(p)
-        settings = c.concurrent_load.model_copy(deep=True)
-        if kind == "error":
-            q["error_percent"] = 100
-        elif kind == "wrong":
-            q.update(scored=1, correct=0, correct_percent=0)
+    assert p['request_allowance'] == 3 and p['reserved_later_requests'] == 4
+    assert run.remaining('local') == 4 and p['cut_short'] and check.status == 'inconclusive'
+    for kind in ('error', 'wrong', 'timing'):
+        g = copy.deepcopy(p['groups'][0])
+        if kind == 'error':
+            g['error_percent'] = 100
+        elif kind == 'wrong':
+            g.update(scored=1, correct=0, correct_percent=0)
         else:
-            settings.pass_criteria.response_p95_ms = 1
-            q.update(response_p95_ms=5, timing_quality={"affected_metrics": {}})
-        records = [RequestRecord(id="r", target="local", fixture_id="x", scenario="x", check_ids=[], started_at="now", status="completed", valid=True, elapsed_ms=5)]
-        assert score_point(settings, q, records)["status"] == "fail"
-    q = copy.deepcopy(p)
-    q.update(delivered_window_seconds=.1, configured_window_seconds=.2, valid=5, load_qualified=True, response_p50_ms=1)
-    assert score_point(c.concurrent_load, q, [])["status"] == "pass"
-    q["delivered_window_seconds"] = .01
-    assert score_point(c.concurrent_load, q, [])["status"] == "inconclusive"
+            g['timing_violations'] = ['response']
+        assert score_group(c.load_test, p, g, [])['status'] == 'fail'
+    # Enough samples never erase a truncated sending window under issue 45.
+    g = copy.deepcopy(p['groups'][0]); g['valid'] = 100
+    assert score_group(c.load_test, p, g, [])['status'] == 'inconclusive'
 
 
 @pytest.mark.parametrize('reported', [False, True])
 async def test_known_runtime_context_not_sent(reported, monkeypatch):
     from giraffe import deployment
-    from giraffe.concurrent_load import context_window
+    from giraffe.load_test import context_window
     c = short_windows(configuration(load={"combinations": {"selected": ["long_short"]}}))
     target = c.targets[0]
     target.deployment.serving['context_limit'] = 1000 if reported else 100
@@ -347,7 +397,7 @@ async def test_error_threshold_stop_still_fails_and_remaining_points_not_run():
             self.failure = not spec.scenario.startswith("load_calibration_")
             return await super().execute(spec, **kw)
     run, check, _, _ = await perform(configuration(stop_after_errors=1, load={"combinations": {"selected": ["short_short", "long_short"]}}), Errors())
-    rows = check.metrics["load_types"]["combinations"]["points"]
+    rows = check.metrics["points"]
     assert rows[0]["status"] == "fail" and rows[0]["reason_code"] == "error_rate"
     assert rows[1]["not_run"] and rows[1]["status"] == "inconclusive"
     assert run.errors == 1 and check.status == "fail"
@@ -378,7 +428,7 @@ async def test_suite_wires_new_check_and_manifest_notes(monkeypatch):
     c = short_windows(configuration())
     c._migration_notes = ['saved migration note']
     report = await run_suite(c)
-    check = next(x for x in report.checks if x.id == 'concurrency')
+    check = next(x for x in report.checks if x.id == 'load')
     assert check.status == 'pass'
     assert 'scenarios' not in check.metrics
     assert report.manifest['config_migration_notes'] == ['saved migration note']
@@ -391,8 +441,8 @@ async def test_socket_endpoint_load_integration():
     with FakeEndpoint(first_token_delay=.005, chunk_delay=.005) as endpoint:
         c = short_windows(configuration(targets=[{**TARGET, 'url': endpoint.url}]))
         report = await run_suite(c)
-    check = next(x for x in report.checks if x.id == 'concurrency')
-    assert check.metrics['load_types']['combinations']['points'][0]['sent'] > 2
+    check = next(x for x in report.checks if x.id == 'load')
+    assert check.metrics['points'][0]['sent'] > 2
     assert report.requests[0].scenario.startswith('load_calibration_')
 
 
@@ -409,7 +459,7 @@ async def test_request_timeout_drain_and_deadline_cancellation():
     run.deadline = time.monotonic() + .04
     await execute(run, c.targets[0], Slow())
     p = point(result(run, c.targets[0]))
-    assert p['cancelled'] == 1 and p['timed_out'] == 0 and p['error_percent'] == 0
+    assert p['cancelled'] == 1 and p['timed_out'] == 0 and p['groups'][0]['error_percent'] == 0
     assert p['status'] == 'inconclusive'
 
 
@@ -420,8 +470,8 @@ async def test_missing_completion_counts_leave_throughput_unknown():
             r.completion_tokens = r.output_tokens = None
             return r
     _, check, _, _ = await perform(client=NoOutputCount())
-    assert point(check)['output_tokens_per_second'] is None
-    assert point(check)['token_lengths']['short_short']['output_tokens']['median'] is None
+    assert point(check)['groups'][0]['aggregate_output_tokens_per_second'] is None
+    assert point(check)['groups'][0]['lengths']['output_tokens']['median'] is None
 
 
 async def test_calibration_variants_and_attempt_limit():
@@ -434,35 +484,35 @@ async def test_calibration_variants_and_attempt_limit():
     assert len(client.specs) == 6
     assert all(s.scenario.startswith('load_calibration_') and s.max_tokens == 1 for s in client.specs)
     assert {c['variant'] for c in check.metrics['calibrations']} == {'short_answer', 'long_output'}
-    assert all(p['status'] == 'inconclusive' and 'not calibrated' in p['reason'] for p in check.metrics['load_types']['combinations']['points'])
+    assert all(p['status'] == 'inconclusive' and p['reason_code'] == 'input_not_calibrated' for p in check.metrics['points'])
 
 
 async def test_interference_never_triggered_is_reported():
-    c = configuration(request_timeout_seconds=.03, load={'combinations': {'enabled': False},
-        'schedule': {'levels': [2]}, 'interference': {'enabled': True, 'trigger': 'after_chunks', 'trigger_chunks': 1000}})
-    _, check, _, _ = await perform(c)
+    c = configuration(load={'combinations':{'enabled':False}, 'schedule':{'levels':[2]}, 'interference':{'enabled':True,'trigger':'after_five_chunks'}})
+    class FourChunks(Client):
+        async def execute(self, spec, first_output_event=None):
+            # Buffer progress until return: the fifth answer chunk never arrives.
+            return await super().execute(spec, None)
+    _, check, _, _ = await perform(c, FourChunks())
     p = point(check)
-    assert p['interference']['probes_never_triggered'] > 0
-    assert p['interference']['control']['matched_count'] == p['interference']['probe']['matched_count'] == 0
+    assert p['interference']['triggered'] == 0
+    assert p['interference']['baseline']['matched_count'] == p['interference']['probe']['matched_count'] == 0
     assert p['status'] == 'inconclusive'
 
 
 def test_matching_uses_short_decode_and_probe_prefill_intersection():
-    def r(name, role, sub, start, first, last, chunks=2):
-        return RequestRecord(id=name, target='local', fixture_id='x', scenario='x', check_ids=[], started_at='now',
-            status='completed', valid=True, first_output_ms=first, last_output_ms=last, elapsed_ms=last+5,
-            answer_chunks=chunks, timing_start_ms=start, max_stream_gap_ms=2,
-            load_point={'role': role, 'sub_window': sub})
-    short = r('short', 'short_stream', 0, 0, 10, 30)
-    control = r('control', 'probe', 0, 15, 10, 40)
-    probe = r('probe', 'probe', 1, 20, 20, 60)
-    data = interference_measurements([short, control, probe], 2, 2)
-    assert data['control']['matched_count'] == data['probe']['matched_count'] == 0
-    assert data['ambiguous_short_streams'] == 1
-    probe.timing_start_ms = 31
-    assert interference_measurements([short, control, probe], 2, 2)['probe']['matched_count'] == 0
-    short.answer_chunks = 1
-    assert interference_measurements([short, control, probe], 2, 2)['buffered_stream']
+    from tests.test_load_executor_regressions import record
+    baseline = record('baseline', start=0, first=10, last=30, load_point={'role':'short_stream','phase':'baseline'})
+    short = record('short', start=100, first=10, last=30, load_point={'role':'short_stream','phase':'probe'})
+    probe = record('probe', 'probe', start=115, first=10, last=40, load_point={'role':'probe','phase':'probe'})
+    windows = [{'phase':'baseline','sending_start_ms':0}, {'phase':'probe','sending_start_ms':100,'triggered':1}]
+    data = interference_measurements([baseline, short, probe], windows)
+    assert data['baseline']['matched_count'] == data['probe']['matched_count'] == 1
+    assert data['actual_overlap_request_ids'] == ['short']
+    probe.timing_start_ms = 131
+    assert interference_measurements([baseline,short,probe], windows)['probe']['matched_count'] == 0
+    probe.timing_start_ms = 115; short.answer_chunks = 1
+    assert interference_measurements([baseline,short,probe], windows)['probe']['matched_count'] == 0
 
 
 async def test_recovery_reserves_load_points_and_later_checks(monkeypatch):
@@ -473,7 +523,7 @@ async def test_recovery_reserves_load_points_and_later_checks(monkeypatch):
                                   limits={'min_samples': 2, 'recovery_max_ratio': 2}))
     report = await run_suite(c)
     reserved = report.observations['targets']['local']['sustained_budget']['reserved_later']
-    assert reserved >= minimum_reservation(c.concurrent_load) + c.samples
+    assert reserved >= minimum_reservation(c.load_test) + c.samples
     assert any(r.load_point for r in report.requests)
 
 
@@ -485,7 +535,7 @@ async def test_real_stream_client_progress_and_cached_usage_without_sockets(monk
             self.payload = payload
         async def __aiter__(self):
             payload = self.payload
-            for text in ('K7P4', ' ', 'one', ' two'):
+            for text in ('K7P4', ' ', 'one', ' two', ' three', ' four', ' five'):
                 await asyncio.sleep(.002)
                 event = {'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]}
                 yield ('data: ' + json.dumps(event) + '\n\n').encode()
@@ -501,9 +551,9 @@ async def test_real_stream_client_progress_and_cached_usage_without_sockets(monk
     c = short_windows(configuration(request_options={'temperature': .7}, load={'combinations': {'enabled': False},
         'interference': {'enabled': True, 'trigger': 'after_chunks', 'trigger_chunks': 2}, 'schedule': {'levels': [2]}}))
     report = await run_suite(c)
-    check = next(x for x in report.checks if x.id == 'concurrency')
+    check = next(x for x in report.checks if x.id == 'load')
     data = point(check)
-    assert data['interference']['control']['matched_count'] > 0
+    assert data['interference']['baseline']['matched_count'] > 0
     assert data['interference']['probe']['matched_count'] > 0
     assert all(p['temperature'] == .7 for p in payloads)
     assert all(r.cached_prompt_tokens == 0 for r in report.requests)
@@ -511,17 +561,16 @@ async def test_real_stream_client_progress_and_cached_usage_without_sockets(monk
 
 
 async def test_nonstream_load_is_client_only_and_wrong_count_allowance_is_exact():
-    run, check, _, _ = await perform(configuration(stream=False, load={'schedule': {'levels': [2]}}))
+    run, check, _, _ = await perform(configuration(stream=False, load={'schedule':{'levels':[2]}}))
     p = point(check)
     assert p['status'] == 'inconclusive' and not p['load_qualified']
-    assert p['concurrency_reason'] == 'client-delivered only; server overlap not evidenced'
-    settings = run.config.concurrent_load.model_copy(deep=True)
-    settings.pass_criteria.min_valid_responses = 5
+    assert p['server_evidenced_concurrency'] == 0
+    settings = run.config.load_test.model_copy(deep=True)
     settings.pass_criteria.min_correct_percent = 80
-    p.update(scored=1, correct=0, correct_percent=0)
-    assert score_point(settings, p, [])['status'] == 'inconclusive'
-    p.update(scored=2, correct=0, correct_percent=0)
-    assert score_point(settings, p, [])['status'] == 'fail'
+    g = copy.deepcopy(p['groups'][0]); g.update(scored=5,correct=4,correct_percent=80)
+    assert score_group(settings,p,g,[])['reason_code'] == 'load_not_delivered'
+    g.update(correct=3,correct_percent=60)
+    assert score_group(settings,p,g,[])['status'] == 'fail'
 
 
 async def test_low_output_length_is_coverage_not_failure():
@@ -533,7 +582,7 @@ async def test_low_output_length_is_coverage_not_failure():
     _, check, _, _ = await perform(configuration(load={'combinations': {'enabled': False}, 'stress': {'enabled': True, 'large_input': False}}), EarlyEnd())
     assert point(check)['status'] == 'inconclusive'
     assert point(check)['reason_code'] == 'insufficient_coverage'
-    assert point(check)['coverage']['covered_valid_responses'] == 0
+    assert point(check)["groups"][0]["coverage"]['output_covered'] == 0
 
 
 async def test_cancelling_executor_finalizes_inflight_and_unreached_points():
@@ -553,18 +602,18 @@ async def test_cancelling_executor_finalizes_inflight_and_unreached_points():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 1)
-    rows = result(run, c.targets[0]).metrics['load_types']['combinations']['points']
-    assert rows[0]['cancelled'] == rows[0]['sent'] > 0
-    assert rows[0]['error_percent'] == 0 and rows[0]['status'] == 'inconclusive'
+    rows = result(run, c.targets[0]).metrics['points']
+    assert rows[0]['cancelled'] == rows[0]['dispatched'] > 0
+    assert rows[0]['groups'][0]['error_percent'] == 0 and rows[0]['status'] == 'inconclusive'
     assert rows[1]['not_run'] and rows[1]['status'] == 'inconclusive'
 
 
 async def test_partial_point_failure_is_scored_when_executor_is_interrupted():
-    from giraffe.concurrent_load import test_points as points
+    from giraffe.load_test import test_points as points
     c = configuration()
     run = _Run(c, None, None)
-    p = points(c.concurrent_load)[0]
-    run.observations['local']['concurrent_load'] = {'load_types': {'combinations': {'title': 'Combinations', 'points': [p]}}}
+    p = points(c.load_test)[0]
+    run.observations['local']['load_test'] = {'points': [p]}
     run.records.append(RequestRecord(id='error', target='local', fixture_id='x', scenario=p['id'], check_ids=['concurrency'],
         started_at='now', status='failed', error='HTTP 500', load_point={'point_id': p['id'], 'shape': 'short_short'}))
     check = result(run, c.targets[0])
@@ -573,5 +622,5 @@ async def test_partial_point_failure_is_scored_when_executor_is_interrupted():
 
 async def test_calibration_failure_remains_failure_for_unreached_dependent_levels():
     _, check, _, _ = await perform(configuration(stop_after_errors=1, load={'schedule': {'levels': [1, 2]}}), Client(failure=True))
-    rows = check.metrics['load_types']['combinations']['points']
+    rows = check.metrics['points']
     assert len(rows) == 2 and all(p['status'] == 'fail' and p['reason_code'] == 'calibration_failed' for p in rows)

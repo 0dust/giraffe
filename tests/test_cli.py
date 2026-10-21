@@ -13,7 +13,7 @@ def test_cli_one_command_has_builtin_suite():
         "run", "--url", "http://localhost:11434/v1", "--model", "tiny",
         "--max-requests", "50", "--json", "--latency-ms", "5000",
     ]))
-    assert len(config.checks) == 11
+    assert len(config.checks) == 10
     assert "json" in config.checks and "gpu" not in config.checks
     assert config.max_requests == 50
     assert config.structured_json
@@ -171,8 +171,8 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     result = json.loads(capsys.readouterr().out)
     assert result == capabilities()
     assert result["config_schema"]["required"] == ["targets"]
-    assert result["defaults"]["traffic"]["rates"] == [1, 2, 4]
-    assert len(result["checks"]) == 17
+    assert result["defaults"]["load_test"]["patterns"]["rates"] == [1, 2]
+    assert len(result["checks"]) == 15
     assert "runtime availability" in result["validation_note"]
 
 
@@ -315,7 +315,7 @@ def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, caps
     from giraffe.open_files import open_file_guard
 
     values = {"config_version": 2, "targets": [{"name": "local", "url": "http://localhost", "model": ""}],
-              "checks": ["capacity"], "request_source": "request_pack", "request_pack": operator_pack()}
+              "checks": ["load"], "request_source": "request_pack", "request_pack": operator_pack()}
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
     monkeypatch.setattr("giraffe.cli._run", lambda *a: pytest.fail("Preview sent traffic"))

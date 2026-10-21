@@ -27,28 +27,28 @@ ISSUES=[
     ("for(const type of ['concurrent','constant','poisson','bursts'])form.elements['load_patterns_'+type+'_enabled'].checked=false",'load_test.patterns.poisson.enabled','Select a traffic pattern for the selected workloads.'),
     ("form.elements.load_patterns_concurrent_levels.value='2, 1'",'load_test.patterns.concurrent.levels','Enter positive, increasing whole-number levels separated by commas.'),
     ("form.elements.load_patterns_rates.value='0'",'load_test.patterns.rates','Enter positive, increasing rates separated by commas.'),
-    ("form.elements.load_schedule_duration_seconds.value='0'",'load_test.schedule.duration_seconds','Check Duration per workload, pattern and level (seconds).'),
-    ("form.elements.load_schedule_finish_seconds.value='-1'",'load_test.schedule.finish_seconds','Check Wait for unfinished requests after each test (seconds).'),
-    ("form.elements.load_patterns_poisson_enabled.checked=true;form.elements.load_patterns_poisson_seed.value='-1'",'load_test.patterns.poisson.seed','Check Random seed.'),
-    ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_size.value='0'",'load_test.patterns.bursts.size','Check Requests per burst.'),
-    ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_first_seconds.value='-1'",'load_test.patterns.bursts.first_seconds','Check First burst after (seconds).'),
-    ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_gap_seconds.value='0'",'load_test.patterns.bursts.gap_seconds','Check Time between burst starts (seconds).'),
+    ("form.elements.load_schedule_duration_seconds.value='0'",'load_test.schedule.duration_seconds','Enter a whole number of at least 1 and no more than 3600 for Duration per workload, pattern and level (seconds).'),
+    ("form.elements.load_schedule_finish_seconds.value='-1'",'load_test.schedule.finish_seconds','Enter a number of at least 0 for Wait for unfinished requests after each test (seconds).'),
+    ("form.elements.load_patterns_poisson_enabled.checked=true;form.elements.load_patterns_poisson_seed.value='-1'",'load_test.patterns.poisson.seed','Enter a whole number of at least 0 and no more than 9007199254740991 for Random seed.'),
+    ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_size.value='0'",'load_test.patterns.bursts.size','Enter a whole number of at least 1 and no more than 1024 for Requests per burst.'),
+    ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_first_seconds.value='-1'",'load_test.patterns.bursts.first_seconds','Enter a number of at least 0 for First burst after (seconds).'),
+    ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_gap_seconds.value='0'",'load_test.patterns.bursts.gap_seconds','Enter a number greater than 0 for Time between burst starts (seconds).'),
     ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_first_seconds.value='15'",'load_test.patterns.bursts.first_seconds','The first burst must start before the sending window ends.'),
     ("form.elements.concurrency.value='4';form.elements.load_patterns_concurrent_levels.value='8'",'concurrency','Concurrency levels exceed the run ceiling. Update Run limits or lower the levels.'),
     ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.concurrency.value='4';form.elements.load_patterns_bursts_size.value='8'",'concurrency','One burst exceeds the concurrency ceiling and cannot be dispatched in full.'),
     ("form.elements.load_workloads_interference_enabled.checked=true;form.elements.load_patterns_concurrent_levels.value='1'",'load_test.patterns.concurrent.levels','The long-input / short-answer test needs a concurrency level of at least 2.'),
-    ("form.elements.load_workloads_interference_enabled.checked=true;form.elements.load_workloads_interference_max_slowdown.value='1'",'load_test.workloads.interference.max_slowdown','Check Maximum allowed slowdown of short answers (×).'),
-    ("form.elements.load_workloads_stress_enabled.checked=true;form.elements.load_workloads_stress_min_output_percent.value='0'",'load_test.workloads.stress.min_output_percent','Check Minimum generated output (% of long-output cap).'),
+    ("form.elements.load_workloads_interference_enabled.checked=true;form.elements.load_workloads_interference_max_slowdown.value='1'",'load_test.workloads.interference.max_slowdown','Enter a slowdown greater than 1×; 1.5× means up to 50% longer.'),
+    ("form.elements.load_workloads_stress_enabled.checked=true;form.elements.load_workloads_stress_min_output_percent.value='0'",'load_test.workloads.stress.min_output_percent','Enter a number of at least 1 and no more than 100 for Minimum generated output (% of long-output cap).'),
     ("form.elements.load_workloads_stress_enabled.checked=true;form.elements.load_workloads_stress_min_output_percent.value='101'",'load_test.workloads.stress.min_output_percent','Output coverage cannot exceed 100% of the cap.'),
-    ("form.elements.load_request_timeout_seconds.value='0'",'load_test.request_timeout_seconds','Check Request timeout (seconds).'),
-    ("form.elements.load_pass_criteria_min_valid_responses.value='0'",'load_test.pass_criteria.min_valid_responses','Check Minimum valid responses per result group.'),
-    ("form.elements.load_pass_criteria_max_error_percent.value='-1'",'load_test.pass_criteria.max_error_percent','Check Errors allowed (%).'),
+    ("form.elements.load_request_timeout_seconds.value='0'",'load_test.request_timeout_seconds','Enter a number greater than 0 for Request timeout (seconds).'),
+    ("form.elements.load_pass_criteria_min_valid_responses.value='0'",'load_test.pass_criteria.min_valid_responses','Enter a whole number of at least 1 for Minimum valid responses per result group.'),
+    ("form.elements.load_pass_criteria_max_error_percent.value='-1'",'load_test.pass_criteria.max_error_percent','Enter a number of at least 0 and no more than 100 for Errors allowed (%).'),
     ("form.elements.load_pass_criteria_min_correct_percent.value='101'",'load_test.pass_criteria.min_correct_percent','Percentages must be from 0 to 100.'),
-    *[(f"form.elements.load_pass_criteria_{key}.value='0'",'load_test.pass_criteria.'+key,'Check '+label+'.') for key,label in [
+    *[(f"form.elements.load_pass_criteria_{key}.value='0'",'load_test.pass_criteria.'+key,'Enter a number greater than 0 for '+label+'.') for key,label in [
         ('max_first_answer_ms','Maximum time to first answer per response (ms)'),('max_completion_ms','Maximum completion time per response (ms)'),('max_stream_pause_ms','Maximum pause between streamed chunks (ms)'),('min_generation_tokens_per_second','Minimum generation speed per response (tokens/sec)')]],
-    ("form.elements.concurrency.value='0'",'concurrency','Check Concurrency ceiling.'),
-    ("form.elements.max_requests.value='0'",'max_requests','Check Total request budget.'),
-    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Check Total duration.'),
+    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Concurrency ceiling.'),
+    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Total request budget.'),
+    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Total duration.'),
 ]
 
 
@@ -162,4 +162,114 @@ for(const text of ['Highest accepted request rate (tested): 10','Long input → 
 assert.match(renderLoadTestResults({points:[rate],highest_accepted:[]}),/Highest accepted request rate \(tested\): Unconfirmed/);
 const conditions=[{target:'local',condition:{id:'load_primary_combinations_long_short_poisson_bursts_r10',check:'load'}},{target:'local',condition:{id:'load_primary_combinations_long_short_constant_r10',check:'load'}}];
 html=renderTests([],{conditions,live:true});assert.match(html,/Poisson \+ bursts · 10 requests\/second/);assert.match(html,/Constant · 10 requests\/second/);assert.equal((html.match(/data-condition-load-type="combinations"/g)||[]).length,2);
+''')
+
+
+def test_load_issue_buttons_use_exact_field_labels_and_levels_hint():
+    browser_logic(FORM+r'''
+const html=renderLoadEditor(config);
+for(const [path,label] of [
+ ['load_test.profile.short.input_tokens','Short input tokens'],
+ ['load_test.workloads.mixed.shares.long_short','Long → Short (%)'],
+ ['load_test.workloads.interference.max_slowdown','Maximum allowed slowdown of short answers (×)'],
+ ['load_test.patterns.concurrent.levels','Concurrency levels'],
+ ['load_test.patterns.rates','Rates (requests/second)'],
+ ['load_test.patterns.bursts.first_seconds','First burst after (seconds)'],
+ ['load_test.schedule.finish_seconds','Wait for unfinished requests after each test (seconds)'],
+ ['load_test.pass_criteria.min_correct_percent','Correct answers required (%)']]){
+ assert.equal(settingDestination(path).label,label,path);assert(settingActions([path]).includes('Edit '+escape(label)));
+}
+assert(html.includes('Used by maintained-concurrency traffic and the long-input / short-answer test.'));
+for(const label of html.matchAll(/<label for="field-(load_[^"]+)">([^<]+)<\/label>/g)){
+ const path=loadSettingPath(label[1]);assert.equal(escape(settingDestination(path).label),label[2],path);
+ assert(settingActions([path]).includes('Edit '+label[2]),path);
+}
+nodes['#field-load_patterns_concurrent_levels-hint']={};updateRunLimitHints(config);
+assert.equal(nodes['#field-load_patterns_concurrent_levels-hint'].textContent,'Used by maintained-concurrency traffic and the long-input / short-answer test.');
+''')
+
+
+def test_unknown_dispatch_delay_has_no_unit_and_interference_request_titles_are_readable():
+    run_render_checks(r'''
+const point={id:'load_primary_interference_c4',type:'interference',workload:'interference',pattern:'interference',level:4,groups:[{id:'short',shape:'short_short'}]};
+const html=renderLoadTestResults({points:[point]});
+assert.doesNotMatch(html,/not reported ms/);
+for(const [suffix,label] of [['.baseline','Short answers alone'],['.probe','Short answers with a long request']]){
+ const record={scenario:point.id+suffix};assert.equal(phaseName(record.scenario),label+' at 4 concurrent requests');
+ assert.equal(testLabel(record),label+' at 4 concurrent requests');
+}
+''')
+
+
+def test_python_interference_conditions_name_baseline_and_probe():
+    from giraffe.conditions import condition_for
+    for phase,label in [('baseline','Short answers alone'),('probe','Short answers with a long request')]:
+        condition=condition_for('load_primary_interference_c4.'+phase)
+        assert condition['label']==label+' at 4 concurrent requests'
+        assert condition['check']=='load'
+        assert condition['level']==4
+
+
+@pytest.mark.parametrize('poisson,label',[(False,'Unknown + 20'),(True,'Unknown + ≈ 20')])
+def test_mixed_unknown_count_keeps_scheduled_requests_in_headline_and_footer(poisson,label):
+    config=RunConfig(targets=[{'name':'local','url':'http://unused.test/v1','model':'test'}],checks=['load'],
+        load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'levels':[1]},'constant':{'enabled':not poisson},'poisson':{'enabled':poisson},'rates':[2]},'schedule':{'duration_seconds':10,'finish_seconds':0}})
+    plan=request_plan(config)
+    assert plan['request_count_label']==label
+    browser_logic('const plan='+json.dumps(plan)+',label='+json.dumps(label)+r''';
+nodes['#request-plan']={};nodes['#dock-summary']={};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};renderRequestPlan();
+const headline=label.startsWith('Unknown + ≈')?'≈ 20 expected requests + adaptive checks':'20 known requests + adaptive checks';
+assert(nodes['#request-plan'].innerHTML.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
+''',config)
+
+
+def test_positive_subcentisecond_burst_gap_matches_server_contract():
+    browser_logic(FORM+r"""
+form.elements.load_patterns_bursts_enabled.checked=true;
+form.elements.load_patterns_bursts_gap_seconds.value='0.000000001';
+assert(!localSettingErrors().some(issue=>issue.fields.includes('load_test.patterns.bursts.gap_seconds')));
+""")
+
+
+def test_historical_condition_labels_remain_readable_without_active_legacy_traffic():
+    from giraffe.conditions import condition_for
+    config=RunConfig(targets=[{'name':'local','url':'http://unused.test/v1','model':'test'}],checks=['load'])
+    assert condition_for('arrival',{'requests_per_second':2},config)['label']=='Arrivals · 2 per second'
+    assert condition_for('traffic_stage_0',{'rate_rps':3},config)['label']=='3 requests/s'
+
+
+@pytest.mark.parametrize('poisson,label,headline',[(False,'20','20 known requests + adaptive checks'),(True,'≈ 20','≈ 20 expected requests + adaptive checks')])
+def test_bounded_calibration_keeps_scheduled_count_qualification(poisson,label,headline):
+    config=RunConfig(targets=[{'name':'local','url':'http://unused.test/v1','model':'test'}],checks=['load'],
+        load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':not poisson},'poisson':{'enabled':poisson},'rates':[2]},'schedule':{'duration_seconds':10,'finish_seconds':0}})
+    plan=request_plan(config)
+    assert plan['count_kind']=='bounded'
+    assert plan['request_count_label']==label
+    browser_logic('const plan='+json.dumps(plan)+',headline='+json.dumps(headline)+r""";
+nodes['#request-plan']={};nodes['#dock-summary']={};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};renderRequestPlan();
+assert(nodes['#request-plan'].innerHTML.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
+""",config)
+
+
+def test_server_load_edit_actions_use_visible_labels_and_focus_exact_fields():
+    browser_logic(FORM+r'''
+for(const [path,raw,label] of [
+ ['load_test.patterns.rates','Edit sending rate','Rates (requests/second)'],
+ ['load_test.profile.long.input_tokens','Edit Long input token target','Long input tokens'],
+ ['load_test.workloads.interference.max_slowdown','Edit interference limit','Maximum allowed slowdown of short answers (×)']]){
+ const error={fields:[path],msg:'Server validation conflict',actions:[{field:path,label:raw}]};
+ state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors:[error]};
+ const html=renderSettingIssues();assert(html.includes('>Edit '+escape(label)+'</button>'),html);
+ assert(!html.includes(raw));assert(html.includes('data-setting-path="'+path+'"'));
+ await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:path}}:null}});
+ assert.equal(focused.at(-1),settingDestination(path).name);assert.equal(state.openTest,'load');assert.equal(state.setupStep,2);
+}
+const preserved=renderSettingIssues([{msg:'Suggested corrections',actions:[
+ {field:'max_requests',value:100,label:'Use 100 requests'},
+ {field:'load_test.patterns.rates',value:[2],label:'Use suggested rates'},
+ {field:'context_limit',label:'Edit server context setting'}]}]);
+assert(preserved.includes('data-action="use-request-budget"'));assert(preserved.includes('>Use 100 requests</button>'));
+assert(preserved.includes('>Use suggested rates</button>'));assert(preserved.includes('>Edit server context setting</button>'));
 ''')

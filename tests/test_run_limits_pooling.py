@@ -204,25 +204,28 @@ def test_saved_lookup_pools_cached_metadata_and_excludes_error_state(tmp_path):
 
 
 def test_arrivals_lower_bound_uses_last_offer_plus_minimum_observed_latency():
-    configured = RunConfig(targets=[TARGET], checks=["arrivals"], arrivals={"requests": 3, "requests_per_second": 10, "max_pending": 1})
+    from tests.test_planning import load_config
+    configuration = load_config(duration=1, finish=.2, rates=[10])
     entry = measurement([1, 10, 20], "run")
     entry.update(family="arrivals", concurrency=4, output_cap=24)
-    plan = request_plan(configured, observations={TARGET["name"]: [entry]})
+    plan = request_plan(configuration, observations={"local": [entry]})
     component, = plan["time_components"]
-    assert component["fixed_seconds"] == .2
-    assert component["low_seconds"] == pytest.approx(.201)
-    assert plan["estimated_low_seconds"] == .201
+    # Fixed #45 windows retain their full sending and finish allowances, rather
+    # than importing a legacy queue's last-offer/min-latency clock.
+    assert component["fixed_seconds"] == component["low_seconds"] == 1
+    assert plan["estimated_low_seconds"] == 1
+    assert plan["estimated_high_seconds"] == 1.2
 
 
 def test_budget_and_runtime_warning_sentences_are_readable_and_exact():
+    from tests.test_planning import load_config
     configured = RunConfig(targets=[TARGET], checks=["correctness"], max_requests=1)
     warning, = request_plan(configured)["request_warnings"]
     assert warning["msg"] == ("service: incomplete coverage for Answer correctness; the planned requests exceed this endpoint's share of the request limit (Stop after this many requests: 1).")
-    configured = RunConfig(targets=[TARGET], checks=["capacity"], max_duration_seconds=1, traffic={"rates": [1], "duration_seconds": 2})
+    configured = load_config(duration=2, finish=30, rates=[1], max_duration_seconds=1)
     warning = next(item for item in request_plan(configured)["time_warnings"] if item["kind"] == "incomplete_coverage")
-    assert warning["msg"] == ("Incomplete coverage: the traffic time limit (Stop test traffic after) may cut service · Capacity under load. The full traffic timeline including the initial connection allowance needs up to 32 seconds.")
-    assert runner._budget_guidance(RunConfig(targets=[TARGET], checks=["concurrency"], max_requests=10), "concurrency") == (
-        "Allow the configured Concurrent load sending windows plus calibration and drain; set the request limit (Stop after this many requests) using observed throughput. Duration-based requests have no fixed count.")
+    assert warning["msg"] == ("Incomplete coverage: the traffic time limit (Stop test traffic after) may cut local · Load test. The full traffic timeline including the initial connection allowance needs up to 32 seconds.")
+    assert warning["actions"][0] == {"label": "Use 32 s", "field": "max_duration_seconds", "value": 32}
 
 
 @pytest.mark.parametrize("suite", ["quality", "responsiveness"])

@@ -104,16 +104,13 @@ async def test_output_remedy_names_the_check_override_that_reached_its_cap(monke
 
 
 def test_burst_warning_accounts_for_other_endpoints_using_shared_slots():
-    from giraffe.planning import request_plan
-
-    configured = config(checks=["arrivals"], concurrency=4, overlap_models=True,
-        targets=[{"name": name, "url": "http://local", "model": "m"} for name in ("one", "two")],
-        arrivals={"mode": "burst", "requests": 6, "burst_size": 6, "max_in_flight": 4, "max_pending": 2})
-    notices = request_plan(configured)["concurrency_warnings"]
-    burst = next(notice for notice in notices if "arrivals.burst_size" in notice["fields"])
-    assert burst["values"]["shared_pool"] == burst["values"]["other_endpoint_slots"] == 4
-    assert burst["values"]["available_in_flight"] == 0
-    assert burst["values"]["dropped"] == 4
-    assert "0 in-flight + 2 pending = 2" in burst["msg"]
-    assert "may be dropped locally" in burst["msg"]
-    assert all("Arrival traffic" in notice["msg"] or "Arrivals share" in notice["msg"] for notice in notices)
+    from pydantic import ValidationError
+    from tests.test_planning import load_config
+    configuration = load_config(concurrency=4, overlap_models=True,
+        targets=[{"name": name, "url": "http://local", "model": "m"} for name in ("one", "two")])
+    configuration.load_test.patterns.bursts.enabled = True
+    configuration.load_test.patterns.bursts.size = 6
+    configuration.load_test.patterns.bursts.first_seconds = 0
+    with pytest.raises(ValidationError) as raised:
+        RunConfig.model_validate(configuration.model_dump())
+    assert raised.value.errors(include_url=False)[0]["ctx"]["fields"] == ["load_test.patterns.bursts.size", "concurrency"]

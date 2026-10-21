@@ -53,7 +53,7 @@ def test_a12_single_stage_cap_explains_arithmetic_and_duration_only_correction()
     assert error["ctx"]["note"] == (
         "This cap covers scheduled traffic only; suite time and request budgets are separate.")
     result = request_plan(configuration(traffic=corrected_traffic(traffic, error)))
-    assert result["planned_total"] == 100000
+    assert result["load_test"]["expected_scheduled_requests"] == 100000
     assert result["errors"] == []
 
 
@@ -68,7 +68,7 @@ def test_a14_multistage_cap_explains_aggregate_and_keeps_every_rate():
     assert error["ctx"]["actions"][0] == {
         "label": "Use 250 seconds", "field": "traffic.duration_seconds", "value": 250}
     result = request_plan(configuration(traffic=corrected_traffic(traffic, error)))
-    assert result["planned_total"] == 100000
+    assert result["load_test"]["expected_scheduled_requests"] == 100000
     assert result["errors"] == []
 
 
@@ -79,7 +79,7 @@ def test_a14_multistage_cap_explains_aggregate_and_keeps_every_rate():
 def test_a13_valid_traffic_plan_reports_suite_budgets_separately(budgets, warning_key, field):
     traffic = {"rates": [25], "duration_seconds": 3600}
     result = request_plan(configuration(traffic=traffic, **budgets))
-    assert result["planned_total"] == 90000
+    assert result["load_test"]["expected_scheduled_requests"] == 90000
     assert result["errors"] == []
     coverage = next(item for item in result[warning_key] if item["kind"] == "incomplete_coverage")
     assert field in coverage["fields"]
@@ -110,18 +110,14 @@ def test_nonfinite_or_out_of_range_rates_are_validation_errors(rate):
 
 
 def test_capacity_risk_is_a_labelled_nonblocking_user_supplied_estimate():
-    result = request_plan(configuration(traffic={"rates": [250], "duration_seconds": 1,
-        "max_in_flight": 256, "expected_response_seconds": 2}))
-    warning, = result["capacity_warnings"]
-    assert warning["kind"] == "capacity_risk_estimate"
-    assert warning["estimate"] is True
-    assert warning["values"]["unfinished_requests"] == 500
-    assert warning["fields"] == ["traffic.rates", "traffic.expected_response_seconds", "traffic.max_in_flight"]
-    assert "≈ 250 requests/second × 2 seconds = 500 unfinished requests needed; in-flight limit 256" in warning["msg"]
-    assert "estimate" in warning["msg"] and "dropped locally" in warning["msg"]
-    assert warning["msg"] in result["warnings"]
-    assert result["planned_total"] == 250
+    configuration = globals()["configuration"](traffic={"rates": [250], "duration_seconds": 1,
+        "max_in_flight": 256, "expected_response_seconds": 2})
+    result = request_plan(configuration)
+    # The removed local cap and response-time estimate cannot claim load capacity.
+    assert result["capacity_warnings"] == []
+    assert result["load_test"]["expected_scheduled_requests"] == 250
     assert result["errors"] == []
+    assert configuration.load_test.legacy_source == "capacity"
 
 
 def test_capacity_risk_does_not_invent_response_times_or_change_workload():
@@ -145,6 +141,6 @@ def test_capacity_expected_response_time_must_be_positive_and_finite(value):
 def test_extreme_but_finite_expected_response_time_keeps_plan_json_safe():
     result = request_plan(configuration(traffic={"rates": [250], "duration_seconds": 1,
         "expected_response_seconds": 1e308}))
-    warning, = result["capacity_warnings"]
-    assert warning["values"]["unfinished_requests"] == "2.500e+310"
+    assert result["capacity_warnings"] == []
+    assert result["load_test"]["expected_scheduled_requests"] == 250
     json.dumps(result, allow_nan=False)

@@ -26,20 +26,24 @@ assert.doesNotMatch(markup,/Request ceiling|Traffic time limit|Maximum at once/)
 
 
 def test_budget_copy_uses_catalogue_names_and_grouped_numbers_without_changing_rows():
-    configured = RunConfig(targets=[TARGET], checks=["access", "correctness", "capacity"],
-                           max_requests=1, traffic={"rates": [100], "duration_seconds": 1000})
+    configured = RunConfig(targets=[TARGET], checks=["access", "correctness", "load"],
+                           max_requests=1, load_test={
+                               "workloads": {"combinations": {"selected": ["short_short"]}},
+                               "patterns": {"concurrent": {"enabled": False}, "rates": [100]},
+                               "schedule": {"duration_seconds": 1000}})
     plan = request_plan(configured)
-    assert plan["planned_total"] == 100007
+    assert plan["planned_total"] == 100010  # 100k arrivals + connection + answers + calibration allowance
     assert [(row["id"], row["title"]) for row in plan["rows"]] == [
         ("initial", "Connection check"), ("access", "Network and access"),
-        ("capacity", "Arrival traffic capacity"), ("correctness", "Known-answer correctness")]
-    notice, = plan["request_warnings"]
-    assert notice["actions"][0] == {"label": "Use 100,007 total requests", "field": "max_requests", "value": 100007}
-    assert "Capacity under load, Answer correctness" in notice["msg"]
+        ("correctness", "Known-answer correctness"),
+        ("load_combinations", "Input → output combinations"), ("load_calibration", "Input token calibration")]
+    notice = next(item for item in plan["request_warnings"] if item["kind"] == "incomplete_coverage")
+    assert notice["actions"][0] == {"label": "Use 100,010 total requests", "field": "max_requests", "value": 100010}
+    assert "Answer correctness, Load test" in notice["msg"]
     assert [action["label"] for action in notice["actions"][1:]] == [
-        "Edit Capacity under load", "Edit Answer correctness"]
+        "Edit Answer correctness", "Edit Load test"]
     larger_budget = request_plan(configured.model_copy(update={"max_requests": 10000}))
-    larger_notice, = larger_budget["request_warnings"]
+    larger_notice = next(item for item in larger_budget["request_warnings"] if item["kind"] == "incomplete_coverage")
     assert "request limit (Stop after this many requests: 10,000)" in larger_notice["msg"]
     assert larger_notice["values"]["max_requests"] == 10000
     browser_logic(r"""
@@ -47,14 +51,14 @@ const plan=PLAN;state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
 nodes['#request-plan']={};renderRequestPlan(config);
 for(const markup of [renderRunBlueprint(config,plan),nodes['#request-plan'].innerHTML]){
-  assert.match(markup,/Use 100,007 total requests/);
-  assert.match(markup,/Capacity under load, Answer correctness/);
-  assert.match(markup,/data-budget="100007"/);
+  assert.match(markup,/Use 100,010 total requests/);
+  assert.match(markup,/Answer correctness, Load test/);
+  assert.match(markup,/data-budget="100010"/);
 }
 const elements={max_requests:{value:'1',disabled:true},max_requests_enabled:{checked:false}};
 nodes['#new-run-form']={elements};nodes['#config-error']={};configChanged=updateBounds=()=>{};
-await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'use-request-budget'}}:q==='[data-budget]'?{dataset:{budget:'100007'}}:null}});
-assert.equal(elements.max_requests.value,100007);assert.equal(elements.max_requests_enabled.checked,true);
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'use-request-budget'}}:q==='[data-budget]'?{dataset:{budget:'100010'}}:null}});
+assert.equal(elements.max_requests.value,100010);assert.equal(elements.max_requests_enabled.checked,true);
 assert.equal(elements.max_requests.disabled,false);assert.equal(elements.max_requests.required,true);
 """.replace('PLAN', json.dumps(plan)), configured)
 
@@ -66,12 +70,16 @@ for(const [check,name] of Object.entries(NAMES))assert.equal(catalogTitle(check)
 
 
 def test_time_budget_warning_formats_action_without_changing_numeric_value():
-    configured = RunConfig(targets=[TARGET], checks=["capacity"], max_duration_seconds=1,
-                           traffic={"rates": [25], "duration_seconds": 3600})
+    configured = RunConfig(targets=[TARGET], checks=["load"], max_duration_seconds=1,
+                           load_test={"workloads": {"combinations": {"selected": ["short_short"]}},
+                                      "patterns": {"concurrent": {"enabled": False}, "rates": [25]},
+                                      "schedule": {"duration_seconds": 3600, "finish_seconds": 30}})
     warning = request_plan(configured)["time_warnings"][0]
-    assert warning["actions"][0] == {"label": "Use 3,630 s", "field": "max_duration_seconds", "value": 3630}
-    assert "Capacity under load" in warning["msg"]
-    assert "3,630 seconds" in warning["msg"]
+    assert warning["actions"][0] == {"label": "Use 3,630 s (covers fixed windows only)", "field": "max_duration_seconds", "value": 3630}
+    assert "Load test" in warning["msg"]
+    assert warning["values"]["minimum_seconds"] == 3600
+    assert warning["values"]["suggested_seconds"] == 3630
+    assert warning["values"]["fully_known"] is False  # token calibration depends on endpoint latency
 
 
 @pytest.mark.parametrize("command", ["validate", "preview", "run"])

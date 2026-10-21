@@ -24,6 +24,7 @@ from giraffe.concurrent_load import (
     context_window,
     inflight,
     make_spec,
+    later_reservation,
     window_cause,
 )
 from giraffe.fixtures import deterministic_options, reasoning_budget
@@ -95,6 +96,14 @@ def point_shapes(settings, point):
         if point["type"] == "interference"
         else [point["shape"]]
     )
+
+
+def burst_count(settings):
+    b, duration = settings.patterns.bursts, settings.schedule.duration_seconds
+    if not b.enabled or b.gap_seconds <= 0 or b.first_seconds >= duration:
+        return 0
+    first, gap, end = map(lambda v: Decimal(str(v)), (b.first_seconds, b.gap_seconds, duration))
+    return int(((end - first) / gap).to_integral_value(rounding="ROUND_CEILING"))
 
 
 def burst_times(settings):
@@ -194,7 +203,7 @@ def test_points(settings):
 def scheduled_count(settings, point):
     if point["pattern"] in {"concurrent", "interference"}:
         return None
-    n = len(burst_times(settings)) * settings.patterns.bursts.size if point["bursts"] else 0
+    n = burst_count(settings) * settings.patterns.bursts.size if point["bursts"] else 0
     if point["pattern"] == "constant":
         n += math.ceil(point["rate"] * settings.schedule.duration_seconds)
     elif point["pattern"] == "poisson":
@@ -208,6 +217,11 @@ def load_time_plan(settings):
     expected = sum(scheduled_count(own[p["source"]], p) or 0 for p in points)
     unknown = any(p["pattern"] in {"concurrent", "interference"} for p in points)
     approximate = any(p["pattern"] == "poisson" for p in points)
+    def known(point):
+        config = own[point["source"]]
+        bursts = burst_count(config) * config.patterns.bursts.size if point["bursts"] else 0
+        constant = math.ceil(point["rate"] * config.schedule.duration_seconds) if point["pattern"] == "constant" else 0
+        return bursts + constant
     windows = sum(p["windows"] for p in points)
     sending = sum(p["windows"] * own[p["source"]].schedule.duration_seconds for p in points)
     allowances = sum(p["windows"] * own[p["source"]].schedule.finish_seconds for p in points)
@@ -228,6 +242,7 @@ def load_time_plan(settings):
                 "expected_requests": sum(
                     scheduled_count(own[p["source"]], p) or 0 for p in selected
                 ),
+                "known_scheduled_requests": sum(known(p) for p in selected),
                 "unknown_requests": any(
                     scheduled_count(own[p["source"]], p) is None for p in selected
                 ),
@@ -257,6 +272,7 @@ def load_time_plan(settings):
         "finish_allowance_seconds": allowances,
         "time_with_allowances_seconds": sending + allowances,
         "expected_scheduled_requests": expected,
+        "known_scheduled_requests": sum(known(p) for p in points),
         "unknown_requests": unknown,
         "approximate": approximate,
         "expected_requests_label": (
@@ -366,32 +382,61 @@ def validate_config(config):
         ):
             load_validation_error(
                 fields,
-                "Concurrency levels exceed the run ceiling. Update Run limits or lower the levels.",
+                f"Concurrency {max(levels)}" + (f" × {len(config.targets)} endpoints" if config.overlap_models else "") + f" exceeds the run ceiling ({config.concurrency}). Update Run limits or lower the levels.",
+                values={prefix + "patterns.concurrent.levels": levels, "concurrency": config.concurrency},
             )
         standard = any(
             getattr(own.workloads, k).enabled for k in ("combinations", "mixed", "stress")
         )
         if standard and own.patterns.bursts.enabled:
-            if config.concurrency is not None and own.patterns.bursts.size > config.concurrency:
+            if config.concurrency is not None and own.patterns.bursts.size > config.concurrency and not getattr(own, "legacy_source", None):
                 load_validation_error(
                     [prefix + "patterns.bursts.size", "concurrency"],
                     "One burst exceeds the concurrency ceiling and cannot be dispatched in full.",
+                    values={prefix + "patterns.bursts.size": own.patterns.bursts.size, "concurrency": config.concurrency},
                 )
-            if len(burst_times(own)) * own.patterns.bursts.size > MAX_PLANNED_ARRIVALS:
+        for point in traffic_points(own) if standard else []:
+            count = scheduled_count(own, point) or 0
+            if count > MAX_PLANNED_ARRIVALS:
+                probe = own.model_copy(deep=True)
+                low, high = 0, own.schedule.duration_seconds
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    probe.schedule.duration_seconds = middle
+                    if all((scheduled_count(probe, other) or 0) <= MAX_PLANNED_ARRIVALS for other in traffic_points(probe)):
+                        low = middle
+                    else:
+                        high = middle - 1
+                rate_field = prefix + ("patterns.rates" if point["rate"] else "patterns.bursts.gap_seconds")
+                duration_field = prefix + "schedule.duration_seconds"
+                minutes, seconds = divmod(low, 60)
+                rate_text = f"{point['rate']:g} requests/second × {own.schedule.duration_seconds:,} seconds" if point["rate"] else ""
+                if point["bursts"]:
+                    rate_text += (" + " if rate_text else "") + f"{burst_count(own) * own.patterns.bursts.size:,} burst offers"
+                rate_text += " = " if rate_text else ""
+                minimum_window = max(1, math.floor(own.patterns.bursts.first_seconds) + 1) if point["bursts"] else 1
+                feasible = low >= minimum_window
+                boundary = (f"At this rate, the longest stage is {low} seconds ({minutes} minutes {seconds} seconds). "
+                    if feasible else f"Even the minimum valid sending window ({minimum_window} seconds) exceeds this bound; reduce the sending rate or burst size/frequency. ")
+                message = (rate_text + f"{count:,.0f} planned arrivals. This traffic plan allows at most {MAX_PLANNED_ARRIVALS:,} per endpoint. "
+                    + boundary + "This bounds scheduled traffic only; run budgets are separate.")
+                actions = ([{"label": f"Use {low} seconds", "field": duration_field, "value": low}] if feasible else [])
+                if point["rate"]:
+                    actions.append({"label": "Edit Rates (requests/second)", "field": prefix + "patterns.rates"})
+                if point["bursts"]:
+                    actions.append({"label": "Edit Time between burst starts (seconds)", "field": prefix + "patterns.bursts.gap_seconds"})
                 load_validation_error(
-                    [prefix + "patterns.bursts.gap_seconds", prefix + "schedule.duration_seconds"],
-                    "The burst schedule exceeds the finite planned-arrival safety bound.",
-                )
-        for p in traffic_points(own) if standard else []:
-            if (scheduled_count(own, p) or 0) > MAX_PLANNED_ARRIVALS:
-                load_validation_error(
-                    [prefix + "patterns.rates", prefix + "schedule.duration_seconds"],
-                    "The arrival schedule exceeds the finite planned-arrival safety bound.",
+                    [rate_field, duration_field], message,
+                    values={rate_field: own.patterns.rates if point["rate"] else own.patterns.bursts.gap_seconds, duration_field: own.schedule.duration_seconds,
+                            "planned_arrivals": count, "maximum_planned_arrivals": MAX_PLANNED_ARRIVALS,
+                            "longest_stage_seconds": low},
+                    actions=actions,
                 )
         if own.workloads.interference.enabled and not config.stream:
             load_validation_error(
                 [prefix + "workloads.interference.enabled", "stream"],
                 "Long input during an active short stream needs streaming responses.",
+                values={prefix + "workloads.interference.enabled": True, "stream": config.stream},
             )
         for target in config.targets:
             context, _ = context_window(target)
@@ -399,6 +444,7 @@ def validate_config(config):
                 a, b = shape.split("_")
                 if (
                     context is not None
+                    and not getattr(own, "legacy_source", None)
                     and getattr(own.profile, a).input_tokens + getattr(own.profile, b).output_tokens
                     > context
                 ):
@@ -409,11 +455,13 @@ def validate_config(config):
                         ],
                         f"{load_shape_label(shape)} exceeds the known endpoint context window ({context} tokens).",
                     )
-    required = minimum_reservation(config.load_test) * len(config.targets)
+    settings = dict(settings_sets(config.load_test))
+    required = sum((p["level"] * 2 - 1 if p["type"] == "interference" else p["level"] or 0) for p in test_points(config.load_test) if not getattr(settings[p["source"]], "legacy_source", None)) * len(config.targets)
     if config.max_requests is not None and required > config.max_requests:
         load_validation_error(
             ["max_requests", "load_test.patterns.concurrent.levels"],
             "The request budget cannot cover even the initial concurrent groups and comparison windows.",
+            values={"max_requests": config.max_requests, "required_requests": required},
         )
 
 
@@ -524,9 +572,12 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             return True
         if not run.allowed(target.name):
             reason = run.condition_reason(target.name)
-            cutoff = time.monotonic() if cutoff is None else cutoff
-            return True
-        return False
+        elif point.get("request_allowance") is not None and run.budget_counts[target.name] - point["budget_start"] >= point["request_allowance"]:
+            reason = "point request allowance used"
+        else:
+            return False
+        cutoff = time.monotonic() if cutoff is None else cutoff
+        return True
 
     async def send(shape, role, progress=None):
         if ended():
@@ -699,7 +750,7 @@ async def arrival_window(run, target, client, settings, point, calibration):
         stage_index=0,
         fixtures={},
         execute=send,
-        reserve_offer=lambda: run.reserve_offer(target.name),
+        reserve_offer=lambda: (point.get("request_allowance") is None or run.budget_counts[target.name] - point["budget_start"] < point["request_allowance"]) and run.reserve_offer(target.name),
         try_acquire=run.try_acquire_slot,
         release=run.release_slot,
         stop_reason=stop,
@@ -792,7 +843,12 @@ def interference_measurements(records, windows, delay_windows=()):
         }
     a, b = result["baseline"]["completion_median_ms"], result["probe"]["completion_median_ms"]
     pauses = [result[k]["longest_stream_pause_ms"] for k in ("baseline", "probe")]
+    valid_shorts = [r for r in records if r.load_point.get("role") == "short_stream" and r.valid and r.status == "completed"]
+    buffered = sum(r.answer_chunks < 2 for r in valid_shorts)
     result.update(
+        buffered_stream=bool(valid_shorts) and buffered > len(valid_shorts) / 2,
+        buffered_short_streams=buffered,
+        valid_short_streams=len(valid_shorts),
         slowdown=b / a if a and b is not None else None,
         matched_measurement_windows=intervals,
         actual_overlap_request_ids=result["probe"]["request_ids"],
@@ -924,12 +980,13 @@ def measurements(run, target, settings, point, records, shape):
         not_offered=not_offered,
         completed=len(completed),
         valid=len(valid),
+        reasoning_budget_exhausted=sum(reasoning_budget(r) for r in rows),
         failed=len(failed),
         timed_out=len(timed_out),
         cancelled=len(cancelled),
         error_denominator=denominator,
         error_denominator_description="Dispatched responses excluding cancellations; local drops are not sent and are excluded.",
-        error_percent=(len(failed) + len(timed_out)) / denominator * 100 if denominator else None,
+        error_percent=(len(failed) + len(timed_out)) / denominator * 100 if denominator else 0,
         scored=len(scored),
         correct=sum(r.score is True for r in scored),
         unscored=len(valid) - len(scored),
@@ -1060,6 +1117,8 @@ def score_group(settings, point, group, records):
             "cancelled",
             "Unfinished requests were cancelled after the finish allowance or run stop.",
         )
+    if point.get("input_not_calibrated"):
+        return result("inconclusive", "input_not_calibrated", "Input target calibration was incomplete.")
     if group["valid"] < c.min_valid_responses:
         return result(
             "inconclusive",
@@ -1084,10 +1143,8 @@ def score_group(settings, point, group, records):
             "missing_timing",
             "Required response timing/speed measurements are missing.",
         )
-    if point.get("input_not_calibrated"):
-        return result(
-            "inconclusive", "input_not_calibrated", "Input target calibration was incomplete."
-        )
+    if group["shape"].startswith("long_") and any(r.input_tokens and r.cached_prompt_tokens is not None and r.cached_prompt_tokens > r.input_tokens / 2 for r in rows):
+        return result("inconclusive", "cached_input", "More than half the long input was cached.")
     coverage = group.get("coverage")
     if coverage:
         if group["shape"].startswith("long_") and coverage["input_verified"] < group["valid"]:
@@ -1168,6 +1225,7 @@ def assess_point(run, target, settings, point, records):
         "failed",
         "timed_out",
         "cancelled",
+        "reasoning_budget_exhausted",
         "local_drops",
         "late_arrivals",
         "not_sent",
@@ -1273,6 +1331,7 @@ def assess_point(run, target, settings, point, records):
         if (rows := [r for r in records if r.load_point.get("origin") == origin])
     }
     point.pop("_source_index", None)
+    point.pop("budget_start", None)
     return point
 
 
@@ -1283,7 +1342,7 @@ def publish_point(run, target, point):
     for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
         scenario = point["id"] + ("." + phase if phase else "")
         run.finish_condition(
-            target.name, scenario, reason=point["reason"], load_point_result=payload
+            target.name, scenario, reason=point.get("window_reason") or ("dropped: all request slots busy" if point.get("local_drops") else None) or point["reason"], load_point_result=payload
         )
 
 
@@ -1320,7 +1379,9 @@ async def execute(run, target, client):
         for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
             scenario = point["id"] + ("." + phase if phase else "")
             run.plan_condition(target.name, scenario, planned=None, planned_kind="duration")
-    for point in points:
+    cancellation = None
+    reserved_checks = later_reservation(run.config)
+    for index, point in enumerate(points):
         cfg = own[point["source"]]
         records = []
         point.update(
@@ -1342,7 +1403,9 @@ async def execute(run, target, client):
             for s in shapes
         ):
             point["blocked"] = f"Request targets exceed known context window {context} ({source})."
-        elif run.allowed(target.name):
+        elif point["source"] in calibration and any(v["status"] == "fail" for v in calibration[point["source"]].values()):
+            point["calibration_failure"] = next(v["reason"] for v in calibration[point["source"]].values() if v["status"] == "fail")
+        elif run.allowed(target.name) and cancellation is None:
             if point["source"] not in calibration:
                 calibration[point["source"]] = {}
             cache = calibration[point["source"]]
@@ -1351,7 +1414,12 @@ async def execute(run, target, client):
                     a, b = shape.split("_")
                     key = a, "short_answer" if b == "short" else "long_output"
                     if key not in cache:
-                        cache[key] = await calibrate(run, target, client, cfg, *key)
+                        try:
+                            cache[key] = await calibrate(run, target, client, cfg, *key)
+                        except asyncio.CancelledError as exc:
+                            cancellation = exc
+                            point.update(cut_short=True, window_reason=run.stop_reason(target.name) or "execution cancelled")
+                            break
                         observation["calibrations"].append(
                             {"source": point["source"], **cache[key]}
                         )
@@ -1361,37 +1429,47 @@ async def execute(run, target, client):
                     )
                 elif any(v["status"] == "inconclusive" for v in cache.values()):
                     point["input_not_calibrated"] = True
-            if not point.get("calibration_failure") and not point.get("input_not_calibrated"):
-                if point["type"] == "interference":
-                    for phase in ("baseline", "probe"):
-                        rows, window = await concurrent_window(
-                            run, target, client, cfg, point, cache, phase=phase
+            if cancellation is None and not point.get("calibration_failure") and not point.get("input_not_calibrated"):
+                remaining = run.remaining(target.name)
+                reserved = reserved_checks + sum((p["level"] * 2 - 1 if p["type"] == "interference" else p["level"] or 0) for p in points[index + 1:])
+                point.update(request_allowance=max(0, remaining - reserved) if remaining is not None else None, reserved_later_requests=reserved, budget_start=run.budget_counts[target.name])
+                try:
+                    if point["type"] == "interference":
+                        for phase in ("baseline", "probe"):
+                            rows, window = await concurrent_window(
+                                run, target, client, cfg, point, cache, phase=phase
+                            )
+                            records += rows
+                            point["cut_short"] |= window["cut_short"]
+                            point["window_reason"] = point["window_reason"] or window["window_reason"]
+                        windows = point["measurement_windows"]
+                        point.update(
+                            sending_start_ms=windows[0]["sending_start_ms"],
+                            sending_end_ms=windows[-1]["sending_end_ms"],
+                            delivered_window_seconds=sum(
+                                w["delivered_window_seconds"] for w in windows
+                            ),
+                            observation_seconds=sum(w["observation_seconds"] for w in windows),
+                            drain_seconds=sum(w["drain_seconds"] for w in windows),
                         )
-                        records += rows
-                        point["cut_short"] |= window["cut_short"]
-                        point["window_reason"] = point["window_reason"] or window["window_reason"]
-                    windows = point["measurement_windows"]
-                    point.update(
-                        sending_start_ms=windows[0]["sending_start_ms"],
-                        sending_end_ms=windows[-1]["sending_end_ms"],
-                        delivered_window_seconds=sum(
-                            w["delivered_window_seconds"] for w in windows
-                        ),
-                        observation_seconds=sum(w["observation_seconds"] for w in windows),
-                        drain_seconds=sum(w["drain_seconds"] for w in windows),
-                    )
-                elif point["pattern"] == "concurrent":
-                    records, window = await concurrent_window(
-                        run, target, client, cfg, point, cache
-                    )
-                    point.update(window)
-                else:
-                    records = await arrival_window(run, target, client, cfg, point, cache)
-                point["not_run"] = False
+                    elif point["pattern"] == "concurrent":
+                        records, window = await concurrent_window(
+                            run, target, client, cfg, point, cache
+                        )
+                        point.update(window)
+                    else:
+                        records = await arrival_window(run, target, client, cfg, point, cache)
+                    point["not_run"] = False
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                    point.update(cut_short=True, not_run=False, window_reason=run.stop_reason(target.name) or "execution cancelled")
+                    records = [r for r in run.records if r.target == target.name and r.load_point.get("point_id") == point["id"]]
         else:
             point.update(cut_short=True, window_reason=run.condition_reason(target.name))
         assess_point(run, target, cfg, point, records)
         publish_point(run, target, point)
+    if cancellation is not None and run.stop_reason(target.name) is None:
+        raise cancellation
     return observation
 
 
@@ -1460,6 +1538,12 @@ def result(run, target):
         )
         + "."
     )
+    if status != "pass":
+        deciding = [p for p in observation["points"] if p["status"] == status]
+        summary += " " + "; ".join(f"{point_label(p)}: {p['reason']}" for p in deciding[:3])
+        if len(deciding) > 3:
+            summary += f"; and {len(deciding) - 3} more"
+        summary += "."
     return CheckResult(
         id="load",
         title="Load test",

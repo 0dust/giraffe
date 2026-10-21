@@ -30,16 +30,18 @@ def test_legacy_concurrency_flag_rebuilds_migrated_overlap_defaults(source, tmp_
     assert {name: config.effective_check(name)["concurrency"]
             for name in ("correctness", "json", "recovery")} == {
                 "correctness": 8, "json": 8, "recovery": 8}
-    assert config.effective_arrivals().max_in_flight == 8
-    assert config.effective_traffic().max_in_flight == 8
-    assert config.concurrent_load.schedule.levels == [1, 4]
+    assert config.checks == ['correctness', 'json', 'recovery', 'load']
+    imports = [config.load_test, *[item.settings for item in config.load_test.migrated_tests]]
+    assert {item.legacy_source for item in imports} == {'arrivals', 'capacity', 'concurrency'}
+    concurrent = next(item for item in imports if item.legacy_source == 'concurrency')
+    assert concurrent.patterns.concurrent.levels == [1, 4]
     notices = config.concurrency_notices()
-    assert len(notices) == 5
+    assert len(notices) == 3
     assert {notice["check"] for notice in notices} == {
-        "correctness", "json", "recovery", "arrivals", "capacity"}
+        "correctness", "json", "recovery"}
     assert all(notice["msg"].startswith(CATALOGUE_NAMES[notice["check"]] + ": ") for notice in notices)
     assert all(notice["msg"].count("Shared across") == 1 for notice in notices)
-    assert not any("40" in note for note in config._migration_notes)
+    assert not any("default_concurrency=40" in note or "concurrency: 40" in note for note in config._migration_notes)
     assert capsys.readouterr().err.count("--concurrency 8 sets both") == 1
 
 
@@ -55,8 +57,10 @@ def test_legacy_concurrency_flag_preserves_explicit_check_settings(tmp_path):
     assert config.effective_check("correctness")["concurrency"] == 9
     assert config.effective_check("json")["concurrency"] == 3
     assert config.effective_check("recovery")["concurrency"] == 8
-    assert config.effective_arrivals().max_in_flight == 8
-    assert config.effective_traffic().max_in_flight == 6
+    assert config.load_test.legacy_source == 'arrivals'
+    capacity, = config.load_test.migrated_tests
+    assert capacity.source == 'capacity'
+    assert any('max_in_flight dropped' in note for note in config._migration_notes)
 
 
 def test_simultaneous_limit_flag_only_changes_legacy_ceiling(tmp_path):
@@ -68,7 +72,9 @@ def test_simultaneous_limit_flag_only_changes_legacy_ceiling(tmp_path):
     ]))
     assert config.concurrency == 8 and config.default_concurrency == 40
     assert config.effective_check("correctness")["concurrency"] == 40
-    assert config.effective_arrivals().max_in_flight == 40
+    assert config.load_test.legacy_source == 'arrivals'
+    assert config.load_test.patterns.constant.enabled
+    assert any('max_in_flight dropped' in note for note in config._migration_notes)
 
 
 def test_v2_input_concurrency_flag_does_not_replace_explicit_check_values(tmp_path):

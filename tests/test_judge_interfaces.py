@@ -18,7 +18,9 @@ from tests.test_web import browser
 def judged_config():
     return {
         "targets": [{"name": "local", "url": "http://localhost:8000/v1", "model": "subject"}],
-        "checks": ["correctness", "capacity"], "request_source": "request_pack",
+        "checks": ["correctness", "load"],
+        "load_test": {"patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True}}},
+        "request_source": "request_pack",
         "request_pack": {"version": 1, "cases": [{
             "fixture_id": "refund", "messages": [{"role": "user", "content": "What is the return window?"}],
             "scorer": "judge", "expected": "Returns are accepted within 30 days.",
