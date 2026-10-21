@@ -517,8 +517,11 @@ def _compare_load_tests(
     An incomplete or client-limited cohort cannot establish that loss.
     """
     def metrics(run):
+        # Unselected checks still have catalogue entries with empty metrics.
+        # Qualification comparison applies only to actual tested cohorts.
         return next((check.metrics for check in run.checks
-                     if check.id == "load" and check.target == target), None)
+                     if check.id == "load" and check.target == target
+                     and check.metrics.get("points")), None)
 
     current, old = metrics(report), metrics(baseline)
     if current is None and old is None:

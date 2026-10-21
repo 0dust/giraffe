@@ -9,6 +9,50 @@ from tests.test_concurrent_load import configuration
 from tests.test_web import report as empty_report
 
 
+@pytest.mark.parametrize("request_source", ["builtin", "request_pack"])
+@pytest.mark.parametrize("load_result", ["absent", "skipped", "empty_points"])
+def test_correctness_baseline_ignores_unselected_load_without_cohorts(request_source, load_result):
+    from giraffe.models import RunConfig
+    from giraffe.request_pack import pack_identity
+    from tests.test_reporting import make_report
+
+    current = make_report(count=16)
+    values = {
+        "targets": current.manifest["config"]["targets"], "checks": ["correctness"],
+        "request_source": request_source, "limits": {"regression_percent": 1_000_000},
+        "test_options": {"capacity": {"limits": {"latency_ms": None}}},
+    }
+    if request_source == "request_pack":
+        values["request_pack"] = {"version": 1, "cases": [{
+            "fixture_id": "answer", "messages": [{"role": "user", "content": "Return 42"}],
+            "scorer": "exact", "expected": "42"}]}
+    config = RunConfig.model_validate(values)
+    current.manifest["config"] = config.model_dump(mode="json")
+    if request_source == "request_pack":
+        current.manifest["request_pack"] = pack_identity(config)
+    assert current.manifest["config"]["checks"] == ["correctness"]
+    for index, record in enumerate(current.requests):
+        record.check_ids = ["correctness"]
+        record.scenario = ("pack_control" if index < 8 else "pack_loaded") if request_source == "request_pack" else "correctness_c4"
+        if request_source == "request_pack":
+            record.fixture_id = "pack:answer"
+    if load_result != "absent":
+        current.checks.append(CheckResult(id="load", title="Load test", target="local",
+            required=False, status="skipped", summary="Not selected.",
+            metrics={} if load_result == "skipped" else {"points": []}))
+    previous = current.model_copy(deep=True)
+    previous.run_id = "baseline"
+    before = current.model_dump_json(), previous.model_dump_json()
+
+    compared = compare_baseline(current, previous)
+
+    assert compared.baseline["status"] == compared.overall == "pass"
+    target = compared.baseline["targets"][0]
+    assert "load_test" not in target
+    assert target["comparisons"] and all(row["status"] == "pass" for row in target["comparisons"])
+    assert (current.model_dump_json(), previous.model_dump_json()) == before
+
+
 def arrival_report(shapes=("short_short",)):
     config = configuration(limits={"min_samples": 100}, load={
         "combinations": {"selected": list(shapes)},
@@ -66,6 +110,21 @@ def test_losing_accepted_rate_fails_baseline_without_bootstrap_sample_minimum():
     assert [row["status"] for row in comparison["points"]] == ["pass", "fail"]
     assert next(check for check in compared.checks if check.id == "baseline").evidence_ids == point["request_ids"]
     assert "previously acceptable tested load now fails" in _render(compared)
+
+
+@pytest.mark.parametrize("missing_side", ["current", "baseline"])
+def test_load_cohorts_missing_from_only_one_run_remain_inconclusive(missing_side):
+    current = arrival_report()
+    previous = current.model_copy(deep=True)
+    missing = current if missing_side == "current" else previous
+    missing.checks[0].metrics = {"points": []}
+
+    compared = compare_baseline(current, previous)
+
+    assert compared.baseline["status"] == "inconclusive"
+    comparison = compared.baseline["targets"][0]["load_test"]
+    assert comparison["status"] == "inconclusive"
+    assert comparison["reason"] == "One run lacks final Load test evidence."
 
 
 @pytest.mark.parametrize("change", ["inconclusive", "truncated", "missing_shape", "configuration"])
