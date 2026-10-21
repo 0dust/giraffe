@@ -512,6 +512,7 @@ def test_stress_long_long_and_ceil_coverage():
     r = record()
     r.load_point["shape"] = "long_long"
     r.input_tokens = 2048
+    r.requested_max_tokens = r.requested_output_tokens = 512
     r.output_tokens = 409
     run = SimpleNamespace(records=[r], max_lag_ms=0)
     p = load_points(c.load_test)[0]
@@ -660,6 +661,7 @@ def test_interference_slowdown_fails_and_missing_overlap_cannot_pass():
     b.timing_start_ms = 100
     probe.timing_start_ms = 102
     probe.first_output_ms = 3
+    probe.input_tokens = 2048
     probe.load_point.update(role="probe", phase="probe", shape="long_short")
     evidence = interference_measurements(
         [a, b, probe],

@@ -13,7 +13,7 @@ from typing import Any
 from giraffe.fixtures import builtin_fixtures
 from giraffe.concurrent_load import prompt_overhead
 from giraffe.logprob_workload import corpus_width, sample_count
-from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets
+from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
 from giraffe.models import CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, required_concurrency
 from giraffe.request_pack import active_pack, pack_summary, pack_settings
 from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
@@ -935,6 +935,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     load_plan = load_time_plan(config.load_test) if "load" in selected else {}
     load_warnings = []
     if load_plan:
+        load_plan["saved_shape_warnings"] = saved_shape_warnings(config)
+        load_warnings.extend({"fields": [], "msg": warning}
+                             for warning in load_plan["saved_shape_warnings"])
         for kind, detail in load_plan["workloads"].items():
             count = None if detail["unknown_requests"] else detail["expected_requests"]
             add(f"load_{kind}", count, f"{detail['test_points']} tests, {detail['windows']} sending windows; "

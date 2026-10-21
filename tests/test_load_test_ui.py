@@ -273,3 +273,56 @@ const preserved=renderSettingIssues([{msg:'Suggested corrections',actions:[
 assert(preserved.includes('data-action="use-request-budget"'));assert(preserved.includes('>Use 100 requests</button>'));
 assert(preserved.includes('>Use suggested rates</button>'));assert(preserved.includes('>Edit server context setting</button>'));
 ''')
+
+
+def test_load_results_disclose_saved_budgets_and_input_qualification_without_hiding_metrics():
+    from giraffe.reporting import _load_test_html
+
+    budget = 'Saved question budget 256 tokens used instead of profile Short output cap 64'
+    reason = 'Long input not exercised: actual median 2 tokens, target 2048 (Long ≥ 1024)'
+    group = {'id': 'long', 'shape': 'long_short', 'status': 'inconclusive', 'reason': reason,
+             'input_qualification': {'qualified': False, 'size': 'long', 'target_tokens': 2048,
+                 'lower_bound': 1024, 'upper_bound': None, 'known_valid': 5, 'in_class': 0,
+                 'out_of_class': 5, 'out_of_class_percent': 100, 'unknown_valid': 0,
+                 'actual_median': 2, 'reason': reason},
+             'saved_question_budgets': [{'case_id': 'mine', 'profile_cap': 64, 'sent_cap': 256, 'note': budget}],
+             'lengths': {'input_tokens': {'median': 2, 'min': 2, 'max': 2},
+                 'output_tokens': {'median': 32, 'min': 30, 'max': 34}, 'output_cap': 256},
+             'first_answer_p50_ms': 12, 'completion_p50_ms': 34, 'scored': 5, 'correct': 5,
+             'completed': 5, 'valid': 5, 'required': 5}
+    point = {'id': 'shape', 'type': 'combinations', 'workload': 'long_short', 'shape': 'long_short',
+             'pattern': 'concurrent', 'level': 1, 'rate': None, 'bursts': None, 'groups': [group], 'status': 'inconclusive', 'reason': reason}
+    metrics = {'workload_source': 'saved questions', 'points': [point], 'highest_accepted': []}
+    html = _load_test_html(metrics)
+    assert budget in html
+    assert 'Input shape qualification' in html
+    assert '0 / 5 known-length valid responses' in html
+    assert reason in html
+    assert '12' in html and '34' in html and 'Scored 5 · correct 5' in html
+    run_render_checks('const metrics='+json.dumps(metrics)+',budget='+json.dumps(budget)+r''';
+const html=renderLoadTestResults(metrics);
+assert(html.includes(budget));assert(html.includes('Input shape qualification'));
+assert(html.includes('0 / 5 known-length valid responses'));
+assert(html.includes('Long input not exercised'));assert(html.includes('12 ms'));assert(html.includes('34 ms'));
+assert(html.includes('Highest accepted concurrency (tested): Unconfirmed'));
+assert(html.includes('data-live-key="qualification:long"'));
+const coverage=loadOutputCoverage({output_covered:2,required:2,input_verified:2,threshold_tokens:null,threshold_tokens_by_request:{a:205,b:410}});
+assert(coverage.includes('per-request sent-cap thresholds (205, 410 tokens)'));
+assert(!coverage.includes('— tokens'));
+''')
+
+
+def test_load_plan_displays_level_one_not_applicable_note_in_execution_order():
+    config = RunConfig(targets=[{'name':'local','url':'http://unused.test/v1','model':'test'}], checks=['load'],
+        load_test={'workloads': {'interference': {'enabled': True}},
+                   'patterns': {'concurrent': {'levels': [1,4]}}})
+    plan = request_plan(config)
+    note = 'Level 1: not applicable to the short-answer comparison (needs at least 2 concurrent requests)'
+    assert note in plan['load_test']['execution_order_notes']
+    from giraffe.load_test import test_points as load_points
+    assert not any(point['type'] == 'interference' and point['level'] == 1
+                   for point in load_points(config.load_test))
+    browser_logic('const plan='+json.dumps(plan)+',note='+json.dumps(note)+r''';
+const html=renderLoadPlan(config,plan);assert(html.includes(escape(note)));
+assert(html.indexOf(escape(note))>html.indexOf('Execution order'));
+''', config=config)

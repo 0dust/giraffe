@@ -79,6 +79,99 @@ def running_shapes(settings):
     )
 
 
+def input_class_bounds(settings, size):
+    """Adjacent profile targets define inclusive lower/exclusive upper classes."""
+    names = ("short", "medium", "long")
+    targets = [getattr(settings.profile, name).input_tokens for name in names]
+    index = names.index(size)
+    return (
+        math.sqrt(targets[index - 1] * targets[index]) if index else None,
+        math.sqrt(targets[index] * targets[index + 1]) if index < 2 else None,
+    )
+
+
+def _in_input_class(settings, size, tokens):
+    lower, upper = input_class_bounds(settings, size)
+    return tokens is not None and (lower is None or tokens >= lower) and (upper is None or tokens < upper)
+
+
+def _class_label(settings, size):
+    lower, upper = input_class_bounds(settings, size)
+    if lower is None:
+        return f"{size.title()} < {upper:g}"
+    if upper is None:
+        return f"{size.title()} ≥ {lower:g}"
+    return f"{size.title()} {lower:g}–{upper:g}"
+
+
+def input_qualification(settings, size, records):
+    # Selection estimates intentionally never enter this measurement evidence.
+    valid = [r for r in records if r.valid and r.status == "completed" and not reasoning_budget(r)]
+    known = [r.input_tokens for r in valid if r.input_tokens is not None]
+    count = sum(_in_input_class(settings, size, n) for n in known)
+    outside = len(known) - count
+    percentage = outside / len(known) * 100 if known else None
+    qualified = count >= settings.pass_criteria.min_valid_responses and percentage <= 10
+    target = getattr(settings.profile, size).input_tokens
+    actual = median(known) if known else None
+    lower, upper = input_class_bounds(settings, size)
+    reason = None
+    if not known:
+        reason = "Input token counts not reported by the endpoint; timing and correctness are shown but capacity is not established"
+    elif not qualified:
+        reason = f"{size.title()} input not exercised: actual median {actual:g} tokens, target {target} ({_class_label(settings, size)})"
+    return dict(qualified=qualified, size=size, target_tokens=target, lower_bound=lower,
+                upper_bound=upper, known_valid=len(known), in_class=count,
+                out_of_class=outside, out_of_class_percent=percentage,
+                unknown_valid=len(valid) - len(known), actual_median=actual, reason=reason)
+
+
+def _source_tokens(source, records=()):
+    measured = [r.input_tokens for r in records
+                if r.fixture_id == source.fixture_id and r.valid and r.input_tokens is not None]
+    if measured:
+        return median(measured)
+    # Used only to choose unchanged saved questions, never to qualify results.
+    chars = source.input_chars or sum(len(str(m.get("content") or "")) for m in source.messages)
+    return chars / 4
+
+
+def _shape_sources(settings, size, sources, records=()):
+    matching = [source for source in sources if _in_input_class(settings, size, _source_tokens(source, records))]
+    return matching or sources
+
+
+def saved_shape_warnings(config):
+    from giraffe.fixtures import load_custom_fixtures
+
+    if "load" not in config.checks:
+        return []
+    estimates = []
+    if config.request_source == "request_pack" and config.request_pack is not None:
+        estimates = [sum(len(message.content) for message in case.messages) / 4
+                     for case in config.request_pack.cases]
+    if not estimates and config.custom_fixtures:
+        try:
+            sources = load_custom_fixtures(config.custom_fixtures,
+                legacy_max_output_tokens=config.legacy_custom_fixture_max_output_tokens)
+        except (OSError, ValueError):
+            # Planning may inspect a portable configuration before its local
+            # source is available. Execution retains source-file validation.
+            return []
+        estimates = [_source_tokens(source) for source in sources]
+    if not estimates:
+        return []
+    warnings = []
+    for _, settings in settings_sets(config.load_test):
+        for size in dict.fromkeys(shape.split("_")[0] for shape in running_shapes(settings)):
+            if any(_in_input_class(settings, size, tokens) for tokens in estimates):
+                continue
+            shapes = [" → ".join(part.title() for part in s.split("_")) for s in running_shapes(settings) if s.startswith(size + "_")]
+            phrase = "long enough" if size == "long" else "in the length class"
+            warnings.append(f"No saved question is {phrase} for {size.title()} input; {', '.join(shapes)} results will be inconclusive")
+    return list(dict.fromkeys(warnings))
+
+
 def calibration_keys(settings):
     return list(
         dict.fromkeys(
@@ -281,6 +374,11 @@ def load_time_plan(settings):
         + (f"{'≈ ' if approximate else ''}{expected:,.0f}" if expected or not unknown else ""),
         "execution_order": [point_label(p) for p in points],
         "execution_summary": execution_summary,
+        "execution_order_notes": list(dict.fromkeys(
+            "Level 1: not applicable to the short-answer comparison (needs at least 2 concurrent requests)"
+            for value in own.values()
+            if value.workloads.interference.enabled and 1 in value.patterns.concurrent.levels
+        )),
         "minimum_initial_requests_per_target": minimum_reservation(settings),
         "points": points,
         "workloads": rows,
@@ -521,6 +619,7 @@ def build_spec(
     # remain requested targets; the report exposes actual lengths and shortfall.
     sources = getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", [])
     if sources:
+        sources = _shape_sources(settings, size, sources, run.records)
         index = point.get("_source_index", 0)
         point["_source_index"] = index + 1
         if getattr(run, "pack_specs", []):
@@ -535,7 +634,7 @@ def build_spec(
         spec.scenario, spec.condition_id, spec.check_ids = scenario, scenario, ["load"]
         spec.load_point = details
         spec.requested_input_tokens = getattr(settings.profile, size).input_tokens
-        spec.requested_output_tokens = getattr(settings.profile, output).output_tokens
+        spec.requested_output_tokens = spec.max_tokens if spec.max_tokens is not None else run.config.max_output_tokens
         # User-provided question budgets and scoring are part of its identity.
     else:
         spec = make_spec(
@@ -1017,6 +1116,7 @@ def measurements(run, target, settings, point, records, shape):
         unattributed_timing_violations=list(set(raw) - set(qualified)),
         missing_timing=sorted(set(missing)),
         lengths=lengths,
+        input_qualification=input_qualification(settings, a, rows),
         completed_during_finish=finish_count,
         throughput_window_seconds=observation,
         sending_window_seconds=sending,
@@ -1031,32 +1131,41 @@ def measurements(run, target, settings, point, records, shape):
         request_ids=[r.id for r in rows],
     )
     if getattr(run, "pack_specs", []):
+        eligible = _shape_sources(settings, a, run.pack_specs, run.records)
         group["case_coverage"] = {
             spec.workload["case_id"]: sum(
                 r.workload.get("case_id") == spec.workload["case_id"] and r.score is not None
                 for r in valid
             )
-            for spec in run.pack_specs
+            for spec in eligible
         }
+    if getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", []):
+        group["saved_question_budgets"] = []
+        seen = set()
+        for record in rows:
+            if record.requested_max_tokens == cap:
+                continue
+            key = (record.workload.get("case_id", record.fixture_id), record.requested_max_tokens)
+            if key in seen:
+                continue
+            seen.add(key)
+            group["saved_question_budgets"].append({
+                "case_id": key[0], "profile_cap": cap, "sent_cap": record.requested_max_tokens,
+                "note": f"Saved question budget {record.requested_max_tokens} tokens used instead of profile {b.title()} output cap {cap}",
+            })
     if point["type"] == "stress":
-        threshold = (
-            math.ceil(cap * settings.workloads.stress.min_output_percent / 100)
-            if b == "long"
-            else None
-        )
+        thresholds = {r.id: math.ceil(r.requested_max_tokens * settings.workloads.stress.min_output_percent / 100) for r in valid} if b == "long" else {}
+        distinct = set(thresholds.values())
+        threshold = next(iter(distinct)) if len(distinct) == 1 else None
         group["coverage"] = {
             "threshold_tokens": threshold,
             "output_covered": sum(
-                r.output_tokens is not None and r.output_tokens >= threshold for r in valid
+                r.output_tokens is not None and r.output_tokens >= thresholds[r.id] for r in valid
             )
-            if threshold
+            if b == "long"
             else None,
-            "input_verified": sum(
-                r.input_tokens is not None
-                and abs(r.input_tokens - target_tokens)
-                <= target_tokens * settings.input_token_tolerance
-                for r in valid
-            ),
+            "threshold_tokens_by_request": thresholds,
+            "input_verified": group["input_qualification"]["in_class"],
             "required": criteria.min_valid_responses,
         }
     return group
@@ -1078,8 +1187,8 @@ def score_group(settings, point, group, records):
     rows = [r for r in records if r.load_point.get("shape") == group["shape"]]
     if any(
         r.completion_tokens is not None
-        and r.requested_output_tokens is not None
-        and r.completion_tokens > r.requested_output_tokens
+        and r.requested_max_tokens
+        and r.completion_tokens > r.requested_max_tokens
         for r in rows
     ):
         return result("fail", "output_cap", "Endpoint exceeded the requested output cap.")
@@ -1145,15 +1254,12 @@ def score_group(settings, point, group, records):
         )
     if group["shape"].startswith("long_") and any(r.input_tokens and r.cached_prompt_tokens is not None and r.cached_prompt_tokens > r.input_tokens / 2 for r in rows):
         return result("inconclusive", "cached_input", "More than half the long input was cached.")
+    qualification = group.get("input_qualification")
+    if qualification and not qualification["qualified"]:
+        return result("inconclusive", "input_not_verified", qualification["reason"])
     coverage = group.get("coverage")
     if coverage:
-        if group["shape"].startswith("long_") and coverage["input_verified"] < group["valid"]:
-            return result(
-                "inconclusive",
-                "input_not_verified",
-                "Large-input token coverage was not verified for every valid response.",
-            )
-        if coverage["threshold_tokens"] and coverage["output_covered"] < group["valid"]:
+        if coverage["output_covered"] is not None and coverage["output_covered"] < group["valid"]:
             return result(
                 "inconclusive",
                 "insufficient_coverage",
@@ -1267,6 +1373,15 @@ def assess_point(run, target, settings, point, records):
                 }
             )
         evidence["short_stream_load"] = window_load
+        evidence["input_qualification"] = {
+            phase: input_qualification(settings, "short", [
+                r for r in records if r.load_point.get("phase") == phase
+                and r.load_point.get("role") == "short_stream"
+            ]) for phase in ("baseline", "probe")
+        }
+        evidence["input_qualification"]["long_probe"] = input_qualification(settings, "long", [
+            r for r in records if r.load_point.get("role") == "probe"
+        ])
         exercised = (
             exercised
             and len(window_load) == 2
@@ -1277,7 +1392,11 @@ def assess_point(run, target, settings, point, records):
             )
         )
         if status not in {"fail", "blocked"}:
-            if not exercised or evidence["slowdown"] is None:
+            if not evidence["input_qualification"]["long_probe"]["qualified"]:
+                status, reason = "inconclusive", "long-input probe not exercised: " + evidence["input_qualification"]["long_probe"]["reason"]
+            elif not all(evidence["input_qualification"][phase]["qualified"] for phase in ("baseline", "probe")):
+                status, reason = "inconclusive", "Short input not exercised in both short-stream comparison windows."
+            elif not exercised or evidence["slowdown"] is None:
                 status, reason = (
                     "inconclusive",
                     "Trigger or matched overlap was not exercised sufficiently in both full comparison windows.",

@@ -492,3 +492,19 @@ def test_fractional_poisson_budget_remedy_is_a_valid_whole_request_limit():
     updated = RunConfig.model_validate(configuration.model_dump() | {action["field"]: action["value"]})
     assert updated.max_requests == 2
     assert any(row["kind"] == "adaptive_risk" for row in result["request_warnings"])
+
+
+def test_saved_question_shape_warning_is_exposed_in_shared_plan_before_running():
+    configuration = config(checks=['load'], request_source='request_pack', request_pack={
+        'version': 1, 'cases': [{'fixture_id': 'short',
+            'messages': [{'role': 'user', 'content': 'Return A'}],
+            'scorer': 'exact', 'expected': 'A'}]},
+        load_test={'workloads': {'combinations': {'selected': ['long_short']}},
+                   'patterns': {'concurrent': {'levels': [1]}}})
+    result = plan(configuration)
+    warning = next(row for row in result['load_warnings']
+                   if 'No saved question is long enough for Long input' in row['msg'])
+    assert 'Long →' in warning['msg'] and 'results will be inconclusive' in warning['msg']
+    assert warning['msg'] in result['warnings']
+    assert warning['msg'] in result['load_test']['saved_shape_warnings']
+    assert next(row for row in result['rows'] if row['id'] == 'load_combinations')['source'] == 'your dataset'
