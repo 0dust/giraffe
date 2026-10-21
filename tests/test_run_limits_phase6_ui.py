@@ -91,7 +91,7 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
             assert len(fields) == 1, (check['id'], name)
             assert any(parent.get('data-test-editor') == check['id'] for parent in fields[0]['parents'])
     for name in ['profile_sessions_concurrency', 'profile_sessions_max_tokens', 'profile_consistency_levels',
-                 'profile_arrivals_max_in_flight']:
+                 'load_request_timeout_seconds']:
         assert len(tree.named(name)) == 1
     assert not tree.named('sessions_max_tokens')
     stream, = tree.named('stream')
@@ -172,34 +172,15 @@ async def test_a4_a17_null_limits_draft_export_and_json_form_derived_parity(tmp_
 
 
 def test_a7_a16_plan_copy_observed_counts_bursts_and_distinct_controls():
-    cfg = RunConfig(targets=[{'name': 'local', 'url': 'http://localhost/v1', 'model': 'test'}],
-                    checks=['arrivals', 'capacity'], arrivals={'mode': 'burst', 'requests': 10, 'burst_size': 4},
-                    traffic={'arrival': 'poisson', 'rates': [2], 'duration_seconds': 1})
-    plan = request_plan(cfg)
-    browser_logic(r"""
-const plan=PLAN;plan.estimated_seconds=3;plan.estimated_low_seconds=2;plan.estimated_high_seconds=4;
-plan.time_estimate_assumptions=['Finite batches use comparable observations.'];
-plan.confidence_details={insufficient_observations:['At least 150 comparable samples are required.']};
-plan.time_bound_reasons=['+ 10 requests at unknown speed'];
-const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);
-assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);
-assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
-assert.match(markup,/Confidence: low/);assert.match(markup,/Additional work at unknown speed/);
-assert.match(markup,/At least 150 comparable samples are required/);
-assert.match(markup,/<details class="estimate-assumptions"><summary>Estimate assumptions/);
-assert.match(markup,/setup\/connection, AI evaluation, report generation/);
-assert.match(markup,/in 3 bursts/);assert.match(markup,/exact count; seeded random timing/);
+    cfg=RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['load'],load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':False},'poisson':{'enabled':True},'bursts':{'enabled':True,'first_seconds':0,'gap_seconds':1,'size':4},'rates':[2]},'schedule':{'duration_seconds':3}})
+    browser_logic('const plan='+json.dumps(request_plan(cfg))+r''';
+plan.estimated_seconds=3;plan.estimated_low_seconds=2;plan.estimated_high_seconds=4;plan.time_estimate_assumptions=['Finite batches use comparable observations.'];plan.confidence_details={insufficient_observations:['At least 150 comparable samples are required.']};plan.time_bound_reasons=['+ 10 requests at unknown speed'];
+const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
+for(const text of ['Confidence: low','Additional work at unknown speed','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation','Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
 assert.equal((markup.match(/Not set/g)||[]).length,3);assert.match(markup,/Memory guardrail/);
-assert.doesNotMatch(markup+limits,/Automatic|Load generation|Giraffe runner|before run limits|Upper limits for the whole run/);
-const duration={id:'load_combinations',kind:'duration',requests_per_target:null};
-assert.equal(planRowCount(duration),'Duration-based');duration.estimated_requests_per_target=12;
-assert.equal(planRowCount(duration),'Duration-based · ~12 (estimate, from your last run)');
-const arrivals=renderProfileEditor(bootstrap.checks.find(check=>check.id==='arrivals'),config);
-for(const label of ['Arrival count','Burst size (requests)','Pending queue (requests)','Sending rate (requests/second)'])assert(arrivals.includes(label));
-assert.match(arrivals,/overflow is dropped locally/);assert.match(arrivals,/Capacity rate-based traffic drops immediately instead of queueing/);
-assert.match(renderTrafficEditor(config),/Expected response time \(seconds, estimate only\)/);
-assert.match(renderTrafficEditor(config),/name="traffic_max_in_flight"[^>]*value="4"/);
-""".replace('PLAN', json.dumps(plan)), cfg)
+const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Duration-based');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Duration-based · ~12 (estimate, from your last run)');
+const editor=renderLoadEditor(config);for(const label of ['Requests per burst','Rates (requests/second)','First burst after (seconds)','Time between burst starts (seconds)','Concurrency ceiling · Run limits'])assert(editor.includes(label));assert.doesNotMatch(editor,/Pending queue|traffic_max_in_flight|profile_arrivals_max_in_flight/);
+''',cfg)
 
 
 def test_a25_budget_free_mosaic_uses_slots_not_unused_budget_and_eviction_summary():
@@ -225,10 +206,10 @@ assert.doesNotMatch(nodes['#main'].innerHTML,/budget-track|NaN|Infinity|undefine
 def test_every_native_bound_is_capability_sourced_including_first_output():
     browser_logic(r"""
 bootstrap.limits['test_options.first_output.request_timeout_seconds'].maximum=777;
-bootstrap.limits['concurrent_load.profile.long.output_tokens'].maximum=987;
+bootstrap.limits['load_test.profile.long.output_tokens'].maximum=987;
 bootstrap.limits['sessions.concurrency'].maximum=23;
 assert.match(renderTestCard(bootstrap.checks.find(check=>check.id==='first_output'),config),/name="test_first_output_request_timeout_seconds"[^>]*max="777"/);
-assert.match(renderConcurrentEditor(config),/name="load_profile_long_output_tokens"[^>]*max="987"/);
+assert.match(renderLoadEditor(config),/name="load_profile_long_output_tokens"[^>]*max="987"/);
 assert.match(renderProfileEditor(bootstrap.checks.find(check=>check.id==='sessions'),config),/name="profile_sessions_concurrency"[^>]*max="23"/);
 """)
     source = (STATIC / 'app.js').read_text() + (STATIC / 'form-config.mjs').read_text()
@@ -238,16 +219,10 @@ assert.match(renderProfileEditor(bootstrap.checks.find(check=>check.id==='sessio
 
 def test_concurrent_load_timeout_uses_real_card_edit_and_read_form_path():
     from tests.test_concurrent_load_ui_review import FORM
-
-    browser_logic(FORM + r"""
-const input=form.elements.test_concurrency_request_timeout_seconds;
-assert(input);assert.equal(form.elements.test_mode_concurrency.value,'default');
-input.value='90';listeners.input({target:input});
-assert.equal(form.elements.test_mode_concurrency.value,'custom');
-const result=readForm(false).config;
-assert.equal(result.test_options.concurrency.request_timeout_seconds,90);
-assert.equal(result.request_timeout_seconds,config.request_timeout_seconds);
-""")
+    browser_logic(FORM + r'''
+const input=form.elements.load_request_timeout_seconds;assert(input);input.value='90';listeners.input({target:input});
+const result=readForm(false).config;assert.equal(result.load_test.request_timeout_seconds,90);assert.equal(result.test_options.load,undefined);assert.equal(result.request_timeout_seconds,config.request_timeout_seconds);
+''')
 
 
 def test_shared_request_defaults_and_sparse_sessions_show_effective_values():
@@ -269,18 +244,13 @@ assert.equal(config.test_options.first_output.request_timeout_seconds,90);
 
 
 def test_ceiling_toggle_refreshes_inherited_check_values_and_reset_traffic_prefills():
-    browser_logic(r"""
-config.concurrency=2;config.checks=['correctness','capacity'];config.traffic.max_in_flight=null;
-const input={name:'test_correctness_concurrency',value:'2',dataset:{inherited:'true'}};
-const capacity={name:'traffic_max_in_flight',value:'2',dataset:{inherited:'true'}};
-const ceiling={value:'2',removeAttribute(){}};
-nodes['#new-run-form']={elements:{test_correctness_concurrency:input,traffic_max_in_flight:capacity,traffic_mode:{value:'custom'},concurrency:ceiling,concurrency_enabled:{checked:false}}};
-configChanged=()=>{};updateBounds=()=>{refreshTrafficDefault();};
-await listeners.change({target:{dataset:{limitToggle:'concurrency'},checked:false,matches:()=>false}});
-assert.equal(input.value,4);assert.equal(capacity.value,4);
-nodes['#new-run-form'].elements.traffic_mode.value='default';capacity.value='';refreshTrafficDefault();
-assert.equal(capacity.value,4);assert.equal(capacity.dataset.inherited,'true');
-""")
+    from tests.test_concurrent_load_ui_review import FORM
+    browser_logic(FORM + r'''
+const levels=form.elements.load_patterns_concurrent_levels;levels.dataset.inherited='true';
+form.elements.concurrency.value='2';let read=readForm(false).config;syncLoadDisplay(read);assert.equal(levels.value,'1');assert.equal(Object.hasOwn(read.load_test.patterns.concurrent,'levels'),false);
+form.elements.concurrency.value='64';read=readForm(false).config;syncLoadDisplay(read);assert.equal(levels.value,'1, 4');assert.equal(Object.hasOwn(read.load_test.patterns.concurrent,'levels'),false);
+levels.value='8';listeners.input({target:levels});assert.equal(levels.dataset.inherited,'false');form.elements.concurrency.value='32';read=readForm(false).config;assert.equal(read.load_test.patterns.concurrent.levels.join(','),'8');
+''')
 
 
 def test_inherited_notice_has_check_inline_plan_and_explicit_use_action():
@@ -304,11 +274,11 @@ assert.equal(state.config.test_options.correctness.concurrency,2);assert.equal(s
 
 @pytest.mark.parametrize('check,settings,path', [
     ('correctness', {'test_options': {'correctness': {'concurrency': 64}}}, 'test_options.correctness.concurrency'),
-    ('capacity', {'traffic': {'max_in_flight': 64}}, 'traffic.max_in_flight'),
-    ('arrivals', {'arrivals': {'max_in_flight': 64}}, 'arrivals.max_in_flight'),
+    ('load', {'load_test': {'patterns':{'bursts':{'enabled':True,'size':64,'first_seconds':0}}}}, 'load_test.patterns.bursts.size'),
+    ('load', {'load_test': {'patterns':{'concurrent':{'levels':[1,64]}}}}, 'load_test.patterns.concurrent.levels'),
     ('sessions', {'sessions': {'sessions': 32, 'concurrency': 32}}, 'sessions.concurrency'),
     ('consistency', {'consistency': {'levels': [1, 64]}}, 'consistency.levels'),
-    ('concurrency', {'concurrent_load': {'schedule': {'levels': [1, 64]}}}, 'concurrent_load.schedule.levels'),
+    ('load', {'load_test': {'workloads':{'interference':{'enabled':True}},'patterns':{'concurrent':{'levels':[1,64]}}}}, 'load_test.patterns.concurrent.levels'),
 ])
 async def test_a8_a9_actual_conflicts_have_inline_plan_and_focus_destination(tmp_path, check, settings, path):
     ceiling = 4 if check == 'sessions' else 40
@@ -337,11 +307,11 @@ for(const [name,input] of Object.entries(inputs)){
  assert.equal(input.attributes['aria-invalid'],'true');
  assert(input.attributes['aria-describedby'].includes('field-'+name+'-error'));
  assert.equal(nodes['#field-'+name+'-error'].hidden,false);
- assert.match(nodes['#field-'+name+'-error'].textContent,/above Limit simultaneous requests/);
+ assert.match(nodes['#field-'+name+'-error'].textContent,/above Limit simultaneous requests|Concurrency levels exceed the run ceiling|One burst exceeds the concurrency ceiling/);
  assert.equal(input.details.open,true);
 }
 const input=inputs[destination.name];
-assert.match(renderRunBlueprint(config),/above Limit simultaneous requests/);
+assert.match(renderRunBlueprint(config),/above Limit simultaneous requests|Concurrency levels exceed the run ceiling|One burst exceeds the concurrency ceiling/);
 assert(renderRunBlueprint(config).includes('data-setting-path="'+path+'"'));
 revealSetupStep=step=>assert.equal(step,2);revealCatalogueCheck=id=>assert.equal(id,destination.check);
 focusSetting(path);assert(input.focused);
@@ -471,36 +441,22 @@ state.requestPreview.revision=state.configRevision;state.jsonDraft='unapplied';a
 
 
 async def test_a12_a17_json_conflict_and_duration_correction_share_form_api_data(tmp_path):
-    cfg = RunConfig(targets=[{'name': 'local', 'url': 'http://localhost/v1', 'model': 'test'}],
-                    checks=['capacity'], traffic={'rates': [250], 'duration_seconds': 400})
-    invalid = cfg.model_dump(mode='json')
-    invalid['traffic']['duration_seconds'] = 3600
+    cfg=RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['load'],load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[250]},'schedule':{'duration_seconds':400}})
+    invalid=cfg.model_dump(mode='json')
+    invalid['load_test']['schedule']['duration_seconds']=3600
     async with browser(tmp_path) as client:
-        rejected = await client.post('/api/config/draft', json=invalid)
-        accepted = await client.post('/api/config/draft', json=cfg.model_dump(mode='json'))
-    assert rejected.status_code == 422
-    assert accepted.status_code == 200
-    browser_logic(r"""
-const errors=__ERRORS__,valid=__ACCEPTED__;state.configView='json';
-state.jsonBase=JSON.stringify(config);state.jsonDraft=JSON.stringify(__REJECTED_INPUT__);
-function element(){return {value:'',dataset:{},attributes:{},getAttribute(name){return this.attributes[name]||'';},setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},focus(){this.focused=true;}};}
-const editor=element();editor.value=state.jsonDraft;nodes['#config-editor']=editor;nodes['#field-config_editor-error']={};nodes['#request-plan']={};nodes['#config-error']={};
+        rejected=await client.post('/api/config/draft',json=invalid)
+        accepted=await client.post('/api/config/draft',json=cfg.model_dump(mode='json'))
+    assert rejected.status_code==422 and accepted.status_code==200
+    browser_logic('const errors='+json.dumps(rejected.json()['detail'])+',valid='+json.dumps(accepted.json())+',invalid='+json.dumps(invalid)+r''';
+state.configView='json';state.jsonBase=JSON.stringify(config);state.jsonDraft=JSON.stringify(invalid);
+const editor={dataset:{},attributes:{},getAttribute(k){return this.attributes[k]||'';},setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];},focus(){this.focused=true;}};nodes['#config-editor']=editor;nodes['#field-config_editor-error']={};nodes['#request-plan']={};nodes['#config-error']={};
 readForm=()=>({config:structuredClone(state.config)});captureFormDraft=invalidateModelDiscovery=toast=()=>{};
 renderNew=()=>{state.jsonDraft=state.jsonBase=JSON.stringify(state.config);editor.value=state.jsonDraft;};
-const sent=[];api=async(path,options)=>{assert.equal(path,'/api/config/draft');const body=JSON.parse(options.body);sent.push(body);if(body.traffic.duration_seconds===3600)throw Object.assign(Error(errors[0].msg),{errors});return valid;};
-await applyConfig();assert.equal(sent.length,1);assert.equal(hasJsonChanges(),true);assert.equal(canStartRun(),false);
-assert.equal(currentSettingErrors()[0].msg,errors[0].msg);assert.equal(editor.attributes['aria-invalid'],'true');
-assert.match(nodes['#field-config_editor-error'].textContent,/900,000/);
-let markup=renderRunBlueprint(config);assert.match(markup,/900,000/);assert.match(markup,/Use 400 seconds/);assert.match(markup,/data-plan-state="error"/);
-focusSetting('traffic.rates');assert(editor.focused);assert.equal(state.configView,'json');
-await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'use-setting-correction'}}:q==='[data-setting-value]'?{dataset:{settingPath:'traffic.duration_seconds',settingValue:'400'}}:null}});
-assert.equal(sent.length,2);assert.equal(sent[1].traffic.duration_seconds,400);assert.equal(sent[1].traffic.rates.join(','),'250');
-assert.equal(sent[1].max_requests,config.max_requests);assert.equal(sent[1].max_duration_seconds,config.max_duration_seconds);
-assert.equal(state.config.traffic.duration_seconds,400);assert.equal(hasJsonChanges(),false);
-assert.equal(currentRequestPlan(),null);assert.equal(canStartRun(),false);
-await refreshRequestPreview(undefined,{draft:true});assert.equal(canStartRun(),true);assert.equal(currentSettingErrors().length,0);
-assert.equal(editor.attributes['aria-invalid'],undefined);assert(nodes['#field-config_editor-error'].hidden);
-// Rejected JSON findings cannot survive an edit of the candidate they described.
-state.jsonBase='old';state.jsonDraft='new';state.jsonValidation={draft:'new',revision:state.configRevision,route:state.routeVersion,errors};
-assert.equal(currentSettingErrors().length,1);configChanged();assert.equal(currentSettingErrors().length,0);assert.equal(canStartRun(),false);
-""".replace('__ERRORS__', json.dumps(rejected.json()['detail'])).replace('__ACCEPTED__', json.dumps(accepted.json())).replace('__REJECTED_INPUT__', json.dumps(invalid)), cfg)
+let sent=0;api=async(path,options)=>{sent++;const body=JSON.parse(options.body);if(body.load_test.schedule.duration_seconds===3600)throw Object.assign(Error(errors[0].msg),{errors});return valid;};
+await applyConfig();assert.equal(sent,1);assert.equal(hasJsonChanges(),true);assert.equal(canStartRun(),false);assert.equal(editor.attributes['aria-invalid'],'true');assert.match(nodes['#field-config_editor-error'].textContent,/finite planned-arrival safety bound/);
+focusSetting('load_test.patterns.rates');assert(editor.focused);assert.equal(state.configView,'json');
+state.jsonDraft=JSON.stringify(valid.config);await applyConfig();assert.equal(sent,2);assert.equal(state.config.load_test.schedule.duration_seconds,400);assert.equal(hasJsonChanges(),false);assert.equal(currentRequestPlan(),null);
+await refreshRequestPreview(undefined,{draft:true});assert.equal(canStartRun(),true);assert.equal(currentSettingErrors().length,0);assert.equal(editor.attributes['aria-invalid'],undefined);
+state.jsonBase='old';state.jsonDraft='new';state.jsonValidation={draft:'new',revision:state.configRevision,route:state.routeVersion,errors};assert.equal(currentSettingErrors().length,1);configChanged();assert.equal(currentSettingErrors().length,0);assert.equal(canStartRun(),false);
+''',cfg)

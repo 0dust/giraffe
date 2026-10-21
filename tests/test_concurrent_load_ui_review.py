@@ -3,7 +3,7 @@ import pytest
 import httpx
 from pydantic import TypeAdapter
 
-from giraffe.models import ConfigDraft, migrate_concurrent_load
+from giraffe.models import ConfigDraft, migrate_load_test, migrate_concurrent_load
 from giraffe.web import ConfigDraftInput, create_app
 from tests.test_concurrent_load import TARGET
 from tests.test_ux_catalogue import browser_logic
@@ -11,19 +11,19 @@ from tests.test_ux_results import run_render_checks
 
 
 FORM = r'''
-config.checks=['concurrency'];state.config=structuredClone(config);state.setupStep=3;
+config.checks=['load'];state.config=structuredClone(config);state.setupStep=3;
 state.jsonDraft=state.jsonBase=null;
 const controls=[],form={elements:{},querySelectorAll:selector=>selector.includes('[data-test-editor]')?controls.filter(input=>input.name.startsWith('load_')):controls},focused=[];
 const details={tagName:'DETAILS',open:false};
 function mount(source=state.config){
  controls.length=0;form.elements={};
- const markup=renderTestCard(bootstrap.checks.find(check=>check.id==='concurrency'),source);
+ const markup=renderTestCard(bootstrap.checks.find(check=>check.id==='load'),source);
  const decode=value=>(value||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&');
  const attr=(tag,key)=>decode(tag.match(new RegExp('(?:^|\\s)'+key+'="([^"]*)"'))?.[1]);
  function add(name,value,type='text',checked=false){
   const input={name,value:String(value??''),type,checked,dataset:{},attributes:{},style:{},parentElement:name.startsWith('load_pass_criteria_')?details:null,
    setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];},getAttribute(k){return this.attributes[k]||'';},
-   matches:()=>false,closest:q=>q==='#new-run-form'?form:q==='[data-test-settings]'?{dataset:{testSettings:'concurrency'}}:null,
+   matches:()=>false,closest:q=>q==='#new-run-form'?form:q==='[data-test-settings]'?{dataset:{testSettings:'load'}}:null,
    focus(){focused.push(name);}};
   controls.push(input);form.elements[name]=input;nodes['#field-'+name]=input;return input;
  }
@@ -55,39 +55,41 @@ mount();
 
 def test_untouched_drawer_and_reset_do_not_create_overrides():
     browser_logic(FORM + r'''
-const check=bootstrap.checks.find(item=>item.id==='concurrency');
+const check=bootstrap.checks.find(item=>item.id==='load');
 let read=readForm(false).config;
 assert.equal(testSettingsLabel(check,read),'');
-read.concurrent_load.profile.short.input_tokens=1;state.config=read;
+read.load_test.profile.short.input_tokens=1;state.config=read;
 captureFormDraft=()=>{};renderNew=()=>mount();state.migrationNotes=['old'];state.dismissedMigrationNotes=['old'];
-await listeners.click({target:{closest:q=>q==='[data-reset-test]'?{dataset:{resetTest:'concurrency'}}:null}});
+await listeners.click({target:{closest:q=>q==='[data-reset-test]'?{dataset:{resetTest:'load'}}:null}});
 read=readForm(false).config;assert.equal(testSettingsLabel(check,read),'');assert.equal(state.migrationNotes.length,0);assert.equal(state.dismissedMigrationNotes.length,0);
-assert.deepEqual(Object.keys(read.concurrent_load.mixed.shares).sort(),Object.keys(bootstrap.concurrent_load.defaults.mixed.shares).sort());
+assert.deepEqual(Object.keys(loadSettings(read).workloads.mixed.shares).sort(),Object.keys(bootstrap.load_test.defaults.workloads.mixed.shares).sort());
 ''')
 
 
 @pytest.mark.parametrize('name,value,path', [
-    ('load_schedule_levels','bad','concurrent_load.schedule.levels'),
-    ('load_profile_short_input_tokens','0','concurrent_load.profile.short.input_tokens'),
-    ('load_profile_long_output_tokens','999999','concurrent_load.profile.long.output_tokens'),
-    ('load_profile_long_output_tokens','0','concurrent_load.profile.long.output_tokens'),
-    ('load_mixed_shares_short_short','bad','concurrent_load.mixed.shares.short_short'),
-    ('load_stress_min_output_percent','0','concurrent_load.stress.min_output_percent'),
-    ('load_pass_criteria_min_valid_responses','1','concurrent_load.pass_criteria.min_valid_responses'),
-    ('load_pass_criteria_first_output_p95_ms','0','concurrent_load.pass_criteria.first_output_p95_ms'),
-    ('load_pass_criteria_response_p95_ms','0','concurrent_load.pass_criteria.response_p95_ms'),
-    ('load_pass_criteria_max_error_percent','101','concurrent_load.pass_criteria.max_error_percent'),
-    ('load_pass_criteria_min_correct_percent','101','concurrent_load.pass_criteria.min_correct_percent'),
+    ('load_patterns_concurrent_levels','bad','load_test.patterns.concurrent.levels'),
+    ('load_profile_short_input_tokens','0','load_test.profile.short.input_tokens'),
+    ('load_profile_long_output_tokens','999999','load_test.profile.long.output_tokens'),
+    ('load_profile_long_output_tokens','0','load_test.profile.long.output_tokens'),
+    ('load_workloads_mixed_shares_short_short','bad','load_test.workloads.mixed.shares.short_short'),
+    ('load_workloads_stress_min_output_percent','0','load_test.workloads.stress.min_output_percent'),
+    ('load_pass_criteria_min_valid_responses','0','load_test.pass_criteria.min_valid_responses'),
+    ('load_pass_criteria_max_first_answer_ms','0','load_test.pass_criteria.max_first_answer_ms'),
+    ('load_pass_criteria_max_completion_ms','0','load_test.pass_criteria.max_completion_ms'),
+    ('load_pass_criteria_max_error_percent','101','load_test.pass_criteria.max_error_percent'),
+    ('load_pass_criteria_min_correct_percent','101','load_test.pass_criteria.min_correct_percent'),
 ])
 def test_start_focuses_local_error_before_any_api_request(name, value, path):
     import json
     browser_logic(FORM + f"form.elements[{json.dumps(name)}].value={json.dumps(value)};\n" + r'''
+if(form.elements.load_workloads_mixed_shares_short_short.value==='bad'){form.elements.load_workloads_mixed_enabled.checked=true;form.elements.load_workloads_mixed_share_mode.value='custom';}
+if(form.elements.load_workloads_stress_min_output_percent.value==='0')form.elements.load_workloads_stress_enabled.checked=true;
 validateRunForm=()=>true;canStartRun=()=>true;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{rows:[],errors:[]}};
 api=()=>assert.fail('local validation must precede the API');
 await startRun({target:form,preventDefault(){}});
 ''' + f"assert.equal(focused.at(-1),{json.dumps(name)});\n" + r'''
-assert.equal(state.setupStep,2);assert.equal(state.openTest,'concurrency');assert.equal(nodes['#form-error'].hidden,false);
+assert.equal(state.setupStep,2);assert.equal(state.openTest,'load');assert.equal(nodes['#form-error'].hidden,false);
 ''' + f"const destination=settingDestination({json.dumps(path)});assert.equal(destination.name,focused.at(-1));\n" +
         ("assert(details.open);" if '.pass_criteria.' in path else ''))
 
@@ -95,60 +97,59 @@ assert.equal(state.setupStep,2);assert.equal(state.openTest,'concurrency');asser
 def test_dormant_load_range_errors_do_not_block_form_submission():
     browser_logic(FORM + r'''
 controls.find(input=>input.name==='check').value='access';
-for(const [key,value] of Object.entries({load_schedule_levels:'bad',load_profile_short_input_tokens:'0',load_mixed_shares_short_short:'wrong',load_stress_min_output_percent:'0',load_pass_criteria_min_valid_responses:'1'}))form.elements[key].value=value;
+for(const [key,value] of Object.entries({load_patterns_concurrent_levels:'bad',load_profile_short_input_tokens:'0',load_workloads_mixed_shares_short_short:'wrong',load_workloads_stress_min_output_percent:'0',load_pass_criteria_min_valid_responses:'1'}))form.elements[key].value=value;
 assert.equal(readForm(false).config.checks.join(','),'access');
 ''')
 
 
 def test_concurrent_output_cap_can_exceed_suite_default():
     browser_logic(FORM + r'''
-form.elements.load_profile_long_output_tokens.value='256';
+form.elements.load_profile_long_output_tokens.value='1024';
 const read=readForm(false).config;
 assert.equal(config.max_output_tokens,128);
 assert.equal(read.max_output_tokens,128);
-assert.equal(read.concurrent_load.profile.long.output_tokens,256);
+assert.equal(read.load_test.profile.long.output_tokens,1024);
 ''')
 
 
 def test_actual_input_events_recalculate_ceil_coverage_without_broad_live_region():
     browser_logic(FORM + r'''
-for(const id of ['load-share-total','load-output-coverage','load-interference-allocation','load-combination-count','load-test-point-example','load-trigger-chunks'])nodes['#'+id]={classList:{toggle(){}}};
-const html=renderConcurrentEditor(state.config);
-assert.doesNotMatch(html,/<section[^>]*load-drawer-plan[^>]*aria-live/);
-assert.match(html,/id="load-share-total"/);assert.match(html,/id="load-output-coverage"/);
-assert.doesNotMatch(html,/aria-live=/);
+for(const id of ['load-share-note','load-output-threshold','load-interference-schedule','load-slowdown-help','load-ceiling-label','load-seed-field'])nodes['#'+id]={classList:{toggle(){}}};
+const html=renderLoadEditor(state.config);assert.doesNotMatch(html,/<section[^>]*aria-live=/);assert.equal((html.match(/aria-live="polite"/g)||[]).length,2);
 assert.equal((renderRunBlueprint(config).match(/aria-live="polite"/g)||[]).length,1);
-const percent=form.elements.load_stress_min_output_percent,cap=form.elements.load_profile_long_output_tokens;
-percent.value='80';cap.value='128';listeners.input({target:percent});
-assert.match(nodes['#load-output-coverage'].textContent,/At least 103 generated tokens/);
-cap.value='512';listeners.input({target:cap});assert.match(nodes['#load-output-coverage'].textContent,/At least 410 generated tokens/);
-percent.value='50';listeners.input({target:percent});assert.match(nodes['#load-output-coverage'].textContent,/At least 256 generated tokens/);
-form.elements.load_schedule_levels.value='wrong';listeners.input({target:form.elements.load_schedule_levels});
-assert.match(nodes['#load-interference-allocation'].textContent,/Enter valid concurrency levels/);
-form.elements.load_mixed_shares_short_short.value='wrong';listeners.input({target:form.elements.load_mixed_shares_short_short});
-assert.match(nodes['#load-share-total'].textContent,/Enter valid request shares/);
+form.elements.load_workloads_stress_enabled.checked=true;
+const percent=form.elements.load_workloads_stress_min_output_percent,cap=form.elements.load_profile_long_output_tokens;
+percent.value='80';cap.value='256';listeners.input({target:percent});
+assert.match(nodes['#load-output-threshold'].textContent,/At least 205 generated tokens/);
+cap.value='512';listeners.input({target:cap});assert.match(nodes['#load-output-threshold'].textContent,/At least 410 generated tokens/);
+percent.value='50';listeners.input({target:percent});assert.match(nodes['#load-output-threshold'].textContent,/At least 256 generated tokens/);
+form.elements.load_patterns_concurrent_levels.value='wrong';listeners.input({target:form.elements.load_patterns_concurrent_levels});
+assert.match(nodes['#load-interference-schedule'].textContent,/Enter positive, increasing whole-number levels/);
+form.elements.load_workloads_mixed_enabled.checked=true;form.elements.load_workloads_mixed_share_mode.value='custom';
+form.elements.load_workloads_mixed_shares_short_short.value='wrong';listeners.input({target:form.elements.load_workloads_mixed_shares_short_short});
+assert.match(nodes['#load-share-note'].textContent,/positive share/);
 for(const node of Object.values(nodes))assert.doesNotMatch(node.textContent || '',/NaN/);
 ''')
 
 
 def test_drawer_labels_enabled_panels_review_and_invalid_live_values():
     browser_logic(r'''
-config.checks=['concurrency'];const settings=config.concurrent_load;
-for(const type of Object.keys(loadTitles))settings[type].enabled=true;
-settings.schedule.levels=[4];settings.pass_criteria.first_output_p95_ms=123;settings.pass_criteria.response_p95_ms=456;
-settings.pass_criteria.max_error_percent=2.5;settings.pass_criteria.min_correct_percent=98.25;settings.pass_criteria.min_valid_responses=7;
-let html=renderConcurrentEditor(config);
-for(const label of ['First answer p95 at most (ms)','Response p95 at most (ms)','Errors allowed (%)','Correct answers required (%)','Minimum valid responses per test point'])assert(html.includes(label),label);
+config.checks=['load'];const settings=config.load_test;
+for(const type of Object.keys(loadTitles))settings.workloads[type].enabled=true;
+settings.patterns.concurrent.levels=[4];settings.pass_criteria.max_first_answer_ms=123;settings.pass_criteria.max_completion_ms=456;
+settings.pass_criteria.max_error_percent=2.5;settings.pass_criteria.min_correct_percent=98.25;settings.pass_criteria.min_valid_responses=1;
+let html=renderLoadEditor(config);
+for(const label of Object.values(loadCriteriaLabels))assert(html.includes(label),label);
 for(const type of Object.keys(loadTitles))assert.match(html,new RegExp('id="load-panel-'+type+'" >'));
-state.loadPanels.mixed=false;html=renderConcurrentEditor(config);assert.match(html,/id="load-panel-mixed" hidden/);
+state.loadPanels.mixed=false;html=renderLoadEditor(config);assert.match(html,/id="load-panel-mixed" hidden/);
 html=renderReviewPassCriteria(config);
-for(const value of ['Concurrent load','First answer p95 at most 123 ms','Response p95 at most 456 ms','Errors allowed 2.5%','Correct answers required 98.25%','Minimum valid responses per test point 7','Maximum slowdown vs short-only control 1.5×','Minimum output length 80% of cap'])assert(html.includes(value),value);
-settings.interference.enabled=false;settings.stress.enabled=false;html=renderReviewPassCriteria(config);assert.doesNotMatch(html,/Maximum slowdown|Minimum output length/);
-settings.schedule.levels=['wrong'];settings.mixed.shares={short_short:'wrong'};
-assert.doesNotMatch(renderConcurrentEditor(config)+renderConcurrentPlan(config)+JSON.stringify(concurrentDisplay(settings)),/NaN/);
-assert.match(concurrentDisplay(settings).allocation,/Enter valid concurrency levels/);
-assert.match(concurrentDisplay(settings).total,/Enter valid request shares/);
-assert.match(effectiveCheckSummary(bootstrap.checks.find(check=>check.id==='concurrency'),config),/Enter valid concurrency levels/);
+for(const value of ['Load test','123','456','2.5','98.25','Minimum valid responses per result group: 1','Maximum allowed slowdown of short answers 1.5×','Minimum generated output 80%'])assert(html.includes(value),value);
+settings.workloads.interference.enabled=false;settings.workloads.stress.enabled=false;html=renderReviewPassCriteria(config);assert.doesNotMatch(html,/Maximum allowed slowdown|Minimum generated output/);
+settings.patterns.concurrent.levels=['wrong'];settings.workloads.mixed.share_mode='custom';settings.workloads.mixed.shares={short_short:'wrong'};
+assert.doesNotMatch(renderLoadEditor(config)+renderLoadPlan(config)+JSON.stringify(loadDisplay(settings)),/NaN/);
+assert.match(loadDisplay(settings).allocation,/Enter positive, increasing/);
+assert.match(loadDisplay(settings).shares,/positive share/);
+assert.match(effectiveCheckSummary(bootstrap.checks.find(check=>check.id==='load'),config),/Enter valid concurrency levels/);
 ''')
 
 
@@ -178,13 +179,15 @@ assert.match(html,/Large-input stress at 4 concurrent requests/);assert.match(ht
 async def test_null_legacy_blocks_are_absent_without_notes(key, checks, tmp_path):
     source={'targets':[TARGET], 'checks':checks, key:None,
             'max_requests':None, 'max_duration_seconds':None, 'concurrency':None}
-    migrated,notes=migrate_concurrent_load(source)
-    assert not notes and key not in migrated
-    assert not ConfigDraft.model_validate(migrated)._migration_notes
-    assert not TypeAdapter(ConfigDraftInput).validate_python(source)._migration_notes
+    migrated,notes=migrate_load_test(migrate_concurrent_load(source)[0])
+    assert bool(notes) == ('concurrency' in checks)
+    assert key not in migrated
+    assert ConfigDraft.model_validate(migrated).checks == migrated["checks"]
+    assert bool(TypeAdapter(ConfigDraftInput).validate_python(source)._migration_notes) == ('concurrency' in checks)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),base_url='http://test') as client:
         response=await client.post('/api/config/draft',json=source)
-    assert response.status_code==200 and response.json()['migration_notes']==[]
+    assert response.status_code==200
+    assert bool(response.json()['migration_notes']) == ('concurrency' in checks)
     assert key not in response.json()['config']
 
 
@@ -253,7 +256,7 @@ api=async(path,options)=>{
 };
 initReticulate=()=>{};connectionError=()=>{};setActive=()=>{};route=async()=>{};refreshRuns=async()=>{};
 for(const id of ['suite-version','runner-location','form-error','start-run','request-plan'])nodes['#'+id]={innerHTML:'',hidden:false};
-await init();assert.match(renderConcurrentEditor(state.config),/samples_per_bucket=7/);
+await init();assert.match(renderLoadEditor(state.config),/samples_per_bucket=7/);
 const form={elements:{baseline_id:{value:''},mode:{value:'normal'},restart_target:{value:''}}};nodes['#new-run-form']=form;
 readForm=()=>({config:structuredClone(state.config),mode:'normal'});validateRunForm=()=>true;renderRequestPreview=()=>{};
 state.setupStep=3;state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{rows:[],errors:[]}};
@@ -268,8 +271,8 @@ def test_server_interference_plan_wording_matches_one_point_per_level():
             'interference':{'enabled':True},'schedule':{'levels':[2,4,8],'duration_seconds':10}})
     plan=request_plan(config)
     row=next(row for row in plan['rows'] if row['id']=='load_interference')
-    assert '1 workload (alternating short/long probe) × 3 levels × 20 s' in row['summary']
-    assert plan['concurrent_load']['interference']['test_points']==3
+    assert '3 tests, 6 sending windows; 60 s sending' in row['summary']
+    assert plan['load_test']['workloads']['interference']['test_points']==3
     assert plan['configured_load_seconds']==60
 
 

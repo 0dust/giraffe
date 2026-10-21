@@ -5,147 +5,86 @@ from tests.test_ux_results import run_render_checks
 
 def test_drawer_structure_and_labels():
     browser_logic(r'''
-const html=renderTestCard(bootstrap.checks.find(c=>c.id==='concurrency'),config);
-let previous=-1;
-for(const title of ['Data profile','Load types','Load schedule','Pass criteria']){
-  const index=html.indexOf('>'+title+'<');assert(index>previous,title);previous=index;
+const html=renderTestCard(bootstrap.checks.find(c=>c.id==='load'),config);let previous=-1;
+for(const title of ['Data profile','Workloads','Traffic patterns','Request timing &amp; delivery','Pass criteria']){
+ const index=html.indexOf((title==='Pass criteria'?'<summary>':'<h3>')+title);assert(index>previous,title);previous=index;
 }
-assert.match(html,/Input tokens · target/);assert.match(html,/Output tokens · cap/);
-for(const type of ['combinations','mixed','interference','stress']){
-  assert(html.includes('name="load_'+type+'_enabled"'));
-  assert(html.includes('aria-controls="load-panel-'+type+'"'));
-  assert(html.includes('data-load-collapse="'+type+'"'));
-}
-assert.equal((html.match(/name="load_combinations_selected_/g)||[]).length,9);
-assert.equal((html.match(/name="load_mixed_shares_/g)||[]).length,9);
-assert.doesNotMatch(html,/Streaming fairness|Context length|Samples per|Pairs per|weight|Sustained load|stage|data-profile-settings/);
-assert.match(html,/name="test_mode_concurrency" value="default"/);
-assert.match(html,/name="test_concurrency_request_timeout_seconds"/);
-assert.doesNotMatch(html,/aria-live=/);
+for(const label of ['Input tokens · target','Output tokens · cap','Choose one or more','This check only','Bursts use this same mix. Shares describe request counts, not tokens or time.',...Object.values(loadTitles),...Object.values(loadCriteriaLabels)])assert(html.includes(label),label);
+for(const type of Object.keys(loadTitles)){assert(html.includes('name="load_workloads_'+type+'_enabled"'));assert(html.includes('data-load-collapse="'+type+'"'));assert(html.includes('aria-controls="load-panel-'+type+'"'));}
+assert.equal((html.match(/name="load_workloads_combinations_selected_/g)||[]).length,9);
+assert.equal((html.match(/name="load_workloads_mixed_selected_/g)||[]).length,9);
+assert.equal((html.match(/name="load_workloads_stress_cases_/g)||[]).length,3);
+assert.equal((html.match(/placeholder="Measure only"/g)||[]).length,4);
+assert.doesNotMatch(html,/Load types|Load schedule|p95|Context length|Pairs per|pending|in.flight|data-profile-settings/);
+assert.equal((html.match(/aria-live="polite"/g)||[]).length,2);assert.doesNotMatch(html,/<section[^>]*aria-live/);
 assert.equal((renderRunBlueprint(config).match(/aria-live="polite"/g)||[]).length,1);
-assert.match(html,/At least 103 generated tokens/);
-assert.match(effectiveCheckSummary(bootstrap.checks.find(c=>c.id==='concurrency'),config),/2 load types · 1, 4 concurrent/);
+assert.match(effectiveCheckSummary(bootstrap.checks.find(c=>c.id==='load'),config),/1 workload · 1, 4 concurrent/);
+assert.equal(bootstrap.checks.filter(c=>['load','concurrency','capacity','arrivals'].includes(c.id)).length,1);
 ''')
 
 
 def test_shape_selection_collapse_and_live_text():
-    browser_logic(r'''
-const form={elements:{}};nodes['#new-run-form']=form;
-for(const shape of loadShapes)form.elements['load_combinations_selected_'+shape]={checked:false};
+    from tests.test_concurrent_load_ui_review import FORM
+    browser_logic(FORM + r'''
 configChanged=()=>{};updateBounds=()=>{};
-await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'load-select-all'}}:null}});assert(Object.values(form.elements).every(input=>input.checked));
-await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'load-clear'}}:null}});assert(Object.values(form.elements).every(input=>!input.checked));
+for(const kind of ['combinations','mixed']){
+ for(const shape of loadShapes)form.elements['load_workloads_'+kind+'_selected_'+shape].checked=false;
+ await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'load-select-grid'}}:q==='[data-load-grid]'?{dataset:{loadGrid:kind}}:null}});
+ assert(loadShapes.every(shape=>form.elements['load_workloads_'+kind+'_selected_'+shape].checked));
+ selectLoadShapes(kind);assert(loadShapes.every(shape=>!form.elements['load_workloads_'+kind+'_selected_'+shape].checked));
+}
 for(const type of Object.keys(loadTitles)){
- const panel={hidden:true},button={attributes:{},setAttribute(key,value){this.attributes[key]=value;}};
- nodes['#load-panel-'+type]=panel;nodes['[data-load-collapse="'+type+'"]']=button;
+ const panel={hidden:true},button={attributes:{},setAttribute(k,v){this.attributes[k]=v;}};nodes['#load-panel-'+type]=panel;nodes['[data-load-collapse="'+type+'"]']=button;
  setLoadPanel(type,true);assert.equal(panel.hidden,false);assert.equal(button.attributes['aria-expanded'],'true');
  setLoadPanel(type,false);assert.equal(panel.hidden,true);assert.equal(button.attributes['aria-expanded'],'false');
- // Enabling opens the panel; collapsing never changes selection.
- await listeners.change({target:{name:'load_'+type+'_enabled',checked:true,dataset:{loadEnable:type},matches:q=>q==='[data-load-enable]',closest:()=>null}});
- assert.equal(panel.hidden,false);
+ const input=form.elements['load_workloads_'+type+'_enabled'];input.checked=true;
+ await listeners.change({target:{name:input.name,checked:true,dataset:{loadEnable:type},matches:q=>q==='[data-load-enable]',closest:()=>null}});assert.equal(panel.hidden,false);assert(input.checked);
+ setLoadPanel(type,false);assert(input.checked);
 }
-const settings=structuredClone(config.concurrent_load);
-assert.match(concurrentDisplay(settings).coverage,/At least 103 generated tokens.*80%.*128-token cap/);
-settings.profile.long.output_tokens=512;
-assert.match(concurrentDisplay(settings).coverage,/At least 410 generated tokens/);
-settings.mixed.shares={short_short:85};
-assert.equal(concurrentDisplay(settings).total,'85% total · must equal 100%');
-assert.equal(concurrentDisplay(settings).validTotal,false);
-settings.mixed.shares={short_short:99.9999995};assert(concurrentDisplay(settings).validTotal);
-settings.mixed.shares={short_short:100};assert.equal(concurrentDisplay(settings).total,'100% total');
-settings.schedule.levels=[1,4,8];settings.schedule.duration_seconds=10;
-const allocation=concurrentDisplay(settings).allocation;
-assert.match(allocation,/At 4 concurrent requests: 3 short streams \+ 1 probe slot.*every 5 s; 20 s total/);
-assert.match(allocation,/At 8 concurrent requests: 7 short streams/);
-assert.match(allocation,/At 1 concurrent request:.*at least two/);
-for(const id of ['load-share-total','load-output-coverage','load-interference-allocation','load-combination-count','load-test-point-example','load-trigger-chunks'])nodes['#'+id]={classList:{toggle(){}}};
-settings.interference.trigger='after_chunks';syncConcurrentDisplay({...config,concurrent_load:settings});
-assert.equal(nodes['#load-trigger-chunks'].hidden,false);assert.match(nodes['#load-output-coverage'].textContent,/410 generated tokens/);
-settings.interference.trigger='first_output';syncConcurrentDisplay({...config,concurrent_load:settings});assert(nodes['#load-trigger-chunks'].hidden);
+const s=loadSettings(config);s.workloads.mixed.selected=['short_short','long_short','short_long'];assert.equal(loadDisplay(s).shares,'33.3% expected per selected combination; actual counts vary.');
+s.workloads.mixed.share_mode='custom';s.workloads.mixed.shares={short_short:20,long_short:30,short_long:40};assert.equal(loadDisplay(s).shares,'90% total · must equal 100%.');
+s.profile.long.output_tokens=512;assert.match(loadDisplay(s).coverage,/At least 410 generated tokens/);
+assert.match(loadDisplay(s).slowdown,/1.5× means up to 50% longer.*at most 3 seconds/);
+s.patterns.concurrent.levels=[1,4,8];s.schedule.duration_seconds=10;assert.match(loadDisplay(s).allocation,/At 4 concurrent requests: 3 short streams, with room for one added long request/);assert.match(loadDisplay(s).allocation,/Level 1 is not applicable/);
+const rows=loadShapes.map(shape=>({dataset:{loadShareRow:shape}}));groups['[data-load-share-row]']=rows;nodes['#load-shares']={};nodes['#load-share-note']={};syncLoadDisplay({...config,load_test:s});assert.equal(rows.filter(row=>!row.hidden).length,3);assert.equal(nodes['#load-shares'].hidden,false);
 ''')
 
 
 def test_every_structured_error_has_inline_and_focus_destination():
-    browser_logic(r'''
-state.jsonDraft=state.jsonBase='synced';
-const paths=['concurrent_load.schedule.levels','concurrency','max_requests','stream','max_duration_seconds',
-'concurrent_load.schedule.duration_seconds','concurrent_load.interference.enabled','concurrent_load.combinations.selected',
-'concurrent_load.mixed.shares','concurrent_load.stress.large_input','concurrent_load.combinations.enabled',
-'concurrent_load.interference.trigger','concurrent_load.interference.trigger_chunks','concurrent_load.interference.max_slowdown',
-'concurrent_load.stress.min_output_percent'];
-for(const size of loadSizes)for(const field of ['input_tokens','output_tokens'])paths.push('concurrent_load.profile.'+size+'.'+field);
-for(const field of ['first_output_p95_ms','response_p95_ms','max_error_percent','min_correct_percent','min_valid_responses'])paths.push('concurrent_load.pass_criteria.'+field);
-for(const shape of loadShapes)paths.push('concurrent_load.mixed.shares.'+shape);
-nodes['#main']={};nodes['#new-run-form']={elements:{mode:{value:'normal'}}};
-syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=()=>{};
-renderNew();
-const markup=nodes['#main'].innerHTML,focused=[];
-revealSetupStep=step=>state.setupStep=step;revealCatalogueCheck=id=>state.openTest=id;
+    from tests.test_concurrent_load_ui_review import FORM
+    browser_logic(FORM + r'''
+state.jsonDraft=state.jsonBase='synced';localSettingErrors=()=>[];const markup=mount();
+const paths=['concurrency','max_requests','max_duration_seconds','load_test.workloads','load_test.patterns.concurrent.levels.0','load_test.patterns.rates.0','load_test.workloads.combinations.selected.0','load_test.workloads.mixed.selected','load_test.workloads.mixed.shares','load_test.workloads.stress.cases','load_test.workloads.interference.trigger'];
+for(const input of controls)if(input.name.startsWith('load_')&&input.name!=='load_rendered')paths.push(settingPath(input.name));
 for(const path of paths){
- // A fresh, closed drawer and disclosure for each independent navigation.
- for(const key of Object.keys(nodes))delete nodes[key];
- const elements={},details={tagName:'DETAILS',open:false},form={elements};
- nodes['#new-run-form']=form;nodes['#load-trigger-chunks']={hidden:true};
- state.openTest=null;state.setupStep=3;state.loadPanels={};
- const dest=settingDestination(path);assert(markup.includes('id="field-'+dest.name+'"'),path);
- const input={dataset:{},parentElement:path.includes('.pass_criteria.')||!path.startsWith('concurrent_load.')?details:null,attributes:{},style:{},setAttribute(k,v){this.attributes[k]=v;},getAttribute(k){return this.attributes[k]||null;},removeAttribute(k){delete this.attributes[k];},focus(){focused.push(dest.name);},closest(){return null;},checked:true};
- elements[dest.name]=input;nodes['#field-'+dest.name]=input;nodes['#field-'+dest.name+'-error']={hidden:true,textContent:''};
- elements.load_interference_enabled ||= {checked:true};
- for(const type of Object.keys(loadTitles)){nodes['#load-panel-'+type]={hidden:true};nodes['[data-load-collapse="'+type+'"]']={setAttribute(){}};}
- const error={fields:[path],msg:'Server rejected '+path};
- state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors:[error]};
- syncInlineErrors();
- assert.equal(nodes['#field-'+dest.name+'-error'].hidden,false,path);
- assert.equal(input.attributes['aria-invalid'],'true',path);
- const issues=renderSettingIssues();assert(issues.includes('data-setting-path="'+path+'"'));assert.match(issues,/Edit /);
+ const dest=settingDestination(path);let input=form.elements[dest.name];
+ if(!input){input={style:{},dataset:{},setAttribute(){},removeAttribute(){},getAttribute(){return '';},focus(){focused.push(dest.name);}};form.elements[dest.name]=input;nodes['#field-'+dest.name]=input;}
+ nodes['#field-'+dest.name+'-error']={hidden:true};state.openTest=null;
+ state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors:[{fields:[path],msg:'Server rejected '+path,actions:[{field:path,label:'Fix field'}]}]};
+ syncInlineErrors();assert.equal(nodes['#field-'+dest.name+'-error'].hidden,false,path);
+ assert.match(renderSettingIssues(),/data-action="edit-setting"/);assert(renderSettingIssues().includes('data-setting-path="'+path+'"'));
  await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:path}}:null}});
- assert.equal(state.setupStep,path==='stream'?1:2,path);assert.equal(focused.at(-1),dest.name,path);
- if(path.includes('.pass_criteria.')||!path.startsWith('concurrent_load.'))assert(details.open,path);
- if(path.startsWith('concurrent_load.'))assert.equal(state.openTest,'concurrency',path);
- const type=path.split('.')[1];if(Object.hasOwn(loadTitles,type))assert.equal(nodes['#load-panel-'+type].hidden,false,path);
- if(path.endsWith('.trigger_chunks'))assert.equal(nodes['#load-trigger-chunks'].hidden,false);
+ assert.equal(focused.at(-1),dest.name,path);assert.equal(state.setupStep,2);if(path.startsWith('load_test'))assert.equal(state.openTest,'load');
+ const type=path.split('.')[2];if(Object.hasOwn(loadTitles,type))assert.equal(nodes['#load-panel-'+type].hidden,false);
 }
-// Suite request defaults are JSON-only; navigation still preserves their errors.
-let jsonFocused=false;
-nodes['#config-editor']={focus(){jsonFocused=true;}};
-switchConfigView=view=>state.configView=view;
-focusSetting('max_output_tokens');
-assert.equal(state.configView,'json');assert(jsonFocused);
-assert.match(renderSettingIssues([{fields:['max_output_tokens'],msg:'Invalid suite output default'}]),/data-setting-path="max_output_tokens"/);
-// Supply a fresh schedule input for the cross-field level-1 navigation.
-const schedule={parentElement:null,setAttribute(){},focus(){},closest(){return null;}};
-nodes['#new-run-form'].elements.load_schedule_levels=schedule;
-// The level-1 interference error opens its panel while focusing the schedule.
-setLoadPanel('interference',false);focusSetting('concurrent_load.schedule.levels');
-assert.equal(nodes['#load-panel-interference'].hidden,false);assert.equal(nodes['#load-trigger-chunks'].hidden,true);
-assert.equal(settingDestination('concurrent_load.schedule.levels.0').name,'load_schedule_levels');
-assert.equal(settingDestination('concurrent_load.combinations.selected.0').name,'load_combinations_selected_short_short');
-// Current server responses own the error set; stale plans never block the new draft.
+assert.equal(settingDestination('load_test.patterns.concurrent.levels.0').name,'load_patterns_concurrent_levels');
+assert.equal(settingDestination('load_test.workloads.combinations.selected.0').name,'load_workloads_combinations_selected_short_short');
 state.configRevision++;syncInlineErrors();assert.equal(currentSettingErrors().length,0);
 ''')
 
 
 def test_plan_breakdown_and_duration_rows_use_server_numbers():
-    browser_logic(r'''
-config.checks=['concurrency'];config.concurrent_load.combinations.selected=[...loadShapes];
-config.concurrent_load.mixed.enabled=false;config.concurrent_load.schedule={levels:[1,4,8],duration_seconds:30};
-let html=renderConcurrentPlan(config);
-assert.match(html,/13 min 30 s/);assert.match(html,/9 workloads × 3 levels × 30 s/);assert.match(html,/27 test points/);
-const plan={configured_load_seconds:60,concurrent_load:{interference:{title:loadTitles.interference,workloads:2,levels:[2,4,8],duration_seconds:10,test_points:3,configured_load_seconds:60}},
- rows:[{id:'load_interference',title:loadTitles.interference,kind:'duration',requests_per_target:null,summary:'Duration-based',source:'configured'}],
- load_warnings:[{fields:['max_requests'],msg:'Request allowance may shorten the windows.'},{fields:['concurrent_load.schedule.duration_seconds','concurrent_load.profile.long.output_tokens'],msg:'Throughput window may be too short.'}],estimated_seconds:200,estimated_low_seconds:180,estimated_high_seconds:220};
-html=renderRunBlueprint(config,plan);
-assert.match(html,/Configured load time/);assert.match(html,/1 workload \(alternating short\/long probe\) × 3 levels × 20 s/);assert.match(html,/3 test points/);
-assert.match(html,/Duration-based/);assert.doesNotMatch(html,/0 requests/);
-assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);assert.match(html,/Edit Stop after this many requests/);assert.match(html,/Edit duration per workload/);
-nodes['#request-plan']={innerHTML:''};state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan,config};
-renderRequestPlan(config);html=nodes['#request-plan'].innerHTML;
-assert.match(html,/Duration-based · as many as complete/);assert.match(html,/Configured load time/);assert.doesNotMatch(html,/0 requests/);
-const input={attributes:{},getAttribute(k){return this.attributes[k]||'';},setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];}};
-nodes['#field-max_requests']=input;nodes['#field-max_requests-warning']={hidden:true};
-syncInlineErrors();assert.equal(nodes['#field-max_requests-warning'].hidden,false);
-assert.match(nodes['#field-max_requests-warning'].innerHTML,/Request allowance.*Edit Stop after this many requests/);
-assert.equal(input.attributes['aria-invalid'],undefined);assert.match(input.attributes['aria-describedby'],/field-max_requests-warning/);
+    import json
+    from giraffe.models import RunConfig
+    from giraffe.planning import request_plan
+    config=RunConfig(targets=[{'name':'local','url':'http://unused/v1','model':'test'}],checks=['load'])
+    plan=request_plan(config)
+    browser_logic('const plan='+json.dumps(plan)+r''';
+config.checks=['load'];const html=renderRunBlueprint(config,plan);
+assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/6m 0s/);assert.match(html,/Unknown \+ 135/);
+assert.match(html,/Expected scheduled requests/);assert.match(html,/Execution order/);
+assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);
+assert.doesNotMatch(renderLoadPlan(config),/12<\/dd>|3m 0s/); // No independent planner fallback.
 ''')
 
 
@@ -160,7 +99,7 @@ let resultNotes=['Old samples_per_bucket=7 was dropped.'],sent,paths=[];
 api=async(path,options)=>{paths.push(path);if(path==='/api/runs'){sent=JSON.parse(options.body);return {id:'new-run'};}const normalized=JSON.parse(options.body);delete normalized.concurrent_workloads;return {config:normalized,migration_notes:resultNotes,request_plan:{rows:[],errors:[]}};};
 setActive=()=>{};
 await refreshRequestPreview(undefined,{draft:true});
-assert.match(renderConcurrentEditor(config),/Old samples_per_bucket=7/);
+assert.match(renderLoadEditor(config),/Old samples_per_bucket=7/);
 assert.match(nodes['#request-plan'].innerHTML,/Old samples_per_bucket=7/);
 resultNotes=[];await refreshRequestPreview();await validatedSnapshot();
 assert.equal(state.migrationNotes.length,1);assert(paths.includes('/api/config/draft'));assert(paths.includes('/api/config/preview'));assert(paths.includes('/api/config/validate'));
@@ -220,7 +159,7 @@ const conditions=['load_combo_long_short_c4','load_combo_short_long_c4','load_mi
 state.detail={id:'live',config:{targets:[{name:'local'}]},live_conditions:conditions};
 let html=renderTests([],{conditions,live:true});
 for(const type of ['combinations','mixed','interference','stress'])assert(html.includes('data-condition-load-type="'+type+'"'));
-assert.match(html,/Mixed load · 8 concurrent requests/);assert.match(html,/Long input → Short output at 4 concurrent requests/);
+assert.match(html,/Mixed traffic · 8 concurrent requests/);assert.match(html,/Long input → Short output at 4 concurrent requests/);
 assert.equal((html.match(/data-condition-load-type="mixed"/g)||[]).length,2);
 conditions[0].status='finished';conditions[0].reason='criteria met';conditions[0].load_point_result={status:'pass',cut_short:false,not_run:false};
 html=renderTests([],{conditions,live:true});let first=html.match(/<article[\s\S]*?<\/article>/)[0];
@@ -237,12 +176,15 @@ html=renderTests([],{conditions:calibration,live:true});assert.match(html,/Input
 
 
 async def test_live_finished_conditions_carry_authoritative_point_measurements():
-    from tests.test_concurrent_load import perform, point
-
-    _, check, _, events = await perform()
-    finished = [event for event in events if event['event'] == 'condition_finished'
-                and event['condition']['id'].startswith('load_combo_')
-                and event['condition_summary'].get('load_point_result')]
-    assert len(finished) == 1
-    assert finished[0]['condition_summary']['load_point_result'] == point(check)
-    assert finished[0]['condition_summary']['load_point_result']['reason_code'] == 'criteria_met'
+    from tests.test_load_test_phase_a import config, Client
+    from giraffe.runner import _Run
+    from giraffe.load_test import execute
+    c=config()
+    c.load_test.schedule.duration_seconds=.01
+    events=[]
+    run=_Run(c,lambda event:events.append(event),None)
+    obs=await execute(run,c.targets[0],Client((.001,)))
+    finished=[event for event in events if event['event']=='condition_finished' and event['condition_summary'].get('load_point_result')]
+    assert len(finished)==1
+    assert finished[0]['condition_summary']['load_point_result']=={key:value for key,value in obs['points'][0].items() if key!='offers'}
+    assert finished[0]['condition_summary']['load_point_result']['groups']

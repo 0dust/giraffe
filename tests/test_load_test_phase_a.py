@@ -108,7 +108,7 @@ def test_worked_burst_plans(constant, poisson, expected, tests):
     assert plan["expected_scheduled_requests"] == expected
     assert plan["scheduled_tests"] == tests
     assert plan["time_with_allowances_seconds"] == tests * 60.02
-    assert "160 additional requests" in plan["burst_previews"][0]["text"]
+    assert ("160 additional requests" if constant or poisson else "160 scheduled requests") in plan["burst_previews"][0]["text"]
     for p in load_points(c.load_test):
         offers, _ = planned_arrivals(c.load_test, p)
         assert sum(o["origin"] == "burst" for o in offers) == 160

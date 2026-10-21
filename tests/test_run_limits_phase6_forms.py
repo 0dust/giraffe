@@ -51,20 +51,20 @@ assert.equal(source.max_requests,null);
 def test_all_check_options_and_pass_rules_roundtrip_without_global_clamps():
     run_form("""
 const values=new FormData();for(const check of caps.checks){values.append('check',check.id);values.set('test_mode_'+check.id,'default');}
-for(const id of ['correctness','sessions','consistency','tools','arrivals','prefix','concurrency']){
+for(const id of ['correctness','sessions','consistency','tools','prefix']){
  const check=caps.checks.find(check=>check.id===id);values.set('test_mode_'+id,'custom');
  for(const name of check.option_fields)values.set('test_'+id+'_'+name,form.optionValue(source,check,name)??'');
  for(const name of check.limit_fields)values.set('test_'+id+'_limit_'+name,form.limitValue(source,check,name)??'');
 }
 values.set('test_correctness_concurrency','64');values.set('test_correctness_max_output_tokens','1024');
-values.set('test_correctness_request_timeout_seconds','90');values.set('test_concurrency_request_timeout_seconds','91');
-for(const id of ['sessions','consistency','tools','arrivals','prefix'])values.set('test_'+id+'_limit_latency_ms','4500');
+values.set('test_correctness_request_timeout_seconds','90');values.set('load_request_timeout_seconds','91');
+for(const id of ['sessions','consistency','tools','prefix'])values.set('test_'+id+'_limit_latency_ms','4500');
 const result=form.configureTests(source,values,caps.checks,caps.defaults.traffic);
 assert.equal(result.test_options.correctness.concurrency,64);
 assert.equal(result.test_options.correctness.max_output_tokens,1024);
 assert.equal(result.test_options.correctness.request_timeout_seconds,90);
-assert.equal(result.test_options.concurrency.request_timeout_seconds,91);
-for(const id of ['sessions','consistency','tools','arrivals','prefix'])assert.equal(result.test_options[id].limits.latency_ms,4500);
+assert.equal(result.test_options.load,undefined); // Load request timing has its dedicated drawer field.
+for(const id of ['sessions','consistency','tools','prefix'])assert.equal(result.test_options[id].limits.latency_ms,4500);
 assert.equal(result.max_output_tokens,source.max_output_tokens);assert.equal(result.request_timeout_seconds,source.request_timeout_seconds);
 assert.deepEqual(form.configureTests(result,values,caps.checks,caps.defaults.traffic),result);
 """)
@@ -121,20 +121,14 @@ assert.deepEqual(form.configureTests(source,values,caps.checks,caps.defaults.tra
 
 
 def test_sparse_load_levels_and_own_caps_are_preserved():
-    run_form("""
-source.checks=['access','concurrency'];source.concurrency=2;
-assert.equal(form.inferSetupPreset(source),'concurrent');
-assert.deepEqual(form.configureSetupLoad(source,'concurrent',{limits:caps.limits}),source);
-const values=new FormData();values.set('load_schedule_levels','1');
-let result=form.configureConcurrentLoad(source,values,caps.concurrent_load.defaults,{limits:caps.limits});
-assert.equal(Object.hasOwn(result.concurrent_load.schedule,'levels'),false);
-values.set('load_profile_long_output_tokens','256');
-result=form.configureConcurrentLoad(source,values,caps.concurrent_load.defaults,{limits:caps.limits});
-assert.equal(result.concurrent_load.profile.long.output_tokens,256);
-const maximum=caps.limits['concurrent_load.profile.long.output_tokens'].maximum;
-values.set('load_profile_long_output_tokens',String(maximum+1));
-assert.throws(()=>form.configureConcurrentLoad(source,values,caps.concurrent_load.defaults,{limits:caps.limits}),/Long output cap/);
-""")
+    from tests.test_concurrent_load_ui_review import FORM
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(FORM + r'''
+form.elements.concurrency.value='2';form.elements.load_patterns_concurrent_levels.dataset.inherited='true';
+let result=readForm(false).config;assert.equal(Object.hasOwn(result.load_test.patterns.concurrent,'levels'),false);assert.equal(loadSettings(result).patterns.concurrent.levels.join(','),'1');
+form.elements.load_profile_long_output_tokens.value='1024';result=readForm(false).config;assert.equal(result.load_test.profile.long.output_tokens,1024);
+const maximum=bootstrap.limits['load_test.profile.long.output_tokens'].maximum;form.elements.load_profile_long_output_tokens.value=String(maximum+1);assert.throws(()=>readForm(false),/must not exceed/);
+''')
 
 
 def test_tool_json_limits_come_from_capabilities_and_count_bytes():
@@ -148,35 +142,26 @@ assert.deepEqual(form.parseToolFixtures('[{}]',caps.limits),[{}]);
 
 def test_profile_edits_do_not_turn_inherited_parallelism_into_overrides():
     run_form("""
-source.arrivals=null;source.sessions=null;source.consistency=null;source.default_concurrency=40;source.concurrency=2;
+source.sessions=null;source.consistency=null;source.default_concurrency=40;source.concurrency=2;
 const values=new FormData();
-for(const [key,name,value] of [['arrivals','requests','12'],['sessions','sessions','6'],['consistency','repetitions','7']]){
+for(const [key,name,value] of [['sessions','sessions','6'],['consistency','repetitions','7']]){
  values.set('profile_edits_'+key,JSON.stringify([name]));values.set('profile_'+key+'_'+name,value);
 }
 const result=form.configureProfiles(source,values,caps.profile_defaults,{limits:caps.limits});
-assert.equal(result.arrivals.requests,12);assert.equal(Object.hasOwn(result.arrivals,'max_in_flight'),false);
 assert.equal(result.sessions.sessions,6);assert.equal(Object.hasOwn(result.sessions,'concurrency'),false);
 assert.equal(result.consistency.repetitions,7);assert.equal(Object.hasOwn(result.consistency,'levels'),false);
-values.set('profile_edits_arrivals','["requests","max_in_flight"]');values.set('profile_arrivals_max_in_flight','64');
-assert.equal(form.configureProfiles(source,values,caps.profile_defaults,{limits:caps.limits}).arrivals.max_in_flight,64);
+values.set('profile_edits_sessions','["sessions","concurrency"]');values.set('profile_sessions_concurrency','64');
+assert.equal(form.configureProfiles(source,values,caps.profile_defaults,{limits:caps.limits}).sessions.concurrency,64);
 """)
 
 
 def test_editing_capacity_rates_preserves_displayed_inherited_in_flight():
-    run_form("""
-source.checks=['capacity'];source.default_concurrency=40;source.concurrency=64;source.overlap_models=true;
-source.targets.push({...source.targets[0],name:'other'});source.traffic.max_in_flight=null;
-const values=new FormData();values.append('check','capacity');values.set('traffic_mode','custom');
-values.set('traffic_rates','25');values.set('traffic_max_in_flight','32');
-let result=form.configureTests(source,values,caps.checks,caps.defaults.traffic);
-assert.deepEqual(result.traffic.rates,[25]);assert.equal(result.traffic.max_in_flight,null);
-delete source.traffic.max_in_flight;
-result=form.configureTests(source,values,caps.checks,caps.defaults.traffic);
-assert.equal(Object.hasOwn(result.traffic,'max_in_flight'),false);
-values.set('traffic_max_in_flight','64');
-assert.equal(form.configureTests(source,values,caps.checks,caps.defaults.traffic).traffic.max_in_flight,64);
-source.traffic.max_in_flight=32;values.set('traffic_max_in_flight','32');
-assert.equal(form.configureTests(source,values,caps.checks,caps.defaults.traffic).traffic.max_in_flight,32);
-values.set('traffic_max_in_flight','');
-assert.equal(form.configureTests(source,values,caps.checks,caps.defaults.traffic).traffic.max_in_flight,null);
-""")
+    from tests.test_concurrent_load_ui_review import FORM
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(FORM + r'''
+form.elements.concurrency.value='64';form.elements.load_patterns_rates.value='25';
+let result=readForm(false).config;assert.equal(result.load_test.patterns.rates.join(','),'25');assert.equal(result.concurrency,64);
+assert.equal(result.load_test.patterns.max_in_flight,undefined);assert.equal(result.load_test.patterns.max_pending,undefined);
+form.elements.concurrency.value='32';result=readForm(false).config;assert.equal(result.concurrency,32);assert.equal(result.load_test.patterns.rates.join(','),'25');
+form.elements.concurrency.value='';result=readForm(true).config;assert.equal(result.concurrency,null);assert.equal(result.load_test.patterns.rates.join(','),'25');
+''')

@@ -233,6 +233,22 @@ def load_time_plan(settings):
                 ),
                 "approximate": any(p["pattern"] == "poisson" for p in selected),
             }
+    execution_summary = []
+    for source, value in own.items():
+        source_points = [p for p in points if p["source"] == source]
+        workloads = value.workloads
+        per_workload = len(traffic_points(value))
+        suffix = "" if source == "primary" else f" Imported {source} schedule."
+        if workloads.combinations.enabled:
+            execution_summary.append(f"{len(workloads.combinations.selected)} individual size combinations × {per_workload} traffic points." + suffix)
+        if workloads.mixed.enabled:
+            execution_summary.append(f"One random mix of {len(workloads.mixed.selected)} request types × {per_workload} traffic points." + suffix)
+        if workloads.stress.enabled:
+            execution_summary.append(f"{len(workloads.stress.cases)} token-stress cases × {per_workload} traffic points." + suffix)
+        comparison = [p for p in source_points if p["type"] == "interference"]
+        if comparison:
+            control = sum(p["windows"] * (value.schedule.duration_seconds + value.schedule.finish_seconds) for p in comparison)
+            execution_summary.append(f"{len(comparison)} short-answer checks at concurrency {', '.join(str(p['level']) for p in comparison)}: short answers alone, then with a long request. {int(control // 60)}m {round(control % 60)}s including finish allowances." + suffix)
     return {
         "scheduled_tests": sum(p["type"] != "interference" for p in points),
         "comparison_checks": sum(p["type"] == "interference" for p in points),
@@ -248,6 +264,8 @@ def load_time_plan(settings):
         )
         + (f"{'≈ ' if approximate else ''}{expected:,.0f}" if expected or not unknown else ""),
         "execution_order": [point_label(p) for p in points],
+        "execution_summary": execution_summary,
+        "minimum_initial_requests_per_target": minimum_reservation(settings),
         "points": points,
         "workloads": rows,
         "burst_previews": [
@@ -255,8 +273,10 @@ def load_time_plan(settings):
                 "source": name,
                 "times_seconds": burst_times(v),
                 "requests": len(burst_times(v)) * v.patterns.bursts.size,
-                "text": f"{len(burst_times(v))} bursts per test: at {', '.join(f'{t:g}' for t in burst_times(v)[:6])} seconds. "
-                f"{len(burst_times(v)) * v.patterns.bursts.size} additional requests per arrival-pattern test",
+                "text": f"{len(burst_times(v))} bursts per test: at {', '.join(f'{t:g}' for t in burst_times(v)[:6])}{', …' if len(burst_times(v)) > 6 else ''} seconds. "
+                f"{len(burst_times(v)) * v.patterns.bursts.size} "
+                + ("additional requests per arrival-pattern test" if v.patterns.constant.enabled or v.patterns.poisson.enabled else "scheduled requests in this burst-only test")
+                + f". No burst starts at or after {v.schedule.duration_seconds:g}s.",
             }
             for name, v in own.items()
             if v.patterns.bursts.enabled

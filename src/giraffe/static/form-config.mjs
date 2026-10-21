@@ -73,162 +73,142 @@ export function configureRunLimits(source, values, {allowInvalid=false}={}) {
   return config;
 }
 
-function validLoadLevels(levels, limits={}) {
-  const bounds = limits['concurrent_load.schedule.levels'] || {}, item = bounds.items || {};
-  return Array.isArray(levels) && levels.length >= (bounds.minItems ?? 1) && levels.length <= (bounds.maxItems ?? Infinity) &&
-    new Set(levels).size === levels.length &&
-    levels.every(level => Number.isInteger(level) && level >= (item.minimum ?? 1) && level <= (item.maximum ?? Infinity));
-}
-
-export function inferSetupPreset(config, {limits={}}={}) {
-  const checks = config.checks;
-  const matches = expected => Array.isArray(checks) && checks.length === expected.length &&
-    new Set(checks).size === checks.length && expected.every(id => checks.includes(id));
-  if (matches(['access','correctness'])) return 'answers';
-  if (matches(['access','correctness','capacity'])) return 'arrival';
-  if (matches(['access','concurrency']) && (config.concurrent_load?.schedule?.levels === undefined || validLoadLevels(config.concurrent_load.schedule.levels, limits)) &&
-      checks.every(id => !Object.keys(config.test_options?.[id] || {}).length)) return 'concurrent';
+export function inferSetupPreset(config) {
+  const ids=config.checks||[];
+  if(ids.length===2&&ids.includes('access')&&ids.includes('correctness'))return 'answers';
+  if(ids.length===2&&ids.includes('access')&&ids.includes('load'))return 'concurrent';
+  if(ids.length===3&&['access','correctness','load'].every(id=>ids.includes(id)))return 'arrival';
   return 'custom';
 }
-
-export function applySetupPreset(source, preset, defaults) {
-  const config = structuredClone(source);
-  const selection = {
-    answers:['access','correctness'],
-    concurrent:['access','concurrency'],
-    arrival:['access','correctness','capacity'],
-  }[preset];
-  if (selection) config.checks = selection;
-  config.structured_json = config.checks.includes('json');
-  config.metrics = config.checks.includes('gpu');
-  config.tool_calling = config.checks.includes('tools');
-  if (preset === 'concurrent') {
-    config.concurrent_load ||= structuredClone(defaults);
-  }
+export function applySetupPreset(source,preset,defaults) {
+  const config=structuredClone(source),selection={answers:['access','correctness'],concurrent:['access','load'],arrival:['access','correctness','load']}[preset];
+  if(selection)config.checks=selection;
+  config.structured_json=config.checks.includes('json');config.metrics=config.checks.includes('gpu');config.tool_calling=config.checks.includes('tools');
   return config;
 }
+export function configureSetupLoad(source) {return structuredClone(source);}
 
-// Tested levels and the optional suite ceiling are independent settings.
-export function configureSetupLoad(source, preset, {allowInvalid=false, limits={}}={}) {
-  const config = structuredClone(source);
-  if (preset !== 'concurrent') return config;
-  if (config.concurrent_load?.schedule?.levels !== undefined && !validLoadLevels(config.concurrent_load.schedule.levels, limits)) {
-    if (allowInvalid) return config;
-    throw new Error(loadLevelsMessage(limits));
-  }
-  return config;
-}
-
-function loadLevelsMessage(limits) {
-  const bounds = limits['concurrent_load.schedule.levels'] || {}, item = bounds.items || {};
-  return `Concurrency levels must contain ${bounds.minItems ?? 1}${bounds.maxItems == null ? ' or more' : ` to ${bounds.maxItems}`} distinct whole numbers from ${item.minimum ?? 1}${item.maximum == null ? ' upwards' : ` to ${item.maximum}`}.`;
-}
-
-export function configureConcurrentLoad(source, values, defaults, {allowInvalid=false, limits={}}={}) {
-  const config = structuredClone(source);
-  if (![...values.keys()].some(name => name.startsWith('load_'))) return config;
-  const settings = structuredClone(defaults);
-  for (const [group, value] of Object.entries(config.concurrent_load || {})) {
-    settings[group] = value && typeof value === 'object' && !Array.isArray(value) ? {...settings[group], ...value} : value;
-  }
-  for (const size of ['short','medium','long']) {
-    settings.profile[size] = {...defaults.profile[size], ...source.concurrent_load?.profile?.[size]};
-  }
-  const inheritedLevels = defaults.schedule.levels.filter(level => level <= inheritedConcurrency(config, Math.max(...defaults.schedule.levels)));
-  if (!inheritedLevels.length) inheritedLevels.push(1);
-  if (source.concurrent_load?.schedule?.levels === undefined) settings.schedule.levels = inheritedLevels;
-  const validate = !allowInvalid && config.checks.includes('concurrency');
-  const invalid = (fields, msg) => {throw Object.assign(new Error(msg), {errors:[{fields, msg}]});};
-  const rendered = values.has('load_rendered');
-  const sizes = ['short','medium','long'];
-  const shapes = sizes.flatMap(input => sizes.map(output => `${input}_${output}`));
-  const number = (group, key, label, {integer=false, nullable=false}={}) => {
-    const name = `load_${group}_${key}`;
-    if (!values.has(name)) return;
-    const value = numeric(values.get(name), label, true);
-    const bounds = limits[`concurrent_load.${group}.${key}`] || {};
-    const minimum = bounds.minimum ?? bounds.exclusiveMinimum ?? -Infinity, maximum = bounds.maximum ?? Infinity;
-    if (validate && !(nullable && value === null) &&
-        (typeof value !== 'number' || !Number.isFinite(value) || value < minimum || value > maximum ||
-         (bounds.exclusiveMinimum != null && value === bounds.exclusiveMinimum) ||
-         (integer && !Number.isInteger(value)))) {
-      const range = bounds.exclusiveMinimum != null ? `greater than ${minimum}${Number.isFinite(maximum)?` and at most ${maximum}`:''}` : Number.isFinite(maximum) ? `from ${minimum} to ${maximum}` : `of at least ${minimum}`;
-      invalid([`concurrent_load.${group}.${key}`], `${label} must be ${integer ? 'a whole number' : 'a number'} ${range}.`);
-    }
-    settings[group] ||= {};
-    settings[group][key] = value;
+export function loadTestSettings(config, defaults) {
+  const merge=(base, extra)=>{
+    const result=structuredClone(base);
+    for(const [key,value] of Object.entries(extra || {}))result[key]=value&&typeof value==='object'&&!Array.isArray(value)&&result[key]&&typeof result[key]==='object'?merge(result[key],value):structuredClone(value);
+    return result;
   };
-  for (const size of sizes) for (const field of ['input_tokens','output_tokens']) {
-    const name = `load_profile_${size}_${field}`;
-    if (!values.has(name)) continue;
-    const label = `${size[0].toUpperCase()+size.slice(1)} ${field === 'input_tokens' ? 'input target' : 'output cap'}`;
-    const value = numeric(values.get(name), label, true);
-    const bounds = limits[`concurrent_load.profile.${size}.${field}`] || {};
-    if (validate && (!Number.isInteger(value) || value < (bounds.minimum ?? 1) || value > (bounds.maximum ?? Infinity))) {
-      invalid([`concurrent_load.profile.${size}.${field}`], `${label} must be a whole number from ${bounds.minimum ?? 1}${bounds.maximum == null ? ' upwards' : ` to ${bounds.maximum}`}.`);
-    }
-    settings.profile[size][field] = value;
+  const settings=merge(defaults,config.load_test);
+  if(config.load_test?.patterns?.concurrent?.levels===undefined){
+    const ceiling=config.concurrency==null?Infinity:Math.max(1,Math.floor(config.concurrency/(config.overlap_models?config.targets?.length||1:1)));
+    settings.patterns.concurrent.levels=defaults.patterns.concurrent.levels.filter(level=>level<=ceiling);
+    if(!settings.patterns.concurrent.levels.length)settings.patterns.concurrent.levels=[1];
   }
-  for (const type of ['combinations','mixed','interference','stress']) {
-    const name = `load_${type}_enabled`;
-    if (rendered || values.has(name)) settings[type].enabled = values.get(name) === 'on';
+  return settings;
+}
+
+export const loadFieldName=path=>'load_'+path.replace(/^load_test\./,'').replaceAll('.','_');
+const loadSizes=['short','medium','long'];
+const loadShapes=loadSizes.flatMap(input=>loadSizes.map(output=>`${input}_${output}`));
+
+export function loadTestIssues(config, defaults, limits={}) {
+  if(!config.checks?.includes('load'))return [];
+  const s=loadTestSettings(config,defaults),w=s.workloads,p=s.patterns,issues=[];
+  const issue=(path,msg)=>issues.push({fields:[path.startsWith('load_test.')||['concurrency','max_requests','max_duration_seconds'].includes(path)?path:'load_test.'+path],msg});
+  const valid=(path,value,min,{integer=false,max=Infinity,label=path,exclusive=false}={})=>{
+    const bounds=limits['load_test.'+path]||{};
+    if(typeof value!=='number'||!Number.isFinite(value)||value<min||value>Math.min(max,bounds.maximum??Infinity)||(exclusive&&value===min)||(integer&&!Number.isInteger(value)))issue(path,`Check ${label}.`);
+  };
+  for(const kind of ['input_tokens','output_tokens'])for(let i=0;i<3;i++){
+    const value=s.profile[loadSizes[i]][kind],path=`profile.${loadSizes[i]}.${kind}`,bounds=limits['load_test.'+path]||{};
+    if(!Number.isInteger(value)||value<1)issue(path,'Token sizes must be positive whole numbers.');
+    else if(value>(bounds.maximum??Infinity))issue(path,`Token sizes must not exceed ${bounds.maximum}.`);
+    if(i&&value<=s.profile[loadSizes[i-1]][kind])issue(path,'Use increasing Short, Medium and Long token sizes.');
   }
-  if (rendered || shapes.some(shape => values.has(`load_combinations_selected_${shape}`))) {
-    const selected = shapes.filter(shape => values.get(`load_combinations_selected_${shape}`) === 'on');
-    settings.combinations.selected = [...settings.combinations.selected.filter(shape => selected.includes(shape)),
-      ...selected.filter(shape => !settings.combinations.selected.includes(shape))];
-  }
-  for (const shape of shapes) {
-    const name = `load_mixed_shares_${shape}`;
-    if (!rendered && !values.has(name)) continue;
-    const raw = values.get(name);
-    const value = raw == null || String(raw).trim() === '' ? 0 : numeric(raw, 'Share of requests', true);
-    const bounds = limits[`concurrent_load.mixed.shares.${shape}`] || limits['concurrent_load.mixed.shares.*'] || {};
-    if (validate && (typeof value !== 'number' || !Number.isFinite(value) || value < (bounds.minimum ?? 0) || value > (bounds.maximum ?? Infinity))) {
-      invalid([`concurrent_load.mixed.shares.${shape}`], `Share of requests must be a number from ${bounds.minimum ?? 0}${bounds.maximum == null ? ' upwards' : ` to ${bounds.maximum}`}.`);
-    }
-    if (value === 0) delete settings.mixed.shares[shape];
-    else settings.mixed.shares[shape] = value;
-  }
-  if (values.has('load_interference_trigger')) settings.interference.trigger = values.get('load_interference_trigger');
-  number('interference','trigger_chunks','Chunk count',{integer:true});
-  number('interference','max_slowdown','Maximum slowdown',{nullable:true});
-  for (const key of ['large_input','large_output']) {
-    if (rendered || values.has(`load_stress_${key}`)) settings.stress[key] = values.get(`load_stress_${key}`) === 'on';
-  }
-  number('stress','min_output_percent','Minimum output length');
-  if (values.has('load_schedule_levels')) {
-    settings.schedule.levels = String(values.get('load_schedule_levels') || '').trim().split(/[\s,]+/)
-      .filter(Boolean).map(value => numeric(value, 'Concurrency levels', true));
-    if (validate && !validLoadLevels(settings.schedule.levels, limits)) {
-      invalid(['concurrent_load.schedule.levels'], loadLevelsMessage(limits));
-    }
-    if (validLoadLevels(settings.schedule.levels, limits)) settings.schedule.levels.sort((left,right) => left-right);
-  }
-  number('schedule','duration_seconds','Duration per workload',{integer:true});
-  for (const key of ['first_output_p95_ms','response_p95_ms']) {
-    number('pass_criteria',key,key === 'first_output_p95_ms' ? 'First answer p95' : 'Response p95',
-      {integer:true,nullable:true});
-  }
-  for (const key of ['max_error_percent','min_correct_percent']) {
-    number('pass_criteria',key,key === 'max_error_percent' ? 'Maximum errors' : 'Minimum correct answers');
-  }
-  number('pass_criteria','min_valid_responses','Minimum valid responses',{integer:true});
-  if (validate) {
-    if (!Object.values(settings).some(value => value?.enabled)) invalid(['concurrent_load.combinations.enabled'], 'Enable at least one load type.');
-    if (settings.combinations.enabled && !settings.combinations.selected.length) invalid(['concurrent_load.combinations.selected'], 'Select at least one combination.');
-    if (settings.mixed.enabled && Math.abs(Object.values(settings.mixed.shares).reduce((sum,share) => sum+share,0)-100) > 1e-6) {
-      invalid([`concurrent_load.mixed.shares.${shapes.find(shape => settings.mixed.shares[shape] > 0) || shapes[0]}`], 'Mixed shares must equal 100%.');
-    }
-    if (settings.stress.enabled && !settings.stress.large_input && !settings.stress.large_output) invalid(['concurrent_load.stress.large_input'], 'Select at least one stress case.');
-    if (settings.interference.max_slowdown !== null && settings.interference.max_slowdown <= 1) {
-      invalid(['concurrent_load.interference.max_slowdown'], 'Maximum slowdown must be greater than 1, or blank to measure only.');
+  if(w.combinations.enabled&&!w.combinations.selected.length)issue('workloads.combinations.selected','Select at least one size combination.');
+  if(w.mixed.enabled){
+    if(w.mixed.selected.length<2)issue('workloads.mixed.selected','Select at least two request types for mixed traffic.');
+    if(w.mixed.share_mode==='custom'){
+      const shares=w.mixed.selected.map(shape=>w.mixed.shares[shape]),total=shares.reduce((sum,n)=>sum+Number(n),0);
+      if(!Number.isFinite(total)||Math.abs(total-100)>0.001||shares.some(n=>typeof n!=='number'||n<=0||n>100)){
+        const bad=w.mixed.selected.find(shape=>typeof w.mixed.shares[shape]!=='number'||!Number.isFinite(w.mixed.shares[shape])||w.mixed.shares[shape]<=0||w.mixed.shares[shape]>100);
+        issue(bad?'workloads.mixed.shares.'+bad:'workloads.mixed.share_mode','Give each selected mix type a positive share, totaling 100%.');
+      }
     }
   }
-  config.concurrent_load = settings;
-  if (source.concurrent_load?.schedule?.levels === undefined && sameConfig(settings.schedule.levels, inheritedLevels)) {
-    delete settings.schedule.levels;
+  if(w.stress.enabled&&!w.stress.cases.length)issue('workloads.stress.cases','Select at least one token-stress case.');
+  if(!Object.values(w).some(row=>row.enabled))issue('workloads.combinations.enabled','Select at least one workload.');
+  const standard=(w.combinations.enabled?w.combinations.selected.length:0)+(w.mixed.enabled?1:0)+(w.stress.enabled?w.stress.cases.length:0);
+  if(standard&&!Object.values(p).some(row=>row?.enabled))issue('patterns.poisson.enabled','Select a traffic pattern for the selected workloads.');
+  const levels=p.concurrent.levels,rates=p.rates;
+  const list=(path,values,integer)=>{if(!Array.isArray(values)||!values.length||values.length>(limits['load_test.'+path]?.maxItems??Infinity)||values.some((n,i)=>typeof n!=='number'||!Number.isFinite(n)||n<=0||(integer&&!Number.isInteger(n))||(i&&n<=values[i-1])||n>(limits['load_test.'+path]?.items?.maximum??Infinity)))issue(path,'Enter positive, increasing '+(integer?'whole-number levels':'rates')+' separated by commas.');};
+  if(standard&&p.concurrent.enabled||w.interference.enabled)list('patterns.concurrent.levels',levels,true);
+  if(standard&&(p.constant.enabled||p.poisson.enabled))list('patterns.rates',rates,false);
+  if(standard||w.interference.enabled){valid('schedule.duration_seconds',s.schedule.duration_seconds,1,{integer:true,label:'Duration per workload, pattern and level (seconds)'});valid('schedule.finish_seconds',s.schedule.finish_seconds,0,{label:'Wait for unfinished requests after each test (seconds)'});}
+  if(standard&&p.poisson.enabled)valid('patterns.poisson.seed',p.poisson.seed,0,{integer:true,label:'Random seed'});
+  if(standard&&p.bursts.enabled){
+    valid('patterns.bursts.size',p.bursts.size,1,{integer:true,label:'Requests per burst'});
+    valid('patterns.bursts.first_seconds',p.bursts.first_seconds,0,{label:'First burst after (seconds)'});
+    valid('patterns.bursts.gap_seconds',p.bursts.gap_seconds,0.01,{label:'Time between burst starts (seconds)'});
+    if(p.bursts.first_seconds>=s.schedule.duration_seconds)issue('patterns.bursts.first_seconds','The first burst must start before the sending window ends.');
+    if(config.concurrency!=null&&p.bursts.size>config.concurrency)issue('concurrency','One burst exceeds the concurrency ceiling and cannot be dispatched in full.');
   }
+  if((standard&&p.concurrent.enabled||w.interference.enabled)&&config.concurrency!=null&&levels.some(n=>n>config.concurrency))issue('concurrency','Concurrency levels exceed the run ceiling. Update Run limits or lower the levels.');
+  if(w.interference.enabled){
+    if(!levels.some(n=>Number.isInteger(n)&&n>=2))issue('patterns.concurrent.levels','The long-input / short-answer test needs a concurrency level of at least 2.');
+    valid('workloads.interference.max_slowdown',w.interference.max_slowdown,1,{exclusive:true,label:'Maximum allowed slowdown of short answers (×)'});
+  }
+  if(w.stress.enabled&&w.stress.cases.some(shape=>shape.endsWith('_long'))){
+    valid('workloads.stress.min_output_percent',w.stress.min_output_percent,1,{label:'Minimum generated output (% of long-output cap)'});
+    if(w.stress.min_output_percent>100)issue('workloads.stress.min_output_percent','Output coverage cannot exceed 100% of the cap.');
+  }
+  valid('request_timeout_seconds',s.request_timeout_seconds,0,{exclusive:true,label:'Request timeout (seconds)'});
+  valid('pass_criteria.min_valid_responses',s.pass_criteria.min_valid_responses,1,{integer:true,label:'Minimum valid responses per result group'});
+  for(const [key,label] of [['max_error_percent','Errors allowed (%)'],['min_correct_percent','Correct answers required (%)']]){
+    valid('pass_criteria.'+key,s.pass_criteria[key],0,{label});
+    if(s.pass_criteria[key]>100)issue('pass_criteria.'+key,'Percentages must be from 0 to 100.');
+  }
+  for(const [key,label] of [['max_first_answer_ms','Maximum time to first answer per response (ms)'],['max_completion_ms','Maximum completion time per response (ms)'],['max_stream_pause_ms','Maximum pause between streamed chunks (ms)'],['min_generation_tokens_per_second','Minimum generation speed per response (tokens/sec)']])if(s.pass_criteria[key]!=null)valid('pass_criteria.'+key,s.pass_criteria[key],0,{exclusive:true,label});
+  return issues;
+}
+
+export function configureLoadTest(source, values, defaults, {allowInvalid=false,limits={}}={}) {
+  const config=structuredClone(source);
+  if(!values.has('load_rendered'))return config;
+  const selectedCheck=config.checks?.includes('load');
+  const settings=loadTestSettings(source,defaults),before=structuredClone(settings),w=settings.workloads,p=settings.patterns;
+  const checkbox=(path,object,key)=>{const name=loadFieldName(path);object[key]=values.get(name)==='on';};
+  for(const kind of ['combinations','mixed','interference','stress'])checkbox(`workloads.${kind}.enabled`,w[kind],'enabled');
+  for(const kind of ['concurrent','constant','poisson','bursts'])checkbox(`patterns.${kind}.enabled`,p[kind],'enabled');
+  for(const kind of ['combinations','mixed']){const selected=loadShapes.filter(shape=>values.get(`load_workloads_${kind}_selected_${shape}`)==='on');w[kind].selected=[...w[kind].selected.filter(shape=>selected.includes(shape)),...selected.filter(shape=>!w[kind].selected.includes(shape))];}
+  w.stress.cases=['long_short','short_long','long_long'].filter(shape=>values.get(`load_workloads_stress_cases_${shape}`)==='on');
+  for(const [path,object,key] of [['workloads.mixed.share_mode',w.mixed,'share_mode'],['workloads.interference.trigger',w.interference,'trigger']])if(values.has(loadFieldName(path)))object[key]=values.get(loadFieldName(path));
+  const standard=w.combinations.enabled||w.mixed.enabled||w.stress.enabled;
+  const set=(path,object,key,active=true,nullable=false)=>{
+    const name=loadFieldName(path);if(!values.has(name))return;
+    let candidate=numeric(values.get(name),path,true);
+    if(candidate===null&&!nullable)candidate='';
+    if(!active||!selectedCheck){
+      const bounds=limits['load_test.'+path]||limits['load_test.workloads.mixed.shares.*']||{};
+      if(typeof candidate!=='number'||!Number.isFinite(candidate)||candidate<(bounds.minimum??-Infinity)||candidate>(bounds.maximum??Infinity)||(bounds.exclusiveMinimum!=null&&candidate<=bounds.exclusiveMinimum)||(bounds.type==='integer'&&!Number.isInteger(candidate)))return;
+    }
+    object[key]=candidate;
+  };
+  for(const size of loadSizes)for(const key of ['input_tokens','output_tokens'])set(`profile.${size}.${key}`,settings.profile[size],key);
+  for(const shape of loadShapes)set('workloads.mixed.shares.'+shape,w.mixed.shares,shape,w.mixed.enabled&&w.mixed.share_mode==='custom'&&w.mixed.selected.includes(shape));
+  set('workloads.interference.max_slowdown',w.interference,'max_slowdown',w.interference.enabled);
+  set('workloads.stress.min_output_percent',w.stress,'min_output_percent',w.stress.enabled&&w.stress.cases.some(shape=>shape.endsWith('_long')));
+  for(const [path,object,key,active] of [['patterns.concurrent.levels',p.concurrent,'levels',standard&&p.concurrent.enabled||w.interference.enabled],['patterns.rates',p,'rates',standard&&(p.constant.enabled||p.poisson.enabled)]]){
+    if(active&&values.has(loadFieldName(path)))object[key]=String(values.get(loadFieldName(path))).split(',').map(n=>n.trim()===''?'':numeric(n,path,true));
+  }
+  set('patterns.poisson.seed',p.poisson,'seed',standard&&p.poisson.enabled);
+  for(const key of ['size','first_seconds','gap_seconds'])set('patterns.bursts.'+key,p.bursts,key,standard&&p.bursts.enabled);
+  for(const key of ['duration_seconds','finish_seconds'])set('schedule.'+key,settings.schedule,key,standard||w.interference.enabled);
+  set('request_timeout_seconds',settings,'request_timeout_seconds');
+  for(const key of Object.keys(settings.pass_criteria))set('pass_criteria.'+key,settings.pass_criteria,key,true,!['max_error_percent','min_correct_percent','min_valid_responses'].includes(key));
+  config.load_test=settings;
+  if(!selectedCheck&&loadTestIssues({...config,checks:['load']},defaults,limits).length)return structuredClone(source);
+  if(!allowInvalid){const errors=loadTestIssues(config,defaults,limits);if(errors.length)throw Object.assign(new Error(errors[0].msg),{errors});}
+  // Opening the drawer and Reset must preserve implicit inheritance and the
+  // portable config, rather than materializing a block of form defaults.
+  if(sameConfig(before,settings))return structuredClone(source);
+  if(source.load_test?.patterns?.concurrent?.levels===undefined&&sameConfig(before.patterns.concurrent.levels,settings.patterns.concurrent.levels))delete settings.patterns.concurrent.levels;
   return config;
 }
 
@@ -274,36 +254,6 @@ export function configureTests(source, values, checks, trafficDefaults, {allowEm
     else delete options.limits;
     if (Object.keys(options).length) config.test_options[check.id] = options;
     else delete config.test_options[check.id];
-  }
-  if (values.get('traffic_mode') === 'default') config.traffic = structuredClone(trafficDefaults);
-  else if (values.has('traffic_mode')) {
-    config.traffic = structuredClone(source.traffic || trafficDefaults);
-    for (const name of Object.keys(trafficDefaults)) {
-      if (name === 'mix') {
-        for (const kind of Object.keys(trafficDefaults.mix)) {
-          if (!values.has(`traffic_mix_${kind}`)) continue;
-          config.traffic.mix[kind] = numeric(values.get(`traffic_mix_${kind}`), `${kind} weight`, allowInvalid);
-        }
-      } else if (!values.has(`traffic_${name}`)) continue;
-      else if (name === 'rates') {
-        const parts = String(values.get('traffic_rates') || '').trim().split(/[\s,]+/);
-        if (parts.some(part => !part) && !allowInvalid) throw new Error('Enter at least one arrival rate.');
-        config.traffic.rates = parts.filter(Boolean).map(part => numeric(part, 'Arrival rate', allowInvalid));
-      } else if (name === 'arrival') config.traffic.arrival = values.get('traffic_arrival');
-      else {
-        const value = numeric(values.get(`traffic_${name}`), name, allowInvalid);
-        if (name === 'max_in_flight' && source.traffic?.max_in_flight == null &&
-            value === inheritedConcurrency(config, config.default_concurrency)) {
-          if (Object.hasOwn(source.traffic || {}, name)) config.traffic[name] = null;
-          else delete config.traffic[name];
-        } else config.traffic[name] = value;
-      }
-    }
-  }
-  if (config.request_source === 'request_pack' && source.traffic) {
-    for (const name of ['mix','long_input_chars','long_output_words']) {
-      if (Object.hasOwn(source.traffic, name)) config.traffic[name] = structuredClone(source.traffic[name]);
-    }
   }
 
   return config;
@@ -450,7 +400,7 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false,
   const config = structuredClone(source);
   const arrayFields = new Set(['modes', 'shapes', 'levels']);
   const textFields = new Set(['mode', 'equality']);
-  for (const key of ['arrivals', 'prefix', 'sessions', 'consistency', 'tools']) {
+  for (const key of ['prefix', 'sessions', 'consistency', 'tools']) {
     const edits = JSON.parse(values.get(`profile_edits_${key}`) || '[]');
     if (!edits.length) continue;
     if (key === 'tools') {
