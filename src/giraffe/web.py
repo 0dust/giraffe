@@ -38,7 +38,7 @@ from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
 from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RunConfig, RunReport,
-                            migrate_concurrent_load, migrate_run_limits)
+                            migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
@@ -59,8 +59,9 @@ def _config_input(value, handler):
         return handler(value)
     value, notes = migrate_run_limits(value)
     value, load_notes = migrate_concurrent_load(value)
+    value, combined_notes = migrate_load_test(value)
     config = handler(value)
-    config._migration_notes = list(dict.fromkeys([*notes, *load_notes, *config._migration_notes]))
+    config._migration_notes = list(dict.fromkeys([*notes, *load_notes, *combined_notes, *config._migration_notes]))
     return config
 
 
@@ -333,6 +334,7 @@ def _bootstrap_config(defaults: dict | None) -> dict:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
         defaults, _ = migrate_run_limits(defaults)
         defaults, _ = migrate_concurrent_load(defaults)
+        defaults, _ = migrate_load_test(defaults)
         config.update(defaults)
         if "concurrent_load" not in defaults:
             config.pop("concurrent_load", None)
@@ -682,9 +684,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         configuration = _bootstrap_config(defaults)
         resolved = ConfigDraft.model_validate(configuration)
         migrated_defaults, limit_notes = migrate_run_limits(defaults)
-        _, load_notes = migrate_concurrent_load(migrated_defaults)
+        migrated_defaults, load_notes = migrate_concurrent_load(migrated_defaults)
+        _, combined_notes = migrate_load_test(migrated_defaults)
         return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
-                "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *resolved._migration_notes])),
+                "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
                 "active_run_id": active.get("id"), "request_plan": preview_plan(resolved)}
 
     @app.get("/api/capabilities")

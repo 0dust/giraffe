@@ -74,7 +74,7 @@ def open_file_guard(config, *, raise_limit=False, web=False):
         if value == peak["per_target_peak"]:
             fields.append({"capacity": "traffic.max_in_flight", "arrivals": "arrivals.max_in_flight",
                            "sessions": "sessions.concurrency", "consistency": "consistency.levels",
-                           "concurrency": "concurrent_load.schedule.levels"}.get(check,
+                           "concurrency": "concurrent_load.schedule.levels", "load": "load_test.patterns.concurrent.levels"}.get(check,
                           f"test_options.{check}.concurrency" if check in {"correctness", "json", "recovery"}
                           else "checks"))
     fields = list(dict.fromkeys(fields))

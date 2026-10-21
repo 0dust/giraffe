@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from giraffe import __version__
 from giraffe.configuration_errors import configuration_errors
 from giraffe.models import (CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
-                           migrate_concurrent_load, migrate_run_limits)
+                           migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.storage import DEFAULT_LIMITS, format_size as _disk_size, parse_size
 from giraffe.resources import PhaseSampler, SAMPLING
 
@@ -278,11 +278,12 @@ def load_configuration(path: Path) -> dict:
 def _migrated_values(values):
     values, limit_notes = migrate_run_limits(values)
     values, load_notes = migrate_concurrent_load(values)
-    return values, limit_notes + load_notes
+    values, combined_notes = migrate_load_test(values)
+    return values, limit_notes + load_notes + combined_notes
 
 
 def _configuration_notes(config, notes):
-    config._migration_notes = notes
+    config._migration_notes = list(dict.fromkeys([*notes, *config._migration_notes]))
     for note in notes:
         print(f"Migration: {note}", file=sys.stderr)
     return config

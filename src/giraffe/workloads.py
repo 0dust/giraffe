@@ -18,11 +18,11 @@ from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, re
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
-    "arrivals": {"arrivals"}, "prefix": {"prefix"},
+    "prefix": {"prefix"},
     "sessions": {"sessions"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
-    "concurrent_load": {"concurrency"},
+    "load_test": {"load"},
 }
 
 
@@ -105,131 +105,11 @@ def label_prompt(chars, prefix=""):
     return prefix + label_context(chars, prefix) + LABEL_INSTRUCTION
 
 
-async def arrivals(run, target, client, fixtures):
-    from giraffe.fixtures import builtin_fixtures
-    from giraffe.runner import _check_config
 
-    config = _check_config(run.config, "arrivals")
-    settings = config.effective_arrivals()
-    base = builtin_fixtures(config, check_id="arrivals")["short"][0].model_copy(deep=True)
-    base.request_timeout_seconds = config.request_timeout_seconds
-    base.scenario, base.check_ids = "arrival", ["arrivals"]
-    base.workload = {"requests_per_second": settings.requests_per_second}
-    run.start_condition(target.name, base.scenario, base.workload, settings.requests)
-    observation = {
-        "planned": settings.requests,
-        "issued": 0,
-        "unissued": [],
-        "clock": "milliseconds since run start; schedule independent of concurrency",
-        "mode": settings.mode,
-        "seed": settings.seed,
-        "max_pending": settings.max_pending,
-    }
-    run.observations[target.name]["arrivals"] = observation
-    start = time.monotonic()
-    pending = set()
-    queued = set()
-    slots = asyncio.Semaphore(settings.max_in_flight)
-
-    async def dispatch(index, request):
-        try:
-            async with slots:
-                return await run.request(target, client, request, on_start=lambda: queued.discard(index))
-        finally:
-            queued.discard(index)
-
-    try:
-        for index in range(settings.requests):
-            offset = (
-                index / settings.requests_per_second
-                if settings.mode == "steady"
-                else (index // settings.burst_size) * settings.interval_seconds
-            )
-            due = start + offset
-            if not run.allowed(target.name):
-                observation["unissued"].append(
-                    {
-                        "first_index": index,
-                        "count": settings.requests - index,
-                        "reason": run.reason or "target budget reached",
-                    }
-                )
-                break
-            await asyncio.sleep(
-                max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
-            )
-            pending = {task for task in pending if not task.done()}
-            if not run.allowed(target.name):
-                observation["unissued"].append(
-                    {
-                        "first_index": index,
-                        "count": settings.requests - index,
-                        "reason": run.reason or "target budget reached",
-                    }
-                )
-                break
-            if len(queued) >= settings.max_pending:
-                observation["unissued"].append(
-                    {
-                        "index": index,
-                        "scheduled_ms": (due - run.start) * 1000,
-                        "reason": "pending queue full",
-                    }
-                )
-                continue
-            request = base.model_copy(
-                update={
-                    "workload": {
-                        **base.workload,
-                        "arrival_index": index,
-                        "scheduled_ms": (due - run.start) * 1000,
-                        "seed": settings.seed,
-                    }
-                }
-            )
-            queued.add(index)
-            pending.add(asyncio.create_task(dispatch(index, request)))
-            await asyncio.sleep(0)
-        if pending:
-            await asyncio.gather(*pending)
-    finally:
-        for task in pending:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        records = [r for r in run.records if r.target == target.name and r.scenario == "arrival"]
-        observation["issued"] = len(records)
-        # Arrivals have no intentional cancellation: a cancelled one was cut by
-        # the run deadline or a stop and is not evidence that it was served.
-        observation["incomplete"] = sum(r.status == "cancelled" for r in records)
-        missing = (
-            settings.requests
-            - len(records)
-            - sum(row.get("count", 1) for row in observation["unissued"])
-        )
-        if missing > 0:
-            observation["unissued"].append(
-                {"count": missing, "reason": "queued request not dispatched before stop/budget"}
-            )
-        observation["client_wait_threshold_ms"] = settings.max_client_wait_ms
-        observation["delayed"] = sum((r.client_wait_ms or 0) > settings.max_client_wait_ms for r in records)
-        observation["max_client_wait_ms"] = max(
-            (r.client_wait_ms or 0 for r in records), default=None
-        )
-        window = time.monotonic() - start
-        observation["measurement_window_seconds"] = window
-        observation["completed_requests_per_second"] = (
-            sum(r.valid and r.status == "completed" for r in records) / window
-            if window > 0
-            else None
-        )
-        observation["configured_rate_achieved"] = (
-            not observation["unissued"] and not observation["delayed"] and not observation["incomplete"]
-        )
-
-        reasons = list(dict.fromkeys(item["reason"] for item in observation["unissued"]))
-        run.finish_condition(target.name, base.scenario, base.workload,
-            reason=run.condition_reason(target.name, "; ".join(reasons)) if reasons else None)
+async def arrivals(run, target, client, fixtures=None):
+    """Compatibility import; legacy configs are migrated to the unified check."""
+    from giraffe.load_test import execute
+    return await execute(run, target, client)
 
 
 def prefix_admitted(input_chars, max_tokens, context_limit):
@@ -559,11 +439,10 @@ async def tools(run, target, client):
 
 
 async def execute(run, target, client, fixtures):
-    from giraffe.concurrent_load import execute as concurrent_load
+    from giraffe.load_test import execute as load_test
     for field, callback in (
-        ("arrivals", arrivals),
         ("prefix", prefixes),
-        ("concurrent_load", concurrent_load),
+        ("load_test", load_test),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -571,7 +450,7 @@ async def execute(run, target, client, fixtures):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and getattr(run.config, field):
             run.emit("scenario_started", target.name, field)
-            if field != "concurrent_load" and not run.allowed(target.name):
+            if field != "load_test" and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:

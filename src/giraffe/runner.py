@@ -23,7 +23,7 @@ from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
-from .request_pack import case_sequence, pack_identity, pack_preview, pack_specs
+from .request_pack import pack_identity, pack_preview, pack_specs
 from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
 from .timing import TimingHealth, configured_metrics, exceeded_unfinished, qualified_violations, run_quality
 from .models import (
@@ -392,7 +392,7 @@ class _Run:
 
     def finish_checks(self, target, checks):
         for check in checks:
-            if not (self.judging_pending and check in {"correctness", "capacity"}):
+            if not (self.judging_pending and check in {"correctness", "capacity", "load"}):
                 self.pending_checks.discard((target, check))
 
     def memory_sample(self, rss, unfinished=None):
@@ -953,66 +953,6 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await run.group(target, client, builtin_fixtures(effective, check_id="generation")["generation"], "generation",
                                 count=effective.samples, checks=["generation"])
             run.finish_checks(target.name, {"generation"})
-            if "capacity" in enabled:
-                from .traffic import arrival_schedule, run_stage
-
-                if run.pack_specs:
-                    await run.group(target, client, run.pack_specs, "pack_control",
-                                    count=len(run.pack_specs), checks=["correctness"] if "correctness" in enabled else [])
-
-                traffic = config.effective_traffic()
-                effective = _check_config(config, "capacity")
-                mixed_fixtures = {} if run.pack_specs else traffic_fixtures(effective, check_id="capacity")
-
-                async def execute(spec):
-                    spec = _spec(spec, spec.scenario, ["capacity"])
-                    return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True)
-
-                def traffic_stop_reason():
-                    reason = run.stop_reason(target.name)
-                    # Exhausting new offers must not cancel already admitted work.
-                    return None if reason == "maximum request budget reached" else reason
-
-                for index, rate in enumerate(traffic.rates):
-                    pack_arguments = {}
-                    if run.pack_specs:
-                        frozen = {spec.fixture_id: spec for spec in run.pack_specs}
-                        schedule, _ = arrival_schedule(traffic, rate, index)
-                        pack_arguments = {
-                            "case_specs": [frozen[spec.fixture_id] for spec in
-                                           case_sequence(config, len(schedule), index)],
-                            "active_case_specs": run.pack_specs,
-                        }
-                    schedule, _ = arrival_schedule(traffic, rate, index)
-                    run.start_condition(target.name, f"traffic_stage_{index}", planned=len(schedule))
-                    stage_start = (time.monotonic() - run.start) * 1000
-                    stage = await run_stage(
-                        traffic=traffic, rate_rps=rate, stage_index=index,
-                        fixtures=mixed_fixtures, execute=execute,
-                        reserve_offer=lambda: run.reserve_offer(target.name),
-                        on_drop=lambda: run.drop_offer(target.name, f"traffic_stage_{index}"),
-                        try_acquire=run.try_acquire_slot, release=run.release_slot,
-                        stop_reason=traffic_stop_reason, deadline=run.deadline, limits=effective.limits,
-                        capture_evidence=(run.stage_evidence[target.name].append
-                                          if any(spec.scorer == "judge" for spec in run.pack_specs) else None),
-                        **pack_arguments,
-                    )
-                    drop_reasons = []
-                    if stage["dropped_local"]:
-                        drop_reasons.append("dropped: all request slots busy")
-                    if stage["dropped_late"]:
-                        drop_reasons.append("dropped: scheduler was late")
-                    if stage["not_offered"]:
-                        drop_reasons.append(run.condition_reason(target.name,
-                            "; ".join(stage["reasons"]) or "not offered"))
-                    run.finish_condition(target.name, f"traffic_stage_{index}",
-                        reason="; ".join(dict.fromkeys(drop_reasons)) or None)
-                    stage["timing_interval_ms"] = [stage_start, (time.monotonic() - run.start) * 1000]
-                    run.observations[target.name]["capacity"].append(stage)
-                    if run.reason or run.stop.is_set() or time.monotonic() >= run.deadline:
-                        run.unfinished[target.name].add("capacity")
-                        break
-            run.finish_checks(target.name, {"capacity"})
             if "context" in enabled:
                 effective = _check_config(config, "context")
                 check_fixtures = builtin_fixtures(effective, check_id="context")
@@ -1098,7 +1038,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 effective = _check_config(config, "recovery")
                 probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
                 from .planning import request_plan
-                later = [name for name in config.checks if name not in CORE_CHECKS or name == "concurrency"]
+                later = [name for name in config.checks if name not in CORE_CHECKS or name == "load"]
                 later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
                 if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
@@ -1333,8 +1273,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     warm = [r for r in ordinary if r.scenario == "warm"]
     for check_id in CORE_CHECKS:
         title = CHECK_NAMES[check_id]
-        if check_id == "concurrency":
-            from giraffe.concurrent_load import result as load_result
+        if check_id == "load":
+            from giraffe.load_test import result as load_result
             result.append(load_result(run, target) if check_id in run.config.checks else CheckResult(
                 id=check_id, title=title, target=target.name, required=False, status="skipped", summary="Not selected."))
             continue
@@ -1817,7 +1757,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         config = _check_config(run.config, check.id)
         evidence = set(check.evidence_ids)
         records = [r for r in all_records if r.id in evidence]
-        if check.id != "concurrency":
+        if check.id not in {"load", "concurrency"}:
             check.summary = _verdict_summary(check, config, records, budget)
         if disconnected:
             check.summary = (f"{disconnected}. {check.summary} "
@@ -1830,8 +1770,8 @@ def _budget_guidance(config, check_id=None):
         return ""
     from .planning import request_plan
     plan = request_plan(config)
-    if check_id == "concurrency":
-        return ("Allow the configured Concurrent load sending windows plus calibration and drain; "
+    if check_id in {"load", "concurrency"}:
+        return ("Allow the configured Load test sending windows plus calibration and finish allowances; "
                 "set the request limit (Stop after this many requests) using observed throughput. Duration-based requests have no fixed count.")
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
@@ -2279,9 +2219,9 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
         "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
         "settings": workload_settings,
     }
-    if "concurrency" in config.checks:
-        from giraffe import concurrent_load
-        workload_identity["concurrent_load_source_sha256"] = hashlib.sha256(Path(concurrent_load.__file__).read_bytes()).hexdigest()
+    if "load" in config.checks:
+        from giraffe import load_test, concurrent_load, traffic
+        workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()
     if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
         from giraffe import logprobs, logprob_workload
         workload_identity["logprob_source_sha256"] = hashlib.sha256(

@@ -6,7 +6,7 @@ import math
 import re
 from typing import Any
 
-from giraffe.models import CATALOGUE_NAMES, ConcurrentLoad, RunConfig, Sessions
+from giraffe.models import CATALOGUE_NAMES, ConcurrentLoad, LoadTest, RunConfig, Sessions
 
 
 def configuration_errors(items: list[dict], body: Any) -> list[dict]:
@@ -52,9 +52,13 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
                       result[int(key)] if isinstance(result, list) and key.isdigit() and int(key) < len(result) else None)
         if result is None:
             parts = path.split(".")
-            model = RunConfig if len(parts) == 1 else {"sessions": Sessions, "concurrent_load": ConcurrentLoad}.get(parts[0])
+            model = RunConfig if len(parts) == 1 else {"sessions": Sessions, "concurrent_load": ConcurrentLoad, "load_test": LoadTest}.get(parts[0])
             if model and len(parts) <= 2 and parts[-1] in model.model_fields:
                 result = model.model_fields[parts[-1]].get_default(call_default_factory=True)
+        if result is None and path.startswith("load_test."):
+            result = LoadTest().model_dump()
+            for key in path.split(".")[1:]:
+                result = result.get(key) if isinstance(result, dict) else None
         if result is None and path.startswith("concurrent_load."):
             result = ConcurrentLoad().model_dump()
             for key in path.split(".")[1:]:
@@ -191,7 +195,7 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
             message = cap_message
             fields = [cap_path]
         safe_fields = set(labels) | {"samples", "max_requests", "sessions.max_tokens"} | set(fields if override or levels or structured else [])
-        safe_fields.update(field for field in fields if field.startswith("concurrent_load.")
+        safe_fields.update(field for field in fields if field.startswith(("concurrent_load.", "load_test."))
                            or re.fullmatch(r"sessions\.workloads\.\d+\.max_tokens", field))
         values = {field: setting for field in fields if field in safe_fields and not sensitive(field)
                   and (setting := value(field)) is not None and evidence(setting)}

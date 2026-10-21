@@ -8,7 +8,7 @@ from giraffe import caps
 from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, CleanupCriteria, Limits,
-    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, ConcurrentLoad, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, ConcurrentLoad, LoadTest, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
     DEFAULT_CONSISTENCY_OUTPUT_TOKENS, SHAPES, RequestPack, session_workload_presets,
 )
 from giraffe.caps import (MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
@@ -54,6 +54,9 @@ CHECK_DETAILS = {
     "concurrency": "Refills individual request slots for each configured duration, then drains active requests. Measures client-delivered and server-evidenced concurrency, latency percentiles, throughput and token lengths. Minimum valid responses is evidence, never a stopping target. Interference alternates short and long probes in A/B/A/B windows. Missing token counts are not reported; insufficient evidence is inconclusive. The default levels [1, 4] do not enable interference. Pass criteria and output budgets belong to concurrent_load; its per-check request timeout inherits the suite default.",
     "tools": "Checks response protocol, configured tool names and arguments, and optional assistant text requirements separately. Parallel calls match as an unordered multiset and conversation results use matched call IDs. Empty argument text means an empty object, except an empty last call cut off by the output limit remains unverified. Only final answer text satisfies content expectations; unclosed reasoning is inconclusive. Output truncation, including partial JSON numbers, is inconclusive unless complete calls independently violate the contract. Giraffe does not execute tools.",
 }
+
+CHECK_DESCRIPTIONS["load"] = "Workloads, request rates and bursts in one place."
+CHECK_DETAILS["load"] = "Runs isolated combinations, seeded random mixed traffic and token stress under maintained concurrency, constant or Poisson arrivals and burst overlays. Controlled stream interference uses separate full baseline/probe windows. Each window sends for its full duration, then finishes within its allowance and cancels unfinished work. Per-response criteria, delivery evidence and minimum valid responses qualify each shape separately; percentiles are measurements only. Arrival timing includes dispatch delay. Local drops are not endpoint failures. Highest accepted values are highest tested, with burst overlays reported separately."
 
 
 def configuration_limits(schema: dict) -> dict:
@@ -118,6 +121,9 @@ def configuration_limits(schema: dict) -> dict:
     limits["concurrent_load.mixed.shares.*"] = share_bounds
     for shape in SHAPES:
         limits[f"concurrent_load.mixed.shares.{shape}"] = deepcopy(share_bounds)
+    limits["load_test.patterns.concurrent.levels"].update(items=deepcopy(level_items), uniqueItems=True)
+    for shape in SHAPES:
+        limits[f"load_test.workloads.mixed.shares.{shape}"] = deepcopy(share_bounds)
     limits["traffic.rates"]["items"] = {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_TRAFFIC_RATE}
     limits["traffic.planned_arrivals"] = {"maximum": MAX_PLANNED_ARRIVALS}
     limits["request_pack.bytes"] = {"maximum": MAX_REQUEST_PACK_BYTES}
@@ -179,6 +185,7 @@ def capabilities(config: RunConfig | None = None) -> dict:
         "baseline_comparison": {"regression_percent": configured.limits.regression_percent,
                                 "field": "limits.regression_percent"},
         "traffic_schema": TrafficConfig.model_json_schema(),
+        "load_test": {"defaults": LoadTest().model_dump(mode="json"), "schema": LoadTest.model_json_schema()},
         "concurrent_load": {"defaults": ConcurrentLoad().model_dump(mode="json"),
                                  "schema": ConcurrentLoad.model_json_schema()},
         "session_workloads": {"defaults": Sessions().model_dump(mode="json"),

@@ -12,8 +12,8 @@ from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import corpus_width, sample_count
-from giraffe.concurrent_load import context_window, calibration_keys, load_time_plan, minimum_reservation, running_shapes, test_points, point_shapes, prompt_overhead
-from giraffe.models import CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, load_shape_label, required_concurrency
+from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets
+from giraffe.models import CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, required_concurrency
 from giraffe.request_pack import active_pack, pack_summary, pack_settings
 from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -29,7 +29,7 @@ def _warning_title(row):
              "recovery_prime": "recovery", "recovery_baseline": "recovery",
              "sustained": "recovery", "recovery_wait": "recovery", "sessions_wait": "sessions"}.get(identifier, identifier)
     if identifier.startswith("load_"):
-        check = "concurrency"
+        check = "load"
     return CATALOGUE_NAMES.get(check, row["title"])
 
 
@@ -122,7 +122,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
 
     def time_field(identifier):
         if identifier.startswith("load_"):
-            return "concurrent_load.schedule.duration_seconds"
+            return "load_test.schedule.duration_seconds"
         if identifier.startswith("pack_"):
             return "request_pack.cases"
         check = {"warm": "serving", "context_first_batch": "context", "recovery_prime": "recovery",
@@ -319,39 +319,46 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                                      "wait": True})
                 continue
             if name == "load_calibration":
-                timeout = config.effective_check("concurrency")["request_timeout_seconds"]
+                timeout = max(own.request_timeout_seconds for _, own in settings_sets(config.load_test))
                 unknown(target.name, row, count, timeout, count * timeout)
                 continue
             if name.startswith("load_"):
-                settings = config.concurrent_load
-                points = [point for point in test_points(settings) if point["type"] == name.removeprefix("load_")]
-                detail = load_time_plan(settings)[name.removeprefix("load_")]
-                timeout = config.effective_check("concurrency")["request_timeout_seconds"]
-                estimates = []
-                # All levels/shapes must be present in each pooled run.
-                queries, sizes = [], []
+                points = [p for p in test_points(config.load_test) if p["type"] == name.removeprefix("load_")]
+                own = dict(settings_sets(config.load_test))
+                queries, completion_points = [], []
                 for point in points:
+                    if point["pattern"] != "concurrent":
+                        continue
+                    settings = own[point["source"]]
                     shapes = point_shapes(settings, point)
-                    sizes.append(len(shapes))
+                    completion_points.append((point,len(shapes)))
                     for shape in shapes:
                         input_size, output_size = shape.split("_")
-                        queries.append(dict(family="concurrency", concurrency=min(point["level"], shares[target.name]),
-                            stream=config.stream, output_cap=getattr(settings.profile, output_size).output_tokens,
-                            input_bucket=input_bucket(getattr(settings.profile, input_size).input_tokens * 4)))
-                observed = pooled_matches(target.name, queries, (observations or {}).get(target.name, []))
+                        queries.append(dict(family=f"load.{point['type']}.{point['pattern']}",
+                            concurrency=min(point["level"],shares[target.name]),stream=config.stream,
+                            output_cap=getattr(settings.profile,output_size).output_tokens,
+                            input_bucket=input_bucket(getattr(settings.profile,input_size).input_tokens*4)))
+                observed = pooled_matches(target.name,queries,(observations or {}).get(target.name,[])) if queries else None
                 if observed and all(item["p50_ms"] > 0 for item in observed["matches"]):
-                    offset = 0
-                    for point, size in zip(points, sizes):
-                        # Individually refilled slots use observed p50 pace.
-                        p50 = max(item["p50_ms"] for item in observed["matches"][offset:offset + size]) / 1000
-                        estimates.append(point["configured_window_seconds"] * min(point["level"], shares[target.name]) / p50)
+                    estimates, offset = [], 0
+                    for point,size in completion_points:
+                        p50 = max(item["p50_ms"] for item in observed["matches"][offset:offset+size])/1000
+                        estimates.append(point["configured_window_seconds"]*min(point["level"],shares[target.name])/p50)
                         offset += size
-                fixed(target.name, row, detail["configured_load_seconds"], "concurrent_load.schedule.duration_seconds",
-                      count=detail["test_points"], timeout=timeout)
-                if estimates:
-                    duration_estimates.setdefault(name, {})[target.name] = round(sum(estimates))
-                    duration_runs.setdefault(name, {})[target.name] = observed["run_count"]
-                    observation_note(target.name, row, observed)
+                    detail = load_time_plan(config.load_test)["workloads"][name.removeprefix("load_")]
+                    # Add known arrivals once; interference remains unknown.
+                    duration_estimates.setdefault(name,{})[target.name] = round(sum(estimates)+detail["expected_requests"])
+                    duration_runs.setdefault(name,{})[target.name] = observed["run_count"]
+                    observation_note(target.name,row,observed)
+                for point in points:
+                    settings = own[point["source"]]
+                    before = len(timeline)
+                    fixed(target.name, row, point["windows"] * settings.schedule.duration_seconds,
+                          "load_test.schedule.duration_seconds", count=point["windows"], timeout=settings.schedule.finish_seconds)
+                    for item in timeline[before:]:
+                        # Finish allowances are explicit configured load windows,
+                        # so budget conflict navigation includes them without samples.
+                        item["coverage_high_seconds"] = item["high_seconds"]
                 continue
             if name == "capacity":
                 settings = config.effective_traffic()
@@ -809,10 +816,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         count = config.effective_check("generation")["samples"]
         add("generation", count, f"{count} copies of the generated passage.")
 
-    pack_selected = config.request_source == "request_pack" and bool(selected & {"capacity", "correctness"})
+    pack_selected = config.request_source == "request_pack" and bool(selected & {"load", "capacity", "correctness"})
     pack = active_pack(config)
     details = pack_details if pack_details is not None else pack_summary(config) if pack else None
-    if pack_selected:
+    if pack_selected and "correctness" in selected:
         count = len(config.request_pack.cases) if pack else None
         add("pack_control", count, "Sends each of your questions once. The answer and arrival checks reuse these results."
             if pack else "Add your questions to calculate their request count.",
@@ -820,7 +827,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         if not pack:
             warnings.append("The selected dataset is empty; request counts and run readiness are incomplete.")
 
-    if pack_selected and "capacity" not in selected and pack:
+    if pack_selected and "correctness" in selected and "capacity" not in selected and pack:
         count = max(len(config.request_pack.cases), config.effective_check("correctness")["concurrency"])
         add("pack_loaded", count, "Concurrent answer pass over your questions.", source="your dataset")
 
@@ -887,7 +894,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Backend cancellation verification")
     if "recovery" in selected:
         options = config.effective_check("recovery")
-        later = [name for name in config.checks if name not in CORE_CHECKS or name == "concurrency"]
+        later = [name for name in config.checks if name not in CORE_CHECKS or name == "load"]
         later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["minimum_reserved_per_target"]
         prior = sum(row["requests_per_target"] or 0 for row in rows)
         needed = later_known + 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
@@ -924,38 +931,33 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 f"{2 * settings.repeats} shared/independent prefix controls and {history} fixed-history requests admitted by the token estimate.")
 
     bucket_cases, bucket_levels = [], []
-    load_plan = load_time_plan(config.concurrent_load) if "concurrency" in selected else {}
+    load_plan = load_time_plan(config.load_test) if "load" in selected else {}
     load_warnings = []
     if load_plan:
-        settings = config.concurrent_load
-        for kind, detail in load_plan.items():
-            levels = f"{len(settings.schedule.levels)} {'level' if len(settings.schedule.levels) == 1 else 'levels'}"
-            workloads = f"{detail['workloads']} {'workload' if detail['workloads'] == 1 else 'workloads'}"
-            breakdown = (f"1 workload (alternating short/long probe) × {levels} × {2 * settings.schedule.duration_seconds} s"
-                         if kind == "interference" else f"{workloads} × {levels} × {settings.schedule.duration_seconds} s")
-            add(f"load_{kind}", None, breakdown + ". " +
-                "Duration-based points send as many requests as the endpoint completes; slots refill individually.",
-                title=detail["title"], kind="duration")
-        add("load_calibration", len(calibration_keys(settings)) * settings.calibration_attempts,
-            "At most this many token-calibration requests; calibration is shared per input size and output-instruction variant.",
-            title="Input token calibration", kind="bounded")
-        for size, variant in calibration_keys(settings):
-            target = getattr(settings.profile, size).input_tokens
-            overhead = prompt_overhead(variant)
-            if target < overhead:
-                message = f"{size.capitalize()} input target {target:,} is below the estimated minimum prompt length (≈{overhead:,} tokens); calibration measures the actual minimum."
-                warnings.append(message)
-                load_warnings.append({"fields": [f"concurrent_load.profile.{size}.input_tokens"], "msg": message})
-        for shape in running_shapes(settings):
-            a, b = shape.split("_")
-            if settings.schedule.duration_seconds < 3 * getattr(settings.profile, b).output_tokens / 30:
-                message = f"{load_shape_label(shape)}: window shorter than expected responses; throughput may be unreliable (output cap ÷ 30 tok/s)."
-                warnings.append(message)
-                load_warnings.append({"fields": ["concurrent_load.schedule.duration_seconds"], "msg": message})
-            if "context_limit" in config.model_fields_set and any(context_window(t)[0] is None for t in config.targets) and getattr(settings.profile, a).input_tokens + getattr(settings.profile, b).output_tokens > config.context_limit:
-                message = f"{load_shape_label(shape)}: input target + output cap exceeds Context window ({config.context_limit} tokens); server context window is unverified."
-                warnings.append(message)
-                load_warnings.append({"fields": [f"concurrent_load.profile.{a}.input_tokens", "context_limit"], "msg": message})
+        for kind, detail in load_plan["workloads"].items():
+            count = None if detail["unknown_requests"] else detail["expected_requests"]
+            add(f"load_{kind}", count, f"{detail['test_points']} tests, {detail['windows']} sending windows; "
+                f"{detail['configured_load_seconds']:g} s sending plus up to {detail['finish_allowance_seconds']:g} s finishing. "
+                + ("Completion-driven request count is unknown." if detail["unknown_requests"] else
+                   "Poisson requests are approximate." if detail["approximate"] else "Scheduled arrivals are exact."),
+                title=detail["title"], kind="duration" if detail["unknown_requests"] else "estimate" if detail["approximate"] else "exact",
+                source="your dataset" if config.request_source == "request_pack" else "saved questions" if config.custom_fixtures else "generated token-target prompts")
+            rows[-1]["expected_scheduled_requests"] = detail["expected_requests"]
+        if config.request_source != "request_pack" and not config.custom_fixtures:
+            calibration_count = sum(len(calibration_keys(own))*own.calibration_attempts for _,own in settings_sets(config.load_test))
+            add("load_calibration", calibration_count, "Up to three token-calibration attempts per input size and instruction variant; separate from scheduled load.", title="Input token calibration", kind="bounded")
+        criteria = config.load_test.pass_criteria
+        if criteria.max_first_answer_ms is None and criteria.max_completion_ms is None:
+            load_warnings.append({"fields":["load_test.pass_criteria.max_first_answer_ms","load_test.pass_criteria.max_completion_ms"],
+                "msg":"Measure only: a first-answer or completion limit is required to establish highest tested accepted capacity."})
+        if any(context_window(t)[0] is None for t in config.targets):
+            load_warnings.append({"fields":["load_test.profile.long.input_tokens"],
+                "msg":"Endpoint context window unknown. Explicit token targets are not sized by the client Context length; server context errors may require smaller targets."})
+        if config.max_requests is not None and load_plan["expected_scheduled_requests"]*target_count > config.max_requests:
+            load_warnings.append({"fields":["max_requests","load_test.schedule.duration_seconds","load_test.patterns.rates"],
+                "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
+                "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
+        warnings.extend(w["msg"] for w in load_warnings)
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":
@@ -1041,7 +1043,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     def edit_field(row):
         identifier = row["id"]
         if identifier.startswith("load_"):
-            return "concurrent_load.schedule.duration_seconds"
+            return "load_test.schedule.duration_seconds"
         if identifier.startswith("pack_"):
             return "request_pack.cases"
         if identifier in {"arrivals", "prefix", "sessions", "consistency"}:
@@ -1128,7 +1130,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     return {**timing, "count_kind": kind, "planned_per_target": planned,
             "planned_total": planned * target_count if planned is not None else None,
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,
-            "concurrent_load": load_plan,
+            "load_test": load_plan,
             "request_settings": {check: (config.effective_check(check) | {
                                          field: config.effective_response()[field]
                                          for field in CHECK_OPTION_FIELDS[check]}
@@ -1138,11 +1140,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             "initial_request_settings": config.effective_initial(),
             "baseline_comparison": {"regression_percent": config.limits.regression_percent,
                                     "field": "limits.regression_percent"},
-            "configured_load_seconds": sum(v["configured_load_seconds"] for v in load_plan.values()),
+            "configured_load_seconds": load_plan.get("configured_load_seconds", 0),
             "load_warnings": load_warnings, "concurrency_warnings": concurrency_warnings,
             "capacity_warnings": capacity_warnings,
             "required_concurrency": required_concurrency(config),
-            "minimum_reserved_per_target": known + (minimum_reservation(config.concurrent_load) if load_plan else 0),
+            "minimum_reserved_per_target": known + (minimum_reservation(config.load_test) if load_plan else 0),
             "known_per_target": known, "known_total": known * target_count,
             "request_warnings": request_warnings, "request_limit": config.max_requests, "memory_limit_bytes": config.max_memory_mb * 1024**2,
             "memory_limit_label": "Memory limit (RAM growth during this run)",

@@ -63,6 +63,13 @@ CATALOGUE_NAMES = {
     "cancellation": "Cancellation & timeouts", "prefix": "Prompt cache evidence",
     "gpu": "GPU metrics",
 }
+for _old_check in ("concurrency", "capacity", "arrivals"):
+    CHECK_NAMES.pop(_old_check, None)
+    CATALOGUE_NAMES.pop(_old_check, None)
+CHECK_NAMES["load"] = CATALOGUE_NAMES["load"] = INTERNAL_CHECK_NAMES["load"] = "Load test"
+CORE_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in CORE_CHECKS))
+DEFAULT_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in DEFAULT_CHECKS))
+
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
 
@@ -129,8 +136,8 @@ def load_shape_label(shape):
 
 
 def load_validation_error(fields, message):
-    raise ValidationError.from_exception_data("Concurrent load", [{
-        "type": PydanticCustomError("concurrent_load", message, {"fields": fields}),
+    raise ValidationError.from_exception_data("Load test", [{
+        "type": PydanticCustomError("load_test", message, {"fields": fields}),
         "loc": tuple(fields[0].split(".")), "input": None}])
 
 
@@ -250,6 +257,283 @@ class ConcurrentLoad(Model):
     pass_criteria: LoadPassCriteria = Field(default_factory=LoadPassCriteria)
     input_token_tolerance: float = Field(default=.1, ge=0, lt=.5)
     calibration_attempts: StrictInt = Field(default=3, ge=1, le=5)
+
+
+# Issue #45: workload selection and traffic are independent. Legacy models above
+# remain importable for decoding saved inputs; execution uses only LoadTest.
+class LoadTestProfile(DataProfile):
+    short: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=128, output_tokens=64))
+    medium: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=512, output_tokens=256))
+    long: LoadSize = Field(default_factory=lambda: LoadSize(input_tokens=2048, output_tokens=512))
+
+    @model_validator(mode="after")
+    def strictly_increasing(self):
+        for field in ("input_tokens", "output_tokens"):
+            for previous, size in zip(SIZES, SIZES[1:]):
+                if getattr(getattr(self, size), field) <= getattr(getattr(self, previous), field):
+                    load_validation_error([f"{size}.{field}"], "Use increasing Short, Medium and Long token sizes.")
+        return self
+
+
+class MixedTraffic(Model):
+    enabled: bool = False
+    selected: list[Literal[*SHAPES]] = Field(default_factory=lambda: list(SHAPES))
+    share_mode: Literal["equal", "custom"] = "equal"
+    shares: dict[Literal[*SHAPES], float] = Field(default_factory=lambda: {s: 12 if i == 8 else 11 for i,s in enumerate(SHAPES)})
+
+    @model_validator(mode="after")
+    def selections(self):
+        if self.enabled:
+            if len(set(self.selected)) < 2 or len(set(self.selected)) != len(self.selected):
+                load_validation_error(["selected"], "Select at least two distinct request types for mixed traffic.")
+            if self.share_mode == "custom" and (any(self.shares.get(s, 0) <= 0 or self.shares.get(s, 0) > 100 for s in self.selected)
+                    or sum(Decimal(str(self.shares.get(s, 0))) for s in self.selected) != Decimal(100)):
+                load_validation_error(["shares", "share_mode"], "Give each selected mix type a positive share, totaling exactly 100%.")
+        return self
+
+    def weights(self):
+        return {s: 100 / len(self.selected) if self.share_mode == "equal" else self.shares[s] for s in self.selected}
+
+
+class StreamInterference(Model):
+    enabled: bool = False
+    trigger: Literal["streaming_started", "after_five_chunks"] = "streaming_started"
+    max_slowdown: float = Field(default=1.5, gt=1)
+
+
+class TokenStress(Model):
+    enabled: bool = False
+    cases: list[Literal["long_short", "short_long", "long_long"]] = Field(default_factory=lambda: ["long_short", "short_long", "long_long"])
+    min_output_percent: float = Field(default=80, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def selected_cases(self):
+        if self.enabled and (not self.cases or len(set(self.cases)) != len(self.cases)):
+            load_validation_error(["cases"], "Select at least one distinct token-stress case.")
+        return self
+
+
+class LoadWorkloads(Model):
+    combinations: LoadCombinations = Field(default_factory=LoadCombinations)
+    mixed: MixedTraffic = Field(default_factory=MixedTraffic)
+    interference: StreamInterference = Field(default_factory=StreamInterference)
+    stress: TokenStress = Field(default_factory=TokenStress)
+
+
+class PatternToggle(Model):
+    enabled: bool = False
+
+
+class ConcurrentPattern(Model):
+    enabled: bool = True
+    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULTANEOUS_REQUESTS)]] = Field(default_factory=lambda: [1, 4], min_length=1, max_length=MAX_STAGES)
+
+    @field_validator("levels")
+    @classmethod
+    def increasing(cls, values):
+        if any(a >= b for a, b in zip(values, values[1:])):
+            raise ValueError("Enter positive, increasing whole-number levels.")
+        return values
+
+
+class PoissonPattern(PatternToggle):
+    seed: StrictInt = Field(default=42, ge=0)
+
+
+class BurstPattern(PatternToggle):
+    size: StrictInt = Field(default=32, ge=1, le=MAX_BURST_SIZE)
+    first_seconds: float = Field(default=10, ge=0)
+    gap_seconds: float = Field(default=10, gt=0)
+
+
+class LoadPatterns(Model):
+    concurrent: ConcurrentPattern = Field(default_factory=ConcurrentPattern)
+    constant: PatternToggle = Field(default_factory=lambda: PatternToggle(enabled=True))
+    poisson: PoissonPattern = Field(default_factory=PoissonPattern)
+    rates: list[Annotated[float, Field(gt=0, le=MAX_TRAFFIC_RATE)]] = Field(default_factory=lambda: [1, 2], min_length=1, max_length=MAX_STAGES)
+    bursts: BurstPattern = Field(default_factory=BurstPattern)
+
+    @field_validator("rates")
+    @classmethod
+    def increasing(cls, values):
+        if any(a >= b for a, b in zip(values, values[1:])):
+            raise ValueError("Enter positive, increasing rates.")
+        return values
+
+
+class LoadWindow(Model):
+    duration_seconds: StrictInt = Field(default=15, ge=1, le=MAX_STAGE_SECONDS)
+    finish_seconds: float = Field(default=15, ge=0)
+
+
+class ResponseCriteria(Model):
+    max_first_answer_ms: float | None = Field(default=2000, gt=0)
+    max_completion_ms: float | None = Field(default=30000, gt=0)
+    max_error_percent: float = Field(default=0, ge=0, le=100)
+    min_correct_percent: float = Field(default=100, ge=0, le=100)
+    max_stream_pause_ms: float | None = Field(default=None, gt=0)
+    min_generation_tokens_per_second: float | None = Field(default=None, gt=0)
+    min_valid_responses: StrictInt = Field(default=5, ge=1)
+
+    def timing_limits(self):
+        return Limits(first_output_ms=self.max_first_answer_ms, latency_ms=self.max_completion_ms,
+                      stream_gap_ms=self.max_stream_pause_ms, min_output_tokens_per_second=self.min_generation_tokens_per_second)
+
+
+class LoadTestSettings(Model):
+    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
+    workloads: LoadWorkloads = Field(default_factory=LoadWorkloads)
+    patterns: LoadPatterns = Field(default_factory=LoadPatterns)
+    schedule: LoadWindow = Field(default_factory=LoadWindow)
+    request_timeout_seconds: float = Field(default=60, gt=0)
+    pass_criteria: ResponseCriteria = Field(default_factory=ResponseCriteria)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sparse_profile(cls, value):
+        if isinstance(value, dict) and isinstance(value.get("profile"), dict):
+            defaults = LoadTestProfile().model_dump()
+            value = {**value, "profile": {size: {**defaults.get(size, {}), **dimensions} if isinstance(dimensions, dict) else dimensions for size,dimensions in value["profile"].items()}}
+        return value
+
+    # Calibration remains an internal generator policy, not duplicate UI controls.
+    @property
+    def calibration_attempts(self):
+        return 3
+
+    @property
+    def input_token_tolerance(self):
+        return .1
+
+    @model_validator(mode="after")
+    def selected_work(self):
+        w, p = self.workloads, self.patterns
+        if not any(getattr(w, k).enabled for k in ("combinations", "mixed", "stress", "interference")):
+            load_validation_error(["workloads.combinations.enabled"], "Select at least one workload.")
+        standard = any(getattr(w, k).enabled for k in ("combinations", "mixed", "stress"))
+        if standard and not any(getattr(p, k).enabled for k in ("concurrent", "constant", "poisson", "bursts")):
+            load_validation_error(["patterns.constant.enabled"], "Select a traffic pattern for the selected workloads.")
+        if w.interference.enabled and not any(n >= 2 for n in p.concurrent.levels):
+            load_validation_error(["patterns.concurrent.levels"], "The long-input / short-answer test needs a concurrency level of at least 2.")
+        if standard and p.bursts.enabled and p.bursts.first_seconds >= self.schedule.duration_seconds:
+            load_validation_error(["patterns.bursts.first_seconds", "schedule.duration_seconds"], "The first burst must start before the sending window ends.")
+        return self
+
+
+class MigratedLoadTest(Model):
+    source: Literal["concurrency", "capacity", "arrivals"]
+    settings: LoadTestSettings
+
+
+class LoadTest(LoadTestSettings):
+    # Independent legacy schedules cannot be represented by one shared duration
+    # or profile. Preserve additional tests explicitly rather than blending them.
+    migrated_tests: list[MigratedLoadTest] = Field(default_factory=list, max_length=3)
+
+
+def migrate_load_test(value):
+    """Preserve legacy traffic as separate tests and explain changed semantics."""
+    if not isinstance(value, dict):
+        return value, []
+    value = deepcopy(value)
+    notes = []
+    old_checks = list(value.get("checks", []))
+    older = {"fairness", "buckets", "mixed", "token_stress"}.intersection(old_checks)
+    if older or value.get("concurrent_workloads") or value.get("buckets"):
+        value, earlier_notes = migrate_concurrent_load(value)
+        notes.extend(earlier_notes)
+        old_checks = list(value.get("checks", []))
+    selected = [c for c in old_checks if c in {"concurrency", "capacity", "arrivals"}]
+    if "checks" not in value and value.get("arrivals"):
+        selected.append("arrivals")
+    if not selected:
+        return value, notes
+    converted = []
+    options = value.get("test_options") or {}
+    def plain(v):
+        return v.model_dump(exclude_unset=True) if isinstance(v, BaseModel) else v or {}
+    timeout = value.get("request_timeout_seconds", 30)
+    for check in dict.fromkeys(selected):
+        settings = LoadTestSettings().model_dump()
+        w, patterns = settings["workloads"], settings["patterns"]
+        for k in w:
+            w[k]["enabled"] = False
+        for k in ("concurrent", "constant", "poisson", "bursts"):
+            patterns[k]["enabled"] = False
+        own = plain(options.get(check))
+        settings["request_timeout_seconds"] = own.get("request_timeout_seconds") or timeout
+        settings["schedule"]["finish_seconds"] = settings["request_timeout_seconds"]
+        if check == "concurrency":
+            old_input = plain(value.get("concurrent_load"))
+            explicit_levels = "levels" in plain(old_input.get("schedule"))
+            old = ConcurrentLoad.model_validate(old_input).model_dump()
+            settings["profile"] = old["profile"]
+            w["combinations"] = old["combinations"]
+            shares = old["mixed"]["shares"]
+            w["mixed"].update(enabled=old["mixed"]["enabled"], selected=[s for s,v in shares.items() if v > 0], share_mode="custom", shares=shares)
+            if w["mixed"]["enabled"] and len(w["mixed"]["selected"]) < 2:
+                w["mixed"]["enabled"] = False
+                notes.append("Legacy one-shape mixed workload disabled; mixed traffic requires at least two request shapes.")
+            w["interference"].update(enabled=old["interference"]["enabled"], trigger="after_five_chunks" if old["interference"]["trigger"] == "after_chunks" else "streaming_started", max_slowdown=old["interference"]["max_slowdown"] or 1.5)
+            w["stress"].update(enabled=old["stress"]["enabled"], cases=(["long_short"] if old["stress"]["large_input"] else []) + (["short_long"] if old["stress"]["large_output"] else []), min_output_percent=old["stress"]["min_output_percent"])
+            patterns["concurrent"].update(enabled=True, levels=old["schedule"]["levels"])
+            if not explicit_levels:
+                patterns["concurrent"].pop("levels", None)
+            patterns["poisson"]["seed"] = old["mixed"]["seed"] if old["mixed"]["seed"] is not None else 42
+            settings["schedule"]["duration_seconds"] = old["schedule"]["duration_seconds"]
+            settings["pass_criteria"].update({k: v for k,v in old["pass_criteria"].items() if k in settings["pass_criteria"]})
+            notes.append("Concurrent load migrated to Load test. Finish allowance uses the old request timeout (drain bound). Old p95 limits were not converted to per-response limits; new per-response defaults (2,000 ms first answer / 30,000 ms completion) apply. Review per-response criteria. Old mixed seed is now the shared schedule/mix seed; interference uses full baseline/probe windows and a five-chunk trigger.")
+        elif check == "capacity":
+            old = TrafficConfig.model_validate(plain(value.get("traffic")))
+            patterns["poisson" if old.arrival == "poisson" else "constant"]["enabled"] = True
+            patterns["rates"], patterns["poisson"]["seed"] = old.rates, old.seed
+            settings["schedule"].update(duration_seconds=math.ceil(old.duration_seconds), finish_seconds=old.drain_timeout_seconds)
+            shares = {"short_short": old.mix.short*100, "long_short": old.mix.long_input*100, "short_long": old.mix.long_output*100}
+            shapes = [s for s,v in shares.items() if v > 0]
+            if len(shapes) == 1:
+                w["combinations"].update(enabled=True, selected=shapes)
+            else:
+                # Decimal-safe normalization makes the persisted shares sum exactly 100.
+                shares[shapes[-1]] = float(Decimal(100)-sum(Decimal(str(shares[s])) for s in shapes[:-1]))
+                w["mixed"].update(enabled=True, selected=shapes, share_mode="custom", shares=shares)
+            notes.append(f"Capacity traffic migrated as an independent {old.arrival} test with the equivalent short/long-input/long-output request shares. long_input_chars={old.long_input_chars} and long_output_words={old.long_output_words} were not converted into tokens; review the explicit data profile. max_in_flight dropped: Run limits concurrency ceiling now governs admission. Fractional durations round up to whole seconds.")
+        else:
+            old = Arrival.model_validate(plain(value.get("arrivals")))
+            w["combinations"].update(enabled=True, selected=["short_short"])
+            patterns["poisson"]["seed"] = max(0, old.seed)
+            if old.mode == "steady":
+                patterns["constant"]["enabled"] = True
+                patterns["rates"] = [old.requests_per_second]
+                duration = old.requests / old.requests_per_second
+            else:
+                patterns["bursts"].update(enabled=True, size=old.burst_size, first_seconds=0, gap_seconds=old.interval_seconds)
+                duration = math.ceil(old.requests / old.burst_size)*old.interval_seconds
+            settings["schedule"]["duration_seconds"] = max(1, math.ceil(duration))
+            notes.append(f"Legacy arrivals migrated as a separate {old.mode} test; requests={old.requests} became duration={settings['schedule']['duration_seconds']} seconds (rounded up; final bursts may contain more requests). max_pending and max_in_flight dropped: there is no pending queue; full client slots are local drops under the run ceiling.")
+        # Preserve old common per-response limits where they already had these semantics.
+        if check != "concurrency":
+            limits = {**Limits().model_dump(), **plain(value.get("limits")), **plain(own.get("limits"))}
+            for old_key,new_key in {"first_output_ms":"max_first_answer_ms", "latency_ms":"max_completion_ms", "stream_gap_ms":"max_stream_pause_ms", "min_output_tokens_per_second":"min_generation_tokens_per_second", "min_samples":"min_valid_responses"}.items():
+                if old_key in limits:
+                    settings["pass_criteria"][new_key] = limits[old_key]
+            for old_key,new_key in (("max_error_rate","max_error_percent"),("min_correctness","min_correct_percent")):
+                if old_key in limits:
+                    settings["pass_criteria"][new_key] = limits[old_key]*100
+        converted.append({"source": check, "settings": settings})
+    if "load_test" not in value or "load" not in old_checks:
+        value["load_test"] = converted.pop(0)["settings"]
+    if isinstance(value["load_test"], BaseModel):
+        value["load_test"] = value["load_test"].model_dump()
+    if converted:
+        value["load_test"].setdefault("migrated_tests", []).extend(converted)
+        notes.append("Multiple saved checks remain separate sequential tests in load_test.migrated_tests; their rates, durations and burst schedules are not blended.")
+    value["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks)) if old_checks else list(DEFAULT_CHECKS)
+    value.pop("concurrent_load", None)
+    value.pop("traffic", None)
+    value.pop("arrivals", None)
+    if options:
+        value["test_options"] = {k:v for k,v in options.items() if k not in {"concurrency", "capacity", "arrivals"}}
+    return value, notes
 
 
 class _LegacyBuckets(Model):
@@ -490,6 +774,9 @@ def required_concurrency(config) -> dict[str, Any]:
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
             peak = max([1, *config.consistency.levels])
+        elif check == "load":
+            from giraffe.load_test import required_slots
+            peak = required_slots(config)
         elif check == "concurrency":
             peak = max(config.concurrent_load.schedule.levels)
         by_check[check] = peak
@@ -1031,6 +1318,8 @@ for _check in ("arrivals", "prefix", "sessions", "consistency", "tools"):
     CHECK_LIMIT_FIELDS[_check] = _TRAFFIC_LIMITS - {"min_correctness"}
 CHECK_LIMIT_FIELDS["tools"] = _TRAFFIC_LIMITS - {"min_correctness", "min_samples"}
 CHECK_LIMIT_FIELDS["concurrency"] = set()
+CHECK_OPTION_FIELDS["load"] = set()
+CHECK_LIMIT_FIELDS["load"] = set()
 CHECK_OPTION_FIELDS.pop("fairness", None)
 CHECK_LIMIT_FIELDS.pop("fairness", None)
 
@@ -1524,6 +1813,7 @@ class RunConfig(Model):
     arrivals: Arrival | None = None
     prefix: Prefix | None = None
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
+    load_test: LoadTest = Field(default_factory=LoadTest)
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
@@ -1548,6 +1838,16 @@ class RunConfig(Model):
     limits: Limits = Field(default_factory=Limits)
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     test_options: dict[str, CheckOptions] = Field(default_factory=dict)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def migrate_load_input(cls, value, handler):
+        if isinstance(value, dict):
+            value, notes = migrate_load_test(value)
+            result = handler(value)
+            result._migration_notes = list(dict.fromkeys([*notes, *result._migration_notes]))
+            return result
+        return handler(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -1646,27 +1946,9 @@ class RunConfig(Model):
             proxy = urlsplit(self.proxy)
             if proxy.username or proxy.password:
                 raise ValueError("put proxy credentials in HTTPS_PROXY/HTTP_PROXY, not config")
-        if "concurrency" in self.checks:
-            load = self.concurrent_load
-            prefix = "concurrent_load."
-            def invalid(fields, message):
-                load_validation_error(fields, message)
-            if not any(getattr(load, kind).enabled for kind in ("combinations", "mixed", "interference", "stress")):
-                invalid([prefix + "combinations.enabled"], "Enable at least one load type.")
-            if load.interference.enabled:
-                if not self.stream:
-                    invalid([prefix + "interference.enabled", "stream"], "Long input during an active short stream needs streaming responses. Turn on Streaming.")
-                if min(load.schedule.levels) < 2:
-                    invalid([prefix + "schedule.levels", prefix + "interference.enabled"], "Long input during an active short stream needs at least 2 concurrent requests at every level. Remove level 1 from Concurrency levels.")
-            from giraffe.concurrent_load import running_shapes, context_window
-            for target in self.targets:
-                window, source = context_window(target)
-                if window is not None:
-                    for shape in running_shapes(load):
-                        input_size, output_size = shape.split("_")
-                        if getattr(load.profile, input_size).input_tokens + getattr(load.profile, output_size).output_tokens > window:
-                            invalid([prefix + f"profile.{input_size}.input_tokens"], f"{load_shape_label(shape)} needs more than the known server context window ({window} token{'s' if window != 1 else ''}).")
-        if "concurrency" in self.checks:
+        if "load" in self.checks:
+            from giraffe.load_test import validate_config
+            validate_config(self)
             from giraffe.planning import request_plan
             errors = request_plan(self)["errors"]
             if errors:
@@ -1682,7 +1964,7 @@ class RunConfig(Model):
 
     def validate_active_judges(self) -> None:
         if (self.request_source == "request_pack" and self.request_pack
-                and {"capacity", "correctness"}.intersection(self.checks)
+                and {"load", "capacity", "correctness"}.intersection(self.checks)
                 and any(case.scorer == "judge" for case in self.request_pack.cases)):
             if not self.judging.judges or any(
                 not all(value.strip() for value in (judge.name, judge.url, judge.model))
@@ -1694,6 +1976,8 @@ class RunConfig(Model):
         """Resolve sparse overrides once; suite request settings are defaults."""
         if check_id not in INTERNAL_CHECK_NAMES:
             raise ValueError(f"unsupported check: {check_id}")
+        if check_id == "load":
+            return self.load_test.model_dump(mode="json")
         options = self.test_options.get(check_id, CheckOptions())
         special_defaults = {"backend_verification": "off", "cancel_after_ms": 100, "deadline_probe_ms": 50,
                             "cancel_after_chunks": 5, "cleanup_seconds": 5,
@@ -1824,6 +2108,18 @@ class RunConfig(Model):
                 if not explicit:
                     self.consistency = own.model_copy(update={"levels": sorted(set(self.inherited_concurrency(n) for n in levels))})
                     self.consistency.__pydantic_fields_set__ = own.model_fields_set.copy()
+            elif check == "load":
+                settings = [("load_test.", self.load_test), *[(f"load_test.migrated_tests.{i}.settings.", v.settings) for i,v in enumerate(self.load_test.migrated_tests)]]
+                for prefix, own in settings:
+                    pattern = own.patterns.concurrent
+                    if (pattern.enabled or own.workloads.interference.enabled) and "levels" not in pattern.model_fields_set:
+                        levels = pattern.levels
+                        effective_levels = [n for n in levels if n <= self.inherited_concurrency(max(levels))] or [1]
+                        if levels != effective_levels:
+                            self._concurrency_warnings.append({"fields":[prefix+"patterns.concurrent.levels","concurrency"],"check":"load",
+                                "msg":f"Load test inherits concurrency levels {levels}; the run ceiling allows {effective_levels} per endpoint."})
+                        pattern.levels = effective_levels
+                        pattern.__pydantic_fields_set__.discard("levels")
             elif check == "concurrency":
                 own = self.concurrent_load.schedule
                 explicit = "levels" in own.model_fields_set
@@ -1835,6 +2131,14 @@ class RunConfig(Model):
                     schedule = own.model_copy(update={"levels": effective_levels})
                     schedule.__pydantic_fields_set__ = own.model_fields_set.copy()
                     self.concurrent_load = self.concurrent_load.model_copy(update={"schedule": schedule})
+
+    @field_serializer("load_test")
+    def serialize_load_test(self, value, info):
+        result = value.model_dump(mode=info.mode)
+        for settings, raw in [(value,result), *[(v.settings,raw) for v,raw in zip(value.migrated_tests,[x["settings"] for x in result["migrated_tests"]])]]:
+            if "levels" not in settings.patterns.concurrent.model_fields_set:
+                raw["patterns"]["concurrent"].pop("levels",None)
+        return result
 
     @field_serializer("sessions", "consistency", "concurrent_load")
     def serialize_parallel_defaults(self, value, info):

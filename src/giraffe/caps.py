@@ -89,10 +89,10 @@ def cap_policy(path):
         return label, "product policy", "the measured reliable client-load ceiling"
     if path == "arrivals.max_pending":
         return label, "product policy", "keeping queued dispatch delay visible"
-    if path in {"arrivals.requests_per_second", "traffic.rates"}:
+    if path in {"arrivals.requests_per_second", "traffic.rates", "load_test.patterns.rates"}:
         return label, "implementation constraint", "the arrival scheduler; accepted rates are not demonstrated delivery capacity"
     if name == "duration_seconds":
-        if path.startswith("concurrent_load."):
+        if path.startswith(("concurrent_load.", "load_test.")):
             label = "Sending window (seconds)"
         return label, "product policy", "the length of an individual sending window"
     if ".limits." in path or path.startswith("limits.") or ".pass_criteria." in path:
@@ -103,7 +103,7 @@ def cap_policy(path):
         return label, "software safety bound", "repeated prompt and history generation"
     if path.startswith("consistency."):
         return label, "software safety bound", "repeated requests and comparison evidence"
-    if path.startswith("concurrent_load."):
+    if path.startswith(("concurrent_load.", "load_test.")):
         return label, "software safety bound", "generated payloads, calibration and workload expansion"
     if path.startswith("arrivals."):
         return label, "software safety bound", "memory and scheduling"

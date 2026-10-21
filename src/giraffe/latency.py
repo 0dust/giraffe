@@ -118,7 +118,12 @@ def latency_summary(report: RunReport) -> dict:
             concurrency = parameters.get("concurrency", condition.get("level", record.workload.get("level", 1)))
             if isinstance(ceiling, int) and ceiling > 0:
                 concurrency = min(concurrency, ceiling)
-            key = (condition["check"], concurrency, record.stream, record.requested_max_tokens,
+            family = condition["check"]
+            if record.load_point and record.load_point.get("point_id"):
+                detail = record.load_point
+                concurrency = detail.get("level") or 1
+                family = f"load.{detail['type']}.{detail['pattern']}" + (".bursts" if detail.get("bursts") else "")
+            key = (family, concurrency, record.stream, record.requested_max_tokens,
                    input_bucket(record.input_chars))
             groups[key].append(record.elapsed_ms)
             timings[key].append(record)

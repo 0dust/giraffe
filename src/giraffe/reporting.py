@@ -594,6 +594,29 @@ def _compare_traffic(
     return result
 
 
+def _load_test_html(metrics):
+    parts = ['<h4>Load test</h4><p>Sequential workload × traffic tests. Highest accepted values are highest tested, not absolute capacity limits. Burst overlays are separate from steady-arrival capacity.</p>']
+    if metrics.get("workload_source"):
+        parts.append('<p>Active workload source: '+_e(metrics["workload_source"])+'. '+_e(metrics.get("context_note", ""))+'</p>')
+    for row in metrics.get("highest_accepted", []):
+        parts.append('<p>'+_e(row['workload'])+' · '+_e(row['pattern'])+(' + bursts' if row.get('bursts') else '')+': <strong>'+_e(row['label'])+' '+_e(row['value'])+'</strong> (highest tested).</p>')
+    for point in metrics.get("points", []):
+        from giraffe.load_test import point_label
+        parts.append('<h5>'+_e(point_label(point))+' · '+_e(point.get('status','inconclusive'))+'</h5><p>'+_e(point.get('reason',''))+'</p>')
+        parts.append('<p>Observed concurrency: mean '+_e(point.get('client_mean_inflight'))+', peak '+_e(point.get('client_peak_inflight'))+', streamed evidence '+_e(point.get('server_evidenced_concurrency'))+'. Timing clock: '+_e(point.get('timing_clock','unknown'))+'.</p>')
+        parts.append('<div class="table"><table><tr><th>Request type / delivery</th><th>Completions and evidence</th><th>Timing and throughput</th></tr>')
+        for group in point.get('groups', []):
+            lengths = group.get('lengths', {})
+            parts.append('<tr><td>'+_e(load_shape_label(group['shape']))+'<br>Requested: '+_e(group.get('requested'))+' · scheduled: '+_e(group.get('scheduled'))+' · dispatched: '+_e(group.get('dispatched'))+'<br>Not sent: '+_e(group.get('not_sent'))+' (local drops '+_e(group.get('local_drops'))+', late '+_e(group.get('late_arrivals'))+', not offered '+_e(group.get('not_offered'))+')</td><td>'+_e(group.get('status'))+' · '+_e(group.get('reason'))+'<br>Valid '+_e(group.get('valid'))+' · failed '+_e(group.get('failed'))+' · timeout '+_e(group.get('timed_out'))+' · cancelled '+_e(group.get('cancelled'))+'<br>Error denominator: '+_e(group.get('error_denominator'))+'. '+_e(group.get('error_denominator_description'))+'<br>Scored '+_e(group.get('scored'))+' · correct '+_e(group.get('correct'))+' · unknown judgments '+_e(group.get('unscored'))+'<br>Actual input tokens '+_e(lengths.get('input_tokens'))+'; output tokens '+_e(lengths.get('output_tokens'))+'; unknown input/output '+_e(lengths.get('unknown_input_count'))+'/'+_e(lengths.get('unknown_output_count'))+'. '+_e(lengths.get('input_method'))+'; '+_e(lengths.get('output_method'))+'<br>Coverage: '+_e(group.get('coverage','not required'))+'</td><td>First-answer p50/p95 ms: '+_e(group.get('first_answer_p50_ms'))+'/'+_e(group.get('first_answer_p95_ms'))+'<br>Completion p50/p95 ms: '+_e(group.get('completion_p50_ms'))+'/'+_e(group.get('completion_p95_ms'))+'<br>Longest pause ms '+_e(group.get('longest_stream_pause_ms'))+' · generation tokens/sec '+_e(group.get('generation_tokens_per_second'))+'<br>'+_e(lengths.get('generation_speed_method'))+'<br>Dispatch delay ms '+_e(group.get('dispatch_delay_ms'))+'<br>Completed requests/sec '+_e(group.get('completed_requests_per_second'))+' · aggregate output tokens/sec '+_e(group.get('aggregate_output_tokens_per_second'))+'<br>Correct work meeting limits '+_e(group.get('correct_work_meeting_limits'))+' ('+_e(group.get('correct_work_per_second'))+'/sec)<br>Window '+_e(group.get('throughput_window_seconds'))+' seconds; '+_e(group.get('completed_during_finish'))+' completions during finish allowance. '+_e(group.get('throughput_description'))+'</td></tr>')
+        parts.append('</table></div>')
+        for key,label in (('observed_mix','Observed request shares'),('interference','Short-only vs long-request comparison'),('burst_delivery','Burst delivery and actual spread'),('response_by_origin','Steady-arrival and burst response degradation')):
+            if point.get(key):
+                parts.append('<details><summary>'+label+'</summary><pre>'+_json(point[key])+'</pre></details>')
+    if metrics.get('migration_notes'):
+        parts.append('<p>Configuration migration: '+_e(' '.join(metrics['migration_notes']))+'</p>')
+    return ''.join(parts)
+
+
 def _concurrent_load_html(metrics):
     from giraffe.conditions import condition_for
     def shown(value):
@@ -1349,6 +1372,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "load":
+            metrics = _load_test_html(check.metrics) + metrics
         if check.id == "concurrency" and "load_types" in check.metrics:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
