@@ -79,10 +79,17 @@ def running_shapes(settings):
     )
 
 
-def input_class_bounds(settings, size):
+def input_class_bounds(settings, size, *, floors=None):
     """Adjacent profile targets define inclusive lower/exclusive upper classes."""
     names = ("short", "medium", "long")
-    targets = [getattr(settings.profile, name).input_tokens for name in names]
+    configured = [getattr(settings.profile, name).input_tokens for name in names]
+    targets = [max(target, (floors or {}).get(name, target))
+               for name, target in zip(names, configured)]
+    # A disclosed built-in prompt floor can exceed several configured sizes.
+    # Keep the higher classes distinct using the profile's relative spacing.
+    for i in range(1, len(targets)):
+        if targets[i] <= targets[i - 1]:
+            targets[i] = targets[i - 1] * configured[i] / configured[i - 1]
     index = names.index(size)
     return (
         math.sqrt(targets[index - 1] * targets[index]) if index else None,
@@ -90,13 +97,13 @@ def input_class_bounds(settings, size):
     )
 
 
-def _in_input_class(settings, size, tokens):
-    lower, upper = input_class_bounds(settings, size)
+def _in_input_class(settings, size, tokens, *, floors=None):
+    lower, upper = input_class_bounds(settings, size, floors=floors)
     return tokens is not None and (lower is None or tokens >= lower) and (upper is None or tokens < upper)
 
 
-def _class_label(settings, size):
-    lower, upper = input_class_bounds(settings, size)
+def _class_label(settings, size, *, floors=None):
+    lower, upper = input_class_bounds(settings, size, floors=floors)
     if lower is None:
         return f"{size.title()} < {upper:g}"
     if upper is None:
@@ -104,22 +111,22 @@ def _class_label(settings, size):
     return f"{size.title()} {lower:g}–{upper:g}"
 
 
-def input_qualification(settings, size, records):
+def input_qualification(settings, size, records, *, floors=None):
     # Selection estimates intentionally never enter this measurement evidence.
     valid = [r for r in records if r.valid and r.status == "completed" and not reasoning_budget(r)]
     known = [r.input_tokens for r in valid if r.input_tokens is not None]
-    count = sum(_in_input_class(settings, size, n) for n in known)
+    count = sum(_in_input_class(settings, size, n, floors=floors) for n in known)
     outside = len(known) - count
     percentage = outside / len(known) * 100 if known else None
     qualified = count >= settings.pass_criteria.min_valid_responses and percentage <= 10
     target = getattr(settings.profile, size).input_tokens
     actual = median(known) if known else None
-    lower, upper = input_class_bounds(settings, size)
+    lower, upper = input_class_bounds(settings, size, floors=floors)
     reason = None
     if not known:
         reason = "Input token counts not reported by the endpoint; timing and correctness are shown but capacity is not established"
     elif not qualified:
-        reason = f"{size.title()} input not exercised: actual median {actual:g} tokens, target {target} ({_class_label(settings, size)})"
+        reason = f"{size.title()} input not exercised: actual median {actual:g} tokens, target {target} ({_class_label(settings, size, floors=floors)})"
     return dict(qualified=qualified, size=size, target_tokens=target, lower_bound=lower,
                 upper_bound=upper, known_valid=len(known), in_class=count,
                 out_of_class=outside, out_of_class_percent=percentage,
@@ -1116,7 +1123,7 @@ def measurements(run, target, settings, point, records, shape):
         unattributed_timing_violations=list(set(raw) - set(qualified)),
         missing_timing=sorted(set(missing)),
         lengths=lengths,
-        input_qualification=input_qualification(settings, a, rows),
+        input_qualification=input_qualification(settings, a, rows, floors=point.get("input_class_floors", {}).get("short_answer" if b == "short" else "long_output")),
         completed_during_finish=finish_count,
         throughput_window_seconds=observation,
         sending_window_seconds=sending,
@@ -1165,7 +1172,11 @@ def measurements(run, target, settings, point, records, shape):
             if b == "long"
             else None,
             "threshold_tokens_by_request": thresholds,
-            "input_verified": group["input_qualification"]["in_class"],
+            "input_verified": sum(
+                r.input_tokens is not None
+                and abs(r.input_tokens - target_tokens) <= target_tokens * settings.input_token_tolerance
+                for r in valid
+            ),
             "required": criteria.min_valid_responses,
         }
     return group
@@ -1259,6 +1270,11 @@ def score_group(settings, point, group, records):
         return result("inconclusive", "input_not_verified", qualification["reason"])
     coverage = group.get("coverage")
     if coverage:
+        if group["shape"].startswith("long_") and coverage["input_verified"] < group["valid"]:
+            return result(
+                "inconclusive", "input_not_verified",
+                "Large-input token coverage was not verified for every valid response.",
+            )
         if coverage["output_covered"] is not None and coverage["output_covered"] < group["valid"]:
             return result(
                 "inconclusive",
@@ -1377,11 +1393,11 @@ def assess_point(run, target, settings, point, records):
             phase: input_qualification(settings, "short", [
                 r for r in records if r.load_point.get("phase") == phase
                 and r.load_point.get("role") == "short_stream"
-            ]) for phase in ("baseline", "probe")
+            ], floors=point.get("input_class_floors", {}).get("short_answer")) for phase in ("baseline", "probe")
         }
         evidence["input_qualification"]["long_probe"] = input_qualification(settings, "long", [
             r for r in records if r.load_point.get("role") == "probe"
-        ])
+        ], floors=point.get("input_class_floors", {}).get("short_answer"))
         exercised = (
             exercised
             and len(window_load) == 2
@@ -1548,6 +1564,13 @@ async def execute(run, target, client):
                     )
                 elif any(v["status"] == "inconclusive" for v in cache.values()):
                     point["input_not_calibrated"] = True
+                point["input_class_floors"] = {
+                    variant: {size: value["input_tokens"] for (size, kind), value in cache.items()
+                              if kind == variant and value["status"] == "calibrated"
+                              and value["reason_code"] == "minimum_prompt_length"
+                              and value["input_tokens"] is not None}
+                    for variant in ("short_answer", "long_output")
+                }
             if cancellation is None and not point.get("calibration_failure") and not point.get("input_not_calibrated"):
                 remaining = run.remaining(target.name)
                 reserved = reserved_checks + sum((p["level"] * 2 - 1 if p["type"] == "interference" else p["level"] or 0) for p in points[index + 1:])
