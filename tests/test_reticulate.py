@@ -51,7 +51,7 @@ assert(html.indexOf('data-live-slot="0"')<html.indexOf('data-live-slot="1"'));
 assert(html.indexOf('data-live-slot="1"')<html.indexOf('data-live-slot="2"'));
 assert.equal((html.match(/class="request-spot /g)||[]).length,5);
 assert.equal((html.match(/class="request-spot idle"/g)||[]).length,1);
-assert.match(html,/Budget slot 4: used or reserved, request evidence unavailable/);
+assert.match(html,/Budget slot 4: Reserved, request evidence unavailable/);
 assert.match(html,/Budget slot 5: not used/);
 assert.doesNotMatch(html,/data-request=/);
 """)
