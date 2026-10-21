@@ -58,8 +58,16 @@ def test_bounded_import_and_duplicate_json_keys():
     assert preview_dataset('[{"q":"x","q":"y"}]', "json")["errors"]
 
 
-def test_try_one_preserves_effective_payload_and_ignores_other_draft_models():
+@pytest.mark.parametrize("checks,load_timeout,expected_timeout", [
+    (["load", "correctness"], None, 60),
+    (["load", "correctness"], 7, 7),
+    (["correctness"], None, 2),
+])
+def test_try_one_preserves_effective_payload_and_ignores_other_draft_models(checks, load_timeout, expected_timeout):
     values = judged_config()
+    values["checks"] = checks
+    if load_timeout is not None:
+        values["load_test"]["request_timeout_seconds"] = load_timeout
     values["targets"].append({"name": "unfinished", "url": "http://localhost:8999", "model": ""})
     values["max_output_tokens"] = 24
     values["request_timeout_seconds"] = 2
@@ -71,7 +79,8 @@ def test_try_one_preserves_effective_payload_and_ignores_other_draft_models():
     assert selected.restart_target is None and len(selected.targets) == 1
     assert selected.judging == draft.judging
     assert pack_specs(selected)[0].max_tokens == original.max_tokens == 24
-    assert pack_specs(selected)[0].request_timeout_seconds == original.request_timeout_seconds == 2
+    assert pack_specs(selected)[0].request_timeout_seconds == original.request_timeout_seconds == expected_timeout
+    assert draft.request_timeout_seconds == 2
     assert draft.restart_target == "local" and len(draft.targets) == 2
 
 

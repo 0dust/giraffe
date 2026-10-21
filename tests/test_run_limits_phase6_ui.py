@@ -289,6 +289,10 @@ async def test_a8_a9_actual_conflicts_have_inline_plan_and_focus_destination(tmp
     assert response.status_code == 422, response.text
     errors = response.json()['detail']
     assert any(path in error['fields'] and 'concurrency' in error['fields'] for error in errors)
+    if path == 'load_test.patterns.concurrent.levels':
+        error, = errors
+        assert error['msg'] == 'Concurrency levels exceed the run ceiling: 64 > 40. Update Run limits or lower the levels.'
+        assert error['values'] == {path: [1, 64], 'concurrency': 40}
     base = RunConfig(targets=values['targets'], checks=[check], concurrency=ceiling)
     browser_logic(r"""
 const errors=ERRORS,path=PATH;state.jsonDraft=state.jsonBase='synced';
@@ -448,13 +452,21 @@ async def test_a12_a17_json_conflict_and_duration_correction_share_form_api_data
         rejected=await client.post('/api/config/draft',json=invalid)
         accepted=await client.post('/api/config/draft',json=cfg.model_dump(mode='json'))
     assert rejected.status_code==422 and accepted.status_code==200
+    error, = rejected.json()['detail']
+    assert error['values']['planned_arrivals'] == 900000
+    assert error['values']['maximum_planned_arrivals'] == 100000
+    assert error['values']['longest_stage_seconds'] == 400
+    assert error['actions'] == [
+        {'label': 'Use 400 seconds', 'field': 'load_test.schedule.duration_seconds', 'value': 400},
+        {'label': 'Edit Rates (requests/second)', 'field': 'load_test.patterns.rates'},
+    ]
     browser_logic('const errors='+json.dumps(rejected.json()['detail'])+',valid='+json.dumps(accepted.json())+',invalid='+json.dumps(invalid)+r''';
 state.configView='json';state.jsonBase=JSON.stringify(config);state.jsonDraft=JSON.stringify(invalid);
 const editor={dataset:{},attributes:{},getAttribute(k){return this.attributes[k]||'';},setAttribute(k,v){this.attributes[k]=v;},removeAttribute(k){delete this.attributes[k];},focus(){this.focused=true;}};nodes['#config-editor']=editor;nodes['#field-config_editor-error']={};nodes['#request-plan']={};nodes['#config-error']={};
 readForm=()=>({config:structuredClone(state.config)});captureFormDraft=invalidateModelDiscovery=toast=()=>{};
 renderNew=()=>{state.jsonDraft=state.jsonBase=JSON.stringify(state.config);editor.value=state.jsonDraft;};
 let sent=0;api=async(path,options)=>{sent++;const body=JSON.parse(options.body);if(body.load_test.schedule.duration_seconds===3600)throw Object.assign(Error(errors[0].msg),{errors});return valid;};
-await applyConfig();assert.equal(sent,1);assert.equal(hasJsonChanges(),true);assert.equal(canStartRun(),false);assert.equal(editor.attributes['aria-invalid'],'true');assert.match(nodes['#field-config_editor-error'].textContent,/finite planned-arrival safety bound/);
+await applyConfig();assert.equal(sent,1);assert.equal(hasJsonChanges(),true);assert.equal(canStartRun(),false);assert.equal(editor.attributes['aria-invalid'],'true');assert.equal(nodes['#field-config_editor-error'].textContent,errors[0].msg);assert.match(nodes['#field-config_editor-error'].textContent,/900,000 planned arrivals.*at most 100,000.*longest stage is 400 seconds/);
 focusSetting('load_test.patterns.rates');assert(editor.focused);assert.equal(state.configView,'json');
 state.jsonDraft=JSON.stringify(valid.config);await applyConfig();assert.equal(sent,2);assert.equal(state.config.load_test.schedule.duration_seconds,400);assert.equal(hasJsonChanges(),false);assert.equal(currentRequestPlan(),null);
 await refreshRequestPreview(undefined,{draft:true});assert.equal(canStartRun(),true);assert.equal(currentSettingErrors().length,0);assert.equal(editor.attributes['aria-invalid'],undefined);

@@ -293,7 +293,7 @@ async def test_bounded_arrivals_report_unissued_and_actual_dispatch(mode):
         short_windows(settings,.012 if mode == 'steady' else .01)
         report=await run_suite(settings)
     p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
-    rows=[r for r in report.requests if r.load_point.get('point_id') == p['id']]
+    rows=[r for r in report.requests if (r.load_point or {}).get('point_id') == p['id']]
     assert p['scheduled'] == 12 and p['dispatched'] == len(rows) < 12
     assert p['dispatched'] + p['not_sent'] == 12 and p['local_drops'] > 0
     assert all(r.scheduled_ms is not None and r.dispatch_ms >= r.scheduled_ms and r.completed_ms >= r.dispatch_ms for r in rows)

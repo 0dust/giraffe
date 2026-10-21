@@ -141,7 +141,9 @@ def try_example_config(draft: ConfigDraft, fixture_id: str, target_name: str) ->
         raise ValueError("Choose an existing dataset example")
     if target is None:
         raise ValueError("Choose an existing target")
-    consumer = "capacity" if "capacity" in draft.checks else "correctness"
+    # The loaded pass owns a shared pack request. Preserve its effective
+    # timeout rather than falling back to the suite default when projecting it.
+    consumer = "load" if "load" in draft.checks else "capacity" if "capacity" in draft.checks else "correctness"
     effective = draft.effective_check(consumer)
     values = draft.model_dump(mode="json")
     selected_target = target.model_dump(mode="json")
@@ -152,5 +154,5 @@ def try_example_config(draft: ConfigDraft, fixture_id: str, target_name: str) ->
                   request_pack={"version": 1, "cases": [case.model_dump(mode="json")]},
                   max_output_tokens=effective.get("max_output_tokens", draft.max_output_tokens),
                   request_timeout_seconds=effective.get("request_timeout_seconds", draft.request_timeout_seconds),
-                  limits=effective["limits"], test_options={})
+                  limits=draft.effective_check("correctness")["limits"], test_options={})
     return RunConfig.model_validate(values)

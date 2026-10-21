@@ -15,14 +15,21 @@ def client(monkeypatch):
 @pytest.mark.parametrize("capacity", [True, False])
 async def test_pack_loaded_wrong_answers_fail_correctness(client, monkeypatch, capacity):
     original = client.execute
+    injected = []
     async def loaded_wrong(self, spec, **kwargs):
         record = await original(self, spec, **kwargs)
-        if spec.scenario.startswith("traffic_stage_") or spec.scenario == "pack_loaded":
+        if spec.load_point or spec.scenario == "pack_loaded":
             record.output = "wrong"
+            injected.append(record.id)
         return record
     monkeypatch.setattr(client, "execute", loaded_wrong)
+    # A client scheduling problem can invalidate overlap/timing attribution,
+    # but it cannot make an observed wrong answer unknown.
+    monkeypatch.setattr(runner, "max_evidenced_overlap", lambda *args: 1)
     report = await runner.run_suite(pack_config(checks=["correctness", *(["capacity"] if capacity else [])]))
     result = check(report, "correctness")
+    assert injected
+    assert all(record.score is False for record in report.requests if record.id in injected)
     assert result.status == "fail"
     assert result.metrics["request_pack"]["control_status"] == "pass"
     assert result.metrics["request_pack"]["loaded_status"] == "fail"

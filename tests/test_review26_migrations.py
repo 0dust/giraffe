@@ -101,7 +101,7 @@ def test_inherited_load_overlap_error_reports_effective_level_and_levels_field()
                   overlap_models=True, concurrency=1)
     detail = error.value.errors()[0]
     assert detail["ctx"]["fields"] == ["load_test.patterns.concurrent.levels", "concurrency"]
-    assert detail["msg"] == "Concurrency 1 × 2 endpoints exceeds the run ceiling (1). Update Run limits or lower the levels."
+    assert detail["msg"] == "Concurrency levels exceed the run ceiling: 1 × 2 endpoints > 1. Update Run limits or lower the levels."
     assert detail["ctx"]["values"] == {"load_test.patterns.concurrent.levels": [1], "concurrency": 1}
 
 

@@ -507,6 +507,120 @@ def _traffic_metrics(report: RunReport, target: str) -> dict[str, Any] | None:
                  and "traffic_stages" in check.metrics), None)
 
 
+def _compare_load_tests(
+    report: RunReport, baseline: RunReport, target: str, reasons: list[str],
+) -> dict[str, Any] | None:
+    """Compare qualification at each tested load, separately from metric sampling.
+
+    Losing a previously passing rate/level is direct acceptance evidence. It
+    does not need enough samples to bootstrap every optional timing metric.
+    An incomplete or client-limited cohort cannot establish that loss.
+    """
+    def metrics(run):
+        return next((check.metrics for check in run.checks
+                     if check.id == "load" and check.target == target), None)
+
+    current, old = metrics(report), metrics(baseline)
+    if current is None and old is None:
+        return None
+    result = {
+        "status": "inconclusive", "reason": "", "points": [],
+        "current_highest_accepted": (current or {}).get("highest_accepted", []),
+        "baseline_highest_accepted": (old or {}).get("highest_accepted", []),
+        "method": "Matched workload, source, traffic pattern, overlays and tested level/rate; "
+                  "qualification outcomes are distinct from statistical metric comparisons.",
+    }
+    if reasons:
+        result["reason"] = "Load test comparison is unavailable: " + " ".join(reasons)
+        return result
+    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
+        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline."
+        return result
+    if current is None or old is None:
+        result["reason"] = "One run lacks final Load test evidence."
+        return result
+    if all(value.get("points") and all(point.get("pattern") == "interference"
+                                       for point in value["points"])
+           for value in (current, old)):
+        return None  # Short-stream comparisons use their separate baseline/probe metric cohorts.
+
+    def key(point):
+        return tuple(point.get(name) for name in
+                     ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts"))
+
+    def points(value):
+        return {key(point): point for point in value.get("points", [])
+                if point.get("pattern") != "interference"}
+
+    def complete(point):
+        return (point is not None and point.get("status") in {"pass", "fail"}
+                and point.get("dispatched", 0) > 0
+                and not any(point.get(name) for name in
+                            ("not_run", "cut_short", "schedule_overflow", "not_sent", "cancelled"))
+                and (point.get("scheduled") is None
+                     or point["scheduled"] == point["dispatched"])
+                and bool(point.get("groups"))
+                and all(group.get("status") in {"pass", "fail"} for group in point["groups"]))
+
+    def snapshot(point):
+        if point is None:
+            return None
+        return {**{name: point.get(name) for name in (
+            "id", "source", "type", "workload", "shape", "pattern", "level", "rate", "bursts",
+            "status", "reason", "reason_code", "dispatched", "scheduled", "not_sent", "cancelled",
+            "cut_short", "not_run")},
+            "groups": [{name: group.get(name) for name in ("shape", "status", "reason_code", "reason")}
+                       for group in point.get("groups", [])]}
+
+    def requested_work(run, point):
+        ids = set(point.get("request_ids", []))
+        records = [record for record in run.requests if record.target == target and record.id in ids]
+        if len(records) != point["dispatched"] or len(ids) != point["dispatched"]:
+            return None
+        cohorts = defaultdict(Counter)
+        for record in records:
+            shape = (record.load_point or {}).get("shape")
+            cohorts[shape][(record.fixture_id, record.input_chars, record.requested_max_tokens, record.stream)] += 1
+        return {shape: {work: Fraction(count, sum(counts.values())) for work, count in counts.items()}
+                for shape, counts in cohorts.items()}
+
+    current_points, old_points = points(current), points(old)
+    for cohort in dict.fromkeys([*old_points, *current_points]):
+        point, previous = current_points.get(cohort), old_points.get(cohort)
+        row = {
+            "current": snapshot(point), "baseline": snapshot(previous),
+            "status": "inconclusive", "reason": "Incomplete or client-limited load evidence.",
+            "evidence_ids": (point or {}).get("request_ids", []),
+        }
+        if complete(point) and complete(previous):
+            current_shapes = {group["shape"] for group in point["groups"]}
+            old_shapes = {group["shape"] for group in previous["groups"]}
+            if current_shapes == old_shapes:
+                current_work = requested_work(report, point)
+                old_work = requested_work(baseline, previous)
+                if current_work is None or old_work is None:
+                    row["reason"] = "Dispatched request metadata is incomplete."
+                elif current_work != old_work:
+                    row["reason"] = "Requested work or request-shape proportions differ."
+                elif previous["status"] == "pass" and point["status"] == "fail":
+                    row.update(status="fail", reason="This previously acceptable tested load now fails its configured criteria.")
+                else:
+                    row.update(status="pass", reason="No loss of previously acceptable load at this tested level/rate.")
+            else:
+                row["reason"] = "Result-group shapes differ."
+        result["points"].append(row)
+    failures = [row for row in result["points"] if row["status"] == "fail"]
+    if failures:
+        result.update(status="fail", reason=f"{len(failures)} previously acceptable tested load(s) now fail.")
+    elif not result["points"] or any(row["status"] == "inconclusive" for row in result["points"]):
+        result["reason"] = "Incomplete or client-limited tests prevent a load acceptance comparison."
+    elif not any(point["status"] == "pass" for point in old_points.values()):
+        result["reason"] = "The baseline established no acceptable tested load."
+    else:
+        result.update(status="pass", reason="Previously acceptable tested loads remain acceptable.")
+    return result
+
+
 def _compare_traffic(
     report: RunReport, baseline: RunReport, target: str, reasons: list[str], threshold: float,
 ) -> dict[str, Any] | None:
@@ -758,6 +872,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
         traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
+        load_tests = _compare_load_tests(report, baseline, name, target_reasons)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
         if (not current_groups or not old_groups) and traffic is None:
             target_reasons.append("Measured request samples are absent from one or both runs.")
@@ -814,10 +929,13 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         missing_measurements = [row for row in rows if "worsening" not in row and
                                 max(row["current_samples"], row["baseline_samples"]) >= minimum]
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
-        if failures or traffic_failures:
+        load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
+        if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
                        f"{len(traffic_failures)} lost acceptable traffic rate(s) against {baseline.run_id}.")
+            if load_failures:
+                summary += f" {len(load_failures)} previously acceptable tested load(s) now fail."
             if target_reasons:
                 summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
         elif target_reasons:
@@ -826,7 +944,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         elif traffic is not None and traffic["status"] == "inconclusive":
             status = "inconclusive"
             summary = traffic["reason"]
-        elif (not assessed and traffic is None) or uncertain or missing_measurements:
+        elif load_tests is not None and load_tests["status"] == "inconclusive":
+            status = "inconclusive"
+            summary = load_tests["reason"]
+        elif (not assessed and traffic is None and load_tests is None) or uncertain or missing_measurements:
             status = "inconclusive"
             if not assessed:
                 summary = "No metric has enough comparable samples."
@@ -857,14 +978,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                  "comparisons": rows}
         if traffic is not None:
             entry["traffic_capacity"] = traffic
+        if load_tests is not None:
+            entry["load_test"] = load_tests
         comparison["targets"].append(entry)
         result.checks.append(CheckResult(
             id="baseline", target=name, title="Baseline comparison", required=True,
             status=status, summary=summary,
             metrics={"compared_metrics": len(assessed), "excluded_metrics": excluded,
-                     "regressions": len(failures) + len(traffic_failures),
+                     "regressions": len(failures) + len(traffic_failures) + len(load_failures),
                      "baseline_run_id": baseline.run_id},
-            evidence_ids=list(dict.fromkeys(rid for row in failures + traffic_failures
+            evidence_ids=list(dict.fromkeys(rid for row in failures + traffic_failures + load_failures
                                             for rid in row["evidence_ids"])),
         ))
     baseline_checks = [check for check in result.checks if check.id == "baseline"]
@@ -1304,6 +1427,25 @@ def _traffic_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _load_baseline_html(target: dict[str, Any]) -> str:
+    from .load_test import point_label
+
+    comparison = target["load_test"]
+    parts = [f'<h3>{_e(target["target"])} — tested load acceptance</h3>',
+             f'<p>{_badge(comparison["status"])} {_e(comparison["reason"])}</p>']
+    if comparison["points"]:
+        parts.append('<div class="table"><table><tr><th>Tested load</th>'
+                     '<th>Baseline / current</th><th>Finding</th></tr>')
+        for row in comparison["points"]:
+            before, after = row["baseline"], row["current"]
+            parts.append(f'<tr><td>{_e(point_label(after or before))}</td>'
+                         f'<td>{_badge((before or {}).get("status", "inconclusive"))} / '
+                         f'{_badge((after or {}).get("status", "inconclusive"))}</td>'
+                         f'<td>{_badge(row["status"])} {_e(row["reason"])}</td></tr>')
+        parts.append('</table></div>')
+    return "".join(parts)
+
+
 def _render(report: RunReport) -> str:
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
@@ -1465,6 +1607,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
         for target in report.baseline.get("targets", []):
             if "traffic_capacity" in target:
                 parts.append(_traffic_baseline_html(target))
+            if "load_test" in target:
+                parts.append(_load_baseline_html(target))
         parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
                      f'<pre>{_json(report.baseline)}</pre></details>')
     else:

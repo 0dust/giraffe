@@ -382,7 +382,7 @@ def validate_config(config):
         ):
             load_validation_error(
                 fields,
-                f"Concurrency {max(levels)}" + (f" × {len(config.targets)} endpoints" if config.overlap_models else "") + f" exceeds the run ceiling ({config.concurrency}). Update Run limits or lower the levels.",
+                f"Concurrency levels exceed the run ceiling: {max(levels)}" + (f" × {len(config.targets)} endpoints" if config.overlap_models else "") + f" > {config.concurrency}. Update Run limits or lower the levels.",
                 values={prefix + "patterns.concurrent.levels": levels, "concurrency": config.concurrency},
             )
         standard = any(
@@ -1463,7 +1463,7 @@ async def execute(run, target, client):
                 except asyncio.CancelledError as exc:
                     cancellation = exc
                     point.update(cut_short=True, not_run=False, window_reason=run.stop_reason(target.name) or "execution cancelled")
-                    records = [r for r in run.records if r.target == target.name and r.load_point.get("point_id") == point["id"]]
+                    records = [r for r in run.records if r.target == target.name and (r.load_point or {}).get("point_id") == point["id"]]
         else:
             point.update(cut_short=True, window_reason=run.condition_reason(target.name))
         assess_point(run, target, cfg, point, records)

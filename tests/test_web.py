@@ -27,7 +27,7 @@ async def test_config_conflicts_include_fields_and_safe_values(tmp_path, endpoin
     assert error["field"] == "load_test.patterns.concurrent.levels"
     assert error["fields"] == ["load_test.patterns.concurrent.levels", "concurrency"]
     assert error["values"] == {"load_test.patterns.concurrent.levels": [1, 64], "concurrency": 40}
-    assert error["msg"] == "Concurrency 64 exceeds the run ceiling (40). Update Run limits or lower the levels."
+    assert error["msg"] == "Concurrency levels exceed the run ceiling: 64 > 40. Update Run limits or lower the levels."
 
 
 @pytest.mark.parametrize("endpoint", ["preview", "validate"])

@@ -32,7 +32,25 @@ def capacity(report):
 
 
 def traffic_records(report):
-    return [r for r in report.requests if r.load_point.get('type') not in {None,'calibration'}]
+    return [r for r in report.requests if (r.load_point or {}).get('type') not in {None,'calibration'}]
+
+
+def test_fake_endpoint_long_output_uses_final_token_prompt_and_preserves_faults():
+    from giraffe.concurrent_load import prompt
+    text = prompt(32, 'long_output')
+    output = FakeEndpoint._continue_numbered_list(text, FakeEndpoint._answer(text), 32)
+    assert output.split() == ['K7P4', *map(str, range(1, 33))]
+    assert FakeEndpoint._continue_numbered_list(text, 'INCORRECT', 32) == 'INCORRECT'
+    short = prompt(32, 'short_answer')
+    assert FakeEndpoint._continue_numbered_list(short, FakeEndpoint._answer(short), 32) == 'K7P4'
+
+
+def test_traffic_records_excludes_optional_metadata_on_quiet_and_other_check_records():
+    from types import SimpleNamespace
+    quiet = SimpleNamespace(load_point=None)
+    calibration = SimpleNamespace(load_point={'type': 'calibration'})
+    loaded = SimpleNamespace(load_point={'type': 'combinations', 'point_id': 'loaded'})
+    assert traffic_records(SimpleNamespace(requests=[quiet, calibration, loaded])) == [loaded]
 
 
 async def test_arrivals_reach_http_server_before_prior_requests_complete():

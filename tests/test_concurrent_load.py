@@ -442,7 +442,10 @@ async def test_socket_endpoint_load_integration():
         c = short_windows(configuration(targets=[{**TARGET, 'url': endpoint.url}]))
         report = await run_suite(c)
     check = next(x for x in report.checks if x.id == 'load')
-    assert check.metrics['points'][0]['sent'] > 2
+    point = check.metrics['points'][0]
+    assert point['dispatched'] > 2
+    assert len(point['request_ids']) == point['dispatched']
+    assert point['not_sent'] == point['cancelled'] == 0
     assert report.requests[0].scenario.startswith('load_calibration_')
 
 
@@ -597,6 +600,9 @@ async def test_cancelling_executor_finalizes_inflight_and_unreached_points():
             return await super().execute(spec, **kwargs)
     c = short_windows(configuration(load={'schedule': {'levels': [2]}, 'combinations': {'selected': ['short_short', 'long_short']}}))
     run, client = _Run(c, None, None), Paused()
+    run.records.append(RequestRecord(id='quiet', target='local', fixture_id='pack:quiet',
+        scenario='pack_control', check_ids=['correctness'], started_at='now',
+        status='completed', valid=True, score=True, load_point=None))
     task = asyncio.create_task(execute(run, c.targets[0], client))
     await asyncio.wait_for(client.sent.wait(), 1)
     task.cancel()
@@ -606,6 +612,7 @@ async def test_cancelling_executor_finalizes_inflight_and_unreached_points():
     assert rows[0]['cancelled'] == rows[0]['dispatched'] > 0
     assert rows[0]['groups'][0]['error_percent'] == 0 and rows[0]['status'] == 'inconclusive'
     assert rows[1]['not_run'] and rows[1]['status'] == 'inconclusive'
+    assert run.records[0].id == 'quiet' and run.records[0].load_point is None
 
 
 async def test_partial_point_failure_is_scored_when_executor_is_interrupted():
