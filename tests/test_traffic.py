@@ -138,7 +138,10 @@ async def test_local_ceiling_drops_arrivals_without_waiting_or_exceeding_bound()
 
 async def test_budget_exhaustion_counts_exact_remainder_and_drains_admitted_requests():
     harness = Harness(budget=2, delay=.07)
-    result = await harness.run(profile(rates=[20], duration_seconds=.2))
+    drops = []
+    result = await harness.run(profile(rates=[20], duration_seconds=.2),
+                               on_drop=lambda: drops.append(harness.budget))
+    assert drops == []
     assert result["scheduled"] == 4
     assert result["started"] == result["completed"] == result["not_offered"] == 2
     assert result["good_fraction"] == .5
@@ -149,7 +152,10 @@ async def test_stop_cancels_active_tasks_and_preserves_exact_plan():
     harness = Harness(delay=1)
     harness.on_start = lambda: setattr(harness, "stop", "Stopped by user.")
     start = time.monotonic()
-    result = await harness.run(profile(duration_seconds=.2))
+    drops = []
+    result = await harness.run(profile(duration_seconds=.2),
+                               on_drop=lambda: drops.append(harness.budget))
+    assert drops == []
     assert time.monotonic() - start < .2
     assert result["started"] == result["cancelled"] == 1
     assert result["not_offered"] == result["scheduled"] - 1
@@ -185,8 +191,10 @@ async def test_cancellation_before_request_coroutine_starts_still_releases_slot(
 
     monkeypatch.setattr(traffic.asyncio, "create_task", cancel_before_start)
     harness = Harness()
-    result = await harness.run()
+    drops = []
+    result = await harness.run(on_drop=lambda: drops.append(harness.budget))
     assert result["not_offered"] == result["scheduled"] and result["started"] == 0
+    assert len(drops) == 100 - harness.budget == result["scheduled"]
 
 
 async def test_monitor_cancellation_during_stop_cleanup_keeps_partial_stage():
@@ -298,8 +306,10 @@ async def test_callback_that_does_not_start_request_releases_reserved_slot():
         return None
 
     harness.execute = no_request
-    result = await harness.run()
+    drops = []
+    result = await harness.run(on_drop=lambda: drops.append(harness.budget))
     assert result["not_offered"] == result["scheduled"] and result["started"] == 0
+    assert len(drops) == 100 - harness.budget == result["scheduled"]
 
 
 async def test_escaped_callback_failure_is_not_reported_as_success():
@@ -462,3 +472,21 @@ async def test_incomplete_judgements_fail_only_when_remaining_votes_cannot_meet_
     assert ("Known-answer correctness was below the required fraction." in result["reasons"]) is (
         (10 - wrong) / 10 < minimum
     )
+
+
+@pytest.mark.parametrize("kind", ["local", "late"])
+async def test_reserved_offers_dropped_before_sending_notify_live_progress(monkeypatch, kind):
+    schedule = [(0, "short"), (.01, "short"), (.02, "short")]
+    monkeypatch.setattr(traffic, "arrival_schedule", lambda *_: (schedule, False))
+    harness = Harness(slots=0 if kind == "local" else 1)
+    drops = []
+    if kind == "late":
+        def late_reservation():
+            time.sleep(.025)
+            return Harness.reserve(harness)
+        harness.reserve = late_reservation
+    result = await harness.run(profile(scheduler_lag_tolerance_ms=1 if kind == "late" else 100),
+                               on_drop=lambda: drops.append(harness.budget))
+    expected = result["dropped_local"] + result["dropped_late"]
+    assert len(drops) == expected > 0
+    assert not harness.starts

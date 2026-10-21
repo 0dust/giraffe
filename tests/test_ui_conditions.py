@@ -73,18 +73,18 @@ assert.match(html,/request-mosaic is-live/);assert.match(html,/data-live-slot="0
 """)
 
 
-def test_closed_condition_spots_are_cached_and_refreshed_when_opened():
+def test_closed_condition_spots_stay_current_without_running_after_completion():
     run_render_checks(r"""
 state.detail={id:'cached',state:'running'};
 const record={slot:0,target:'local',scenario:'warm',status:'running'};
 let html=renderTests([record],{live:true});
 assert.match(html,/class="request-spot running"/);
 record.status='timeout';html=renderTests([record],{live:true});
-assert.match(html,/1 of 1 requests failed/);assert.match(html,/class="request-spot running"/);
+assert.match(html,/1 of 1 requests failed/);assert.match(html,/class="request-spot timeout"/);assert.doesNotMatch(html,/class="request-spot running"/);
 const key=[...conditionViews.keys()][0],content={innerHTML:''};
 const disclosure={open:true,dataset:{conditionKey:key},matches:s=>s==='.condition-requests',querySelector:()=>content};
-listeners.toggle({target:disclosure});assert.match(content.innerHTML,/class="request-spot fail"/);
-html=renderTests([record],{live:true});assert.match(html,/<details class="condition-requests"[^>]* open>/);assert.match(html,/class="request-spot fail"/);
+listeners.toggle({target:disclosure});assert.match(content.innerHTML,/class="request-spot timeout"/);
+html=renderTests([record],{live:true});assert.match(html,/<details class="condition-requests"[^>]* open>/);assert.match(html,/class="request-spot timeout"/);
 """)
 
 
@@ -212,7 +212,7 @@ assert.equal((html.match(/class="test-condition"/g)||[]).length,54);
 assert.equal((html.match(/class="test-check"/g)||[]).length,1);
 assert.equal((html.match(/class="test-level"/g)||[]).length,6);
 assert.match(html,/<h4 class="test-level">32 at once<\/h4>/);
-assert.equal((html.match(/class="condition-status">Waiting/g)||[]).length,54);
+assert.equal((html.match(/class="condition-status"[^>]*><span[^>]*>○<\/span> Waiting/g)||[]).length,54);
 assert.match(html,/Started 0\/up to 8 · Failed 0 · Not started 8/);
 const card=html.match(/<article class="test-condition"[\s\S]*?<\/article>/)[0];
 assert(card.indexOf('class="condition-counts"')>card.indexOf('<details class="condition-requests"'));
@@ -254,3 +254,116 @@ assert.match(html,/<details class="condition-count-help" open>/);
 state.detail.id='different-run';html=renderTests([],{live:true});
 assert.doesNotMatch(html,/<details class="condition-count-help" open>/);
 """)
+
+
+def test_live_polls_preserve_nodes_and_land_new_terminal_items_only_once():
+    run_render_checks(r"""
+(async()=>{
+const config={targets:[{name:'local',model:'test'}],max_requests:300};
+const first={slot:0,id:'done',target:'local',scenario:'warm',status:'completed',valid:true,score:true};
+const pending={slot:1,id:'pending',target:'local',scenario:'warm',status:'running'};
+const condition={target:'local',condition:{id:'warm',label:'Warm-up',check:'serving'},status:'running',planned:2,started:2,running:1,completed:1};
+state.detail={id:'live',state:'running',config,live_requests:[first,pending],live_conditions:[condition],phases:[{event:'scenario_started',scenario:'warm',target:'local',elapsed_seconds:0}]};
+state.runs=[{id:'live',state:'running',targets:config.targets}];renderRailRuns();renderDetail();
+const main=$('#main'),finished=$('.request-mosaic [data-live-slot="0"]'),running=$('.request-mosaic [data-live-slot="1"]'),polygon=$('polygon',running),card=$('.test-condition'),status=$('.condition-status'),badgeNode=$('.live-state .status'),phase=$('.phase-mark'),heading=$('h1'),rail=$('.status-spot'),active=$('#active-run-link .status');
+const details=$('.condition-requests');details.open=true;listeners.toggle({target:details});
+$('.all-requests').open=true;listeners.toggle({target:$('.all-requests')});
+const conditionSpot=$('[data-live-slot="1"]',details);conditionSpot.setAttribute('tabindex','0');conditionSpot.focus({preventScroll:true});
+const scroller=$('.mosaic-scroll',details);scroller.scrollTop=51;scroller.scrollLeft=29;window.scrollY=390;
+let next=structuredClone(state.detail);api=async path=>path==='/api/runs'?{runs:state.runs,active_run_id:'live'}:path==='/api/storage'?{}:structuredClone(next);
+await pollDetail(state.routeVersion);
+assert.equal(main.writes,1,'poll must not replace #main');
+for(const [selector,node] of [['.test-condition',card],['.condition-status',status],['.live-state .status',badgeNode],['.phase-mark',phase],['h1',heading],['.request-mosaic [data-live-slot="0"]',finished],['.request-mosaic [data-live-slot="1"]',running]])assert.equal($(selector),node,selector+' must retain identity');
+assert.equal($('polygon',running),polygon);assert(!finished.classList.contains('is-landing'));
+assert.equal(document.activeElement,conditionSpot);assert(details.open);assert($('.all-requests').open);assert.equal(scroller.scrollTop,51);assert.equal(scroller.scrollLeft,29);assert.equal(window.scrollY,390);assert.equal(state.mosaicFollow,true);assert.match(main.textContent,/Following live/);
+renderRailRuns();setActive('live');assert.equal($('.status-spot'),rail);assert.equal($('#active-run-link .status'),active);
+next.live_requests[1]={...pending,status:'timeout'};next.live_conditions[0]={...condition,status:'finished',completed:2,running:0,failed:1};
+await pollDetail(state.routeVersion);
+assert.equal($('.request-mosaic [data-live-slot="1"]'),running);assert(running.classList.contains('timeout'));assert.equal(running.animationCalls.length,1);assert.equal(conditionSpot.animationCalls.length,1);assert.equal(status.animationCalls.length,1);assert.equal($$('.is-landing').length,0);
+const landed=landedItems.size;assert(landed>=3);
+for(const animation of document.body.getAnimations({subtree:true}))animation.finish();await Promise.resolve();
+await pollDetail(state.routeVersion);
+assert.equal(landedItems.size,landed);assert.equal($$('.is-landing').length,0);assert.equal($('.request-mosaic [data-live-slot="0"]'),finished);assert.equal($('.condition-status'),status);
+// A correction of terminal evidence, or paging away and back, must not replay landing.
+next.live_requests[1]={...pending,status:'completed',valid:true,score:true};await pollDetail(state.routeVersion);assert.equal($$('.is-landing').length,0);
+state.mosaicFollow=false;state.mosaicPage=1;renderDetail();state.mosaicPage=0;renderDetail();assert.equal($$('.is-landing').length,0);assert.equal(state.mosaicFollow,false);
+})()
+""", dom=True)
+
+
+def test_final_poll_and_saved_reopen_leave_no_active_or_animation_classes():
+    run_render_checks(r"""
+(async()=>{
+const config={targets:[{name:'local',model:'test'}],max_requests:4};
+for(const terminal of ['completed','failed','cancelled','interrupted','error']){
+  const id='ended-'+terminal,stale={id:'stale',slot:0,target:'local',scenario:'warm',status:'running'};
+  state.detail={id,state:'running',config,live_requests:[stale]};state.runs=[{id,state:'running',targets:config.targets}];renderRailRuns();renderDetail();openLiveRequest(0);
+  const result=report([check('serving','running')],{requests:[stale]});
+  api=async path=>path==='/api/runs'?{runs:state.runs,active_run_id:id}:path==='/api/storage'?{}:{id,state:terminal,report:result};
+  await pollDetail(state.routeVersion);
+  for(const name of ['running','queued','stopping','is-live','is-landing','is-entering'])assert.equal($$('.'+name).length,0,terminal+' retains '+name);
+  assert.equal(document.body.getAnimations({subtree:true}).length,0);assert.equal(state.active,null);assert($('#active-run-link').hidden);assert.equal($('#active-run-link').innerHTML,'');assert.doesNotMatch(document.title,/In progress/);assert(!$('#request-dialog').open);
+  renderDetail();assert.equal($$('.is-entering').length,0);
+  // Fresh saved view, including malformed unfinished evidence.
+  state.enteredRun=null;state.mosaicAnimated=null;state.liveRendered=null;renderDetail();
+  for(const name of ['running','queued','stopping','is-live','is-landing'])assert.equal($$('.'+name).length,0);
+  renderDetail();assert.equal($$('.is-entering').length,0);
+}
+})()
+""", dom=True)
+
+
+def test_cancelled_landing_and_reduced_motion_do_not_replay_terminal_animation():
+    run_render_checks(r"""
+(async()=>{
+state.detail={id:'motion',state:'running',config:{targets:[],max_requests:1},live_requests:[{slot:0,status:'running'}]};
+renderLive();$('.all-requests').open=true;listeners.toggle({target:$('.all-requests')});const spot=$('.request-mosaic [data-live-slot="0"]');
+state.detail.live_requests[0].status='timeout';renderLive();assert.equal(spot.animationCalls.length,1);assert.equal($$('.is-landing').length,0);
+spot.animationCalls[0].cancel();await Promise.resolve();renderLive();assert.equal(spot.getAnimations().length,0);assert.equal(spot.animationCalls.length,1);assert.equal(spot.opacity,1);
+$('#main').innerHTML='';state.detail.id='reduced';state.detail.live_requests[0].status='running';window.matchMedia=()=>({matches:true});renderLive();$('.all-requests').open=true;
+state.detail.live_requests[0].status='completed';renderLive();assert.equal(document.body.getAnimations({subtree:true}).length,0);
+window.matchMedia=()=>({matches:false});renderLive();assert.equal(document.body.getAnimations({subtree:true}).length,0);assert.equal($$('.is-landing').length,0);
+})()
+""", dom=True)
+
+
+def test_condition_spot_cache_only_rebuilds_changed_rendered_evidence():
+    run_render_checks(r"""
+state.detail={id:'cache',state:'running'};
+const records=[{slot:0,target:'local',scenario:'warm',status:'completed',valid:true,score:true}];
+const original=renderConditionSpots;let renders=0;renderConditionSpots=(...args)=>{renders++;return original(...args);};
+renderTests(records,{live:true});assert.equal(renders,1);
+renderTests(structuredClone(records),{live:true});assert.equal(renders,1);
+records[0].elapsed_ms=123;renderTests(records,{live:true});assert.equal(renders,2);assert.match([...conditionSpots.values()][0],/123 ms/);
+records[0].status='timeout';renderTests(records,{live:true});assert.equal(renders,3);assert.match([...conditionSpots.values()][0],/Timed out/);
+state.detail.state='cancelled';renderTests([{...records[0],status:'running'}],{live:false});assert.equal(renders,4);assert.match([...conditionSpots.values()][0],/Cancelled/);
+""")
+
+
+def test_run_finishing_before_first_live_request_snapshot_has_no_entrance_replay():
+    run_render_checks(r"""
+state.detail={id:'quick',state:'running',config:{targets:[],max_requests:4}};renderDetail();
+state.detail={id:'quick',state:'completed',report:report([check('serving','pass')],{requests:[{id:'r',status:'completed',valid:true,score:true}]})};renderDetail();
+for(const name of ['running','queued','stopping','is-live','is-landing','is-entering'])assert.equal($$('.'+name).length,0,name);
+""", dom=True)
+
+
+def test_open_live_request_status_settles_while_other_requests_continue():
+    run_render_checks(r"""
+state.detail={id:'dialog-live',state:'running',config:{targets:[],max_requests:2},live_requests:[{slot:0,status:'running'},{slot:1,status:'running'}]};
+renderDetail();openLiveRequest(0);const dialog=$('#request-dialog'),status=$('.live-request-status .status');
+renderDetail();assert.equal($('.live-request-status .status'),status);
+state.detail.live_requests[0].status='cancelled';renderDetail();
+assert(dialog.open);assert.equal($('.live-request-status .status'),status);assert(status.classList.contains('cancelled'));assert(!status.classList.contains('running'));assert.match(status.textContent,/Cancelled/);
+status.animationCalls[0].finish();renderDetail();assert.equal(status.animationCalls.length,1);assert(!status.classList.contains('is-landing'));assert.equal(status.opacity,1);
+""", dom=True)
+
+
+def test_queued_and_stopping_badges_keep_their_elements_between_polls():
+    run_render_checks(r"""
+for(const status of ['queued','stopping']){
+  state.detail={id:status,state:status,config:{targets:[],max_requests:1}};renderDetail();
+  const badgeNode=$('.live-state .status'),icon=$('.status-icon',badgeNode),heading=$('h1');
+  renderDetail();assert.equal($('.live-state .status'),badgeNode);assert.equal($('.status-icon',badgeNode),icon);assert.equal($('h1'),heading);assert(badgeNode.classList.contains(status));assert.equal($$('.is-landing').length,0);
+}
+""", dom=True)

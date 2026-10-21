@@ -905,3 +905,33 @@ async def test_first_run_and_baseline_create_only_their_required_directories(tmp
         baseline = response.json()
         assert (runs / ".baselines" / baseline["id"] / "report.json").is_file()
         assert (await client.get("/api/baselines")).json()["baselines"] == [baseline]
+
+
+async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path, monkeypatch):
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "offer_dropped", "budget_used": 4, "attempted": 2,
+                  "completed": 2, "dropped_offers": 2})
+        progress({"event": "judging_started", "phase": "judging", "budget_used": 4,
+                  "attempted": 2, "completed": 2, "dropped_offers": 2})
+        ready.set()
+        await release.wait()
+        return report(configuration)
+
+    monkeypatch.setattr("giraffe.web.run_suite", waiting)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        assert detail["state"] == "running"
+        assert detail["progress"]["phase"] == "judging"
+        assert detail["progress"]["dropped_offers"] == 2
+        assert detail["progress"]["budget_used"] > detail["progress"]["attempted"]
+        assert detail["events"][0]["dropped_offers"] == 2
+        release.set()
+        await finished(client, identifier)
+    async with browser(tmp_path) as client:
+        saved = (await client.get(f"/api/runs/{identifier}")).json()
+        assert saved["state"] == "completed"
+        assert saved["progress"]["dropped_offers"] == 2

@@ -153,12 +153,15 @@ async def run_stage(
     case_specs: list[RequestSpec] | None = None,
     active_case_specs: list[RequestSpec] | None = None,
     capture_evidence: Callable[[StageEvidence], None] | None = None,
+    on_drop: Callable[[], None] | None = None,
 ) -> dict:
     """Run one stage; callbacks own shared run budgets and global admission slots.
 
     ``traffic.max_in_flight`` must already be resolved against the global bound.
     ``execute`` uses the reserved slot without waiting for another semaphore and
     must return after cancellation, as the existing HTTP client does.
+    ``on_drop`` reports reserved offers that never dispatch, including tasks
+    cancelled before starting; unreserved schedule entries are not drops.
     """
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
@@ -176,6 +179,7 @@ async def run_stage(
     started_at = time.monotonic()
     stage_end = started_at + traffic.duration_seconds
     outcomes = ["not_offered"] * len(schedule)
+    dropped_indices: set[int] = set()
     records: list[tuple[int, RequestRecord]] = []
     lifetimes: dict[int, tuple[float, float]] = {}
     tasks: set[asyncio.Task] = set()
@@ -210,12 +214,19 @@ async def run_stage(
             stalls.append((offset, now - started_at))
         return offset <= discard_through
 
+    def drop(index: int, outcome: str):
+        outcomes[index] = outcome
+        if index not in dropped_indices:
+            dropped_indices.add(index)
+            if on_drop:
+                on_drop()
+
     async def dispatch(index: int, kind: str, offset: float):
         nonlocal execution_errors
         dispatched = time.monotonic()
         lag_ms = max(0.0, (dispatched - started_at - offset) * 1000)
         if missed_arrival(offset, dispatched):
-            outcomes[index] = "dropped_late"
+            drop(index, "dropped_late")
             return
         outcomes[index] = "started"
         try:
@@ -224,7 +235,7 @@ async def run_stage(
             })
             record = await execute(spec)
             if record is None:
-                outcomes[index] = "not_offered"
+                drop(index, "not_offered")
                 return
             record.traffic_stage = stage_index
             record.traffic_rate_rps = rate_rps
@@ -264,11 +275,11 @@ async def run_stage(
                     break
                 now = time.monotonic()
                 if missed_arrival(offset, now):
-                    outcomes[index] = "dropped_late"
+                    drop(index, "dropped_late")
                     continue
                 active = sum(not task.done() for task in tasks)
                 if active >= traffic.max_in_flight or not try_acquire():
-                    outcomes[index] = "dropped_local"
+                    drop(index, "dropped_local")
                     continue
                 outcomes[index] = "dispatching"
                 task = asyncio.create_task(dispatch(index, kind, offset))
@@ -314,6 +325,11 @@ async def run_stage(
                 except asyncio.CancelledError:
                     reasons.append("Traffic stage cancelled.")
                     interrupted = True
+
+    # A task cancelled before its coroutine starts still consumed an offer.
+    for index, outcome in enumerate(outcomes):
+        if outcome == "dispatching":
+            drop(index, "not_offered")
 
     case_scorers = None
     if case_specs is not None:

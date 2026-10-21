@@ -2202,3 +2202,38 @@ async def test_serving_transport_diagnostics_do_not_classify_requests_as_workloa
     json_path, _ = write_report(report, tmp_path)
     saved = json.loads(json_path.read_text())["requests"]
     assert all(not r["workload"] and r["response_body_bytes"] > 0 for r in saved)
+
+
+async def test_dropped_offer_progress_survives_traffic_into_judging(client, monkeypatch):
+    from giraffe import judging, traffic
+
+    client.delay = .03
+    schedule = [(0, "short"), (.001, "short"), (.002, "short")]
+    monkeypatch.setattr(traffic, "arrival_schedule", lambda *_: (schedule, False))
+
+    async def evaluate(config, records, specs, *, stop_event=None, progress=None):
+        progress({"event": "judging_started", "judge_calls_total": len(records)})
+        for record in records:
+            record.score = True
+        progress({"event": "judging_finished", "judge_calls_completed": len(records)})
+        return judge_summary(records)
+
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    events = []
+    result = await runner.run_suite(judged_pack_config(
+        concurrency=1, traffic={"rates": [100], "duration_seconds": .04},
+    ), progress=events.append)
+    stage = check(result, "capacity").metrics["traffic_stages"][0]
+    assert stage["dropped_local"] == 2
+    dropped = [event for event in events if event["event"] == "offer_dropped"]
+    assert [event["dropped_offers"] for event in dropped] == [1, 2]
+    assert all(event["target"] == "service" and event["scenario"] == "traffic_stage_0"
+               for event in dropped)
+    after_traffic = [event for event in events if event["event"] in {
+        "judging_started", "judging_finished", "run_finished",
+    }]
+    assert len(after_traffic) == 3
+    for event in after_traffic:
+        assert event["dropped_offers"] == 2
+        assert event["budget_used"] - event["attempted"] == 2
+        assert event["attempted"] == event["completed"] == len(result.requests)
