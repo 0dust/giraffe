@@ -70,3 +70,20 @@ def test_standalone_report_shows_recorded_latency_violation():
     assert 'First useful output limit' in html
     assert '<summary>Underlying values</summary>' in html
     assert 'Recorded; see evidence' not in html
+
+
+ENUM_ROW = {"id": "latency_samples", "label": "Latency samples affected", "state": "measured",
+            "value": {"status": "client_delayed", "scope": "request_intervals", "threshold_ms": 100}}
+
+
+def test_structured_enum_values_are_readable_in_app_and_html():
+    import json
+    run_render_checks('const rows=' + json.dumps([ENUM_ROW]) + r''';
+document.querySelector('#main').innerHTML=performanceMetricTable(rows);
+const text=$('#main').textContent;
+assert.match(text,/Status: Client delayed · Scope: Request intervals/);
+assert(!/client_delayed|request_intervals/.test(text));
+''', dom=True)
+    html = _table([ENUM_ROW])
+    assert "Status: Client delayed · Scope: Request intervals" in html
+    assert "client_delayed" not in html and "request_intervals" not in html

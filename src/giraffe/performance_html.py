@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from html import escape
 import math
+import re
 
 from .performance import KPI_IDS
 
@@ -65,7 +66,9 @@ def _structured_value(row):
         nonlocal truncated
         result = ("Unknown" if value is None else ("Yes" if value else "No") if isinstance(value, bool)
                   else _fmt(value) + (" ms" if key.endswith("_ms") else "") if _number(value)
-                  else _evidence_label(value) if value in ("first_output_ms", "first_token_ms") else str(value))
+                  else _evidence_label(value) if value in ("first_output_ms", "first_token_ms")
+                  else str(value).replace("_", " ").capitalize() if re.fullmatch(r"[a-z]+(?:_[a-z0-9]+)+", str(value))
+                  else str(value))
         if len(result) > 240:
             result = result[:240] + "…"
             truncated = True

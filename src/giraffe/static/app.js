@@ -2748,7 +2748,7 @@ function performanceStructuredValue(metric) {
   const rows=[],limit=40;
   let truncated=false;
   const text=(value,key='')=>{
-    let result=value==null?'Unknown':typeof value==='boolean'?(value?'Yes':'No'):finitePerformance(value)?performanceNumber(value)+(key.endsWith('_ms')?' ms':''):(['first_output_ms','first_token_ms'].includes(value)?performanceEvidenceLabel(value):String(value));
+    let result=value==null?'Unknown':typeof value==='boolean'?(value?'Yes':'No'):finitePerformance(value)?performanceNumber(value)+(key.endsWith('_ms')?' ms':''):(['first_output_ms','first_token_ms'].includes(value)?performanceEvidenceLabel(value):/^[a-z]+(?:_[a-z0-9]+)+$/.test(String(value))?human(String(value)):String(value));
     if(result.length>240){result=result.slice(0,240)+'…';truncated=true;}
     return result;
   };
