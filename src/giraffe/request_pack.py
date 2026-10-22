@@ -43,13 +43,23 @@ def pack_warnings(pack: RequestPack) -> list[str]:
 
 def active_pack(config: RunConfig) -> bool:
     return (config.request_source == "request_pack" and config.request_pack is not None
-            and bool({"capacity", "correctness"}.intersection(config.checks)))
+            and bool({"load", "capacity", "correctness"}.intersection(config.checks)))
+
+
+def pack_settings(config: RunConfig) -> dict[str, Any]:
+    """Read-only request settings for the dataset correctness panel."""
+    return {
+        "read_only": True,
+        "concurrency": config.inherited_concurrency(config.default_concurrency),
+        "fields": ["default_concurrency", "max_output_tokens", "request_timeout_seconds"],
+        "explanation": "Dataset correctness uses every case once for serial controls, then default_concurrency for its loaded pass. Case output budgets and suite request defaults supply request settings; per-check request overrides are unsupported. When Capacity is selected, its requests provide the shared loaded pass.",
+    }
 
 
 def pack_specs(config: RunConfig) -> list[RequestSpec]:
     if not active_pack(config):
         return []
-    consumer = "capacity" if "capacity" in config.checks else "correctness"
+    consumer = "load" if "load" in config.checks else "capacity" if "capacity" in config.checks else "correctness"
     effective = config.effective_check(consumer)
     cap = effective.get("max_output_tokens", config.max_output_tokens)
     specs = []
@@ -60,10 +70,10 @@ def pack_specs(config: RunConfig) -> list[RequestSpec]:
         messages = [message.model_dump() for message in case.messages]
         specs.append(RequestSpec(
             fixture_id=f"pack:{case.fixture_id}", scenario="request_pack",
-            check_ids=[check for check in ("capacity", "correctness") if check in config.checks],
+            check_ids=[check for check in ("load", "capacity", "correctness") if check in config.checks],
             messages=messages, scorer=case.scorer, expected=case.expected, schema=case.schema_,
             expected_provided="expected" in case.model_fields_set, rubric=case.rubric,
-            max_tokens=min(case.max_tokens or cap, cap), stream=config.stream, options=options,
+            max_tokens=case.max_tokens or cap, stream=config.stream, options=options,
             request_timeout_seconds=effective.get("request_timeout_seconds", config.request_timeout_seconds),
             input_chars=sum(len(message.content) for message in case.messages),
             workload={"case_id": case.fixture_id, "request_source": "request_pack"},
@@ -169,13 +179,25 @@ def pack_identity(config: RunConfig) -> dict[str, Any] | None:
 
 def _pack_summary(config: RunConfig, stages: list[dict[str, Any]]) -> dict[str, Any]:
     cases = config.request_pack.cases if active_pack(config) else []
-    quiet = len(cases)
+    quiet = len(cases) if "load" not in config.checks or "correctness" in config.checks else 0
     planned = quiet + sum(stage["planned"] for stage in stages)
-    base, extra = divmod(config.max_requests, len(config.targets))
-    quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
+    if config.max_requests is None:
+        quotas = {target.name: None for target in config.targets}
+    else:
+        base, extra = divmod(config.max_requests, len(config.targets))
+        quotas = {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
     judge_ids = {case.fixture_id for case in cases if case.scorer == "judge"}
-    planned_judged = len(judge_ids) + sum(
+    planned_judged = (len(judge_ids) if quiet else 0) + sum(
         sum(stage["counts"].get(case_id, 0) for case_id in judge_ids) for stage in stages)
+    load_plan = None
+    if "load" in config.checks and active_pack(config):
+        from giraffe.load_test import load_time_plan
+        load_plan = load_time_plan(config.load_test)
+        planned += load_plan["expected_scheduled_requests"]
+        # Random weighted selection can choose a judged case on every offer.
+        # A proportional expectation is not a safe evaluator-call upper bound.
+        if judge_ids:
+            planned_judged += load_plan["expected_scheduled_requests"]
     judge_count = len(config.judging.judges) if judge_ids else 0
     readiness_errors = []
     if judge_ids:
@@ -189,8 +211,16 @@ def _pack_summary(config: RunConfig, stages: list[dict[str, Any]]) -> dict[str, 
                "ready": not readiness_errors, "readiness_errors": readiness_errors,
                "planned_requests_per_target": planned_judged,
                "planned_call_upper_bound": planned_judged * len(config.targets) * judge_count,
-               "quota_call_upper_bound": sum(min(planned_judged, quota) for quota in quotas.values()) * judge_count}
-    return {"quiet_requests": quiet, "stages": stages, "planned_requests_per_target": planned,
+               "quota_call_upper_bound": sum(planned_judged if quota is None else min(planned_judged, quota) for quota in quotas.values()) * judge_count}
+    if load_plan:
+        judging["planned_requests_approximate"] = load_plan["approximate"]
+        judging["unknown_completion_driven_requests"] = load_plan["unknown_requests"]
+        # The shared hard budget bounds evaluator work even for adaptive traffic;
+        # without it the count must stay unknown rather than claiming zero calls.
+        if load_plan["unknown_requests"] or load_plan["approximate"]:
+            judging["planned_call_upper_bound"] = config.max_requests * judge_count if config.max_requests is not None else None
+            judging["quota_call_upper_bound"] = judging["planned_call_upper_bound"]
+    return {"quiet_requests": quiet, "stages": stages, "load_test": load_plan, "planned_requests_per_target": planned,
             "per_target_request_quota": quotas, "request_cap": config.max_requests, "judging": judging}
 
 
@@ -210,20 +240,20 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
     judging = summary["judging"] | {"identity": judging_identity(config)}
     warnings = pack_warnings(config.request_pack) if config.request_pack else []
     if config.request_source == "request_pack" and not active:
-        warnings.append("Request pack is inactive: select correctness or capacity to exercise it.")
+        warnings.append("Request pack is inactive: select Answer correctness or Load test to exercise it.")
     if active:
         warnings.append("Repeated, warmed workload: quiet controls and traffic repeat the same requests and may benefit caches.")
         if any(case.scorer == "none" for case in cases.values()):
             warnings.append("Unscored cases prevent a full-pack correct-capacity claim, including cases with zero offers.")
         if any(any(amount == 0 for amount in stage["counts"].values()) for stage in stages):
             warnings.append("Some stages do not offer every case; full-pack coverage cannot be established at those rates.")
-        if any(planned > quota for quota in quotas.values()):
+        if any(quota is not None and planned > quota for quota in quotas.values()):
             warnings.append("Planned pack requests exceed a target request quota; the bounded run may have incomplete coverage.")
-        if sum(config.traffic.duration_seconds for _ in stages) > config.max_duration_seconds:
+        if config.max_duration_seconds is not None and sum(config.traffic.duration_seconds for _ in stages) > config.max_duration_seconds:
             warnings.append("Planned traffic duration exceeds the run time budget before quiet requests or draining.")
         if not config.stream and config.effective_check("capacity" if stages else "correctness")["limits"].get("stream_gap_ms") is not None:
             warnings.append("Streaming is disabled; the configured stream-gap limit will lack evidence.")
-        if set(config.checks) - {"capacity", "correctness"}:
+        if set(config.checks) - {"load", "capacity", "correctness"} and (config.max_requests is not None or config.max_duration_seconds is not None):
             warnings.append("Other selected checks consume additional shared request and time budget; their requests are not included in the pack subtotal.")
     if judging["active"]:
         warnings.append("AI judging runs after target traffic. Messages, golden answers and generated answers are sent to every configured judge.")
@@ -231,7 +261,7 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
             warnings.append("Configure at least one judge with a name, URL and model before running judge-scored cases.")
     effective_requests = {_digest({"messages": spec.messages, **_effective(spec)}) for spec in specs}
     return {"source": config.request_source, "active": active,
-            "consumers": [check for check in ("capacity", "correctness") if active and check in config.checks],
+            "consumers": [check for check in ("load", "capacity", "correctness") if active and check in config.checks],
             "case_count": len(cases), "scorer_counts": dict(Counter(case.scorer for case in cases.values())),
             "cases": [{"fixture_id": spec.workload["case_id"], "scorer": spec.scorer,
                        "weight": cases[spec.workload["case_id"]].weight,
@@ -241,9 +271,12 @@ def pack_preview(config: RunConfig) -> dict[str, Any]:
                        "effective": _effective(spec)} for spec in specs],
             "quiet_requests": summary["quiet_requests"], "stages": stages,
             "planned_requests_per_target": planned, "known_selected_check_subtotal": planned,
+            "load_test": summary.get("load_test"),
             "per_target_request_quota": quotas, "request_cap": config.max_requests,
             "unique_effective_requests": len(effective_requests),
             "repeated_requests_per_target": max(0, planned - len(effective_requests)),
-            "inapplicable_settings": ["correctness.samples", "correctness.concurrency"] if active else [],
+            "inapplicable_settings": ["correctness.samples", "correctness.concurrency",
+                                      "correctness.max_output_tokens", "correctness.request_timeout_seconds"] if active else [],
+            "correctness_settings": pack_settings(config) if active else None,
             "identity": pack_identity(config), "judging": judging, "warnings": warnings,
             "input_retention_notice": INPUT_RETENTION_NOTICE}

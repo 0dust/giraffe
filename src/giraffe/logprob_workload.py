@@ -100,7 +100,7 @@ def corpus_width(settings):
 
 def logprob_fixtures(config, fixtures):
     """Non-repetitive copy passage (>= 64 tokens) so token comparisons cover many positions."""
-    from giraffe.workloads import COPY_PASSAGES, label_context, spec
+    from giraffe.workloads import COPY_PASSAGES, consistency_output_cap, label_context, spec
     answer = COPY_PASSAGES[0]
     result = {}
     for shape in ('short', 'long'):
@@ -110,17 +110,21 @@ def logprob_fixtures(config, fixtures):
         base = fixtures[shape][0]
         result[shape] = spec(context + f'Copy the following text exactly, with no extra text:\n{answer}',
                              base.scenario, 'consistency', expected=answer,
-                             max_tokens=min(192, config.max_output_tokens), options=dict(base.options))
+                             max_tokens=consistency_output_cap(config),
+                             request_timeout_seconds=config.request_timeout_seconds, options=dict(base.options))
     return result
 
 
 async def run_logprob_consistency(run, target, client, fixtures):
+    from giraffe.fixtures import builtin_fixtures
+    from giraffe.runner import _check_config
     from giraffe.workloads import consistency_options
 
-    settings = run.config.consistency
+    config = _check_config(run.config, "consistency")
+    settings = config.consistency
     options = settings.logprobs
     width = corpus_width(settings)
-    templates = logprob_fixtures(run.config, fixtures)
+    templates = logprob_fixtures(config, builtin_fixtures(config))
     levels = list(dict.fromkeys([1, *settings.levels]))
     for shape in settings.shapes:
         for level in levels:
@@ -140,10 +144,10 @@ async def run_logprob_consistency(run, target, client, fixtures):
                             spec = templates[shape].model_copy(deep=True)
                             spec.fixture_id = f'logprob_{shape}_{slot}'
                             spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], False
-                            spec.options = consistency_options(run.config, spec.options)
+                            spec.options = consistency_options(config, spec.options)
                             spec.options.update(logprobs=True, top_logprobs=options.top_logprobs)
                             spec.workload = {'level': level, 'input_bucket': shape, 'equality': settings.equality,
-                                             'temperature': (run.config.request_options | spec.options).get('temperature'), 'seed': settings.seed,
+                                             'temperature': (config.request_options | spec.options).get('temperature'), 'seed': settings.seed,
                                              'logprobs': True, 'top_logprobs': options.top_logprobs,
                                              'phase': phase, 'round': repeat, 'corpus_index': slot,
                                              'corpus_size': width, 'response_mode': 'complete',

@@ -117,27 +117,31 @@ detail(report([],{requests:records.map(({condition_id,...r})=>r)}));html=nodes['
 async def test_live_metadata_comes_from_actual_builders_and_survives_report_save(tmp_path):
     from giraffe.fixtures import builtin_fixtures
     from giraffe.runner import _Run
-    from giraffe.workloads import arrivals
-    from giraffe.concurrent_load import make_spec
+    from giraffe.models import RunConfig
+    from giraffe.load_test import build_spec, test_points
     from giraffe.reporting import write_report
     from tests.test_condition_tracking import Client, configuration
     from tests.test_web import report
 
-    config = configuration(arrivals={"requests": 2, "requests_per_second": 1000})
+    config = RunConfig(targets=[{"name":"local","url":"http://unused.test/v1","model":"test"}],checks=["load"],load_test={"workloads":{"combinations":{"selected":["short_long"]}},"patterns":{"concurrent":{"levels":[2]},"constant":{"enabled":True},"rates":[1000]}})
     events = []
     run = _Run(config, events.append, None)
-    request = make_spec(config.concurrent_load, "short_long", "load_combo_short_long_c2", {"type": "combinations", "shape": "short_long", "level": 2}, 64)
+    point = next(point for point in test_points(config.load_test) if point["workload"] == "short_long")
+    request = build_spec(run, config.load_test, point, "short_long", {("short", "long_output"): {"filler_chars": 64}})
     await run.group(config.targets[0], Client(), [request], request.scenario, count=2, concurrency=2)
-    await arrivals(run, config.targets[0], Client(), builtin_fixtures(config))
+    arrival_point = next(item for item in test_points(config.load_test) if item["pattern"] == "constant")
+    arrival_request = build_spec(run, config.load_test, arrival_point, "short_long", {("short", "long_output"): {"filler_chars": 48}})
+    await run.group(config.targets[0], Client(), [arrival_request], arrival_request.scenario, count=2, concurrency=1)
     rows = run.observations["local"]["conditions"]
     matrix = rows[0]["condition"]
-    assert matrix["parameters"] == {"concurrency": 2, "same_prompt": True,
+    assert matrix["parameters"] == {"concurrency": point["level"], "same_prompt": True,
         "input_chars": len(request.messages[0]["content"]),
         "input_tokens_target": request.requested_input_tokens,
         "output_tokens": request.max_tokens}
     arrival = rows[1]["condition"]
+    assert arrival["rate_rps"] == 1000
     assert arrival["parameters"]["same_prompt"] is True
-    assert arrival["parameters"]["input_chars"] == len(builtin_fixtures(config)["short"][0].messages[0]["content"])
+    assert arrival["parameters"]["input_chars"] == len(arrival_request.messages[0]["content"])
     assert all(event["condition_summary"]["condition"]["purpose"] for event in events if event.get("condition_summary"))
     started = next(e for e in events if e["event"] == "request_started")
     assert started["input_chars"] == matrix["parameters"]["input_chars"]
@@ -192,8 +196,9 @@ async def test_condition_and_live_dialog_metadata_use_effective_output_cap(reque
     events = []
     run = _Run(config, events.append, None)
     await run.request(config.targets[0], Client(), spec("hi", "generation", "generation", max_tokens=requested))
-    assert run.observations["local"]["conditions"][0]["condition"]["parameters"]["output_tokens"] == config.max_output_tokens
-    assert next(e for e in events if e["event"] == "request_started")["requested_max_tokens"] == config.max_output_tokens
+    effective = config.max_output_tokens if requested is None else requested
+    assert run.observations["local"]["conditions"][0]["condition"]["parameters"]["output_tokens"] == effective
+    assert next(e for e in events if e["event"] == "request_started")["requested_max_tokens"] == effective
 
 
 def test_partial_condition_card_and_global_spots_use_the_same_request_total():

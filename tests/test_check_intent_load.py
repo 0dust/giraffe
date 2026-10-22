@@ -8,7 +8,16 @@ from datetime import datetime, timezone
 
 import pytest
 
-from giraffe import runner, traffic
+from giraffe import runner, traffic, load_test
+from tests.test_concurrent_load import Client as TokenClient, configuration as load_configuration, short_windows
+
+
+async def load_run(*, client=None, duration=.5, rates=(20,), pattern="constant", criteria=None, **values):
+    cfg = load_configuration(load={"patterns":{"concurrent":{"enabled":False},"constant":{"enabled":pattern == "constant"},"poisson":{"enabled":pattern == "poisson","seed":35},"rates":list(rates)}, "pass_criteria":criteria or {}}, **values)
+    short_windows(cfg,duration)
+    run = runner._Run(cfg,None,None)
+    await load_test.execute(run,cfg.targets[0],client or TokenClient())
+    return run,load_test.result(run,cfg.targets[0])
 from giraffe.models import Limits, RequestRecord, TrafficConfig
 from giraffe.runner import run_suite
 from tests.fake_endpoint import FakeEndpoint
@@ -79,33 +88,34 @@ class QueueClient(LoadClient):
 
 
 @pytest.mark.parametrize("arrival,seed", [("steady", 42), ("poisson", 35)])
-async def test_short_stage_above_service_rate_is_not_accepted_while_queue_grows(monkeypatch, arrival, seed):
-    class Client(QueueClient):
-        calls = []
-        lock = None
-    monkeypatch.setattr(runner, "LLMClient", Client)
-    report = await run_suite(config(checks=["capacity"], concurrency=16, max_requests=400, max_duration_seconds=60,
-        traffic={"rates": [10, 14], "duration_seconds": .5, "arrival": arrival, "seed": seed},
-        limits=Limits(latency_ms=400, min_samples=2)))
-    result = check(report, "capacity")
-    stages = {stage["rate_rps"]: stage for stage in result.metrics["traffic_stages"]}
-    assert stages[14]["scheduled_rps"] == 14
-    assert not stages[14]["accepted"] and (stages[14]["queue_growth"] or stages[14]["stability_unverified"])
-    assert stages[14]["status"] == "inconclusive"
-    assert "Queue grew" in " ".join(stages[14]["reasons"])
-    assert result.metrics["highest_acceptable_rate_rps"] != 14 and result.status != "pass"
+async def test_short_stage_above_service_rate_is_not_accepted_while_queue_grows(monkeypatch,arrival,seed):
+    class FIFO(TokenClient):
+        def __init__(self): super().__init__(); self.service=asyncio.Lock()
+        async def execute(self,spec,**kw):
+            if spec.scenario.startswith('load_calibration_'): return await super().execute(spec,**kw)
+            start=time.monotonic()
+            async with self.service: await asyncio.sleep(.08)
+            r=await super().execute(spec,**kw)
+            r.elapsed_ms=(time.monotonic()-start)*1000
+            r.first_output_ms=r.elapsed_ms-1
+            r._timing_started_monotonic=start
+            return r
+    _,result=await load_run(client=FIFO(),rates=(10,14),pattern='constant' if arrival == 'steady' else 'poisson',concurrency=16,criteria={'max_completion_ms':100})
+    high=result.metrics['points'][1]
+    assert high['rate'] == 14 and high['status'] == 'fail'
+    assert high['groups'][0]['completion_p95_ms'] > 100
+    assert not any(v['value'] == 14 for v in result.metrics['highest_accepted'])
 
 
 async def test_steady_stage_below_service_rate_still_passes(monkeypatch):
-    class Client(QueueClient):
-        calls = []
-        lock = None
-    monkeypatch.setattr(runner, "LLMClient", Client)
-    report = await run_suite(config(checks=["capacity"], concurrency=16, max_requests=400, max_duration_seconds=60,
-        traffic={"rates": [5, 10], "duration_seconds": .5}, limits=Limits(latency_ms=400, min_samples=2)))
-    result = check(report, "capacity")
-    assert result.status == "pass" and result.metrics["highest_acceptable_rate_rps"] == 10
-    assert not any(stage["queue_growth"] for stage in result.metrics["traffic_stages"])
+    class Service(TokenClient):
+        async def execute(self,spec,**kw):
+            if not spec.scenario.startswith('load_calibration_'): await asyncio.sleep(.08)
+            return await super().execute(spec,**kw)
+    _,result=await load_run(client=Service(),rates=(5,10),concurrency=16,criteria={'max_completion_ms':400})
+    assert result.status == 'pass'
+    assert result.metrics['highest_accepted'][0]['value'] == 10
+    assert [p['dispatched'] for p in result.metrics['points']] == [3,5]
 
 
 def _evidence(stalls, slow_index):
@@ -159,24 +169,20 @@ def test_rising_latency_with_normal_inflight_work_is_not_queue_growth():
 
 # arrivals
 
-async def test_three_cancelled_arrivals_leave_eight_request_schedule_unqualified(endpoint, monkeypatch):
-    original = endpoint.execute
-
-    async def cancelled(self, spec, **kw):
-        record = await original(self, spec, **kw)
-        if spec.scenario == "arrival" and spec.workload["arrival_index"] >= 5:
-            record.status, record.valid = "cancelled", False
-        return record
-
-    monkeypatch.setattr(endpoint, "execute", cancelled)
-    report = await run_suite(config(checks=["arrivals"], concurrency=8,
-        limits=Limits(latency_ms=5000, min_samples=2),
-        arrivals={"requests": 8, "requests_per_second": 20}))
-    result = check(report, "arrivals")
-    assert result.metrics["schedule"]["issued"] == 8
-    assert result.metrics["schedule"]["incomplete"] == 3
-    assert not result.metrics["schedule"]["configured_rate_achieved"]
-    assert result.status == "inconclusive"
+async def test_three_cancelled_arrivals_leave_eight_request_schedule_unqualified(endpoint,monkeypatch):
+    class Cancelled(TokenClient):
+        def __init__(self): super().__init__(); self.count=0
+        async def execute(self,spec,**kw):
+            r=await super().execute(spec,**kw)
+            if not spec.scenario.startswith('load_calibration_'):
+                self.count+=1
+                if self.count>5: r.status,r.valid='cancelled',False
+            return r
+    _,result=await load_run(client=Cancelled(),duration=.4,rates=(20,),concurrency=8)
+    p=result.metrics['points'][0]
+    assert p['scheduled'] == p['dispatched'] == 8
+    assert p['cancelled'] == 3 and p['groups'][0]['error_percent'] == 0
+    assert p['status'] == result.status == 'inconclusive'
 
 
 @pytest.mark.parametrize("limits,status", [
@@ -187,41 +193,38 @@ async def test_three_cancelled_arrivals_leave_eight_request_schedule_unqualified
     (Limits(min_output_tokens_per_second=.01, min_samples=2), "inconclusive"),
     (Limits(latency_ms=1, min_samples=2), "fail"),
 ])
-async def test_arrivals_need_timing_limit_and_preserve_real_failures(endpoint, limits, status):
-    report = await run_suite(config(checks=["arrivals"], concurrency=4, limits=limits,
-        arrivals={"requests": 4, "requests_per_second": 20}))
-    result = check(report, "arrivals")
+async def test_arrivals_need_timing_limit_and_preserve_real_failures(endpoint,limits,status):
+    criteria={'max_completion_ms':limits.latency_ms,'max_first_answer_ms':limits.first_output_ms,'max_stream_pause_ms':limits.stream_gap_ms,'min_generation_tokens_per_second':limits.min_output_tokens_per_second}
+    _,result=await load_run(duration=.2,rates=(20,),criteria=criteria,concurrency=4)
+    g=result.metrics['points'][0]['groups'][0]
+    # A pause limit alone measures streaming but cannot qualify accepted capacity.
+    if limits.stream_gap_ms and not limits.latency_ms and not limits.first_output_ms: status='inconclusive'
     assert result.status == status
     if limits.min_output_tokens_per_second is not None:
-        assert "generation_tokens_per_second" in result.metrics["missing_timing_metrics"]
-    elif not limits.latency_ms and status == "inconclusive":
-        assert result.summary.startswith("Arrivals observed; no acceptance limit configured.")
-        assert "To conclude, set limits.latency_ms" in result.summary
+        assert 'generation_tokens_per_second' in g['missing_timing']
+    elif status == 'inconclusive': assert g['reason_code'] == 'measure_only'
 
 async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
     with FakeEndpoint(first_token_delay=.4) as server:
-        report = await run_suite(workload_config(server, checks=["arrivals"], concurrency=16,
-            request_timeout_seconds=10, max_duration_seconds=1.0, limits=Limits(min_samples=2, latency_ms=5000),
-            arrivals={"requests": 8, "requests_per_second": 8}))
-    result = check(report, "arrivals", target="local")
-    schedule = result.metrics["schedule"]
-    assert any(r.status == "cancelled" for r in report.requests if r.scenario == "arrival")
-    assert schedule["incomplete"] > 0 and not schedule["configured_rate_achieved"]
-    assert result.status == "inconclusive"
+        c=load_configuration(targets=[{'name':'local','url':server.url,'model':'test'}],concurrency=16,max_duration_seconds=1,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[8]},'schedule':{'duration_seconds':1,'finish_seconds':1},'pass_criteria':{'max_completion_ms':5000}})
+        report=await run_suite(c)
+    result=next(v for v in report.checks if v.id == 'load')
+    p=result.metrics['points'][0]
+    assert any(r.status == 'cancelled' for r in report.requests if r.load_point.get('point_id') == p['id'])
+    assert p['cancelled']>0 and p['status'] == result.status == 'inconclusive'
 
 
 async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one():
     with FakeEndpoint(first_token_delay=.05) as server:
-        unlimited = await run_suite(workload_config(server, checks=["arrivals"], concurrency=16,
-            request_timeout_seconds=10, arrivals={"requests": 4, "requests_per_second": 20}))
-        limited = await run_suite(workload_config(server, checks=["arrivals"], concurrency=16,
-            request_timeout_seconds=10, limits=Limits(latency_ms=5000, min_samples=2),
-            arrivals={"requests": 4, "requests_per_second": 20}))
-    result = check(unlimited, "arrivals", target="local")
-    assert result.status == "inconclusive"
-    assert result.summary.startswith("Arrivals observed; no acceptance limit configured.")
-    assert "To conclude, set limits.latency_ms" in result.summary
-    assert check(limited, "arrivals", target="local").status == "pass"
+        c=load_configuration(targets=[{'name':'local','url':server.url,'model':'test'}],concurrency=16,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[20]},'pass_criteria':{'max_completion_ms':None,'max_first_answer_ms':None}})
+        short_windows(c,.2)
+        unlimited=await run_suite(c)
+        c.load_test.pass_criteria.max_completion_ms=5000
+        limited=await run_suite(c)
+    result=next(v for v in unlimited.checks if v.id == 'load')
+    assert result.status == 'inconclusive' and result.metrics['highest_accepted'] == []
+    assert result.metrics['points'][0]['groups'][0]['reason_code'] == 'measure_only'
+    assert next(v for v in limited.checks if v.id == 'load').status == 'pass'
 
 
 # recovery

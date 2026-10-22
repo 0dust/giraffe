@@ -295,3 +295,26 @@ for(const fails of [false,true]){
 }
 })()
 """, dom=True)
+
+
+def test_budget_free_live_window_keeps_keyed_terminal_states_without_filler():
+    run_render_checks(r"""
+state.detail={id:'no-budget',state:'running',config:{targets:[],max_requests:null,concurrency:null,max_duration_seconds:null},
+ progress:{attempted:503,budget_used:506,dropped_offers:3},
+ live_request_summary:{evicted:500,statuses:{completed:500}},
+ live_requests:[{slot:500,id:'timeout',status:'timeout'},{slot:501,id:'pending',status:'running'},{slot:502,id:'cancelled',status:'cancelled'}]};
+renderDetail();const disclosure=$('.all-requests');disclosure.open=true;listeners.toggle({target:disclosure});
+const mosaic=$('.request-mosaic'),pending=$('[data-live-slot="501"]',mosaic);
+assert.equal($$('.request-spot',mosaic).length,3);assert.equal($('[tabindex="0"]',mosaic).dataset.liveSlot,'500');
+assert.equal($('[data-live-slot="500"]',mosaic).dataset.state,'timeout');assert.equal($('[data-live-slot="502"]',mosaic).dataset.state,'cancelled');
+assert.equal($('[data-live-slot="500"] .spot-glyph',mosaic).textContent,statusIcons.timeout);
+assert.match($('#main').textContent,/503 started · 3 in live window/);assert.match($('#main').textContent,/3 dropped before sending/);
+assert.match($('#main').textContent,/500 earlier requests outside the live window/);assert.match($('#main').textContent,/No request limit set/);
+assert.equal($('.budget-track'),null);assert.equal($('.request-spot.idle, .request-spot.reserved, .request-spot.skipped',mosaic),null);
+assert.doesNotMatch($('.mosaic-legend').textContent,/Unused|Reserved/);
+state.detail.live_requests[1]={slot:501,id:'pending',status:'completed',valid:true,score:true};renderDetail();
+assert.equal($('.request-mosaic'),mosaic);assert.equal($('[data-live-slot="501"]',mosaic),pending);assert.equal(pending.dataset.state,'pass');assert.equal(pending.animationCalls.length,1);
+renderDetail();assert.equal(pending.animationCalls.length,1);assert(disclosure.open);
+state.mosaicFollow=false;state.mosaicPage=0;renderDetail();
+assert.match($('.all-requests').textContent,/Earlier request evidence was evicted from the live window/);assert.equal($('.request-mosaic'),null);
+""", dom=True)

@@ -1,18 +1,14 @@
 """Duration-based concurrent load, with individual replenishment and shared budgets."""
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import math
-import random
 import re
-import time
 import uuid
 from collections import Counter
 from statistics import median
 
 from giraffe.fixtures import deterministic_options, reasoning_budget
-from giraffe.models import CHECK_NAMES, CheckResult, RequestSpec, load_shape_label
+from giraffe.models import RequestSpec, load_shape_label
 from giraffe.overlap import answer_window, peak_evidenced_concurrency, scheduling_delay_windows
 from giraffe.timing import run_quality
 
@@ -105,7 +101,7 @@ def window_cause(reason):
     return "run_stopped"
 
 
-def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=False):
+def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=False, request_timeout_seconds=None):
     input_size, output_size = shape.split("_")
     variant = "short_answer" if output_size == "short" else "long_output"
     text = prompt(filler_chars, variant)
@@ -113,17 +109,18 @@ def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=Fal
     condition_id = None
     if point.get("type") == "interference":
         condition_id = f"load_interference_{'probe' if (point.get('sub_window') or 0) % 2 else 'control'}_c{point['level']}"
-    return RequestSpec(condition_id=condition_id, fixture_id=f"load.{shape}.{variant}", scenario=scenario, check_ids=["concurrency"],
+    return RequestSpec(condition_id=condition_id, fixture_id=f"load.{shape}.{variant}", scenario=scenario, check_ids=["load"],
         messages=[{"role": "user", "content": text}], scorer="none" if calibration else "label", expected=None if calibration else "K7P4",
         input_chars=len(text), max_tokens=cap, requested_input_tokens=getattr(settings.profile, input_size).input_tokens,
-        requested_output_tokens=cap, load_point=point)
+        requested_output_tokens=cap, request_timeout_seconds=request_timeout_seconds, load_point=point)
 
 
 async def calibrate(run, target, client, settings, size, variant):
+    config = run.config.model_copy(update={"request_timeout_seconds":settings.request_timeout_seconds})
     target_tokens = getattr(settings.profile, size).input_tokens
     overhead = len(prompt(0, variant))
     filler = max(0, target_tokens * 4 - overhead)
-    scenario = f"load_calibration_{size}_{variant}"
+    scenario = f"load_calibration_v45_{size}_{variant}"
     run.plan_condition(target.name, scenario, planned=settings.calibration_attempts, planned_kind="upper_bound")
     run.start_condition(target.name, scenario, planned=settings.calibration_attempts, planned_kind="upper_bound")
     result = {"size": size, "variant": variant, "target_tokens": target_tokens, "status": "inconclusive",
@@ -135,7 +132,8 @@ async def calibrate(run, target, client, settings, size, variant):
             if not run.allowed(target.name):
                 result.update(reason=run.condition_reason(target.name), reason_code=window_cause(run.condition_reason(target.name)))
                 break
-            spec = make_spec(settings, shape, scenario, {"type": "calibration", "input_size": size, "variant": variant}, filler, calibration=True)
+            spec = make_spec(settings, shape, scenario, {"type": "calibration", "input_size": size, "variant": variant}, filler, calibration=True,
+                             request_timeout_seconds=config.request_timeout_seconds)
             spec.stream = run.config.stream
             spec.options = deterministic_options(run.config)
             record = await run.request(target, client, spec)
@@ -194,167 +192,6 @@ def _conditions(point):
         return [f"load_interference_{name}_c{point['level']}" for name in ("control", "probe")]
     return [point["id"]]
 
-
-async def sending_window(run, target, client, settings, point, calibration, allowance, rng):
-    duration, level = point["configured_window_seconds"], point["level"]
-    begin = cutoff = None
-    sent, records, active_short = 0, [], {}
-    changed = asyncio.Event()
-    waiting = set()
-    trigger_latencies, never_triggered = [], 0
-    stop_reason = None
-
-    def close(reason, now=None):
-        nonlocal cutoff, stop_reason
-        if cutoff is None:
-            cutoff, stop_reason = time.monotonic() if now is None else now, reason
-
-    def ended():
-        nonlocal stop_reason
-        now = time.monotonic()
-        if begin is not None and now >= begin + duration:
-            return True
-        if cutoff is not None:
-            return True
-        if not run.allowed(target.name):
-            close(run.condition_reason(target.name))
-            return True
-        return False
-
-    async def send(shape, role, progress=None, sub_window=None):
-        nonlocal begin, sent
-        if ended():
-            return None
-        slot_wait = None
-        try:
-            end = min(run.deadline, begin + duration if begin is not None else run.deadline)
-            async with asyncio.timeout_at(end) as slot_wait:
-                waiting.add(slot_wait)
-                async with run.slot(False, end) as admitted:
-                    waiting.discard(slot_wait)
-                    if not admitted or ended() or sent >= allowance:
-                        return None
-                    slot_wait.reschedule(None)
-                    input_size, output_size = shape.split("_")
-                    variant = "short_answer" if output_size == "short" else "long_output"
-                    condition = (f"load_interference_{'probe' if sub_window in (1, 3) else 'control'}_c{level}" if point["type"] == "interference" else point["id"])
-                    scenario = f"{condition}.{shape}" if point["type"] == "mixed" else condition
-                    if point["type"] == "interference":
-                        scenario = f"load_interference_c{level}." + ("short_stream" if role == "short_stream" else "long_probe" if sub_window % 2 else "short_probe")
-                    details = {"point_id": point["id"], "type": point["type"], "workload": point["workload"],
-                               "level": level, "shape": shape, "sub_window": sub_window, "role": role}
-                    spec = make_spec(settings, shape, scenario, details, calibration[(input_size, variant)]["filler_chars"])
-                    spec.stream = run.config.stream
-                    spec.options = deterministic_options(run.config)
-                    def started():
-                        nonlocal begin, sent
-                        now = time.monotonic()
-                        if begin is None:
-                            begin = now
-                            for waiter in waiting:
-                                waiter.reschedule(min(run.deadline, begin + duration))
-                        sent += 1
-                        if sent >= allowance:
-                            close("point request allowance used", now)
-                    record = await run.request(target, client, spec, event=progress, on_start=started, slot_reserved=True)
-                    if record is not None:
-                        records.append(record)
-                    if asyncio.current_task().cancelling():
-                        raise asyncio.CancelledError
-                    return record
-        except TimeoutError:
-            return None
-        finally:
-            waiting.discard(slot_wait)
-
-    async def worker(index):
-        while not ended():
-            role, progress, sub = "request", None, None
-            if point["type"] == "interference":
-                role = "short_stream"
-                progress = OutputProgress(changed)
-                active_short[index] = progress
-                sub = min(3, int((time.monotonic() - begin) / (duration / 4))) if begin is not None else 0
-                shape = "short_short"
-            elif point["type"] == "mixed":
-                shapes = point_shapes(settings, point)
-                shape = rng.choices(shapes, weights=[settings.mixed.shares[s] for s in shapes])[0]
-            else:
-                shape = point["shape"]
-            try:
-                record = await send(shape, role, progress, sub)
-            finally:
-                active_short.pop(index, None)
-                changed.set()
-            if record is None:
-                break
-
-    async def probe_worker():
-        nonlocal never_triggered
-        while not ended():
-            trigger_start = time.monotonic()
-            triggered = False
-            while not ended() and time.monotonic() - trigger_start < run.config.request_timeout_seconds:
-                changed.clear()
-                streams = list(active_short.values())
-                triggered = len(streams) == level - 1 and all(
-                    p.first if settings.interference.trigger == "first_output" else p.chunks >= settings.interference.trigger_chunks
-                    for p in streams)
-                if triggered:
-                    break
-                end = min(run.deadline, trigger_start + run.config.request_timeout_seconds,
-                          begin + duration if begin is not None else run.deadline)
-                try:
-                    await asyncio.wait_for(changed.wait(), max(.0001, end - time.monotonic()))
-                except TimeoutError:
-                    break
-            trigger_latencies.append((time.monotonic() - trigger_start) * 1000)
-            if not triggered:
-                never_triggered += 1
-                if ended():
-                    break
-                continue
-            if ended():
-                break
-            sub = min(3, int((time.monotonic() - begin) / (duration / 4)))
-            if await send("long_short" if sub % 2 else "short_short", "probe", sub_window=sub) is None:
-                break
-
-    for condition in _conditions(point):
-        run.start_condition(target.name, condition, planned=None, planned_kind="duration")
-    cancellation = None
-    try:
-        workers = [worker(i) for i in range(level - 1 if point["type"] == "interference" else level)]
-        if point["type"] == "interference":
-            workers.append(probe_worker())
-        tasks = [asyncio.create_task(worker) for worker in workers]
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError as exc:
-            reason = run.stop_reason(target.name)
-            close(reason or "execution cancelled")
-            cancellation = exc if reason is None else None
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
-        for condition in _conditions(point):
-            run.finish_condition(target.name, condition, reason=stop_reason)
-    now = time.monotonic()
-    finish = min(begin + duration, cutoff if cutoff is not None else now) if begin is not None else now
-    delivered = max(0, finish - begin) if begin is not None else 0
-    point.update(request_allowance=allowance, delivered_window_seconds=delivered,
-        sending_start_ms=(begin - run.start) * 1000 if begin is not None else None,
-        sending_end_ms=(finish - run.start) * 1000 if begin is not None else None,
-        drain_seconds=max(0, now - finish) if begin is not None else 0,
-        cut_short=delivered + 1e-6 < duration, window_reason=stop_reason,
-        not_run=not records, request_ids=[r.id for r in records])
-    if point["type"] == "interference":
-        point["interference"] = interference_measurements(records, level, duration, trigger_latencies, never_triggered)
-    if cancellation is not None:
-        raise cancellation
-    return records
 
 
 def interference_measurements(records, level, duration, latencies=(), never_triggered=0):
@@ -574,113 +411,14 @@ def later_reservation(config):
 
 
 async def execute(run, target, client):
-    settings = run.config.concurrent_load
-    points = test_points(settings)
-    observation = {"load_types": {k: {"title": v, "points": []} for k, v in LOAD_TITLES.items() if getattr(settings, k).enabled},
-        "configured_load_seconds": sum(p["configured_window_seconds"] for p in points),
-        "migration_notes": list(getattr(run.config, "_migration_notes", [])), "calibrations": []}
-    run.observations[target.name]["concurrent_load"] = observation
-    run_id = getattr(run, "run_id", None) or str(run.start)
-    seed = settings.mixed.seed if settings.mixed.seed is not None else int.from_bytes(hashlib.sha256(run_id.encode()).digest()[:8], "big") % (2**53)
-    observation["mixed_seed"] = seed
-    rng, calibration = random.Random(seed), {}
-    reserved = later_reservation(run.config)
-    for point in points:
-        observation["load_types"][point["type"]]["points"].append(point)
-        for condition in _conditions(point):
-            run.plan_condition(target.name, condition, planned=None, planned_kind="duration")
-    for index, point in enumerate(points):
-        shapes = point_shapes(settings, point)
-        window, source = context_window(target, run.observations[target.name])
-        blocked = next((shape for shape in shapes if window is not None and
-                        getattr(settings.profile, shape.split("_")[0]).input_tokens + getattr(settings.profile, shape.split("_")[1]).output_tokens > window), None)
-        point.update(delivered_window_seconds=0, drain_seconds=0, cut_short=False, not_run=True,
-                     request_ids=[], request_allowance=0, window_reason=None)
-        records = []
-        keys = [(a, "short_answer" if b == "short" else "long_output") for a, b in (shape.split("_") for shape in shapes)]
-        known_failure = next((calibration[key] for key in keys if key in calibration and calibration[key]["status"] == "fail"), None)
-        if blocked:
-            point["blocked"] = f"{load_shape_label(blocked)}: input target + output cap exceeds server context window {window} ({source})"
-        elif known_failure:
-            point["calibration_failure"] = known_failure["reason"]
-        elif run.allowed(target.name):
-            for shape in shapes:
-                a, b = shape.split("_")
-                key = a, "short_answer" if b == "short" else "long_output"
-                if key not in calibration:
-                    calibration[key] = await calibrate(run, target, client, settings, *key)
-                    observation["calibrations"].append(calibration[key])
-            dependencies = [calibration[(a, "short_answer" if b == "short" else "long_output")] for a, b in (s.split("_") for s in shapes)]
-            failure = next((c for c in dependencies if c["status"] == "fail"), None)
-            if failure:
-                point["calibration_failure"] = failure["reason"]
-            elif any(c["status"] == "inconclusive" for c in dependencies):
-                incomplete = next(c for c in dependencies if c["status"] == "inconclusive")
-                point["input_not_calibrated"] = incomplete["reason_code"] == "input_not_calibrated"
-                point["window_reason"] = incomplete["reason"]
-            else:
-                remaining = min(run.config.max_requests - run.budget_used, run.quotas[target.name] - run.budget_counts[target.name])
-                allowance = max(1, (remaining - reserved) // (len(points) - index))
-                point["reserved_later_requests"] = reserved
-                records = await sending_window(run, target, client, settings, point, calibration, allowance, rng)
-        else:
-            point["window_reason"] = run.condition_reason(target.name)
-        measurements(run, target, settings, point, records)
-        score_point(settings, point, records)
-        for condition in _conditions(point):
-            run.finish_condition(target.name, condition, reason=point["reason"], load_point_result=point)
-    for group in observation["load_types"].values():
-        group["status"] = aggregate([p["status"] for p in group["points"]])
-    return observation
-
-
-def aggregate(statuses):
-    return next((status for status in ("fail", "blocked", "inconclusive", "pass") if status in statuses), "inconclusive")
+    # Compatibility import only: all execution is unified.
+    from giraffe.load_test import execute as unified
+    return await unified(run, target, client)
 
 
 def result(run, target):
-    metrics = run.observations[target.name].get("concurrent_load")
-    if metrics is None:
-        settings = run.config.concurrent_load
-        metrics = {"load_types": {}, "configured_load_seconds": sum(p["configured_window_seconds"] for p in test_points(settings)),
-                   "migration_notes": list(run.config._migration_notes), "calibrations": [], "mixed_seed": settings.mixed.seed}
-        for point in test_points(settings):
-            point.update(delivered_window_seconds=0, drain_seconds=0, cut_short=False, not_run=True, request_allowance=0, request_ids=[], window_reason=run.condition_reason(target.name))
-            measurements(run, target, settings, point, [])
-            score_point(settings, point, [])
-            metrics["load_types"].setdefault(point["type"], {"title": LOAD_TITLES[point["type"]], "points": [], "status": "inconclusive"})["points"].append(point)
-    for group in metrics["load_types"].values():
-        for point in group["points"]:
-            if "status" not in point:
-                records = [r for r in run.records if r.target == target.name and r.load_point
-                           and r.load_point.get("point_id") == point["id"]]
-                point.update(delivered_window_seconds=point.get("delivered_window_seconds", 0), drain_seconds=point.get("drain_seconds", 0), cut_short=bool(records),
-                    not_run=not records, request_allowance=point.get("request_allowance", 0),
-                    request_ids=[r.id for r in records], window_reason=point.get("window_reason") or run.observations[target.name].get("client_error") or run.condition_reason(target.name))
-                measurements(run, target, run.config.concurrent_load, point, records)
-                score_point(run.config.concurrent_load, point, records)
-        group["status"] = aggregate([p["status"] for p in group["points"]])
-    status = aggregate([g["status"] for g in metrics["load_types"].values()])
-    points = [p for g in metrics["load_types"].values() for p in g["points"]]
-    deciding = [p for p in points if p["status"] == status]
-    from giraffe.conditions import condition_for
-    if status == "pass":
-        limited = sum(p.get("reason_code") == "budget_limited" for p in points)
-        summary = f"All {len(points)} test {'point' if len(points) == 1 else 'points'} passed across {len(metrics['load_types'])} load {'type' if len(metrics['load_types']) == 1 else 'types'}"
-        if limited:
-            summary += f" ({limited} ran budget-limited {'window' if limited == 1 else 'windows'})"
-        summary += "."
-    else:
-        summary = "; ".join(f"{condition_for(p['id'])['label']}: {p['reason'].rstrip('.')}" for p in deciding[:3])
-        if len(deciding) > 3:
-            summary += f"; and {len(deciding) - 3} more"
-        summary = summary.rstrip(".") + "."
-    check = CheckResult(id="concurrency", title=CHECK_NAMES["concurrency"], target=target.name, status=status, required=True,
-                       summary=summary, metrics=metrics, evidence_ids=[r.id for r in run.records if r.target == target.name and r.load_point])
-    guidance = remedies(metrics, run.config)
-    if guidance and status != "pass":
-        check.summary += " To conclude, " + guidance
-    return check
+    from giraffe.load_test import result as unified
+    return unified(run, target)
 
 
 def remedy_conditions(check, config, records):
@@ -692,15 +430,15 @@ def remedies(metrics, config):
     points = [p for g in metrics.get("load_types", {}).values() for p in g["points"]]
     codes = {p.get("reason_code") for p in points if p.get("status") != "pass"}
     guidance = []
-    if "budget_limited" in codes:
+    if "budget_limited" in codes and config.max_requests is not None:
         rates = [p["sent"] / p["delivered_window_seconds"] / p["level"] for p in points if p.get("delivered_window_seconds", 0) > 0]
         remaining = sum(p["level"] * max(0, p["configured_window_seconds"] - p.get("delivered_window_seconds", 0)) for p in points)
         suggested = config.max_requests + math.ceil(median(rates) * remaining) if rates else None
-        guidance.append(f"raise the total request limit to approximately {suggested} (observed requests/second × remaining concurrency-seconds) and allow the configured load time" if suggested else "raise the total request limit (max_requests) to allow the configured load windows")
-    if "time_limited" in codes:
-        guidance.append("raise Total time limit (max_duration_seconds) to allow the configured load windows")
+        guidance.append(f"raise Stop after this many requests to approximately {suggested:,} (observed requests/second × remaining concurrency-seconds) and allow the configured load time" if suggested else "raise Stop after this many requests (max_requests) to allow the configured load windows")
+    if "time_limited" in codes and config.max_duration_seconds is not None:
+        guidance.append("raise Stop test traffic after (max_duration_seconds) to allow the configured load windows")
     if "load_not_delivered" in codes:
-        guidance.append("raise Maximum at once or server concurrency (OLLAMA_NUM_PARALLEL or vLLM --max-num-seqs); disable response buffering")
+        guidance.append("raise Limit simultaneous requests or server concurrency (OLLAMA_NUM_PARALLEL or vLLM --max-num-seqs); disable response buffering")
     if "insufficient_coverage" in codes:
         guidance.append("raise the output cap or lower Minimum output length")
     if "context_exceeded" in codes:
@@ -726,3 +464,7 @@ def remedies(metrics, config):
         if code in codes:
             guidance.append(message)
     return "; ".join(guidance)
+
+
+def aggregate(statuses):
+    return next((status for status in ('fail', 'blocked', 'inconclusive', 'pass') if status in statuses), 'inconclusive')

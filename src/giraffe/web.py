@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import re
 import shutil
@@ -12,11 +11,12 @@ import socket
 import tempfile
 import threading
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,13 +25,22 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from anyio import CancelScope
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, WrapValidator
 
+from .caps import (
+    MAX_BASELINE_NAME_CHARS, MAX_LIVE_CONDITIONS, MAX_LIVE_EVENTS,
+    MAX_LIVE_PHASES, MAX_LIVE_REQUESTS, MAX_MIGRATION_NOTES,
+    MAX_SESSION_CREDENTIALS, MAX_WEB_IDENTIFIER_CHARS,
+)
+from giraffe.configuration_errors import configuration_errors as _configuration_errors
 from giraffe.capabilities import capabilities
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
-from giraffe.models import CHECK_NAMES, ConcurrentLoad, ConfigDraft, Model, RunConfig, RunReport, Sessions
+from giraffe.latency import load_observations
+from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RunConfig, RunReport,
+                            migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.planning import request_plan
+from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
@@ -44,123 +53,84 @@ from giraffe.storage import (DEFAULT_LIMITS, apply_cleanup, automatic_cleanup, c
                              is_giraffe_run, run_alive, run_size, set_kept, storage_summary)
 
 
-def _configuration_errors(items: list[dict], body: Any) -> list[dict]:
-    """Expose setting destinations without echoing arbitrary (possibly secret) input.
+def _config_input(value, handler):
+    """Migrate external configs before validating; constructed models are already v2."""
+    if isinstance(value, RunConfig):
+        return handler(value)
+    value, notes = migrate_run_limits(value)
+    value, load_notes = migrate_concurrent_load(value)
+    value, combined_notes = migrate_load_test(value)
+    config = handler(value)
+    config._migration_notes = list(dict.fromkeys([*notes, *load_notes, *combined_notes, *config._migration_notes]))
+    return config
 
-    Pydantic's model-level conflicts have no loc. Recognize their explicit field
-    names here; ordinary field errors retain their complete loc. Only numeric
-    conflicting values are included, never strings, request bodies or ctx input.
-    """
-    config = body.get("config", body) if isinstance(body, dict) else {}
-    labels = {"concurrency": "Maximum at once", "max_output_tokens": "Output cap (tokens)",
-              "request_timeout_seconds": "Request timeout (seconds)",
-              "max_duration_seconds": "Traffic time limit", "max_memory_mb": "Memory limit (RAM)", "concurrent_load.schedule.levels": "Concurrency levels",
-              "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
-              "traffic.max_in_flight": "Capacity requests at once"}
 
-    def numeric(value):
-        return type(value) is int or type(value) is float and math.isfinite(value)
+RunConfigInput = Annotated[RunConfig, WrapValidator(_config_input)]
+ConfigDraftInput = Annotated[ConfigDraft, WrapValidator(_config_input)]
 
-    def number(value):
-        if type(value) is bool:
-            return int(value)
-        if isinstance(value, str):
-            try:
-                value = float(value)
-            except ValueError:
-                return None
-            if math.isfinite(value) and value.is_integer():
-                value = int(value)
-        return value if numeric(value) else None
 
-    def value(path):
-        result = config
-        for key in path.split("."):
-            result = (result.get(key) if isinstance(result, dict) else
-                      result[int(key)] if isinstance(result, list) and key.isdigit() and int(key) < len(result) else None)
-        if result is None:
-            parts = path.split(".")
-            model = RunConfig if len(parts) == 1 else {"sessions": Sessions, "concurrent_load": ConcurrentLoad}.get(parts[0])
-            if model and len(parts) <= 2 and parts[-1] in model.model_fields:
-                result = model.model_fields[parts[-1]].get_default(call_default_factory=True)
-        if result is None and path.startswith("concurrent_load."):
-            result = ConcurrentLoad().model_dump()
-            for key in path.split(".")[1:]:
-                result = result.get(key) if isinstance(result, dict) else None
-        if isinstance(result, list):
-            values = [number(item) for item in result]
-            return values if all(numeric(item) for item in values) else None
-        return number(result)
 
-    errors = []
-    for item in items:
-        loc, message = list(item["loc"]), item["msg"].removeprefix("Value error, ")
-        path = ".".join(map(str, [part for part in loc if part not in ("body", "config")]))
-        fields = [path] if path else []
-        override = re.search(r"test_options\.([a-z_]+)\.([a-z_]+) must not exceed", message)
-        levels = re.search(r"(consistency)\.levels must not exceed", message)
-        structured = item.get("ctx", {}).get("fields")
-        if structured:
-            fields = [str(f) for f in structured]
-            if path.startswith("concurrent_load.") and not fields[0].startswith("concurrent_load."):
-                parent = path.rsplit(".", len(fields[0].split(".")))[0]
-                fields = [parent + "." + f for f in fields]
-        elif path.startswith("concurrent_load."):
-            parts = path.split(".")[1:]
-            label = {"schedule.levels": "Concurrency levels", "schedule.duration_seconds": "Duration per workload at each concurrency level",
-                "combinations.selected": "Input/output combinations", "combinations.enabled": "Input → output combinations",
-                "mixed.shares": "Share of requests", "mixed.seed": "Mixed load seed",
-                "interference.trigger": "Introduce the long input", "interference.trigger_chunks": "Answer chunks per short stream",
-                "interference.max_slowdown": "Maximum slowdown vs short-only control",
-                "stress.min_output_percent": "Minimum output length (% of cap)",
-                "pass_criteria.first_output_p95_ms": "First answer p95 at most (ms)", "pass_criteria.response_p95_ms": "Response p95 at most (ms)",
-                "pass_criteria.max_error_percent": "Errors allowed (%)", "pass_criteria.min_correct_percent": "Correct answers required (%)",
-                "pass_criteria.min_valid_responses": "Minimum valid responses per test point",
-                "input_token_tolerance": "Input token tolerance", "calibration_attempts": "Calibration attempts"}.get(".".join(parts[:2]), "Concurrent load")
-            if parts[0] == "profile" and len(parts) >= 3 and parts[1] in {"short", "medium", "long"}:
-                label = parts[1].capitalize() + (" input token target" if parts[2] == "input_tokens" else " output token cap")
-            if item["type"] == "literal_error" and parts[:2] == ["interference", "trigger"]:
-                message = "Introduce the long input after the short streams begin responding or after a number of answer chunks."
-            elif item["type"] == "extra_forbidden":
-                message = "Remove the unrecognized setting under Concurrent load."
-            elif message.startswith("Input should be "):
-                message = label + " must be " + message.removeprefix("Input should be ").rstrip(".") + "."
-            elif item["type"] != "value_error":
-                message = label + ": " + message
-        elif override:
-            path = f"test_options.{override[1]}.{override[2]}"
-            fields = [path, override[2]]
-            label = "requests at once" if override[2] == "concurrency" else labels.get(override[2], override[2]).lower()
-            message = f"{CHECK_NAMES.get(override[1], override[1])} {label} {value(path)} exceeds {labels.get(override[2], override[2])} {value(override[2])}."
-        elif levels:
-            path = levels[1] + ".levels"
-            fields = [path, "concurrency"]
-            message = f"Concurrency level {max(value(path) or [0])} exceeds Maximum at once {value('concurrency')}."
-        elif message.startswith("traffic.max_in_flight must not exceed"):
-            fields = ["traffic.max_in_flight", "concurrency"]
-            message = f"Capacity requests at once {value(fields[0])} exceeds Maximum at once {value('concurrency')}."
-        elif message.startswith("session concurrency must not exceed"):
-            fields = ["sessions.concurrency", "concurrency"]
-            message = f"Session concurrency {value(fields[0])} exceeds Maximum at once {value('concurrency')}."
-        elif message.startswith("session workload output budgets"):
-            ceiling = value("max_output_tokens")
-            fields = [f"sessions.workloads.{index}.max_tokens" for index, workload in enumerate(config.get("sessions", {}).get("workloads", []))
-                      if numeric(value(f"sessions.workloads.{index}.max_tokens")) and numeric(ceiling)
-                      and value(f"sessions.workloads.{index}.max_tokens") > ceiling] + ["max_output_tokens"]
-            message = f"Task output caps {', '.join(str(value(field)) for field in fields[:-1])} tokens exceed Output cap {ceiling} tokens."
-        elif message.startswith("session output budget"):
-            fields = ["sessions.max_tokens", "max_output_tokens"]
-            message = f"Output cap per turn {value(fields[0])} tokens exceeds Output cap {value('max_output_tokens')} tokens."
-        elif not fields:
-            fields = ["config"]  # Advanced JSON is the destination for unmapped model errors.
-        elif path in labels:
-            message = f"{labels[path]}: {message}"
-        safe_fields = set(labels) | {"samples", "max_requests", "sessions.max_tokens"} | set(fields if override or levels else [])
-        safe_fields.update(field for field in fields if field.startswith("concurrent_load.")
-                           or re.fullmatch(r"sessions\.workloads\.\d+\.max_tokens", field))
-        errors.append({"loc": loc, "msg": message, "field": fields[0], "fields": fields,
-                       "values": {field: value(field) for field in fields if field in safe_fields and value(field) is not None}})
-    return errors
+
+def _track_live_request(job: dict, event: dict, max_requests: int | None) -> None:
+    """Keep a bounded slot window and count completed requests evicted while running."""
+    slot = event.get("request_slot")
+    if (not isinstance(slot, int) or slot < 0
+            or max_requests is not None and slot >= max_requests):
+        return
+    kind = event["event"]
+    if kind not in {"request_started", "request_completed"}:
+        return
+    requests = job["requests"]
+    summary = job["live_request_summary"]
+    job["live_request_count"] = max(job["live_request_count"], slot + 1)
+    if kind == "request_started":
+        request = {"slot": slot, "status": "running", "target": event.get("target"),
+                   "scenario": event.get("scenario"), "condition_id": event.get("condition_id"),
+                   "fixture_id": event.get("fixture_id")}
+    elif event.get("request"):
+        request = {**event["request"], "slot": slot, "intentional": event.get("intentional", False)}
+    else:
+        return
+    request.update({key: event.get(key) for key in
+                    ("input_chars", "requested_max_tokens", "requested_input_tokens")})
+    if summary["through_slot"] is not None and slot <= summary["through_slot"]:
+        if kind == "request_completed" and slot in job["evicted_running"]:
+            job["evicted_running"].remove(slot)
+            summary["statuses"]["running"] -= 1
+            status = request["status"]
+            summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
+        return
+    requests[slot] = request
+    while len(requests) > MAX_LIVE_REQUESTS:
+        evicted_slot, evicted = requests.popitem(last=False)
+        summary["evicted"] += 1
+        summary["through_slot"] = evicted_slot
+        status = evicted["status"]
+        summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
+        if status == "running":
+            job["evicted_running"].add(evicted_slot)
+
+
+
+def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> None:
+    """Bound live web metadata independently of the configured arrival count."""
+    if not event["event"].startswith("condition_"):
+        job["progress"] = event
+        job["events"].append(event)
+        del job["events"][:-MAX_LIVE_EVENTS]
+    summary = event.get("condition_summary")
+    if not summary and event["event"] in {"condition_planned", "condition_started", "condition_finished"}:
+        summary = {key: event.get(key) for key in ("target", "condition", "planned", "planned_kind",
+            "status", "sent", "started", "running", "completed", "failed", "not_sent", "reason")}
+    if summary and summary.get("condition"):
+        key = (summary["target"], summary["condition"]["id"])
+        if key in job["conditions"] or len(job["conditions"]) < MAX_LIVE_CONDITIONS:
+            job["conditions"][key] = summary
+    _track_live_request(job, event, max_requests)
+    if event["event"] in {"scenario_started", "scenario_finished"}:
+        job["phases"].append({key: event.get(key) for key in
+            ("event", "target", "scenario", "elapsed_seconds")})
+        del job["phases"][:-MAX_LIVE_PHASES]
 
 
 def _validated_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | None = None) -> dict:
@@ -170,7 +140,7 @@ def _validated_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | Non
     return plan
 
 
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
+_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0," + str(MAX_WEB_IDENTIFIER_CHARS - 1) + r"}\Z")
 _SHUTDOWN_SECONDS = 5
 
 
@@ -181,7 +151,7 @@ class TargetAPIKey(APIKeyInput):
 
 class SessionCredentials(Model):
     api_keys: list[TargetAPIKey] = Field(default_factory=list, exclude=True, repr=False,
-                                       max_length=64)
+                                       max_length=MAX_SESSION_CREDENTIALS)
 
     def attach_api_keys(self, config: RunConfig | ConfigDraft) -> None:
         seen = set()
@@ -198,24 +168,11 @@ class SessionCredentials(Model):
 
 
 class StartRun(SessionCredentials):
-    config: RunConfig
-    migration_notes: list[str] = Field(default_factory=list, max_length=1000)
+    config: RunConfigInput
+    migration_notes: list[str] = Field(default_factory=list, max_length=MAX_MIGRATION_NOTES)
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
     restart_target: str | None = None
-
-
-class CleanupCriteria(Model):
-    older_than_days: int | None = Field(default=None, ge=0, strict=True)
-    keep_latest: int | None = Field(default=None, ge=0, strict=True)
-    max_total_bytes: int | None = Field(default=None, strict=True)
-
-    @field_validator("max_total_bytes")
-    @classmethod
-    def positive_total(cls, value):
-        if value is not None and value <= 0:
-            raise ValueError("Cleanup max total must be greater than 0; use --older-than 0 to remove all unprotected runs")
-        return value
 
 
 class CleanupRequest(CleanupCriteria):
@@ -235,14 +192,14 @@ class DatasetPreview(Model):
 
 
 class TryExample(SessionCredentials):
-    config: ConfigDraft
+    config: ConfigDraftInput
     fixture_id: str
     target_name: str
 
 
 class SaveBaseline(Model):
     run_id: str
-    name: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=MAX_BASELINE_NAME_CHARS)
     replace: bool = False
 
 
@@ -375,6 +332,9 @@ def _bootstrap_config(defaults: dict | None) -> dict:
         config["checks"] = ["access", "correctness"]
     else:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
+        defaults, _ = migrate_run_limits(defaults)
+        defaults, _ = migrate_concurrent_load(defaults)
+        defaults, _ = migrate_load_test(defaults)
         config.update(defaults)
         if "concurrent_load" not in defaults:
             config.pop("concurrent_load", None)
@@ -404,6 +364,21 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     unsaved_metadata: dict[str, dict] = {}
     metadata_lock = threading.RLock()
     last_auto_cleanup: dict = {}
+    observation_cache: dict = {}
+
+    def preview_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | None = None,
+                     validate: bool = False) -> dict:
+        plan = request_plan(config, pack_details=pack_details,
+                            observations=load_observations(root, config, cache=observation_cache))
+        guard = open_file_guard(config, web=True)
+        plan["open_files"] = guard
+        plan["resource_issues"] = ([dict(issue, blocking=True) for issue in guard["errors"]]
+                                   + [dict(issue, blocking=False) for issue in guard["warnings"]])
+        plan["resource_warnings"] = guard["warnings"]
+        plan["warnings"].extend(item["msg"] for item in guard["warnings"])
+        if validate and plan["errors"]:
+            raise HTTPException(422, detail=plan["errors"])
+        return plan
 
     def metadata(directory: Path) -> dict:
         with metadata_lock:
@@ -432,6 +407,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except (OSError, ValueError):
                 saved = {}
             cached = unsaved_metadata.get(directory.name, {})
+            if "latency_summary" in saved:
+                meta["latency_summary"] = saved["latency_summary"]
             resources = merge_resources(meta.get("resources", {}), saved.get("resources", {}))
             resources = merge_resources(resources, cached.get("resources", {}))
             if resources:
@@ -569,6 +546,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
                 "live_requests": list(live.get("requests", {}).values()),
+                "live_request_summary": live.get("live_request_summary", meta.get("live_request_summary", {})),
+                "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
                 "live_conditions": list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", []),
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
@@ -614,47 +593,17 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         def progress(event: dict) -> None:
             if finished:
                 return
-            if not event["event"].startswith("condition_"):
-                job["progress"] = event
-                job["events"].append(event)
-                del job["events"][:-100]
-            summary = event.get("condition_summary")
-            if not summary and event["event"] in {"condition_planned", "condition_started", "condition_finished"}:
-                summary = {key: event.get(key) for key in ("target", "condition", "planned", "planned_kind",
-                    "status", "sent", "started", "running", "completed", "failed", "not_sent", "reason")}
-            if summary and summary.get("condition"):
-                key = (summary["target"], summary["condition"]["id"])
-                if key in job["conditions"] or len(job["conditions"]) < 2048:
-                    job["conditions"][key] = summary
-            slot = event.get("request_slot")
-            if isinstance(slot, int) and 0 <= slot < config.max_requests:
-                if event["event"] == "request_started":
-                    job["requests"][slot] = {"slot": slot, "status": "running",
-                        "target": event.get("target"), "scenario": event.get("scenario"),
-                        "condition_id": event.get("condition_id"),
-                        "fixture_id": event.get("fixture_id"),
-                        "input_chars": event.get("input_chars"),
-                        "requested_max_tokens": event.get("requested_max_tokens"),
-                        "requested_input_tokens": event.get("requested_input_tokens")}
-                elif event["event"] == "request_completed" and event.get("request"):
-                    job["requests"][slot] = {**event["request"], "slot": slot,
-                        "intentional": event.get("intentional", False),
-                        "input_chars": event.get("input_chars"),
-                        "requested_max_tokens": event.get("requested_max_tokens"),
-                        "requested_input_tokens": event.get("requested_input_tokens")}
-            if event["event"] in {"scenario_started", "scenario_finished"}:
-                job["phases"].append({key: event.get(key) for key in
-                    ("event", "target", "scenario", "elapsed_seconds")})
-                del job["phases"][:-1024]
+            _track_live_progress(job, event, config.max_requests)
 
         try:
             report = await run_suite(config, progress=progress, stop_event=job["stop"])
+            report.manifest["open_files"] = job["open_files"]
             if baseline is not None:
                 report = compare_baseline(report, baseline)
             meta["run_id"] = report.run_id
             sampler = PhaseSampler("export")
             try:
-                with sampler:
+                with sampler, metadata_lock:
                     write_report(report, job["directory"], max_run_storage=max_run_storage)
             except OSError as error:
                 if getattr(error, "json_complete", False):
@@ -679,7 +628,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         finally:
             finished = True
             meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
-                        conditions=list(job["conditions"].values()))
+                        conditions=list(job["conditions"].values()),
+                        live_request_summary=job["live_request_summary"],
+                        live_request_count=job["live_request_count"])
             status_warning_added = False
 
             def persist_final():
@@ -732,9 +683,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     async def bootstrap():
         configuration = _bootstrap_config(defaults)
         resolved = ConfigDraft.model_validate(configuration)
+        migrated_defaults, limit_notes = migrate_run_limits(defaults)
+        migrated_defaults, load_notes = migrate_concurrent_load(migrated_defaults)
+        _, combined_notes = migrate_load_test(migrated_defaults)
         return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
-                "migration_notes": list(dict.fromkeys([*(migration_notes or []), *resolved._migration_notes])),
-                "active_run_id": active.get("id"), "request_plan": request_plan(resolved)}
+                "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
+                "active_run_id": active.get("id"), "request_plan": preview_plan(resolved)}
 
     @app.get("/api/capabilities")
     async def describe_capabilities():
@@ -761,22 +715,22 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
 
     @app.post("/api/config/draft")
-    async def validate_draft(config: ConfigDraft):
+    async def validate_draft(config: ConfigDraftInput):
         """Normalize a draft for editing or export without requiring run readiness."""
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": request_plan(config)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": preview_plan(config)}
 
     @app.post("/api/config/plan")
     @app.post("/api/config/validate")
-    async def validate_config(config: RunConfig):
+    async def validate_config(config: RunConfigInput):
         """Normalize edits using the same contract as a run without sending traffic."""
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": _validated_plan(config)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": preview_plan(config, validate=True)}
 
     @app.post("/api/config/preview")
-    async def preview_config(config: ConfigDraft):
+    async def preview_config(config: ConfigDraftInput):
         """Describe effective requests and coverage without target calls or file imports."""
         preview = pack_preview(config)
         return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_pack_preview": preview,
-                "request_plan": _validated_plan(config, pack_details=preview)}
+                "request_plan": preview_plan(config, pack_details=preview, validate=True)}
 
     @app.post("/api/datasets/preview")
     async def preview_dataset_import(body: DatasetPreview):
@@ -895,6 +849,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                     "before starting a run.")
             config, baseline = prepare_run(body)
             _validated_plan(config)
+            guard = open_file_guard(config, raise_limit=True, web=True)
+            if guard["errors"]:
+                raise HTTPException(422, detail=guard["errors"])
             try:
                 await run_in_threadpool(check_start, root, limits)
             except ValueError as error:
@@ -906,9 +863,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
             save_metadata(directory, meta)
             active.update(id=identifier, state="running", directory=directory, meta=meta,
-                          progress={}, events=[], requests={}, conditions={}, phases=[], stop=asyncio.Event())
+                          open_files=guard,
+                          progress={}, events=[], requests=OrderedDict(), conditions={}, phases=[],
+                          live_request_summary={"evicted": 0, "through_slot": None, "statuses": {}},
+                          live_request_count=0, evicted_running=set(), stop=asyncio.Event())
             active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": "running"}
+            return {"id": identifier, "state": "running", "migration_notes": config._migration_notes}
 
 
     @app.get("/api/runs/{identifier}")

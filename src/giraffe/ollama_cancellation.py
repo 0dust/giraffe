@@ -9,13 +9,14 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 from giraffe.sglang_traces import TraceTail
+from giraffe.caps import MAX_OLLAMA_HEADER_BYTES
 
 
 class OllamaLogTail(TraceTail):
     def __init__(self, path, target):
         super().__init__(path)
         with self.path.open("rb") as source:
-            header = source.read(min(self.offset, 512 * 1024)).decode(errors="replace")
+            header = source.read(min(self.offset, MAX_OLLAMA_HEADER_BYTES)).decode(errors="replace")
         port = urlsplit(target.url).port or 80
         parallelism = re.findall(r"\bmsg=load\b.*\bOperation:commit\b.*\bParallel:(\d+)\b", header)
         if (not parallelism or any(value != "1" for value in parallelism)

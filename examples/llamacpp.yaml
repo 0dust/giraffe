@@ -1,3 +1,4 @@
+config_version: 2
 # Match the URL, model and server limits to your deployment.
 targets:
 - name: llamacpp
@@ -28,6 +29,7 @@ checks:
 - consistency
 - tools
 concurrency: 2
+default_concurrency: 2
 max_requests: 700
 max_duration_seconds: 1800
 request_timeout_seconds: 60

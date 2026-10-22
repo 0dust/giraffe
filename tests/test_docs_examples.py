@@ -10,6 +10,7 @@ import yaml
 from giraffe.cli import configuration, main, parser
 from giraffe.models import RunConfig, Target
 from giraffe.planning import request_plan
+from giraffe.open_files import open_file_guard
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,11 +31,20 @@ def test_yaml_examples_validate_and_preview_without_traffic(path, monkeypatch, c
     config = RunConfig.model_validate(yaml.safe_load(path.read_text()))
     assert preview['config'] == config.model_dump(mode='json')
     plan = request_plan(config)
-    assert preview['request_plan'] == plan
+    guard = open_file_guard(config)
+    expected = {**plan, "open_files": guard, "resource_warnings": guard["warnings"],
+                "resource_issues": [dict(issue, blocking=True) for issue in guard["errors"]]
+                + [dict(issue, blocking=False) for issue in guard["warnings"]]}
+    expected["warnings"] = plan["warnings"] + [issue["msg"] for issue in guard["warnings"]]
+    assert preview['request_plan'] == expected
     assert all(quota >= plan['conservative_requests_per_target']
                for quota in plan['target_quotas'].values()), plan['warnings']
-    for warning in plan['warnings']:
-        assert 'throughput may be unreliable' in warning or 'context_limit' in warning
+    notices = [notice for name in ('time_warnings', 'request_warnings', 'load_warnings',
+                                  'concurrency_warnings', 'capacity_warnings') for notice in plan[name]]
+    assert set(plan['warnings']) == {notice['msg'] for notice in notices}
+    assert all(notice['fields'] for notice in notices)
+    assert {notice['kind'] for notice in plan['request_warnings']} <= {'adaptive_risk', 'incomplete_coverage'}
+    assert {notice['kind'] for notice in plan['time_warnings']} <= {'estimate_risk', 'incomplete_coverage'}
 
 
 

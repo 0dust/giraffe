@@ -1,0 +1,8 @@
+# No config_version: preserve the legacy shared-pool workload on both endpoints.
+targets:
+  - {name: one, url: 'http://local/one', model: m}
+  - {name: two, url: 'http://local/two', model: m}
+checks: [correctness, json, recovery, arrivals, capacity]
+concurrency: 40
+overlap_models: true
+arrivals: {requests: 2}

@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from giraffe.caps import MAX_DATASET_PREVIEW_ROWS
+
 from giraffe.models import (MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
                             ConfigDraft, RequestPack, RunConfig)
 from giraffe.request_pack import pack_warnings
@@ -68,7 +70,7 @@ def preview_dataset(text: str, format: str, *, input_field: str | None = None,
                     return result
                 result["request_pack"] = pack.model_dump(mode="json")
                 result["warnings"] = pack_warnings(pack)
-                result["preview_rows"] = result["request_pack"]["cases"][:5]
+                result["preview_rows"] = result["request_pack"]["cases"][:MAX_DATASET_PREVIEW_ROWS]
                 return result
             if not isinstance(parsed, list):
                 raise ValueError("JSON must be a request pack or an array of row objects")
@@ -94,7 +96,7 @@ def preview_dataset(text: str, format: str, *, input_field: str | None = None,
         if not rows or len(rows) > MAX_REQUEST_PACK_CASES:
             raise ValueError("Dataset must contain 1 to 1000 rows")
         result["columns"] = columns
-        result["preview_rows"] = rows[:5]
+        result["preview_rows"] = rows[:MAX_DATASET_PREVIEW_ROWS]
         for field, aliases in (("input_field", ("prompt", "question", "input", "text")),
                                ("expected_field", ("expected", "expected_answer", "answer", "reference", "output"))):
             result["suggested_mapping"][field] = next(
@@ -139,7 +141,9 @@ def try_example_config(draft: ConfigDraft, fixture_id: str, target_name: str) ->
         raise ValueError("Choose an existing dataset example")
     if target is None:
         raise ValueError("Choose an existing target")
-    consumer = "capacity" if "capacity" in draft.checks else "correctness"
+    # The loaded pass owns a shared pack request. Preserve its effective
+    # timeout rather than falling back to the suite default when projecting it.
+    consumer = "load" if "load" in draft.checks else "capacity" if "capacity" in draft.checks else "correctness"
     effective = draft.effective_check(consumer)
     values = draft.model_dump(mode="json")
     selected_target = target.model_dump(mode="json")
@@ -150,10 +154,5 @@ def try_example_config(draft: ConfigDraft, fixture_id: str, target_name: str) ->
                   request_pack={"version": 1, "cases": [case.model_dump(mode="json")]},
                   max_output_tokens=effective.get("max_output_tokens", draft.max_output_tokens),
                   request_timeout_seconds=effective.get("request_timeout_seconds", draft.request_timeout_seconds),
-                  test_options={"correctness": {"limits": effective["limits"]}})
-    # Limits accepted by correctness are narrower than the global limits model.
-    from giraffe.models import CHECK_LIMIT_FIELDS
-    values["test_options"]["correctness"]["limits"] = {
-        key: value for key, value in effective["limits"].items()
-        if key in CHECK_LIMIT_FIELDS["correctness"]}
+                  limits=draft.effective_check("correctness")["limits"], test_options={})
     return RunConfig.model_validate(values)

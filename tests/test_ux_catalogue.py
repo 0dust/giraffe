@@ -1,6 +1,7 @@
 """Catalogue behavior, honest summaries and lossless specialist settings."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,11 +36,17 @@ const context={assert,structuredClone,FormData,...formConfig,nodes,groups,listen
 context.bootstrap=BOOTSTRAP;context.config=CONFIG;
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;state.bootstrap.config=config;state.config=config;\n(async()=>{'+BODY+'\n})()',context);
-""".replace("MODULE_PATH", json.dumps((STATIC / "form-config.mjs").as_uri()))
-    script = script.replace("APP_PATH", json.dumps(str(STATIC / "app.js")))
-    script = script.replace("BOOTSTRAP", json.dumps(capabilities()))
-    script = script.replace("CONFIG", json.dumps(config.model_dump(mode="json")))
-    script = script.replace("BODY", json.dumps(body))
+"""
+    substitutions = {
+        "MODULE_PATH": json.dumps((STATIC / "form-config.mjs").as_uri()),
+        "APP_PATH": json.dumps(str(STATIC / "app.js")),
+        "BOOTSTRAP": json.dumps(capabilities()),
+        "CONFIG": json.dumps(config.model_dump(mode="json")),
+        "BODY": json.dumps(body),
+    }
+    # Replace template tokens once; injected constants can contain CONFIG/BODY.
+    script = re.sub(r"\b(?:MODULE_PATH|APP_PATH|BOOTSTRAP|CONFIG|BODY)\b",
+                    lambda match: substitutions[match[0]], script)
     result = subprocess.run([node, "--input-type=module", "-"], input=script,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -49,7 +56,7 @@ await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;state.bootstrap.con
 def test_all_checks_have_local_settings_and_one_question_source():
     browser_logic(r"""
 const original=JSON.stringify(config),markup=renderCheckSelection(config);
-assert.equal((markup.match(/data-test-card="/g)||[]).length,17);
+assert.equal((markup.match(/data-test-card="/g)||[]).length,15);
 for(const check of bootstrap.checks){
   assert.equal((markup.match(new RegExp('data-test-card="'+check.id+'"','g'))||[]).length,1);
   const row=renderTestCard(check,config);assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
@@ -57,10 +64,10 @@ for(const check of bootstrap.checks){
 for(const group of checkGroups)assert(markup.includes('data-action="catalogue-category" data-category="'+group.id+'"'));
 assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);
 assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config),/id="setup-dataset"/);
-const capacity={...config,checks:['capacity']};
-assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='capacity'),capacity),/id="setup-dataset"/);
+const capacity={...config,checks:['load']};
+assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='load'),capacity),/id="setup-dataset"/);
 assert.doesNotMatch(renderCheckSelection({...config,checks:['access']}),/id="setup-dataset"/);
-for(const name of ['traffic_rates','traffic_duration_seconds','load_schedule_levels','load_profile_short_input_tokens','profile_sessions_concurrency']){
+for(const name of ['load_patterns_rates','load_schedule_duration_seconds','load_patterns_concurrent_levels','load_profile_short_input_tokens','profile_sessions_concurrency']){
   assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 }
 assert.doesNotMatch(markup,/name="setup_goal"|name="setup_load"/);
@@ -120,15 +127,15 @@ for(const check of bootstrap.checks){
     dataset:{category:checkGroups.find(x=>x.checks.includes(check.id)).id,search:(checkGuide[check.id].name+' '+checkGuide[check.id].purpose).toLowerCase()}};
   nodes['[data-test-card="'+check.id+'"]']=card;cards.push(card);
 }
-syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,17);
-state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,17);
+syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,15);
+state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,15);
 state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 // Browse filters must not hide selected checks when returning to the run.
 state.catalogueCategory='server';state.catalogueSearch='gpu';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 state.catalogueCategory='all';
 state.catalogueFilter='all';state.catalogueSearch='concurrent conversations';syncTestControls();assert.equal(cards.filter(x=>!x.hidden)[0].id,'sessions');
-revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,17);
+revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,15);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -144,10 +151,10 @@ state.catalogueCategory='server';state.catalogueFilter='selected';state.catalogu
 assert.throws(()=>validateSetupChecks(),/Add a question/);
 assert.equal(state.openTest,'correctness');assert.equal(state.setupStep,2);assert.equal(state.catalogueCategory,'all');
 assert(nodes['[data-action="add-example"]'].focused);
-state.config.checks=['capacity'];state.config.judging={judges:[{}]};state.openTest=null;state.setupStep=3;
-configureEvaluator();assert.equal(state.openTest,'capacity');assert.equal(state.setupStep,2);assert(details.open);
+state.config.checks=['load'];state.config.judging={judges:[{}]};state.openTest=null;state.setupStep=3;
+configureEvaluator();assert.equal(state.openTest,'load');assert.equal(state.setupStep,2);assert(details.open);
 assert(nodes['[name="judge_0_url"]'].focused);
-state.config.judging=null;let added=false;changeJudge=action=>{added=action==='add';assert.equal(state.openTest,'capacity');};
+state.config.judging=null;let added=false;changeJudge=action=>{added=action==='add';assert.equal(state.openTest,'load');};
 state.openTest=null;configureEvaluator();assert(added);
 """)
 
@@ -155,7 +162,7 @@ state.openTest=null;configureEvaluator();assert(added);
 def test_browse_warnings_follow_selection_and_open_draft_without_losing_values():
     browser_logic(r"""
 config.limits.min_samples=5;config.max_output_tokens=32;
-config.concurrent_load=structuredClone(bootstrap.concurrent_load.defaults);config.concurrent_load.schedule.levels=[1];
+config.load_test=structuredClone(bootstrap.load_test.defaults);config.load_test.patterns.concurrent.levels=[1];
 config.consistency={...bootstrap.profile_defaults.consistency,repetitions:4,levels:[1,2],shapes:['short','long']};
 config.test_options.generation={max_output_tokens:64};
 state.catalogueFilter='all';state.openTest=null;
@@ -179,23 +186,24 @@ for(const id of ['consistency']){
   assert(warnings[id].coverage.textContent.length>0);
 }
 syncTestControls();updateCheckFieldHints(config);
-for(const id of ['concurrency','consistency'])assert.equal(warnings[id].coverage.hidden,true);
+for(const id of ['load','consistency'])assert.equal(warnings[id].coverage.hidden,true);
 assert.equal(warnings.generation.override.hidden,true);
 // An unselected draft gets feedback only while the user is editing it.
 state.openTest='consistency';syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.consistency.coverage.hidden,false);
 state.openTest='generation';syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.consistency.coverage.hidden,true);assert.equal(warnings.generation.override.hidden,false);
+assert.equal(warnings.consistency.coverage.hidden,true);assert.equal(warnings.generation.override.hidden,true); // Suite output is a default, not a ceiling.
+assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config,true),'');
 state.openTest=null;syncTestControls();updateCheckFieldHints(config);
 assert.equal(warnings.generation.override.hidden,true);
 assert.equal(JSON.stringify(config),original);
 // Selected checks keep warnings visible with their editor closed.
-config.checks.push('concurrency');selections.concurrency.checked=true;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.concurrency.coverage.hidden,true); // Duration windows have no planned sample target.
-config.checks=config.checks.filter(id=>id!=='concurrency');selections.concurrency.checked=false;
-state.openTest='concurrency';syncTestControls();assert.equal(warnings.concurrency.coverage.hidden,true); // Duration windows have no planned sample target.
+config.checks.push('load');selections.load.checked=true;syncTestControls();updateCheckFieldHints(config);
+assert.equal(warnings.load.coverage.hidden,true); // Duration windows have no planned sample target.
+config.checks=config.checks.filter(id=>id!=='load');selections.load.checked=false;
+state.openTest='load';syncTestControls();assert.equal(warnings.load.coverage.hidden,true); // Duration windows have no planned sample target.
 state.openTest=null;syncTestControls();updateCheckFieldHints(config);
-assert.equal(warnings.concurrency.coverage.hidden,true);
+assert.equal(warnings.load.coverage.hidden,true);
 assert.equal(config.test_options.generation.max_output_tokens,64);
 """)
 
@@ -215,8 +223,8 @@ assert.equal(saved.prefix.repeats,9);
 values.clear();values.set('profile_edits_sessions','["sessions"]');values.set('profile_sessions_sessions','3');
 values.set('profile_edits_consistency','["repetitions"]');values.set('profile_consistency_repetitions','3');
 const bounded=configureProfiles(config,values,bootstrap.profile_defaults);
-assert.equal(bounded.sessions.concurrency,1);assert.equal(bounded.sessions.max_tokens,16);
-assert.equal(bounded.consistency.levels.join(','),'1');assert.equal(bounded.sessions.sessions,3);
+assert.equal(effectiveProfileDefaults(bounded,bootstrap.profile_defaults,'sessions').concurrency,1);assert.equal(effectiveProfileDefaults(bounded,bootstrap.profile_defaults,'sessions').max_tokens,16);
+assert.equal(effectiveProfileDefaults(bounded,bootstrap.profile_defaults,'consistency').levels.join(','),'1');assert.equal(bounded.sessions.sessions,3);
 assert.equal(JSON.stringify(config),original);console.log(JSON.stringify(bounded));
 """, config)
     valid = RunConfig.model_validate(payload)
@@ -307,26 +315,27 @@ def test_run_limits_are_collapsed_and_keep_controls_without_repeating_workload()
 config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
 assert.match(markup,/<details class="shared-settings-editor" id="shared-settings">/);
-assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Edit run limits<\/h2>/);
+assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits<\/h2>/);
 assert.match(markup,/Up to 160 requests · 5m 0s · 4 at once/);assert.match(markup,/class="shared-settings-edit" aria-hidden="true">⌄/);
 assert(markup.lastIndexOf('</details>')<markup.indexOf('id="checks-plan-summary"'));
 assert.match(markup,/class="run-ceilings-values" id="run-ceilings-summary"/);
-assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary" role="status"/);
-const expected=['max_requests','max_duration_seconds','concurrency','samples','max_output_tokens','request_timeout_seconds','context_limit','stream',
-  ...limitFields.map(([name])=>'limit_'+name),'limit_max_error_rate','limit_min_correctness','limit_min_samples','limit_regression_percent'];
+assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary"/);
+assert.doesNotMatch(markup,/aria-live=/);
+const expected=['max_requests','max_duration_seconds','concurrency','max_memory_mb','max_requests_enabled','max_duration_seconds_enabled','concurrency_enabled','max_memory_mb_enabled','max_duration_unit'];
 for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 let depth=0,maximumDepth=0;
 for(const tag of markup.matchAll(/<(\/?)details\b[^>]*>/g)){depth+=tag[1]?-1:1;maximumDepth=Math.max(maximumDepth,depth);}
-assert.equal(depth,0);assert.equal(maximumDepth,2); // Outer shared settings plus request or pass defaults.
+assert.equal(depth,0);assert.equal(maximumDepth,1); // One disclosure; request settings and pass criteria live in check panels.
 assert.doesNotMatch(markup,/Set the limits once|run-limit-note|<p class="hint">/);
-for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.doesNotMatch(markup,new RegExp('id="field-'+name+'-hint"'));
+for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.match(markup,new RegExp('id="field-'+name+'-hint"></span>')); // Empty enabled-state hint receives Not set when unchecked.
 assert.match(markup,/AI evaluator calls have separate limits/); // Available through the field help.
 assert.equal(JSON.stringify(config),before);
 for(const id of ['run-ceilings-summary','request-defaults-summary','acceptance-summary'])nodes['#'+id]={};
 config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
 assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
-assert(catalogue.indexOf('id="test-selection"')<catalogue.indexOf('id="shared-settings"'));
+assert(!catalogue.includes('id="shared-settings"')); // Run limits is a preceding sibling in renderNew.
+assert.doesNotMatch(markup,/name="samples"|name="max_output_tokens"|name="request_timeout_seconds"|name="context_limit"|name="stream"|name="limit_/);
 assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
 assert.doesNotMatch(catalogue,/catalogue-view-hint/);

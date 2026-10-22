@@ -204,12 +204,15 @@ async def test_w7_history_mixup_fails_each_sessions_seeded_value(monkeypatch):
 
 
 async def test_w9_pending_queue_does_not_cap_inflight(monkeypatch):
-    endpoint = MemoryEndpoint(monkeypatch, delay=.03)
-    report = await run_suite(config(endpoint, checks=['arrivals'], stream=False, concurrency=4,
-        arrivals={'mode': 'burst', 'requests': 8, 'burst_size': 8, 'max_pending': 1}))
+    endpoint=MemoryEndpoint(monkeypatch,delay=.03)
+    settings=config(endpoint,checks=['arrivals'],stream=False,concurrency=4,arrivals={'mode':'burst','requests':8,'burst_size':8,'max_pending':1})
+    report=await run_suite(settings)
+    p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
     assert endpoint.peak == 4
-    assert len(report.requests) == 5  # Four dispatched and one queued; the remaining offers drop.
-    assert check(report, 'arrivals').metrics['schedule']['unissued']
+    # Final load admits immediately; the old pending queue no longer exists.
+    assert p['scheduled'] == 8 and p['dispatched'] == 4 and p['local_drops'] == 4
+    assert p['not_sent'] == 4 and p['status'] == 'inconclusive'
+    assert any('max_pending' in n for n in settings._migration_notes)
 
 
 
@@ -345,10 +348,19 @@ async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workl
         arrivals={'requests': 3, 'requests_per_second': 100},
         prefix={'repeats': 3}, consistency={'shapes': ['short'], 'repetitions': 2,
             **({'logprobs': {'top_logprobs': 0}} if workload == 'logprobs' else {})})
+    if workload == 'arrivals':
+        from tests.test_concurrent_load import short_windows
+        short_windows(settings,.03)
     report = await run_suite(settings)
     planned = request_plan(settings)
-    assert planned['count_kind'] == 'exact'
-    assert planned['planned_per_target'] == len(endpoint.requests) == len(report.requests)
+    assert planned['count_kind'] == ('bounded' if workload == 'arrivals' else 'exact')
+    if workload == 'arrivals':
+        p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
+        calibration=sum(r.load_point.get('type') == 'calibration' for r in report.requests)
+        assert planned['load_test']['expected_scheduled_requests'] == p['scheduled'] == p['dispatched']
+        assert len(endpoint.requests) == len(report.requests) == p['dispatched'] + calibration
+    else:
+        assert planned['planned_per_target'] == len(endpoint.requests) == len(report.requests)
 
 
 async def test_round2_overlap_is_time_weighted_over_each_request_lifetime(monkeypatch):

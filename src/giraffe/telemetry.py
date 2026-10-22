@@ -12,6 +12,10 @@ from datetime import datetime, timezone
 
 import httpx
 
+from .caps import (
+    MAX_DEPLOYMENT_HISTORY, MAX_METRICS_BODY_BYTES, MAX_METRICS_LABELS,
+    MAX_METRICS_LABEL_CHARS,
+)
 from giraffe.deployment import sanitize
 
 # Exact names and units, not substring guesses. Profiles are explicit runtime contracts.
@@ -299,10 +303,10 @@ def parse(body, target, config):
             continue
         labels = {}
         for key, value in LABEL.findall(raw_labels or ""):
-            if len(labels) >= 16:
+            if len(labels) >= MAX_METRICS_LABELS:
                 truncated = True
                 break
-            labels[key] = value[:256]
+            labels[key] = value[:MAX_METRICS_LABEL_CHARS]
         family, kind, unit = mapping[name]
         timestamp = float(raw_time) if raw_time else None
         age = time.time() - timestamp / 1000 if timestamp is not None else None
@@ -414,7 +418,7 @@ async def scrape(run, target, phase, *, force=False):
                     response.raise_for_status()
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
-                        if len(body) + len(chunk) > 1024 * 1024:
+                        if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
                             return result | {
                                 "status": "response_limit",
                                 "reason": "Statistics response exceeds 1 MiB.",
@@ -462,7 +466,7 @@ async def sample_during(run, target):
         data["snapshots"].append(snap)
         if (
             target.deployment.collector_url
-            and len(run.observations[target.name]["deployment_history"]) < 32
+            and len(run.observations[target.name]["deployment_history"]) < MAX_DEPLOYMENT_HISTORY
         ):
             from giraffe.deployment import snapshot
 

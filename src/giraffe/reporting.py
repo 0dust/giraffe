@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 import errno
 from fractions import Fraction
 from html import escape
@@ -17,17 +18,23 @@ import tempfile
 from statistics import median
 from typing import Any
 
-from .deployment import deployment_diff, safe_config, sanitize
+from pydantic import ValidationError
+
+from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
+                   DEFAULT_HTML_REQUEST_DETAILS, MAX_FAILURE_SUMMARY_TITLE_CHARS,
+                   MAX_FAILURE_SUMMARY_CHARS)
+from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport, overall_status, load_shape_label
-from .storage import format_size
+from .models import (CHECK_NAMES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+                     migrate_concurrent_load, migrate_run_limits)
+from .storage import DEFAULT_LIMITS, format_size
 from .workloads import WORKLOAD_CHECKS
 from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
 _MATCH_CONFIG = (
-    "concurrency", "max_requests", "max_duration_seconds", "request_timeout_seconds",
+    "request_timeout_seconds",
     "max_output_tokens", "context_limit", "samples", "sustained_seconds", "checks",
     "structured_json", "overlap_models", "stream", "request_options", "stop_after_errors",
     "unresponsive_after_failures", "unresponsive_for_seconds",
@@ -57,8 +64,181 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
         if (record.target == target and getattr(record, "traffic_stage", None) is None
                 and record.scenario not in {"client_cancel", "client_deadline", "sglang_cancel", "backend_cancel"}):
             for check in record.check_ids:
-                groups[(check, record.scenario)].append(record)
+                if check == "load" and not (record.load_point or {}).get("point_id"):
+                    continue  # Setup calibration is not a workload result group.
+                scenario = record.scenario
+                if check == "load" and record.load_point:
+                    # A mixed test has one sending window but distinct shape cohorts.
+                    scenario += "." + str(record.load_point.get("shape", "unknown"))
+                    if record.load_point.get("role") != "request":
+                        scenario += "." + str(record.load_point.get("role", "unknown"))
+                groups[(check, scenario)].append(record)
     return groups
+
+
+def _comparison_config(value: dict) -> dict:
+    """Normalize saved config I/O without changing the recorded workload identity."""
+    config, _ = migrate_run_limits(deepcopy(value))
+    config, _ = migrate_concurrent_load(config)
+    if isinstance(config.get("limits"), dict):
+        config["limits"].pop("regression_percent", None)
+    default = config.setdefault("default_concurrency", 4)
+    ceiling = config.get("concurrency")
+    if isinstance(ceiling, int):
+        targets = len(config.get("targets", [])) if config.get("overlap_models") else 1
+        default = max(1, min(default, ceiling // max(1, targets)))
+    if isinstance(config.get("arrivals"), dict):
+        arrivals = config["arrivals"]
+        if arrivals.get("max_in_flight") is None:
+            arrivals["max_in_flight"] = default
+    if isinstance(config.get("traffic"), dict):
+        # The user-supplied response-time estimate affects preview advice only.
+        config["traffic"].pop("expected_response_seconds", None)
+        if config["traffic"].get("max_in_flight") is None:
+            config["traffic"]["max_in_flight"] = default
+    return config
+
+
+def _comparison_manifest(manifest: dict) -> dict:
+    config = _comparison_config(manifest.get("config", {}))
+    value = {**manifest, "config": config}
+    try:
+        resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
+    except ValidationError:
+        return value  # Preserve unknown/missing evidence rather than invent executed work.
+    for field, checks in WORKLOAD_CHECKS.items():
+        if checks.intersection(resolved.checks):
+            settings = resolved.effective_arrivals() if field == "arrivals" else getattr(resolved, field)
+            config[field] = settings.model_dump(mode="json") if hasattr(settings, "model_dump") else settings
+    effective = {name: resolved.effective_check(name) for name in resolved.checks}
+    if "effective_checks" not in value:
+        value["effective_checks"] = effective
+    elif isinstance(value.get("effective_checks"), dict):
+        # Phase 3 adds request defaults to the recorded check contract. Fill only
+        # those newly introduced fields; missing earlier evidence stays unknown.
+        added = {
+            "serving": {"samples", "max_output_tokens", "request_timeout_seconds"},
+            "first_output": {"max_output_tokens", "request_timeout_seconds"},
+            "generation": {"request_timeout_seconds"},
+            "context": {"max_output_tokens", "request_timeout_seconds"},
+            "correctness": {"max_output_tokens", "request_timeout_seconds"},
+            "json": {"max_output_tokens", "request_timeout_seconds"},
+            "cancellation": {"max_output_tokens", "request_timeout_seconds"},
+            "recovery": {"max_output_tokens", "request_timeout_seconds"},
+            "capacity": {"max_output_tokens", "request_timeout_seconds"},
+            "arrivals": {"max_output_tokens", "request_timeout_seconds"},
+            "prefix": {"context_limit", "request_timeout_seconds"},
+            "sessions": {"context_limit", "request_timeout_seconds"},
+            "consistency": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
+            "tools": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
+            "concurrency": {"request_timeout_seconds"},
+        }
+        value["effective_checks"] = {
+            check: {**{field: effective.get(check, {}).get(field)
+                        for field in added.get(check, set()) if field in effective.get(check, {})},
+                    **settings} if isinstance(settings, dict) else settings
+            for check, settings in value["effective_checks"].items()
+        }
+    if "capacity" in resolved.checks:
+        value.setdefault("effective_traffic", resolved.effective_traffic().model_dump(mode="json"))
+    return value
+
+
+def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | None:
+    """Reconstruct only identities whose generator revision is known exactly."""
+    raw = manifest.get("config", {})
+    legacy = revision == "legacy"
+    config, _ = migrate_run_limits(deepcopy(raw))
+    config, _ = migrate_concurrent_load(config)
+    try:
+        resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
+    except ValidationError:
+        return None
+    if revision == "issue45" and not set(resolved.checks) <= {"sessions", "consistency"}:
+        return None  # Load generators changed; this attestation covers unchanged specialists only.
+    settings = {}
+    for field, checks in WORKLOAD_CHECKS.items():
+        if not checks.intersection(resolved.checks):
+            continue
+        if field not in raw:
+            return None  # A fingerprint cannot attest settings missing from the saved config.
+        value = raw[field] if legacy else getattr(resolved, field)
+        settings[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+    # These exact source revisions preserve default generated workloads across
+    # the bounds/request-setting split. Unknown revisions retain strict matching.
+    identity = {
+        "generator_source_sha256": {
+            "legacy": "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115eccb0",
+            "phase2": "c4edf02ed8db34d203da2328543acc3a49d98d3af41dc9471855b232c9ccf9f3",
+            "phase3": "e147840e6530a40c0ac1607ac05840a5aec5abeb2faaff31e53bd2613057eaec",
+            "review26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
+            "caps26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
+            "issue45": "9c47aa627a061bd90f0e181ce26b7faa912be790ae75547348c72445c4144b35",
+        }[revision] if any(settings.values()) else None,
+        "settings": settings,
+    }
+    if "concurrency" in resolved.checks:
+        identity["concurrent_load_source_sha256"] = {
+            "legacy": "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7",
+            "phase2": "5d4c4519c9f4b83dbec1286cd77287cfbeabbb1b9578b0d1365e9ea7480c5b88",
+            "phase3": "4124cfbd14b126c663cfa1e6f2e0a1cdc7146bfe415249e801e06049e3f79eb3",
+            "review26": "af6447cbef3456e303a590b430b3d11ea8d93a6c1a553d54f26e41086320f222",
+            # Named caps and readable remedies preserve the default requests.
+            "caps26": "5fed7f8033592e8392a51a598f6eddddf1462b74e963569527d793539f62ff88",
+        }[revision]
+    if "consistency" in resolved.checks and resolved.consistency and resolved.consistency.logprobs:
+        identity["logprob_source_sha256"] = {
+            "legacy": "1cecd981fea42d75a7abffbe8a069699b97cca73a273c2786c240b5a8c78b7b2",
+            "phase2": "1cecd981fea42d75a7abffbe8a069699b97cca73a273c2786c240b5a8c78b7b2",
+            "phase3": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
+            "review26": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
+            "caps26": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "issue45": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+        }[revision]
+    if "tools" in resolved.checks:
+        from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        identity["resolved_tool_checks"] = {
+            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
+            "modes": resolved_tool_modes(resolved),
+            **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
+                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in {"phase3", "review26", "caps26"} else
+                                               "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
+               if resolved.tool_checks and resolved.tool_checks.conversations else {}),
+        }
+    return identity
+
+
+def _same_run_limits_workload(current: dict, old: dict) -> bool:
+    if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
+        return False
+    for manifest in (current, old):
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
+        if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+                   for identity in identities):
+            return False
+    current_config = _comparison_manifest(current)["config"]
+    old_config = _comparison_manifest(old)["config"]
+    selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    return all(current_config.get(field) == old_config.get(field)
+               for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
+
+
+def _limits_reached(report: RunReport) -> set[str]:
+    reached = set(report.limits_reached)
+    if any("Global request budget exhausted" in warning for warning in report.warnings):
+        reached.add("max_requests")
+    load_metrics = [check.metrics for check in report.checks if check.id == "concurrency"]
+    load_metrics.extend(target.get("concurrent_load", {})
+                        for target in report.observations.get("targets", {}).values()
+                        if isinstance(target, dict))
+    if any(point.get("reason_code") == "budget_limited"
+           for metrics in load_metrics
+           if isinstance(metrics, dict)
+           for group in metrics.get("load_types", {}).values()
+           for point in group.get("points", [])):
+        reached.add("max_requests")
+    return reached
 
 
 def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
@@ -75,10 +255,16 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for label, run in (("Current", report), ("Baseline", baseline)):
         if any(record.evaluation_error for record in run.requests):
             reasons.append(f"{label} answer evaluation failed; correctness and capacity cannot be compared.")
-    current_config = report.manifest.get("config", {})
-    old_config = baseline.manifest.get("config", {})
+    current_manifest = _comparison_manifest(report.manifest)
+    old_manifest = _comparison_manifest(baseline.manifest)
+    current_config = current_manifest["config"]
+    old_config = old_manifest["config"]
+    reached = _limits_reached(report) | _limits_reached(baseline)
+    for key in ("concurrency", "max_requests", "max_duration_seconds"):
+        if key in reached and current_config.get(key) != old_config.get(key):
+            reasons.append(f"Run setting {key} differs and its limit stopped work or constrained concurrency.")
     pack_modes = [config.get("request_source") == "request_pack"
-                  and bool({"capacity", "correctness"}.intersection(config.get("checks", [])))
+                  and bool({"load", "capacity", "correctness"}.intersection(config.get("checks", [])))
                   for config in (current_config, old_config)]
     if any(pack_modes):
         identities = [run.manifest.get("request_pack") for run in (report, baseline)]
@@ -103,6 +289,15 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
     def effective_value(manifest, key):
         value = manifest.get(key)
+        if key == "effective_traffic" and isinstance(value, dict):
+            value = {name: setting for name, setting in value.items() if name != "expected_response_seconds"}
+        if key == "effective_checks" and isinstance(value, dict):
+            value = {check: {**settings, **({"limits": {
+                name: limit for name, limit in settings["limits"].items()
+                if name != "regression_percent"
+            }} if isinstance(settings.get("limits"), dict) else {})}
+                            if isinstance(settings, dict) else settings
+                     for check, settings in value.items()}
         if key == "effective_checks" and isinstance(value, dict):
             cancellation = value.get("cancellation")
             if isinstance(cancellation, dict) and cancellation.get("backend_verification", "off") == "off":
@@ -121,7 +316,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
             if isinstance(correctness, dict):
                 # A pack always uses one serial quiet pass. Capacity, when
                 # selected, also owns the payload used by that shared pass.
-                shared = "capacity" in manifest.get("config", {}).get("checks", [])
+                shared = bool({"load", "capacity"}.intersection(manifest.get("config", {}).get("checks", [])))
                 inactive = {"samples", "concurrency"}
                 if shared:
                     inactive.update({"max_output_tokens", "request_timeout_seconds",
@@ -133,8 +328,11 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
 
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
     inactive_pack_globals = ({"context_limit", "samples", "sustained_seconds"}
-                             if all(pack_modes) and selected <= {"capacity", "correctness"} else set())
-    workload_fields = [key for key, checks in WORKLOAD_CHECKS.items() if checks & selected]
+                             if all(pack_modes) and selected <= {"load", "capacity", "correctness"} else set())
+    comparison_workloads = {**WORKLOAD_CHECKS, "concurrent_load": {"concurrency"},
+                            "arrivals": {"arrivals"}, "buckets": {"buckets", "mixed"},
+                            "concurrent_workloads": {"token_stress"}}
+    workload_fields = [key for key, checks in comparison_workloads.items() if checks & selected]
     for key in (*_MATCH_CONFIG, *workload_fields):
         if key in inactive_pack_globals:
             continue
@@ -153,7 +351,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for key, effective in (("traffic", "effective_traffic"), ("test_options", "effective_checks")):
         if key == "traffic" and not traffic_selected:
             continue
-        if effective in report.manifest and effective in baseline.manifest:
+        if effective in current_manifest and effective in old_manifest:
             continue  # Saved drafts and explicit defaults do not change executed work.
         if key in current_config or key in old_config:
             if key not in current_config or key not in old_config:
@@ -161,19 +359,30 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
             elif current_config[key] != old_config[key]:
                 reasons.append(f"Run setting {key} differs.")
     for key in ("effective_checks", "effective_traffic"):
+        if key not in current_manifest and key not in old_manifest:
+            continue
+        if key == "effective_checks" and ((key in report.manifest) != (key in baseline.manifest)):
+            missing = baseline.manifest if key in report.manifest else report.manifest
+            if "config_version" in missing.get("config", {}):
+                reasons.append(f"Recorded {key} differs or is missing.")
+                continue
         if key == "effective_traffic" and not traffic_selected:
             continue
-        if key in report.manifest or key in baseline.manifest:
-            if effective_value(report.manifest, key) != effective_value(baseline.manifest, key):
+        if key in current_manifest or key in old_manifest:
+            if effective_value(current_manifest, key) != effective_value(old_manifest, key):
                 reasons.append(f"Recorded {key} differs or is missing.")
     # The suite version identifies bundled fixtures; custom packs also need a content identity.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
         reasons.append("Fixture pack identity is missing or unknown.")
-    elif ({key: value for key, value in current_pack.items() if key != "custom"}
-          != {key: value for key, value in old_pack.items() if key != "custom"}):
-        reasons.append("Fixture pack identity differs.")
+    else:
+        inactive = {"custom"}
+        if _same_run_limits_workload(report.manifest, baseline.manifest):
+            inactive.add("workload_fixture_sha256")
+        if ({key: value for key, value in current_pack.items() if key not in inactive}
+                != {key: value for key, value in old_pack.items() if key not in inactive}):
+            reasons.append("Fixture pack identity differs.")
     for label, config, pack in (("Current", current_config, current_pack),
                                 ("Baseline", old_config, old_pack)):
         if config.get("custom_fixtures") and "correctness" in config.get("checks", []):
@@ -184,8 +393,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for key in ("run_location", "load_shape"):
         if key not in report.manifest or key not in baseline.manifest:
             reasons.append(f"Recorded {key} is missing; comparability is unknown.")
-        elif report.manifest[key] != baseline.manifest[key]:
-            reasons.append(f"{key} differs.")
+        else:
+            current, old = report.manifest[key], baseline.manifest[key]
+            if key == "load_shape" and "max_requests" not in reached:
+                current, old = ({name: setting for name, setting in shape.items()
+                                 if name != "target_request_quotas"} if isinstance(shape, dict) else shape
+                                for shape in (current, old))
+            if current != old:
+                reasons.append(f"{key} differs.")
     return reasons
 
 
@@ -202,12 +417,15 @@ def _timing_quality(report, target, records, metrics):
 
 def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
     completed = [r for r in records if r.status == "completed" and r.valid]
+    def clock_value(record, arrival_field, dispatch_field):
+        arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
+        return getattr(record, arrival_field if arrival else dispatch_field)
     return {
         "valid_completion_rate": [float(r.status == "completed" and r.valid) for r in records],
         "error_rate": [float(r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
-        "latency_ms": [r.elapsed_ms for r in completed],
-        "first_output_ms": [r.first_output_ms for r in completed if r.first_output_ms is not None],
+        "latency_ms": [v for r in completed if (v := clock_value(r, "arrival_elapsed_ms", "elapsed_ms")) is not None],
+        "first_output_ms": [v for r in completed if (v := clock_value(r, "arrival_first_output_ms", "first_output_ms")) is not None],
         "max_stream_gap_ms": [
             r.max_stream_gap_ms for r in completed if r.max_stream_gap_ms is not None
         ],
@@ -287,6 +505,123 @@ def _traffic_metrics(report: RunReport, target: str) -> dict[str, Any] | None:
     return next((check.metrics for check in report.checks
                  if check.id == "capacity" and check.target == target
                  and "traffic_stages" in check.metrics), None)
+
+
+def _compare_load_tests(
+    report: RunReport, baseline: RunReport, target: str, reasons: list[str],
+) -> dict[str, Any] | None:
+    """Compare qualification at each tested load, separately from metric sampling.
+
+    Losing a previously passing rate/level is direct acceptance evidence. It
+    does not need enough samples to bootstrap every optional timing metric.
+    An incomplete or client-limited cohort cannot establish that loss.
+    """
+    def metrics(run):
+        # Unselected checks still have catalogue entries with empty metrics.
+        # Qualification comparison applies only to actual tested cohorts.
+        return next((check.metrics for check in run.checks
+                     if check.id == "load" and check.target == target
+                     and check.metrics.get("points")), None)
+
+    current, old = metrics(report), metrics(baseline)
+    if current is None and old is None:
+        return None
+    result = {
+        "status": "inconclusive", "reason": "", "points": [],
+        "current_highest_accepted": (current or {}).get("highest_accepted", []),
+        "baseline_highest_accepted": (old or {}).get("highest_accepted", []),
+        "method": "Matched workload, source, traffic pattern, overlays and tested level/rate; "
+                  "qualification outcomes are distinct from statistical metric comparisons.",
+    }
+    if reasons:
+        result["reason"] = "Load test comparison is unavailable: " + " ".join(reasons)
+        return result
+    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
+        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline."
+        return result
+    if current is None or old is None:
+        result["reason"] = "One run lacks final Load test evidence."
+        return result
+    if all(value.get("points") and all(point.get("pattern") == "interference"
+                                       for point in value["points"])
+           for value in (current, old)):
+        return None  # Short-stream comparisons use their separate baseline/probe metric cohorts.
+
+    def key(point):
+        return tuple(point.get(name) for name in
+                     ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts"))
+
+    def points(value):
+        return {key(point): point for point in value.get("points", [])
+                if point.get("pattern") != "interference"}
+
+    def complete(point):
+        return (point is not None and point.get("status") in {"pass", "fail"}
+                and point.get("dispatched", 0) > 0
+                and not any(point.get(name) for name in
+                            ("not_run", "cut_short", "schedule_overflow", "not_sent", "cancelled"))
+                and (point.get("scheduled") is None
+                     or point["scheduled"] == point["dispatched"])
+                and bool(point.get("groups"))
+                and all(group.get("status") in {"pass", "fail"} for group in point["groups"]))
+
+    def snapshot(point):
+        if point is None:
+            return None
+        return {**{name: point.get(name) for name in (
+            "id", "source", "type", "workload", "shape", "pattern", "level", "rate", "bursts",
+            "status", "reason", "reason_code", "dispatched", "scheduled", "not_sent", "cancelled",
+            "cut_short", "not_run")},
+            "groups": [{name: group.get(name) for name in ("shape", "status", "reason_code", "reason")}
+                       for group in point.get("groups", [])]}
+
+    def requested_work(run, point):
+        ids = set(point.get("request_ids", []))
+        records = [record for record in run.requests if record.target == target and record.id in ids]
+        if len(records) != point["dispatched"] or len(ids) != point["dispatched"]:
+            return None
+        cohorts = defaultdict(Counter)
+        for record in records:
+            shape = (record.load_point or {}).get("shape")
+            cohorts[shape][(record.fixture_id, record.input_chars, record.requested_max_tokens, record.stream)] += 1
+        return {shape: {work: Fraction(count, sum(counts.values())) for work, count in counts.items()}
+                for shape, counts in cohorts.items()}
+
+    current_points, old_points = points(current), points(old)
+    for cohort in dict.fromkeys([*old_points, *current_points]):
+        point, previous = current_points.get(cohort), old_points.get(cohort)
+        row = {
+            "current": snapshot(point), "baseline": snapshot(previous),
+            "status": "inconclusive", "reason": "Incomplete or client-limited load evidence.",
+            "evidence_ids": (point or {}).get("request_ids", []),
+        }
+        if complete(point) and complete(previous):
+            current_shapes = {group["shape"] for group in point["groups"]}
+            old_shapes = {group["shape"] for group in previous["groups"]}
+            if current_shapes == old_shapes:
+                current_work = requested_work(report, point)
+                old_work = requested_work(baseline, previous)
+                if current_work is None or old_work is None:
+                    row["reason"] = "Dispatched request metadata is incomplete."
+                elif current_work != old_work:
+                    row["reason"] = "Requested work or request-shape proportions differ."
+                elif previous["status"] == "pass" and point["status"] == "fail":
+                    row.update(status="fail", reason="This previously acceptable tested load now fails its configured criteria.")
+                else:
+                    row.update(status="pass", reason="No loss of previously acceptable load at this tested level/rate.")
+            else:
+                row["reason"] = "Result-group shapes differ."
+        result["points"].append(row)
+    failures = [row for row in result["points"] if row["status"] == "fail"]
+    if failures:
+        result.update(status="fail", reason=f"{len(failures)} previously acceptable tested load(s) now fail.")
+    elif not result["points"] or any(row["status"] == "inconclusive" for row in result["points"]):
+        result["reason"] = "Incomplete or client-limited tests prevent a load acceptance comparison."
+    elif not any(point["status"] == "pass" for point in old_points.values()):
+        result["reason"] = "The baseline established no acceptable tested load."
+    else:
+        result.update(status="pass", reason="Previously acceptable tested loads remain acceptable.")
+    return result
 
 
 def _compare_traffic(
@@ -392,6 +727,51 @@ def _compare_traffic(
     else:
         result.update(status="pass", reason="Previously acceptable tested arrival rates remain acceptable.")
     return result
+
+
+def _load_group_notes_html(group):
+    notes = []
+    qualification = group.get("input_qualification")
+    if qualification:
+        notes.append("Input shape qualification: " + str(qualification.get("in_class", 0))
+                     + " / " + str(qualification.get("known_valid", 0))
+                     + " known-length valid responses in " + str(qualification.get("size", "")).capitalize()
+                     + " class; " + str(qualification.get("out_of_class", 0))
+                     + " outside; " + str(qualification.get("unknown_valid", 0))
+                     + " unknown-length valid responses. " + str(qualification.get("reason") or "Input class exercised."))
+    notes.extend(row["note"] for row in group.get("saved_question_budgets", []) if row.get("note"))
+    coverage = group.get("coverage") or {}
+    if coverage.get("threshold_tokens") is not None and "profile_output_cap" in coverage:
+        notes.append(f"Required long-output stress coverage: {coverage['threshold_tokens']} tokens "
+                     f"({coverage['min_output_percent']:g}% of Long output cap {coverage['profile_output_cap']})")
+        notes.append("Actual sent output budgets: " + ", ".join(str(budget) for budget in coverage.get("sent_budgets", [])) + " tokens")
+    return "".join("<br>" + _e(note) for note in notes)
+
+
+def _load_test_html(metrics):
+    parts = ['<h4>Load test</h4><p>Sequential workload × traffic tests. Highest accepted values are highest tested, not absolute capacity limits. Burst overlays are separate from steady-arrival capacity.</p>']
+    for calibration in metrics.get("calibrations", []):
+        if calibration.get("reason"):
+            parts.append('<p>Input token calibration: ' + _e(calibration["reason"]) + '</p>')
+    if metrics.get("workload_source"):
+        parts.append('<p>Active workload source: '+_e(metrics["workload_source"])+'. '+_e(metrics.get("context_note", ""))+'</p>')
+    for row in metrics.get("highest_accepted", []):
+        parts.append('<p>'+_e(row['workload'])+' · '+_e(row['pattern'])+(' + bursts' if row.get('bursts') else '')+': <strong>'+_e(row['label'])+' '+_e(row['value'])+'</strong> (highest tested).</p>')
+    for point in metrics.get("points", []):
+        from giraffe.load_test import point_label
+        parts.append('<h5>'+_e(point_label(point))+' · '+_e(point.get('status','inconclusive'))+'</h5><p>'+_e(point.get('reason',''))+'</p>')
+        parts.append('<p>Observed concurrency: mean '+_e(point.get('client_mean_inflight'))+', peak '+_e(point.get('client_peak_inflight'))+', streamed evidence '+_e(point.get('server_evidenced_concurrency'))+'. Timing clock: '+_e(point.get('timing_clock','unknown'))+'.</p>')
+        parts.append('<div class="table"><table><tr><th>Request type / delivery</th><th>Completions and evidence</th><th>Timing and throughput</th></tr>')
+        for group in point.get('groups', []):
+            lengths = group.get('lengths', {})
+            parts.append('<tr><td>'+_e(load_shape_label(group['shape']))+'<br>Requested: '+_e(group.get('requested'))+' · scheduled: '+_e(group.get('scheduled'))+' · dispatched: '+_e(group.get('dispatched'))+'<br>Not sent: '+_e(group.get('not_sent'))+' (local drops '+_e(group.get('local_drops'))+', late '+_e(group.get('late_arrivals'))+', not offered '+_e(group.get('not_offered'))+')</td><td>'+_e(group.get('status'))+' · '+_e(group.get('reason'))+'<br>Valid '+_e(group.get('valid'))+' · failed '+_e(group.get('failed'))+' · timeout '+_e(group.get('timed_out'))+' · cancelled '+_e(group.get('cancelled'))+'<br>Error denominator: '+_e(group.get('error_denominator'))+'. '+_e(group.get('error_denominator_description'))+'<br>Scored '+_e(group.get('scored'))+' · correct '+_e(group.get('correct'))+' · unknown judgments '+_e(group.get('unscored'))+'<br>Actual input tokens '+_e(lengths.get('input_tokens'))+'; output tokens '+_e(lengths.get('output_tokens'))+'; unknown input/output '+_e(lengths.get('unknown_input_count'))+'/'+_e(lengths.get('unknown_output_count'))+'. '+_e(lengths.get('input_method'))+'; '+_e(lengths.get('output_method'))+_load_group_notes_html(group)+'<br>Coverage: '+_e(group.get('coverage','not required'))+'</td><td>First-answer p50/p95 ms: '+_e(group.get('first_answer_p50_ms'))+'/'+_e(group.get('first_answer_p95_ms'))+'<br>Completion p50/p95 ms: '+_e(group.get('completion_p50_ms'))+'/'+_e(group.get('completion_p95_ms'))+'<br>Longest pause ms '+_e(group.get('longest_stream_pause_ms'))+' · generation tokens/sec '+_e(group.get('generation_tokens_per_second'))+'<br>'+_e(lengths.get('generation_speed_method'))+'<br>Dispatch delay ms '+_e(group.get('dispatch_delay_ms'))+'<br>Completed requests/sec '+_e(group.get('completed_requests_per_second'))+' · aggregate output tokens/sec '+_e(group.get('aggregate_output_tokens_per_second'))+'<br>Correct work meeting limits '+_e(group.get('correct_work_meeting_limits'))+' ('+_e(group.get('correct_work_per_second'))+'/sec)<br>Window '+_e(group.get('throughput_window_seconds'))+' seconds; '+_e(group.get('completed_during_finish'))+' completions during finish allowance. '+_e(group.get('throughput_description'))+'</td></tr>')
+        parts.append('</table></div>')
+        for key,label in (('observed_mix','Observed request shares'),('interference','Short-only vs long-request comparison'),('burst_delivery','Burst delivery and actual spread'),('response_by_origin','Steady-arrival and burst response degradation')):
+            if point.get(key):
+                parts.append('<details><summary>'+label+'</summary><pre>'+_json(point[key])+'</pre></details>')
+    if metrics.get('migration_notes'):
+        parts.append('<p>Configuration migration: '+_e(' '.join(metrics['migration_notes']))+'</p>')
+    return ''.join(parts)
 
 
 def _concurrent_load_html(metrics):
@@ -514,6 +894,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
         traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
+        load_tests = _compare_load_tests(report, baseline, name, target_reasons)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
         if (not current_groups or not old_groups) and traffic is None:
             target_reasons.append("Measured request samples are absent from one or both runs.")
@@ -553,6 +934,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         if delayed_runs:
                             row.update(status="inconclusive", reason=" / ".join(delayed_runs) +
                                        " client scheduling delay overlaps these metric samples; endpoint timing attribution is uncertain.")
+                        if check == "load" and metric in {"latency_ms", "first_output_ms"}:
+                            completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
+                                                for cohort in (current_records, old_records)]
+                            if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
+                                row.update(status="inconclusive", reason="Per-response timing evidence is incomplete; missing clocks remain unknown.")
                         if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
                             row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
                     row.update(check=check, scenario=scenario,
@@ -565,10 +951,13 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         missing_measurements = [row for row in rows if "worsening" not in row and
                                 max(row["current_samples"], row["baseline_samples"]) >= minimum]
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
-        if failures or traffic_failures:
+        load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
+        if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
                        f"{len(traffic_failures)} lost acceptable traffic rate(s) against {baseline.run_id}.")
+            if load_failures:
+                summary += f" {len(load_failures)} previously acceptable tested load(s) now fail."
             if target_reasons:
                 summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
         elif target_reasons:
@@ -577,7 +966,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         elif traffic is not None and traffic["status"] == "inconclusive":
             status = "inconclusive"
             summary = traffic["reason"]
-        elif (not assessed and traffic is None) or uncertain or missing_measurements:
+        elif load_tests is not None and load_tests["status"] == "inconclusive":
+            status = "inconclusive"
+            summary = load_tests["reason"]
+        elif (not assessed and traffic is None and load_tests is None) or uncertain or missing_measurements:
             status = "inconclusive"
             if not assessed:
                 summary = "No metric has enough comparable samples."
@@ -608,14 +1000,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                  "comparisons": rows}
         if traffic is not None:
             entry["traffic_capacity"] = traffic
+        if load_tests is not None:
+            entry["load_test"] = load_tests
         comparison["targets"].append(entry)
         result.checks.append(CheckResult(
             id="baseline", target=name, title="Baseline comparison", required=True,
             status=status, summary=summary,
             metrics={"compared_metrics": len(assessed), "excluded_metrics": excluded,
-                     "regressions": len(failures) + len(traffic_failures),
+                     "regressions": len(failures) + len(traffic_failures) + len(load_failures),
                      "baseline_run_id": baseline.run_id},
-            evidence_ids=list(dict.fromkeys(rid for row in failures + traffic_failures
+            evidence_ids=list(dict.fromkeys(rid for row in failures + traffic_failures + load_failures
                                             for rid in row["evidence_ids"])),
         ))
     baseline_checks = [check for check in result.checks if check.id == "baseline"]
@@ -841,14 +1235,14 @@ def connection_summary(records: list[RequestRecord], url: str) -> str | None:
     return f"Could not connect to {url} ({', '.join(dict.fromkeys(errors))}); no checks could run"
 
 
-def _preview(value: Any, limit: int = 1200) -> str:
+def _preview(value: Any, limit: int = MAX_HTML_PREVIEW_CHARS) -> str:
     text = str(value)
     if len(text) <= limit:
         return _e(text)
     return _e(text[:limit]) + '… [Preview truncated; <a href="report.json">full evidence in report.json</a>]'
 
 
-def _json(value: Any, limit: int = 6000) -> str:
+def _json(value: Any, limit: int = MAX_HTML_JSON_PREVIEW_CHARS) -> str:
     return _preview(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), limit)
 
 
@@ -1055,13 +1449,32 @@ def _traffic_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _load_baseline_html(target: dict[str, Any]) -> str:
+    from .load_test import point_label
+
+    comparison = target["load_test"]
+    parts = [f'<h3>{_e(target["target"])} — tested load acceptance</h3>',
+             f'<p>{_badge(comparison["status"])} {_e(comparison["reason"])}</p>']
+    if comparison["points"]:
+        parts.append('<div class="table"><table><tr><th>Tested load</th>'
+                     '<th>Baseline / current</th><th>Finding</th></tr>')
+        for row in comparison["points"]:
+            before, after = row["baseline"], row["current"]
+            parts.append(f'<tr><td>{_e(point_label(after or before))}</td>'
+                         f'<td>{_badge((before or {}).get("status", "inconclusive"))} / '
+                         f'{_badge((after or {}).get("status", "inconclusive"))}</td>'
+                         f'<td>{_badge(row["status"])} {_e(row["reason"])}</td></tr>')
+        parts.append('</table></div>')
+    return "".join(parts)
+
+
 def _render(report: RunReport) -> str:
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
     ordered = sorted(report.requests, key=lambda r: (
         r.id not in evidence,
         not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error)))
-    detailed = ordered[:max(25, sum(r.id in evidence for r in report.requests))]
+    detailed = ordered[:max(DEFAULT_HTML_REQUEST_DETAILS, sum(r.id in evidence for r in report.requests))]
     anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
     disconnected = {target["name"]: summary for target in config.get("targets", [])
@@ -1149,6 +1562,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "load":
+            metrics = _load_test_html(check.metrics) + metrics
         if check.id == "concurrency" and "load_types" in check.metrics:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
@@ -1214,6 +1629,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
         for target in report.baseline.get("targets", []):
             if "traffic_capacity" in target:
                 parts.append(_traffic_baseline_html(target))
+            if "load_test" in target:
+                parts.append(_load_baseline_html(target))
         parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
                      f'<pre>{_json(report.baseline)}</pre></details>')
     else:
@@ -1245,7 +1662,7 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
-            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, 1200)}</pre>'
+            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>'
                          f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
             if evidence.tool_expectation is None:
                 if evidence.expected_provided:
@@ -1323,7 +1740,7 @@ def html_failure_warning(error: OSError) -> str:
     return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
 
 
-def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 256 * 1024**2,
+def write_report(report: RunReport, directory: Path, *, max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
                  html: bool = False) -> tuple[Path, Path | None]:
     """Save compact JSON; standalone HTML is an explicit optional export."""
     if isinstance(max_run_storage, bool) or not isinstance(max_run_storage, int) or max_run_storage < 0:
@@ -1335,6 +1752,24 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = 2
         raise ReportWriteError(error, "report.json", json_complete=False) from error
     retained = _retained(report)
     json_path, html_path = directory / "report.json", directory / "report.html"
+    from .latency import latency_summary
+
+    metadata_path = directory / ".web.json"
+    try:
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (OSError, ValueError):
+            metadata = {}
+        metadata["latency_summary"] = latency_summary(report)
+        _atomic_write(metadata_path, json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+    except Exception as error:
+        reason = _write_failure_reason(error) if isinstance(error, OSError) else type(error).__name__
+        warning = f"Latency summary could not be saved: {reason}"
+        report.warnings.append(warning)
+        if retained.warnings is not report.warnings:
+            retained.warnings.append(warning)
     _storage_limited(retained, max_run_storage)
     try:
         _atomic_write_chunks(json_path, _report_json_chunks(retained))
@@ -1375,10 +1810,10 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
     summary = {"run_id": report.run_id, "overall": report.overall, "state": "error",
                "started_at": report.started_at, "finished_at": report.finished_at,
                "request_count": len(report.requests), "summary_saved": True, "error": message,
-               "checks": [{"id": check.id, "target": check.target, "title": check.title[:256],
+               "checks": [{"id": check.id, "target": check.target, "title": check.title[:MAX_FAILURE_SUMMARY_TITLE_CHARS],
                            "status": check.status, "summary": (
-                               text if len(text := _without_answer_excerpts(check.summary)) <= 2048
-                               else text[:2048] + " … [truncated]")}
+                               text if len(text := _without_answer_excerpts(check.summary)) <= MAX_FAILURE_SUMMARY_CHARS
+                               else text[:MAX_FAILURE_SUMMARY_CHARS] + " … [truncated]")}
                           for check in report.checks]}
     try:
         directory.mkdir(parents=True, exist_ok=True)

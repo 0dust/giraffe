@@ -9,6 +9,7 @@ import time
 from contextlib import AsyncExitStack
 from typing import Callable
 
+from .caps import MAX_JUDGE_REASON_CHARS
 from giraffe.client import LLMClient
 from giraffe.fixtures import REASONING_WITHOUT_ANSWER, TRUNCATED_ANSWER, final_answer
 from giraffe.models import (
@@ -65,7 +66,7 @@ def _vote(judge: JudgeEndpoint, result: RequestRecord) -> JudgeVote:
         data = json.loads(fenced[1] if fenced else answer, object_pairs_hook=_unique_object)
         if (not isinstance(data, dict) or set(data) != {"verdict", "reason"}
                 or type(data["verdict"]) is not bool or not isinstance(data["reason"], str)
-                or not data["reason"].strip() or len(data["reason"]) > 2000):
+                or not data["reason"].strip() or len(data["reason"]) > MAX_JUDGE_REASON_CHARS):
             raise ValueError("invalid verdict")
     except (ValueError, TypeError, RecursionError):
         return _error(judge, "invalid_verdict", observed)
@@ -144,7 +145,7 @@ async def judge_records(
                     ca_bundle=settings.ca_bundle, proxy=settings.proxy,
                 )
                 try:
-                    client = await stack.enter_async_context(LLMClient(target, isolated))
+                    client = await stack.enter_async_context(LLMClient(target, isolated, max_connections=settings.concurrency))
                 except (ImportError, OSError, ValueError, RuntimeError):
                     client = None
                 clients.append(client)

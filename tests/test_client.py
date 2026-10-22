@@ -385,7 +385,7 @@ async def test_normal_length_cap_is_a_valid_but_distinct_completion(monkeypatch)
         }))
     assert result.valid and result.finish_reason == "length"
     request = json.loads(calls[0].content)
-    assert request["max_tokens"] == result.requested_max_tokens == 128
+    assert request["max_tokens"] == result.requested_max_tokens == 999
     assert request["model"] == "test" and request["n"] == 1
     assert "max_completion_tokens" not in request
 

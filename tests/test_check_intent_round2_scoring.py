@@ -132,14 +132,18 @@ def test_later_truncation_cannot_erase_proven_initial_xid_absence():
     assert any(a["family"] == "device_errors" for a in metrics["alerts"])
 
 
-def test_poisson_plan_sums_exact_bounded_stage_counts(monkeypatch):
-    settings = config(checks=["capacity"], traffic={"arrival": "poisson", "rates": [.49, .5, .51], "duration_seconds": 5})
+def test_poisson_plan_reports_expected_counts_and_seeded_schedule():
+    from giraffe.load_test import planned_arrivals, test_points as load_points
+    settings = config(checks=["load"], load_test={
+        "workloads": {"combinations": {"selected": ["short_short"]}},
+        "patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": False},
+                     "poisson": {"enabled": True, "seed": 41}, "rates": [.49, .5, .51]},
+        "schedule": {"duration_seconds": 5}})
     plan = planning.request_plan(settings)
-    row = next(r for r in plan["rows"] if r["id"] == "capacity")
-    assert row["requests_per_target"] == 7 and row["kind"] == "exact"
-    assert not any("saved seed" in w for w in plan["warnings"])
-    monkeypatch.setattr(planning, "MAX_PLANNED_ARRIVALS", 1)
-    assert next(r for r in planning.request_plan(settings)["rows"] if r["id"] == "capacity")["requests_per_target"] == 3
+    assert plan["load_test"]["approximate"] is True
+    assert plan["load_test"]["expected_scheduled_requests"] == 7.5
+    for point in load_points(settings.load_test):
+        assert planned_arrivals(settings.load_test, point) == planned_arrivals(settings.load_test, point)
 
 
 @pytest.mark.parametrize("budget,expected", [(10, 0), (11, 1)])

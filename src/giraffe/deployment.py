@@ -13,6 +13,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from .caps import (
+    MAX_DEPLOYMENT_BODY_BYTES, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_LAUNCH_ARGUMENTS,
+    MAX_REPORT_SANITIZE_DEPTH, MAX_SANITIZE_DEPTH, MAX_SANITIZE_ITEMS,
+    MAX_SANITIZE_KEYS, MAX_SANITIZE_KEY_CHARS, MAX_SANITIZE_STRING_CHARS,
+)
+
 CATEGORIES = {
     "model": {
         "requested",
@@ -65,12 +71,12 @@ def now():
 
 def sanitize(value, *, depth=0, bounded=True):
     """Redact structured credentials and credential-bearing text before any persistence."""
-    if depth > (8 if bounded else 24):
+    if depth > (MAX_SANITIZE_DEPTH if bounded else MAX_REPORT_SANITIZE_DEPTH):
         return "[depth limit]"
     if isinstance(value, dict):
         result = {}
-        for key, child in list(value.items())[:128] if bounded else value.items():
-            key = str(key)[:128]
+        for key, child in list(value.items())[:MAX_SANITIZE_KEYS] if bounded else value.items():
+            key = str(key)[:MAX_SANITIZE_KEY_CHARS]
             result[key] = (
                 REDACTED
                 if SECRET.search(key)
@@ -81,7 +87,7 @@ def sanitize(value, *, depth=0, bounded=True):
     if isinstance(value, list):
         return [
             sanitize(v, depth=depth + 1, bounded=bounded)
-            for v in (value[:256] if bounded else value)
+            for v in (value[:MAX_SANITIZE_ITEMS] if bounded else value)
         ]
     if isinstance(value, str):
 
@@ -97,7 +103,7 @@ def sanitize(value, *, depth=0, bounded=True):
                 return REDACTED
             return match.group()
 
-        return _SECRET_TEXT.sub(REDACTED, _URL.sub(clean_url, value))[:8192]
+        return _SECRET_TEXT.sub(REDACTED, _URL.sub(clean_url, value))[:MAX_SANITIZE_STRING_CHARS]
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return "[unsupported value]"
@@ -133,7 +139,7 @@ LAUNCH_FLAGS = {
 
 def safe_launch(command):
     args = shlex.split(command) if isinstance(command, str) else list(command)
-    if len(args) > 256:
+    if len(args) > MAX_LAUNCH_ARGUMENTS:
         raise ValueError("launch command exceeds 256 arguments")
     result, index = [], 0
     while index < len(args):
@@ -193,7 +199,7 @@ def safe_metadata(data):
 
 def load_metadata(path):
     path = Path(path)
-    if path.stat().st_size > 65536:
+    if path.stat().st_size > MAX_DEPLOYMENT_BODY_BYTES:
         raise ValueError("deployment metadata file exceeds 64 KiB")
     try:
         data = json.loads(path.read_text())
@@ -202,7 +208,7 @@ def load_metadata(path):
             if key in data and data[key] is not None:
                 if not isinstance(data[key], str):
                     raise ValueError("metadata scope and collection time must be strings")
-                result[key] = sanitize(data[key])[:512]
+                result[key] = sanitize(data[key])[:MAX_DEPLOYMENT_SCOPE_CHARS]
         return result
     except (OSError, ValueError, UnicodeError) as exc:
         raise ValueError("deployment metadata file is not valid bounded JSON") from exc
@@ -240,7 +246,7 @@ async def _read(client, url, *, body=None):
         response.raise_for_status()
         data = bytearray()
         async for chunk in response.aiter_bytes():
-            if len(data) + len(chunk) > 65536:
+            if len(data) + len(chunk) > MAX_DEPLOYMENT_BODY_BYTES:
                 raise ValueError("discovery response exceeds 64 KiB")
             data.extend(chunk)
     return json.loads(data)

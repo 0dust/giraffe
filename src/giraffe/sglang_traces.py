@@ -9,6 +9,8 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from giraffe.caps import MAX_SERVER_ID_CHARS
+
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_LINE_BYTES = 16 * 1024
@@ -30,7 +32,7 @@ def terminal_spans(body: bytes) -> list[dict]:
                          if a.value.WhichOneof("value") == "string_value"}
                 rid = attrs.get("gen_ai.request.id")
                 if (attrs.get("module") != "sglang::request" or not rid
-                        or len(rid) > 4096 or rid != attrs.get("rid")):
+                        or len(rid) > MAX_SERVER_ID_CHARS or rid != attrs.get("rid")):
                     continue
                 try:
                     reasons = json.loads(attrs.get("gen_ai.response.finish_reasons", "null"))
@@ -38,7 +40,7 @@ def terminal_spans(body: bytes) -> list[dict]:
                     continue
                 model = attrs.get("gen_ai.response.model", "")
                 if (reasons not in (["abort"], ["stop"], ["length"])
-                        or not model or len(model) > 4096
+                        or not model or len(model) > MAX_SERVER_ID_CHARS
                         or not 0 < span.start_time_unix_nano <= span.end_time_unix_nano):
                     continue
                 # Never persist prompts, outputs, headers, or arbitrary attributes.

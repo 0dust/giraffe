@@ -1,8 +1,9 @@
 from copy import deepcopy
 
 import pytest
+from pydantic import ValidationError
 
-from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport, Target
+from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport, Target, TrafficConfig
 from giraffe.reporting import compare_baseline, write_report
 
 
@@ -12,6 +13,8 @@ def traffic_report(run_id="current", *, high_failure=None):
         checks=["capacity"], traffic={"rates": [1, 4], "duration_seconds": 5},
         limits={"latency_ms": 150},
     )
+    # This fixture represents an already saved pre-#45 report, not runnable input.
+    config = config.model_copy(update={"checks": ["capacity"], "traffic": TrafficConfig(rates=[1, 4], duration_seconds=5)})
     records, stages = [], []
     for index, rate in enumerate(config.traffic.rates):
         count = int(rate * config.traffic.duration_seconds)
@@ -285,7 +288,6 @@ def test_portable_report_explains_traffic_accounting_and_capacity_change(tmp_pat
 def test_disabled_workload_drafts_do_not_invalidate_capacity_comparison(field, value):
     current, old = traffic_report(), traffic_report("baseline")
     current.manifest["config"][field] = value
-    current.manifest["config"] = RunConfig.model_validate(current.manifest["config"]).model_dump()
     assert compare_baseline(current, old).baseline["status"] == "pass"
 
 
@@ -299,9 +301,7 @@ def test_selected_workload_settings_still_block_comparison(field, check, value):
     current, old = traffic_report(), traffic_report("baseline")
     for report in (current, old):
         report.manifest["config"]["checks"].append(check)
-        report.manifest["config"] = RunConfig.model_validate(report.manifest["config"]).model_dump()
     current.manifest["config"][field] = value
-    current.manifest["config"] = RunConfig.model_validate(current.manifest["config"]).model_dump()
     result = compare_baseline(current, old)
     assert result.baseline["status"] == "inconclusive"
     assert f"Run setting {field} differs." in result.baseline["targets"][0]["reasons"]
@@ -329,7 +329,6 @@ def test_tool_expectation_changes_only_block_selected_tool_comparisons(selected)
         if selected:
             report.manifest["config"]["checks"].append("tools")
         report.manifest["config"]["tool_checks"] = deepcopy(tool_checks)
-        report.manifest["config"] = RunConfig.model_validate(report.manifest["config"]).model_dump()
     current.manifest["config"]["tool_checks"]["fixtures"][0]["expected_content"]["value"] = "Finished."
     result = compare_baseline(current, old)
     reasons = result.baseline["targets"][0]["reasons"]
@@ -338,14 +337,35 @@ def test_tool_expectation_changes_only_block_selected_tool_comparisons(selected)
 
 
 @pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])
-async def test_executed_pack_rejects_unsupported_correctness_overrides(monkeypatch, checks):
+async def test_pack_rejects_unsupported_correctness_overrides_before_execution(monkeypatch, checks):
     from giraffe import runner
     from tests.test_runner import FakeClient, pack_config
 
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    with pytest.raises(ValueError, match="samples/concurrency overrides are unsupported"):
+    with pytest.raises(ValidationError) as error:
         await runner.run_suite(pack_config(checks=checks,
-            test_options={"correctness": {"samples": 9, "concurrency": 1}}))
+            test_options={"correctness": {"samples": 9, "concurrency": 1,
+                                          "limits": {"min_correctness": .5}}}))
+    detail = error.value.errors(include_input=False)[0]
+    assert detail["type"] == "request_pack_override"
+    assert detail["msg"] == ("Request-pack correctness does not support request-setting overrides: "
+                             "test_options.correctness.concurrency, test_options.correctness.samples. "
+                             "Per-check pass criteria are supported.")
+    # Cross-field model errors navigate using ctx.fields at the I/O boundary.
+    assert detail["loc"] == ()
+    assert detail["ctx"]["fields"] == ["test_options.correctness.concurrency", "test_options.correctness.samples"]
+    from giraffe.configuration_errors import configuration_errors
+    diagnostic, = configuration_errors([detail], {})
+    assert diagnostic["field"] == "test_options.correctness.concurrency"
+    assert diagnostic["fields"] == detail["ctx"]["fields"]
+
+
+@pytest.mark.parametrize("checks", [["correctness"], ["capacity", "correctness"]])
+def test_pack_accepts_correctness_pass_criteria(checks):
+    from tests.test_runner import pack_config
+
+    configured = pack_config(checks=checks, test_options={"correctness": {"limits": {"min_correctness": .5}}})
+    assert configured.effective_check("correctness")["limits"]["min_correctness"] == .5
 
 
 @pytest.mark.parametrize("field,value", [("samples", 9), ("context_limit", 1024), ("sustained_seconds", .1)])

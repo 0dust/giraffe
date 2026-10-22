@@ -11,6 +11,7 @@ import stat
 import time
 
 from vllm.v1.core.sched.scheduler import Scheduler
+from giraffe.sglang_traces import MAX_FILE_BYTES, MAX_LINE_BYTES
 
 
 class CancellationScheduler(Scheduler):
@@ -40,7 +41,7 @@ class CancellationScheduler(Scheduler):
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
             try:
                 info = os.fstat(fd)
-                if stat.S_ISREG(info.st_mode) and info.st_size + len(data) <= 16 * 1024 * 1024 and len(data) <= 16 * 1024:
+                if stat.S_ISREG(info.st_mode) and info.st_size + len(data) <= MAX_FILE_BYTES and len(data) <= MAX_LINE_BYTES:
                     os.write(fd, data)
             finally:
                 os.close(fd)

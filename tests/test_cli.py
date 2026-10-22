@@ -13,7 +13,7 @@ def test_cli_one_command_has_builtin_suite():
         "run", "--url", "http://localhost:11434/v1", "--model", "tiny",
         "--max-requests", "50", "--json", "--latency-ms", "5000",
     ]))
-    assert len(config.checks) == 11
+    assert len(config.checks) == 10
     assert "json" in config.checks and "gpu" not in config.checks
     assert config.max_requests == 50
     assert config.structured_json
@@ -21,14 +21,16 @@ def test_cli_one_command_has_builtin_suite():
 
 
 @pytest.mark.parametrize("output_format", ["text", "json"])
-def test_default_cli_budget_covers_default_preview(output_format, tmp_path, monkeypatch, capsys):
+def test_explicit_cli_budget_covers_default_preview(output_format, tmp_path, monkeypatch, capsys):
     config = configuration(parser().parse_args([
         "run", "--url", "http://127.0.0.1:11434/v1", "--model", "llama3.2:3b",
+        "--max-requests", "300", "--max-duration", "300", "--concurrency", "4",
     ]))
     assert config.max_requests == 300
     assert (config.max_duration_seconds, config.request_timeout_seconds, config.max_output_tokens) == (300, 30, 128)
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"targets": [target.model_dump(mode="json") for target in config.targets]}))
+    path.write_text(json.dumps(config.model_dump(mode="json")))
+    capsys.readouterr()
     monkeypatch.setattr("giraffe.preflight.check_target", lambda *a: pytest.fail("Preview probed"))
     monkeypatch.setattr("giraffe.cli._run", lambda *a: pytest.fail("Preview sent traffic"))
     assert main(["preview", "--config", str(path), "--output-format", output_format]) == 0
@@ -39,9 +41,9 @@ def test_default_cli_budget_covers_default_preview(output_format, tmp_path, monk
         assert result["config"]["max_requests"] == result["request_plan"]["request_limit"] == 300
         warnings = result["request_plan"]["warnings"]
     else:
-        assert "max_requests: 300" in captured.out
+        assert "Stop after this many requests: 300" in captured.out
         warnings = captured.out.splitlines()
-    assert not any("share of the run limit" in warning for warning in warnings)
+    assert not any("share of the request limit (Stop after this many requests:" in warning for warning in warnings)
     assert not captured.err
 
 
@@ -119,7 +121,7 @@ def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch
     config = tmp_path / "ui.yaml"
     config.write_text(json.dumps({"targets": [{"name": "local", "url": "http://localhost",
                                              "model": "tiny", "restart_command": ["false"]}],
-                                  "restart_target": "local", **({"checks": ["buckets"], "buckets": {"samples_per_bucket": 7}} if legacy else {})}))
+                                  "restart_target": "local", **({"checks": ["buckets"], "buckets": {"samples_per_bucket": 7}} if legacy else {"config_version": 2})}))
     captured = {}
 
     def create_app(**kwargs):
@@ -169,8 +171,8 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     result = json.loads(capsys.readouterr().out)
     assert result == capabilities()
     assert result["config_schema"]["required"] == ["targets"]
-    assert result["defaults"]["traffic"]["rates"] == [1, 2, 4]
-    assert len(result["checks"]) == 17
+    assert result["defaults"]["load_test"]["patterns"]["rates"] == [1, 2]
+    assert len(result["checks"]) == 15
     assert "runtime availability" in result["validation_note"]
 
 
@@ -310,17 +312,23 @@ def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, caps
     from giraffe.models import ConfigDraft
     from giraffe.request_pack import pack_preview
     from giraffe.planning import request_plan
+    from giraffe.open_files import open_file_guard
 
-    values = {"targets": [{"name": "local", "url": "http://localhost", "model": ""}],
-              "checks": ["capacity"], "request_source": "request_pack", "request_pack": operator_pack()}
+    values = {"config_version": 2, "targets": [{"name": "local", "url": "http://localhost", "model": ""}],
+              "checks": ["load"], "request_source": "request_pack", "request_pack": operator_pack()}
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
     monkeypatch.setattr("giraffe.cli._run", lambda *a: pytest.fail("Preview sent traffic"))
     assert main(["preview", "--config", "-"]) == 0
     draft = ConfigDraft.model_validate(values)
+    expected = request_plan(draft)
+    guard = open_file_guard(draft)
+    expected.update(open_files=guard, resource_warnings=guard["warnings"],
+                    resource_issues=[dict(issue, blocking=True) for issue in guard["errors"]]
+                    + [dict(issue, blocking=False) for issue in guard["warnings"]])
     assert json.loads(capsys.readouterr().out) == {
         "config": draft.model_dump(mode="json"), "migration_notes": [], "request_pack_preview": pack_preview(draft),
-        "request_plan": request_plan(draft)}
+        "request_plan": expected}
     assert not list(tmp_path.iterdir())
 
 
@@ -366,12 +374,12 @@ def test_preview_includes_plan_warnings_without_traffic(flags, tmp_path, monkeyp
 
     monkeypatch.setattr(httpx.AsyncClient, "send", no_traffic)
     monkeypatch.chdir(tmp_path)
-    values = {"targets": [{"name": "local", "url": "http://localhost", "model": ""}],
+    values = {"config_version": 2, "targets": [{"name": "local", "url": "http://localhost", "model": ""}],
               "checks": ["correctness"], "max_requests": 1}
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
     assert main(["preview", "--config", "-", *flags]) == 0
     captured = capsys.readouterr()
-    warning = "local needs at least 6 requests, but its share of the run limit is 1. Some tests may be incomplete."
+    warning = "local: incomplete coverage for Answer correctness; the planned requests exceed this endpoint's share of the request limit (Stop after this many requests: 1)."
     if any("text" in value for value in flags):
         assert "No traffic was sent." in captured.out
         assert f"Warning: {warning}\n" in captured.out

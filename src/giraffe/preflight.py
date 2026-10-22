@@ -9,6 +9,9 @@ import ssl
 import httpx
 from pydantic import Field, SecretStr, field_validator, model_validator
 
+from .caps import (
+    MAX_PREFLIGHT_BODY_BYTES, MAX_PREFLIGHT_HEADER_CHARS,
+)
 from giraffe.client import LLMClient, _headers, completion_url
 from giraffe.models import Model, RequestSpec, RunConfig, Target
 
@@ -40,7 +43,7 @@ class APIKeyInput(Model):
         raw = raw.strip()
         if not raw:
             return None
-        if len(raw) > 8192 or any(ord(c) < 33 or ord(c) > 126 for c in raw):
+        if len(raw) > MAX_PREFLIGHT_HEADER_CHARS or any(ord(c) < 33 or ord(c) > 126 for c in raw):
             raise ValueError("API key must contain printable ASCII characters without whitespace")
         return raw
 
@@ -131,7 +134,7 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False) -
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
                     content.extend(chunk)
-                    if len(content) > 1_048_576:
+                    if len(content) > MAX_PREFLIGHT_BODY_BYTES:
                         if allow_manual:
                             return {"models": [], "message": "The model list is too large. "
                                     "Enter the model name to test the connection."}

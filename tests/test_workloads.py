@@ -31,8 +31,7 @@ def config(endpoint, **extra):
         if extra.get("buckets") is not None:
             selected.append("mixed")
         extra["checks"] = selected
-    return RunConfig.model_validate(
-        {
+    values = {
             "targets": [{"name": "local", "url": endpoint.url, "model": "fake-model"}],
             "checks": ["serving"],
             "concurrency": 2,
@@ -45,7 +44,10 @@ def config(endpoint, **extra):
             "limits": {"min_samples": 2},
             **extra,
         }
-    )
+    if "buckets" in values or "concurrent_workloads" in values:
+        from giraffe.cli import migrated_configuration
+        return migrated_configuration(values)
+    return RunConfig.model_validate(values)
 
 
 def check(report, name):
@@ -285,34 +287,18 @@ async def test_missing_configured_workload_timing_is_inconclusive():
 
 @pytest.mark.parametrize("mode", ["steady", "burst"])
 async def test_bounded_arrivals_report_unissued_and_actual_dispatch(mode):
-    with FakeEndpoint(first_token_delay=0.03) as endpoint:
-        report = await run_suite(
-            config(
-                endpoint,
-                concurrency=1,
-                arrivals={
-                    "mode": mode,
-                    "requests": 12,
-                    "requests_per_second": 1000,
-                    "burst_size": 6,
-                    "interval_seconds": 0.005,
-                    "max_pending": 2,
-                },
-            )
-        )
-    rows = [r for r in report.requests if r.scenario == "arrival"]
-    observation = report.observations["targets"]["local"]["arrivals"]
-    assert observation["issued"] == len(rows) < 12
-    assert observation["issued"] + sum(row.get("count", 1) for row in observation["unissued"]) == 12
-    assert all(
-        r.scheduled_ms is not None
-        and r.dispatch_ms >= r.scheduled_ms
-        and r.completed_ms >= r.dispatch_ms
-        for r in rows
-    )
+    from tests.test_concurrent_load import short_windows
+    with FakeEndpoint(first_token_delay=.03) as endpoint:
+        settings=config(endpoint,concurrency=1,arrivals={'mode':mode,'requests':12,'requests_per_second':1000,'burst_size':6,'interval_seconds':.005,'max_pending':2})
+        short_windows(settings,.012 if mode == 'steady' else .01)
+        report=await run_suite(settings)
+    p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
+    rows=[r for r in report.requests if (r.load_point or {}).get('point_id') == p['id']]
+    assert p['scheduled'] == 12 and p['dispatched'] == len(rows) < 12
+    assert p['dispatched'] + p['not_sent'] == 12 and p['local_drops'] > 0
+    assert all(r.scheduled_ms is not None and r.dispatch_ms >= r.scheduled_ms and r.completed_ms >= r.dispatch_ms for r in rows)
     assert all(r.overlap == 1 for r in rows)
-    assert observation["configured_rate_achieved"] is False
-    assert check(report, "arrivals").status == "inconclusive"
+    assert p['status'] == 'inconclusive'
 
 
 async def test_global_budget_limits_all_workloads():
@@ -453,11 +439,11 @@ async def test_tools_disabled_and_forced_diagnostic_remain_separate():
 @pytest.mark.parametrize(
     "extra",
     [
-        {"concurrent_load": {"schedule": {"levels": [3]}}},
+        {"checks":["load"],"load_test":{"patterns":{"concurrent":{"levels":[3]}}}},
         {"sessions": {"concurrency": 3}},
         {"sessions": {"turns": ["one"]}},
         {"consistency": {"repetitions": 1}},
-        {"concurrent_load": {"profile": {"long": {"output_tokens": 256}}}},
+        {"concurrent_load": {"profile": {"long": {"output_tokens": 65537}}}},
     ],
 )
 def test_invalid_workloads_rejected_before_network(extra):

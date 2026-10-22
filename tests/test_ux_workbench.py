@@ -34,9 +34,9 @@ const plan={count_kind:'exact',planned_total:4,request_limit:12,required_request
  {id:'correctness',title:'Known answers',requests_per_target:3,kind:'exact',summary:'Three questions.',source:'generated'}]};
 api=()=>{throw new Error('Preview rendering must not send traffic');};
 let html=renderRunBlueprint(state.config,plan);
-assert.match(html,/4 requests planned/);assert.match(html,/Request ceiling/);
+assert.match(html,/4 requests planned/);assert.match(html,/Stop after this many requests/);
 assert.match(html,/data-plan-row="initial"/);assert.doesNotMatch(html,/data-plan-row="access"/);
-assert.doesNotMatch(html,/data-plan-check=/);assert.match(html,/per endpoint, before run limits/);
+assert.doesNotMatch(html,/data-plan-check=/);assert.match(html,/per endpoint/);
 assert.doesNotMatch(html,/Play example|800 ms|Passed/);
 html=renderRunBlueprint(state.config,null);assert.doesNotMatch(html,/4 requests planned|data-plan-row=/);
 assert.match(html,/Calculating traffic/);
@@ -50,8 +50,8 @@ assert.equal(JSON.stringify(state.config),original);
 def test_check_choices_precede_settings_without_changing_the_run():
     browser_logic(r"""
 config.test_options.correctness={samples:11,limits:{min_correctness:.8}};
-const original=JSON.stringify(config),markup=renderCheckSelection(config);
-assert(markup.indexOf('id="test-selection"')<markup.indexOf('id="shared-settings"'));
+const original=JSON.stringify(config),markup=renderSharedRunSettings(config)+renderCheckSelection(config);
+assert(markup.indexOf('id="shared-settings"')<markup.indexOf('id="test-selection"'));
 assert.equal((markup.match(/name="check"/g)||[]).length,bootstrap.checks.length);
 assert.equal((markup.match(/id="shared-settings"/g)||[]).length,1);
 assert.equal(JSON.stringify(config),original);

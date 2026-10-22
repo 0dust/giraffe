@@ -53,32 +53,32 @@ async def test_intentional_timeout_is_completed_without_failed_count_live_and_re
 
 
 async def test_capacity_local_drop_shortfall_names_busy_slots(monkeypatch):
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    monkeypatch.setattr(FakeClient, "delay", .03)
-    config = runner_config(checks=["capacity"], traffic={"rates": [1000], "duration_seconds": .005, "max_in_flight": 1})
-    result = await run_suite(config)
-    row = result.observations["targets"]["service"]["conditions"][0]
-    stage = result.observations["targets"]["service"]["capacity"][0]
-    assert stage["dropped_local"] > 0 and row["not_sent"] == stage["dropped_local"]
-    assert row["reason"] == "dropped: all request slots busy"
+    from giraffe import load_test
+    from tests.test_concurrent_load import configuration as load_configuration,short_windows
+    cfg=short_windows(load_configuration(concurrency=1,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.005)
+    run=_Run(cfg,None,None)
+    await load_test.execute(run,cfg.targets[0],Client(delay=.03))
+    p=load_test.result(run,cfg.targets[0]).metrics['points'][0]
+    row=next(r for r in run.observations['local']['conditions'] if r['condition']['id'] == p['id'])
+    assert p['local_drops'] > 0 and row['not_sent'] == p['local_drops']
+    assert row['reason'] == 'dropped: all request slots busy'
 
 
 async def test_arrival_pending_queue_shortfall_is_not_a_stopped_check():
-    config = configuration(arrivals={"requests": 5, "requests_per_second": 1000, "max_pending": 1})
-    config.checks = ["arrivals"]
-    run = _Run(config, None, None)
-    for _ in range(config.concurrency):
-        run.slots.get_nowait()
-
-    async def release():
-        await asyncio.sleep(.02)
-        for _ in range(config.concurrency):
-            run.release_slot()
-
-    await asyncio.gather(workloads.arrivals(run, config.targets[0], Client(), {"short": [spec("x", "short", "arrivals")]}), release())
-    row = run.observations["local"]["conditions"][0]
-    assert row["not_sent"] == 4 and row["sent"] == 1
-    assert row["reason"] == "pending queue full"
+    from giraffe import load_test
+    from tests.test_concurrent_load import configuration as load_configuration,short_windows
+    cfg=short_windows(load_configuration(concurrency=1,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.005)
+    run=_Run(cfg,None,None)
+    run.load_custom_specs = [spec("x", "short", "load")]
+    run.slots.get_nowait()
+    async def release(): await asyncio.sleep(.02); run.release_slot()
+    await asyncio.gather(load_test.execute(run,cfg.targets[0],Client(delay=0)),release())
+    p=load_test.result(run,cfg.targets[0]).metrics['points'][0]
+    row=next(r for r in run.observations['local']['conditions'] if r['condition']['id'] == p['id'])
+    # Final load has no pending queue: every full-slot offer is an immediate drop.
+    assert row['not_sent'] == p['local_drops'] == 5 and row['sent'] == 0
+    assert row['reason'] == 'dropped: all request slots busy'
+    assert not run.stop.is_set()
 
 
 @pytest.mark.parametrize("check", ["sessions", "consistency", "logprobs"])
@@ -143,27 +143,22 @@ async def test_condition_events_do_not_occupy_activity_feed(tmp_path, monkeypatc
     ("dropped_late", "dropped: scheduler was late"),
     ("not_offered", "not offered: sending window ended"),
 ])
-async def test_capacity_condition_preserves_stage_shortfall_facts(monkeypatch, outcome, reason):
-    from giraffe import traffic
-    original = traffic.run_stage
-
+async def test_capacity_condition_preserves_stage_shortfall_facts(monkeypatch,outcome,reason):
+    from dataclasses import replace
+    from giraffe import load_test
+    from tests.test_concurrent_load import configuration as load_configuration,short_windows
+    original=load_test.run_stage
     async def stage_with_shortfall(**kwargs):
-        stage = await original(**kwargs)
-        # The consumer must distinguish these scheduler facts from a local drop.
-        stage[outcome] += stage["dropped_local"]
-        stage["dropped_local"] = 0
-        stage["reasons"] = [reason]
-        return stage
-
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    monkeypatch.setattr(FakeClient, "delay", .03)
-    monkeypatch.setattr(traffic, "run_stage", stage_with_shortfall)
-    result = await run_suite(runner_config(checks=["capacity"],
-        traffic={"rates": [1000], "duration_seconds": .005, "max_in_flight": 1}))
-    row = result.observations["targets"]["service"]["conditions"][0]
-    stage = result.observations["targets"]["service"]["capacity"][0]
-    assert row["not_sent"] == stage[outcome] > 0
-    assert row["reason"] == reason
+        evidence=await original(**kwargs)
+        return replace(evidence,outcomes=tuple(outcome if o == 'dropped_local' else o for o in evidence.outcomes),reasons=(reason,))
+    monkeypatch.setattr(load_test,'run_stage',stage_with_shortfall)
+    cfg=short_windows(load_configuration(concurrency=1,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.005)
+    run=_Run(cfg,None,None)
+    await load_test.execute(run,cfg.targets[0],Client(delay=.03))
+    p=load_test.result(run,cfg.targets[0]).metrics['points'][0]
+    row=next(r for r in run.observations['local']['conditions'] if r['condition']['id'] == p['id'])
+    assert row['not_sent'] == sum(o['outcome']==outcome for o in p['offers']) > 0
+    assert row['reason'] == reason
 
 
 def test_intentional_flag_survives_saved_record_round_trip():

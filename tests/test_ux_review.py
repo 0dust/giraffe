@@ -15,13 +15,13 @@ def configuration(**overrides):
 
 @pytest.mark.parametrize("config,kind", [
     (configuration(checks=["access", "correctness"]), "exact"),
-    (configuration(checks=["capacity"], traffic={"arrival": "poisson", "rates": [1, 2], "duration_seconds": 1}), "exact"),
+    (configuration(checks=["load"], request_source="request_pack",request_pack={"version":1,"cases":[{"fixture_id":"one","messages":[{"role":"user","content":"Question"}],"scorer":"exact","expected":"Answer"}]},load_test={"patterns":{"concurrent":{"enabled":False},"poisson":{"enabled":True},"rates":[1,2]},"schedule":{"duration_seconds":1}}), "estimate"),
     (configuration(checks=["concurrency"], concurrency=2, concurrent_load={"schedule": {"levels": [1, 2]}}), "bounded"),
 ])
 def test_visible_traffic_keeps_count_certainty_and_limits(config, kind):
     plan = request_plan(config)
     assert plan["count_kind"] == kind
-    if "concurrency" in config.checks:
+    if "load" in config.checks and kind == "bounded":
         assert plan["planned_total"] is None
         assert all(row["requests_per_target"] is None for row in plan["rows"] if row["kind"] == "duration")
     browser_logic(r"""
@@ -31,14 +31,14 @@ state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
 assert.match(visible,/<h3>Traffic<\/h3>/);assert(visible.includes(setupPlanCount(plan)));
-assert.match(visible,/<dt>Request limit<\/dt>/);assert.match(visible,/<dt>Traffic time limit<\/dt>/);
-assert(visible.includes(`<dd>${number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${elapsed(config.max_duration_seconds)}</dd>`));
+assert.match(visible,/<dt>Stop after this many requests<\/dt>/);assert.match(visible,/<dt>Stop test traffic after<\/dt>/);
+assert(visible.includes(`<dd>${config.max_requests==null?'Not set':number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${config.max_duration_seconds==null?'Not set':elapsed(config.max_duration_seconds)}</dd>`));
 assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass criteria|requests per endpoint/);
 assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
 assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
 assert.equal(nodes['#start-run'].disabled,false);
-if(plan.count_kind==='bounded'){assert.match(visible,/known requests \+ adaptive checks/);assert.match(visible,/Configured load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/Duration-based/);}
-if(plan.count_kind==='estimate')assert.match(visible,/About /);
+if(plan.count_kind==='bounded'){assert.match(visible,/Unknown requests/);assert.match(visible,/Sending \/ maintained-load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/Duration-based/);}
+if(plan.count_kind==='estimate')assert.match(visible,/≈ /);
 state.configRevision++;renderRequestPlan();assert.equal(nodes['#start-run'].disabled,true);
 assert.match(nodes['#request-plan'].innerHTML,/stale/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/plan-total|Request breakdown/);
 """.replace("PLAN", json.dumps(plan)), config)
@@ -51,8 +51,9 @@ def test_budget_warning_and_fix_actions_remain_outside_breakdown():
 const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
-assert.match(visible,/budget is too small/);assert.match(visible,/data-action="use-request-budget"/);
-assert(visible.includes('data-budget="'+plan.required_request_limit+'"'));assert.match(visible,/data-action="edit-load"/);
+assert.match(visible,/incomplete coverage/);assert.match(visible,/data-action="use-request-budget"/);
+assert(visible.includes('data-budget="'+plan.required_request_limit+'"'));assert.match(visible,/data-action="edit-setting"/);
+assert.match(visible,/Answer correctness/);
 for(const warning of plan.warnings)assert(visible.includes(escape(warning)));
 assert(markup.indexOf('Endpoint request budgets')>markup.indexOf('Request breakdown'));
 assert.match(markup,/local: up to 2 requests/);
@@ -81,11 +82,11 @@ assert.match(markup,/Enter an endpoint URL and model/);assert.match(markup,/Add 
 
 
 def test_evaluator_destinations_and_scope_stay_visible_and_thresholds_stay_separate():
-    config = configuration(checks=["correctness", "capacity"], request_source="request_pack",
+    config = configuration(checks=["correctness", "load"], request_source="request_pack",
                            request_pack={"version": 1, "cases": [{"fixture_id": "one", "messages": [{"role": "user", "content": "Question"}], "expected": "Answer", "scorer": "judge"}]},
                            judging={"judges": [{"name": "reviewer", "url": "https://judge.example/v1", "model": "judge-model"}]},
-                           test_options={"correctness": {"limits": {"min_correctness": .95}},
-                                         "capacity": {"limits": {"min_correctness": .8}}})
+                           limits={"min_correctness": .95},
+                           load_test={"pass_criteria":{"min_correct_percent":80}})
     plan = request_plan(config)
     assert plan["evaluator"]["active"]
     browser_logic(r"""
@@ -96,8 +97,8 @@ assert(visible.includes('Up to '+number(plan.evaluator.call_upper_bound)+' evalu
 assert.match(visible,/Questions, expected answers and model answers/);assert.match(visible,/separate limits/);
 assert.match(visible,/judge-model/);assert.match(visible,/https:\/\/judge.example\/v1/);
 const criteria=renderReviewPassCriteria(config);
-assert(criteria.includes(catalogTitle('correctness')));assert(criteria.includes(catalogTitle('capacity')));
-assert.match(criteria,/Correct answers 95%/);assert.match(criteria,/Correct answers 80%/);
+assert(criteria.includes(catalogTitle('correctness')));assert(criteria.includes(catalogTitle('load')));
+assert.match(criteria,/Correct answers 95%/);assert.match(criteria,/Correct answers required \(%\): 80/);
 assert(markup.indexOf('Pass criteria')>markup.indexOf('Request breakdown'));
 plan.evaluator.readiness_errors=['Evaluator needs a URL'];plan.warnings.push('Evaluator needs a URL');renderRequestPlan();
 assert.equal((nodes['#request-plan'].innerHTML.match(/Evaluator needs a URL/g)||[]).length,1);
@@ -123,9 +124,9 @@ def test_review_identifies_dataset_consumers_when_other_checks_generate_requests
     browser_logic(r"""
 config.request_source='request_pack';config.request_pack={version:1,cases:[{scorer:'exact'}]};
 for(const additional of ['access','json','context','generation']){
-  config.checks=['correctness','capacity',additional];
+  config.checks=['correctness','load',additional];
   const original=JSON.stringify(config),markup=renderReviewScope({config});
-  assert(markup.includes('1 saved question for '+escape(catalogTitle('correctness')+' and '+catalogTitle('capacity'))));
+  assert(markup.includes('1 saved question for '+escape(catalogTitle('correctness')+' and '+catalogTitle('load'))));
   assert.match(markup,/Other checks use generated requests/);assert.equal(JSON.stringify(config),original);
 }
 config.checks=['correctness','gpu'];let markup=renderReviewScope({config});
@@ -136,21 +137,18 @@ assert.match(markup,/Built-in examples/);assert.doesNotMatch(markup,/Your questi
 
 
 def test_review_capacity_stages_show_requested_rates_and_effective_concurrency():
-    config = configuration(checks=["capacity"], concurrency=3,
-                           traffic={"rates": [.125, 2, 8], "duration_seconds": 2.5,
-                                    "max_in_flight": None, "arrival": "poisson"})
-    plan = request_plan(config)
-    browser_logic(r"""
-const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
+    config = configuration(checks=["load"], concurrency=3,
+        load_test={"patterns":{"concurrent":{"enabled":False},"poisson":{"enabled":True},"rates":[.125,2,8]},"schedule":{"duration_seconds":3}})
+    plan=request_plan(config)
+    browser_logic('const plan='+json.dumps(plan)+r""";
+nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
-const original=JSON.stringify(config);renderRequestPlan();
-const visible=nodes['#request-plan'].innerHTML.split('<details class="request-planning">')[0];
-assert.match(visible,/Capacity target rates: 0.125 → 2 → 8 requests\/s · 2.5s per rate · up to 3 at once · random arrivals/);
-assert.equal(JSON.stringify(config),original); // The summary does not rewrite a saved load profile.
-config.traffic.max_in_flight=2;config.traffic.arrival='steady';
-assert.match(renderReviewLoad(config),/up to 2 at once/);assert.doesNotMatch(renderReviewLoad(config),/random arrivals/);
-config.checks=['access','correctness'];assert.equal(renderReviewLoad(config),'');
-""".replace("PLAN", json.dumps(plan)), config)
+const original=JSON.stringify(config);renderRequestPlan();const visible=nodes['#request-plan'].innerHTML;
+assert.match(visible,/Poisson/);for(const rate of [.125,2,8])assert(visible.includes(rate+' requests/second'));
+assert.match(visible,/<dt>Limit simultaneous requests<\/dt><dd>3<\/dd>/);assert(visible.includes(plan.load_test.expected_requests_label));
+assert.equal(JSON.stringify(config),original);
+config.checks=['access','correctness'];assert.equal(renderLoadPlan(config,plan),'');
+""",config)
 
 
 def test_review_explains_measurement_only_timing_with_explicit_null_overrides():
@@ -192,12 +190,12 @@ syncTestControls=()=>synced++;configError=error=>{throw error;};
 nodes['#check-search']={value:'cache'};
 nodes['[data-catalogue-filter="selected"]']={focus(){focused=true;}};
 const click=()=>listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-load'}}:null}});
-state.catalogueFilter='all';state.catalogueCategory='server';state.catalogueSearch='cache';state.openTest='concurrency';
+state.catalogueFilter='all';state.catalogueCategory='server';state.catalogueSearch='cache';state.openTest='load';
 await click();assert.equal(step,2);assert.equal(state.catalogueFilter,'selected');assert.equal(state.catalogueCategory,'all');
 assert.equal(state.catalogueSearch,'');assert.equal(nodes['#check-search'].value,'');assert.equal(state.openTest,null);
 assert.equal(revealed.length,0);assert.equal(synced,1);assert(focused);
-config.checks=['concurrency'];await click();assert.deepEqual(revealed,['concurrency']);
-config.checks=['concurrency','capacity'];await click();assert.deepEqual(revealed,['concurrency','capacity']);
+config.checks=['load'];await click();assert.deepEqual(revealed,['load']);
+config.checks=['load','sessions'];await click();assert.deepEqual(revealed,['load','load']);
 """)
 
 

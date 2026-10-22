@@ -294,7 +294,10 @@ assert.equal(JSON.stringify(parseLogprobSettings(JSON.stringify(settings))),JSON
 assert.equal(parseLogprobSettings('null'),null);
 for(const invalid of ['[1]','true','{'])assert.throws(()=>parseLogprobSettings(invalid));
 config.consistency={logprobs:settings};
+const original=JSON.stringify(config);
 assert.match(renderCheckSelection(config),/profile_consistency_logprobs/);
+assert.deepEqual(Array.from(loadSettings(config).patterns.concurrent.levels),[1,4]);
+assert.equal(JSON.stringify(config),original);
 const html=renderLogprobResults({status:'fail',conditions:[{shape:'short',level:2,examples:[{kind:'chosen',position:0,absolute_delta:.0000001,request_ids:['id1','id2']}]}]});
 assert.match(html,/data-request="id1"/);
 assert.match(html,/data-request="id2"/);

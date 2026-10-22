@@ -6,6 +6,7 @@ import math
 from collections import Counter, defaultdict
 from bisect import bisect_right
 
+from .caps import MAX_LOGPROB_EXAMPLES
 from giraffe.models import LogprobAlternative, LogprobEvidence, LogprobToken
 
 MAX_TOKENS = 4096
@@ -131,7 +132,7 @@ def compare_samples(records, *, cross=False, prefix_cache=None):
         by_slot[record.workload['corpus_index']].append(record)
 
     def example(kind, position, a, b, delta=None):
-        if len(summary['examples']) < 16:
+        if len(summary['examples']) < MAX_LOGPROB_EXAMPLES:
             summary['examples'].append({'kind': kind, 'position': position,
                                         'request_ids': [a, b], 'absolute_delta': delta})
 
@@ -206,7 +207,7 @@ def compare_samples(records, *, cross=False, prefix_cache=None):
                     differences = pairs([rid for group in different.values() for rid in group]) - sum(
                         pairs(group) for group in different.values())
                     summary[field] += differences
-                    if differences and len(summary['examples']) < 16:
+                    if differences and len(summary['examples']) < MAX_LOGPROB_EXAMPLES:
                         groups = list(different.values())
                         representatives, level_groups = [], defaultdict(list)
                         for index, ids in enumerate(groups):
@@ -217,7 +218,7 @@ def compare_samples(records, *, cross=False, prefix_cache=None):
                             for level in first:
                                 level_groups[level].append(index)
                         for index, left in enumerate(representatives):
-                            if len(summary['examples']) >= 16:
+                            if len(summary['examples']) >= MAX_LOGPROB_EXAMPLES:
                                 break
                             if cross and len(left) == 1:
                                 other = next((ids for level, ids in level_groups.items() if level not in left), [])
@@ -225,7 +226,7 @@ def compare_samples(records, *, cross=False, prefix_cache=None):
                             else:
                                 candidates = range(index + 1, len(groups))
                             for right_index in candidates:
-                                if len(summary['examples']) >= 16:
+                                if len(summary['examples']) >= MAX_LOGPROB_EXAMPLES:
                                     break
                                 right = representatives[right_index]
                                 pair = next((a, b) for a in left.values() for b in right.values()

@@ -1,10 +1,11 @@
 import json
+import math
 from collections import Counter
 
 import pytest
 from pydantic import ValidationError
 
-from giraffe.models import ConfigDraft, RequestPack, RunConfig, Target
+from giraffe.models import ConfigDraft, RequestPack, RunConfig, Target, TrafficConfig
 from giraffe.request_pack import (active_pack, case_sequence, load_request_pack,
                                   pack_identity, pack_preview, pack_specs)
 
@@ -15,9 +16,16 @@ def case(fixture_id="one", **updates):
 
 
 def config(cases=None, **updates):
+    traffic = TrafficConfig.model_validate(updates.get("traffic", {}))
     return RunConfig(targets=[Target(name="local", url="http://localhost", model="test")],
-                     checks=["capacity", "correctness"], request_source="request_pack",
-                     request_pack={"version": 1, "cases": cases or [case()]}, **updates)
+        checks=["load", "correctness"], request_source="request_pack",
+        request_pack={"version": 1, "cases": cases or [case()]},
+        load_test={"workloads": {"combinations": {"selected": ["short_short"]}},
+            "patterns": {"concurrent": {"enabled": False},
+                "constant": {"enabled": traffic.arrival == "steady"},
+                "poisson": {"enabled": traffic.arrival == "poisson", "seed": traffic.seed},
+                "rates": traffic.rates},
+            "schedule": {"duration_seconds": math.ceil(traffic.duration_seconds)}}, **updates)
 
 
 @pytest.mark.parametrize("updates", [
@@ -95,15 +103,15 @@ def test_source_selection_and_legacy_conflict():
     assert pack_preview(draft)["quiet_requests"] == 0
 
 
-def test_effective_payload_obeys_cap_and_option_precedence():
+def test_explicit_case_output_budget_overrides_suite_default_and_options_merge():
     configured = config([case(max_tokens=999, options={"temperature": .2})],
                         max_output_tokens=32, stream=False,
                         request_options={"temperature": .8, "stop": ["END"]})
     spec = pack_specs(configured)[0]
-    assert spec.max_tokens == 32 and spec.stream is False
+    assert spec.max_tokens == 999 and spec.stream is False
     assert spec.options == {"temperature": .2, "stop": ["END"]}
     preview = pack_preview(configured)
-    assert preview["cases"][0]["effective"]["max_tokens"] == 32
+    assert preview["cases"][0]["effective"]["max_tokens"] == 999
     assert preview["cases"][0]["requested"]["max_tokens"] == 999
     assert preview["quiet_requests"] == 1
 
@@ -113,7 +121,7 @@ def test_effective_identity_ignores_order_weight_scale_and_inactive_settings():
     second = config([case("b", weight=6), case("a", weight=2)],
                     traffic={"mix": {"short": 0, "long_input": 1, "long_output": 0},
                              "long_input_chars": 5000},
-                    test_options={"correctness": {"samples": 8}})
+                    test_options={"json": {"samples": 8}})
     assert pack_identity(first) == pack_identity(second)
     for updates in ({"expected": "B"}, {"weight": 2}, {"options": {"temperature": .3}},
                     {"messages": [{"role": "user", "content": "Return B"}]}):
@@ -128,7 +136,8 @@ def test_weighted_sequence_preserves_mix_without_forcing_coverage():
     assert Counter(s.workload["case_id"] for s in sequence) == {"common": 99, "rare": 1}
     assert sequence == case_sequence(configured, 100, 0)
     preview = pack_preview(configured)
-    assert preview["stages"][0]["counts"] == {"common": 2, "rare": 0}
+    assert preview["load_test"]["expected_scheduled_requests"] == 2
+    assert preview["stages"] == []
     assert preview["warnings"]
 
 
@@ -255,7 +264,7 @@ def test_judge_preview_counts_only_eligible_cases_and_distinguishes_quota():
     configured = config([case("judge", scorer="judge"), case("exact")], judging=judge_config(),
                         traffic={"rates": [2], "duration_seconds": 2}, max_requests=3)
     preview = pack_preview(configured)["judging"]
-    assert preview["planned_call_upper_bound"] == 3  # one quiet + two loaded
+    assert preview["planned_call_upper_bound"] == 5  # one judged quiet + up to four judged offers
     assert preview["quota_call_upper_bound"] == 3
     assert preview["judge_count"] == 1
     assert preview["active"] is True
@@ -284,12 +293,10 @@ def test_judge_preview_is_read_only_draft_readiness_and_panel_bounds(monkeypatch
 
 
 @pytest.mark.parametrize("arrival", ["steady", "poisson"])
-@pytest.mark.parametrize("checks", [["capacity", "correctness"], ["correctness"], ["buckets"]])
+@pytest.mark.parametrize("checks", [["load", "correctness"], ["correctness"], ["load"]])
 @pytest.mark.parametrize("ready", [True, False])
-def test_pack_summary_matches_full_preview_counts_and_evaluator_bounds(arrival, checks, ready):
-    from giraffe.request_pack import case_counts, pack_summary
-    from giraffe.traffic import arrival_schedule
-
+def test_final_pack_summary_matches_preview_and_evaluator_bounds(arrival, checks, ready):
+    from giraffe.request_pack import pack_summary
     configured = config([case("judged", scorer="judge", weight=3, max_tokens=128),
                          case("exact", weight=1, max_tokens=16)],
                         judging=judge_config(), traffic={"rates": [1.5, 3], "duration_seconds": 2,
@@ -301,34 +308,25 @@ def test_pack_summary_matches_full_preview_counts_and_evaluator_bounds(arrival, 
         "judging": {"judges": [{"name": name, "url": "http://localhost/v1" if ready else "",
                                  "model": "judge" if ready else ""} for name in ("one", "two")]},
     })
-    preview = pack_preview(configured)
-    summary = pack_summary(configured)
+    preview, summary = pack_preview(configured), pack_summary(configured)
     expected = {key: preview[key] for key in summary}
-    expected["stages"] = [{key: value for key, value in stage.items() if key != "schedule_hash"}
-                          for stage in preview["stages"]]
     expected["judging"] = {key: value for key, value in preview["judging"].items() if key != "identity"}
     assert summary == expected
-    assert summary["request_cap"] == 3
-    assert summary["per_target_request_quota"] == {"a": 2, "b": 1}
-
-    active = bool({"correctness", "capacity"}.intersection(checks))
-    staged_judged = 0
-    if "capacity" in checks:
-        for index, stage in enumerate(summary["stages"]):
-            schedule, truncated = arrival_schedule(configured.effective_traffic(), stage["rate_rps"], index)
-            assert stage["planned"] == len(schedule)
-            assert stage["truncated"] == truncated
-            assert stage["counts"] == case_counts(configured, len(schedule))
-            staged_judged += stage["counts"]["judged"]
+    assert summary["request_cap"] == 3 and summary["per_target_request_quota"] == {"a": 2, "b": 1}
+    assert summary["quiet_requests"] == (2 if "correctness" in checks else 0)
+    assert summary["stages"] == []
+    assert summary["judging"]["ready"] is ready
+    if "load" in checks:
+        assert summary["load_test"]["expected_scheduled_requests"] == 9
+        assert summary["judging"]["planned_requests_approximate"] == (arrival == "poisson")
+        if arrival == "poisson":
+            assert summary["judging"]["planned_call_upper_bound"] == summary["judging"]["quota_call_upper_bound"] == 6
+        else:
+            # Weighted random selection may choose the judged case on every request.
+            assert summary["judging"]["planned_call_upper_bound"] == (40 if "correctness" in checks else 36)
+            assert summary["judging"]["quota_call_upper_bound"] == 6
     else:
-        assert summary["stages"] == []
-    judged = int(active) + staged_judged
-    if active:
-        assert {item["fixture_id"]: item["effective"]["max_tokens"] for item in preview["cases"]} == {
-            "exact": 16, "judged": 32}
-    assert summary["judging"]["planned_call_upper_bound"] == judged * 2 * (2 if active else 0)
-    assert summary["judging"]["quota_call_upper_bound"] == (min(judged, 2) + min(judged, 1)) * (2 if active else 0)
-    assert summary["judging"]["ready"] == (ready or not active)
+        assert summary["judging"]["planned_call_upper_bound"] == summary["judging"]["quota_call_upper_bound"] == 4
 
 
 @pytest.mark.parametrize("scorer", ["exact", "contains"])
@@ -339,3 +337,24 @@ def test_pack_preview_warns_about_expected_text_in_own_messages_without_rejectin
     assert any("echo" in warning and "echo would pass" in warning for warning in warnings)
     safe = config([case("safe", scorer=scorer, expected="4", messages=[{"role": "user", "content": "Two plus two?"}])])
     assert not any("echo would pass" in warning for warning in pack_preview(safe)["warnings"])
+
+
+async def test_final_load_judge_upper_bound_covers_weighted_random_cases(monkeypatch):
+    from giraffe import judging, runner
+    from tests.test_runner import FakeClient, judge_summary
+    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
+
+    async def evaluate(config, records, specs, **kwargs):
+        for record in records:
+            record.score = True
+        return judge_summary(records)
+
+    monkeypatch.setattr(judging, 'judge_records', evaluate)
+    configured = config([case('judged', scorer='judge', weight=99), case('exact', weight=1)],
+        judging=judge_config(), max_requests=None,
+        traffic={'rates': [20], 'duration_seconds': 1})
+    preview = pack_preview(configured)['judging']
+    report = await runner.run_suite(configured)
+    actual_judged = sum(record.fixture_id == 'pack:judged' for record in report.requests)
+    assert preview['planned_call_upper_bound'] >= actual_judged
+    assert preview['quota_call_upper_bound'] >= actual_judged

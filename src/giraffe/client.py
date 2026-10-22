@@ -17,6 +17,9 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from .caps import (
+    MAX_SERVER_ID_CHARS, MAX_TOOL_CALLS,
+)
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget
 
@@ -189,9 +192,15 @@ def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[t
 class LLMClient:
     reports_response_activity = True
 
-    def __init__(self, target: Target, config: RunConfig):
+    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None):
         self.target = target
         self.config = config
+        if max_connections is None:
+            from .models import required_concurrency
+            required = required_concurrency(config)
+            pool = min(required["peak"], config.concurrency) if config.concurrency is not None else required["peak"]
+            max_connections = min(required["per_target_peak"], pool)
+        self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | None = None
         self.on_response = None
@@ -208,7 +217,8 @@ class LLMClient:
             timeout=httpx.Timeout(None, connect=min(self.config.request_timeout_seconds * .9, 10)),
             verify=verify, proxy=self.config.proxy,
             trust_env=True, follow_redirects=False,
-            limits=httpx.Limits(max_connections=self.config.concurrency),
+            limits=httpx.Limits(max_connections=self.max_connections,
+                                max_keepalive_connections=self.max_connections),
         )
 
     async def __aenter__(self) -> LLMClient:
@@ -247,7 +257,7 @@ class LLMClient:
             raise RuntimeError("Use LLMClient as an async context manager")
         preparation_start = time.perf_counter()
         stream = self.config.stream and spec.stream
-        budget = min(spec.max_tokens or self.config.max_output_tokens, self.config.max_output_tokens)
+        budget = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
         record = RequestRecord(
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
@@ -308,9 +318,9 @@ class LLMClient:
             nonlocal last_answer, response_sequence, assistant_content_present, tool_output, reads_truncated
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
-                    and len(server_id) > 4096):
+                    and len(server_id) > MAX_SERVER_ID_CHARS):
                 raise _ProtocolError("completion request ID exceeded the safety limit")
-            if isinstance(server_id, str) and 0 < len(server_id) <= 4096:
+            if isinstance(server_id, str) and 0 < len(server_id) <= MAX_SERVER_ID_CHARS:
                 if (spec.cancel_after_chunks is not None and record.server_request_id is not None
                         and server_id != record.server_request_id):
                     raise _ProtocolError("completion request ID changed during the response")
@@ -376,7 +386,7 @@ class LLMClient:
                 record.generation_chunks += 1
             calls = content.get("tool_calls")
             if calls is not None:
-                if not isinstance(calls, list) or len(calls) > 16:
+                if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
                     raise _ProtocolError("invalid tool-call structure or count")
                 for ordinal, call in enumerate(calls):
                     if not isinstance(call, dict):
@@ -453,8 +463,8 @@ class LLMClient:
                     raise _ProtocolError("repeated completion finish reason")
                 record.finish_reason = finish
 
-        request_timeout = min(self.config.request_timeout_seconds,
-                              spec.request_timeout_seconds or self.config.request_timeout_seconds)
+        request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
+                           else self.config.request_timeout_seconds)
         intentional = spec.cancel_after_ms is not None and (
             spec.cancel_after_ms / 1000 < request_timeout
         )

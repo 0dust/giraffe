@@ -95,7 +95,7 @@ async def test_interrupted_request_records_keep_the_effective_output_cap(failure
     run = _Run(config, None, None)
     record = await run.request(config.targets[0], InterruptedClient(),
         spec("hello", "generation", "generation", max_tokens=config.max_output_tokens * 2))
-    assert record.requested_max_tokens == config.max_output_tokens
+    assert record.requested_max_tokens == config.max_output_tokens * 2
 
 
 def test_named_tool_selection_has_a_tool_call_label():

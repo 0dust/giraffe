@@ -5,7 +5,7 @@ from tests.test_ux_catalogue import browser_logic
 
 def test_run_limit_edits_refresh_all_quoted_limits_without_replacing_controls():
     browser_logic(r"""
-config.checks=['access','correctness','generation','concurrency','sessions'];
+config.checks=['access','correctness','generation','load','sessions'];
 config.test_options={correctness:{concurrency:8},generation:{max_output_tokens:64},access:{request_timeout_seconds:10}};
 config.sessions={profile:'performance',concurrency:2,max_tokens:512};
 const elements={};
@@ -15,54 +15,53 @@ for(const check of bootstrap.checks){
   for(const name of check.limit_fields)elements[`test_${check.id}_limit_${name}`]={value:'',dataset:{inherited:'false'}};
 }
 for(const [name,value] of Object.entries({test_correctness_concurrency:'8',test_generation_max_output_tokens:'64',test_access_request_timeout_seconds:'10',
-  load_schedule_levels:'1, 64',profile_sessions_concurrency:'2',profile_sessions_max_tokens:'512',sessions_max_tokens:'512',session_cap_0:'512'})){
+  load_patterns_concurrent_levels:'1, 64',profile_sessions_concurrency:'2',profile_sessions_max_tokens:'512',sessions_max_tokens:'512',session_cap_0:'512'})){
   elements[name]={name,value,dataset:{inherited:'false'},selectionStart:1,selectionEnd:2};
 }
 const form={elements};nodes['#new-run-form']=form;
 elements.test_json_concurrency={value:'4',dataset:{inherited:'true'}};
-for(const id of ['selection-summary','load-guidance','run-bounds','run-bar-summary','cli-fallback','run-ceilings-summary','field-load_schedule_levels-hint','field-traffic_max_in_flight-hint'])nodes['#'+id]={};
+for(const id of ['selection-summary','load-guidance','run-bounds','run-bar-summary','cli-fallback','run-ceilings-summary','field-load_patterns_concurrent_levels-hint','field-traffic_max_in_flight-hint'])nodes['#'+id]={};
 const hints=[['correctness','concurrency'],['generation','max_output_tokens'],['access','request_timeout_seconds']].map(([checkId,settingName])=>({dataset:{checkId,settingName,settingKind:'option'}}));
 groups['[data-check-field-hint]']=hints;groups['[name^="session_cap_"]']=[elements.session_cap_0];
 syncSetupIdentity=updateDatasetReadiness=updateCheckRow=renderReviewScope=renderRequestPlan=renderRequestPreview=scheduleRequestPlan=()=>{};
 renderNew=()=>{throw Error('Limit edits must not replace form controls');};
 readForm=()=>{const current=structuredClone(config);for(const [name] of numericFields)current[name]=Number(elements[name].value);return {config:current};};
-const snapshots=['load_schedule_levels','test_correctness_concurrency','test_generation_max_output_tokens','test_access_request_timeout_seconds','sessions_max_tokens','session_cap_0'].map(name=>[name,elements[name],elements[name].value]);
+const snapshots=['load_patterns_concurrent_levels','test_correctness_concurrency','test_generation_max_output_tokens','test_access_request_timeout_seconds','sessions_max_tokens','session_cap_0'].map(name=>[name,elements[name],elements[name].value]);
 for(const [name,value] of [['concurrency','40'],['max_output_tokens','256'],['request_timeout_seconds','60']]){
   const input=elements[name];input.value=value;input.matches=()=>false;input.closest=q=>q==='#new-run-form'?form:null;
   listeners.input({target:input});assert.equal(form.elements[name],input);assert.equal(input.value,value);assert.equal(input.selectionStart,1);assert.equal(input.selectionEnd,2);
 }
-assert.match(nodes['#field-load_schedule_levels-hint'].textContent,/Maximum at once \(40\)/);
-assert.match(nodes['#field-traffic_max_in_flight-hint'].textContent,/Maximum at once \(40\)/);
+assert.equal(nodes['#field-load_patterns_concurrent_levels-hint'].textContent,'Used by maintained-concurrency traffic and the long-input / short-answer test.');
+nodes['#load-ceiling-label']={};syncLoadDisplay(readForm().config);assert.equal(nodes['#load-ceiling-label'].textContent,40);
 assert.match(nodes['#run-ceilings-summary'].textContent,/40 at once/);
-assert.equal(hints[0].textContent,'Custom · run default: 40 at a time');
+assert.equal(hints[0].textContent,'Custom · run default: 4 at a time');
 assert.equal(hints[1].textContent,'Custom · run default: 256 tokens');
 assert.equal(hints[2].textContent,'Custom · run default: 60 seconds');
-assert.equal(elements.profile_sessions_concurrency.max,'32'); // Preserve the session schema's own maximum.
-for(const name of ['profile_sessions_max_tokens','sessions_max_tokens','session_cap_0'])assert.equal(elements[name].max,'256');
-assert.equal(Number(elements.test_json_concurrency.value),40);
+assert.equal(bootstrap.limits['sessions.concurrency'].maximum,512);assert.equal(elements.profile_sessions_concurrency.max,String(bootstrap.limits['sessions.concurrency'].maximum)); // Preserve the session schema's own maximum.
+for(const name of ['profile_sessions_max_tokens','sessions_max_tokens','session_cap_0'])assert.equal(elements[name].max,bootstrap.limits[settingPath(name)].maximum==null?undefined:String(bootstrap.limits[settingPath(name)].maximum));
+assert.equal(Number(elements.test_json_concurrency.value),4);
 for(const [name,input,value] of snapshots){assert.equal(form.elements[name],input);assert.equal(input.value,value);assert.equal(input.selectionStart,1);assert.equal(input.selectionEnd,2);}
-elements.concurrency.value='2';listeners.input({target:elements.concurrency});assert.equal(elements.profile_sessions_concurrency.max,'2');assert.equal(Number(elements.test_json_concurrency.value),2);
-assert.match(nodes['#field-load_schedule_levels-hint'].textContent,/Maximum at once \(2\)/);assert.equal(elements.load_schedule_levels.value,'1, 64');
+elements.concurrency.value='2';listeners.input({target:elements.concurrency});assert.equal(bootstrap.limits['sessions.concurrency'].maximum,512);assert.equal(elements.profile_sessions_concurrency.max,String(bootstrap.limits['sessions.concurrency'].maximum));assert.equal(Number(elements.test_json_concurrency.value),2);
+assert.equal(nodes['#field-load_patterns_concurrent_levels-hint'].textContent,'Used by maintained-concurrency traffic and the long-input / short-answer test.');assert.equal(elements.load_patterns_concurrent_levels.value,'1, 64');
 """)
 
 
 def test_questions_precede_settings_and_inactive_controls_stay_preserved():
     browser_logic(r"""
-for(const id of ['correctness','capacity']){
+for(const id of ['correctness','load']){
   config.checks=[id];const check=bootstrap.checks.find(x=>x.id===id);
   const markup=renderTestCard(check,config);
-  assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('data-test-settings="'+id+'"'));
-  if(id==='capacity')assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('name="traffic_rates"'));
+  if(id==='correctness')assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('data-test-settings="'+id+'"'));
+  if(id==='load')assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('name="load_patterns_rates"'));
   assert.match(markup,/>Settings<\/button>/);assert.match(markup,/aria-label="Settings for /);
 }
 config.checks=['correctness'];config.request_source='request_pack';config.request_pack={cases:[]};
 config.test_options.correctness={samples:9,concurrency:2};
 const markup=renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config);
-const hidden=markup.slice(markup.indexOf('<div hidden data-inactive-question-settings>'),markup.indexOf('class="fields check-criteria-fields"'));
-assert.match(hidden,/name="test_correctness_samples"[^>]*value="9"/);
-assert.match(hidden,/name="test_correctness_concurrency"[^>]*value="2"/);
-assert.match(markup,/Sample count and requests-at-a-time settings are not used/);
-assert.match(markup,/name="test_correctness_limit_min_correctness"/);
+assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
+assert.match(markup,/Each saved case owns its output cap and request options/);
+assert.match(markup,/Concurrency: 4 \(default\)/);
+assert.match(markup,/Per-check request-setting overrides are unavailable. Per-check pass criteria remain supported./);
 assert.equal(config.test_options.correctness.samples,9);
 """)
 
@@ -71,7 +70,7 @@ def test_generic_transport_controls_are_secondary_and_pass_targets_remain_visibl
     browser_logic(r"""
 for(const [id,name] of [['access','request_timeout_seconds'],['correctness','concurrency'],['generation','max_output_tokens'],['recovery','concurrency']]){
   const markup=renderTestCard(bootstrap.checks.find(x=>x.id===id),config);
-  const disclosure=markup.match(/<details class="check-advanced check-run-overrides">([\s\S]*?)<\/details>/)[1];
+  const disclosure=markup.match(/<fieldset class="fields check-request-fields">([\s\S]*?)<\/fieldset>/)[1];
   assert.match(disclosure,new RegExp('name="test_'+id+'_'+name+'"'));
   assert.equal((markup.match(new RegExp('name="test_'+id+'_'+name+'"','g'))||[]).length,1);
   assert.match(markup,new RegExp('id="field-check_'+id+'-help"[^>]*popover="auto"'));
@@ -95,8 +94,8 @@ const correctness=bootstrap.checks.find(x=>x.id==='correctness'),cancel=bootstra
 config.samples=7;
 assert.equal(checkFieldHint(correctness,config,'samples'),'Run default');
 assert.equal(checkFieldHint(cancel,config,'cancel_after_ms'),'Check default');
-assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/cannot exceed the run request deadline/);
-assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/cannot exceed the run output cap/);
+assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/suite value is a default, not a ceiling/);
+assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/suite value is a default, not a ceiling/);
 config.test_options.correctness={samples:7};
 assert.equal(checkFieldHint(correctness,config,'samples'),'Custom · run default: 7 requests');
 const generation=bootstrap.checks.find(x=>x.id==='generation');config.limits.latency_ms=900;
@@ -122,16 +121,16 @@ def test_default_check_editor_keeps_only_actionable_copy_and_live_reset():
 const check=bootstrap.checks.find(x=>x.id==='correctness');config.checks=['correctness'];
 let markup=renderTestCard(check,config);
 assert.equal(testSettingsLabel(check,config),'');
-assert.match(markup,/class="test-settings simple-primary-settings"/);
-assert.doesNotMatch(markup,/Settings for this check|<h4>Requests<\/h4>|<h4>Pass criteria<\/h4>|Changes are kept as you edit|Shared by/);
+assert.match(markup,/class="test-settings"/);
+assert.doesNotMatch(markup,/Settings for this check|Changes are kept as you edit|Shared by/);
 assert.doesNotMatch(markup,/question-source-scope/);
 assert.match(markup,/data-reset-test="correctness"[^>]*hidden/);
 const reset={dataset:{resetTest:'correctness'},hidden:true};groups['[data-reset-test]']=[reset];
 config.test_options.correctness={samples:9};updateCheckFieldHints(config);assert.equal(reset.hidden,false);
 assert.equal(testSettingsLabel(check,config),'Overrides');
 delete config.test_options.correctness;updateCheckFieldHints(config);assert.equal(reset.hidden,true);
-config.checks.push('capacity');markup=renderTestCard(check,config);
-assert.match(markup,/question-source-scope">Also used by Capacity under load/);
+config.checks.push('load');markup=renderTestCard(check,config);
+assert.match(markup,/question-source-scope">Also used by Load test/);
 assert.equal((markup.match(/name="request_source"/g)||[]).length,2);
 """)
 
@@ -167,20 +166,20 @@ def test_sample_coverage_warnings_use_each_comparison_group_not_totals():
     browser_logic(r"""
 config.limits.min_samples=5;
 const check=id=>bootstrap.checks.find(x=>x.id===id);
-config.concurrent_load=structuredClone(bootstrap.concurrent_load.defaults);
-config.concurrent_load.schedule.levels=[1,8];config.concurrent_load.pass_criteria.min_valid_responses=5;
-config.concurrent_load.combinations.selected=['short_short','long_short'];config.concurrent_load.mixed.enabled=true;
+config.load_test=structuredClone(bootstrap.load_test.defaults);
+config.load_test.patterns.concurrent.levels=[1,8];config.load_test.pass_criteria.min_valid_responses=5;
+config.load_test.workloads.combinations.selected=['short_short','long_short'];config.load_test.workloads.mixed.enabled=true;
 // Duration points have no fixed sample count; required evidence belongs to each point.
-assert.equal(checkCoverageWarning(check('concurrency'),config),'');
-let criteria=renderConcurrentEditor(config);
-assert.match(criteria,/Minimum valid responses per test point/);
+assert.equal(checkCoverageWarning(check('load'),config),'');
+let criteria=renderLoadEditor(config);
+assert.match(criteria,/Minimum valid responses per result group/);
 assert.match(criteria,/name="load_pass_criteria_min_valid_responses"[^>]*value="5"/);
-assert.match(criteria,/Required for each workload and concurrency level/);
-assert.match(criteria,/reaching this count does not stop the workload/);
-config.limits.min_samples=100;config.concurrent_load.schedule.levels=[8];
-config.concurrent_load.pass_criteria.min_valid_responses=2;
-assert.equal(checkCoverageWarning(check('concurrency'),config),'');
-criteria=renderConcurrentEditor(config);
+assert.match(criteria,/A result group is a request type at one traffic pattern and level/);
+assert.match(criteria,/Minimum valid responses is an evidence requirement, not a stopping count/);
+config.limits.min_samples=100;config.load_test.patterns.concurrent.levels=[8];
+config.load_test.pass_criteria.min_valid_responses=2;
+assert.equal(checkCoverageWarning(check('load'),config),'');
+criteria=renderLoadEditor(config);
 assert.match(criteria,/name="load_pass_criteria_min_valid_responses"[^>]*value="2"/);
 // Global comparison-group coverage remains independent for consistency.
 config.limits.min_samples=5;
@@ -201,7 +200,9 @@ config.sessions={...bootstrap.profile_defaults.sessions,modes:['live','fixed']};
 const markup=renderProfileEditor(bootstrap.checks.find(x=>x.id==='sessions'),config);
 assert.match(markup,/<option value="live,fixed" selected>Saved selection/);
 const advanced=markup.match(/<details class="check-advanced">([\s\S]*?)<\/details>/)[1];
-assert.match(advanced,/name="profile_sessions_max_tokens"/);
+assert.doesNotMatch(advanced,/name="profile_sessions_max_tokens"/);
+assert.match(markup,/data-profile-settings="sessions" class="fields">[\s\S]*name="profile_sessions_max_tokens"/);
+assert.equal((markup.match(/name="profile_sessions_max_tokens"/g)||[]).length,1);
 assert.match(markup,/Conversations to run for each chosen history type/);
 const consistency=renderProfileEditor(bootstrap.checks.find(x=>x.id==='consistency'),config);
 assert(consistency.indexOf('name="profile_consistency_strict"')<consistency.indexOf('<details'));
@@ -220,26 +221,26 @@ config.test_options.generation={max_output_tokens:64};config.test_options.access
 const summary=effectiveCheckSummary(check,config);
 assert.match(summary,/8 at a time/);assert.doesNotMatch(summary,/exceeds run limit/);
 assert.doesNotMatch(summary,/ · 4 at a time/);
-assert.match(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config),/64 tokens exceeds run limit 32 tokens/);
-assert.match(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='access'),config),/10 seconds exceeds run limit 5 seconds/);
+assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config),'');
+assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='access'),config),'');
 const elements={test_correctness_concurrency:{value:'8'},test_generation_max_output_tokens:{value:'64'},
   test_access_request_timeout_seconds:{value:'10'},test_context_context_limit:{value:'2048',max:'65536'}};
+for(const input of Object.values(elements))input.removeAttribute=name=>delete input[name];
 nodes['#new-run-form']={elements};updateCheckFieldHints(config);
-assert.equal(elements.test_correctness_concurrency.max,'4');assert.equal(elements.test_correctness_concurrency.value,'8');
-assert.equal(elements.test_generation_max_output_tokens.max,'32');assert.equal(elements.test_generation_max_output_tokens.value,'64');
-assert.equal(elements.test_access_request_timeout_seconds.max,'5');assert.equal(elements.test_access_request_timeout_seconds.value,'10');
-assert.equal(elements.test_context_context_limit.max,'65536');
+assert.equal(elements.test_correctness_concurrency.max,String(bootstrap.limits['test_options.correctness.concurrency'].maximum));assert.equal(elements.test_correctness_concurrency.value,'8');
+assert.equal(elements.test_generation_max_output_tokens.max,bootstrap.limits['test_options.generation.max_output_tokens'].maximum==null?undefined:String(bootstrap.limits['test_options.generation.max_output_tokens'].maximum));assert.equal(elements.test_generation_max_output_tokens.value,'64');
+assert.equal(elements.test_access_request_timeout_seconds.max,undefined);assert.equal(elements.test_access_request_timeout_seconds.value,'10');
+assert.equal(elements.test_context_context_limit.max,bootstrap.limits['test_options.context.context_limit'].maximum==null?undefined:String(bootstrap.limits['test_options.context.context_limit'].maximum));
 assert.equal(config.test_options.correctness.concurrency,8);
 config.request_source='request_pack';config.request_pack={cases:[]};
-const recovery=checkOverrideWarning(check,config,true);
-assert.match(recovery,/Reset this check’s overrides or raise Maximum at once in Run limits/);
 const markup=renderTestCard(check,config);
-assert.match(markup,/data-check-override-warning="correctness" >/);
-assert(markup.indexOf('data-check-override-warning')<markup.indexOf('data-test-editor="correctness" hidden'));
-assert.equal((markup.match(/exceeds run limit/g)||[]).length,1);
+assert.match(markup,/data-pack-request-settings/);
+assert.doesNotMatch(markup,/exceeds run limit/);
+assert.doesNotMatch(markup,/name="test_correctness_concurrency"/);
 const warning={dataset:{checkOverrideWarning:'correctness'}};groups['[data-check-override-warning]']=[warning];
-updateCheckFieldHints(config);assert.equal(warning.hidden,false);assert.equal(warning.textContent,recovery);
-config.concurrency=8;updateCheckFieldHints(config);assert.equal(elements.test_correctness_concurrency.max,'8');
+updateCheckFieldHints(config);assert.equal(warning.hidden,true);assert.equal(warning.textContent,'');
+config.concurrency=8;updateCheckFieldHints(config);
+assert.equal(elements.test_correctness_concurrency.max,String(bootstrap.limits['concurrency'].maximum));
 assert.equal(warning.hidden,true);
 assert.doesNotMatch(effectiveCheckSummary(check,config),/exceeds run limit/);
 """)

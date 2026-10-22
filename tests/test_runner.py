@@ -25,7 +25,7 @@ class FakeClient:
     bad_mixed_gap = False
     initial_slow = False
 
-    def __init__(self, target, config):
+    def __init__(self, target, config, *, max_connections=None):
         self.target, self.config = target, config
 
     async def __aenter__(self):
@@ -107,6 +107,28 @@ def config(**kwargs):
                   traffic={"rates": [20, 40], "duration_seconds": .2},
                   limits=Limits(min_samples=2))
     return RunConfig(**(values | kwargs))
+
+
+def load_config(*, rate=40, duration=.1, finish=.2, criteria=None, **updates):
+    settings = {
+        "profile": {size: {"input_tokens": n, "output_tokens": cap} for size, n, cap in
+                    [("short", 64, 8), ("medium", 96, 16), ("long", 128, 32)]},
+        "workloads": {"combinations": {"selected": ["short_short"]}},
+        "patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True}, "rates": [rate]},
+        "schedule": {"duration_seconds": 1, "finish_seconds": finish},
+        "pass_criteria": {"max_completion_ms": 1000, "min_valid_responses": 2, **(criteria or {})},
+    }
+    configured = config(**({"checks": ["load"], "load_test": settings} | updates))
+    configured.load_test.schedule.duration_seconds = duration
+    return configured
+
+
+def load_point(report, target="service", index=0):
+    return check(report, "load", target).metrics["points"][index]
+
+
+def load_group(report, target="service", index=0):
+    return load_point(report, target, index)["groups"][0]
 
 
 async def test_overlap_verdict_explains_plain_reason_and_rerun_settings(client):
@@ -246,7 +268,7 @@ async def test_dead_endpoint_keeps_verdicts_and_reports_connection_cause(client,
     assert report.overall == "fail"
     expected = "Could not connect to http://localhost:1234 (ConnectError); no checks could run"
     assert report.observations["summary"] == expected
-    assert expected in next(c for c in report.checks if c.id == "capacity").summary
+    assert expected in next(c for c in report.checks if c.id == "load").summary
     assert next(c for c in report.checks if c.id == "access").status == "blocked"
 
 
@@ -284,20 +306,21 @@ async def test_wrong_answer_summary_has_expected_and_received(client):
 
 async def test_all_unfinished_default_verdicts_offer_a_remedy(client):
     report = await runner.run_suite(config(checks=RunConfig.model_fields["checks"].get_default(call_default_factory=True),
-        max_requests=1, concurrency=4, max_duration_seconds=300))
+        max_requests=32, concurrency=4, max_duration_seconds=.01))
     unfinished = [check for check in report.checks if check.status in {"fail", "inconclusive"}]
-    assert any(check.id == "concurrency" for check in unfinished)
+    assert any(check.id == "load" for check in unfinished)
     assert all("To conclude," in check.summary for check in unfinished), [(check.id, check.summary) for check in unfinished]
 
 
 
 
-async def test_capacity_guidance_uses_duration_and_real_sample_gate(client):
-    report = await runner.run_suite(config(checks=["capacity"], limits=Limits(min_samples=5, latency_ms=100)))
-    check = next(c for c in report.checks if c.id == "capacity")
-    assert check.status == "inconclusive"
-    assert "traffic.duration_seconds of at least 0.25 seconds per rate" in check.summary
-    assert "at least 5 scored completions" in check.summary
+async def test_load_minimum_valid_gate_preserves_duration_window(client):
+    report = await runner.run_suite(load_config(criteria={"min_valid_responses": 5}))
+    group = load_group(report)
+    assert group["valid"] == 4
+    assert group["status"] == "inconclusive"
+    assert check(report, "load").metrics["highest_accepted"] == []
+    assert not load_point(report)["cut_short"]
 
 
 
@@ -354,7 +377,7 @@ def check(report, id, target="service"):
 
 @pytest.mark.parametrize("selected,allowed", [
     ("correctness", {"correctness_c2"}), ("generation", {"initial", "generation"}),
-    ("json", {"json_c2"}), ("capacity", {"traffic_stage_0", "traffic_stage_1"}),
+    ("json", {"json_c2"}),
     ("gpu", set()),
 ])
 async def test_selected_check_runs_only_its_workload(selected, allowed):
@@ -413,17 +436,16 @@ async def test_access_timeout_override_is_used(client):
     assert not report.requests[0].valid and report.requests[0].elapsed_ms < 20
 
 
-async def test_local_drops_consume_budget_but_admitted_requests_drain(client):
+async def test_load_local_drops_consume_budget_and_admitted_requests_drain(client):
     client.delay = .12
-    report = await runner.run_suite(config(checks=["capacity"], max_requests=3, concurrency=1,
-                                          traffic={"rates": [100], "duration_seconds": .1},
-                                          limits=Limits(latency_ms=1000, min_samples=2)))
-    stage = check(report, "capacity").metrics["traffic_stages"][0]
+    report = await runner.run_suite(load_config(rate=100, max_requests=3, concurrency=1,
+                                               request_source="request_pack", request_pack={"version": 1, "cases": [
+        {"fixture_id": "one", "messages": [{"role": "user", "content": "A"}], "scorer": "exact", "expected": "A"}]}))
+    group = load_group(report)
     assert report.observations["request_budget_used"] == 3
-    assert stage["scheduled"] == 10
-    assert stage["started"] == stage["completed"] == 1
-    assert stage["dropped_local"] == 2 and stage["not_offered"] == 7
-    assert stage["good_fraction"] == .1 and not stage["accepted"]
+    assert group["scheduled"] == 10 and group["dispatched"] == group["valid"] == 1
+    assert group["local_drops"] == 2 and group["not_offered"] == 7
+    assert group["status"] == "inconclusive"
     assert report.requests[0].status == "completed" and client.active == 0
 
 
@@ -501,7 +523,7 @@ async def test_shared_request_concurrency_budget_and_replica_separation(client):
     assert report.overall == "inconclusive" and "request budget" in report.abort_reason
     assert all(check(report, "serving", name).status == "inconclusive" for name in ("service", "replica"))
     assert max(e["attempted"] for e in events) == 5
-    assert len(report.checks) == 24
+    assert len(report.checks) == 22
     assert all(row["other_replicas"] == "unverified" for row in report.observations["replica_coverage"])
 
 
@@ -614,10 +636,7 @@ async def test_context_sizing_uses_actual_usage_and_records_reproduction(checks)
     calibration = result.metrics["calibration"]
     assert calibration["fixture_context_limit"] > 512
     assert len({r.fixture_id for r in report.requests if r.scenario == "context"}) == 6
-    if "capacity" in checks:
-        assert not any(r.scenario == "context_calibration" for r in report.requests)
-        source = next(r for r in report.requests if r.id == calibration["source_request_id"])
-        assert source.traffic_class == "long_input"
+    assert any(r.scenario == "context_calibration" for r in report.requests)
 
 
 async def test_context_without_token_usage_never_claims_declared_limit(client):
@@ -697,7 +716,7 @@ async def test_context_correction_does_not_erase_an_earlier_wrong_answer(client,
     assert result.metrics["correct"] < result.metrics["scored"]
 
 
-@pytest.mark.parametrize("check_id", ["capacity", "cancellation", "recovery"])
+@pytest.mark.parametrize("check_id", ["cancellation", "recovery"])
 async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
     client, monkeypatch, check_id,
 ):
@@ -803,22 +822,18 @@ async def test_sustained_timing_is_observational_when_recovery_is_fast(client):
     assert result.metrics["sustained"]["p95_ms"] == 500
 
 
-async def test_capacity_missing_configured_token_rate_is_inconclusive(client, monkeypatch):
+async def test_load_missing_generation_speed_evidence_is_inconclusive(client, monkeypatch):
     original = client.execute
-
-    async def no_usage(self, *args, **kwargs):
-        result = await original(self, *args, **kwargs)
-        result.output_tokens = None
-        return result
-
+    async def no_usage(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        record.output_tokens = None
+        return record
     monkeypatch.setattr(client, "execute", no_usage)
-    report = await runner.run_suite(config(checks=["capacity"],
-                                          limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
-    result = check(report, "capacity")
-    assert result.status == "inconclusive"
-    assert result.metrics["highest_acceptable_rate_rps"] is None
-    stage = result.metrics["traffic_stages"][1]
-    assert stage["missing_timing"] == stage["completed"] == 8
+    report = await runner.run_suite(load_config(criteria={"min_generation_tokens_per_second": 1}))
+    group = load_group(report)
+    assert group["status"] == check(report, "load").status == "inconclusive"
+    assert group["missing_timing"]
+    assert check(report, "load").metrics["highest_accepted"] == []
 
 
 async def test_nonstreaming_cannot_pass_a_stream_gap_limit():
@@ -1002,49 +1017,33 @@ async def test_nonstreaming_recovery_cannot_pass_configured_gap_limit():
 
 
 
-@pytest.mark.parametrize("scenario,check_id", [("traffic_stage_1", "capacity")])
-async def test_mixed_and_capacity_semantic_failures_are_not_acceptable_load(
-        client, monkeypatch, scenario, check_id):
+async def test_load_semantic_failures_are_not_acceptable(client, monkeypatch):
     original = client.execute
-
     async def wrong_answer(self, spec, **kwargs):
-        result = await original(self, spec, **kwargs)
-        if spec.scenario == scenario:
-            result.output = "incorrect known answer"
-        return result
-
+        record = await original(self, spec, **kwargs)
+        if (spec.load_point or {}).get("point_id"):
+            record.output = "incorrect known answer"
+        return record
     monkeypatch.setattr(client, "execute", wrong_answer)
-    report = await runner.run_suite(config(checks=[check_id], limits=Limits(
-        latency_ms=1000, fairness_max_ratio=10, min_samples=2)))
-    result = check(report, check_id)
-    assert result.status == report.overall == "fail"
-    if check_id == "capacity":
-        assert result.metrics["highest_acceptable_rate_rps"] == 20
-        assert result.metrics["traffic_stages"][1]["correctness"] == 0
-    else:
-        assert result.metrics["accuracy"] == pytest.approx(2/3)
+    report = await runner.run_suite(load_config())
+    group = load_group(report)
+    assert group["correct"] == 0 and group["scored"] > 0
+    assert group["status"] == check(report, "load").status == report.overall == "fail"
+    assert check(report, "load").metrics["highest_accepted"] == []
 
 
-@pytest.mark.parametrize("check_id", ["capacity"])
-async def test_unscored_valid_load_is_inconclusive(monkeypatch, check_id):
+async def test_load_unscored_valid_answers_remain_inconclusive(monkeypatch):
     original = runner.score_response
-
     def omit_score(spec, record):
-        result = original(spec, record)
-        if spec.scenario in {"traffic_stage_1", "fairness_long"}:
-            result.score = None
-        return result
-
+        record = original(spec, record)
+        if (spec.load_point or {}).get("point_id"):
+            record.score = None
+        return record
     monkeypatch.setattr(runner, "score_response", omit_score)
-    report = await runner.run_suite(config(checks=[check_id], limits=Limits(
-        latency_ms=1000, fairness_max_ratio=10, min_samples=2)))
-    result = check(report, check_id)
-    assert result.status == report.overall == "inconclusive"
-    if check_id == "capacity":
-        assert result.metrics["highest_acceptable_rate_rps"] == 20
-        assert result.metrics["traffic_stages"][1]["unscored_completions"] == 8
-    else:
-        assert result.metrics["unscored_completions"] == 2
+    report = await runner.run_suite(load_config())
+    group = load_group(report)
+    assert group["unscored"] == group["valid"] == 4
+    assert group["status"] == "inconclusive" and group["failed"] == 0
 
 
 async def test_output_cap_includes_reported_reasoning_tokens(client, monkeypatch):
@@ -1063,7 +1062,7 @@ async def test_output_cap_includes_reported_reasoning_tokens(client, monkeypatch
     assert len(result.metrics["output_cap_violations"]) == 1
 
 
-@pytest.mark.parametrize("check_id", ["first_output", "generation", "capacity", "recovery"])
+@pytest.mark.parametrize("check_id", ["first_output", "generation", "recovery"])
 async def test_generator_saturation_makes_timing_violation_inconclusive(monkeypatch, check_id):
     original = runner._Run.monitor
 
@@ -1180,7 +1179,7 @@ async def test_client_dispatch_anchor_excludes_slow_progress_callback(monkeypatc
     assert all("_timing_started_monotonic" not in r.model_dump() for r in report.requests)
 
 
-@pytest.mark.parametrize("check_id", ["capacity", "recovery"])
+@pytest.mark.parametrize("check_id", ["recovery"])
 async def test_generator_saturation_does_not_hide_known_answer_failure(client, monkeypatch, check_id):
     client.bad_target = "service"
     original = runner._Run.monitor
@@ -1266,50 +1265,42 @@ async def test_gpu_freshness_override_survives_shared_telemetry_collection(monke
     assert strict.observations["targets"]["service"]["serving_telemetry"]["snapshots"]
 
 
-async def test_capacity_and_opt_in_arrivals_share_budget_and_keep_distinct_reports():
-    report = await runner.run_suite(config(
-        checks=["capacity", "arrivals"],
-        traffic={"rates": [20], "duration_seconds": .1},
-        arrivals={"requests": 2, "requests_per_second": 100},
-    ))
-    assert {record.scenario for record in report.requests} == {"traffic_stage_0", "arrival"}
-    assert check(report, "capacity").metrics["traffic_stages"]
-    assert check(report, "arrivals").metrics["attempted"] == 2
-    assert report.manifest["workload_selection"]["arrivals"] == "selected"
-    assert report.manifest["effective_traffic"]["rates"] == [20]
-    assert report.manifest["fixture_pack"]["workload_fixture_sha256"]
+async def test_legacy_capacity_and_arrivals_migrate_to_separate_load_points():
+    report = await runner.run_suite(config(checks=["capacity", "arrivals"], max_duration_seconds=.15,
+        traffic={"rates": [20], "duration_seconds": .1}, arrivals={"requests": 2, "requests_per_second": 100}))
+    points = check(report, "load").metrics["points"]
+    assert len({point["source"] for point in points}) == 2
+    assert {point["rate"] for point in points} == {20, 100}
+    assert report.manifest["config"]["checks"] == ["load"]
     assert report.observations["request_budget_used"] == len(report.requests)
 
 
-async def test_saved_inactive_workload_drafts_do_not_change_executed_fixture_identity():
-    baseline = await runner.run_suite(config(checks=["capacity"]))
-    changed = await runner.run_suite(config(checks=["capacity"], sessions={"sessions": 3},
-        forced_tool_diagnostic=True))
+async def test_saved_inactive_drafts_do_not_change_load_fixture_identity():
+    baseline = await runner.run_suite(load_config())
+    changed = await runner.run_suite(load_config(sessions={"sessions": 3}, forced_tool_diagnostic=True))
     assert baseline.manifest["fixture_pack"] == changed.manifest["fixture_pack"]
     assert changed.manifest["config"]["sessions"]["sessions"] == 3
     assert changed.manifest["config"]["forced_tool_diagnostic"] is True
-    assert {r.scenario for r in changed.requests} == {"traffic_stage_0", "traffic_stage_1"}
 
 
-async def test_selected_workload_changes_executed_fixture_identity():
-    baseline = await runner.run_suite(config(checks=["arrivals"],
-        arrivals={"requests": 2, "requests_per_second": 100}))
-    changed = await runner.run_suite(config(checks=["arrivals"],
-        arrivals={"requests": 3, "requests_per_second": 100}))
-    assert (baseline.manifest["fixture_pack"]["workload_fixture_sha256"]
-            != changed.manifest["fixture_pack"]["workload_fixture_sha256"])
+async def test_selected_load_settings_change_executed_fixture_identity():
+    baseline = await runner.run_suite(load_config(rate=20))
+    changed = await runner.run_suite(load_config(rate=40))
+    assert baseline.manifest["fixture_pack"]["workload_fixture_sha256"] != changed.manifest["fixture_pack"]["workload_fixture_sha256"]
+
+
+def _pack_config(**overrides):
+    return load_config(**({
+        "checks": ["load", "correctness"], "request_source": "request_pack",
+        "request_pack": {"version": 1, "cases": [
+            {"fixture_id": key, "messages": [{"role": "user", "content": key}],
+             "scorer": "exact", "expected": key} for key in ("alpha", "beta")]},
+        "limits": Limits(latency_ms=1000, min_samples=2),
+    } | overrides))
 
 
 def pack_config(**overrides):
-    return config(**({
-        "checks": ["capacity", "correctness"], "request_source": "request_pack",
-        "request_pack": {"version": 1, "cases": [
-            {"fixture_id": key, "messages": [{"role": "user", "content": key}],
-             "scorer": "exact", "expected": key} for key in ("alpha", "beta")
-        ]},
-        "traffic": {"rates": [40], "duration_seconds": .1},
-        "limits": Limits(latency_ms=1000, min_samples=2),
-    } | overrides))
+    return _pack_config(**({"duration": 1} | overrides))
 
 
 async def test_pack_control_is_serial_and_reused_for_correctness(client, monkeypatch):
@@ -1321,40 +1312,35 @@ async def test_pack_control_is_serial_and_reused_for_correctness(client, monkeyp
         return await execute(self, spec, **kwargs)
 
     monkeypatch.setattr(client, "execute", capture)
-    report = await runner.run_suite(pack_config(max_output_tokens=7))
+    report = await runner.run_suite(_pack_config(max_output_tokens=7))
     quiet = [r for r in report.requests if r.scenario == "pack_control"]
-    loaded = [r for r in report.requests if r.traffic_stage is not None]
+    loaded = [r for r in report.requests if (r.load_point or {}).get("point_id")]
     assert len(quiet) == 2 and len(loaded) == 4
     assert all(r.overlap == 1 for r in quiet)
     assert all(r.requested_max_tokens == 7 for r in quiet + loaded)
     assert check(report, "correctness").metrics["attempted"] == 6
-    assert check(report, "capacity").metrics["request_pack"]["control_status"] == "pass"
+    assert check(report, "correctness").metrics["request_pack"]["control_status"] == "pass"
     assert report.manifest["request_pack"]
     assert {r.fixture_id for r in report.requests} == {"pack:alpha", "pack:beta"}
 
 
 async def test_quiet_wrong_answer_does_not_filter_pack_or_stop_load(client, monkeypatch):
     execute = client.execute
-
     async def quiet_wrong(self, spec, **kwargs):
         record = await execute(self, spec, **kwargs)
         if spec.scenario == "pack_control" and spec.fixture_id == "pack:alpha":
             record.output = "wrong"
         return record
-
     monkeypatch.setattr(client, "execute", quiet_wrong)
-    report = await runner.run_suite(pack_config(stop_after_errors=1))
-    result = check(report, "capacity")
-    assert result.status == "fail"
-    assert result.metrics["traffic_stages"][0]["accepted"]
-    assert result.metrics["highest_acceptable_rate_rps"] == 40
-    assert result.metrics["request_pack"]["control_status"] == "fail"
-    assert result.metrics["traffic_stages"][0]["case_counts"]["alpha"]["correct"] == 2
+    report = await runner.run_suite(_pack_config(stop_after_errors=1))
+    assert check(report, "correctness").status == "fail"
+    assert load_group(report)["correct"] == load_group(report)["scored"] == 4
+    assert check(report, "correctness").metrics["request_pack"]["control_status"] == "fail"
     assert report.abort_reason is None
 
 
 async def test_correctness_only_pack_uses_quiet_and_concurrent_pass_and_case_coverage_floor():
-    report = await runner.run_suite(pack_config(checks=["correctness"], samples=20,
+    report = await runner.run_suite(_pack_config(checks=["correctness"], samples=20,
                                                limits=Limits(min_samples=5)))
     result = check(report, "correctness")
     assert len(report.requests) == 4 and result.status == "pass"
@@ -1362,44 +1348,35 @@ async def test_correctness_only_pack_uses_quiet_and_concurrent_pass_and_case_cov
     assert result.metrics["request_pack"]["coverage_complete"]
 
 
-async def test_pack_quiet_budget_shortfall_prevents_capacity_claim():
-    report = await runner.run_suite(pack_config(max_requests=1))
-    result = check(report, "capacity")
-    assert result.status == "inconclusive"
-    assert result.metrics["highest_acceptable_rate_rps"] is None
-    assert not result.metrics["request_pack"]["coverage_complete"]
-    assert "every request-pack case" in result.summary
-    assert "--samples" not in result.summary
+async def test_pack_quiet_budget_shortfall_prevents_acceptable_load_claim():
+    report = await runner.run_suite(_pack_config(max_requests=1))
+    assert check(report, "load").status == "inconclusive"
+    assert check(report, "load").metrics["highest_accepted"] == []
+    assert not check(report, "correctness").metrics["request_pack"]["coverage_complete"]
 
 
 @pytest.mark.parametrize("scorer", ["exact", "none"])
 async def test_rare_case_missing_loaded_evidence_blocks_full_pack_claim(scorer):
-    configured = pack_config()
-    cases = configured.request_pack.model_dump(mode="json")["cases"]
+    cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
     cases[0]["weight"], cases[1]["weight"] = 99, 1
     cases[1]["scorer"] = scorer
     if scorer == "none":
         cases[1]["expected"] = None
-    configured = pack_config(request_pack={"version": 1, "cases": cases},
-                             traffic={"rates": [20], "duration_seconds": .1})
-    result = check(await runner.run_suite(configured), "capacity")
-    stage = result.metrics["traffic_stages"][0]
-    assert result.status == "inconclusive" and result.metrics["highest_acceptable_rate_rps"] is None
-    assert stage["case_counts"]["beta"]["planned"] == 0
-    assert not stage["coverage_complete"]
-    assert stage["all_cases_scored"] is (scorer != "none")
+    report = await runner.run_suite(_pack_config(request_pack={"version": 1, "cases": cases}))
+    group = load_group(report)
+    assert group["case_coverage"]["beta"] == 0
+    assert check(report, "load").status == "inconclusive"
+    assert check(report, "load").metrics["highest_accepted"] == []
 
 
-async def test_pack_capacity_missing_stream_gap_timing_stays_inconclusive():
-    report = await runner.run_suite(pack_config(stream=False,
-        limits=Limits(latency_ms=1000, stream_gap_ms=100, min_samples=2)))
-    result = check(report, "capacity")
-    assert result.status == "inconclusive"
-    assert result.metrics["traffic_stages"][0]["missing_timing"] == 4
+async def test_pack_load_missing_stream_gap_timing_stays_inconclusive():
+    report = await runner.run_suite(_pack_config(stream=False, criteria={"max_stream_pause_ms": 100}))
+    assert check(report, "load").status == "inconclusive"
+    assert load_group(report)["missing_timing"]
 
 
 async def test_pack_config_is_frozen_before_progress_can_mutate_caller():
-    configured = pack_config()
+    configured = _pack_config()
 
     def mutate(event):
         if event["event"] == "run_started":
@@ -1411,19 +1388,19 @@ async def test_pack_config_is_frozen_before_progress_can_mutate_caller():
     assert all(record.score for record in report.requests)
 
 
-async def test_pack_target_quotas_include_quiet_and_loaded_requests():
+async def test_pack_target_quotas_include_quiet_and_load_requests():
     targets = [Target(name=name, model="local", url="http://localhost:1234") for name in ("one", "two")]
-    report = await runner.run_suite(pack_config(targets=targets, max_requests=8))
+    report = await runner.run_suite(_pack_config(targets=targets, max_requests=8))
     for target in ("one", "two"):
-        records = [record for record in report.requests if record.target == target]
+        records = [r for r in report.requests if r.target == target]
         assert len(records) == 4
-        assert sum(record.scenario == "pack_control" for record in records) == 2
-        stage = check(report, "capacity", target).metrics["traffic_stages"][0]
-        assert stage["started"] == stage["not_offered"] == 2
+        assert sum(r.scenario == "pack_control" for r in records) == 2
+        group = load_group(report, target)
+        assert group["dispatched"] == group["not_offered"] == 2
 
 
 def judged_pack_config(**overrides):
-    return pack_config(**({
+    return _pack_config(**({
         "request_pack": {"version": 1, "cases": [
             {"fixture_id": "reference", "messages": [{"role": "user", "content": "Refund window?"}],
              "scorer": "judge", "expected": "Within 30 days."},
@@ -1486,12 +1463,12 @@ async def test_judging_waits_for_every_target_telemetry_and_monitor(client, monk
     assert report.observations["judging"]["duration_seconds"] == .12
     assert report.observations["generator_max_lag_ms"] < 100
     for target in ("one", "two"):
-        result = check(report, "capacity", target)
-        stage = result.metrics["traffic_stages"][0]
+        result = check(report, "load", target)
+        stage = load_group(report, target)
         assert result.status == "fail" and stage["status"] == "fail"
-        assert stage["case_counts"]["reference"]["scored"] == 4
-        assert stage["case_counts"]["reference"]["correct"] == 0
-        assert stage["scored_subset_correct_goodput_rps"] == 0 < stage["valid_throughput_rps"]
+        assert stage["scored"] == 4
+        assert stage["correct"] == 0
+        assert stage["correct_work_per_second"] == 0 < stage["completed_requests_per_second"]
         assert check(report, "correctness", target).status == "fail"
     kinds = [event["event"] for event in events]
     assert max(i for i, kind in enumerate(kinds) if kind == "request_completed") < kinds.index("judging_started")
@@ -1505,13 +1482,13 @@ async def test_missing_judgments_do_not_become_serving_errors(monkeypatch):
         return judge_summary(records, stopped="phase_deadline")
 
     monkeypatch.setattr(judging, "judge_records", evaluate)
-    report = await runner.run_suite(judged_pack_config(checks=["capacity", "correctness", "serving"]))
+    report = await runner.run_suite(judged_pack_config(checks=["load", "correctness", "serving"]))
     assert check(report, "serving").status == "pass"
     assert check(report, "correctness").status == "inconclusive"
-    result = check(report, "capacity")
-    assert result.status == "inconclusive" and result.metrics["highest_acceptable_rate_rps"] is None
-    assert result.metrics["traffic_stages"][0]["error_rate"] == 0
-    assert not result.metrics["traffic_stages"][0]["accepted"]
+    result = check(report, "load")
+    assert result.status == "inconclusive" and result.metrics["highest_accepted"] == []
+    assert load_group(report)["failed"] == load_group(report)["timed_out"] == 0
+    assert load_group(report)["status"] == "inconclusive"
     assert report.abort_reason is None and all(record.valid for record in report.requests)
 
 
@@ -1578,11 +1555,11 @@ async def test_cancelling_evaluation_preserves_partial_report(monkeypatch, exter
     assert report.observations["judging"]["scored_requests"] == 1
     assert report.observations["judging"]["inconclusive_requests"] == 4
     assert check(report, "correctness").status == "inconclusive"
-    assert not check(report, "capacity").metrics["traffic_stages"][0]["accepted"]
+    assert check(report, "load").metrics["highest_accepted"] == []
 
 
 @pytest.mark.parametrize("wrong_answers,expected_status", [(1, "inconclusive"), (3, "fail")])
-async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure(
+async def test_load_partial_judgments_use_scorable_denominator_despite_client_delay(
     monkeypatch, wrong_answers, expected_status,
 ):
     from giraffe import judging
@@ -1595,7 +1572,7 @@ async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure
         await original(self, tasks)
 
     async def evaluate(config, records, specs, **kwargs):
-        loaded = [record for record in records if record.traffic_stage is not None]
+        loaded = [record for record in records if bool(record.load_point)]
         for record in records:
             if record.scenario == "pack_control":
                 record.score = True
@@ -1607,15 +1584,15 @@ async def test_saturated_capacity_preserves_only_proven_partial_judgment_failure
     monkeypatch.setattr(runner._Run, "monitor", saturated)
     monkeypatch.setattr(judging, "judge_records", evaluate)
     report = await runner.run_suite(judged_pack_config(
-        traffic={"rates": [100], "duration_seconds": .1},
+        rate=100, criteria={"max_completion_ms": 1, "min_correct_percent": 80},
         limits=Limits(latency_ms=1, min_correctness=.8, min_samples=2),
     ))
-    result = check(report, "capacity")
-    stage = result.metrics["traffic_stages"][0]
-    assert stage["completed"] == 10 and stage["scored"] == 1 + wrong_answers
-    assert stage["timing_violations"] and stage["generator_limited"]
-    assert stage["status"] == result.status == expected_status
-    assert result.metrics["highest_acceptable_rate_rps"] is None
+    result = check(report, "load")
+    stage = load_group(report)
+    assert stage["valid"] == 10 and stage["scored"] == 1 + wrong_answers
+    assert stage["unattributed_timing_violations"] and stage["unscored"] == 9 - wrong_answers
+    assert stage["status"] == result.status == "fail"
+    assert result.metrics["highest_accepted"] == []
 
 
 async def test_recursive_schema_does_not_abort_remaining_examples(client):
@@ -1869,15 +1846,16 @@ async def test_silence_policy_cancels_capacity_drain_even_after_offer_budget_is_
 
     mock_inference_transport(monkeypatch, handler)
     started = time.monotonic()
-    report = await runner.run_suite(config(checks=["capacity"], max_requests=8,
-        traffic={"rates": [500], "duration_seconds": .1, "drain_timeout_seconds": 1},
+    report = await runner.run_suite(load_config(max_requests=8, rate=500, finish=1,
+        request_source="request_pack", request_pack={"version": 1, "cases": [{"fixture_id": "one",
+            "messages": [{"role": "user", "content": "42"}], "scorer": "exact", "expected": "42"}]},
         unresponsive_after_failures=2, unresponsive_for_seconds=.025))
     assert time.monotonic() - started < .5
     assert active == 0 and report.abort_reason.startswith("Endpoint service unresponsive:")
     assert any(r.status == "cancelled" for r in report.requests)
     assert all(r.score is None for r in report.requests)
-    assert check(report, "capacity").status != "pass"
-    stage = report.observations["targets"]["service"]["capacity"][0]
+    assert check(report, "load").status != "pass"
+    stage = load_point(report)
     assert stage["status"] != "pass"
 
 
@@ -1931,8 +1909,10 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
 @pytest.mark.parametrize("phase,settings", [
     ("initial", {}), ("warm", {}), ("context_calibration", {"checks": ["context"]}),
     ("session_", {"checks": ["sessions"], "context_limit": 4096}),
-    ("traffic_stage_", {"checks": ["capacity"], "traffic": {"rates": [100], "duration_seconds": .1,
-                                                           "drain_timeout_seconds": 1}}),
+    ("load_primary_", {"checks": ["load"], "load_test": {
+        "workloads": {"combinations": {"selected": ["short_short"]}},
+        "patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True}, "rates": [100]},
+        "schedule": {"duration_seconds": 1, "finish_seconds": 1}}}),
 ])
 async def test_run_deadline_bounds_each_target_traffic_phase(client, monkeypatch, phase, settings):
     original = client.execute
@@ -2146,9 +2126,10 @@ async def test_target_outage_cancels_only_its_capacity_requests(monkeypatch, ove
 
     mock_inference_transport(monkeypatch, handler)
     targets = [Target(name=name, model="test", url="http://" + name) for name in ("silent", "healthy")]
-    report = await runner.run_suite(config(targets=targets, overlap_models=overlap, stream=False,
-        checks=["capacity"], concurrency=4, max_requests=100, stop_after_errors=100,
-        traffic={"rates": [100], "duration_seconds": .15, "drain_timeout_seconds": 1},
+    report = await runner.run_suite(load_config(targets=targets, overlap_models=overlap, stream=False,
+        concurrency=4, max_requests=100, stop_after_errors=100, rate=100, duration=.15, finish=1,
+        request_source="request_pack", request_pack={"version": 1, "cases": [{"fixture_id": "one",
+            "messages": [{"role": "user", "content": "42"}], "scorer": "exact", "expected": "42"}]},
         unresponsive_after_failures=2, unresponsive_for_seconds=.04))
     assert report.abort_reason is None and list(report.observations["target_abort_reasons"]) == ["silent"]
     assert streams and all(stream.closed for stream in streams)
@@ -2194,7 +2175,7 @@ async def test_serving_transport_diagnostics_do_not_classify_requests_as_workloa
 
     mock_inference_transport(monkeypatch, handler)
     report = await runner.run_suite(config(checks=["serving"], stream=stream,
-        arrivals={}, prefix={}, buckets={}, sessions={}, consistency={}, tool_calling=True))
+        arrivals={}, prefix={}, concurrent_load={}, sessions={}, consistency={}, tool_calling=True))
     assert {r.scenario for r in report.requests} == {"initial", "warm"}
     assert all(r.valid for r in report.requests)
     assert not any(r.workload for r in report.requests)
@@ -2205,11 +2186,11 @@ async def test_serving_transport_diagnostics_do_not_classify_requests_as_workloa
 
 
 async def test_dropped_offer_progress_survives_traffic_into_judging(client, monkeypatch):
-    from giraffe import judging, traffic
+    from giraffe import judging, load_test
 
     client.delay = .03
-    schedule = [(0, "short"), (.001, "short"), (.002, "short")]
-    monkeypatch.setattr(traffic, "arrival_schedule", lambda *_: (schedule, False))
+    schedule = [{"offset_seconds": offset, "shape": "short_short", "origin": "constant", "burst_index": None} for offset in [0, .001, .002]]
+    monkeypatch.setattr(load_test, "planned_arrivals", lambda *_: (schedule, False))
 
     async def evaluate(config, records, specs, *, stop_event=None, progress=None):
         progress({"event": "judging_started", "judge_calls_total": len(records)})
@@ -2221,13 +2202,13 @@ async def test_dropped_offer_progress_survives_traffic_into_judging(client, monk
     monkeypatch.setattr(judging, "judge_records", evaluate)
     events = []
     result = await runner.run_suite(judged_pack_config(
-        concurrency=1, traffic={"rates": [100], "duration_seconds": .04},
+        concurrency=1, rate=100, duration=.04,
     ), progress=events.append)
-    stage = check(result, "capacity").metrics["traffic_stages"][0]
-    assert stage["dropped_local"] == 2
+    stage = load_group(result)
+    assert stage["local_drops"] == 2
     dropped = [event for event in events if event["event"] == "offer_dropped"]
     assert [event["dropped_offers"] for event in dropped] == [1, 2]
-    assert all(event["target"] == "service" and event["scenario"] == "traffic_stage_0"
+    assert all(event["target"] == "service" and event["scenario"] == load_point(result)["id"]
                for event in dropped)
     after_traffic = [event for event in events if event["event"] in {
         "judging_started", "judging_finished", "run_finished",
@@ -2237,3 +2218,29 @@ async def test_dropped_offer_progress_survives_traffic_into_judging(client, monk
         assert event["dropped_offers"] == 2
         assert event["budget_used"] - event["attempted"] == 2
         assert event["attempted"] == event["completed"] == len(result.requests)
+
+
+@pytest.mark.parametrize('wrong_answer,expected', [(False, 'inconclusive'), (True, 'fail')])
+async def test_final_load_client_delay_qualifies_timing_but_preserves_known_answer_failure(
+        client, monkeypatch, wrong_answer, expected):
+    original_execute, original_monitor = client.execute, runner._Run.monitor
+
+    async def response(self, spec, **kwargs):
+        record = await original_execute(self, spec, **kwargs)
+        if wrong_answer and (spec.load_point or {}).get('point_id'):
+            record.output = 'known wrong answer'
+        return record
+
+    async def delayed(self, tasks):
+        self.max_lag_ms = 500
+        self.timing_health.windows.append({'start_ms': 0, 'end_ms': 10000, 'lag_ms': 500})
+        await original_monitor(self, tasks)
+
+    monkeypatch.setattr(client, 'execute', response)
+    monkeypatch.setattr(runner._Run, 'monitor', delayed)
+    report = await runner.run_suite(load_config(criteria={'max_completion_ms': 1}))
+    group = load_group(report)
+    assert group['unattributed_timing_violations']
+    assert group['timing_violations'] == []
+    assert group['status'] == check(report, 'load').status == expected
+    assert check(report, 'load').metrics['highest_accepted'] == []

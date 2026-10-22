@@ -326,7 +326,7 @@ class FakeEndpoint:
                 if mode == "http_error":
                     self._json(503, {"error": {"message": "seeded unavailable response"}})
                     return
-                output = endpoint._answer(prompt)
+                output = endpoint._continue_numbered_list(prompt, endpoint._answer(prompt), payload["max_tokens"])
                 if mode.startswith("logprob_") and payload.get("logprobs"):
                     self._logprobs(payload, mode, output)
                     return
@@ -426,6 +426,17 @@ class FakeEndpoint:
             self._thread.join(timeout=2)
         self._server = None
         self._thread = None
+
+    @staticmethod
+    def _continue_numbered_list(prompt: str, answer: str, budget: int) -> str:
+        # The final token-based workload asks for a label followed by an open
+        # numbered list. Produce more synthetic whitespace tokens than the cap;
+        # the normal response path still performs truncation and usage counting.
+        label = re.search(r"The box label is\s*([A-Z0-9]+)", prompt)
+        if (label and answer == label.group(1)
+                and "then continue a numbered list from 1 to 1000000" in prompt):
+            return " ".join([answer, *(str(number) for number in range(1, budget + 1))])
+        return answer
 
     @staticmethod
     def _answer(prompt: str) -> str:

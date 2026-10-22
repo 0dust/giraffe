@@ -12,17 +12,17 @@ from pathlib import Path
 
 from giraffe.fixtures import final_answer, reasoning_budget
 from giraffe.logprob_workload import corpus_width, refill, sample_count
-from giraffe.overlap import NEEDS_STREAM, answer_window, evidenced_overlap, scheduling_delay_windows
+from giraffe.overlap import NEEDS_STREAM, evidenced_overlap, scheduling_delay_windows
 from giraffe.models import INTERNAL_CHECK_NAMES as CHECK_NAMES, CORE_CHECKS, CheckResult, RequestSpec, ToolExpectation
 from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, resolved_tool_fixtures, resolved_tool_modes
 
 # One settings block can drive multiple selectable workloads.
 WORKLOAD_CHECKS = {
-    "arrivals": {"arrivals"}, "prefix": {"prefix"},
+    "prefix": {"prefix"},
     "sessions": {"sessions"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
-    "concurrent_load": {"concurrency"},
+    "load_test": {"load"},
 }
 
 
@@ -30,7 +30,8 @@ WORKLOAD_CHECKS = {
 FIXTURE_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
-def spec(prompt, scenario, check, *, expected=None, max_tokens=24, options=None, **workload):
+def spec(prompt, scenario, check, *, expected=None, max_tokens=24,
+         request_timeout_seconds=None, options=None, **workload):
     return RequestSpec(
         fixture_id=f"{scenario}.v1",
         scenario=scenario,
@@ -40,6 +41,7 @@ def spec(prompt, scenario, check, *, expected=None, max_tokens=24, options=None,
         expected=expected,
         input_chars=len(prompt),
         max_tokens=max_tokens,
+        request_timeout_seconds=request_timeout_seconds,
         options=options or {},
         workload=workload,
     )
@@ -103,124 +105,11 @@ def label_prompt(chars, prefix=""):
     return prefix + label_context(chars, prefix) + LABEL_INSTRUCTION
 
 
-async def arrivals(run, target, client, fixtures):
-    settings = run.config.arrivals
-    base = fixtures["short"][0].model_copy(deep=True)
-    base.scenario, base.check_ids = "arrival", ["arrivals"]
-    base.workload = {"requests_per_second": settings.requests_per_second}
-    run.start_condition(target.name, base.scenario, base.workload, settings.requests)
-    observation = {
-        "planned": settings.requests,
-        "issued": 0,
-        "unissued": [],
-        "clock": "milliseconds since run start; schedule independent of concurrency",
-        "mode": settings.mode,
-        "seed": settings.seed,
-        "max_pending": settings.max_pending,
-    }
-    run.observations[target.name]["arrivals"] = observation
-    start = time.monotonic()
-    pending = set()
-    queued = set()
 
-    async def dispatch(index, request):
-        try:
-            return await run.request(target, client, request, on_start=lambda: queued.discard(index))
-        finally:
-            queued.discard(index)
-
-    try:
-        for index in range(settings.requests):
-            offset = (
-                index / settings.requests_per_second
-                if settings.mode == "steady"
-                else (index // settings.burst_size) * settings.interval_seconds
-            )
-            due = start + offset
-            if not run.allowed(target.name):
-                observation["unissued"].append(
-                    {
-                        "first_index": index,
-                        "count": settings.requests - index,
-                        "reason": run.reason or "target budget reached",
-                    }
-                )
-                break
-            await asyncio.sleep(
-                max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
-            )
-            pending = {task for task in pending if not task.done()}
-            if not run.allowed(target.name):
-                observation["unissued"].append(
-                    {
-                        "first_index": index,
-                        "count": settings.requests - index,
-                        "reason": run.reason or "target budget reached",
-                    }
-                )
-                break
-            if len(queued) >= settings.max_pending:
-                observation["unissued"].append(
-                    {
-                        "index": index,
-                        "scheduled_ms": (due - run.start) * 1000,
-                        "reason": "pending queue full",
-                    }
-                )
-                continue
-            request = base.model_copy(
-                update={
-                    "workload": {
-                        **base.workload,
-                        "arrival_index": index,
-                        "scheduled_ms": (due - run.start) * 1000,
-                        "seed": settings.seed,
-                    }
-                }
-            )
-            queued.add(index)
-            pending.add(asyncio.create_task(dispatch(index, request)))
-            await asyncio.sleep(0)
-        if pending:
-            await asyncio.gather(*pending)
-    finally:
-        for task in pending:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        records = [r for r in run.records if r.target == target.name and r.scenario == "arrival"]
-        observation["issued"] = len(records)
-        # Arrivals have no intentional cancellation: a cancelled one was cut by
-        # the run deadline or a stop and is not evidence that it was served.
-        observation["incomplete"] = sum(r.status == "cancelled" for r in records)
-        missing = (
-            settings.requests
-            - len(records)
-            - sum(row.get("count", 1) for row in observation["unissued"])
-        )
-        if missing > 0:
-            observation["unissued"].append(
-                {"count": missing, "reason": "queued request not dispatched before stop/budget"}
-            )
-        observation["client_wait_threshold_ms"] = settings.max_client_wait_ms
-        observation["delayed"] = sum((r.client_wait_ms or 0) > settings.max_client_wait_ms for r in records)
-        observation["max_client_wait_ms"] = max(
-            (r.client_wait_ms or 0 for r in records), default=None
-        )
-        window = time.monotonic() - start
-        observation["measurement_window_seconds"] = window
-        observation["completed_requests_per_second"] = (
-            sum(r.valid and r.status == "completed" for r in records) / window
-            if window > 0
-            else None
-        )
-        observation["configured_rate_achieved"] = (
-            not observation["unissued"] and not observation["delayed"] and not observation["incomplete"]
-        )
-
-        reasons = list(dict.fromkeys(item["reason"] for item in observation["unissued"]))
-        run.finish_condition(target.name, base.scenario, base.workload,
-            reason=run.condition_reason(target.name, "; ".join(reasons)) if reasons else None)
+async def arrivals(run, target, client, fixtures=None):
+    """Compatibility import; legacy configs are migrated to the unified check."""
+    from giraffe.load_test import execute
+    return await execute(run, target, client)
 
 
 def prefix_admitted(input_chars, max_tokens, context_limit):
@@ -229,7 +118,9 @@ def prefix_admitted(input_chars, max_tokens, context_limit):
 
 
 async def prefixes(run, target, client):
-    from giraffe.runner import _context_rejection, _serving_failure
+    from giraffe.runner import _check_config, _context_rejection, _serving_failure
+
+    config = _check_config(run.config, "prefix")
 
     async def send(request):
         record = await run.request(target, client, request)
@@ -243,7 +134,7 @@ async def prefixes(run, target, client):
             return None
         return record
 
-    settings = run.config.prefix
+    settings = config.prefix
     plans = {"prefix_shared": settings.repeats, "prefix_independent": settings.repeats,
              "prefix_history": settings.history_turns}
     for scenario, count in plans.items():
@@ -267,33 +158,36 @@ async def prefixes(run, target, client):
                     prompt,
                     f"prefix_{kind}",
                     "prefix",
-                    expected="K7P4",
+                    expected="K7P4", max_tokens=min(24, config.max_output_tokens),
+                    request_timeout_seconds=config.request_timeout_seconds,
                     prefix_group=kind,
                     shared_prefix_chars=len(prefix),
                     order=index,
                     cache_state="first unique use is not proof of empty server cache",
                 )
-                if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
+                if not prefix_admitted(request.input_chars, request.max_tokens, config.context_limit):
                     run.unfinished[target.name].add("prefix")
                     run.observations[target.name]["prefix_stop"] = "Estimated token admission ceiling reached."
                     return
-                request.options = deterministic_options(run.config, request.options)
+                request.options = deterministic_options(config, request.options)
                 if not await send(request):
                     return
         history = []
         for turn in range(settings.history_turns):
             prompt = label_prompt(96)
             messages = [*history, {"role": "user", "content": prompt}]
-            request = spec(prompt, "prefix_history", "prefix", expected="K7P4", turn=turn, mode="fixed")
+            request = spec(prompt, "prefix_history", "prefix", expected="K7P4",
+                           max_tokens=min(24, config.max_output_tokens),
+                           request_timeout_seconds=config.request_timeout_seconds, turn=turn, mode="fixed")
             request.messages = messages
             request.input_chars = sum(len(m["content"]) for m in messages)
-            if not prefix_admitted(request.input_chars, request.max_tokens, run.config.context_limit):
+            if not prefix_admitted(request.input_chars, request.max_tokens, config.context_limit):
                 run.unfinished[target.name].add("prefix")
                 run.observations[target.name]["prefix_history_stop"] = (
                     "Estimated token admission ceiling reached; no history cropped."
                 )
                 break
-            request.options = deterministic_options(run.config, request.options)
+            request.options = deterministic_options(config, request.options)
             if not await send(request):
                 break
             history = [*messages, {"role": "assistant", "content": "K7P4"}]
@@ -303,7 +197,10 @@ async def prefixes(run, target, client):
 
 
 async def sessions(run, target, client):
-    settings = run.config.sessions
+    from giraffe.runner import _check_config
+
+    config = _check_config(run.config, "sessions")
+    settings = config.sessions
     mixed = settings.profile == "performance"
     observation = {
         "failure_policy": settings.failure_policy,
@@ -340,7 +237,7 @@ async def sessions(run, target, client):
                 prompt = session_prompt(prompt, turn, value)
             messages = [*history, {"role": "user", "content": prompt}]
             input_chars = sum(len(m["content"]) for m in messages)
-            if input_chars + budget + 32 > run.config.context_limit:
+            if input_chars + budget + 32 > config.context_limit:
                 item["stop_reason"] = (
                     "history admission ceiling reached; required history not cropped"
                 )
@@ -351,6 +248,7 @@ async def sessions(run, target, client):
                 f"session_{mode}_turn{turn}",
                 "sessions",
                 max_tokens=budget,
+                request_timeout_seconds=config.request_timeout_seconds,
                 session_id=session_id,
                 task_type=item["task_type"],
                 turn_id=turn,
@@ -362,7 +260,7 @@ async def sessions(run, target, client):
             request.messages, request.input_chars = messages, input_chars
             if not workload:
                 request.scorer, request.expected = "exact", value
-                request.options = deterministic_options(run.config, request.options)
+                request.options = deterministic_options(config, request.options)
             record = await run.request(target, client, request)
             if record is None:
                 item["stop_reason"] = run.reason or "request budget reached"
@@ -386,7 +284,7 @@ async def sessions(run, target, client):
                 break
             if (
                 record.input_tokens is not None
-                and record.input_tokens + budget > run.config.context_limit
+                and record.input_tokens + budget > config.context_limit
             ):
                 item["stop_reason"] = "observed context budget reached"
                 run.unfinished[target.name].add("sessions")
@@ -435,8 +333,18 @@ async def sessions(run, target, client):
                 reason="dependent turns skipped" if skipped else None)
 
 
+def consistency_output_cap(config):
+    options = config.test_options.get("consistency")
+    if options is not None and options.max_output_tokens is not None:
+        return config.max_output_tokens
+    return min(192, config.max_output_tokens)
+
+
 async def consistency(run, target, client, fixtures):
-    settings = run.config.consistency
+    from giraffe.runner import _check_config
+
+    config = _check_config(run.config, "consistency")
+    settings = config.consistency
     if settings.logprobs is not None:
         from giraffe.logprob_workload import run_logprob_consistency
         await run_logprob_consistency(run, target, client, fixtures)
@@ -454,17 +362,18 @@ async def consistency(run, target, client, fixtures):
                     answer += f" The parcel tag reads R{prompt_index:04d}."
                 context = ""
                 if shape == "long":
-                    context = label_context(max(64, (run.config.context_limit - 256) * 2))
+                    context = label_context(max(64, (config.context_limit - 256) * 2))
                     context += "\nThe background above is context only.\n"
                 prompt = context + f"Copy the following text exactly, with no extra text:\n{answer}"
                 base = spec(prompt, "consistency", "consistency", expected=answer,
-                            max_tokens=min(192, run.config.max_output_tokens),
-                            options=consistency_options(run.config))
+                            max_tokens=consistency_output_cap(config),
+                            request_timeout_seconds=config.request_timeout_seconds,
+                            options=consistency_options(config))
                 for level in dict.fromkeys([1, *settings.levels]):
                     base.scenario = f"consistency_c{level}_{shape}_p{prompt_index}"
                     base.check_ids = ["consistency"]
                     base.workload = {"level": level, "input_bucket": shape, "prompt_index": prompt_index,
-                                     "equality": settings.equality, "temperature": (run.config.request_options | base.options).get("temperature"),
+                                     "equality": settings.equality, "temperature": (config.request_options | base.options).get("temperature"),
                                      "seed": settings.seed, "option_support": "requested; runtime enforcement unverified"}
                     await refill(run, target, client, [base], sample_count(settings.repetitions, level), level, condition_plan=False)
     finally:
@@ -477,11 +386,14 @@ TOOL = default_tool_fixture().tools[0]
 
 
 async def tools(run, target, client):
-    fixtures = resolved_tool_fixtures(run.config)
-    modes = resolved_tool_modes(run.config)
-    custom = bool(run.config.tool_checks and run.config.tool_checks.fixtures)
+    from giraffe.runner import _check_config
+
+    config = _check_config(run.config, "tools")
+    fixtures = resolved_tool_fixtures(config)
+    modes = resolved_tool_modes(config)
+    custom = bool(config.tool_checks and config.tool_checks.fixtures)
     from giraffe.tool_conversations import run_conversation
-    for fixture in run.config.tool_checks.conversations if run.config.tool_checks else []:
+    for fixture in config.tool_checks.conversations if config.tool_checks else []:
         for mode in modes:
             await run_conversation(run, target, client, fixture, mode)
     expectations = {
@@ -490,7 +402,7 @@ async def tools(run, target, client):
             expected_content=fixture.expected_content, choice=fixture.choice)
         for fixture in fixtures
     }
-    for forced in [False, True] if run.config.forced_tool_diagnostic else [False]:
+    for forced in [False, True] if config.forced_tool_diagnostic else [False]:
         for fixture in fixtures:
             if forced and fixture.choice:
                 continue
@@ -507,7 +419,8 @@ async def tools(run, target, client):
                     fixture_id=f"{scenario}.v1", scenario=scenario, check_ids=["tools"],
                     messages=messages, scorer="tool", stream=mode == "stream",
                     input_chars=sum(len(message["content"]) for message in messages),
-                    max_tokens=run.config.max_output_tokens,
+                    max_tokens=config.max_output_tokens,
+                    request_timeout_seconds=config.request_timeout_seconds,
                     options={**fixture.options, "tools": fixture.tools,
                              **({} if fixture.choice else {
                                  "tool_choice": {"type": "function", "function": {
@@ -516,20 +429,20 @@ async def tools(run, target, client):
                     workload={"selection": selection, "capability": "required when selected",
                               "tool_fixture_id": fixture.fixture_id, "mode": mode},
                 )
-                request.options = deterministic_options(run.config, request.options)
+                request.options = deterministic_options(config, request.options)
                 run.start_condition(target.name, scenario, request.workload, planned=1)
+                reason = None
                 try:
                     await run.request(target, client, request)
                 finally:
-                    run.finish_condition(target.name, scenario, request.workload)
+                    run.finish_condition(target.name, scenario, request.workload, reason=reason)
 
 
 async def execute(run, target, client, fixtures):
-    from giraffe.concurrent_load import execute as concurrent_load
+    from giraffe.load_test import execute as load_test
     for field, callback in (
-        ("arrivals", arrivals),
         ("prefix", prefixes),
-        ("concurrent_load", concurrent_load),
+        ("load_test", load_test),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -537,7 +450,7 @@ async def execute(run, target, client, fixtures):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and getattr(run.config, field):
             run.emit("scenario_started", target.name, field)
-            if field != "concurrent_load" and not run.allowed(target.name):
+            if field != "load_test" and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:
@@ -560,7 +473,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if check not in selected:
             continue
         from giraffe.runner import _check_config
-        config = run.config
+        config = _check_config(run.config, check)
         records = [r for r in run.records if r.target == target.name and check in r.check_ids]
         metrics = stats(records)
         quality = run_quality(run, records, target.name, configured_metrics(config.limits, check))
@@ -638,21 +551,21 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             misses = len(observed) - len(verified)
             metrics["cache_reuse_samples"] = len(verified)
             metrics["cache_repeat_misses"] = {"misses": misses, "observed": len(observed),
-                                              "planned": run.config.prefix.repeats - 1}
+                                              "planned": config.prefix.repeats - 1}
             metrics["cache_controls_discriminative"] = bool(controls) and not any(reused(r) for r in controls)
             counts = f"{misses} of {len(observed)} repeat misses."
             if any(reused(r) for r in controls):
                 status, summary = "inconclusive", "cache reporting not discriminative: independent controls also report reuse; " + counts
-            elif len(controls) < minimum or len(controls) != run.config.prefix.repeats:
+            elif len(controls) < minimum or len(controls) != config.prefix.repeats:
                 status, summary = "inconclusive", "cache reuse unverified: missing independent-control cache evidence; " + counts
-            elif misses > (run.config.prefix.repeats - 1) / 2:
+            elif misses > (config.prefix.repeats - 1) / 2:
                 prefix_tokens = [r.input_tokens * r.workload.get("shared_prefix_chars", 0) / max(1, r.input_chars)
                                  for r in observed]
                 if prefix_tokens and max(prefix_tokens) < 512:
                     status, summary = "inconclusive", "Prefix is estimated below 512 tokens; cache misses do not establish failed reuse; " + counts
                 else:
                     status, summary = "fail", "no prefix reuse observed on a majority of repeats; " + counts
-            elif len(observed) < run.config.prefix.repeats - 1:
+            elif len(observed) < config.prefix.repeats - 1:
                 status, summary = "inconclusive", "cache reuse unverified: missing repeated cache/token evidence; " + counts
             elif len(verified) < minimum:
                 status, summary = "inconclusive", "cache reuse unverified: insufficient repeats with substantial reuse; " + counts
@@ -695,20 +608,20 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             completed_sessions = {mode: sum(s["mode"] == mode and not s["stop_reason"]
                 and s["completed_turns"] == s["planned_turns"]
                 for s in (metrics["sessions"] or {}).get("sessions", []))
-                for mode in run.config.sessions.modes}
+                for mode in config.sessions.modes}
             metrics["completed_sessions_per_mode"] = completed_sessions
             if any(count < minimum for count in completed_sessions.values()) and status != "fail":
                 status, summary = "inconclusive", "Insufficient completed independent sessions per mode."
-            metrics["configured_session_concurrency"] = run.config.sessions.concurrency
+            metrics["configured_session_concurrency"] = config.sessions.concurrency
             delays = scheduling_delay_windows(run)
             metrics["evidenced_session_overlap"] = max((evidenced_overlap(r, [other for other in records
                 if other is r or other.workload.get("session_id") != r.workload.get("session_id")], delays)
                 for r in records), default=0)
             metrics["conversation_performance"]["evidenced_overlap"] = metrics["evidenced_session_overlap"]
-            if status != "fail" and (run.config.sessions.concurrency < 2 or metrics["evidenced_session_overlap"] < 2):
+            if status != "fail" and (config.sessions.concurrency < 2 or metrics["evidenced_session_overlap"] < 2):
                 status, summary = "inconclusive", (
                     "Conversations were not observed concurrently: "
-                    + ("session concurrency is below two." if run.config.sessions.concurrency < 2 else
+                    + ("session concurrency is below two." if config.sessions.concurrency < 2 else
                        "no session turn's output overlapped another conversation's output; "
                        + (NEEDS_STREAM if not any(r.stream for r in records) else "client overlap alone does not show server concurrency") + "."))
         if check == "tools":
@@ -775,7 +688,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             else [r for r in records if r.workload.get("selection") in {"automatic", "contract", "conversation"}
                   and not is_discovery_rejection(r)]
         )
-        if check == "consistency" and not run.config.consistency.logprobs:
+        if check == "consistency" and not config.consistency.logprobs:
             comparisons = []
             for name, entry in groups.items():
                 identity = entry["workload"]
@@ -790,16 +703,16 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
                 comparisons.append({"scenario": name, "level": identity["level"],
                                     "level1_modal_hash": modal, "agreement_rate": agreement})
                 if identity["level"] != 1 and agreement is not None and agreement < 1:
-                    if run.config.consistency.strict:
+                    if config.consistency.strict:
                         status, summary = "fail", "Strict cross-level answer consistency violated against level-1 modal answer."
                     elif status == "pass":
                         status, summary = "inconclusive", "Cross-level answer variation observed; enable strict to enforce."
                 if agreement is None and status != "fail":
                     status, summary = "inconclusive", "Missing comparable level-1 answer baseline."
             metrics["cross_level"] = comparisons
-        if check == "consistency" and run.config.consistency.logprobs:
+        if check == "consistency" and config.consistency.logprobs:
             from giraffe.logprob_workload import summarize_logprobs
-            metrics["logprobs"] = summarize_logprobs(records, run.config.consistency, min_samples=minimum)
+            metrics["logprobs"] = summarize_logprobs(records, config.consistency, min_samples=minimum)
             probability_status = metrics["logprobs"]["status"]
             reasons = list(dict.fromkeys(reason for row in metrics["logprobs"]["conditions"] for reason in row["coverage_reasons"]))
             if probability_status == "fail" or (probability_status == "inconclusive" and status == "pass"):
@@ -822,8 +735,8 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             status, summary = "inconclusive", "Too few successful samples for workload acceptance."
         errors = stats([r for r in assessed if not (
             (check == "consistency" and r.logprob_evidence and
-             r.logprob_evidence.status == "rejected" and run.config.consistency.logprobs and
-             run.config.consistency.logprobs.support == "discover")
+             r.logprob_evidence.status == "rejected" and config.consistency.logprobs and
+             config.consistency.logprobs.support == "discover")
             or (r.tool_conversation and r.tool_conversation["status"] == "inconclusive")
             or (check in {"prefix", "sessions", "tools"} and reasoning_budget(r))
             or r.id in prefix_rejected_ids
@@ -890,7 +803,7 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
             )
         if prefix_rejected and status != "fail":
             status, summary = "inconclusive", "Server rejected a Giraffe-built prefix prompt for context length; token admission estimate did not fit."
-        if check == "consistency" and run.config.consistency.logprobs:
+        if check == "consistency" and config.consistency.logprobs:
             probability = metrics["logprobs"]
             if not probability["strict"] and any(
                 row["token_divergences"] or row["top_k_membership_changes"] or

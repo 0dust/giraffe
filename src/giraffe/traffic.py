@@ -19,7 +19,7 @@ from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, Tr
 from .timing import qualify, qualified_violations
 
 
-def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int = 0):
+def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int = 0, *, poisson_unconditioned: bool = False):
     """Return a bounded, reproducible list of (offset seconds, workload class)."""
     arrivals, choices = random.Random(traffic.seed + stage_index), random.Random(
         (traffic.seed + stage_index) ^ 0x6A09E667
@@ -30,6 +30,15 @@ def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int =
     for key in classes:
         total += weights[key]
         cumulative.append(total)
+    if traffic.arrival == "poisson" and poisson_unconditioned:
+        schedule, offset = [], arrivals.expovariate(rate_rps)
+        while offset < traffic.duration_seconds:
+            if len(schedule) >= MAX_PLANNED_ARRIVALS:
+                return schedule, True
+            kind = choices.choices(classes, weights=[weights[k] for k in classes])[0]
+            schedule.append((offset, kind))
+            offset += arrivals.expovariate(rate_rps)
+        return schedule, False
     # Condition Poisson arrivals on N so a seeded draw cannot under-offer a rate.
     count = (round(rate_rps * traffic.duration_seconds) if traffic.arrival == "poisson"
              else math.ceil(rate_rps * traffic.duration_seconds))
@@ -135,6 +144,9 @@ class StageEvidence:
     case_scorers: tuple[tuple[str, str], ...] | None
     stalls: tuple[tuple[float, float], ...] = ()
     arrival: str = "steady"
+    started_monotonic: float | None = None
+    sending_seconds: float | None = None
+    offer_lags_ms: tuple[float | None, ...] = ()
 
 
 async def run_stage(
@@ -154,6 +166,13 @@ async def run_stage(
     active_case_specs: list[RequestSpec] | None = None,
     capture_evidence: Callable[[StageEvidence], None] | None = None,
     on_drop: Callable[[], None] | None = None,
+    schedule_override: list[tuple[float, str]] | None = None,
+    specs_override: list[RequestSpec] | None = None,
+    spec_factory: Callable[[int], RequestSpec] | None = None,
+    check_id: str = "capacity",
+    scenario: str | None = None,
+    run_start: float | None = None,
+    return_evidence: bool = False,
 ) -> dict:
     """Run one stage; callbacks own shared run budgets and global admission slots.
 
@@ -165,12 +184,15 @@ async def run_stage(
     """
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
-    schedule, overflow = arrival_schedule(traffic, rate_rps, stage_index)
+    if schedule_override is None:
+        schedule, overflow = arrival_schedule(traffic, rate_rps, stage_index)
+    else:
+        schedule, overflow = schedule_override, len(schedule_override) > MAX_PLANNED_ARRIVALS
     if case_specs is not None and len(case_specs) != len(schedule):
         raise ValueError("case sequence must match the finite arrival schedule")
-    if case_specs is None and any(not fixtures.get(kind) for _, kind in schedule):
+    if case_specs is None and specs_override is None and spec_factory is None and any(not fixtures.get(kind) for _, kind in schedule):
         raise ValueError("every scheduled traffic class needs a scored fixture")
-    selected_specs = (case_specs if case_specs is not None else [
+    selected_specs = (None if spec_factory is not None else specs_override if specs_override is not None else case_specs if case_specs is not None else [
         fixtures[kind][index % len(fixtures[kind])] for index, (_, kind) in enumerate(schedule)
     ])
     if case_specs is not None:
@@ -178,6 +200,8 @@ async def run_stage(
                     for (offset, _), spec in zip(schedule, selected_specs, strict=True)]
     started_at = time.monotonic()
     stage_end = started_at + traffic.duration_seconds
+    sending_finished_at = None
+    offer_lags_ms = [None] * len(schedule)
     outcomes = ["not_offered"] * len(schedule)
     dropped_indices: set[int] = set()
     records: list[tuple[int, RequestRecord]] = []
@@ -225,14 +249,17 @@ async def run_stage(
         nonlocal execution_errors
         dispatched = time.monotonic()
         lag_ms = max(0.0, (dispatched - started_at - offset) * 1000)
+        offer_lags_ms[index] = lag_ms
         if missed_arrival(offset, dispatched):
             drop(index, "dropped_late")
             return
         outcomes[index] = "started"
         try:
-            spec = selected_specs[index].model_copy(update={
-                "scenario": f"traffic_stage_{stage_index}", "check_ids": ["capacity"],
+            spec = (spec_factory(index) if spec_factory is not None else selected_specs[index]).model_copy(update={
+                "scenario": scenario or f"traffic_stage_{stage_index}", "check_ids": [check_id],
             })
+            if run_start is not None:
+                spec.workload = {**spec.workload, "scheduled_ms": (started_at - run_start + offset) * 1000}
             record = await execute(spec)
             if record is None:
                 drop(index, "not_offered")
@@ -241,6 +268,10 @@ async def run_stage(
             record.traffic_rate_rps = rate_rps
             record.traffic_class = kind
             record.scheduled_offset_ms = offset * 1000
+            if run_start is not None and record.scheduled_ms is not None:
+                clock_start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
+                if clock_start is not None:
+                    lag_ms = max(lag_ms, clock_start-record.scheduled_ms)
             record.dispatch_lag_ms = lag_ms
             record.arrival_first_output_ms = (lag_ms + record.first_output_ms
                                                if record.first_output_ms is not None else None)
@@ -274,6 +305,7 @@ async def run_stage(
                     interrupted = True
                     break
                 now = time.monotonic()
+                offer_lags_ms[index] = max(0, (now - started_at - offset) * 1000)
                 if missed_arrival(offset, now):
                     drop(index, "dropped_late")
                     continue
@@ -294,7 +326,8 @@ async def run_stage(
                     reasons.append(reason)
                     interrupted = True
 
-        drain_deadline = min(deadline, time.monotonic() + traffic.drain_timeout_seconds)
+        sending_finished_at = time.monotonic()
+        drain_deadline = min(deadline, sending_finished_at + traffic.drain_timeout_seconds)
         while tasks:
             if reason := interruption():
                 reasons.append(reason)
@@ -310,6 +343,8 @@ async def run_stage(
         reasons.append("Traffic stage cancelled.")
         interrupted = True
     finally:
+        if sending_finished_at is None:
+            sending_finished_at = time.monotonic()
         # Copy: task completion callbacks remove tasks from the live set.
         pending = list(tasks)
         for task in pending:
@@ -346,8 +381,11 @@ async def run_stage(
         execution_errors=execution_errors, overflow=overflow, interrupted=interrupted,
         drain_expired=drain_expired, case_scorers=case_scorers, stalls=tuple(stalls),
         arrival=traffic.arrival,
+        started_monotonic=started_at,
+        sending_seconds=min(traffic.duration_seconds, sending_finished_at-started_at),
+        offer_lags_ms=tuple(offer_lags_ms),
     )
-    result = finalize_stage(evidence, limits)
+    result = evidence if return_evidence else finalize_stage(evidence, limits)
     if capture_evidence is not None:
         capture_evidence(evidence)
     return result
