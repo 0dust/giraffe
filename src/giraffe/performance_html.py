@@ -6,7 +6,6 @@ It never computes a metric from request records or pools targets/windows.
 from __future__ import annotations
 
 from html import escape
-import json
 import math
 
 from .performance import KPI_IDS
@@ -49,17 +48,87 @@ def _fmt(value):
     return f"{value:,.{precision}f}".rstrip("0").rstrip(".")
 
 
+def _evidence_label(key):
+    return {"first_output_ms": "First useful output limit", "first_token_ms": "Client TTFT limit",
+            "elapsed_ms": "Elapsed time", "local_drops": "Local drops", "dropped_local": "Local drops",
+            "late_drops": "Late", "dropped_late": "Late", "not_offered": "Not offered",
+            "timing_violations": "Timing violations", "missing_timing": "Missing timing"}.get(
+                key, str(key).replace("_", " ").capitalize())
+
+
+def _structured_value(row):
+    """Readable bounded evidence, without deriving new performance decisions."""
+    rows = []
+    truncated = False
+
+    def text(value, key=""):
+        nonlocal truncated
+        result = ("Unknown" if value is None else ("Yes" if value else "No") if isinstance(value, bool)
+                  else _fmt(value) + (" ms" if key.endswith("_ms") else "") if _number(value)
+                  else _evidence_label(value) if value in ("first_output_ms", "first_token_ms") else str(value))
+        if len(result) > 240:
+            result = result[:240] + "…"
+            truncated = True
+        return result
+
+    def visit(value, path="", key="", depth=0):
+        nonlocal truncated
+        if len(rows) >= 40:
+            truncated = True
+            return
+        if depth > 6:
+            rows.append((path, "Nested values (preview depth limit)"))
+            truncated = True
+        elif isinstance(value, list):
+            if all(not isinstance(item, (dict, list)) for item in value):
+                rows.append((path or "Values", ", ".join(text(item) for item in value[:12]) if value else "None"))
+                truncated |= len(value) > 12
+            else:
+                for index, item in enumerate(value[:41]):
+                    visit(item, f"{path} · {index+1}" if path else f"Entry {index+1}", depth=depth+1)
+                truncated |= len(value) > 41
+        elif isinstance(value, dict):
+            if not value:
+                rows.append((path or "Values", "None"))
+            for index, (field, item) in enumerate(value.items()):
+                if index > 40:
+                    truncated = True
+                    break
+                label = _evidence_label(field)
+                visit(item, f"{path} · {label}" if path else label, field, depth+1)
+        else:
+            rows.append((path or "Value", text(value, key)))
+
+    visit(row["value"])
+    summary = " · ".join(f"{key}: {value}" for key, value in rows[:3])
+    if row.get("id") == "drops":
+        values = row["value"] if isinstance(row["value"], list) else [row["value"]]
+        summaries = []
+        for index, item in enumerate(values[:3]):
+            counts = [("Local drops", item.get("local_drops") if item.get("local_drops") is not None else item.get("dropped_local")),
+                      ("Late", item.get("late_drops") if item.get("late_drops") is not None else item.get("dropped_late")),
+                      ("Not offered", item.get("not_offered"))]
+            summaries.append((f"Entry {index+1}: " if len(values) > 1 else "")
+                             + " · ".join(f"{label} {text(value)}" for label, value in counts))
+        summary = "; ".join(summaries) + (f" · {len(values)} entries" if len(values) > 3 else "")
+    empty_fields = [key for key, value in rows if value == "None"]
+    rows = [(key, value) for key, value in rows if value != "None"]
+    if empty_fields:
+        rows.append(("Fields with no entries", "; ".join(empty_fields)))
+    evidence = ''.join('<tr><th>' + _e(key[:160]) + '<td>' + _e(value) for key, value in rows)
+    return (_e(summary)
+            + '<details><summary>Underlying values</summary><table><tr><th>Recorded field<th>Value'
+            + evidence + '</table>'
+            + ('<p>Preview limited to 40 fields, 12 items per list and 240 characters per value. Complete values are included in the JSON export.</p>' if truncated else '')
+            + '</details>')
+
+
 def _value(row):
     value = row.get("value")
     if value is None:
         return "—"
     if isinstance(value, (dict, list)):
-        # Structured evidence is bounded in the HTML just like request details;
-        # the JSON export retains the complete evidence.
-        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        truncated = len(text) > 1200
-        return ('<details><summary>Recorded evidence</summary><pre>' + escape(text[:1200], quote=False)
-                + ('…\nPreview capped; complete evidence in report.json.' if truncated else '') + '</pre></details>')
+        return _structured_value(row)
     return _fmt(value) + (f' <small>{_e(row.get("unit", ""))}</small>' if row.get("unit") else '')
 
 
@@ -101,7 +170,7 @@ def _table(rows):
     parts = ['<div class="table"><table class="html-metrics"><tr><th>Metric<th>Value<th>Definition / availability']
     remaining = 0
     for index, row in enumerate(rows):
-        parts.append('<tr><th scope="row">' + _e(row.get("label", "")) + '<td>' + _value(row))
+        parts.append('<tr><th>' + _e(row.get("label", "")) + '<td>' + _value(row))
         if not remaining:
             count = 1
             while index + count < len(rows) and notes[index + count] == notes[index]:

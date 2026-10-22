@@ -2738,6 +2738,47 @@ function minMaxDecimate(points,buckets=160) {
   for(const group of groups.values()){indices.add(group.min);indices.add(group.max);}
   return [...indices].sort((a,b)=>a-b).map(index=>points[index]);
 }
+// Presentation only: retain recorded fields, with bounded previews for large ledgers.
+function performanceEvidenceLabel(key) {
+  return ({first_output_ms:'First useful output limit',first_token_ms:'Client TTFT limit',elapsed_ms:'Elapsed time',
+    local_drops:'Local drops',dropped_local:'Local drops',late_drops:'Late',dropped_late:'Late',
+    not_offered:'Not offered',timing_violations:'Timing violations',missing_timing:'Missing timing'})[key]||human(key);
+}
+function performanceStructuredValue(metric) {
+  const rows=[],limit=40;
+  let truncated=false;
+  const text=(value,key='')=>{
+    let result=value==null?'Unknown':typeof value==='boolean'?(value?'Yes':'No'):finitePerformance(value)?performanceNumber(value)+(key.endsWith('_ms')?' ms':''):(['first_output_ms','first_token_ms'].includes(value)?performanceEvidenceLabel(value):String(value));
+    if(result.length>240){result=result.slice(0,240)+'…';truncated=true;}
+    return result;
+  };
+  const visit=(value,path='',key='',depth=0)=>{
+    if(rows.length>=limit){truncated=true;return;}
+    if(depth>6){rows.push([path,'Nested values (preview depth limit)']);truncated=true;return;}
+    if(Array.isArray(value)){
+      if(value.every(item=>item==null||typeof item!=='object')){
+        rows.push([path||'Values',value.length?value.slice(0,12).map(item=>text(item)).join(', '):'None']);
+        if(value.length>12)truncated=true;
+      }else for(let i=0;i<Math.min(value.length,limit+1);i++)visit(value[i],path?`${path} · ${i+1}`:`Entry ${i+1}`,'',depth+1);
+      if(value.length>limit+1)truncated=true;
+    }else if(value&&typeof value==='object'){
+      const entries=Object.entries(value);
+      if(!entries.length)rows.push([path||'Values','None']);
+      for(const [field,item] of entries.slice(0,limit+1))visit(item,path?`${path} · ${performanceEvidenceLabel(field)}`:performanceEvidenceLabel(field),field,depth+1);
+      if(entries.length>limit+1)truncated=true;
+    }else rows.push([path||'Value',text(value,key)]);
+  };
+  visit(metric.value);
+  let summary=rows.slice(0,3).map(([key,value])=>`${key}: ${value}`).join(' · ');
+  if(metric.id==='drops'){
+    const values=Array.isArray(metric.value)?metric.value:[metric.value];
+    summary=values.slice(0,3).map((item,index)=>{
+      const counts=[['Local drops',item.local_drops??item.dropped_local],['Late',item.late_drops??item.dropped_late],['Not offered',item.not_offered]];
+      return (values.length>1?`Entry ${index+1}: `:'')+counts.map(([label,value])=>`${label} ${text(value)}`).join(' · ');
+    }).join('; ')+(values.length>3?` · ${values.length} entries`:'');
+  }
+  return `<span class="performance-structured-summary">${escape(summary)}</span><details class="performance-evidence"><summary>Underlying values</summary><table><thead><tr><th>Recorded field</th><th>Value</th></tr></thead><tbody>${rows.map(([key,value])=>`<tr><th scope="row">${escape(key.slice(0,160))}</th><td>${escape(value)}</td></tr>`).join('')}</tbody></table>${truncated?'<p>Preview limited to 40 fields, 12 items per list and 240 characters per value. Complete values are included in the JSON export.</p>':''}</details>`;
+}
 function performanceDisplay(metric,{seconds=false}={}) {
   if(metric?.value==null)return '—';
   let value=metric.value,unit=metric.unit||'';
@@ -2746,13 +2787,7 @@ function performanceDisplay(metric,{seconds=false}={}) {
     if(['ratio','fraction'].includes(unit)){value*=100;unit='%';}
     return `${performanceNumber(value)}${unit?' <small class="performance-unit">'+escape(unit)+'</small>':''}`;
   }
-  if(Array.isArray(value))return value.every(item=>typeof item!=='object')?value.map(item=>escape(item)).join(' → '):'Recorded; see evidence';
-  if(typeof value==='object'){
-    if(finitePerformance(value.median))return `${performanceNumber(value.median)} <small class="performance-unit">${escape(unit)}</small>`;
-    if(value.affected_requests!=null)return `${number(value.affected_requests)} / ${number(value.total_requests)} requests · ${escape(value.status)}`;
-    const fields=Object.entries(value).filter(([,item])=>typeof item==='number'||typeof item==='boolean'||typeof item==='string');
-    return fields.length?fields.map(([key,item])=>`${escape(human(key))}: ${finitePerformance(item)?performanceNumber(item):escape(item)}`).join(' · '):'Recorded; see evidence';
-  }
+  if(typeof value==='object')return performanceStructuredValue(metric);
   return escape(value);
 }
 function performanceInfo(metric,key) {

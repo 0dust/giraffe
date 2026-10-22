@@ -266,6 +266,7 @@ def _request_series(records):
     rows = []
     for number, record in enumerate(records, 1):
         modern = getattr(record, "timing_schema", 0) >= 1
+        generation_pace = record.generation_tokens_per_second
         stream_duration = (record.last_output_ms - record.first_output_ms
                            if record.stream and record.first_output_ms is not None and record.last_output_ms is not None
                            and record.last_output_ms >= record.first_output_ms else None)
@@ -288,7 +289,7 @@ def _request_series(records):
                     "completion_tokens": record.completion_tokens,
                     "cached_prompt_tokens": record.cached_prompt_tokens,
                     "reasoning_tokens": record.reasoning_tokens,
-                    "tpot_estimate_ms": getattr(record, "tpot_estimate_ms", None) if modern else None,
+                    "tpot_estimate_ms": 1000 / generation_pace if generation_pace else None,
                     "tpot_direct_ms": getattr(record, "tpot_direct_ms", None) if modern else None}))
     return rows
 
@@ -352,15 +353,21 @@ def _window_summary(report, target, window, records, series, observation):
     maximum_gaps = gaps + [r.max_stream_gap_ms for r in good if r.max_stream_gap_ms is not None]
     put("longest_stream_pause", max(maximum_gaps, default=None), "Longest stream pause", "ms",
         "Maximum gap between answer network reads; not token ITL", samples=len(maximum_gaps))
-    estimates = [getattr(r, "tpot_estimate_ms", None) for r in modern]
+    # The saved generation estimate predates versioned token-event evidence.
+    # Its existing property enforces valid, completed, unbuffered streaming
+    # evidence; only direct/token-event metrics require the newer schema.
+    generation_rates = [r.generation_tokens_per_second for r in good]
+    legacy_rates = [r.generation_tokens_per_second for r in good if getattr(r, "timing_schema", 0) < 1]
+    legacy_source = "; from saved generation-rate estimate; older run" if any(rate is not None for rate in legacy_rates) else ""
+    estimates = [1000 / rate if rate else None for rate in generation_rates]
     direct = [getattr(r, "tpot_direct_ms", None) for r in modern]
-    dist("tpot_estimate", estimates, "TPOT estimate", "ms/token", "1000 / generation_tokens_per_second", state="estimated")
+    dist("tpot_estimate", estimates, "TPOT estimate", "ms/token", "1000 / generation_tokens_per_second" + legacy_source, state="estimated")
     dist("tpot_direct", direct, "Direct TPOT", "ms/token", "(last answer receipt − first answer receipt) / (answer tokens − 1); proven first event token boundary")
     selected_tpot = metrics["tpot_direct"] if metrics["tpot_direct"]["value"] is not None else metrics["tpot_estimate"]
     metrics["tpot"] = {**selected_tpot, "id": "tpot", "label": "Time per output token (TPOT)"}
     metrics["tpot_direct"]["exclusion_reasons"] = dict(Counter(r.tpot_direct_reason for r in good if r.tpot_direct_reason))
-    dist("generation_pace", [r.generation_tokens_per_second for r in modern], "Generation pace", "tok/s",
-         "Answer streaming estimate; first-read tokens estimated by character share", state="estimated")
+    dist("generation_pace", generation_rates, "Generation pace", "tok/s",
+         "Answer streaming estimate; first-read tokens estimated by character share" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled",
          state="measured" if itl else "not_supported",
@@ -375,7 +382,7 @@ def _window_summary(report, target, window, records, series, observation):
             row["request_coverage"] = {"sample": covered, "eligible": eligible_count, "missing": eligible_count-covered}
             row["sample_unit"] = "gaps"
     if not event_records:
-        for key in ("tpot_direct", "tpot_estimate", "tpot", "generation_pace", "client_ttft", "answer_read_gap", "reasoning_read_gap"):
+        for key in ("tpot_direct", "client_ttft", "answer_read_gap", "reasoning_read_gap"):
             metrics[key].update(value=None, state="not_collected", reason="No versioned timing evidence; old records remain unavailable.", action="Rerun with timing schema 1 instrumentation.")
     stats = _stats(population)
     for key, label in (("attempted", "Requests started"), ("completed", "Valid completions"),
