@@ -218,6 +218,7 @@ Exit codes:
         run.add_argument("--skip-preflight", action="store_true", help="Skip the bounded connection/model probe")
         run.add_argument("--deployment-file", type=Path, help="Bounded deployment JSON for the first target")
         run.add_argument("--metrics-url", help="Separate statistics endpoint for the first target")
+        run.add_argument("--host-metrics-url", help="Optional node_exporter endpoint for server host CPU/RAM")
         run.add_argument("--metrics-api-key-env", help="Separate metrics secret reference")
         run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"], help="Metrics format used by the statistics endpoint")
         run.add_argument("--tool-calling", action="store_true", default=None, help="Include tool-calling capability checks")
@@ -367,7 +368,7 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     if getattr(args, "deployment_file", None):
         from giraffe.deployment import load_metadata
         values["targets"][0].setdefault("deployment", {}).update(load_metadata(args.deployment_file))
-    for key in ("metrics_url", "metrics_api_key_env", "metrics_profile"):
+    for key in ("metrics_url", "metrics_api_key_env", "metrics_profile", "host_metrics_url"):
         if getattr(args, key, None) is not None:
             values["targets"][0][key] = getattr(args, key)
     args._configuration_input = values
@@ -457,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             for error in errors:
                 location = ".".join(map(str, error["loc"]))
                 if len(error["loc"]) == 2 and error["loc"][0] == "targets" and error["message"].startswith(
-                    ("target url ", "metrics_url ")
+                    ("target url ", "metrics_url ", "host_metrics_url ")
                 ):
                     location = ""
                 print(f"giraffe: {location + ': ' if location else ''}{error['message']}", file=sys.stderr)
@@ -631,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             report = _retained(load_report(args.report))
             value = reproduction_export(report) if args.command == "export" else {
                 "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline,
+                "performance": report.performance, "conditions": report.conditions,
                 "workload_selection": report.manifest.get("workload_selection", {})}
             print(json.dumps(value, indent=2, allow_nan=False))
             return 0
@@ -824,10 +826,14 @@ def main(argv: list[str] | None = None) -> int:
         summary = report.observations.get("summary")
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
+                 performance=report.performance,
                  abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
                  **({"summary": summary} if summary else {}),
                  report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
         else:
+            from giraffe.performance import cli_summary
+            for line in cli_summary(report):
+                print(line)
             for check in report.checks:
                 print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
             for name, observation in report.observations.get("targets", {}).items():

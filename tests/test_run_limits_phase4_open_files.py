@@ -203,3 +203,13 @@ def test_unmeasurable_descriptors_skip_with_note(monkeypatch, limits):
     assert not result["supported"] and not result["errors"]
     assert "could not be measured" in result["warnings"][0]["msg"]
     assert limits["calls"] == []
+
+
+def test_host_exporter_is_budgeted_even_without_runtime_metrics(limits):
+    cfg = config()
+    before = open_files.open_file_guard(cfg)
+    cfg.targets[0].host_metrics_url = "http://host/metrics"
+    after = open_files.open_file_guard(cfg)
+    assert not cfg.metrics
+    assert after["counts"]["metrics_clients"] == before["counts"]["metrics_clients"] + 1
+    assert after["need"] == before["need"] + 1

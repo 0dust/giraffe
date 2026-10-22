@@ -44,7 +44,7 @@ from giraffe.overlap import (
     scheduling_delay_windows,
 )
 from giraffe.timing import configured_metrics, qualified_violations, run_quality
-from giraffe.traffic import arrival_schedule, run_stage
+from giraffe.traffic import ScheduleObservation, arrival_schedule, run_stage
 
 LOAD_TITLES = {
     "combinations": "Input → output combinations",
@@ -695,6 +695,13 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     triggered = 0
     scenario = point["id"] + ("." + phase if phase else "")
     run.start_condition(target.name, scenario, planned=None, planned_kind="duration")
+    intent = ScheduleObservation(
+        run.observations[target.name].setdefault("schedule_transitions", []),
+        start=begin, origin=run.start, stage_id=scenario, check_id="load",
+        kind="concurrency", label=point_label(point) + (f" · {phase}" if phase else ""),
+        pattern=point["pattern"],
+        concurrency=point["level"] - (1 if phase == "control" else 0),
+    )
 
     def ended():
         nonlocal reason, cutoff
@@ -780,6 +787,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     if phase == "probe":
         tasks.append(asyncio.create_task(probe()))
     cancelled = None
+    sending_end = None
     try:
         # Do not await workers directly: requests may outlive the sending window.
         while time.monotonic() < end and not ended():
@@ -791,6 +799,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             except TimeoutError:
                 pass
         sending_end = min(end, cutoff if cutoff is not None else time.monotonic())
+        intent.begin_drain(sending_end)
         finish_end = min(run.deadline, sending_end + settings.schedule.finish_seconds)
         while any(not t.done() for t in tasks) and time.monotonic() < finish_end:
             stop = run.stop_reason(target.name)
@@ -803,6 +812,9 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         reason = run.stop_reason(target.name) or "execution cancelled"
         cancelled = exc
     finally:
+        if sending_end is None:
+            sending_end = min(end, time.monotonic())
+        intent.begin_drain(sending_end)
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -813,6 +825,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             except asyncio.CancelledError as exc:
                 cancelled = exc
                 reason = run.stop_reason(target.name) or "execution cancelled"
+        intent.finish(time.monotonic())
     now = time.monotonic()
     for record in records:
         if record.status == "cancelled":
@@ -893,6 +906,10 @@ async def arrival_window(run, target, client, settings, point, calibration):
         run_start=run.start,
         return_evidence=True,
         on_drop=lambda: run.drop_offer(target.name, point["id"]),
+        schedule_observations=run.observations[target.name].setdefault("schedule_transitions", []),
+        schedule_stage_id=point["id"],
+        schedule_label=point_label(point),
+        schedule_pattern=point["pattern"],
     )
     begin = evidence.started_monotonic
     for index, (offer, outcome) in enumerate(zip(offers, evidence.outcomes)):

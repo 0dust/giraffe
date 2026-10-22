@@ -18,7 +18,7 @@ from typing import Callable
 
 
 from .client import LLMClient, no_response_failure
-from .conditions import condition_for
+from .conditions import condition_aggregate, condition_for, request_status
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
@@ -304,7 +304,7 @@ class _Run:
             row = {"target": target, "condition": condition, "planned": None,
                    "planned_kind": "exact", "status": "waiting", "sent": 0,
                    "started": 0, "running": 0, "completed": 0, "failed": 0,
-                   "not_sent": None, "reason": None}
+                   "not_sent": None, "reason": None, "request_statuses": {}}
             self.conditions[key] = row
             self.observations[target]["conditions"].append(row)
         else:
@@ -338,7 +338,7 @@ class _Run:
             row["planned"] = (row["planned"] or 0) + planned
         if row["planned"] is not None:
             row["not_sent"] = max(0, row["planned"] - row["sent"])
-        if planned_kind == "upper_bound":
+        if planned_kind in {"upper_bound", "duration"}:
             row["planned_kind"] = planned_kind
         row.update(status="running", reason=None)
         if previous != "running":
@@ -347,7 +347,9 @@ class _Run:
 
     def emit_condition(self, event, scenario, row):
         # Keep the global completed progress counter separate from condition totals.
-        self.emit(event, row["target"], scenario, condition_summary=dict(row),
+        aggregate = condition_aggregate(row)
+        self.emit(event, row["target"], scenario, condition_summary={**row, "aggregate_status": aggregate["status"],
+                  **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
                   **{k: v for k, v in row.items() if k not in {"target", "completed"}})
 
     def condition_reason(self, target, fallback="check stopped early"):
@@ -678,6 +680,9 @@ class _Run:
                 condition["running"] -= 1
                 condition["completed"] += 1
                 condition["failed"] += int(_request_failed(record))
+                result_status = request_status(record.model_dump(include={"status", "score", "valid"}))
+                statuses = condition.setdefault("request_statuses", {})
+                statuses[result_status] = statuses.get(result_status, 0) + 1
                 if record.status == "cancelled" and not intentional and (
                         self.stop.is_set() or self.reason or time.monotonic() >= self.deadline):
                     condition["reason"] = self.condition_reason(target.name)
@@ -688,7 +693,7 @@ class _Run:
                       requested_input_tokens=spec.requested_input_tokens,
                       request_slot=request_slot, request=record.model_dump(mode="json", include={
                           "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
-                          "elapsed_ms", "first_output_ms", "check_ids",
+                          "elapsed_ms", "first_output_ms", "check_ids", "http_status",
                       }), intentional=intentional)
             return record
 
@@ -807,7 +812,7 @@ async def _metrics(run, target, phase):
     if len(data["snapshots"]) >= limit:
         data["sample_limit_reached"] = True
         return
-    snapshot = await scrape(run, target, phase, force=True)
+    snapshot = await scrape(run, target, phase, force=run.config.metrics or "gpu" in run.config.checks)
     data["snapshots"].append(snapshot)
     run.observations[target.name]["metrics"].append(_gpu_snapshot(snapshot))
 
@@ -899,8 +904,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             client.on_response = lambda: run.endpoint_response(target.name)
             if "gpu" in enabled and not config.metrics:
                 await _metrics(run, target, "start")
-            if config.metrics:
+            if config.metrics or target.host_metrics_url:
                 data = run.observations[target.name]["serving_telemetry"]
+                data["host_configured"] = bool(target.host_metrics_url)
                 await _metrics(run, target, "start")
                 telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
             elif target.deployment.collector_url:
@@ -1126,7 +1132,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         data = run.observations[target.name]["serving_telemetry"]
         if "gpu" in enabled and "gpu_observation_window" not in run.observations[target.name]:
             await _finish_gpu_observation(run, target)
-        elif config.metrics:
+        elif config.metrics or target.host_metrics_url:
             await _metrics(run, target, "end")
         elif len(data["snapshots"]) < config.metrics_max_samples:
             data["snapshots"].append(await telemetry.scrape(run, target, "not collected"))

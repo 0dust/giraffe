@@ -170,7 +170,9 @@ def expanded_report_chunks(path: Path):
 
     Keep the source inode open across passes. The temporary lookup holds unique
     inputs on disk; memory scales with metadata and the largest individual value,
-    rather than the sum of request evidence. No RunReport with requests is built.
+    rather than the sum of request evidence. For old reports without performance
+    data, only numeric/status/timing records are retained to build the new views;
+    prompts and response bodies still pass through one at a time.
     """
     with tempfile.TemporaryDirectory(prefix="giraffe-download-") as temporary, \
             closing(sqlite3.connect(str(Path(temporary) / "inputs.sqlite"), check_same_thread=False)) as inputs, \
@@ -179,6 +181,7 @@ def expanded_report_chunks(path: Path):
         inputs.execute("CREATE TABLE inputs (ref TEXT PRIMARY KEY, messages TEXT)")
         reader = _Reader(handle)
         metadata = {}
+        measurements = []
         has_inputs = has_requests = False
         for key in reader.members():
             if key == "inputs":
@@ -197,7 +200,13 @@ def expanded_report_chunks(path: Path):
                 for raw in reader.requests():
                     if "input_ref" in raw and metadata.get("report_format") != 2:
                         raise ValueError("Input references require report format 2 before requests")
-                    _request(raw, inputs)
+                    record = _request(raw, inputs)
+                    if not metadata.get("performance"):
+                        measurements.append(record.model_copy(update={
+                            "output": "", "reasoning": "", "reasoning_stripped": bool(record.reasoning.strip()) or record.reasoning_stripped,
+                            "evaluation": None, "tool_calls": [], "assistant_message": None,
+                            "tool_conversation": None, "logprob_evidence": None,
+                            "response_events": [], "judgement": None}))
             else:
                 metadata[key] = reader.value()
         if reader.peek() or not has_requests:
@@ -205,7 +214,10 @@ def expanded_report_chunks(path: Path):
         report_format = metadata.pop("report_format", None)
         if has_inputs != (report_format == 2) or report_format not in (None, 2):
             raise ValueError("Unsupported saved report format")
-        header = RunReport.model_validate({**metadata, "requests": []})
+        if not metadata.get("performance"):
+            header = RunReport.model_validate({**metadata, "requests": measurements})
+        else:
+            header = RunReport.model_validate({**metadata, "requests": []}, context={"metadata_only": True})
         yield header.model_dump_json(exclude={"requests"})[:-1] + ',"requests":['
         handle.seek(0)
         reader = _Reader(handle)

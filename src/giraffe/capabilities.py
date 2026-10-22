@@ -177,6 +177,11 @@ def capabilities(config: RunConfig | None = None) -> dict:
              **({"request_settings": pack_settings(configured)}
                 if key == "correctness" and configured.request_source == "request_pack" else {})} for key, title in CHECK_NAMES.items()
         ],
+        "telemetry": {"host_metrics_url": {"field": "targets[].host_metrics_url",
+            "label": "Server host exporter URL", "optional": True, "profile": "node_exporter",
+            "metrics": ["host_cpu_percent", "host_ram_used_bytes", "host_ram_total_bytes"],
+            "scope": "server-wide", "credentials": "No inference or runtime metrics credentials are forwarded.",
+            "collection": "Read-only alongside the workload; configured URL enables host sampling."}},
         "profile_defaults": {name: model().model_dump(mode="json") for name, model in {
             "arrivals": Arrival, "prefix": Prefix, "sessions": Sessions,
             "consistency": Consistency,

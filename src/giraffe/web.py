@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +34,7 @@ from .caps import (
 )
 from giraffe.configuration_errors import configuration_errors as _configuration_errors
 from giraffe.capabilities import capabilities
+from giraffe.conditions import ConditionRequestIndex, condition_aggregate
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
@@ -118,11 +119,18 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
         job["progress"] = event
         job["events"].append(event)
         del job["events"][:-MAX_LIVE_EVENTS]
+    index = job.get("condition_requests")
+    if index is None:
+        index = job["condition_requests"] = ConditionRequestIndex()
+    index.update(event)
     summary = event.get("condition_summary")
     if not summary and event["event"] in {"condition_planned", "condition_started", "condition_finished"}:
         summary = {key: event.get(key) for key in ("target", "condition", "planned", "planned_kind",
             "status", "sent", "started", "running", "completed", "failed", "not_sent", "reason")}
     if summary and summary.get("condition"):
+        summary = {**summary, **{key: value for key, value in condition_aggregate(summary).items()
+                   if key not in {"status", "lifecycle_status"}}}
+        index.summary(summary)
         key = (summary["target"], summary["condition"]["id"])
         if key in job["conditions"] or len(job["conditions"]) < MAX_LIVE_CONDITIONS:
             job["conditions"][key] = summary
@@ -557,6 +565,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "started_at": (persisted or summary or {}).get("started_at", meta.get("started_at")),
                 "finished_at": (persisted or summary or {}).get("finished_at", meta.get("finished_at"))}
 
+    @lru_cache(maxsize=8)
+    def saved_condition_requests(path: str, modified: int, size: int) -> ConditionRequestIndex:
+        return ConditionRequestIndex.from_report(_report(Path(path)))
+
     def run_summary(detail: dict) -> dict:
         report = detail["report"] or detail["summary"] or {}
         counts = dict.fromkeys(("pass", "fail", "inconclusive", "skipped", "blocked"), 0)
@@ -874,6 +886,28 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
         return run_detail(identifier)
+
+    @app.get("/api/runs/{identifier}/conditions/{condition_id}/requests")
+    async def condition_requests(identifier: str, condition_id: str, status: str | None = None,
+                                 page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=50),
+                                 target: str | None = None):
+        if page_size not in {10, 25, 50}:
+            raise HTTPException(422, "Rows must be 10, 25 or 50")
+        directory = _directory(root, identifier)
+        if active.get("id") == identifier:
+            index = active.setdefault("condition_requests", ConditionRequestIndex())
+        else:
+            path = directory / "report.json"
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(404, "Report is not available")
+            stat = path.stat()
+            index = saved_condition_requests(str(path), stat.st_mtime_ns, stat.st_size)
+        try:
+            return index.page(condition_id, target=target, status=status, page=page, page_size=page_size)
+        except KeyError:
+            raise HTTPException(404, "Unknown condition") from None
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
 
     @app.get("/api/runs/{identifier}/config.json")
     async def download_config(identifier: str):

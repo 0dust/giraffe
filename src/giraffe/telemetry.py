@@ -29,6 +29,9 @@ V1 = {
     "vllm:prefix_cache_queries_total": ("prefix_queries", "counter", "tokens"),
     "vllm:time_to_first_token_seconds_sum": ("server_ttft_sum", "counter", "seconds"),
     "vllm:time_to_first_token_seconds_count": ("server_ttft_count", "counter", "requests"),
+    "vllm:time_to_first_token_seconds_bucket": ("server_ttft_bucket", "counter", "requests"),
+    "vllm:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
+    "vllm:generation_tokens_total": ("generated_tokens", "counter", "tokens"),
 }
 LEGACY = V1 | {
     "vllm:gpu_cache_usage_perc": ("cache_occupancy", "gauge", "fraction"),
@@ -45,6 +48,7 @@ SGLANG = {
     "sglang:prompt_tokens_total": ("prompt_tokens", "counter", "tokens"),
     "sglang:time_to_first_token_seconds_sum": ("server_ttft_sum", "counter", "seconds"),
     "sglang:time_to_first_token_seconds_count": ("server_ttft_count", "counter", "requests"),
+    "sglang:time_to_first_token_seconds_bucket": ("server_ttft_bucket", "counter", "requests"),
 }
 # Exact metric contracts from the source used for the live Apple Silicon run.
 SGLANG_REFERENCE = "SGLang 44bc47886 srt/observability/metrics_collector.py"
@@ -68,6 +72,8 @@ TGI = {
     "tgi_request_queue_duration_count": ("server_queue_count", "counter", "requests"),
     "tgi_request_inference_duration_sum": ("server_inference_sum", "counter", "seconds"),
     "tgi_request_inference_duration_count": ("server_inference_count", "counter", "requests"),
+    "tgi_request_queue_duration_bucket": ("server_queue_bucket", "counter", "requests"),
+    "tgi_request_inference_duration_bucket": ("server_inference_bucket", "counter", "requests"),
 }
 ENGINE_METRICS = {"llamacpp": LLAMACPP, "lmdeploy": LMDEPLOY, "tgi": TGI}
 ENGINE_METRIC_REFERENCES = {
@@ -83,6 +89,12 @@ GPU = {
     "DCGM_FI_DEV_CLOCKS_EVENT_REASONS": ("throttling", "gauge", "bitmask"),
     "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS": ("throttling", "gauge", "bitmask"),
     "DCGM_FI_DEV_XID_ERRORS": ("device_errors", "gauge", "code"),
+}
+HOST = {
+    "node_cpu_seconds_total": ("host_cpu_seconds", "counter", "seconds"),
+    "node_memory_MemTotal_bytes": ("host_ram_total", "gauge", "bytes"),
+    "node_memory_MemAvailable_bytes": ("host_ram_available", "gauge", "bytes"),
+    "node_uname_info": ("host_identity", "gauge", "info"),
 }
 LINE = re.compile(
     r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*?\})?\s+([-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?)(?:\s+(\d+(?:\.\d+)?))?\s*$"
@@ -276,7 +288,7 @@ def _metrics_headers(target):
     return headers
 
 
-def parse(body, target, config):
+def parse(body, target, config, *, host=False):
     profile = (
         V1
         if target.metrics_profile == "vllm-v1"
@@ -286,7 +298,7 @@ def parse(body, target, config):
         if target.metrics_profile == "sglang"
         else ENGINE_METRICS.get(target.metrics_profile, {})
     )
-    mapping = profile | GPU
+    mapping = HOST if host else profile | GPU
     samples, recognized, truncated = [], 0, False
     for line in body.splitlines():
         if line.lstrip().startswith("#") or not line.strip():
@@ -328,7 +340,7 @@ def parse(body, target, config):
                 "freshness": "source timestamp"
                 if timestamp
                 else "scrape only; source freshness unknown",
-                "provenance": "runtime-reported metrics",
+                "provenance": "host node_exporter metrics" if host else "runtime-reported metrics",
             }
         )
     families = {s["family"] for s in samples if not s["stale"]}
@@ -343,7 +355,7 @@ def parse(body, target, config):
     )
     if not body.strip() or body.strip() in {"[]", "{}"}:
         state = "empty_response"
-    required = (
+    required = {"host_cpu_seconds", "host_ram_total", "host_ram_available"} if host else (
         (SERVING_FAMILIES - {"preemptions"}) | {"retractions"}
         if target.metrics_profile == "sglang" else SERVING_FAMILIES
     )
@@ -352,8 +364,8 @@ def parse(body, target, config):
         "samples": samples,
         "missing_families": sorted(required - families),
         "series_limit_reached": truncated,
-        "mapping": target.metrics_profile,
-        "mapping_reference": "vLLM 0.30.0 v1/metrics/loggers.py"
+        "mapping": "node_exporter" if host else target.metrics_profile,
+        "mapping_reference": "https://prometheus.io/docs/guides/node-exporter/" if host else "vLLM 0.30.0 v1/metrics/loggers.py"
         if target.metrics_profile == "vllm-v1"
         else SGLANG_REFERENCE
         if target.metrics_profile == "sglang"
@@ -382,7 +394,7 @@ def _metrics_client(config, target, timeout):
     )
 
 
-async def scrape(run, target, phase, *, force=False):
+async def _scrape_runtime(run, target, phase, *, force=False):
     result = {
         "phase": phase,
         "collected_at": stamp(),
@@ -536,4 +548,293 @@ def summarize(data, threshold):
         failures=sum(s["status"] != "available" for s in data["snapshots"]),
         interpretation="Concurrent observations provide context, not causality. Sampling can miss peaks. Missing counters are unknown. Label changes create separate series; counters are never joined across replicas.",
     )
+    data["derived"] = derive_server_metrics(data, host_configured=data.get("host_configured", False))
     return data
+
+
+async def _scrape_host(run, target, phase):
+    """Independent read-only exporter; never forward inference/runtime credentials."""
+    from urllib.parse import urlsplit
+
+    result = {"phase": phase, "collected_at": stamp(),
+              "elapsed_seconds": time.monotonic() - run.start, "samples": [],
+              "host_identity": urlsplit(target.host_metrics_url).hostname,
+              "collection_period_seconds": run.config.metrics_interval_seconds,
+              "max_age_seconds": run.config.metrics_max_age_seconds,
+              "scope": "server-wide; configured exporter host, not runner resources"}
+    remaining = min(run.config.metrics_timeout_seconds, run.deadline - time.monotonic())
+    if run.stop.is_set() or remaining <= 0:
+        return result | {"status": "run_stopped", "reason": "Run stopped or deadline reached."}
+    try:
+        def make_client():
+            verify = ssl.create_default_context(cafile=run.config.ca_bundle) if run.config.ca_bundle else True
+            return httpx.AsyncClient(verify=verify, proxy=run.config.proxy, timeout=remaining,
+                                     follow_redirects=False)
+        async with asyncio.timeout(remaining):
+            client = await asyncio.to_thread(make_client)
+            async with client:
+                async with client.stream("GET", target.host_metrics_url) as response:
+                    response.raise_for_status()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
+                            return result | {"status": "response_limit", "reason": "Host statistics response exceeds 1 MiB."}
+                        body.extend(chunk)
+        result.update(parse(body.decode("utf-8"), target, run.config, host=True))
+        hosts = {s["labels"].get("nodename") for s in result["samples"]
+                 if s["family"] == "host_identity" and not s["stale"]}
+        result["reported_host_identities"] = sorted(h for h in hosts if h)
+    except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
+        result.update(status="connection_failure", reason=f"Host statistics unavailable ({type(exc).__name__}).")
+    result["scrape_duration_seconds"] = time.monotonic() - run.start - result["elapsed_seconds"]
+    return result
+
+
+async def scrape(run, target, phase, *, force=False):
+    runtime = _scrape_runtime(run, target, phase, force=force)
+    if not target.host_metrics_url:
+        return await runtime
+    result, host = await asyncio.gather(runtime, _scrape_host(run, target, phase))
+    result["host"] = host
+    result["host_configured"] = True
+    return result
+
+
+def _derived(value, unit, source, *, reason=None, state=None, samples=0, eligible=0, **details):
+    return {"value": value, "unit": unit, "source": source,
+            "state": state or ("measured" if value is not None else "insufficient_evidence"),
+            "reason": reason or ("No fresh compatible observations or nonzero measurement population." if value is None else None),
+            "action": None if value is not None else "Collect at least two fresh compatible exporter samples during the workload.",
+            "sample_count": samples, "eligible_count": eligible, "scope": "server-wide",
+            "details": details}
+
+
+def _fresh_families(snapshot, families):
+    """A failed, truncated, duplicate or stale scope cannot form a counter interval."""
+    if snapshot.get("status") not in {"available", "absent_families"} or snapshot.get("series_limit_reached"):
+        return None
+    rows = {family: {} for family in families}
+    for sample in snapshot.get("samples", []):
+        family = sample.get("family")
+        if family not in rows:
+            continue
+        labels = tuple(sorted(sample.get("labels", {}).items()))
+        value = sample.get("value")
+        if sample.get("stale") or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or labels in rows[family]:
+            return None
+        rows[family][labels] = value
+    return rows if all(rows.values()) else None
+
+
+def _counter_intervals(snapshots, families, *, matching=True):
+    intervals, excluded = [], 0
+    for left, right in zip(snapshots, snapshots[1:]):
+        elapsed = right.get("elapsed_seconds", 0) - left.get("elapsed_seconds", 0)
+        a, b = _fresh_families(left, families), _fresh_families(right, families)
+        identity_changed = (left.get("reported_host_identities") != right.get("reported_host_identities")
+                            or left.get("host_identity") != right.get("host_identity"))
+        if identity_changed or elapsed <= 0 or not a or not b or any(a[f].keys() != b[f].keys() for f in families):
+            excluded += 1
+            continue
+        if matching and any(a[f].keys() != a[families[0]].keys() for f in families):
+            excluded += 1
+            continue
+        deltas = {f: {labels: b[f][labels] - value for labels, value in a[f].items()} for f in families}
+        if any(v < 0 for rows in deltas.values() for v in rows.values()):
+            excluded += 1
+            continue
+        if len(families) == 2 and families[0].endswith("_sum") and any(
+                deltas[families[1]][labels] == 0 and value != 0 for labels, value in deltas[families[0]].items()):
+            excluded += 1
+            continue
+        intervals.append((elapsed, deltas))
+    return intervals, excluded
+
+
+def _mean_duration(snapshots, family):
+    sum_family, count_family = family + "_sum", family + "_count"
+    intervals, excluded = _counter_intervals(snapshots, [sum_family, count_family])
+    count = sum(sum(d[count_family].values()) for _, d in intervals)
+    total = sum(sum(d[sum_family].values()) for _, d in intervals)
+    return _derived(1000 * total / count if count else None, "ms", "1000 × matching Δsum / Δcount; server-wide",
+                    samples=count, eligible=len(snapshots), reason=None if count else
+                    "No fresh matching duration sum/count increments; reset, missing scope or zero count.",
+                    duration_seconds=sum(t for t, _ in intervals), excluded_intervals=excluded,
+                    attribution="Includes other server traffic; not request-linked.")
+
+
+def _histogram_percentiles(snapshots, family):
+    bucket_family = family + "_bucket"
+    intervals, excluded = _counter_intervals(snapshots, [bucket_family])
+    buckets, resolutions, population = defaultdict(float), set(), 0
+    valid_intervals = 0
+    for _, deltas in intervals:
+        scopes = defaultdict(dict)
+        try:
+            for labels, value in deltas[bucket_family].items():
+                labels = dict(labels)
+                bound = float(labels.pop("le"))
+                scopes[tuple(sorted(labels.items()))][bound] = value
+        except (KeyError, ValueError):
+            excluded += 1
+            continue
+        layouts = {tuple(sorted(rows)) for rows in scopes.values()}
+        if len(layouts) != 1 or any(math.inf not in rows or any(b < a for a, b in zip(
+                [rows[k] for k in sorted(rows)], [rows[k] for k in sorted(rows)][1:])) for rows in scopes.values()):
+            excluded += 1
+            continue
+        layout = next(iter(layouts))
+        if any(bound < 0 for bound in layout) or resolutions and layout not in resolutions:
+            excluded += 1
+            continue
+        resolutions.add(layout)
+        valid_intervals += 1
+        for rows in scopes.values():
+            population += rows[math.inf]
+            for bound, count in rows.items():
+                buckets[bound] += count
+    output = {}
+    for quantile in (.95, .99):
+        value, bounds = None, None
+        if population:
+            rank, previous_bound, previous_count = quantile * population, 0.0, 0.0
+            for bound in sorted(buckets):
+                count = buckets[bound]
+                if count >= rank:
+                    bounds = [previous_bound, bound if math.isfinite(bound) else None]
+                    if math.isfinite(bound) and count > previous_count:
+                        value = 1000 * (previous_bound + (bound - previous_bound) * (rank - previous_count) / (count - previous_count))
+                    break
+                previous_bound, previous_count = bound, count
+        output[f"p{int(quantile * 100)}"] = _derived(
+            value, "ms", "Linear interpolation within classic histogram Δbucket counts; server-wide",
+            state="estimated" if value is not None else "insufficient_evidence", samples=population,
+            eligible=len(snapshots), reason=None if value is not None else
+            "No complete compatible histogram increments, zero observations, or percentile falls in unbounded +Inf bucket.",
+            bucket_bounds_seconds=bounds,
+            bucket_resolution_seconds=[b for b in sorted(buckets) if math.isfinite(b)],
+            excluded_intervals=excluded, observed_intervals=valid_intervals,
+            approximation="Uniform observations within each finite bucket; no exact percentile or maximum.")
+    return output
+
+
+def derive_server_metrics(data, *, host_configured=False):
+    """Derive server-wide observations from adjacent compatible scrape intervals.
+
+    Scopes must match at both ends and across paired families. Counter resets,
+    stale/missing data, failed scrapes and label/replica changes exclude intervals;
+    coverage records exclusions. Replica sums/counts and bucket counts are pooled,
+    never replica percentiles. Rates use actual elapsed seconds, not the configured
+    polling interval. Source freshness without exporter timestamps stays unknown.
+    """
+    snapshots = data.get("snapshots", [])
+    metrics = {}
+    for family in ("server_ttft", "server_queue", "server_inference"):
+        metrics[family + "_mean_ms"] = _mean_duration(snapshots, family)
+        for percentile, row in _histogram_percentiles(snapshots, family).items():
+            metrics[family + "_" + percentile + "_ms"] = row
+    for family in ("prompt_tokens", "generated_tokens", "preemptions", "retractions"):
+        intervals, excluded = _counter_intervals(snapshots, [family])
+        duration = sum(t for t, _ in intervals)
+        delta = sum(sum(d[family].values()) for _, d in intervals)
+        key = "server_" + family + "_per_second"
+        metrics[key] = _derived(delta / duration if duration else None,
+                               "tokens/s" if family.endswith("tokens") else "events/s",
+                               "Compatible server-wide counter delta / actual sample duration",
+                               samples=len(intervals), eligible=max(0, len(snapshots)-1),
+                               duration_seconds=duration, counter_delta=delta, excluded_intervals=excluded,
+                               reason=None if duration else "No fresh stable counter interval; resets, missing samples or changing labels.")
+    intervals, excluded = _counter_intervals(snapshots, ["prefix_hits", "prefix_queries"])
+    hits = sum(sum(d["prefix_hits"].values()) for _, d in intervals)
+    queries = sum(sum(d["prefix_queries"].values()) for _, d in intervals)
+    metrics["prefix_cache_hit_ratio"] = _derived(hits / queries if queries and hits <= queries else None,
+        "fraction", "Matching prefix-cache hit/query token-counter deltas; server-wide",
+        samples=queries, eligible=len(snapshots), excluded_intervals=excluded,
+        reason=None if queries and hits <= queries else "No compatible nonzero hit/query deltas; missing is not zero.")
+    # Runtime direct gauges retain their units; average samples is not a time-weighted average.
+    for family in ("running", "waiting", "cache_occupancy", "prefix_hit_rate", "memory", "utilization",
+                   "temperature", "throttling", "device_errors"):
+        samples = [s for snap in snapshots for s in snap.get("samples", [])
+                   if s.get("family") == family and not s.get("stale")]
+        unit = samples[0]["unit"] if samples else {
+            "running": "requests", "waiting": "requests", "cache_occupancy": "fraction",
+            "prefix_hit_rate": "fraction", "memory": "MiB", "utilization": "percent",
+            "temperature": "celsius", "throttling": "bitmask", "device_errors": "code"}[family]
+        metrics[family] = _derived(max((s["value"] for s in samples), default=None), unit,
+            "Maximum fresh runtime-reported gauge sample; server-wide", samples=len(samples),
+            eligible=len(snapshots), reason=None if samples else "No fresh gauge observations.",
+            aggregation="Maximum across observed samples/replicas, not sum or time-weighted mean.")
+    host_snapshots = [snap.get("host", {"status": "missing", "elapsed_seconds": snap.get("elapsed_seconds", 0)})
+                      for snap in snapshots]
+    configured = host_configured or data.get("host_configured") or any("host" in snap for snap in snapshots)
+    metrics.update(_derive_host(host_snapshots, configured))
+    profiles = {snap.get("profile", snap.get("mapping")) for snap in snapshots
+                if snap.get("profile", snap.get("mapping"))}
+    mappings = {"vllm-v1": V1, "vllm-legacy": LEGACY, "sglang": SGLANG, **ENGINE_METRICS}
+    support = {family for profile in profiles for family, _, _ in mappings.get(profile, {}).values()}
+    for key, row in metrics.items():
+        row["details"].setdefault("freshness", "Exporter timestamps when supplied; scrape-only samples have unknown source freshness.")
+        row["details"].setdefault("partial_coverage", bool(row["details"].get("excluded_intervals")))
+        if row["value"] is None and not key.startswith("host_"):
+            if not snapshots or all(snap.get("status") == "not_enabled" for snap in snapshots):
+                row.update(state="not_collected", reason="Runtime telemetry was not collected.",
+                           action="Configure and enable a supported runtime metrics endpoint.")
+            elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
+                family = key.rsplit("_", 2)[0]
+                required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
+                if required not in support:
+                    row.update(state="not_supported", reason="Selected runtime profile has no explicit contract for this measurement.",
+                               action="Use an adapter exposing documented matching duration counters or histogram buckets.")
+    return metrics
+
+
+def _derive_host(snapshots, configured):
+    intervals, excluded = _counter_intervals(snapshots, ["host_cpu_seconds"])
+    idle, total = 0, 0
+    valid_cpu_intervals = 0
+    for _, deltas in intervals:
+        modes = defaultdict(set)
+        for labels in deltas["host_cpu_seconds"]:
+            labels = dict(labels)
+            mode = labels.pop("mode", None)
+            modes[tuple(sorted(labels.items()))].add(mode)
+        if any("idle" not in values or not (values - {None, "idle", "guest", "guest_nice"}) for values in modes.values()):
+            excluded += 1
+            continue
+        valid_cpu_intervals += 1
+        for labels, delta in deltas["host_cpu_seconds"].items():
+            mode = dict(labels).get("mode")
+            # guest time is already included in user/nice in node_exporter Linux counters.
+            if mode in {"guest", "guest_nice"}:
+                continue
+            total += delta
+            if mode == "idle":
+                idle += delta
+    cpu = 100 * (1 - idle / total) if total and any(
+        dict(labels).get("mode") == "idle" for _, d in intervals for labels in d["host_cpu_seconds"]) else None
+    rows = {"host_cpu_percent": _derived(cpu, "percent", "100 × (1 − Δidle / Δtotal CPU seconds); node_exporter; server-wide",
+        samples=valid_cpu_intervals, eligible=max(0, len(snapshots)-1), excluded_intervals=excluded)}
+    # Match RAM labels in the latest scrape; stale/missing final RAM stays unavailable.
+    ram = None
+    for snap in snapshots[-1:]:
+        fresh = _fresh_families(snap, ["host_ram_total", "host_ram_available"])
+        if fresh and fresh["host_ram_total"].keys() == fresh["host_ram_available"].keys():
+            if all(0 <= fresh["host_ram_available"][k] <= v for k, v in fresh["host_ram_total"].items()):
+                ram = fresh
+                break
+    total_ram = sum(ram["host_ram_total"].values()) if ram else None
+    used = total_ram - sum(ram["host_ram_available"].values()) if ram else None
+    for key, value in (("host_ram_total_bytes", total_ram), ("host_ram_used_bytes", used)):
+        rows[key] = _derived(value, "bytes", "Latest matching MemTotal − MemAvailable (used), or MemTotal; node_exporter; server-wide",
+                             samples=len(ram["host_ram_total"]) if ram else 0, eligible=len(snapshots))
+        if value is None:
+            rows[key]["action"] = "Collect fresh matching node_memory_MemTotal_bytes and node_memory_MemAvailable_bytes from the configured exporter."
+    identities = sorted({s.get("host_identity") for s in snapshots if s.get("host_identity")})
+    for row in rows.values():
+        row["details"].update(host_identities=identities, collection_period_seconds=sorted({
+            s["collection_period_seconds"] for s in snapshots if "collection_period_seconds" in s}),
+            freshness="Exporter timestamp when supplied; otherwise scrape time only, source freshness unknown.")
+        if not configured:
+            row.update(state="not_collected", reason="Server host exporter not configured.",
+                       action="Set targets[].host_metrics_url to an existing node_exporter Prometheus-text endpoint.")
+    return rows

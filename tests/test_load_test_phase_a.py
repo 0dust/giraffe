@@ -343,6 +343,13 @@ async def test_sustained_individual_replenishment_and_not_sample_count():
     )  # One completion refills without slow peer.
     assert obs["points"][0]["delivered_window_seconds"] >= 0.059
     assert not obs["points"][0]["cut_short"]
+    sending, drain = run.observations["local"]["schedule_transitions"]
+    assert sending["intended_concurrency"] == 2
+    assert sending["start_ms"] == obs["points"][0]["sending_start_ms"]
+    assert sending["end_ms"] == obs["points"][0]["sending_end_ms"]
+    assert drain["start_ms"] == sending["end_ms"]
+    assert drain["intended_concurrency"] == 0
+    assert drain["end_ms"] >= drain["start_ms"]
     assert run.slots.qsize() == run.slots.maxsize
     assert (
         _checks(run, c.targets[0])[
@@ -922,4 +929,9 @@ async def test_repeated_cancellation_preserves_partial_window_records_and_slots(
     assert point["cancelled"] == 1
     assert point["delivered_window_seconds"] > 0
     assert point["cut_short"] and point["status"] == "inconclusive"
+    sending, drain = run.observations["local"]["schedule_transitions"]
+    assert sending["end_ms"] == point["sending_end_ms"]
+    assert drain["start_ms"] == sending["end_ms"]
+    assert drain["end_ms"] >= drain["start_ms"]
+    assert drain["intended_concurrency"] == 0
     assert run.slots.qsize() == run.slots.maxsize

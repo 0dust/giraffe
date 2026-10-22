@@ -1020,7 +1020,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     result.overall = overall_status(result.checks, result.abort_reason,
         memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted
                                      for check in result.checks))
-    return result
+    from .performance import refresh_performance
+    return refresh_performance(result)
 
 
 def _retained(report: RunReport) -> RunReport:
@@ -1051,7 +1052,8 @@ def _retained(report: RunReport) -> RunReport:
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
         result.requests.append(record if keep else _without_response(record))
-    return result
+    from .performance import refresh_performance
+    return refresh_performance(result)
 
 
 def _without_response(record: RequestRecord) -> RequestRecord:
@@ -1469,6 +1471,10 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
 
 
 def _render(report: RunReport) -> str:
+    from .performance import cli_summary, refresh_performance
+
+    # Keep the existing HTML layout until Phase C, sharing KPI semantics now.
+    report = refresh_performance(report.model_copy())
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
     ordered = sorted(report.requests, key=lambda r: (
@@ -1505,6 +1511,8 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
+    parts.append('<details><summary>Performance KPIs &amp; availability</summary>'
+                 + ''.join(f'<p>{_e(line)}</p>' for line in cli_summary(report)) + '</details>')
     storage = report.manifest.get("storage", {})
     if storage.get("response_bodies_omitted") or storage.get("limit_exceeded"):
         omitted = storage.get("response_bodies_omitted", 0)

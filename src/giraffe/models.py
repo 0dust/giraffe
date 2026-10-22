@@ -1150,6 +1150,7 @@ class Target(Model):
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
     metrics_url: str | None = None
+    host_metrics_url: str | None = Field(default=None, description="Optional node_exporter Prometheus-text URL for server host CPU/RAM; independent of runtime metrics credentials.")
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
     metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "unknown"
@@ -1173,6 +1174,14 @@ class Target(Model):
                 raise ValueError("metrics_url must be an http(s) endpoint")
             if metrics.username or metrics.password or metrics.query or metrics.fragment:
                 raise ValueError("metrics_url must not contain credentials, query or fragment")
+        if self.host_metrics_url is not None:
+            host_metrics = urlsplit(self.host_metrics_url)
+            if host_metrics.scheme not in {"http", "https"} or not host_metrics.hostname:
+                raise ValueError("host_metrics_url must be an http(s) endpoint")
+            if any(char.isspace() for char in self.host_metrics_url) or host_metrics.port == 0:
+                raise ValueError("host_metrics_url must have a valid host and port")
+            if host_metrics.username or host_metrics.password or host_metrics.query or host_metrics.fragment:
+                raise ValueError("host_metrics_url must not contain credentials, query or fragment")
         if self.route == "replica" and not self.parent:
             raise ValueError("replica targets require parent service name")
         if self.deployment.collector_url:
@@ -2297,6 +2306,16 @@ class RequestRecord(Model):
     client_cancelled_ms: float | None = None
     elapsed_ms: float = 0
     stream_end_ms: float | None = None
+    # Version 0 denotes saved records without receipt-event evidence. All times
+    # below are monotonic milliseconds relative to the same request timer.
+    timing_schema: int = 0
+    first_token_ms: float | None = None
+    first_token_reason: str | None = "Timing schema predates client content-event collection."
+    output_events: list[dict[str, Any]] = Field(default_factory=list)
+    output_events_truncated: bool = False
+    answer_read_timestamps_ms: list[float] = Field(default_factory=list)
+    reasoning_read_timestamps_ms: list[float] = Field(default_factory=list)
+    read_timestamps_truncated: bool = False
     first_output_ms: float | None = None
     last_output_ms: float | None = None
     answer_chunks: int = 0
@@ -2363,6 +2382,84 @@ class RequestRecord(Model):
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
+    def read_gaps_ms(self) -> list[float] | None:
+        """Answer-bearing network read gaps; these are not token ITL."""
+        if not self.timing_schema or not self.stream or self.read_timestamps_truncated:
+            return None
+        return [right - left for left, right in zip(
+            self.answer_read_timestamps_ms, self.answer_read_timestamps_ms[1:])]
+
+    @property
+    def reasoning_read_gaps_ms(self) -> list[float] | None:
+        if not self.timing_schema or not self.stream or self.read_timestamps_truncated:
+            return None
+        return [right - left for left, right in zip(
+            self.reasoning_read_timestamps_ms, self.reasoning_read_timestamps_ms[1:])]
+
+    @property
+    def tpot_estimate_ms(self) -> float | None:
+        """Reciprocal of the existing character-allocation generation estimate."""
+        pace = self.generation_tokens_per_second if self.timing_schema else None
+        return 1000 / pace if pace is not None and pace > 0 else None
+
+    @property
+    def tpot_direct_reason(self) -> str | None:
+        if not self.timing_schema:
+            return "Timing schema predates client content-event collection."
+        if not self.stream:
+            return "Non-streamed replies do not provide token arrival timing."
+        if not self.valid or self.status != "completed":
+            return "A valid completed answer and matching usage are required."
+        if self.output_tokens is None:
+            return "Answer-token usage is missing or includes unseparated reasoning."
+        if self.output_tokens <= 1:
+            return "Single-token answers have no subsequent-token interval."
+        if self.output_events_truncated or self.read_timestamps_truncated:
+            return "Receipt-event evidence was truncated; collect a shorter response."
+        if self.reasoning_stripped:
+            return "Inline reasoning lacks an independently aligned answer-token population."
+        events = [event for event in self.output_events if event["kind"] == "answer"]
+        if not events or events[0].get("token_count") != 1:
+            return "The first answer event is not proven to contain exactly one token; collect aligned streamed logprobs."
+        if (any(event.get("token_count") is None for event in events)
+                or sum(event["token_count"] for event in events) != self.output_tokens):
+            return "Streamed token-boundary evidence does not match answer usage."
+        if (len(events) < 2 or len({event["read_id"] for event in events}) != len(events)
+                or events[-1]["at_ms"] <= events[0]["at_ms"]):
+            return "Buffered answer events do not supply independent token arrival times."
+        return None
+
+    @property
+    def tpot_direct_ms(self) -> float | None:
+        """Mean answer-token interval, excluding one proven first-event token.
+
+        Later multi-token events retain their actual shared receipt timestamp;
+        this mean is not an observed individual-token latency distribution.
+        """
+        if self.tpot_direct_reason is not None:
+            return None
+        events = [event for event in self.output_events if event["kind"] == "answer"]
+        return (events[-1]["at_ms"] - events[0]["at_ms"]) / (self.output_tokens - 1)
+
+    @property
+    def itl_reason(self) -> str | None:
+        reason = self.tpot_direct_reason
+        if reason is not None:
+            return reason
+        if any(event.get("token_count") != 1 for event in self.output_events
+               if event["kind"] == "answer"):
+            return "Multi-token answer events lack individual token arrival timestamps."
+        return None
+
+    @property
+    def itl_ms(self) -> list[float] | None:
+        """Only proven one-token, independent-read events yield token ITL."""
+        if self.itl_reason is not None:
+            return None
+        times = [event["at_ms"] for event in self.output_events if event["kind"] == "answer"]
+        return [right - left for left, right in zip(times, times[1:])]
+
+    @property
     def stream_gap_applicable(self) -> bool:
         return not (self.stream and self.answer_reads <= 1 and self.completion_tokens in (1, 2))
 
@@ -2424,12 +2521,22 @@ class RunReport(Model):
     overall: Status
     manifest: dict[str, Any]
     checks: list[CheckResult] = Field(default_factory=list)
+    conditions: list[dict[str, Any]] = Field(default_factory=list)
+    performance: dict[str, Any] = Field(default_factory=dict)
     requests: list[RequestRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     observations: dict[str, Any] = Field(default_factory=dict)
     baseline: dict[str, Any] | None = None
     abort_reason: str | None = None
     limits_reached: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def aggregate_performance(self, info: ValidationInfo):
+        if not (info.context or {}).get("metadata_only"):
+            from .performance import refresh_performance
+
+            refresh_performance(self)
+        return self
 
     @model_validator(mode="before")
     @classmethod

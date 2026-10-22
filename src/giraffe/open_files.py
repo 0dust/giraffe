@@ -67,6 +67,7 @@ def open_file_guard(config, *, raise_limit=False, web=False):
                       and any(case.scorer == "judge" for case in config.request_pack.cases))
     judging = config.judging.concurrency if judging_active else 0
     metrics = sum(bool(target.metrics_url) for target in config.targets) if config.metrics or "gpu" in config.checks else 0
+    metrics += sum(bool(target.host_metrics_url) for target in config.targets)
     deployment = sum(target.deployment.discovery != "none" or bool(target.deployment.collector_url)
                      for target in config.targets)
     fields = ["concurrency", "default_concurrency"]

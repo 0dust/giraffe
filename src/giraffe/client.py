@@ -28,6 +28,7 @@ _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_RESPONSE_EVENTS = 256
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 _MAX_CONTENT_READS = 65536
+_MAX_OUTPUT_EVENTS = 4096
 _REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
@@ -263,6 +264,9 @@ class LLMClient:
             scenario=spec.scenario, check_ids=spec.check_ids,
             started_at=datetime.now(timezone.utc).isoformat(), status="failed",
             input_chars=spec.input_chars, requested_max_tokens=budget, stream=stream, answer_reads=0,
+            timing_schema=1, first_token_reason=(
+                "No qualifying streamed generated-content event was observed." if stream else
+                "Non-streamed replies do not provide first-token arrival timing."),
         )
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
@@ -296,12 +300,47 @@ class LLMClient:
         last_answer: float | None = None
         tool_output: float | None = None
         # (output offset, read time) per network read carrying content; bounded.
-        content_reads: list[tuple[int, float]] = []
+        content_reads: list[tuple[int, float, int]] = []
         reads_truncated = False
+        read_id = 0
+        reasoning_read_ids: set[int] = set()
+        content_event_spans: list[tuple[dict[str, Any], int, int]] = []
         response_sequence = -1
         conversation = spec.workload.get("selection") == "conversation"
         assistant_content_present = False
         assistant_extras: dict[str, list[str]] = {}
+
+        def stream_body_received(size):
+            nonlocal read_id
+            read_id += 1
+            body_received(size)
+
+        def output_event(kind: str, text: str, at: float, *, tokens=None):
+            # Client receipt time, not server generation time. Tool-only TTFT
+            # starts at generated argument content, not ID/type/function names.
+            # No tokenization or text retention is added to the stream reader.
+            # A nonempty whitespace delta is still generated content for TTFT;
+            # useful-answer timing continues to require non-whitespace output.
+            if not stream or not text:
+                return
+            if record.first_token_ms is None:
+                record.first_token_ms = (at - start) * 1000
+                record.first_token_reason = None
+            if kind == "reasoning" and read_id not in reasoning_read_ids:
+                if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
+                    record.reasoning_read_timestamps_ms.append((at - start) * 1000)
+                    reasoning_read_ids.add(read_id)
+                else:
+                    record.read_timestamps_truncated = True
+            if len(record.output_events) >= _MAX_OUTPUT_EVENTS:
+                record.output_events_truncated = True
+                return
+            event = {"sequence": response_sequence, "read_id": read_id,
+                "at_ms": (at - start) * 1000, "kind": kind, "chars": len(text),
+                "token_count": tokens,
+                "token_count_source": "choice.logprobs.content" if tokens is not None else None}
+            record.output_events.append(event)
+            return event
 
         def trace(kind: str, **metadata: int | bool) -> None:
             # Sequence identifies a response choice, not field order within its JSON.
@@ -382,6 +421,19 @@ class LLMClient:
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
+            if streaming:
+                token_evidence = choice.get("logprobs")
+                token_parts = token_evidence.get("content") if isinstance(token_evidence, dict) else None
+                tokens = None
+                if (isinstance(token_parts, list) and token_parts
+                        and all(isinstance(part, dict) and isinstance(part.get("token"), str)
+                                for part in token_parts)
+                        and "".join(part["token"] for part in token_parts) == answer):
+                    tokens = len(token_parts)
+                content_event = output_event("answer", _REASONING_TAG.sub("", answer), now, tokens=tokens)
+                if content_event is not None:
+                    content_event_spans.append((content_event, len(record.output), len(record.output) + len(answer)))
+                output_event("reasoning", reasoning, now)
             if streaming and (_REASONING_TAG.sub("", answer).strip() or reasoning.strip()):
                 record.generation_chunks += 1
             calls = content.get("tool_calls")
@@ -417,6 +469,8 @@ class LLMClient:
                           type_present=call.get("type") is not None)
                     part["function"]["name"] += name
                     part["function"]["arguments"] += arguments
+                    if streaming:
+                        output_event("tool_arguments", arguments, now)
                     if tool_output is None and (function.get("name") or function.get("arguments")):
                         tool_output = now
                     if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
@@ -427,9 +481,9 @@ class LLMClient:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
                 trace("content", offset=len(record.output), length=len(answer))
-                if not content_reads or content_reads[-1][1] != now:
+                if not content_reads or content_reads[-1][2] != read_id:
                     if len(content_reads) < _MAX_CONTENT_READS:
-                        content_reads.append((len(record.output), now))
+                        content_reads.append((len(record.output), now, read_id))
                     else:
                         reads_truncated = True
                 record.output += answer
@@ -505,7 +559,7 @@ class LLMClient:
                         if "application/json" in response.headers.get("content-type", ""):
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        async for event_type, event, observed_at in _sse_events(response, on_read=body_received):
+                        async for event_type, event, observed_at in _sse_events(response, on_read=stream_body_received):
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
@@ -589,17 +643,38 @@ class LLMClient:
                 record.output_tokens = None
             record.reasoning_stripped = record.reasoning_stripped or stripped
             reasoning_spans = _reasoning_spans(spans, len(record.output))
+            # Inline reasoning is known only once all fragments/tags have been
+            # parsed. Reclassify bounded metadata without retaining extra text.
+            if stripped:
+                for event, offset, end in content_event_spans:
+                    answer_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
+                    reasoning_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in reasoning_spans)
+                    has_answer = bool(answer_text.strip())
+                    has_reasoning = bool(_REASONING_TAG.sub("", reasoning_text).strip())
+                    event["kind"] = ("answer_and_reasoning" if has_answer and has_reasoning else
+                                     "answer" if has_answer else "reasoning")
+                    event["token_count"] = event["token_count_source"] = None
             first_read = last_read = None
             gap = None
-            for index, (offset, at) in enumerate(content_reads):
+            for index, (offset, at, content_read_id) in enumerate(content_reads):
                 end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
                 text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
+                has_reasoning = stripped and any(
+                    _REASONING_TAG.sub("", record.output[max(offset, a):min(end, b)]).strip()
+                    for a, b in reasoning_spans)
+                if has_reasoning and stream and content_read_id not in reasoning_read_ids:
+                    if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
+                        record.reasoning_read_timestamps_ms.append((at - start) * 1000)
+                        reasoning_read_ids.add(content_read_id)
+                    else:
+                        record.read_timestamps_truncated = True
                 if (stripped and record.first_reasoning_ms is None
-                        and any(_REASONING_TAG.sub("", record.output[max(offset, a):min(end, b)]).strip()
-                                for a, b in reasoning_spans)):
+                        and has_reasoning):
                     record.first_reasoning_ms = (at - start) * 1000
                 if not text.strip():
                     continue
+                if stream:
+                    record.answer_read_timestamps_ms.append((at - start) * 1000)
                 record.answer_reads += 1
                 if first_read is None:
                     first_read, record.first_read_answer_chars = at, len(text)
@@ -607,6 +682,7 @@ class LLMClient:
                     gap = max(gap or 0, (at - last_read) * 1000)
                 last_read = at
             if reads_truncated:
+                record.read_timestamps_truncated = True
                 record.answer_reads = 0
                 record.first_read_answer_chars = 0
                 record.last_output_ms = record.max_stream_gap_ms = None
@@ -620,6 +696,7 @@ class LLMClient:
                     record.first_output_ms = (min(candidates) - start) * 1000 if candidates else None
                 if tool_output is None:
                     record.last_output_ms = (last_read - start) * 1000 if last_read is not None else None
+            record.reasoning_read_timestamps_ms.sort()
             if record.valid and record.status == "completed":
                 answer = final
                 if record.workload.get("equality") == "whitespace":
