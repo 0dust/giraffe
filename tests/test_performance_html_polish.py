@@ -34,3 +34,13 @@ def test_only_intended_transitions_have_bounded_markers():
     html = _chart('Concurrency', [('Actual', rows), ('Intended', rows)], step=True)
     assert 0 < html.count('class="html-transition"') <= 40
     assert html.count('<circle') == html.count('class="html-transition"')
+
+
+def test_standalone_time_and_value_domains_end_at_nice_ticks():
+    html = _chart('Timing', [('Latency', [(1, 1), (1000, 11.26)])])
+    assert 'class="html-axis-label y-max">12.5</span>' in html
+    assert 'class="html-axis-label x-max">1,000</span>' in html
+    html = _chart('Concurrency', [('Actual', [(0, 0), (217.48, 156)])],
+                  xlabel='Elapsed seconds', ylabel='Requests in flight', step=True)
+    assert 'class="html-axis-label x-max">250</span>' in html
+    assert 'class="html-axis-label y-max">200</span>' in html

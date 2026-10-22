@@ -157,6 +157,17 @@ def _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel, stage_labels=''):
                                           ('x-title', xlabel), ('y-title', ylabel))) + '</div>')
 
 
+def _nice_max(start, end, *, integer=False):
+    """Drawing domain only: nearest 1/2/2.5/5 decade step, rounded outward."""
+    raw = (end - start or abs(end) or 1) / 4
+    power = 10 ** math.floor(math.log10(raw))
+    choices = ([1] if integer and raw < 1 else
+               [value * power for value in (1, 2, 2.5, 5, 10)
+                if not integer or float(value * power).is_integer()])
+    step = min(choices, key=lambda value: abs(value - raw))
+    return float(f'{math.ceil(end / step - 1e-10) * step:.12g}')
+
+
 def _chart(title, series, *, xlabel="Request number · dispatch order", ylabel="seconds", step=False, bands=()):
     series = [(name, [(x, y) for x, y in points if _number(x) and _number(y)]) for name, points in series]
     series = [(name, points) for name, points in series if len(points) > 1]
@@ -168,6 +179,9 @@ def _chart(title, series, *, xlabel="Request number · dispatch order", ylabel="
     if xmax <= xmin:
         return ''
     ymax = ymax if ymax > ymin else ymin + 1
+    if not xlabel.startswith('Request number'):
+        xmax = _nice_max(xmin, xmax)
+    ymax = _nice_max(ymin, ymax, integer='tokens' in ylabel.lower() or 'requests' in ylabel.lower())
     def x(value):
         return 48 + (value - xmin) / (xmax - xmin) * 816
 
@@ -212,9 +226,10 @@ def _buckets(data):
     maximum = max(row['count'] for row in rows)
     if duration <= 0 or not maximum:
         return ''
+    xmax, ymax = _nice_max(0, duration), _nice_max(0, maximum, integer=True)
     # Backend bounds completion buckets to approximately twenty per window.
-    bars = ''.join(f'<rect x="{48+816*r["start_s"]/duration+3:.2f}" y="{220-180*r["count"]/maximum:.2f}"'
-                   f' width="{max(1,816*r["duration_s"]/duration-6):.2f}" height="{180*r["count"]/maximum:.2f}" fill="#f5b544">'
+    bars = ''.join(f'<rect x="{48+816*r["start_s"]/xmax+3:.2f}" y="{220-180*r["count"]/ymax:.2f}"'
+                   f' width="{max(1,816*r["duration_s"]/xmax-6):.2f}" height="{180*r["count"]/ymax:.2f}" fill="#f5b544">'
                    f'<title>{_fmt(r["start_s"])}–{_fmt(r["end_s"])} s · {r["count"]} completed requests'
                    + (' · partial bucket' if r['partial'] else '') + '</title></rect>' for r in rows)
     desc = f'Completed-request counts in {len(rows)} elapsed-time buckets, nominal width {data["width_s"]} seconds. Includes failed terminal requests; counts are not a rate.'
@@ -222,7 +237,7 @@ def _buckets(data):
     caption = (_fmt(data['width_s']) + '-second buckets; '
                + ('the final bucket uses its actual duration (' + _fmt(rows[-1]['duration_s']) + ' s).'
                   if data['final_partial_bucket'] else 'all buckets use the full duration.'))
-    return (_chart_frame(svg, 0, duration, 0, maximum, 'Elapsed seconds', 'Completed requests')
+    return (_chart_frame(svg, 0, xmax, 0, ymax, 'Elapsed seconds', 'Completed requests')
             + '<p class="html-note">' + caption + '</p><details><summary>Bucket definitions</summary><p>'
             + _e(data['rule']) + ' ' + _e(data.get('boundary_rule', '')) + ' '
             + _e(data['partial_bucket_disclosure']) + '</p></details>')

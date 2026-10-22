@@ -326,7 +326,13 @@ function conditionGeometry(keys) {
     layout.basis ||=added.length;
     for(let offset=0;offset<added.length;offset+=layout.basis){
       const batch=added.slice(offset,offset+layout.basis),strip=reticulateCells(batch.length,layout.basis),width=layout.width||strip.width,scale=width/strip.width,y=layout.height;
-      batch.forEach((key,i)=>layout.cells.set(key,strip.cells[i].split(' ').map(pair=>{const [px,py]=pair.split(',').map(Number);return `${(px*scale).toFixed(2)},${(y+py*scale).toFixed(2)}`;}).join(' ')));
+      // Assign execution order to centroid reading order, without changing the
+      // original coat generator or any polygon once assigned to a condition.
+      const rowHeight=strip.height/Math.ceil(batch.length/strip.columns),cells=strip.cells.map(points=>{
+        const vertices=points.split(' ').map(pair=>pair.split(',').map(Number)),x=vertices.reduce((sum,p)=>sum+p[0],0)/vertices.length,cy=vertices.reduce((sum,p)=>sum+p[1],0)/vertices.length;
+        return {points,x,row:Math.floor(cy/rowHeight)};
+      }).sort((a,b)=>a.row-b.row||a.x-b.x);
+      batch.forEach((key,i)=>layout.cells.set(key,cells[i].points.split(' ').map(pair=>{const [px,py]=pair.split(',').map(Number);return `${(px*scale).toFixed(2)},${(y+py*scale).toFixed(2)}`;}).join(' ')));
       layout.width=width;layout.height+=strip.height*scale;layout.columns ||=strip.columns;layout.round=strip.round;
     }
   }
@@ -372,15 +378,16 @@ function renderTests(records,{conditions=[],live=false,report=null}={}) {
     const check=summary.check_id || condition.check || 'serving',name=conditionDisplayName(condition,summary),description=conditionDescription(condition,summary),checkName=catalogTitle(check);
     conditionViews.set(item.key,{...item,summary,status,name,description,checkName,live});
   }
-  const views=[...conditionViews.values()],geometry=conditionGeometry(views.map(view=>view.key)),counts=new Map();
+  const geometry=conditionGeometry([...conditionViews.keys()]),views=[...geometry.cells.keys()].map(key=>conditionViews.get(key)).filter(Boolean),counts=new Map();
   views.forEach(view=>counts.set(view.status,(counts.get(view.status)||0)+1));
+  const orderedCounts=Object.keys(conditionStatusNames).filter(status=>counts.has(status)).map(status=>[status,counts.get(status)]);
   if(!conditionViews.has(conditionFocus))conditionFocus=(views.find(view=>view.status==='running') || views.at(-1))?.key || null;
-  const focused=currentConditionView(views),countsLine=[...counts].map(([status,count])=>`${number(count)} ${(conditionStatusNames[status] || status).toLowerCase()}`).join(' · ');
+  const focused=currentConditionView(views),countsLine=orderedCounts.map(([status,count])=>`${number(count)} ${(conditionStatusNames[status] || status).toLowerCase()}`).join(' · ');
   const cells=views.map((view,i)=>{
     const points=geometry.cells.get(view.key),css=conditionStatusClass(view.status),tooltip=`${view.checkName} · ${view.name} · ${view.description}\n${conditionProgress(view)}`;
     return `<g class="condition-spot request-spot ${css}${view.key===focused?.key?' current':''}" data-live-key="condition:${escape(view.key)}" data-condition-key="${escape(view.key)}" data-condition-id="${escape(view.condition.id)}" data-state="${escape(css)}" role="button" tabindex="${view.key===conditionFocus?0:-1}" aria-label="${escape(tooltip)}"><title>${escape(tooltip)}</title><polygon points="${points}"/><text class="spot-glyph" x="${(points.split(' ').reduce((sum,p)=>sum+Number(p.split(',')[0]),0)/points.split(' ').length).toFixed(2)}" y="${(points.split(' ').reduce((sum,p)=>sum+Number(p.split(',')[1]),0)/points.split(' ').length).toFixed(2)}" aria-hidden="true">${conditionStatusGlyphs[view.status] || '!'}</text></g>`;
   }).join('');
-  return `<section class="request-viz tests-section" aria-label="Tests" data-live-key="condition-tests"><div class="viz-heading"><h2 id="tests-heading">Tests</h2><span class="mono hint condition-summary" aria-live="polite">${escape(countsLine)}</span></div>${views.length?`<div class="mosaic-scroll"><svg class="condition-mosaic" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="Test conditions. Arrow keys move between cells; Enter opens details.">${cells}</svg></div>`:'<p class="viz-empty">Waiting for the first test condition…</p>'}<div class="viz-footer"><div class="mosaic-legend">${[...counts].map(([status])=>`<span><i class="legend-dot ${conditionStatusClass(status)}"></i>${conditionStatusGlyphs[status] || '!'} ${escape(conditionStatusNames[status] || human(status))}</span>`).join('')}</div><span class="hint">${number(views.length)} test condition${views.length===1?'':'s'}</span></div><div id="condition-selection" class="condition-selection" data-live-key="condition-selection">${conditionSelection(focused)}</div></section>`;
+  return `<section class="request-viz tests-section" aria-label="Tests" data-live-key="condition-tests"><div class="viz-heading"><h2 id="tests-heading">Tests</h2><span class="mono hint condition-summary" aria-live="polite">${escape(countsLine)}</span></div>${views.length?`<div class="mosaic-scroll"><svg class="condition-mosaic" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="Test conditions. Arrow keys move between cells; Enter opens details.">${cells}</svg></div>`:'<p class="viz-empty">Waiting for the first test condition…</p>'}<div class="viz-footer"><div class="mosaic-legend">${orderedCounts.map(([status])=>`<span><i class="legend-dot ${conditionStatusClass(status)}"></i>${conditionStatusGlyphs[status] || '!'} ${escape(conditionStatusNames[status] || human(status))}</span>`).join('')}</div><span class="hint">${number(views.length)} test condition${views.length===1?'':'s'}</span></div><div id="condition-selection" class="condition-selection" data-live-key="condition-selection">${conditionSelection(focused)}</div></section>`;
 }
 function conditionDialogCounts(view) {
   const s=view.summary,plan=s.planned==null?'—':`${s.planned_kind==='upper_bound'?'up to ':''}${number(s.planned)}`;
@@ -2779,12 +2786,20 @@ function performanceIntegerTicks(min,max,divisions=4) {
   if(ticks.at(-1)!==max)ticks.push(max);
   return ticks;
 }
+function performanceNiceTicks(min,max,divisions=4,integer=false) {
+  const raw=(max-min||Math.abs(max)||1)/divisions,power=10**Math.floor(Math.log10(raw));
+  const choices=integer&&raw<1?[1]:[1,2,2.5,5,10].map(value=>value*power).filter(value=>!integer||Number.isInteger(value));
+  const step=choices.reduce((best,value)=>Math.abs(value-raw)<Math.abs(best-raw)?value:best);
+  const first=Math.ceil(min/step-1e-10),last=Math.max(first+Number(max===min),Math.ceil(max/step-1e-10));
+  const ticks=Array.from({length:last-first+1},(_,index)=>Number(((first+index)*step).toPrecision(12)));
+  return {min,max:ticks.at(-1),step,ticks};
+}
 function performanceAxes(xmin,xmax,ymax,{xlabel='Request number · dispatch order',ylabel='seconds',width=900,integerX=false,integerY=false}={}) {
-  const left=58,right=width-20,bottom=238,sx=x=>xmin===xmax?(left+right)/2:left+(x-xmin)/(xmax-xmin)*(right-left),sy=y=>bottom-y/ymax*204,divisions=width<500?2:4;
-  const ticks=integerX?performanceIntegerTicks(xmin,xmax,divisions):xmin===xmax?[xmin]:Array.from({length:divisions+1},(_,i)=>xmin+(xmax-xmin)*i/divisions);
-  const yticks=integerY?performanceIntegerTicks(0,Math.ceil(ymax),4):Array.from({length:5},(_,i)=>ymax*i/4);
+  const divisions=width<500?2:4,xaxis=integerX?{min:xmin,max:xmax,ticks:performanceIntegerTicks(xmin,xmax,divisions)}:performanceNiceTicks(xmin,xmax,divisions),yaxis=performanceNiceTicks(0,ymax,4,integerY);
+  const left=58,right=width-20,bottom=238,sx=x=>xaxis.min===xaxis.max?(left+right)/2:left+(x-xaxis.min)/(xaxis.max-xaxis.min)*(right-left),sy=y=>bottom-y/yaxis.max*204;
+  const ticks=xaxis.ticks,yticks=yaxis.ticks;
   const grid=yticks.map(y=>`<line x1="${left}" x2="${right}" y1="${sy(y)}" y2="${sy(y)}" class="performance-gridline"/><text data-axis-tick="y" x="${left-9}" y="${sy(y)+4}" text-anchor="end">${integerY?number(y):performanceNumber(y)}</text>`).join('');
-  return {sx,sy,width,left,right,bottom,html:`${grid}<line x1="${left}" x2="${right}" y1="238" y2="238" class="performance-axis"/>${ticks.map(x=>`<text data-axis-tick="x" x="${sx(x)}" y="257" text-anchor="middle">${integerX?number(x):performanceNumber(x)}</text>`).join('')}<text x="${(left+right)/2}" y="282" text-anchor="middle">${escape(xlabel)}</text><text x="${left}" y="17">${escape(ylabel)}</text>`};
+  return {sx,sy,width,left,right,bottom,xmin:xaxis.min,xmax:xaxis.max,ymax:yaxis.max,xticks:ticks,yticks,html:`${grid}<line x1="${left}" x2="${right}" y1="238" y2="238" class="performance-axis"/>${ticks.map(x=>`<text data-axis-tick="x" x="${sx(x)}" y="257" text-anchor="middle">${integerX?number(x):performanceNumber(x)}</text>`).join('')}<text x="${(left+right)/2}" y="282" text-anchor="middle">${escape(xlabel)}</text><text x="${left}" y="17">${escape(ylabel)}</text>`};
 }
 function renderPerformanceLineChart(id,title,caption,rows,series,{step=false,stages=[],bounds=null,controls='',xlabel='Request number · dispatch order',ylabel='seconds'}={}) {
   const view=performancePlotView(id),prepared=series.map(item=>({...item,points:rows.map((row,index)=>({x:row.x??row.number,y:item.value?item.value(row):row.values?.[item.key],row,index})).filter(point=>finitePerformance(point.x)&&finitePerformance(point.y)).map(point=>({...point,y:point.y*(item.scale??1)}))}));
@@ -2806,7 +2821,7 @@ function renderPerformanceLineChart(id,title,caption,rows,series,{step=false,sta
     if(carry&&(!visibleRows.length||(visibleRows[0].x??visibleRows[0].number)>xmin))visibleRows.unshift({...carry,x:xmin});
     if(visibleRows.length&&(visibleRows.at(-1).x??visibleRows.at(-1).number)<xmax)visibleRows.push({...visibleRows.at(-1),x:xmax});
   }
-  const chart={id,rows:visibleRows,series:prepared.map(({points,...item})=>step?{...item,points}:item),xmin,xmax,ymax,sx:axes.sx,sy:axes.sy,width:axes.width,left:axes.left,right:axes.right,kind:step?'step':'requests'};
+  const chart={id,rows:visibleRows,series:prepared.map(({points,...item})=>step?{...item,points}:item),xmin:axes.xmin,xmax:axes.xmax,ymax:axes.ymax,sx:axes.sx,sy:axes.sy,width:axes.width,left:axes.left,right:axes.right,kind:step?'step':'requests'};
   performanceCharts.set(id,chart);
   const paths=prepared.filter(item=>item.points.length).map((item,index)=>{
     const drawn=minMaxDecimate(visiblePoints(item.points),Math.min(160,Math.floor((axes.right-axes.left)/2))),path=drawn.map((point,i)=>`${i?(step?'H'+axes.sx(point.x).toFixed(2)+'V':'L'):'M'}${step&&i?'':axes.sx(point.x).toFixed(2)+','}${axes.sy(point.y).toFixed(2)}`).join(' ');
@@ -2823,7 +2838,7 @@ function renderPerformanceCompletions(summary) {
   if(!buckets.length||!buckets.some(bucket=>bucket.count>0))return `<article class="performance-plot performance-chart-empty"><h3>Completed requests over time</h3><p class="hint">${buckets.length?'No completed requests in the selected window; recorded bucket counts are zero.':'No completion timestamps were recorded in this window.'}</p></article>`;
   const xmax=buckets.at(-1).end_s,ymax=Math.max(1,...buckets.map(bucket=>bucket.count)),axes=performanceAxes(0,xmax,ymax,{xlabel:'Elapsed seconds',ylabel:'completed requests',width:performanceChartWidths.get('completions')||900,integerY:true});
   const rows=buckets.map((bucket,index)=>({...bucket,x:(bucket.start_s+bucket.end_s)/2,number:index+1,values:{count:bucket.count}}));
-  performanceCharts.set('completions',{id:'completions',rows,series:[{key:'count',label:'Completed requests',unit:'requests'}],xmin:0,xmax,ymax,sx:axes.sx,sy:axes.sy,width:axes.width,left:axes.left,right:axes.right,kind:'buckets'});
+  performanceCharts.set('completions',{id:'completions',rows,series:[{key:'count',label:'Completed requests',unit:'requests'}],xmin:axes.xmin,xmax:axes.xmax,ymax:axes.ymax,sx:axes.sx,sy:axes.sy,width:axes.width,left:axes.left,right:axes.right,kind:'buckets'});
   const last=buckets.at(-1),partial=data.final_partial_bucket?`The final bucket uses its actual duration (${performanceNumber(last.duration_s)} s).`:'Every bucket covers its full duration.';
   return `<article class="performance-plot" data-live-key="plot-completions"><h3>Completed requests over time</h3><p class="performance-caption">${performanceNumber(data.width_s)}-second buckets; ${escape(partial.charAt(0).toLowerCase()+partial.slice(1))} Completion counts include failed terminal requests.</p><svg class="performance-chart" data-performance-chart="completions" viewBox="0 0 ${axes.width} 292" role="img" tabindex="0" aria-label="Completed request counts in ${buckets.length} elapsed-time buckets, including terminal failures. ${escape(partial)}" aria-describedby="performance-inspection-completions"><desc>${escape(data.rule)} ${escape(data.boundary_rule)}</desc>${axes.html}${buckets.map(bucket=>{const span=axes.sx(bucket.end_s)-axes.sx(bucket.start_s),gap=Math.min(6,span*.2);return `<rect class="performance-completion-bar" x="${axes.sx(bucket.start_s)+gap/2}" y="${axes.sy(bucket.count)}" width="${Math.max(.1,span-gap)}" height="${238-axes.sy(bucket.count)}"><title>${performanceNumber(bucket.start_s)}–${performanceNumber(bucket.end_s)} s · ${number(bucket.count)} completed · ${number(bucket.valid_completions)} valid</title></rect>`;}).join('')}<line class="performance-crosshair" x1="${axes.left}" x2="${axes.left}" y1="27" y2="238" hidden/></svg><details class="performance-bucket-details"><summary>Bucket definitions${data.final_partial_bucket?' · partial final bucket':''}</summary><p class="performance-caption">${escape(data.rule)} ${escape(data.boundary_rule)} ${escape(data.partial_bucket_disclosure||'')} ${escape(partial)}</p></details><div id="performance-inspection-completions" class="performance-inspection" role="status" aria-live="polite">Focus or point at a bucket to inspect its count and actual duration.</div></article>`;
 }
@@ -3133,7 +3148,7 @@ function renderLive() {
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const stopReasons=liveStopReasons(d),liveError=state.liveError?.id===d.id?state.liveError.message:'';
   const title=judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Mission control';
-  const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'Requests appear as they start. Select a spot for evidence.';
+  const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Limit simultaneous requests',c.concurrency??'Not set'],['Stop after this many requests',c.max_requests??'Not set'],['Stop test traffic after',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request deadline',elapsed(c.request_timeout_seconds)],['Output cap',`${c.max_output_tokens} tokens`]];
   patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p></div><button class="button danger" data-action="stop" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':'Stop run'}</button></div>
   ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>

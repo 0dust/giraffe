@@ -292,15 +292,20 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
     # core batches; only rows that actually have a meaningful executor scenario
     # are cells (never check aliases that merely reuse another request).
     plan = request_plan(config)
-    core = {"initial", "generation", "pack_control", "pack_loaded", "recovery_baseline", "recovery", "sustained"}
-    for row in plan["rows"]:
-        identifier = row["id"]
-        if identifier in {"correctness", "json"} and row["requests_per_target"]:
+    plan_rows = {row["id"]: row for row in plan["rows"]}
+    # Preview/catalogue order differs from dispatch order. Match _target first,
+    # then workloads.execute; ordering changes metadata only, never execution.
+    for identifier in ("initial", "generation", "context_first_batch", "pack_control",
+                       "pack_loaded", "correctness", "json"):
+        row = plan_rows.get(identifier)
+        if row is None:
+            continue
+        if identifier in {"correctness", "json"}:
+            if not row["requests_per_target"]:
+                continue
             identifier += f"_c{config.effective_check(identifier)['concurrency']}"
         elif identifier == "context_first_batch":
             identifier = "context"
-        elif identifier not in core:
-            continue
         count = row["requests_per_target"]
         kind = "exact" if row["kind"] == "exact" else "upper_bound" if count is not None else "unknown"
         if identifier == "context":
@@ -308,6 +313,30 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
         if count != 0:
             add(identifier, count, kind)
 
+    if "cancellation" in selected:
+        options = config.effective_check("cancellation")
+        fixtures = builtin_fixtures(config, check_id="cancellation")["limits"]
+        normal = sum(spec.cancel_after_ms is None and not spec.fixture_id.startswith("limits.stop_control") for spec in fixtures)
+        cancelled = sum(spec.cancel_after_ms is not None for spec in fixtures)
+        add("stop_control", 1, "exact")
+        add("limits", max(options["samples"], normal), "exact")
+        if cancelled:
+            add("cancellation_baseline", 1, "exact")
+            add("client_cancel", cancelled, "exact")
+        add("cancellation_probe", options["samples"], "exact")
+        if cancelled:
+            add("client_deadline", 1, "exact")
+    for identifier in ("recovery_baseline", "sustained", "recovery"):
+        row = plan_rows.get(identifier)
+        if row and row["requests_per_target"] != 0:
+            count = row["requests_per_target"]
+            kind = "exact" if row["kind"] == "exact" else "upper_bound" if count is not None else "unknown"
+            add(identifier, count, kind)
+    if "prefix" in selected and config.prefix:
+        settings = config.prefix
+        add("prefix_shared", settings.repeats, "exact")
+        add("prefix_independent", settings.repeats, "exact")
+        add("prefix_history", settings.history_turns, "upper_bound")
     if "load" in selected:
         settings = dict(settings_sets(config.load_test))
         for point in test_points(config.load_test):
@@ -334,11 +363,12 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
     if "arrivals" in selected and config.arrivals:
         add("arrival", config.arrivals.requests, "exact",
             {"requests_per_second": config.arrivals.requests_per_second})
-    if "prefix" in selected and config.prefix:
-        settings = config.prefix
-        add("prefix_shared", settings.repeats, "exact")
-        add("prefix_independent", settings.repeats, "exact")
-        add("prefix_history", settings.history_turns, "upper_bound")
+    if "sessions" in selected and config.sessions:
+        settings = config.sessions
+        count = (sum(len(item.turns) for item in workload_plan(settings.workloads, settings.sessions))
+                 if settings.profile == "performance" else settings.sessions * len(settings.turns))
+        for mode in settings.modes:
+            add(f"session_{mode}_turn0", count, "upper_bound")
     if "consistency" in selected and config.consistency:
         settings = config.consistency
         for shape in settings.shapes:
@@ -346,35 +376,19 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                 count = (corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
                          if settings.logprobs else settings.prompts_per_shape * sample_count(settings.repetitions, level))
                 add(f"consistency_c{level}_{shape}", count, "exact")
-    if "sessions" in selected and config.sessions:
-        settings = config.sessions
-        count = (sum(len(item.turns) for item in workload_plan(settings.workloads, settings.sessions))
-                 if settings.profile == "performance" else settings.sessions * len(settings.turns))
-        for mode in settings.modes:
-            add(f"session_{mode}_turn0", count, "upper_bound")
     if "tools" in selected:
         custom = bool(config.tool_checks and config.tool_checks.fixtures)
-        for fixture in resolved_tool_fixtures(config):
-            for forced in ([False, True] if config.forced_tool_diagnostic and not fixture.choice else [False]):
+        for fixture in config.tool_checks.conversations if config.tool_checks else []:
+            for mode in resolved_tool_modes(config):
+                add(f"tools_{fixture.fixture_id}_{mode}_turn0", len(fixture.steps) + 1, "upper_bound")
+        for forced in ([False, True] if config.forced_tool_diagnostic else [False]):
+            for fixture in resolved_tool_fixtures(config):
+                if forced and fixture.choice:
+                    continue
                 choice = "forced" if forced else fixture.choice.mode if fixture.choice else "auto"
                 prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
                 for mode in resolved_tool_modes(config):
                     add(f"{prefix}_{choice}_{mode}", 1, "exact")
-        for fixture in config.tool_checks.conversations if config.tool_checks else []:
-            for mode in resolved_tool_modes(config):
-                add(f"tools_{fixture.fixture_id}_{mode}_turn0", len(fixture.steps) + 1, "upper_bound")
-    if "cancellation" in selected:
-        options = config.effective_check("cancellation")
-        fixtures = builtin_fixtures(config, check_id="cancellation")["limits"]
-        normal = sum(spec.cancel_after_ms is None and not spec.fixture_id.startswith("limits.stop_control") for spec in fixtures)
-        cancelled = sum(spec.cancel_after_ms is not None for spec in fixtures)
-        add("stop_control", 1, "exact")
-        add("limits", max(options["samples"], normal), "exact")
-        if cancelled:
-            add("cancellation_baseline", 1, "exact")
-            add("client_cancel", cancelled, "exact")
-            add("client_deadline", 1, "exact")
-        add("cancellation_probe", options["samples"], "exact")
     return [condition_aggregate({"target": target.name, **summary})
             for target in config.targets for summary in scenarios.values()]
 

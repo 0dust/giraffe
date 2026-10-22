@@ -10,8 +10,9 @@ def synthetic_report_1000():
     """Six sustained stages 4→8→16→32→16→8, budgets 80/140/200/300/180/100.
 
     Synthetic successful transport is not a correctness/capacity verdict. Long
-    responses and outliers survive stage downshifts; heap slots model real
-    lifetimes. Pauses, cache reuse and timing are invented, explicitly labelled.
+    responses and outliers survive stage downshifts; new dispatches wait until
+    the surviving lifetimes leave room under the current target. Pauses, cache
+    reuse and timing are invented, explicitly labelled.
     """
     rng = random.Random(52)
     epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -22,7 +23,7 @@ def synthetic_report_1000():
         for slot in range(budget):
             while active and active[0] <= now:
                 heapq.heappop(active)
-            if len(active) >= level:
+            while len(active) >= level:
                 now = heapq.heappop(active)
                 while active and active[0] <= now:
                     heapq.heappop(active)
