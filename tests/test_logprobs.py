@@ -390,7 +390,16 @@ async def test_api_preview_export_execution_retention_and_rerun(tmp_path):
             detail = await finished(client, identifier)
             result = next(c for c in detail['report']['checks'] if c['id'] == 'consistency')
             assert result['status'] == 'inconclusive'
-            assert all(not r['logprob_evidence']['tokens'] for r in detail['report']['requests'])
+            assert detail['report']['requests_compact']
+            assert all('logprob_evidence' not in r for r in detail['report']['requests'])
+            for row in detail['report']['requests']:
+                evidence = await client.get(f"/api/runs/{identifier}/requests/{row['id']}")
+                assert evidence.status_code == 200
+                retained = evidence.json()
+                assert retained['id'] == row['id']
+                assert retained['logprob_evidence']['tokens'] == []
+                assert retained['output'] == retained['reasoning'] == ''
+                assert retained['logprob_evidence']['status'] == 'available'
             saved = (await client.get(f'/api/runs/{identifier}/config.json')).json()
             assert saved['consistency']['logprobs'] == normalized['consistency']['logprobs']
             rerun = await start(client, saved)

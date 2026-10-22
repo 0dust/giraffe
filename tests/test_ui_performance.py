@@ -14,12 +14,9 @@ from tests.test_ux_results import run_render_checks, stylesheet_rules
 
 @pytest.fixture(scope="module")
 def performance():
-    report = synthetic_report_1000()
-    # One comparable workload exercises all 1,000 observations in one chart;
-    # the fixture's six recorded schedule transitions are still real inputs.
-    for request in report.requests:
-        request.condition_id = request.scenario = "SYNTHETIC-shared-workload"
-    return build_performance(report)
+    # Schedule stages belong to one comparable workload; use the real fixture
+    # unchanged so its default scope must retain all 1,000 observations.
+    return build_performance(synthetic_report_1000())
 
 
 def render_assertions(performance, assertions):
@@ -49,7 +46,8 @@ for(const id of ['timing','completions','concurrency','size','cached']){
  const svg=chart.tagName==='SVG'?chart:chart.querySelector('svg');assert(svg,id+' SVG');
  assert.equal(svg.getAttribute('role'),'img');assert(svg.getAttribute('aria-label')||svg.querySelector('desc'));
  assert(svg.querySelectorAll('path').length<=8,'lines should be paths, not a node per request');
- assert.equal(svg.querySelectorAll('circle').length,0,'dense lines have no visible request markers');
+ assert.equal(svg.querySelectorAll('circle:not(.performance-intended-transition)').length,0,'dense lines have no visible request markers');
+ assert(svg.querySelectorAll('.performance-intended-transition').length<=40,'schedule transition markers remain bounded');
  assert(svg.querySelectorAll('*').length<500,'SVG node count must stay bounded');
 }
 assert.match($('#performance-timing').textContent,/1,000/);
@@ -153,14 +151,18 @@ assert.equal(info.getAttribute('aria-expanded'),'true');
 
 
 def test_window_cohort_is_not_silently_expanded_to_all_request_series():
-    value = synthetic_report_1000().performance
+    report = synthetic_report_1000()
+    catalog = report.performance["targets"][0]["windows"]
+    first_stage = next(window for window in catalog if window["kind"] == "stage")
+    value = build_performance(report, window=first_stage["id"])
     render_assertions(value, r"""
 assert.equal(selected.request_series.length,1000);
-assert.equal(summary.request_row_indices.length,80);
-assert.match($('#performance-timing').textContent,/80 requests/);
+assert(summary.request_row_indices.length>0&&summary.request_row_indices.length<1000);
+assert.equal(performanceCharts.get('timing').rows.length,summary.request_row_indices.length);
+assert.match($('#performance-timing').textContent,new RegExp(summary.request_row_indices.length+' requests'));
 const chart=$('[data-performance-chart="timing"]');
 handlePerformanceKeydown({target:chart,key:'End',preventDefault(){}});
-assert.match($('#performance-timing').textContent,/SYNTHETIC-0080/);
+assert($('#performance-inspection-timing').textContent.includes(selected.request_series[summary.request_row_indices.at(-1)].request_id));
 assert.doesNotMatch($('.performance-inspection').textContent,/SYNTHETIC-1000/);
 """)
 

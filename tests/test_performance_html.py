@@ -37,7 +37,9 @@ def test_standalone_chart_decimation_preserves_extrema_and_bounds_geometry():
     assert points[333] in drawn and points[777] in drawn
     assert len(drawn) <= 122
     html = _render(synthetic_report_1000())
-    assert '<circle' not in html
+    # Request series have no dense markers; only bounded intended-stage changes
+    # are marked, so a 1,000-request report never has 1,000 circles.
+    assert html.count('<circle') == html.count('class="html-transition"') <= 40
     assert html.count('<svg') <= 5
     assert html.count('<path') <= 14
     assert html.count('<rect') < 100
@@ -150,7 +152,7 @@ def test_standalone_measurement_catalog_preview_is_bounded():
 
     performance = build_performance(synthetic_report_1000())
     target = performance['targets'][0]
-    target['windows'] = [dict(target['windows'][0], label=f'window-canary-{n}') for n in range(1000)]
+    target['windows'] = [dict(target['windows'][0], label=f'window-canary-{n}', selection_label=f'window-canary-{n}') for n in range(1000)]
     html = render_performance(performance)
     assert 'Showing 50 of 1000 windows; complete catalog in report.json.' in html
     assert 'window-canary-49' in html and 'window-canary-50' not in html

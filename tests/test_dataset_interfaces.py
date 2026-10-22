@@ -56,13 +56,19 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path):
             result = await finished(client, response.json()["id"])
             assert result["state"] == "completed", result
             saved = result["report"]
+            assert saved["requests_compact"]
+            request_id = saved["requests"][0]["id"]
+            evidence = await client.get(f"/api/runs/{response.json()['id']}/requests/{request_id}")
+            assert evidence.status_code == 200
         assert len(endpoint.requests) == 1
         assert endpoint.collector_reads == endpoint.metrics_reads == 0
         assert endpoint.requests[0]["messages"][0]["content"] == "What is the return window?"
         assert len(saved["requests"]) == 1 and saved["requests"][0]["score"] is True
         assert saved["manifest"]["config"]["max_requests"] == 1
         assert saved["manifest"]["config"]["checks"] == ["correctness"]
-        assert saved["requests"][0]["output"] == "INCORRECT"
+        assert "output" not in saved["requests"][0]
+        assert evidence.json()["output"] == "INCORRECT"
+        assert evidence.json()["id"] == saved["requests"][0]["id"]
 
 
 async def test_try_example_uses_existing_busy_and_cancel_lifecycle(tmp_path, monkeypatch):

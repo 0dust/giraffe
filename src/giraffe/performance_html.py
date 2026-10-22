@@ -17,9 +17,11 @@ STYLE = """
 .html-tabs{position:sticky;top:env(safe-area-inset-top,0px);z-index:2;display:flex;gap:24px;align-items:center;background:var(--bg);border-block:1px solid var(--line);padding:16px 0;margin:24px 0}.html-tabs label{cursor:pointer;padding:4px}.html-tabs label:has(:checked){color:var(--accent);border-bottom:2px solid}.html-tabs label:has(:focus-visible){outline:2px solid var(--accent)}.html-tabs input{position:absolute;opacity:0;width:1px;height:1px}.html-tabs small{margin-left:auto}#html-results{display:none}main:has(#html-tab-results:checked) #html-performance{display:none}main:has(#html-tab-results:checked) #html-results{display:block}
 .html-section{margin:32px 0;scroll-margin-top:90px}.html-section>header{display:flex;align-items:baseline;justify-content:space-between;gap:18px}.html-section h2{margin:0 0 16px}.html-section header p{font-size:12px;text-align:right}.html-cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.html-kpi{margin:0;min-width:0}.html-kpi h3{font-size:12px;margin:0 0 14px;display:flex;justify-content:space-between;gap:6px}.html-value{font:24px/1.25 var(--mono);overflow-wrap:anywhere}.html-value small,.html-kpi p,.html-note,.html-legend{font:11px/1.5 system-ui;color:var(--text-2)}.html-kpi p{margin:10px 0 0}.html-estimate{font:9px var(--mono);color:var(--accent)}.html-info{position:relative;margin:0;padding:0;border:0;display:inline-block}.html-info summary{font-size:11px;list-style:none}.html-info>span{position:absolute;right:0;z-index:3;width:240px;background:var(--surface);border:1px solid var(--line);padding:10px;font-weight:400}.html-two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.html-throughput{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:18px;align-items:start}.html-capacity{grid-template-columns:repeat(2,minmax(0,1fr))}.html-load{grid-template-columns:repeat(3,minmax(0,1fr))}.html-support{grid-template-columns:1fr 1fr;margin:14px 0}.html-plot{min-width:0;margin:0}.html-plot svg{display:block;width:100%;height:auto}.html-legend{display:flex;flex-wrap:wrap;gap:8px 16px}.html-legend i{display:inline-block;width:14px;border-top:2px solid;margin-right:5px}.html-metrics details{margin:0;padding:0;border:0}.html-scope{padding:12px 0;border-bottom:1px solid var(--line)}
 @media(max-width:800px){main{padding:14px}.html-throughput{grid-template-columns:1fr}.html-two{grid-template-columns:1fr}.html-section>header{display:block}.html-section header p{text-align:left}.html-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.html-tabs{gap:12px}.html-tabs small{font-size:10px}}
+@media(max-width:640px){.html-tabs{position:static;flex-wrap:wrap}.html-tabs small{width:100%;margin-left:0}}
 """
 
-COLORS = ("#b5b2aa", "#9aa4ff", "#f5b544", "#3dd68c", "#e8833a")
+CHART_STYLE = """.html-chart-frame{position:relative;margin:16px 0}.html-chart-frame svg{height:240px;width:100%}.html-axis-label,.html-stage-label{position:absolute;color:var(--text-2);font:11px/1.3 var(--mono);pointer-events:none}.html-axis-label.x-min{left:5.33%;bottom:8%}.html-axis-label.x-max{right:4%;bottom:8%}.html-axis-label.y-max{left:0;top:10%}.html-axis-label.y-min{left:0;bottom:20%}.html-axis-label.x-title{left:5.33%;right:4%;bottom:0;text-align:center}.html-axis-label.y-title{left:5.33%;top:0}.html-stage-label{top:8%;max-width:18%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.html-transition{stroke:var(--surface);stroke-width:1;vector-effect:non-scaling-stroke}@media(max-width:640px){.html-chart-frame svg{height:220px}}"""
+COLORS = ("#b5b2aa", "#9aa4ff", "#f5b544", "#3dd68c", "#63c8d2")
 COMMON_GUIDANCE = {"No eligible observations in this scope.", "Collect eligible observations for this scope."}
 
 STATES = {"not_measured": "Not measured", "not_observed": "Not observed", "not_collected": "Not collected",
@@ -38,7 +40,13 @@ def _number(value):
 def _fmt(value):
     if not _number(value):
         return "—" if value is None else _e(value)
-    return f"{value:,.4f}".rstrip("0").rstrip(".") if value != int(value) else f"{int(value):,}"
+    if value == int(value):
+        return f"{int(value):,}"
+    magnitude = abs(value)
+    precision = 2 if magnitude >= 1 else max(2, 1 - math.floor(math.log10(magnitude)))
+    if precision > 8:
+        return f"{value:.2g}"
+    return f"{value:,.{precision}f}".rstrip("0").rstrip(".")
 
 
 def _value(row):
@@ -139,6 +147,16 @@ def decimate(points, buckets=120):
     return [points[index] for index in indices]
 
 
+def _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel, stage_labels=''):
+    # Text is HTML in CSS pixels, outside the scaled SVG coordinate system.
+    # The portable report needs neither a script nor a fixed minimum width.
+    return ('<div class="html-chart-frame">' + svg + stage_labels
+            + ''.join('<span class="html-axis-label ' + kind + '">' + _e(label) + '</span>'
+                      for kind, label in (('x-min', _fmt(xmin)), ('x-max', _fmt(xmax)),
+                                          ('y-min', _fmt(ymin)), ('y-max', _fmt(ymax)),
+                                          ('x-title', xlabel), ('y-title', ylabel))) + '</div>')
+
+
 def _chart(title, series, *, xlabel="Request number · dispatch order", ylabel="seconds", step=False, bands=()):
     series = [(name, [(x, y) for x, y in points if _number(x) and _number(y)]) for name, points in series]
     series = [(name, points) for name, points in series if len(points) > 1]
@@ -157,27 +175,29 @@ def _chart(title, series, *, xlabel="Request number · dispatch order", ylabel="
         return 220 - (value - ymin) / (ymax - ymin) * 192
     desc = f'{title}. {xlabel}: {_fmt(xmin)} to {_fmt(xmax)}. {ylabel}: {_fmt(ymin)} to {_fmt(ymax)}. '
     desc += '; '.join(f'{name}: {len(points)} observations' for name, points in series)
-    body = []
+    body, stage_labels = [], []
     for band in bands[:40]:
         left, right = max(xmin, band.get('elapsed_s', xmin)), min(xmax, band.get('end_elapsed_s', xmax))
         if right <= left:
             continue
-        body.append(f'<rect x="{x(left):.2f}" y="22" width="{x(right)-x(left):.2f}" height="198" fill="#f5b544" opacity=".04"/>'
-                    f'<text x="{x(left)+4:.2f}" y="18" fill="#b5b2aa" font-size="10">{_e(band.get("label", ""))}</text>')
+        body.append(f'<rect x="{x(left):.2f}" y="22" width="{x(right)-x(left):.2f}" height="198" fill="#f5b544" opacity=".04"/>')
+        stage_labels.append(f'<span class="html-stage-label" style="left:{x(left)/9:.2f}%">{_e(band.get("label", ""))}</span>')
     for index, (name, points) in enumerate(series):
         drawn = decimate(points)
         path = f'M{x(drawn[0][0]):.2f},{y(drawn[0][1]):.2f}'
         path += ''.join((f'H{x(a):.2f}V{y(b):.2f}' if step else f'L{x(a):.2f},{y(b):.2f}') for a, b in drawn[1:])
         body.append(f'<path d="{path}" fill="none" stroke="{COLORS[index % len(COLORS)]}" stroke-width="1.6"'
                     + (' stroke-dasharray="6 4"' if step and index else '') + f'><title>{_e(name)}</title></path>')
-    labels = (f'<text x="48" y="244">{_e(_fmt(xmin))}</text><text x="864" y="244" text-anchor="end">{_e(_fmt(xmax))}</text>'
-              f'<text x="8" y="34">{_e(_fmt(ymax))}</text><text x="8" y="220">{_e(_fmt(ymin))}</text>'
-              f'<text x="450" y="270" text-anchor="middle">{_e(xlabel)}</text><text x="48" y="12">{_e(ylabel)}</text>')
-    return ('<svg viewBox="0 0 900 280" role="img" tabindex="0" aria-label="' + _e(desc) + '"><desc>' + _e(desc) + '</desc>'
+        if step and name == 'Intended':
+            transitions = [point for i, point in enumerate(points) if not i or point[1] != points[i-1][1]]
+            body.extend(f'<circle class="html-transition" cx="{x(a):.2f}" cy="{y(b):.2f}" r="3" fill="{COLORS[index % len(COLORS)]}"><title>Intended: {_fmt(b)} at {_fmt(a)} s</title></circle>'
+                        for a, b in transitions[:40])
+    svg = ('<svg viewBox="0 0 900 280" preserveAspectRatio="none" role="img" tabindex="0" aria-label="' + _e(desc) + '"><desc>' + _e(desc) + '</desc>'
             + '<path d="M48,24V220H864" fill="none" stroke="#555159"/>' + ''.join(body)
-            + '<g fill="#b5b2aa" font-family="monospace" font-size="11">' + labels + '</g></svg>'
-            + '<div class="html-legend">' + ''.join(f'<span><i style="color:{COLORS[index % len(COLORS)]}"></i>{_e(name)}</span>' for index, (name, _) in enumerate(series))
-            + '</div><p class="html-note">Min/max decimation for drawing; every request included in metrics.</p>')
+            + '</svg>')
+    legend = '<div class="html-legend">' + ''.join(f'<span><i style="color:{COLORS[index % len(COLORS)]}"></i>{_e(name)}</span>' for index, (name, _) in enumerate(series)) + '</div>'
+    return (legend + _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel, ''.join(stage_labels))
+            + '<p class="html-note">Min/max decimation for drawing; every request included in metrics.</p>')
 
 
 def _plot(title, content, reason):
@@ -193,16 +213,19 @@ def _buckets(data):
     if duration <= 0 or not maximum:
         return ''
     # Backend bounds completion buckets to approximately twenty per window.
-    bars = ''.join(f'<rect x="{48+816*r["start_s"]/duration:.2f}" y="{220-180*r["count"]/maximum:.2f}"'
-                   f' width="{max(1,816*r["duration_s"]/duration-3):.2f}" height="{180*r["count"]/maximum:.2f}" fill="#f5b544">'
+    bars = ''.join(f'<rect x="{48+816*r["start_s"]/duration+3:.2f}" y="{220-180*r["count"]/maximum:.2f}"'
+                   f' width="{max(1,816*r["duration_s"]/duration-6):.2f}" height="{180*r["count"]/maximum:.2f}" fill="#f5b544">'
                    f'<title>{_fmt(r["start_s"])}–{_fmt(r["end_s"])} s · {r["count"]} completed requests'
                    + (' · partial bucket' if r['partial'] else '') + '</title></rect>' for r in rows)
     desc = f'Completed-request counts in {len(rows)} elapsed-time buckets, nominal width {data["width_s"]} seconds. Includes failed terminal requests; counts are not a rate.'
-    return (f'<svg viewBox="0 0 900 265" role="img" tabindex="0" aria-label="{_e(desc)}"><desc>{_e(desc)}</desc>' + bars
-            + f'<g fill="#b5b2aa" font-size="12"><text x="48" y="245">0 s</text><text x="864" y="245" text-anchor="end">{_fmt(duration)} s</text>'
-            + f'<text x="48" y="20">Completed requests · maximum {_fmt(maximum)}</text></g></svg>'
-            + '<p class="html-note">' + _e(data['rule']) + ' ' + _e(data['partial_bucket_disclosure'])
-            + (' Final partial bucket: ' + _fmt(rows[-1]['duration_s']) + ' s.' if data['final_partial_bucket'] else ' No partial bucket.') + '</p>')
+    svg = f'<svg viewBox="0 0 900 280" preserveAspectRatio="none" role="img" tabindex="0" aria-label="{_e(desc)}"><desc>{_e(desc)}</desc>' + bars + '</svg>'
+    caption = (_fmt(data['width_s']) + '-second buckets; '
+               + ('the final bucket uses its actual duration (' + _fmt(rows[-1]['duration_s']) + ' s).'
+                  if data['final_partial_bucket'] else 'all buckets use the full duration.'))
+    return (_chart_frame(svg, 0, duration, 0, maximum, 'Elapsed seconds', 'Completed requests')
+            + '<p class="html-note">' + caption + '</p><details><summary>Bucket definitions</summary><p>'
+            + _e(data['rule']) + ' ' + _e(data.get('boundary_rule', '')) + ' '
+            + _e(data['partial_bucket_disclosure']) + '</p></details>')
 
 
 def _section(prefix, name, title, note, body):
@@ -223,13 +246,14 @@ def render_performance(performance, *, prefix='performance'):
         parts.append('<div class="html-scope"><strong>' + _e(target['target']) + '</strong> · '
             + _e(window['label']) + ' · ' + _fmt(window.get('duration_s')) + ' s · '
             + _fmt(window['request_count']) + ' requests<p class="html-note">'
-            + _e(window.get('population', '')) + ' ' + _e(target.get('scope_note', '')) + '</p>'
+            + _e(' · '.join(filter(None, (window.get('workload_label'), window.get('stages_description')))))
+            + ' ' + _e(window.get('population', '')) + ' ' + _e(target.get('scope_note', '')) + '</p>'
             + '<p class="html-note">Absent evidence stays unavailable. Collect eligible observations for this scope. Specific exclusions and collection instructions appear below.</p></div>')
         if len(target.get('windows', [])) > 1:
             parts.append('<details><summary>Measurement windows · static report</summary>'
                 '<p>This document shows the default measurement for this target. Other windows are selectable in the app; populations are never pooled.</p>'
                 '<div class="table"><table><tr><th>Window<th>Bounds (ms)<th>Requests<th>Population'
-                + ''.join('<tr><th scope="row">' + _e(item['label']) + '<td>'
+                + ''.join('<tr><th scope="row">' + _e(item.get('selection_label') or item['label']) + '<td>'
                     + _fmt(item.get('start_ms')) + '–' + _fmt(item.get('end_ms')) + '<td>'
                     + _fmt(item['request_count']) + '<td>' + _e(item.get('population', ''))
                     for item in target['windows'][:50]) + '</table></div>'
@@ -291,4 +315,5 @@ def render_performance(performance, *, prefix='performance'):
             ('telemetry', '08 Server observations', 'server', 'Server-wide counters may include other traffic; separate collection window.'),
             ('baseline', '09 Baseline comparison', 'baseline', 'Only qualified comparable evidence; no capacity inferred.')):
             parts.append(_section(pfx, name, title, note, _table(sections[key])))
-    return ''.join(parts)
+    content = ''.join(parts)
+    return ('<style>' + CHART_STYLE + '</style>' if '<svg' in content else '') + content

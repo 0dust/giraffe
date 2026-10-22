@@ -156,14 +156,16 @@ def test_synthetic_thousand_preserves_full_dataset_and_reconciles():
     assert len(value.requests)==1000
     target=value.performance["targets"][0]
     assert len(target["request_series"])==1000
-    assert len(target["cohorts"])==6
-    counts=[]
-    for cohort in target["cohorts"]:
-        result=summary(value, window="full:"+cohort["id"])
-        counts.append(result["metrics"]["attempted"]["value"])
-        assert sum(b["count"] for b in result["completion_buckets"]["buckets"]) == cohort["request_count"]
-    assert counts==[80,140,200,300,180,100]
-    assert sum(counts)==1000
+    # The six level changes are windows of the same comparable workload.
+    assert len(target["cohorts"])==1
+    result=summary(value)
+    assert result["metrics"]["attempted"]["value"]==1000
+    assert sum(b["count"] for b in result["completion_buckets"]["buckets"])==1000
+    stages=[window for window in target["windows"] if window["kind"]=="stage" and not window["includes_drain"]]
+    assert [window["request_count"] for window in stages]==[80,140,200,300,180,100]
+    assert sum(window["request_count"] for window in stages)==1000
+    assert sum(b["count"] for window in target["windows"] if window["kind"]=="stage"
+               for b in summary(value,window=window["id"])["completion_buckets"]["buckets"])==1000
     assert len(value.observations["targets"]["SYNTHETIC"]["schedule_transitions"])==7
     assert max(row["values"]["response_latency_ms"] for row in target["request_series"]) > 7000
     assert summary(value)["metrics"]["knee"]["value"] is None
@@ -323,6 +325,15 @@ def test_baseline_rows_reuse_comparable_results_and_preserve_no_baseline_states(
     assert rows["baseline_capacity"]["value"] is None
     traffic=compare_baseline(traffic_report(),traffic_report("baseline"))
     rows=summary(traffic)["metrics"]
+    assert rows["highest_acceptable_rate"]["value"] == 4
+    assert rows["goodput"]["value"] is None  # Distinct qualified stages are not pooled into one rate.
+    assert rows["goodput"]["sample_count"] == 2
+    assert rows["baseline_capacity"]["state"] == "measured"
+    # A subset still binds only its own existing stage qualification. The full
+    # request window now spans the sweep, rather than defaulting to rate 1.
+    low=traffic.model_copy(update={"requests":[r for r in traffic.requests if r.traffic_stage == 0]})
+    target=build_performance(low)["targets"][0]
+    rows=target["summaries"][target["default_window"]]["metrics"]
     assert rows["highest_acceptable_rate"]["value"] == 1
     assert rows["goodput"]["value"] == 1
     assert rows["baseline_capacity"]["state"] == "measured"

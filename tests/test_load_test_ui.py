@@ -161,7 +161,13 @@ html=renderLoadTestResults({points:[rate],highest_accepted:[{source:'primary',ty
 for(const text of ['Highest accepted request rate (tested): 10','Long input → Short output','Poisson + bursts','Burst delivery and degradation','Dispatch spread','Arrival and burst response degradation','highest tested, not an absolute capacity limit'])assert(html.includes(text),text);
 assert.match(renderLoadTestResults({points:[rate],highest_accepted:[]}),/Highest accepted request rate \(tested\): Unconfirmed/);
 const conditions=[{target:'local',condition:{id:'load_primary_combinations_long_short_poisson_bursts_r10',check:'load'}},{target:'local',condition:{id:'load_primary_combinations_long_short_constant_r10',check:'load'}}];
-html=renderTests([],{conditions,live:true});assert.match(html,/Poisson \+ bursts · 10 requests\/second/);assert.match(html,/Constant · 10 requests\/second/);assert.equal((html.match(/data-condition-load-type="combinations"/g)||[]).length,2);
+html=renderTests([],{conditions,live:true});
+const views=[...conditionViews.values()];assert.equal(views.length,2);
+assert(views.every(view=>view.name==='Long input / short output'));
+assert.equal(views[0].description,'Poisson arrivals · 10 requests/s · with bursts');
+assert.equal(views[1].description,'Constant arrivals · 10 requests/s');
+assert.match(html,/Poisson arrivals · 10 requests\/s · with bursts/);assert.match(html,/Constant arrivals · 10 requests\/s/);
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,2);assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
 ''')
 
 

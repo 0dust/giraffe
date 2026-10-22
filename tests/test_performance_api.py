@@ -25,6 +25,10 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
         target = data['performance']['targets'][0]
         assert len(target['summaries']) == 1
         assert len(target['request_series']) == 1000
+        assert target['full_series_summary_window'] == target['default_window']
+        assert 'full_actual_concurrency' not in target
+        assert 'full_completion_buckets' not in target
+        assert target['summaries'][target['default_window']]['window']['request_count'] == 1000
         assert all('request_series' not in summary for summary in target['summaries'].values())
         window = target['windows'][-1]['id']
         selected = (await client.get('/api/runs/saved/performance', params={'window': window})).json()

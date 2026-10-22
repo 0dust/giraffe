@@ -817,7 +817,10 @@ async def _metrics(run, target, phase):
     if len(data["snapshots"]) >= limit:
         data["sample_limit_reached"] = True
         return
-    snapshot = await scrape(run, target, phase, force=run.config.metrics or "gpu" in run.config.checks)
+    # Calling this helper explicitly requests runtime telemetry. Host-only collection
+    # shares the scheduler but must not implicitly enable the runtime exporter.
+    runtime_requested = not target.host_metrics_url or run.config.metrics or "gpu" in run.config.checks
+    snapshot = await scrape(run, target, phase, force=runtime_requested)
     data["snapshots"].append(snapshot)
     run.observations[target.name]["metrics"].append(_gpu_snapshot(snapshot))
 

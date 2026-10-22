@@ -1630,8 +1630,17 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         record = event["request"]
         assert record["elapsed_ms"] == by_id[record["id"]].elapsed_ms
         assert record["score"] == by_id[record["id"]].score
-        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid",
-                               "score", "elapsed_ms", "first_output_ms", "check_ids"}
+        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
+                "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
+                "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
+                "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
+                "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason"}
+        assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",
+                    "logprob_evidence", "content_reads", "reasoning_reads", "output_events"} & record.keys()
+        assert all(not isinstance(value, (dict, list)) for key, value in record.items() if key != "check_ids")
+        for field in ["dispatch_ms", "completed_ms", "timing_schema", "output_tokens", "first_token_ms"]:
+            assert record[field] == getattr(by_id[record["id"]], field)
         assert event["budget_used"] >= event["attempted"]
 
 

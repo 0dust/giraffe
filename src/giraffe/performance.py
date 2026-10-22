@@ -5,13 +5,15 @@ All durations originate at the request's monotonic timing start, except occupanc
 use linear interpolation at (n - 1) * p. Concurrency ties close before opening;
 zero-duration lifetimes occupy no time. Full windows include startup and drain.
 Each headline belongs to ONE target/cohort/window; controls, warmups, calibration
-and different load conditions remain selectable, never silently pooled. Raw series
+and different workload shapes and roles remain selectable, never silently pooled.
+Schedule levels/rates of one workload are windows of its common full cohort. Raw series
 retain all observations, including failures. Rendering/decimation belongs to UI.
 """
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 import math
+import re
 from statistics import fmean
 
 PERFORMANCE_SCHEMA = 1
@@ -116,19 +118,136 @@ def completion_buckets(records, start_ms, end_ms):
             "partial_bucket_disclosure": "Final bucket uses its actual duration; counts are not requests/s."}
 
 
+_PERFORMANCE_CHECKS = {"load", "concurrency", "capacity", "arrivals", "sessions", "buckets"}
+
+
 def _cohort(record):
+    """Comparable workload identity; schedule level/rate is a window, not a cohort.
+
+    Explicit source, shape, phase and role remain part of identity. Actual token
+    counts vary within a workload and are not its requested shape.
+    """
     from .conditions import condition_for
 
     point = record.load_point or {}
-    if point.get("point_id"):
-        # Mixed shapes are intentional parts of one point, but paired control and
-        # probe requests have different purposes and must not share a headline.
-        role = point.get("role", "request")
-        phase = point.get("phase")
-        return str(point["point_id"]) + (":" + str(phase) if phase else "") + (":" + str(role) if role != "request" else "")
-    if record.traffic_stage is not None:
-        return f"traffic_stage_{record.traffic_stage}"
-    return record.condition_id or condition_for(record.scenario, record.workload)["id"]
+    identity = str(point.get("point_id") or record.condition_id
+                   or condition_for(record.scenario, record.workload)["id"])
+    if _preparation(record):
+        return identity
+    if point or _PERFORMANCE_CHECKS.intersection(record.check_ids):
+        if record.traffic_stage is not None and re.fullmatch(r"traffic(?:_stage_|-)\d+", identity):
+            identity = "traffic"
+        identity = re.sub(r"_stage_\d+$", "", identity)
+        identity = re.sub(r"^bucket_c\d+_(?=(?:short|medium|long)_(?:short|medium|long)$)", "bucket_", identity)
+        identity = re.sub(r"_c\d+(?=\.|$)", "", identity)
+        identity = re.sub(r"_r[0-9.e+-]+(?=\.|$)", "", identity)
+        # Concurrent, fixed-rate, Poisson and burst delivery alter the schedule,
+        # not the workload. Strip only the executor's known suffix grammar.
+        if identity.startswith("load_"):
+            identity = re.sub(r"_(?:concurrent|constant|poisson|bursts)(?:_bursts)?(?:_only)?$", "", identity)
+        parts = [identity]
+        parts.extend(f"{key}={point[key]}" for key in ("source", "type", "workload", "shape", "phase", "role")
+                     if point.get(key) is not None and not (key == "role" and point[key] == "request"))
+        parts.append("check=" + ",".join(sorted(record.check_ids)))
+        parts.extend(f"{key}={record.workload[key]}" for key in ("source", "request_source", "input_shape", "output_shape", "role", "phase")
+                     if record.workload.get(key) is not None)
+        return ":".join(parts)
+    return identity
+
+
+def _cohort_label(group, observation):
+    from .conditions import condition_for
+    from .models import CHECK_NAMES
+
+    first = group[0]
+    point = first.load_point or {}
+    check = next((name for name in first.check_ids if name in _PERFORMANCE_CHECKS), first.check_ids[0] if first.check_ids else "serving")
+    check_label = CHECK_NAMES.get(check, check.replace("_", " ").capitalize())
+    if point:
+        shape = point.get("shape") or point.get("workload")
+        name = {
+            "mixed": "Mixed workload", "interference": "Interference workload", "input": "Large-input stress", "output": "Large-output stress"
+        }.get(shape, check_label)
+        # The compact arrow label matches the request-shape selector.
+        if shape and re.fullmatch(r"(short|medium|long)_(short|medium|long)", shape):
+            name = " → ".join(part.title() for part in shape.split("_"))
+        label = f"{check_label} · {name}" if name != check_label else check_label
+        source = {"custom_fixtures": "Custom questions", "request_pack": "Request pack"}.get(first.workload.get("request_source"))
+        if source:
+            label += " · " + source
+        role = (point.get("phase") or first.workload.get("phase") or first.workload.get("role")
+                or (point.get("role") if point.get("role") != "request" else None))
+        if role:
+            label += " · " + str(role).replace("_", " ").capitalize()
+        return check, label
+    if first.traffic_stage is not None or first.scenario.startswith("traffic_stage_"):
+        return check, check_label
+    saved = next((row.get("condition", {}).get("label") for row in observation.get("conditions", [])
+                  if row.get("condition", {}).get("id") == first.condition_id), None)
+    label = saved or condition_for(first.scenario, first.workload)["label"]
+    label = re.sub(r"(?: · | at )\d+(?: concurrent requests?| at once| per second).*?$", "", label)
+    if re.fullmatch(r"(?:synthetic|traffic)_stage_\d+", first.scenario):
+        label = saved.split(" · ")[0] if saved else "Comparable request workload"
+    return check, f"{check_label} · {label}" if check in _PERFORMANCE_CHECKS and label != check_label else label
+
+
+def _identities(records):
+    return {str(value) for row in records for value in
+            (row.scenario, row.condition_id, (row.load_point or {}).get("point_id")) if value}
+
+
+def _cohort_schedule(group, all_records, observation):
+    """Only this workload's sending stages and their recorded drain intervals.
+
+    Unknown legacy stage IDs may be associated by dispatch time, never merely
+    by a long-lived request overlapping somebody else's sending window.
+    """
+    own_ids, all_ids = _identities(group), _identities(all_records)
+    checks = {name for row in group for name in row.check_ids}
+    indices = []
+    previous_owned = False
+    observed_end = _observed_interval(group)[1]
+    for index, stage in enumerate(observation.get("schedule_transitions", [])):
+        left = stage.get("start_ms")
+        right = stage.get("end_ms") if stage.get("end_ms") is not None else observed_end
+        if not _number(left) or not _number(right) or right <= left:
+            previous_owned = False
+            continue
+        identifier = str(stage.get("stage_id", ""))
+        base = identifier.removesuffix(".drain")
+        compatible = not stage.get("check_id") or stage["check_id"] in checks
+        if stage.get("kind") == "drain":
+            owned = compatible and (base in own_ids or previous_owned)
+        else:
+            owned = compatible and (identifier in own_ids or
+                (identifier not in all_ids and any(row.dispatch_ms is not None and left <= row.dispatch_ms < right for row in group)))
+        if owned:
+            indices.append(index)
+        previous_owned = owned
+    return indices
+
+
+def _stage_label(stage):
+    if stage.get("kind") == "drain":
+        return "Drain"
+    if stage.get("intended_concurrency") is not None:
+        return f"C{stage['intended_concurrency']:g}"
+    if stage.get("intended_rate_rps") is not None:
+        return f"{stage['intended_rate_rps']:g} requests/s"
+    return str(stage.get("pattern") or "Recorded stage").replace("_", " ").capitalize()
+
+
+def _window_labels(window, full_start):
+    left, right = window["start_ms"], window["end_ms"]
+    bounds = (f"{(left-full_start)/1000:,.2f}–{(right-full_start)/1000:,.2f} s" if left is not None and right is not None and full_start is not None
+              else "timing not measured")
+    population = f"{window['request_count']:,} requests"
+    scope = "full run" if window["kind"] == "full" else ("Drain" if window["includes_drain"] else f"Stage {window['label']}")
+    window["selection_label"] = f"{window['workload_label']} · {scope} ({bounds}, {population})"
+    window["description"] = " · ".join(filter(None, (window["label"],
+        "includes first-request startup" if window["includes_startup"] else None,
+        f"{window['duration_s']:,.2f} s" if window["duration_s"] is not None else "timing not measured",
+        population, window.get("stages_description"))))
 
 
 def _preparation(record):
@@ -347,7 +466,8 @@ def _window_summary(report, target, window, records, series, observation):
                              ("dispatch_delay", "dispatch_lag_ms", "Dispatch delay"), ("arrival_first_output", "arrival_first_output_ms", "Arrival-to-output latency"),
                              ("arrival_completion", "arrival_elapsed_ms", "Arrival-to-completion latency")):
         dist(key, [getattr(r, field) for r in population], label, source="Recorded client scheduler/request timestamps; not server queue time")
-    transitions = [row for row in observation.get("schedule_transitions", []) if start is not None
+    transitions = [row for index, row in enumerate(observation.get("schedule_transitions", []))
+                   if index in window.get("schedule_indices", []) and start is not None
                    and row.get("start_ms", math.inf) < end and (row.get("end_ms") if row.get("end_ms") is not None else end) > start]
     intended = [{**row, "elapsed_s": (max(start, row["start_ms"])-start)/1000,
                  "end_elapsed_s": (min(end, row["end_ms"] if row.get("end_ms") is not None else end)-start)/1000} for row in transitions]
@@ -398,9 +518,11 @@ def _bind_existing(report, target, window, records, observation, put):
     ids = {r.id for r in records}
     cohort = window["cohort_id"]
     load = by_id.get("load", observation.get("load_test", {}))
-    points = [p for p in load.get("points", []) if str(p.get("id")) == cohort.split(":")[0]]
+    point_ids = {(row.load_point or {}).get("point_id") for row in records}
+    points = [p for p in load.get("points", []) if str(p.get("id")) in point_ids]
+    stage_ids = {row.traffic_stage for row in records if row.traffic_stage is not None}
     stages = [s for index, s in enumerate(by_id.get("capacity", {}).get("traffic_stages", observation.get("capacity", [])))
-              if isinstance(s, dict) and cohort == f"traffic_stage_{s.get('stage_index', index)}"]
+              if isinstance(s, dict) and s.get("stage_index", index) in stage_ids]
     if points:
         delivery = [{key: p.get(key) for key in ("id", "scheduled", "dispatched", "not_sent", "local_drops", "late_drops", "not_offered", "window_reason", "reason", "reason_code")}
                     for p in points]
@@ -419,9 +541,11 @@ def _bind_existing(report, target, window, records, observation, put):
         samples=len(rate_findings), state="measured" if rate_findings else "insufficient_evidence",
         reason=None if rate_findings else "No accepted arrival-rate evidence for this cohort.")
     goodput = [s.get("goodput_rps") for s in stages if s.get("goodput_rps") is not None and not s.get("generator_limited")]
-    point_groups = [g for p in points for g in p.get("groups", [])]
+    shapes = {(row.load_point or {}).get("shape") for row in records} - {None}
+    point_groups = [group for point in points for group in point.get("groups", [])
+                    if not shapes or group.get("shape") in shapes]
     for point in points:
-        groups = point.get("groups", [])
+        groups = [group for group in point.get("groups", []) if not shapes or group.get("shape") in shapes]
         seconds = point.get("observation_seconds")
         if seconds and groups and all(g.get("correct_work_meeting_limits") is not None and
                 g.get("timing_quality", {}).get("status") == "qualified" for g in groups):
@@ -469,7 +593,7 @@ def _bind_existing(report, target, window, records, observation, put):
             samples=len(values), state="measured" if values else "not_applicable")
     workload = [{"point_id": p.get("id"), "shape": g.get("shape"), **{k:g.get(k) for k in
         ("client_mean_inflight", "client_peak_inflight", "requested_share_percent", "observed_request_share_percent", "server_evidenced_concurrency")}}
-        for p in points for g in p.get("groups", [])]
+        for p in points for g in p.get("groups", []) if not shapes or g.get("shape") in shapes]
     put("workload_occupancy", workload or None, "Mixed-workload occupancy / shares", "requests, ratio", "Existing per-shape delivery/occupancy evidence", samples=len(workload), state="measured" if workload else "not_applicable")
     recovery = by_id.get("recovery", {}) if cohort.startswith(("recovery", "sustained")) else {}
     ratios = {k: recovery[k] for k in ("latency_ratio", "first_output_ratio") if recovery.get(k) is not None}
@@ -538,7 +662,7 @@ def _baseline_rows(report, target, window, records, put):
     # Existing comparisons already carry sample/shape/timing qualifications.
     comparisons = [r for r in entry.get("comparisons", []) if r.get("scenario") in scenarios or r.get("scenario") == cohort]
     traffic = [row for index, row in enumerate(entry.get("traffic_capacity", {}).get("stages", []))
-               if cohort == f"traffic_stage_{index}" and row.get("status") in {"pass", "fail"}]
+               if index in {record.traffic_stage for record in records} and row.get("status") in {"pass", "fail"}]
     mapping = (("baseline_throughput", "Throughput change", {"output_tokens_per_second"}),
                ("baseline_timing", "Latency / first-output change", {"latency_ms", "first_output_ms", "max_stream_gap_ms"}),
                ("baseline_generation", "Generation pace change", {"generation_tokens_per_second"}),
@@ -555,7 +679,7 @@ def _baseline_rows(report, target, window, records, put):
             reason=None if qualified else ("No baseline attached." if baseline is None else "No comparable qualified baseline population for this scope."),
             evidence=rows, comparable=bool(qualified),
             qualification="Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
-    capacity = [r for r in entry.get("load_test", {}).get("points", []) if (r.get("current") or {}).get("id") == cohort.split(":")[0] and r.get("status") in {"pass", "fail"}]
+    capacity = [r for r in entry.get("load_test", {}).get("points", []) if (r.get("current") or {}).get("id") in {(row.load_point or {}).get("point_id") for row in records} and r.get("status") in {"pass", "fail"}]
     capacity += traffic
     put("baseline_capacity", capacity or None, "Accepted capacity change", "tested load", "Existing qualified tested-load baseline; not inferred saturation",
         samples=len(capacity), state="measured" if capacity else ("no_baseline" if baseline is None else "insufficient_evidence"))
@@ -567,7 +691,7 @@ def build_performance(report, *, target=None, window=None):
     The window catalog is cheap; only the selected summary is aggregated. Raw
     dispatch-ordered series occurs once per target. Summaries reference its row
     indices instead of copying rows. Missing selectors choose the first target
-    and first non-preparation cohort. Unknown explicit selectors are errors.
+    and the performance workload with most valid completions (earliest on ties). Unknown explicit selectors are errors.
     """
     requested_window = window
     config_targets = report.manifest.get("config", {}).get("targets", [])
@@ -586,36 +710,67 @@ def build_performance(report, *, target=None, window=None):
         groups = defaultdict(list)
         for record in records:
             groups[_cohort(record)].append(record)
-        cohorts = [{"id": key, "request_count": len(group), "preparation": all(_preparation(r) for r in group),
-                    "scenarios": list(dict.fromkeys(r.scenario for r in group))} for key, group in groups.items()]
-        default = next((c["id"] for c in cohorts if not c["preparation"]), cohorts[0]["id"] if cohorts else None)
         observation = report.observations.get("targets", {}).get(name, {})
+        cohorts = []
+        for key, group in groups.items():
+            check, label = _cohort_label(group, observation)
+            cohorts.append(dict(id=key, label=label, check=check, request_count=len(group),
+                valid_completions=sum(row.status == "completed" and row.valid for row in group),
+                preparation=all(_preparation(row) for row in group),
+                performance_workload=bool(_PERFORMANCE_CHECKS.intersection(group[0].check_ids)),
+                scenarios=list(dict.fromkeys(row.scenario for row in group))))
+        candidates = [row for row in cohorts if not row["preparation"]] or cohorts
+        representative = max(candidates, key=lambda row: (row["performance_workload"], row["valid_completions"])) if candidates else None
+        default = representative["id"] if representative else None
         windows, summaries = [], {}
-        for cohort, group in groups.items():
+        for descriptor in cohorts:
+            cohort, group = descriptor["id"], groups[descriptor["id"]]
             start, end = _observed_interval(group)
+            indices = _cohort_schedule(group, records, observation)
+            stages = observation.get("schedule_transitions", [])
+            sending = [stages[index] for index in indices if stages[index].get("kind") != "drain"]
+            count_words = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+            kinds = {row.get("kind") for row in sending}
+            changes = (f"{count_words.get(len(sending), str(len(sending)))} changing " +
+                       ("concurrency" if kinds == {"concurrency"} else "arrival-rate" if kinds == {"arrival_rate"} else "load") + " stages") if len(sending) > 1 else None
             window = dict(id=f"full:{cohort}", kind="full", label="Full request window", cohort_id=cohort,
+                          workload_label=descriptor["label"], stage_count=len(sending),
+                          stage_labels=[_stage_label(row) for row in sending], stages_description=changes,
+                          schedule_indices=indices,
                           start_ms=start, end_ms=end, duration_s=(end-start)/1000 if start is not None and end is not None else None,
                           request_count=len(group), includes_startup=True, includes_drain=True,
-                          population="One target and condition/role; warmup/calibration/control/probe cohorts are separate.")
-            candidates = [window]
-            for i, stage in enumerate(observation.get("schedule_transitions", [])):
-                left, right = stage.get("start_ms"), stage.get("end_ms")
-                if left is None or right is None or start is None or end is None or right <= left or right < start or left > end:
+                          population="One comparable workload across its recorded load stages; preparation, shapes, sources and control/probe roles remain separate.")
+            _window_labels(window, start)
+            windows.append(window)
+            for index in indices:
+                stage = stages[index]
+                left = stage["start_ms"]
+                right = stage.get("end_ms") if stage.get("end_ms") is not None else end
+                if start is None or end is None or right < start or left > end:
                     continue
-                members = [r for r in group if r.dispatch_ms is not None and r.dispatch_ms < right and (r.completed_ms is None or r.completed_ms >= left)]
-                if not members:
+                inclusive = not any(stages[other].get("start_ms") == right for other in indices)
+                dispatched = sum(row.dispatch_ms is not None and left <= row.dispatch_ms < right for row in group)
+                completed = sum(row.completed_ms is not None and left <= row.completed_ms <= right and (inclusive or row.completed_ms < right) for row in group)
+                drain = stage.get("kind") == "drain"
+                if not drain and not dispatched:
                     continue
-                candidates.append(dict(id=f"stage:{i}:{cohort}", kind="stage", label=stage.get("label", stage["stage_id"]),
-                    cohort_id=cohort, stage_id=stage["stage_id"], start_ms=left, end_ms=right,
-                    end_inclusive=not any(s.get("start_ms") == right for s in observation.get("schedule_transitions", [])),
-                    duration_s=(right-left)/1000, request_count=len(members), includes_startup=False,
-                    includes_drain=stage.get("kind") == "drain", population="Terminal events in [start,end); occupancy includes carry-in lifetimes."))
-            for item in candidates:
+                if drain and not completed and not any(row.dispatch_ms is not None and row.dispatch_ms < right and (row.completed_ms is None or row.completed_ms > left) for row in group):
+                    continue
+                item = dict(id=f"stage:{index}:{cohort}", kind="stage", label=_stage_label(stage),
+                    workload_label=descriptor["label"], cohort_id=cohort, stage_id=stage["stage_id"],
+                    schedule_indices=[index], start_ms=left, end_ms=right, end_inclusive=inclusive,
+                    duration_s=(right-left)/1000, request_count=completed if drain else dispatched,
+                    dispatch_count=dispatched, completion_count=completed, includes_startup=False,
+                    includes_drain=drain,
+                    population="Request count is dispatches during the sending stage (completions during drain). Metrics use terminal events in [start,end); occupancy includes this workload's carry-in lifetimes.")
+                _window_labels(item, start)
                 windows.append(item)
         if not windows:
             window = dict(id="full", kind="full", label="Full request window", cohort_id="empty", start_ms=None,
                           end_ms=None, duration_s=None, request_count=0, includes_startup=True, includes_drain=True,
-                          population="No request lifetime evidence.")
+                          population="No request lifetime evidence.", workload_label="No requests",
+                          stage_count=0, stage_labels=[], schedule_indices=[])
+            _window_labels(window, None)
             windows.append(window)
         default_window = f"full:{default}" if default is not None else "full"
         selected_window = requested_window if requested_window is not None else default_window
@@ -632,10 +787,9 @@ def build_performance(report, *, target=None, window=None):
             windows=windows, summaries=summaries, request_series=series,
             full_request_window={"start_ms": full_start, "end_ms": full_end, "request_count": len(records),
                 "population": "All target requests, including preparation and distinct conditions; no pooled headline."},
-            full_actual_concurrency=concurrency_series(records, full_start, full_end) if full_start is not None and full_end is not None else None,
+            full_series_summary_window=selected_window if descriptor["kind"] == "full" and len(group) == len(records) else None,
             schedule_transitions=observation.get("schedule_transitions", []),
-            full_completion_buckets=completion_buckets(records, full_start, full_end) if full_start is not None and full_end is not None else None,
-            scope_note="Headlines use the selected condition/role only. Every request remains in the dispatch-ordered series; observed throughput does not establish capacity."))
+            scope_note="Headlines use one comparable workload across its recorded load stages; shapes, sources and control/probe roles remain separate. Every request remains in the dispatch-ordered series; observed throughput does not establish capacity."))
     return dict(performance_schema=PERFORMANCE_SCHEMA, timing_schema=1,
                 percentile_convention=PERCENTILES, default_target=names[0] if names else None,
                 selected_target=selected, available_targets=available, targets=targets)

@@ -157,11 +157,16 @@ def test_old_records_group_with_their_original_check_and_concurrency():
     run_render_checks(r'''
 const r={id:'old',target:'local',scenario:'bucket_c1_short_short',check_ids:['concurrency'],status:'completed',valid:true,elapsed_ms:10};
 assert.equal(conditionInfo(r).check,'concurrency');
-assert.match(renderTests([r]),/>1 at once</);
-// Historical bucket ownership must also survive without a condition summary.
+let html=renderTests([r]);let view=[...conditionViews.values()][0];
+assert.equal(view.checkName,'Concurrent load');assert.equal(view.description,'1 at once');
+assert.match(html,/aria-label="Concurrent load · Short input \/ short output · 1 at once/);
+// Historical bucket ownership and concurrency survive without any condition summary.
 const bucket={...r,check_ids:['buckets']};
-let html=renderTests([bucket]);assert.match(html,/>1 at once</);assert.match(html,/>1 test</);assert.doesNotMatch(html,/— at once|>1 tests</);
-html=renderTests([bucket,{...bucket,id:'old2',scenario:'bucket_c1_long_short'}]);assert.match(html,/>2 tests</);
+html=renderTests([bucket]);view=[...conditionViews.values()][0];assert.equal(view.condition.check,'buckets');
+assert.equal(view.description,'1 at once');assert.match(html,/>1 test condition</);assert.doesNotMatch(html,/— at once|>1 tests</);
+html=renderTests([bucket,{...bucket,id:'old2',scenario:'bucket_c1_long_short'}]);assert.match(html,/>2 test conditions</);
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,2);
+assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
 const generic={...r,scenario:'custom_old',check_ids:['correctness']};assert.equal(conditionInfo(generic).check,'correctness');
 ''')
 
