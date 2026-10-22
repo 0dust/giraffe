@@ -694,6 +694,11 @@ class _Run:
                       request_slot=request_slot, request=record.model_dump(mode="json", include={
                           "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                           "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                          "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                          "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
+                          "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
+                          "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                          "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
                       }), intentional=intentional)
             return record
 

@@ -10,6 +10,7 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager, closing
@@ -38,7 +39,7 @@ from giraffe.conditions import ConditionRequestIndex, condition_aggregate
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
-from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RunConfig, RunReport,
+from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport,
                             migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
@@ -115,6 +116,9 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
 
 def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> None:
     """Bound live web metadata independently of the configured arrival count."""
+    # Derived performance is requested separately, never copied into polling
+    # progress/events (including events from third-party runner integrations).
+    event = {key: value for key, value in event.items() if key != "performance"}
     if not event["event"].startswith("condition_"):
         job["progress"] = event
         job["events"].append(event)
@@ -249,6 +253,22 @@ def _directory(root: Path, identifier: str) -> Path:
     if path.is_symlink() or path.resolve().parent != root.resolve():
         raise HTTPException(404, "Unknown run or baseline")
     return path
+
+
+def _api_report(report: RunReport) -> dict:
+    """Keep dispatch/condition metadata; fetch retained evidence on demand."""
+    result = report.model_dump(mode="json", exclude={"requests"})
+    fields = {"id", "target", "fixture_id", "scenario", "condition_id", "check_ids", "status",
+              "valid", "score", "elapsed_ms", "first_output_ms", "dispatch_ms", "completed_ms",
+              "started_at", "completed_at", "intentional", "http_status", "error", "score_message",
+              "output_chars", "stream", "finish_reason", "input_tokens", "output_tokens", "evaluation_error",
+              "requested_input_tokens", "requested_output_tokens", "input_chars", "requested_max_tokens",
+              "traffic_stage", "traffic_rate_rps", "traffic_class", "load_point", "workload"}
+    result.update(request_count=len(report.requests), requests_compact=True,
+                  requests=[{**row.model_dump(mode="json", include=fields, exclude_defaults=True),
+                             "valid": row.valid, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars}
+                            for row in report.requests])
+    return result
 
 
 def _report(path: Path) -> RunReport:
@@ -546,7 +566,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     if persisted is None:
                         raise HTTPException(404, "Saved report is unreadable")
                 else:
-                    persisted = _report(report_path).model_dump(mode="json")
+                    persisted = _api_report(_report(report_path))
             except (HTTPException, FileNotFoundError, NotADirectoryError):
                 meta = {**meta, "state": "error", "error": "Saved report is unreadable."}
         live = active if active.get("id") == identifier else {}
@@ -564,6 +584,77 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "bytes": run_size(directory), "kept": (directory / ".keep").is_file(),
                 "started_at": (persisted or summary or {}).get("started_at", meta.get("started_at")),
                 "finished_at": (persisted or summary or {}).get("finished_at", meta.get("finished_at"))}
+
+    # Two selections per run, four runs total. Cache derived values only, never
+    # expanded retained request evidence. File identity invalidates saved values.
+    performance_cache = OrderedDict()
+
+    def selected_performance(identifier, target=None, window=None):
+        from .performance import build_performance
+
+        directory = _directory(root, identifier)
+        live = active if active.get("id") == identifier and active.get("state") in {"running", "stopping"} else None
+        path = directory / "report.json"
+        if live is None:
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(404, "Report is not available")
+            stat = path.stat()
+            revision = (stat.st_mtime_ns, stat.st_size)
+        else:
+            revision = "live"
+        cached = performance_cache.get(identifier)
+        if cached is None or cached["revision"] != revision:
+            cached = {"revision": revision, "selections": OrderedDict()}
+            performance_cache[identifier] = cached
+        performance_cache.move_to_end(identifier)
+        while len(performance_cache) > 4:
+            performance_cache.popitem(last=False)
+        selections = cached["selections"]
+        selection = (target, window)
+        now = time.monotonic()
+        prior = selections.get(selection)
+        # Debounce live requests independently of incoming request event volume.
+        if prior is not None and (live is None or now - prior[0] < .5):
+            selections.move_to_end(selection)
+            return prior[1]
+        if live is None:
+            report = _report(path)
+        else:
+            records = []
+            for row in live.get("requests", {}).values():
+                if row.get("status") == "running" or not row.get("id"):
+                    continue
+                records.append({**{key: value for key, value in row.items()
+                                   if key in RequestRecord.model_fields and value is not None},
+                                "started_at": row.get("started_at") or live["meta"]["started_at"]})
+            conditions = list(live.get("conditions", {}).values())
+            targets = {}
+            for condition in conditions:
+                targets.setdefault(condition["target"], {"conditions": []})["conditions"].append(condition)
+            report = RunReport.model_validate(dict(run_id=identifier, started_at=live["meta"]["started_at"],
+                finished_at=_now(), overall="inconclusive", manifest={"config": live["meta"]["config"]},
+                requests=records, observations={"targets": targets}), context={"metadata_only": True})
+        try:
+            value = build_performance(report, target=target, window=window)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
+        # Window selections share the target series object in the cache as
+        # well as in the wire schema. No cached copy per measurement window.
+        if live is None:
+            for _, previous in selections.values():
+                if previous["selected_target"] == value["selected_target"] and value["targets"]:
+                    value["targets"][0]["request_series"] = previous["targets"][0]["request_series"]
+                    break
+        if live is not None:
+            started = live.get("live_request_count", 0)
+            retained = len(report.requests)
+            value["coverage"] = dict(retained_requests=retained, started_requests=started,
+                partial=True, reason="Live view uses bounded retained completed measurements; running and evicted requests are not included.")
+        selections[selection] = (now, value)
+        selections.move_to_end(selection)
+        while len(selections) > 2:
+            selections.popitem(last=False)
+        return value
 
     @lru_cache(maxsize=8)
     def saved_condition_requests(path: str, modified: int, size: int) -> ConditionRequestIndex:
@@ -886,6 +977,25 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
         return run_detail(identifier)
+
+    @app.get("/api/runs/{identifier}/performance")
+    async def performance_selection(identifier: str, target: str | None = None, window: str | None = None):
+        return selected_performance(identifier, target, window)
+
+    @app.get("/api/runs/{identifier}/requests/{request_id}")
+    async def request_evidence(identifier: str, request_id: str):
+        directory = _directory(root, identifier)
+        path = directory / "report.json"
+        if path.is_symlink() or not path.is_file():
+            raise HTTPException(404, "Saved request evidence is not available yet")
+        from .report_stream import load_request
+        try:
+            record = load_request(path, request_id)
+        except (OSError, ValueError) as error:
+            raise HTTPException(404, "Saved request evidence is unavailable or unreadable") from error
+        if record is None:
+            raise HTTPException(404, "Unknown request")
+        return record.model_dump(mode="json")
 
     @app.get("/api/runs/{identifier}/conditions/{condition_id}/requests")
     async def condition_requests(identifier: str, condition_id: str, status: str | None = None,

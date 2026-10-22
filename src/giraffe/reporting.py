@@ -1094,7 +1094,7 @@ def _request_json(record: RequestRecord) -> str:
 
 def _report_json_chunks(report: RunReport):
     # Keep defaults for raw consumers. Only exact input messages move to the table.
-    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests"})
+    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests", "performance"})
     yield metadata[:-1] + ',"report_format":2,"inputs":{'
     seen = set()
     for record in report.requests:
@@ -1117,7 +1117,7 @@ def _report_json_chunks(report: RunReport):
 
 
 def _portable_json_chunks(report: RunReport):
-    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests"})
+    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests", "performance"})
     yield metadata[:-1] + ',"requests":['
     for index, record in enumerate(report.requests):
         yield "," if index else ""

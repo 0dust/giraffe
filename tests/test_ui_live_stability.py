@@ -26,8 +26,8 @@ for(const terminal of $$('.request-spot'))if(!inProgress(terminal.dataset.state)
 def test_closed_disclosures_consume_terminal_landings_and_never_replay_on_open():
     run_render_checks(r"""
 state.detail={id:'closed',state:'running',config:{targets:[],max_requests:2},live_requests:[{slot:0,id:'r',scenario:'warm',status:'running'}]};renderDetail();
-state.detail.live_requests[0].status='timeout';renderDetail();const consumed=landedItems.size;assert(consumed>=2);
-for(const details of [$('.all-requests'),$('.condition-requests')]){details.open=true;listeners.toggle({target:details});}
+state.detail.live_requests[0].status='timeout';renderDetail();const consumed=landedItems.size;assert(consumed>=1);assert.equal($$('.condition-spot').length,1);assert.equal($('.condition-requests'),null);
+for(const details of [$('.all-requests')]){details.open=true;listeners.toggle({target:details});}
 renderDetail();
 for(const spot of $$('.request-spot')){assert.equal(spot.animationCalls.length,0);assert.equal(spot.getAnimations().length,0);assert.equal(spot.opacity,1);assert(!spot.classList.contains('is-landing'));}
 assert.equal(landedItems.size,consumed);
@@ -131,7 +131,7 @@ state.detail={id:'saved-labels',state:'completed'};
 for(const status of ['completed','failed','timeout','cancelled','skipped','queued','reserved','running']){
   const record={id:status,status};assert.match(requestLabel(record,[record]),/No timing recorded/);assert.doesNotMatch(requestLabel(record,[record]),/pending/i);assert.doesNotMatch(renderRequestContext(record,[record]),/Timing pending/);
 }
-const html=renderTests([{id:'r',scenario:'warm',status:'failed'}],{live:false});assert.match(html,/■<\/span> Finished/);assert.doesNotMatch(html,/✓<\/span> Finished|✓<\/span> Stopped early/);
+const html=renderTests([{id:'r',scenario:'warm',status:'failed'}],{live:false});assert.match(html,/✕ Failed/);assert.doesNotMatch(html,/✓.*Finished|✓.*Stopped early|condition-card/);
 state.runs=['completed','failed','cancelled','interrupted','error'].map(state=>({id:state,state,targets:[{model:'m'}]}));renderRailRuns();
 for(const run of state.runs){const row=$(`[data-live-key="${run.id}"]`);assert.equal($('.status-spot',row).textContent,statusIcons[runOutcome(run)]);}
 assert.notEqual(statusIcons.queued,statusIcons.running);assert.equal(statusIcons.reserved,'○');assert.equal(statusLabels.reserved,'Reserved');

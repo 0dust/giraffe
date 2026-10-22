@@ -201,8 +201,7 @@ def expanded_report_chunks(path: Path):
                     if "input_ref" in raw and metadata.get("report_format") != 2:
                         raise ValueError("Input references require report format 2 before requests")
                     record = _request(raw, inputs)
-                    if not metadata.get("performance"):
-                        measurements.append(record.model_copy(update={
+                    measurements.append(record.model_copy(update={
                             "output": "", "reasoning": "", "reasoning_stripped": bool(record.reasoning.strip()) or record.reasoning_stripped,
                             "evaluation": None, "tool_calls": [], "assistant_message": None,
                             "tool_conversation": None, "logprob_evidence": None,
@@ -214,10 +213,10 @@ def expanded_report_chunks(path: Path):
         report_format = metadata.pop("report_format", None)
         if has_inputs != (report_format == 2) or report_format not in (None, 2):
             raise ValueError("Unsupported saved report format")
-        if not metadata.get("performance"):
-            header = RunReport.model_validate({**metadata, "requests": measurements})
-        else:
-            header = RunReport.model_validate({**metadata, "requests": []}, context={"metadata_only": True})
+        # Old embedded summaries are ignored: exports always derive the current
+        # default selection from retained measurement evidence.
+        metadata.pop("performance", None)
+        header = RunReport.model_validate({**metadata, "requests": measurements})
         yield header.model_dump_json(exclude={"requests"})[:-1] + ',"requests":['
         handle.seek(0)
         reader = _Reader(handle)
@@ -234,3 +233,42 @@ def expanded_report_chunks(path: Path):
             else:
                 reader.value()
         yield "]}"
+
+
+def load_request(path: Path, request_id: str):
+    """Find retained evidence with one request and disk-backed shared inputs in RAM."""
+    with tempfile.TemporaryDirectory(prefix="giraffe-request-") as temporary, \
+            closing(sqlite3.connect(str(Path(temporary) / "inputs.sqlite"))) as inputs, \
+            path.open(encoding="utf-8") as handle:
+        inputs.execute("PRAGMA cache_size=-1024")
+        inputs.execute("CREATE TABLE inputs (ref TEXT PRIMARY KEY, messages TEXT)")
+        reader = _Reader(handle)
+        report_format = None
+        has_inputs = has_requests = False
+        found = None
+        for key in reader.members():
+            if key == "report_format":
+                report_format = reader.value()
+            elif key == "inputs":
+                has_inputs = True
+                for reference in reader.members(unique=False):
+                    messages = reader.value()
+                    verify_input(reference, messages)
+                    try:
+                        inputs.execute("INSERT INTO inputs VALUES (?, ?)",
+                                       (reference, json.dumps(messages, ensure_ascii=False, separators=(",", ":"))))
+                    except sqlite3.IntegrityError as error:
+                        raise ValueError("Duplicate saved input table entry") from error
+            elif key == "requests":
+                has_requests = True
+                for raw in reader.requests():
+                    if "input_ref" in raw and report_format != 2:
+                        raise ValueError("Input references require report format 2 before requests")
+                    record = _request(raw, inputs)
+                    if record.id == request_id:
+                        found = record
+            else:
+                reader.value()
+        if reader.peek() or not has_requests or has_inputs != (report_format == 2) or report_format not in (None, 2):
+            raise ValueError("Unsupported or malformed saved report")
+        return found

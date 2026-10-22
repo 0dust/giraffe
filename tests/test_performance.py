@@ -21,7 +21,8 @@ def report(records, **extra):
 
 
 def summary(value, target=0, window=None):
-    data = value.performance["targets"][target]
+    name = value.performance["available_targets"][target]["target"]
+    data = build_performance(value, target=name, window=window)["targets"][0] if window else value.performance["targets"][target]
     return data["summaries"][window or data["default_window"]]
 
 
@@ -49,12 +50,14 @@ def test_distributions_timing_origins_dispatch_order_and_no_decimation():
     result = summary(value)
     dist = result["distributions"]["response_latency"]["value"]
     assert dist == pytest.approx({"n":4,"mean":2500,"min":1000,"median":2500,"p90":3700,"p95":3850,"p99":3970,"max":4000})
-    assert [row["request_id"] for row in result["request_series"]] == ["0","1","2","3"]
-    assert [row["number"] for row in result["request_series"]] == [1,2,3,4]
-    assert result["request_series"][0]["values"]["before_first_useful_output_ms"] == 125
+    series = value.performance["targets"][0]["request_series"]
+    assert result["request_row_indices"] == list(range(4))
+    assert [row["request_id"] for row in series] == ["0","1","2","3"]
+    assert [row["number"] for row in series] == [1,2,3,4]
+    assert series[0]["values"]["before_first_useful_output_ms"] == 125
     assert result["metrics"]["first_useful_output"]["value"] == 100
-    assert result["request_series"][0]["values"]["answer_streaming_ms"] == 100
-    assert result["request_series"][0]["values"]["completion_tail_ms"] == 775
+    assert series[0]["values"]["answer_streaming_ms"] == 100
+    assert series[0]["values"]["completion_tail_ms"] == 775
 
 
 def test_concurrency_clips_carry_in_and_uses_completion_before_dispatch_ties():
@@ -136,7 +139,9 @@ def test_scope_separates_target_warmup_control_probe_and_stages():
     value=report(records,observations={"targets":{"t":{"schedule_transitions":[dict(stage_id="send",label="C1",kind="concurrency",start_ms=0,end_ms=500,intended_concurrency=1),dict(stage_id="drain",kind="drain",start_ms=500,end_ms=1000,intended_concurrency=0)]}}})
     target=value.performance["targets"][0]
     assert target["default_cohort"] == "generation"
-    assert len(value.performance["targets"]) == 2
+    assert len(value.performance["targets"]) == 1
+    assert [t["target"] for t in value.performance["available_targets"]] == ["t", "other"]
+    assert build_performance(value, target="other")["targets"][0]["request_series"][0]["request_id"] == "other"
     assert len(target["request_series"]) == 3
     result=summary(value)
     assert result["metrics"]["attempted"]["value"] == 1
@@ -153,7 +158,7 @@ def test_synthetic_thousand_preserves_full_dataset_and_reconciles():
     assert len(target["cohorts"])==6
     counts=[]
     for cohort in target["cohorts"]:
-        result=target["summaries"]["full:"+cohort["id"]]
+        result=summary(value, window="full:"+cohort["id"])
         counts.append(result["metrics"]["attempted"]["value"])
         assert sum(b["count"] for b in result["completion_buckets"]["buckets"]) == cohort["request_count"]
     assert counts==[80,140,200,300,180,100]
@@ -174,7 +179,7 @@ def test_all_sections_have_contract_rows_and_no_answer_text_leaks(tmp_path):
     value.requests[0].first_output_ms = 100
     path, html = write_report(value, tmp_path, html=True)
     saved = load_report(path)
-    assert saved.performance == json.loads(path.read_text())["performance"]
+    assert "performance" not in json.loads(path.read_text())
     assert saved.performance == json.loads(''.join(expanded_report_chunks(path)))["performance"]
     assert "private answer" not in json.dumps(saved.performance)
     assert "private thought" not in json.dumps(saved.performance)
@@ -218,7 +223,7 @@ def test_partial_stage_counts_boundary_completion_once_and_carry_in_occupancy():
     assert drain["metrics"]["request_throughput"]["value"] == 4
     assert drain["metrics"]["average_concurrency"]["value"] == 1
     assert sum(b["count"] for w in target["windows"] if w["kind"]=="stage"
-               for b in target["summaries"][w["id"]]["completion_buckets"]["buckets"]) == 2
+               for b in summary(value, window=w["id"])["completion_buckets"]["buckets"]) == 2
 
 
 def test_direct_tpot_and_read_gaps_do_not_imply_token_itl_for_multitoken_events():
@@ -294,8 +299,10 @@ def test_empty_and_larger_than_thousand_runs_keep_missing_distinct_from_zero():
     assert empty["metrics"]["response_latency"]["value"] is None
     large=report([record(str(i),start=i,end=i+1000) for i in range(2001)])
     data=summary(large)
-    assert len(data["request_series"]) == 2001
-    assert data["request_series"][-1]["number"] == 2001
+    series = large.performance["targets"][0]["request_series"]
+    assert len(series) == 2001
+    assert len(data["request_row_indices"]) == 2001
+    assert series[-1]["number"] == 2001
     assert data["metrics"]["peak_concurrency"]["value"] == 1000
     assert sum(b["count"] for b in data["completion_buckets"]["buckets"]) == 2001
 

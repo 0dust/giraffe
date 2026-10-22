@@ -369,7 +369,8 @@ def _window_summary(report, target, window, records, series, observation):
     }
     return {"metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
             "sections": {name: [metrics[key] for key in keys] for name, keys in sections.items()},
-            "request_series": selected_series,
+            "request_row_indices": [row["number"] - 1 for row in selected_series],
+            "window": window,
             "series_units": {"timing": "ms", "tokens": "tokens"},
             "series_definitions": {"response_latency_ms": "Client request timing start to completion.",
                 "before_first_useful_output_ms": "Dispatch to first useful output; includes offset before client timing start. Missing origin remains unavailable.",
@@ -560,28 +561,31 @@ def _baseline_rows(report, target, window, records, put):
         samples=len(capacity), state="measured" if capacity else ("no_baseline" if baseline is None else "insufficient_evidence"))
 
 
-def build_performance(report):
-    """Build once at report construction/load/export. No synthetic defaults.
+def build_performance(report, *, target=None, window=None):
+    """Derive one selected target/window, never persist derived report data.
 
-    targets[].windows contains comparable per-cohort full and recorded-stage
-    windows; summaries[window_id] supplies every section. The target-wide raw
-    request_series preserves dispatch numbers across selections. The default is
-    the first non-preparation cohort in dispatch order. Multi-target results are
-    always separate. Old records cannot supply newly versioned timing metrics.
+    The window catalog is cheap; only the selected summary is aggregated. Raw
+    dispatch-ordered series occurs once per target. Summaries reference its row
+    indices instead of copying rows. Missing selectors choose the first target
+    and first non-preparation cohort. Unknown explicit selectors are errors.
     """
+    requested_window = window
     config_targets = report.manifest.get("config", {}).get("targets", [])
     names = list(dict.fromkeys([t["name"] for t in config_targets if t.get("name")] + [r.target for r in report.requests]))
+    selected = target if target is not None else (names[0] if names else None)
+    if target is not None and target not in names:
+        raise ValueError("Unknown performance target")
+    available = [{"target": name, "identity": next(({
+        k: item.get(k) for k in ("name", "url", "model", "route", "parent")
+    } for item in config_targets if item.get("name") == name), {"name": name})} for name in names]
     targets = []
-    for name in names:
+    for name in [selected] if selected is not None else []:
         records = [r for r in report.requests if r.target == name]
         records.sort(key=lambda r: (r.dispatch_ms is None, r.dispatch_ms if r.dispatch_ms is not None else 0, r.started_at, r.id))
         series = _request_series(records)
         groups = defaultdict(list)
-        series_by_cohort = defaultdict(list)
         for record in records:
             groups[_cohort(record)].append(record)
-        for row in series:
-            series_by_cohort[row["cohort_id"]].append(row)
         cohorts = [{"id": key, "request_count": len(group), "preparation": all(_preparation(r) for r in group),
                     "scenarios": list(dict.fromkeys(r.scenario for r in group))} for key, group in groups.items()]
         default = next((c["id"] for c in cohorts if not c["preparation"]), cohorts[0]["id"] if cohorts else None)
@@ -608,17 +612,23 @@ def build_performance(report):
                     includes_drain=stage.get("kind") == "drain", population="Terminal events in [start,end); occupancy includes carry-in lifetimes."))
             for item in candidates:
                 windows.append(item)
-                summaries[item["id"]] = _window_summary(report, name, item, group, series_by_cohort[cohort], observation)
         if not windows:
             window = dict(id="full", kind="full", label="Full request window", cohort_id="empty", start_ms=None,
                           end_ms=None, duration_s=None, request_count=0, includes_startup=True, includes_drain=True,
                           population="No request lifetime evidence.")
             windows.append(window)
-            summaries["full"] = _window_summary(report, name, window, [], [], observation)
+        default_window = f"full:{default}" if default is not None else "full"
+        selected_window = requested_window if requested_window is not None else default_window
+        descriptor = next((item for item in windows if item["id"] == selected_window), None)
+        if descriptor is None:
+            raise ValueError("Unknown performance window")
+        group = groups.get(descriptor["cohort_id"], [])
+        cohort_series = [row for row in series if row["cohort_id"] == descriptor["cohort_id"]]
+        summaries[selected_window] = _window_summary(report, name, descriptor, group, cohort_series, observation)
         full_start, full_end = _observed_interval(records)
         target_config = next((t for t in config_targets if t.get("name") == name), {})
         targets.append(dict(target=name, identity={k: target_config.get(k) for k in ("name", "url", "model", "route", "parent")}, default_cohort=default,
-            default_window=f"full:{default}" if default is not None else "full", cohorts=cohorts,
+            default_window=default_window, selected_window=selected_window, cohorts=cohorts,
             windows=windows, summaries=summaries, request_series=series,
             full_request_window={"start_ms": full_start, "end_ms": full_end, "request_count": len(records),
                 "population": "All target requests, including preparation and distinct conditions; no pooled headline."},
@@ -627,7 +637,8 @@ def build_performance(report):
             full_completion_buckets=completion_buckets(records, full_start, full_end) if full_start is not None and full_end is not None else None,
             scope_note="Headlines use the selected condition/role only. Every request remains in the dispatch-ordered series; observed throughput does not establish capacity."))
     return dict(performance_schema=PERFORMANCE_SCHEMA, timing_schema=1,
-                percentile_convention=PERCENTILES, default_target=names[0] if names else None, targets=targets)
+                percentile_convention=PERCENTILES, default_target=names[0] if names else None,
+                selected_target=selected, available_targets=available, targets=targets)
 
 
 def refresh_performance(report):
@@ -640,7 +651,9 @@ def refresh_performance(report):
 def cli_summary(report):
     performance = report.performance or build_performance(report)
     lines = []
-    for target in performance["targets"]:
+    for entry in performance["available_targets"]:
+        target = (performance if entry["target"] == performance["selected_target"] else
+                  build_performance(report, target=entry["target"]))["targets"][0]
         wid = target["default_window"]
         summary = target["summaries"][wid]
         rows = summary["metrics"]
