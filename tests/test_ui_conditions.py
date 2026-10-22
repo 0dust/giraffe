@@ -131,7 +131,7 @@ const conditions=[{target:'local',condition:{id:'a',label:'Explicit pass',check:
 const saved=report([check('concurrency','fail',{metrics:{scenarios:{size_matrix:{id:'buckets',status:'fail',metrics:{buckets:{a:{status:'pass'}}}}}}})],{conditions});
 let html=renderTests([],{report:saved});const cells=html.match(/<g class="condition-spot[\s\S]*?<\/g>/g);assert.equal(cells.length,2);assert.match(cells[0],/request-spot pass/);assert.match(cells[1],/request-spot inconclusive/);
 assert.equal(conditionViews.get(JSON.stringify(['local','b'])).summary.planned,null);
-const legacy=[{id:'one',target:'local',scenario:'warm',status:'completed'},{id:'two',target:'local',scenario:'warm',status:'timeout'},{id:'three',target:'other',scenario:'warm',status:'completed'}];
+const legacy=[{id:'one',target:'local',scenario:'short',status:'completed'},{id:'two',target:'local',scenario:'short',status:'timeout'},{id:'three',target:'other',scenario:'short',status:'completed'}];
 html=renderTests(legacy,{report:report([],{requests:legacy})});assert.equal((html.match(/class="condition-spot /g)||[]).length,2);assert.match(html,/request-spot fail/);assert.match(html,/request-spot inconclusive/);
 assert.doesNotMatch(html,/test-condition|condition-requests/);
 """)

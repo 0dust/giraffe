@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 import errno
 from fractions import Fraction
+from hashlib import sha256
 from html import escape
 import json
 import math
@@ -1245,7 +1246,12 @@ def _preview(value: Any, limit: int = MAX_HTML_PREVIEW_CHARS) -> str:
 
 
 def _json(value: Any, limit: int = MAX_HTML_JSON_PREVIEW_CHARS) -> str:
-    return _preview(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), limit)
+    # This helper emits text inside <pre>, never an attribute. Quote entities
+    # inflate retained JSON substantially without adding protection in text.
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    content = escape(text[:limit], quote=False)
+    return content + ('… [Preview truncated; <a href="report.json">full evidence in report.json</a>]'
+                      if len(text) > limit else '')
 
 
 def _tool_evidence(record: RequestRecord) -> str:
@@ -1471,9 +1477,9 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
 
 
 def _render(report: RunReport) -> str:
-    from .performance import cli_summary, refresh_performance
+    from .performance import build_performance, refresh_performance
+    from .performance_html import STYLE, render_performance
 
-    # Keep the existing HTML layout until Phase C, sharing KPI semantics now.
     report = refresh_performance(report.model_copy())
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
@@ -1490,29 +1496,38 @@ def _render(report: RunReport) -> str:
                 else "Giraffe acceptance results")
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", """<style>
-*{box-sizing:border-box}body{margin:0;background:#f6f7f8;color:#17212c;font:15px/1.55 system-ui,sans-serif}
-main{max-width:1160px;margin:auto;padding:28px}h1{font-size:30px;margin-bottom:8px}h2{font-size:22px;margin-top:30px}
-h3{font-size:17px}a{color:#17569b}p{max-width:95ch}.muted{color:#53616e}.card,details{background:white;border:1px solid #d7dfe5;border-radius:8px;padding:14px 18px;margin:12px 0}
-.badge{display:inline-block;border-radius:4px;padding:2px 9px;font-size:13px;font-weight:650;background:#edf0f3;color:#3d4752}
-.pass{background:#e2f2e8;color:#1b6539}.fail,.blocked{background:#ffe8e5;color:#932c21}.inconclusive{background:#fff0cb;color:#795300}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:9px;border-bottom:1px solid #e1e6ea;vertical-align:top}
-th{background:#f2f5f7;white-space:nowrap}.table{overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:#f4f6f8;padding:12px}
-summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{padding-left:22px}section{scroll-margin-top:16px}
-@media(max-width:640px){main{padding:16px}h1{font-size:25px}td,th{padding:7px}}
-</style><main>""", f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
-             f'{_e(report.started_at)} → {_e(report.finished_at)}</p>',
-             '<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
-             '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
-             '<a href="#reproduction">Reproduce</a></p>']
+             f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     if headline == "Giraffe acceptance results":
         for summary in disconnected.values():
             parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
-    parts.append('<details><summary>Performance KPIs &amp; availability</summary>'
-                 + ''.join(f'<p>{_e(line)}</p>' for line in cli_summary(report)) + '</details>')
+    for target in config.get("targets", []):
+        parts.append(f'<p class="muted"><strong>{_e(target.get("name", ""))}</strong> · '
+                     f'{_e(target.get("route", "unknown"))} · Model: <code>{_e(target.get("model", ""))}</code>'
+                     f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></p>')
+    # Native radio navigation keeps the portable report keyboard-accessible
+    # without scripts, external assets, or duplicating the aggregation layer.
+    parts.append('<div class="html-tabs" role="group" aria-label="Report tabs">'
+                 '<label><input id="html-tab-performance" name="report-tab" type="radio" '
+                 'aria-controls="html-performance" checked>Performance</label>'
+                 '<label><input id="html-tab-results" name="report-tab" type="radio" '
+                 'aria-controls="html-results">Test results '
+                 + str(len(report.checks)) + '</label><small>Measurement: default window per target · '
+                 '<a href="report.json">JSON export</a></small></div>'
+                 '<div id="html-performance" aria-label="Performance">')
+    for entry in report.performance["available_targets"]:
+        selected = (report.performance if entry["target"] == report.performance["selected_target"]
+                    else build_performance(report, target=entry["target"]))
+        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))))
+    if not report.performance["available_targets"]:
+        parts.append(render_performance(report.performance))
+    parts.append('</div><div id="html-results" aria-label="Test results">')
+    parts.append('<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
+                 '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
+                 '<a href="#reproduction">Reproduce</a></p>')
     storage = report.manifest.get("storage", {})
     if storage.get("response_bodies_omitted") or storage.get("limit_exceeded"):
         omitted = storage.get("response_bodies_omitted", 0)
@@ -1524,10 +1539,6 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     for reason in report.observations.get("target_abort_reasons", {}).values():
         if reason != report.abort_reason:
             parts.append(f'<p class="card">Target stopped: {_e(reason)}</p>')
-    for target in config.get("targets", []):
-        parts.append(f'<div class="card"><strong>{_e(target.get("name", ""))}</strong> · '
-                     f'{_e(target.get("route", "unknown"))}<br>Model: <code>{_e(target.get("model", ""))}</code>'
-                     f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></div>')
     for check in report.checks:
         if check.id == "capacity":
             if check.target in disconnected:
@@ -1660,6 +1671,7 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                  'Retention does not cap disk usage; storage limits do.</p>'
                  f'<p>Showing {len(detailed)} of {len(report.requests)} request details, failures first. '
                  '<a href="report.json">All requests and complete retained bodies in report.json</a>.</p>')
+    input_previews = {}
     for record in detailed:
         label = f"{record.target} · {record.scenario} · {record.fixture_id} · {record.status}"
         parts.append(f'<details id="{anchors[record.id]}"><summary>{_e(label)}'
@@ -1670,8 +1682,14 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
-            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>'
-                         f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
+            messages_key = sha256(json.dumps(evidence.messages, ensure_ascii=False, sort_keys=True).encode()).digest()
+            if messages_key in input_previews:
+                parts.append('<h3>Input messages</h3><p>Same recorded input as '
+                             f'<a href="#{input_previews[messages_key]}">earlier request evidence</a>.</p>')
+            else:
+                input_previews[messages_key] = anchors[record.id]
+                parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>')
+            parts.append(f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
             if evidence.tool_expectation is None:
                 if evidence.expected_provided:
                     expected = _json(evidence.expected) if evidence.scorer == "json" else _preview(evidence.expected)
@@ -1710,7 +1728,7 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     if report.observations:
         parts.append(f'<details><summary>Additional observations</summary><pre>'
                      f'{_json(report.observations)}</pre></details>')
-    parts.append('</section></main></html>')
+    parts.append('</section></div></main></html>')
     return "".join(parts)
 
 

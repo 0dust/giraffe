@@ -133,7 +133,11 @@ async def test_condition_events_do_not_occupy_activity_feed(tmp_path, monkeypatc
         detail = (await client.get(f"/api/runs/{identifier}")).json()
         assert all(not event["event"].startswith("condition_") for event in detail["events"])
         assert any(event["event"] == "request_completed" for event in detail["events"])
-        assert len(detail["live_conditions"]) == 111
+        from giraffe.conditions import planned_conditions
+        from giraffe.models import RunConfig
+        planned = {row["condition_id"] for row in planned_conditions(RunConfig.model_validate(detail["config"]))}
+        observed = {"warm", *(f"extra_{index}" for index in range(110))}
+        assert {row["condition"]["id"] for row in detail["live_conditions"]} == planned | observed
         assert detail["progress"]["event"] == "scenario_finished"
         await client.post(f"/api/runs/{identifier}/cancel", json={})
         await finished(client, identifier)

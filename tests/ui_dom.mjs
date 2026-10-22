@@ -73,6 +73,6 @@ export function browserDOM(listeners) {
   }
   const body=new Node('body');
   document={body,activeElement:null,createElement(tag){const node=new Node(tag);if(tag==='template')node.content=new Node('fragment');return node;},querySelector:selector=>body.querySelector(selector),querySelectorAll:selector=>body.querySelectorAll(selector),addEventListener:(kind,fn)=>listeners[kind]=fn};
-  body.innerHTML='<main id="main"></main><a id="active-run-link"></a><ol id="rail-runs"></ol><section id="rail-recent"></section><div id="connection-error"></div><section id="report-sections" hidden></section><dialog id="test-dialog"></dialog><dialog id="request-dialog"></dialog><div id="spot-tip"></div>';
+  body.innerHTML='<main id="main"></main><a id="active-run-link"></a><ol id="rail-runs"></ol><section id="rail-recent"></section><div id="connection-error"></div><section id="report-sections" hidden></section><dialog id="test-dialog"></dialog><dialog id="request-dialog"></dialog><div id="performance-chart-tooltip" class="performance-chart-tooltip" role="tooltip" hidden></div><div id="spot-tip"></div>';
   return document;
 }

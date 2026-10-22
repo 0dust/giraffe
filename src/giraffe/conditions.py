@@ -255,6 +255,130 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     return condition
 
 
+
+def planned_conditions(config: Any) -> list[dict[str, Any]]:
+    """Describe configured test cells before execution, without building requests.
+
+    IDs come from the same point/scenario constructors as the executors. These
+    are waiting UI/index summaries, not reservations or execution counters;
+    authoritative lifecycle events replace them under the same target/id key.
+    Setup, calibration and warm-up remain request/check evidence only.
+    """
+    from .fixtures import builtin_fixtures
+    from .load_test import scheduled_count, settings_sets, test_points
+    from .logprob_workload import corpus_width, sample_count
+    from .planning import request_plan
+    from .session_metrics import workload_plan
+    from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+
+    selected = set(config.checks)
+    scenarios: dict[str, dict[str, Any]] = {}
+
+    def add(scenario, planned=None, kind="unknown", workload=None):
+        condition = condition_for(scenario, workload, config)
+        key = condition["id"]
+        if key in scenarios:
+            previous = scenarios[key]
+            if previous["planned"] is not None and planned is not None:
+                previous["planned"] += planned
+                previous["not_sent"] = previous["planned"]
+            return
+        scenarios[key] = {"condition": condition, "planned": planned,
+            "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
+            "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
+            "not_sent": planned, "reason": None, "request_statuses": {}}
+
+    # The request preview already accounts for shared initial work and finite
+    # core batches; only rows that actually have a meaningful executor scenario
+    # are cells (never check aliases that merely reuse another request).
+    plan = request_plan(config)
+    core = {"initial", "generation", "pack_control", "pack_loaded", "recovery_baseline", "recovery", "sustained"}
+    for row in plan["rows"]:
+        identifier = row["id"]
+        if identifier in {"correctness", "json"} and row["requests_per_target"]:
+            identifier += f"_c{config.effective_check(identifier)['concurrency']}"
+        elif identifier == "context_first_batch":
+            identifier = "context"
+        elif identifier not in core:
+            continue
+        count = row["requests_per_target"]
+        kind = "exact" if row["kind"] == "exact" else "upper_bound" if count is not None else "unknown"
+        if identifier == "context":
+            count, kind = None, "unknown"  # Adaptive repeated batches share one condition.
+        if count != 0:
+            add(identifier, count, kind)
+
+    if "load" in selected:
+        settings = dict(settings_sets(config.load_test))
+        for point in test_points(config.load_test):
+            own = settings[point["source"]]
+            count = scheduled_count(own, point)
+            # Poisson uses unconditioned draws: an expectation is not a plan.
+            if point["pattern"] == "poisson":
+                count = None
+            for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
+                workload = {"rate_rps": point["rate"]} if point["rate"] is not None else {}
+                identifier = point["id"] + (f".{phase}" if phase else "")
+                add(identifier, count, "exact" if count is not None else "unknown", workload)
+                if point["pattern"] in {"concurrent", "interference"}:
+                    scenarios[identifier]["planned_reason"] = "Unknown — duration-based"
+    if "capacity" in selected:
+        traffic = config.effective_traffic()
+        if traffic is not None:
+            from .models import MAX_PLANNED_ARRIVALS
+            from .planning import _steady_count
+            for stage, rate in enumerate(traffic.rates):
+                count = (_steady_count(rate, traffic.duration_seconds) if traffic.arrival == "steady"
+                         else min(round(rate * traffic.duration_seconds), MAX_PLANNED_ARRIVALS))
+                add(f"traffic_stage_{stage}", count, "exact", {"rate_rps": rate})
+    if "arrivals" in selected and config.arrivals:
+        add("arrival", config.arrivals.requests, "exact",
+            {"requests_per_second": config.arrivals.requests_per_second})
+    if "prefix" in selected and config.prefix:
+        settings = config.prefix
+        add("prefix_shared", settings.repeats, "exact")
+        add("prefix_independent", settings.repeats, "exact")
+        add("prefix_history", settings.history_turns, "upper_bound")
+    if "consistency" in selected and config.consistency:
+        settings = config.consistency
+        for shape in settings.shapes:
+            for level in dict.fromkeys([1, *settings.levels]):
+                count = (corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
+                         if settings.logprobs else settings.prompts_per_shape * sample_count(settings.repetitions, level))
+                add(f"consistency_c{level}_{shape}", count, "exact")
+    if "sessions" in selected and config.sessions:
+        settings = config.sessions
+        count = (sum(len(item.turns) for item in workload_plan(settings.workloads, settings.sessions))
+                 if settings.profile == "performance" else settings.sessions * len(settings.turns))
+        for mode in settings.modes:
+            add(f"session_{mode}_turn0", count, "upper_bound")
+    if "tools" in selected:
+        custom = bool(config.tool_checks and config.tool_checks.fixtures)
+        for fixture in resolved_tool_fixtures(config):
+            for forced in ([False, True] if config.forced_tool_diagnostic and not fixture.choice else [False]):
+                choice = "forced" if forced else fixture.choice.mode if fixture.choice else "auto"
+                prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
+                for mode in resolved_tool_modes(config):
+                    add(f"{prefix}_{choice}_{mode}", 1, "exact")
+        for fixture in config.tool_checks.conversations if config.tool_checks else []:
+            for mode in resolved_tool_modes(config):
+                add(f"tools_{fixture.fixture_id}_{mode}_turn0", len(fixture.steps) + 1, "upper_bound")
+    if "cancellation" in selected:
+        options = config.effective_check("cancellation")
+        fixtures = builtin_fixtures(config, check_id="cancellation")["limits"]
+        normal = sum(spec.cancel_after_ms is None and not spec.fixture_id.startswith("limits.stop_control") for spec in fixtures)
+        cancelled = sum(spec.cancel_after_ms is not None for spec in fixtures)
+        add("stop_control", 1, "exact")
+        add("limits", max(options["samples"], normal), "exact")
+        if cancelled:
+            add("cancellation_baseline", 1, "exact")
+            add("client_cancel", cancelled, "exact")
+            add("client_deadline", 1, "exact")
+        add("cancellation_probe", options["samples"], "exact")
+    return [condition_aggregate({"target": target.name, **summary})
+            for target in config.targets for summary in scenarios.values()]
+
+
 def request_status(record: Mapping[str, Any]) -> str:
     """UI result classes; transport completion alone never establishes correctness."""
     status = record.get("status")

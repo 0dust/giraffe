@@ -35,7 +35,7 @@ from .caps import (
 )
 from giraffe.configuration_errors import configuration_errors as _configuration_errors
 from giraffe.capabilities import capabilities
-from giraffe.conditions import ConditionRequestIndex, condition_aggregate
+from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, condition_aggregate, planned_conditions
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
@@ -132,6 +132,14 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
         summary = {key: event.get(key) for key in ("target", "condition", "planned", "planned_kind",
             "status", "sent", "started", "running", "completed", "failed", "not_sent", "reason")}
     if summary and summary.get("condition"):
+        key = (summary["target"], summary["condition"]["id"])
+        plan = job.get("condition_plans", {}).get(key)
+        if plan and plan.get("planned_reason"):
+            summary = {**summary, "planned_reason": plan["planned_reason"]}
+        if plan and plan.get("planned") is not None and (summary.get("planned") is None or summary["planned"] < plan["planned"]):
+            # Some executors announce successive one-request groups. Keep the
+            # full configured condition denominator, without altering dispatch.
+            summary = {**summary, "planned": plan["planned"], "planned_kind": plan["planned_kind"]}
         summary = {**summary, **{key: value for key, value in condition_aggregate(summary).items()
                    if key not in {"status", "lifecycle_status"}}}
         index.summary(summary)
@@ -253,6 +261,31 @@ def _directory(root: Path, identifier: str) -> Path:
     if path.is_symlink() or path.resolve().parent != root.resolve():
         raise HTTPException(404, "Unknown run or baseline")
     return path
+
+
+
+def _merged_condition_rows(planned: list[dict], observed: list[dict], *, terminal=False, reason=None) -> list[dict]:
+    """Keep configured cell order through completion; evidence owns verdicts."""
+    rows = {(row.get("target"), (row.get("condition") or {}).get("id")): row for row in planned}
+    for observed_row in observed:
+        key = (observed_row.get("target"), (observed_row.get("condition") or {}).get("id"))
+        prior = rows.get(key, {})
+        row = {**prior, **observed_row}
+        if prior.get("planned") is not None and (row.get("planned") is None or row["planned"] < prior["planned"]):
+            row.update(planned=prior["planned"], planned_kind=prior["planned_kind"])
+        rows[key] = row
+    result = []
+    for row in rows.values():
+        lifecycle = row.get("status") if row.get("status") in {"waiting", "running", "finished"} else row.get("lifecycle_status", row.get("status"))
+        row = {**row, "status": lifecycle}
+        if terminal and lifecycle in {"waiting", "running"}:
+            row.update(status="finished", running=0,
+                       reason=reason or "Work was not completed before the run ended.")
+            # A stale running aggregate is never a terminal passing verdict.
+            row.pop("aggregate_status", None)
+        verdict = {"passed": "pass", "failed": "fail"}.get(row.get("aggregate_status"), row.get("aggregate_status"))
+        result.append(condition_aggregate(row, verdict=verdict))
+    return result
 
 
 def _api_report(report: RunReport) -> dict:
@@ -570,13 +603,21 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except (HTTPException, FileNotFoundError, NotADirectoryError):
                 meta = {**meta, "state": "error", "error": "Saved report is unreadable."}
         live = active if active.get("id") == identifier else {}
-        return {"id": identifier, "state": live.get("state", meta.get("state", "completed")),
+        state = live.get("state", meta.get("state", "completed"))
+        condition_rows = list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", [])
+        if not listing:
+            condition_rows = _merged_condition_rows(condition_rows, (persisted or {}).get("conditions", []),
+                terminal=state not in {"running", "queued", "stopping"},
+                reason=(persisted or {}).get("abort_reason") or meta.get("error"))
+            if persisted is not None:
+                persisted["conditions"] = condition_rows
+        return {"id": identifier, "state": state,
                 "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
                 "live_requests": list(live.get("requests", {}).values()),
                 "live_request_summary": live.get("live_request_summary", meta.get("live_request_summary", {})),
                 "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
-                "live_conditions": list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", []),
+                "live_conditions": condition_rows,
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": meta.get("baseline_id"), "report": persisted, "summary": summary,
@@ -703,6 +744,17 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             report.manifest["open_files"] = job["open_files"]
             if baseline is not None:
                 report = compare_baseline(report, baseline)
+            # Persist the same condition cohort shown while live, including
+            # work a stop/budget never reached. These are report observations,
+            # not executor counters or invented request records.
+            merged = _merged_condition_rows(list(job["conditions"].values()), report.conditions,
+                terminal=True, reason=report.abort_reason)
+            targets = report.observations.setdefault("targets", {})
+            for target in config.targets:
+                targets.setdefault(target.name, {})["conditions"] = [
+                    {**row, "status": row["lifecycle_status"]}
+                    for row in merged if row.get("target") == target.name]
+            report.conditions = aggregate_conditions(report)
             meta["run_id"] = report.run_id
             sampler = PhaseSampler("export")
             try:
@@ -965,13 +1017,21 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             meta = {"id": identifier, "state": "running", "started_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                     "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
             save_metadata(directory, meta)
+            waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
+            condition_index = ConditionRequestIndex()
+            for summary in waiting:
+                condition_index.summary(summary)
             active.update(id=identifier, state="running", directory=directory, meta=meta,
                           open_files=guard,
-                          progress={}, events=[], requests=OrderedDict(), conditions={}, phases=[],
+                          progress={}, events=[], requests=OrderedDict(),
+                          conditions={(row["target"], row["condition_id"]): row for row in waiting},
+                          condition_requests=condition_index,
+                          condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],
                           live_request_summary={"evicted": 0, "through_slot": None, "statuses": {}},
                           live_request_count=0, evicted_running=set(), stop=asyncio.Event())
             active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": "running", "migration_notes": config._migration_notes}
+            return {"id": identifier, "state": "running", "migration_notes": config._migration_notes,
+                    "live_conditions": waiting}
 
 
     @app.get("/api/runs/{identifier}")
@@ -1012,6 +1072,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 raise HTTPException(404, "Report is not available")
             stat = path.stat()
             index = saved_condition_requests(str(path), stat.st_mtime_ns, stat.st_size)
+            meta = metadata(directory)
+            for summary in _merged_condition_rows(meta.get("conditions", []), list(index.summaries.values()),
+                    terminal=True, reason=meta.get("error") or (meta.get("progress") or {}).get("reason")):
+                index.summary({**summary, "status": summary["lifecycle_status"]})
         try:
             return index.page(condition_id, target=target, status=status, page=page, page_size=page_size)
         except KeyError:

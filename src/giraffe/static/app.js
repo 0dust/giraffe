@@ -268,9 +268,32 @@ function conditionProgress(view) {
   return `${number(done)}${total==null?'':` of ${s.planned_kind==='upper_bound'?'up to ':''}${number(total)}`} requests finished · ${number(active)} active${s.not_started>0?` · ${number(s.not_started)} not started`:''}`;
 }
 function conditionDescription(condition,summary) {
+  const point=loadPointIdentity(condition.id || '');
+  if(point){
+    const level=condition.parameters?.concurrency ?? condition.level ?? point.level,rate=condition.parameters?.rate_rps ?? condition.rate_rps ?? point.rate;
+    const pattern={constant:'Constant arrivals',poisson:'Poisson arrivals',bursts:'Bursts',interference:'Short-answer comparison'}[point.pattern];
+    const delivery=rate!=null?`${number(rate,2)} requests/s`:level!=null?`${number(level)} at once`:'';
+    return [pattern,delivery,point.bursts&&point.pattern!=='bursts'?'with bursts':''].filter(Boolean).join(' · ') || 'Concurrency not recorded';
+  }
   if(summary.concurrency_description)return summary.concurrency_description;
   const p=condition.parameters || {},rate=p.rate_rps ?? condition.rate_rps,level=p.concurrency ?? condition.level;
   return rate!=null?`${number(rate,2)} requests/s`:level!=null?`${number(level)} at once`:'Concurrency not recorded';
+}
+function isSetupCondition(condition) {
+  const id=String(condition.id || ''),p=condition.parameters || {};
+  return [condition.load_type,condition.kind,condition.phase,condition.cohort,p.cohort,p.phase].some(value=>/^(setup|preparation|priming|calibration|warmup|warm_up|warm-up)$/i.test(String(value || '')))
+    || /^(?:warm|warmup|warm_up|warm-up|recovery_prime)$|^(?:setup|warmup|warm_up)(?:_|$)|(?:^|_)calibration(?:_|$)/.test(id);
+}
+function conditionDisplayName(condition,summary) {
+  const point=loadPointIdentity(condition.id || ''),p=condition.parameters || {};
+  if(point?.shape)return loadShapeLabel(point.shape).replace(' → ',' / ').replace(/\/ ([A-Z])/,(_,letter)=>'/ '+letter.toLowerCase());
+  if(point?.type==='mixed')return 'Mixed traffic';
+  if(point?.type==='stress')return {input:'Large-input stress',output:'Large-output stress',large_input:'Large-input stress',large_output:'Large-output stress'}[point.workload] || 'Token stress';
+  if(point?.type==='interference')return /\.baseline(?:\.|$)/.test(condition.id)?'Short answers alone':'Short answers with a long request';
+  const input=condition.input || p.input_shape,output=condition.output || p.output_shape;
+  if(input&&output)return `${human(input)} input / ${String(output).toLowerCase()} output`;
+  const name=summary.name || condition.label || phaseName(condition.id);
+  return name.replace(/\s*[·→]?\s*(?:at )?[\d,]+ (?:at once|concurrent requests?)$/i,'').replace(/\s*·\s*$/,'');
 }
 function conditionSelection(view) {
   if(!view)return '<p class="hint">Waiting for the first test condition…</p>';
@@ -332,12 +355,13 @@ function renderTests(records,{conditions=[],live=false,report=null}={}) {
   if(!conditions.length)conditions=report?.conditions || Object.entries(report?.observations?.targets || {}).flatMap(([target,obs])=>(obs.conditions || []).map(item=>({...item,target})));
   const {results,key:resultKey}=conditionResults(report),defaultTarget=reportConfig(report || {}).targets?.[0]?.name || state.detail?.config?.targets?.[0]?.name || '',groups=new Map();
   for(const summary of conditions){
-    const condition=summary.condition || {id:summary.condition_id,label:summary.name,check:summary.check_id};if(!condition.id)continue;
+    const condition=summary.condition || {id:summary.condition_id,label:summary.name,check:summary.check_id};if(!condition.id||isSetupCondition(condition))continue;
     const target=summary.target ?? defaultTarget,key=JSON.stringify([target,condition.id]);groups.set(key,{key,target,condition,summary,records:[]});
   }
   // Current reports provide aggregates; legacy reports alone need a request scan.
   if(!groups.size)for(const record of records){
     const condition=conditionInfo(record,report),target=record.target ?? defaultTarget,key=JSON.stringify([target,condition.id]);
+    if(isSetupCondition(condition))continue;
     if(!groups.has(key))groups.set(key,{key,target,condition,records:[]});groups.get(key).records.push(record);
   }
   conditionViews.clear();
@@ -345,7 +369,7 @@ function renderTests(records,{conditions=[],live=false,report=null}={}) {
     const {condition,records}=item,s=item.summary || {},started=s.started ?? s.sent ?? records.length,running=live?(s.running ?? records.filter(r=>r.status==='running').length):0,completed=s.completed ?? Math.max(0,started-running),failed=s.failed ?? records.filter(r=>requestOutcome(r)==='fail').length,planned=Object.hasOwn(s,'planned')?s.planned:null,passed=records.filter(r=>requestOutcome(r)==='pass').length;
     const summary={...s,planned,planned_kind:s.planned_kind || (planned==null?'unknown':'exact'),started,running,completed,failed,not_started:s.not_started ?? s.not_sent ?? (planned==null?null:Math.max(0,planned-started))};
     const status=conditionStatus(s,{live,started,completed,failed,passed,verdict:s.load_point_result?.status || results.get(resultKey(item.target,condition.id))});
-    const check=summary.check_id || condition.check || 'serving',name=summary.name || condition.label || phaseName(condition.id),description=conditionDescription(condition,summary),checkName=catalogTitle(check);
+    const check=summary.check_id || condition.check || 'serving',name=conditionDisplayName(condition,summary),description=conditionDescription(condition,summary),checkName=catalogTitle(check);
     conditionViews.set(item.key,{...item,summary,status,name,description,checkName,live});
   }
   const views=[...conditionViews.values()],geometry=conditionGeometry(views.map(view=>view.key)),counts=new Map();
@@ -360,7 +384,16 @@ function renderTests(records,{conditions=[],live=false,report=null}={}) {
 }
 function conditionDialogCounts(view) {
   const s=view.summary,plan=s.planned==null?'—':`${s.planned_kind==='upper_bound'?'up to ':''}${number(s.planned)}`;
-  return [['Planned',plan],['Started',number(s.started)],['Running',number(s.running)],['Completed',number(s.completed)],['Failed / timed out',number(s.failed)],['Not started',number(s.not_started)]].map(([label,value])=>`<div><dt>${label}</dt><dd>${value}</dd></div>`).join('');
+  const p=view.condition.parameters || {},duration=s.planned_kind==='duration'||s.plan_kind==='duration'||s.duration_seconds!=null||p.duration_seconds!=null||p.window_seconds!=null||Boolean(loadPointIdentity(view.condition.id || ''));
+  const note=s.planned==null?`Unknown — ${duration?'duration-based':'plan not recorded'}`:'';
+  return [['Planned',plan],['Started',number(s.started)],['Running',number(s.running)],['Completed',number(s.completed)],['Failed / timed out',number(s.failed)],['Not started',number(s.not_started)]].map(([label,value])=>`<div><dt>${label}</dt><dd>${value}</dd>${label==='Planned'&&note?`<small class="hint condition-plan-reason">${escape(note)}</small>`:''}</div>`).join('');
+}
+function conditionRequestContext(id) {
+  const d=conditionDialog,view=conditionViews.get(d?.key),row=d?.payload?.rows?.find(row=>row.request_id===id);
+  if(!view||!row)return null;
+  const totals=Object.values(d.payload.totals || {}).filter(value=>Number.isFinite(value)).reduce((sum,value)=>sum+value,0);
+  const s=view.summary,total=s.planned_kind==='exact'&&s.planned!=null?s.planned:Math.max(s.started || 0,totals,d.filter==='all'?d.payload.total || 0:0);
+  return {number:row.number,total,label:view.name,condition_id:view.condition.id,target:view.target};
 }
 function renderConditionDialog() {
   const dialog=$('#test-dialog'),d=conditionDialog,view=conditionViews.get(d?.key);if(!dialog||!view)return;
@@ -404,16 +437,20 @@ function conditionDialogClosed({reveal=true}={}) {
   const spot=$$('.condition-spot').find(node=>node.dataset.conditionKey===key);spot?.focus?.({preventScroll:true});
 }
 function closeConditionDialog(options) {const dialog=$('#test-dialog');if(dialog?.open)dialog.close();conditionDialogClosed(options);}
+function jumpConditionPage() {
+  const d=conditionDialog;if(!d)return;
+  const pages=d.payload?.pages || 1,value=$('#condition-page-number')?.value,page=Number(value);
+  if(!value||!Number.isInteger(page)||page<1||page>pages){d.validation=`Enter a page from 1 to ${pages}.`;renderConditionDialog();return;}
+  d.page=page;d.validation='';refreshConditionDialog({force:true});
+}
 function handleConditionClick(event) {
   const spot=event.target.closest?.('.condition-spot');if(spot){updateConditionFocus(spot);openConditionDialog(spot.dataset.conditionKey);return true;}
   const request=event.target.closest?.('[data-condition-request]');if(request){openRequest(request.dataset.conditionRequest);return true;}
   const action=event.target.closest?.('[data-condition-action]');if(!action||!conditionDialog)return false;
   const d=conditionDialog,pages=d.payload?.pages || 1,name=action.dataset.conditionAction;
   if(name==='close'){closeConditionDialog();return true;}
-  if(name==='go'){
-    const value=$('#condition-page-number')?.value,page=Number(value);
-    if(!value||!Number.isInteger(page)||page<1||page>pages){d.validation=`Enter a page from 1 to ${pages}.`;renderConditionDialog();return true;}d.page=page;
-  }else d.page=name==='first'?1:name==='last'?pages:name==='prev'?Math.max(1,d.page-1):Math.min(pages,d.page+1);
+  if(name==='go'){jumpConditionPage();return true;}
+  else d.page=name==='first'?1:name==='last'?pages:name==='prev'?Math.max(1,d.page-1):Math.min(pages,d.page+1);
   d.validation='';refreshConditionDialog({force:true});return true;
 }
 function handleConditionChange(event) {
@@ -431,7 +468,7 @@ function handleConditionKeydown(event) {
     if(delta!==undefined||['Home','End'].includes(event.key)){event.preventDefault();const next=spots[event.key==='Home'?0:event.key==='End'?spots.length-1:Math.max(0,Math.min(spots.length-1,index+delta))];updateConditionFocus(next);next?.focus?.({preventScroll:true});return true;}
   }
   if(conditionDialog&&event.key==='Escape'&&$('#test-dialog')?.open&&!$('#request-dialog')?.open){event.preventDefault();closeConditionDialog();return true;}
-  if(conditionDialog&&event.key==='Enter'&&event.target.id==='condition-page-number'){event.preventDefault();handleConditionClick({target:{closest:()=>({dataset:{conditionAction:'go'}})}});return true;}
+  if(conditionDialog&&event.key==='Enter'&&event.target.id==='condition-page-number'){event.preventDefault();jumpConditionPage();return true;}
   return false;
 }
 function renderAllRequests(records,options={}) {
@@ -723,7 +760,7 @@ async function route() {
   state.reportRouteActive=false;
   const reportRail=$('#report-sections');if(reportRail)reportRail.hidden=true;
   if($('#test-dialog')?.open)closeConditionDialog();
-  hideSpotTip();state.cleanup=null;
+  hideSpotTip();hidePerformanceTooltip();state.cleanup=null;
   if($('#dataset-dialog')?.open)closeDatasetDialog();
   closeRequestEvidence();
   for(const id of ['baseline-dialog','storage-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
@@ -1510,7 +1547,7 @@ function renderTestCard(check,config) {
   <div class="test-editor" id="settings-${check.id}" data-test-editor="${check.id}" hidden>
   <div class="test-editor-head"><span class="eyebrow">${escape(checkGroups.find(group=>group.checks.includes(check.id))?.title || 'Check')}</span><h3 tabindex="-1" data-editor-title>${escape(guide.name)}</h3><button type="button" class="button ghost icon-button" data-close-test="${check.id}" aria-label="Close ${escape(guide.name)} settings"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div>
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
-  ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${check.id==='load'?'':questionSource}${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','First metrics URL',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}</div>`:''}
+  ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${check.id==='load'?'':questionSource}${check.id==='gpu'?`<div class="metrics-field">${field('metrics_url','First metrics URL',config.targets[0].metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}${field('host_metrics_url','Host metrics exporter URL (optional)',config.targets[0].host_metrics_url,{type:'url',placeholder:'http://localhost:9100/metrics',hint:'An existing node_exporter URL measures server-wide CPU and host RAM. Runner memory is separate; inference credentials are not forwarded.'})}</div>`:''}
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
   ${check.option_fields.length||check.limit_fields.length||check.id==='load'?`<button type="button" class="text-button reset-test" data-reset-test="${check.id}" aria-label="${check.id==='load'?'Reset workload settings':'Reset overrides'} for ${escape(guide.name)}" ${custom||check.id==='load'?'':'hidden'}>${check.id==='load'?'Reset workload settings':'Reset overrides'}</button>`:''}${inactiveControls}
   ${requests?`${requestFields.length>1?'<h4>Requests</h4>':''}<fieldset class="fields check-request-fields">${requests}</fieldset>`:''}
@@ -1763,7 +1800,7 @@ function syncTestControls() {
       const warning=$(selector,card);if(warning)warning.hidden=!(selected||open)||!warning.textContent;
     }
     for(const fieldset of $$('fieldset',editor))fieldset.disabled=!open;
-    if(check.id==='gpu')form.elements.metrics_url.disabled=!open;
+    if(check.id==='gpu'){form.elements.metrics_url.disabled=!open;if(form.elements.host_metrics_url)form.elements.host_metrics_url.disabled=!open;}
   }
   const sessionProfile=form.elements.sessions_profile;
   if(sessionProfile){const mixed=sessionProfile.value==='performance';$('[data-session-mix]',form).hidden=!mixed;$('[data-session-legacy]',form).hidden=mixed;const fixed=$('[data-session-fixed]',form);if(fixed)fixed.hidden=mixed;}
@@ -2486,6 +2523,7 @@ function readForm(allowEmpty=false) {
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
   if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
   first.metrics_url=form.elements.metrics_url.value.trim() || null;
+  if(form.elements.host_metrics_url)first.host_metrics_url=form.elements.host_metrics_url.value.trim() || null;
   for(const [key] of numericFields)if(data.has(key))config[key]=data.get(key)===''?null:Number(data.get(key));
   for(const name of ['max_requests','max_duration_seconds','concurrency','max_memory_mb'])if(form.elements[`${name}_enabled`])data.set(`${name}_enabled`,form.elements[`${name}_enabled`].checked?'on':'off');
   config=configureRunLimits(config,data,{allowInvalid:allowEmpty});
@@ -2651,26 +2689,190 @@ function renderReportToolbar() {
   const {data,target,window}=selectedPerformance(),checks=(state.detail.report?.checks||state.detail.summary?.checks||[]).filter(check=>check.status!=='skipped'&&check.id!=='baseline'),checkCount=state.detail.report||state.detail.summary?checks.length:(state.detail.config?.checks||[]).length;
   return `<div class="report-toolbar" data-live-key="report-toolbar"><div class="result-tabs" role="tablist" aria-label="Run report">${[['performance','Performance'],['results',`Test results ${checkCount}`]].map(([tab,label])=>`<button role="tab" id="tab-${tab}" aria-selected="${reportView.tab===tab}" tabindex="${reportView.tab===tab?0:-1}" aria-controls="report-${tab}" class="${reportView.tab===tab?'selected':''}" data-report-tab="${tab}">${label}</button>`).join('')}</div><div class="report-measurement">${(data?.available_targets?.length||0)>1?`<label>Target <select id="performance-target">${data.available_targets.map(item=>`<option value="${escape(item.target)}" ${target?.target===item.target?'selected':''}>${escape(item.identity?.model||item.target)} · ${escape(item.target)}</option>`).join('')}</select></label>`:''}<label>Measurement <select id="performance-window" ${!target||reportView.pending?'disabled':''}>${target?.windows?.map(item=>`<option value="${escape(item.id)}" ${window?.id===item.id?'selected':''}>${escape(measurementLabel(item))}</option>`).join('')||'<option>Full request window · not yet measured</option>'}</select></label></div></div>`;
 }
-function performanceValue(metric) {
+// Presentation uses the selected backend summary. Only scales and drawing are reduced here.
+const performanceCharts=new Map(),performancePlotViews=new Map();
+let performancePlotScope=null;
+const finitePerformance=value=>typeof value==='number'&&Number.isFinite(value);
+function minMaxDecimate(points,buckets=160) {
+  if(points.length<=2*buckets+2)return points;
+  const first=points[0],last=points.at(-1),span=last.x-first.x||1,groups=new Map();
+  points.forEach((point,index)=>{
+    const bucket=Math.min(buckets-1,Math.floor((point.x-first.x)/span*buckets));
+    const group=groups.get(bucket)||{min:index,max:index};
+    if(point.y<points[group.min].y)group.min=index;
+    if(point.y>points[group.max].y)group.max=index;
+    groups.set(bucket,group);
+  });
+  const indices=new Set([0,points.length-1]);
+  for(const group of groups.values()){indices.add(group.min);indices.add(group.max);}
+  return [...indices].sort((a,b)=>a-b).map(index=>points[index]);
+}
+function performanceDisplay(metric,{seconds=false}={}) {
   if(metric?.value==null)return '—';
-  if(typeof metric.value==='number')return `${number(metric.value,2)}${metric.unit?' '+escape(metric.unit):''}`;
-  if(Array.isArray(metric.value))return metric.value.map(value=>typeof value==='number'?number(value,2):escape(value)).join(', ');
-  return escape(typeof metric.value==='object'?JSON.stringify(metric.value):metric.value);
+  let value=metric.value,unit=metric.unit||'';
+  if(finitePerformance(value)){
+    if(seconds&&unit==='ms'){value/=1000;unit='s';}
+    if(['ratio','fraction'].includes(unit)){value*=100;unit='%';}
+    return `${number(value,unit==='requests'||unit==='tokens'?0:3)}${unit?' '+escape(unit):''}`;
+  }
+  if(Array.isArray(value))return value.every(item=>typeof item!=='object')?value.map(item=>escape(item)).join(' → '):'Recorded; see evidence';
+  if(typeof value==='object'){
+    if(finitePerformance(value.median))return `${number(value.median,3)} ${escape(unit)}`;
+    if(value.affected_requests!=null)return `${number(value.affected_requests)} / ${number(value.total_requests)} requests · ${escape(value.status)}`;
+    const fields=Object.entries(value).filter(([,item])=>typeof item==='number'||typeof item==='boolean'||typeof item==='string');
+    return fields.length?fields.map(([key,item])=>`${escape(human(key))}: ${finitePerformance(item)?number(item,3):escape(item)}`).join(' · '):'Recorded; see evidence';
+  }
+  return escape(value);
+}
+function performanceInfo(metric,key) {
+  const id=`performance-info-${key}`;
+  return `<span class="performance-info-wrap"><button type="button" class="performance-info" data-performance-info="${escape(key)}" aria-label="Definition of ${escape(metric.label)}" aria-describedby="${id}" aria-expanded="false">i</button><span id="${id}" class="performance-info-popover" role="tooltip"><b>${escape(metric.label)}</b><span>${escape(metric.source||'Origin not recorded.')}</span><span>Unit: ${escape(metric.unit||'not specified')} · ${number(metric.sample_count)} samples / ${number(metric.eligible_count)} eligible.</span><span>${escape(human(metric.state||'not_measured'))}${metric.reason?': '+escape(metric.reason):''}</span>${metric.action?`<span>How to collect: ${escape(metric.action)}</span>`:''}<span>Window: ${escape(metric.window||'selected window')} · Target: ${escape(metric.target||'selected target')}</span></span></span>`;
+}
+function performanceCard(metric,key,{seconds=false,note='',emptyLabel=''}={}) {
+  if(!metric)return '';
+  const available=metric.value!=null,subtext=!available?metric.reason||'No eligible observations in this scope.':note||(metric.p95!=null?`Median · P95 ${performanceDisplay({...metric,value:metric.p95},{seconds})}`:available?`${number(metric.sample_count)} / ${number(metric.eligible_count)} eligible observations`:metric.reason||'No eligible observations in this scope.');
+  return `<article class="performance-kpi ${available?'':'unavailable'}" data-live-key="kpi-${escape(key)}"><div class="performance-card-label"><h3>${escape(metric.label)}</h3>${performanceInfo(metric,key)}</div><strong>${emptyLabel&&!available?escape(emptyLabel):performanceDisplay(metric,{seconds})}</strong>${metric.state==='estimated'?'<span class="performance-estimate">ESTIMATE</span>':''}<span class="metric-state ${escape(metric.state)}">${escape(human(metric.state))}</span><p>${escape(subtext)}</p>${!available&&metric.action?`<p class="performance-collect">${escape(metric.action)}</p>`:''}${metric.partial?'<p class="performance-coverage">Partial usage / measurement coverage; known observations only.</p>':''}</article>`;
+}
+function performanceMetricTable(rows,title='') {
+  return `${title?`<h3 class="performance-table-heading">${escape(title)}</h3>`:''}<div class="metric-table performance-metric-table"><table><thead><tr><th>Metric</th><th>Value</th><th>Definition / availability</th></tr></thead><tbody>${(rows||[]).map(metric=>`<tr class="${metric.value==null?'missing':''}"><th scope="row">${escape(metric.label)}</th><td class="performance-metric-value">${performanceDisplay(metric)}${metric.state==='estimated'?'<small class="performance-estimate">ESTIMATE</small>':''}<small class="availability">${escape(human(metric.state))}</small></td><td>${escape(metric.reason||metric.source)}${metric.reason&&metric.source?`<small>${escape(metric.source)}</small>`:''}${metric.action?`<small>How to collect: ${escape(metric.action)}</small>`:''}<small>${number(metric.sample_count)} samples / ${number(metric.eligible_count)} eligible${metric.partial?' · partial coverage':''}</small></td></tr>`).join('')}</tbody></table></div>`;
+}
+function performanceDistributions(summary,keys,title) {
+  const rows=keys.map(key=>summary.distributions?.[key]).filter(Boolean);
+  return `<details class="performance-distributions"><summary>${escape(title)}</summary><p class="hint">${escape(selectedPerformance().data?.percentile_convention||'Percentile convention was not recorded.')}</p><div class="performance-distribution-scroll"><table><thead><tr><th>Metric / unit</th><th>n</th>${['Mean','Min','Median','P90','P95','P99','Max'].map(label=>`<th>${label}</th>`).join('')}</tr></thead><tbody>${rows.map(metric=>{const value=metric.value;return `<tr><th scope="row">${escape(metric.label)}<small>${escape(metric.unit)} · ${escape(metric.source)}</small></th>${value?`<td>${number(value.n)}</td>${['mean','min','median','p90','p95','p99','max'].map(key=>`<td>${number(value[key],3)}</td>`).join('')}`:`<td colspan="8">— · ${escape(human(metric.state))}. ${escape(metric.reason)} ${escape(metric.action)}</td>`}</tr>`;}).join('')||'<tr><td colspan="9">No distributions were recorded for this scope.</td></tr>'}</tbody></table></div></details>`;
+}
+function performanceSection(id,label,note,body) {
+  const index=reportSections.findIndex(section=>section[0]===id)+1;
+  return `<section id="performance-${id}" class="performance-section"><div class="performance-section-head"><h2><span class="section-number">${String(index).padStart(2,'0')}</span> ${escape(label)}</h2><p>${escape(note)}</p></div>${body}</section>`;
+}
+function performancePlotView(id) {
+  if(!performancePlotViews.has(id))performancePlotViews.set(id,{hidden:new Set(),index:null,zoom:'all'});
+  return performancePlotViews.get(id);
+}
+function performanceAxes(xmin,xmax,ymax,{xlabel='Request number · dispatch order',ylabel='seconds'}={}) {
+  const sx=x=>xmin===xmax?460:52+(x-xmin)/(xmax-xmin)*816,sy=y=>238-y/ymax*204;
+  const ticks=xmin===xmax?[xmin]:Array.from({length:5},(_,i)=>xmin+(xmax-xmin)*i/4);
+  const grid=Array.from({length:5},(_,i)=>{const y=ymax*i/4;return `<line x1="52" x2="868" y1="${sy(y)}" y2="${sy(y)}" class="performance-gridline"/><text x="43" y="${sy(y)+4}" text-anchor="end">${number(y,2)}</text>`;}).join('');
+  return {sx,sy,html:`${grid}<line x1="52" x2="868" y1="238" y2="238" class="performance-axis"/>${ticks.map(x=>`<text x="${sx(x)}" y="257" text-anchor="middle">${number(x,1)}</text>`).join('')}<text x="460" y="282" text-anchor="middle">${escape(xlabel)}</text><text x="52" y="17">${escape(ylabel)}</text>`};
+}
+function renderPerformanceLineChart(id,title,caption,rows,series,{step=false,stages=[],bounds=null,controls='',xlabel='Request number · dispatch order',ylabel='seconds'}={}) {
+  const view=performancePlotView(id),prepared=series.map(item=>({...item,points:rows.map((row,index)=>({x:row.x??row.number,y:item.value?item.value(row):row.values?.[item.key],row,index})).filter(point=>finitePerformance(point.x)&&finitePerformance(point.y)).map(point=>({...point,y:point.y*(item.scale??1)}))}));
+  if(!prepared.some(item=>item.points.length))return `<article class="performance-plot performance-chart-empty"><h3>${escape(title)}</h3><p class="hint">${escape(id==='cached'?'No cached prompt usage was reported in this window.':id==='size'?'No input or answer token counts were reported in this window.':'No eligible timestamped observations were recorded in this window.')}</p></article>`;
+  let xmin=bounds?.[0]??Infinity,xmax=bounds?.[1]??-Infinity;
+  if(!bounds)for(const item of prepared)for(const point of item.points){xmin=Math.min(xmin,point.x);xmax=Math.max(xmax,point.x);}
+  const visiblePoints=points=>{
+    if(!bounds)return points;
+    const left=points.filter(point=>point.x<xmin).at(-1),selected=points.filter(point=>point.x>=xmin&&point.x<=xmax);
+    if(left)selected.unshift({...left,x:xmin});
+    if(step&&selected.length&&selected.at(-1).x<xmax)selected.push({...selected.at(-1),x:xmax});
+    return selected;
+  };
+  let ymax=1;for(const item of prepared)for(const point of visiblePoints(item.points))ymax=Math.max(ymax,point.y);
+  const axes=performanceAxes(xmin,xmax,ymax,{xlabel,ylabel});
+  const visibleRows=bounds?rows.filter(row=>(row.x??row.number)>=xmin&&(row.x??row.number)<=xmax):rows;
+  if(bounds&&step){
+    const carry=rows.filter(row=>(row.x??row.number)<xmin).at(-1);
+    if(carry&&(!visibleRows.length||(visibleRows[0].x??visibleRows[0].number)>xmin))visibleRows.unshift({...carry,x:xmin});
+    if(visibleRows.length&&(visibleRows.at(-1).x??visibleRows.at(-1).number)<xmax)visibleRows.push({...visibleRows.at(-1),x:xmax});
+  }
+  const chart={id,rows:visibleRows,series:prepared.map(({points,...item})=>step?{...item,points}:item),xmin,xmax,ymax,sx:axes.sx,sy:axes.sy,kind:step?'step':'requests'};
+  performanceCharts.set(id,chart);
+  const paths=prepared.filter(item=>item.points.length).map((item,index)=>{
+    const drawn=minMaxDecimate(visiblePoints(item.points),160),path=drawn.map((point,i)=>`${i?(step?'H'+axes.sx(point.x).toFixed(2)+'V':'L'):'M'}${step&&i?'':axes.sx(point.x).toFixed(2)+','}${axes.sy(point.y).toFixed(2)}`).join(' ');
+    return `<path data-live-key="series-${escape(item.key)}" data-series="${escape(item.key)}" d="${path}" class="performance-series ${item.dashed?'dashed':''}" style="--series-color:${item.color}" fill="none" ${view.hidden.has(item.key)?'hidden':''}/>${drawn.length===1?`<circle cx="${axes.sx(drawn[0].x)}" cy="${axes.sy(drawn[0].y)}" r="3" style="fill:${item.color}" ${view.hidden.has(item.key)?'hidden':''}/>`:''}`;
+  }).join('');
+  const visibleStages=stages.filter(stage=>stage.end_elapsed_s>xmin&&stage.elapsed_s<xmax);
+  const bands=visibleStages.slice(0,40).map((stage,index)=>{const left=Math.max(xmin,stage.elapsed_s),right=Math.min(xmax,stage.end_elapsed_s);return `<g class="performance-stage-band"><rect x="${axes.sx(left)}" y="27" width="${Math.max(0,axes.sx(right)-axes.sx(left))}" height="211" opacity="${index%2?.055:.025}"/><text x="${axes.sx(left)+5}" y="42">${escape(stage.label||'Stage')}</text></g>`;}).join('');
+  const description=`${title}. ${rows.length} ${step?'recorded events':'request observations'}, x ${number(xmin,2)} to ${number(xmax,2)}, y 0 to ${number(ymax,3)} ${ylabel}. Series: ${prepared.filter(item=>item.points.length).map(item=>item.label).join(', ')}. Arrow keys inspect every retained observation; drawing uses min/max reduction.`;
+  return `<article class="performance-plot" data-live-key="plot-${id}"><div class="performance-chart-toolbar"><div><h3>${escape(title)}</h3><p class="performance-caption">${escape(caption)}</p></div>${controls}</div><svg class="performance-chart" data-performance-chart="${id}" viewBox="0 0 900 292" role="img" tabindex="0" aria-label="${escape(description)}" aria-describedby="performance-inspection-${id}"><desc>${escape(description)}</desc><defs><clipPath id="performance-clip-${id}"><rect x="52" y="27" width="816" height="211"/></clipPath></defs>${axes.html}<g clip-path="url(#performance-clip-${id})">${bands}${paths}<line class="performance-crosshair" x1="52" x2="52" y1="27" y2="238" hidden/></g></svg><div class="performance-chart-legend">${prepared.filter(item=>item.points.length).map(item=>`<button type="button" data-live-key="legend-${item.key}" data-performance-series="${escape(item.key)}" data-chart="${id}" aria-pressed="${!view.hidden.has(item.key)}" style="--series-color:${item.color}"><i aria-hidden="true"></i>${escape(item.label)}</button>`).join('')}</div><p class="performance-caption">Drawn from ${number(rows.length)} ${step?'recorded events':'requests'}; every eligible request is included in metrics. Min/max per drawing bucket preserves extrema; lines connect observations.${step?' Steps hold each recorded value until its next transition.':' Timing phases are not all additive.'}${visibleStages.length>40?' Showing the first 40 of '+number(visibleStages.length)+' stage bands; complete schedule evidence is retained in JSON.':''}</p><div id="performance-inspection-${id}" class="performance-inspection" role="status" aria-live="polite">Focus the chart and use ← / → to inspect ${step?'events':'every request'}, or point at the chart.</div></article>`;
+}
+function renderPerformanceCompletions(summary) {
+  const data=summary.completion_buckets,buckets=data?.buckets||[];
+  if(!buckets.length||!buckets.some(bucket=>bucket.count>0))return `<article class="performance-plot performance-chart-empty"><h3>Completed requests over time</h3><p class="hint">${buckets.length?'No completed requests in the selected window; recorded bucket counts are zero.':'No completion timestamps were recorded in this window.'}</p>${data?.rule?`<p class="performance-caption">${escape(data.rule)}</p>`:''}</article>`;
+  const xmax=buckets.at(-1).end_s,ymax=Math.max(1,...buckets.map(bucket=>bucket.count)),axes=performanceAxes(0,xmax,ymax,{xlabel:'Elapsed seconds',ylabel:'completed requests'});
+  const rows=buckets.map((bucket,index)=>({...bucket,x:(bucket.start_s+bucket.end_s)/2,number:index+1,values:{count:bucket.count}}));
+  performanceCharts.set('completions',{id:'completions',rows,series:[{key:'count',label:'Completed requests',unit:'requests'}],xmin:0,xmax,ymax,sx:axes.sx,sy:axes.sy,kind:'buckets'});
+  const last=buckets.at(-1),partial=data.final_partial_bucket?`Final partial bucket: ${number(last.start_s,2)}–${number(last.end_s,2)} s (${number(last.duration_s,2)} s actual duration). ${data.partial_bucket_disclosure}`:'No partial final bucket.';
+  return `<article class="performance-plot" data-live-key="plot-completions"><h3>Completed requests over time</h3><p class="performance-caption">${number(data.width_s)}-second buckets · completion counts, including failed terminal requests.</p><svg class="performance-chart" data-performance-chart="completions" viewBox="0 0 900 292" role="img" tabindex="0" aria-label="Completed request counts in ${buckets.length} elapsed-time buckets, including terminal failures. ${escape(partial)}" aria-describedby="performance-inspection-completions"><desc>${escape(data.rule)} ${escape(data.boundary_rule)}</desc>${axes.html}${buckets.map(bucket=>`<rect class="performance-completion-bar" x="${axes.sx(bucket.start_s)+1}" y="${axes.sy(bucket.count)}" width="${Math.max(1,axes.sx(bucket.end_s)-axes.sx(bucket.start_s)-2)}" height="${238-axes.sy(bucket.count)}"><title>${number(bucket.start_s,2)}–${number(bucket.end_s,2)} s · ${number(bucket.count)} completed · ${number(bucket.valid_completions)} valid</title></rect>`).join('')}<line class="performance-crosshair" x1="52" x2="52" y1="27" y2="238" hidden/></svg><p class="performance-caption">${escape(data.rule)} ${escape(partial)} ${escape(data.boundary_rule)}</p><div id="performance-inspection-completions" class="performance-inspection" role="status" aria-live="polite">Focus or point at a bucket to inspect its count and actual duration.</div></article>`;
+}
+function performanceStepValue(series,x) {
+  const points=series.points||[];let low=0,high=points.length;
+  while(low<high){const middle=Math.floor((low+high)/2);if(points[middle].x<=x)low=middle+1;else high=middle;}
+  return low?points[low-1].y:null;
+}
+function hidePerformanceTooltip() {const tip=$('#performance-chart-tooltip');if(tip)tip.hidden=true;}
+function showPerformanceTooltip(id,x,y) {
+  const tip=$('#performance-chart-tooltip'),inspection=$(`#performance-inspection-${id}`);if(!tip||!inspection)return;
+  tip.textContent=inspection.textContent;tip.hidden=false;
+  const box=tip.getBoundingClientRect();tip.style.left=`${Math.max(12,Math.min(x+14,window.innerWidth-box.width-12))}px`;tip.style.top=`${Math.max(12,Math.min(y+18,window.innerHeight-box.height-12))}px`;
+}
+function inspectPerformanceChart(id,index) {
+  const chart=performanceCharts.get(id);if(!chart?.rows.length)return;
+  const view=performancePlotView(id);view.index=Math.max(0,Math.min(chart.rows.length-1,index));
+  const row=chart.rows[view.index],svg=$(`[data-performance-chart="${id}"]`),crosshair=svg?.querySelector('.performance-crosshair'),inspection=$(`#performance-inspection-${id}`);
+  const x=Math.max(chart.xmin,Math.min(chart.xmax,row.x??row.number));
+  if(crosshair){crosshair.removeAttribute('hidden');crosshair.setAttribute('x1',chart.sx(x));crosshair.setAttribute('x2',chart.sx(x));}
+  let text;
+  if(chart.kind==='buckets')text=`${number(row.start_s,2)}–${number(row.end_s,2)} s · ${number(row.count)} completed requests · ${number(row.valid_completions)} valid · ${number(row.duration_s,3)} s actual duration${row.partial?' · partial bucket':''}`;
+  else text=`${chart.kind==='requests'?`Request #${String(row.number).padStart(4,'0')} · ${row.request_id}`:`Elapsed ${number(row.x,3)} s`}: ${chart.series.map(series=>{const value=chart.kind==='step'?performanceStepValue(series,row.x):series.value?series.value(row):row.values?.[series.key];return `${series.label}: ${finitePerformance(value)?number(value*(series.scale??1),3)+' '+(series.unit||''):'Unavailable'}`;}).join(' · ')}`;
+  if(inspection)inspection.textContent=text;
+}
+function handlePerformanceKeydown(event) {
+  if(event.key==='Escape'){hidePerformanceTooltip();for(const button of $$('[data-performance-info][aria-expanded="true"]')){button.setAttribute('aria-expanded','false');button.closest('.performance-info-wrap')?.classList.remove('info-open');}return false;}
+  const svg=event.target.closest?.('[data-performance-chart]'),chart=performanceCharts.get(svg?.dataset?.performanceChart);
+  if(!chart||!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return false;
+  event.preventDefault();const current=performancePlotView(chart.id).index??0;
+  inspectPerformanceChart(chart.id,event.key==='Home'?0:event.key==='End'?chart.rows.length-1:current+(event.key==='ArrowRight'?1:-1));return true;
+}
+function handlePerformancePointer(event) {
+  const svg=event.target.closest?.('[data-performance-chart]'),chart=performanceCharts.get(svg?.dataset?.performanceChart);if(!chart)return false;
+  const rect=svg.getBoundingClientRect(),x=chart.xmin+Math.max(0,Math.min(1,((event.clientX-rect.left)/rect.width*900-52)/816))*(chart.xmax-chart.xmin);
+  let low=0,high=chart.rows.length-1;
+  while(low<high){const middle=Math.floor((low+high)/2);if((chart.rows[middle].x??chart.rows[middle].number)<x)low=middle+1;else high=middle;}
+  if(low>0&&Math.abs((chart.rows[low-1].x??chart.rows[low-1].number)-x)<Math.abs((chart.rows[low].x??chart.rows[low].number)-x))low--;
+  inspectPerformanceChart(chart.id,low);showPerformanceTooltip(chart.id,event.clientX,event.clientY);return true;
+}
+function handlePerformanceClick(event) {
+  const info=event.target.closest?.('[data-performance-info]');if(info){const open=info.getAttribute('aria-expanded')!=='true';info.setAttribute('aria-expanded',String(open));info.closest('.performance-info-wrap')?.classList.toggle('info-open',open);return true;}
+  const legend=event.target.closest?.('[data-performance-series]');if(!legend)return false;
+  const view=performancePlotView(legend.dataset.chart),key=legend.dataset.performanceSeries;
+  if(view.hidden.has(key))view.hidden.delete(key);else view.hidden.add(key);
+  renderDetail();return true;
+}
+function handlePerformanceChange(event) {
+  if(event.target.id!=='performance-concurrency-stage')return false;
+  const view=performancePlotView('concurrency');view.zoom=event.target.value;view.index=null;hidePerformanceTooltip();renderDetail();return true;
 }
 function renderPerformance() {
-  const {data,target,window,summary}=selectedPerformance();
-  const coverage=data?.coverage;
-  return `<section id="report-performance" role="tabpanel" aria-labelledby="tab-performance" data-live-key="report-performance" ${reportView.tab==='performance'?'':'hidden'}>
-    ${!activeState(state.detail)?`<div class="notice report-terminal-notice">${escape(statusLabels[state.detail.state]||human(state.detail.state))}. ${state.detail.report?.abort_reason?'Partial evidence: '+escape(state.detail.report.abort_reason):'Review measurement coverage and check verdicts before interpreting these results.'} <a href="${linkRun(state.detail.id)}/results" data-report-tab="results">View test results</a></div>`:''}
-    ${coverage?.partial?notice(coverage.reason||'Live measurements cover only retained requests.','warning'):''}
-    ${reportView.error?notice(reportView.error,'warning'):''}
-    <section id="performance-overview" class="performance-section"><div class="section-heading"><h2>Performance overview</h2><span class="hint">${escape(target?.identity?.model||target?.target||'')}</span></div>
-    <p class="performance-window-description">${window?escape(measurementLabel(window))+' · '+elapsed(window.duration_s)+(window.includes_startup?' · includes first-request startup':'')+(window.includes_drain?' · includes drain':''):'Measurements will appear when eligible request timing is available.'}</p>
-    ${target?.scope_note?`<p class="hint">${escape(target.scope_note)}</p>`:''}
-    ${summary?`<div class="performance-kpis">${summary.kpis.map(key=>{const metric=summary.metrics[key];return `<article class="performance-kpi" data-live-key="kpi-${key}"><h3>${escape(metric.label)}</h3><strong>${performanceValue(metric)}</strong><span class="metric-state ${escape(metric.state)}">${escape(human(metric.state))}</span><p>${escape(metric.reason||`${number(metric.sample_count)} / ${number(metric.eligible_count)} eligible observations`)}</p><details><summary>Definition & availability</summary><p>${escape(metric.source)}</p><p>${escape(metric.action||'')}</p><p>${number(metric.sample_count)} samples · ${number(metric.eligible_count)} eligible · ${escape(metric.unit)}</p></details></article>`;}).join('')}</div>`:`<div class="empty-state"><h3>${reportView.pending?'Loading measurements…':'No performance measurements available'}</h3><p>Request evidence and check verdicts remain available in Test results.</p>${!reportView.pending?'<button class="button small" data-action="refresh-performance">Load measurements</button>':''}</div>`}</section>
-    ${reportSections.slice(1).map(([id,label,section],index)=>`<section id="performance-${id}" class="performance-section"><div class="section-heading"><h2><span class="section-number">${String(index+2).padStart(2,'0')}</span> ${label}</h2></div>${summary&&section?`<details><summary>Recorded metrics & availability</summary><div class="metric-table"><table><thead><tr><th>Metric</th><th>Value</th><th>Definition / availability</th></tr></thead><tbody>${(summary.sections[section]||[]).map(metric=>`<tr><th>${escape(metric.label)}</th><td>${performanceValue(metric)}<small>${escape(human(metric.state))}</small></td><td>${escape(metric.reason||metric.source)}${metric.action?`<small>${escape(metric.action)}</small>`:''}</td></tr>`).join('')}</tbody></table></div></details>`:`<p class="hint">${summary?'Per-request timing and full distributions are included in the JSON export.':'No measurements available for this selection.'}</p>`}</section>`).join('')}
-  </section>`;
+  const {data,target,window,summary}=selectedPerformance(),scope=JSON.stringify([state.detail?.id,target?.target,window?.id]);
+  if(performancePlotScope!==scope){performancePlotScope=scope;performancePlotViews.clear();}
+  performanceCharts.clear();
+  const terminal=!activeState(state.detail)?`<div class="notice report-terminal-notice">${escape(statusLabels[state.detail.state]||human(state.detail.state))}. ${state.detail.report?.abort_reason?'Partial evidence: '+escape(state.detail.report.abort_reason):'Review measurement coverage and check verdicts before interpreting these results.'} <a href="${linkRun(state.detail.id)}/results" data-report-tab="results">View test results</a></div>`:'';
+  let body='';
+  if(summary){
+    const metrics=summary.metrics||{},rows=(summary.request_row_indices||[]).map(index=>target.request_series?.[index]).filter(Boolean),timingKeys=Object.keys(summary.distributions||{}).filter(key=>!key.endsWith('_length'));
+    const seconds=new Set(['response_latency','first_useful_output','answer_streaming','completion_tail','client_ttft','first_reasoning','server_ttft']);
+    const kpis=(summary.kpis||[]).map(key=>performanceCard(metrics[key],key,{seconds:seconds.has(key),note:key==='output_throughput'?(metrics.completion_throughput?.semantically_identical_to_answer?'Answer and completion rates match for this usage.':'Answer tokens / matching window; completion may also include reasoning.'):key==='generation_pace'?'Median · answer streaming only':''})).join('');
+    body=`<section id="performance-overview" class="performance-section performance-overview"><p class="performance-window-description"><span class="performance-target-label">${escape(target.identity?.model||target.target)}</span> · ${escape(measurementLabel(window))} · ${elapsed(window?.duration_s)}${window?.includes_startup?' · includes first-request startup':''}${window?.includes_drain?' · includes drain':''}</p>${target.scope_note?`<p class="hint performance-scope-note">${escape(target.scope_note)}</p>`:''}<div class="performance-kpis">${kpis}</div>${performanceDistributions(summary,timingKeys,'All timing percentiles & definitions')}</section>`;
+    const timingSeries=[['response_latency_ms','Response latency','var(--text-2)'],['before_first_useful_output_ms','Before first useful output','var(--unknown)'],['answer_streaming_ms','Answer streaming time','var(--accent)'],['completion_tail_ms','Completion time (tail)','var(--pass)'],['client_ttft_ms','Client TTFT','var(--live)']].map(([key,label,color])=>({key,label,color,scale:.001,unit:'s'}));
+    body+=performanceSection('timing','Request timing','Each observation is a request, ordered by dispatch.',renderPerformanceLineChart('timing','Timing across requests','X: request number · Y: seconds. First useful output and client TTFT have distinct definitions.',rows,timingSeries)+`<div class="performance-support-cards">${performanceCard(metrics.answer_streaming,'answer-streaming',{seconds:true,note:metrics.answer_streaming?.value!=null?`Median · Max ${performanceDisplay({...metrics.answer_streaming,value:summary.distributions?.answer_streaming?.value?.max},{seconds:true})}`:''})}${performanceCard(metrics.longest_stream_pause,'longest-pause',{note:'Maximum gap between answer reads; not token ITL.'})}</div>`+performanceDistributions(summary,['answer_streaming','completion_tail','answer_read_gap','reasoning_read_gap'],'Timing distributions'));
+    const capacity=(summary.sections?.throughput_capacity||[]).filter(metric=>metric.id!=='completion_throughput'||!metric.semantically_identical_to_answer);
+    body+=performanceSection('throughput','Throughput & capacity','Input, completion and normalized rates retain their populations.',`<div class="performance-throughput-layout">${renderPerformanceCompletions(summary)}<div class="performance-capacity-cards">${capacity.map(metric=>performanceCard(metric,`capacity-${metric.id}`)).join('')}</div></div>`);
+    const stages=summary.schedule_intervals||[],view=performancePlotView('concurrency'),stage=stages.find((item,index)=>String(index)===view.zoom),bounds=stage?[stage.elapsed_s,stage.end_elapsed_s]:null;
+    const actual=summary.actual_concurrency,actualRows=actual?.sample_count?actual.points.map(point=>({x:point.elapsed_s,values:{actual:point.in_flight}})):[],intended=(summary.intended_concurrency||[]).flatMap(item=>[{x:item.elapsed_s,values:{intended:item.intended_concurrency}},{x:item.end_elapsed_s,values:{intended:item.intended_concurrency}}]);
+    const concurrencyRows=[...actualRows,...intended].sort((a,b)=>a.x-b.x),concurrencySeries=[{key:'actual',label:'Actual concurrency',color:'var(--accent)',unit:'requests'},{key:'intended',label:'Intended concurrency',color:'var(--text-2)',unit:'requests',dashed:true}];
+    const controls=`<label class="performance-chart-view">Chart view <select id="performance-concurrency-stage"><option value="all" ${view.zoom==='all'?'selected':''}>Whole selected window</option>${stages.map((item,index)=>`<option value="${index}" ${String(index)===view.zoom?'selected':''}>${escape(item.label||'Stage')} · ${number(item.elapsed_s,2)}–${number(item.end_elapsed_s,2)} s</option>`).join('')}</select></label>`;
+    const pauses=summary.client_pauses||[],pauseList=`<article class="performance-plot performance-pauses"><h3>When did the client pause?</h3><p class="performance-caption">Recorded scheduling delays${summary.client_pause_threshold_ms!=null?' above '+number(summary.client_pause_threshold_ms)+' ms':''}; these are client pauses, not server response times.</p>${pauses.length?`<div class="performance-pause-list"><div><span>Elapsed time</span><span>Scheduling delay</span></div>${pauses.slice(0,50).map(pause=>`<div><span>${number(pause.elapsed_s,3)} s</span><strong>${number(pause.lag_ms,1)} ms</strong></div>`).join('')}</div>${pauses.length>50?`<p class="performance-caption">Showing the first 50 of ${number(pauses.length)} client pauses; complete evidence is retained in JSON.</p>`:''}`:`<p class="hint">${escape(summary.client_pause_threshold_ms==null?'Client scheduling-delay recording was not collected.':metrics.max_event_loop_delay?.reason||'No scheduling delays above the recording threshold were observed in this window.')}</p>`}</article>`;
+    body+=performanceSection('delivery','Load delivery','Request lifetimes determine actual concurrency.',`<div class="performance-load-cards">${['peak_concurrency','average_concurrency','configured_ceiling'].map(key=>performanceCard(metrics[key],key,{emptyLabel:key==='configured_ceiling'?'Not set':''})).join('')}</div>`+renderPerformanceLineChart('concurrency','Actual and intended concurrency','X: elapsed seconds · Y: requests in flight. Actual lifetimes and recorded schedule transitions only.',concurrencyRows,concurrencySeries,{step:true,stages,bounds,controls,xlabel:'Elapsed seconds',ylabel:'requests in flight'})+(!intended.length?`<p class="hint">Intended concurrency: ${escape(summary.intended_reason||'No recorded schedule transitions; the configured ceiling is not intended history.')}</p>`:'')+pauseList+performanceMetricTable(summary.sections?.delivery));
+    body+=performanceSection('outcomes','Outcomes & quality','Completion validity and answer correctness are distinct.',performanceMetricTable(summary.sections?.outcomes));
+    const tokenSeries=[{key:'input_tokens',label:'Input tokens',color:'var(--text-2)',unit:'tokens'},{key:'answer_tokens',label:'Answer tokens',color:'var(--accent)',unit:'tokens'}];
+    body+=performanceSection('tokens','Workload & tokens','Token counts and reported cache reuse; rates are shown above.',`<div class="performance-token-charts">${renderPerformanceLineChart('size','Input and answer size by request','All eligible request identities are retained; token usage comes from the endpoint.',rows,tokenSeries,{ylabel:'tokens'})}${renderPerformanceLineChart('cached','Cached prompt tokens by request','Reported cache reuse is a subset of input tokens, not a measured latency saving.',rows,[{key:'cached_prompt_tokens',label:'Cached prompt tokens',color:'var(--pass)',unit:'tokens'}],{ylabel:'cached prompt tokens'})}</div>`+performanceMetricTable(summary.sections?.token_accounting,'Token accounting · selected window')+performanceDistributions(summary,Object.keys(summary.distributions||{}).filter(key=>key.endsWith('_length')),'Token-length distributions'));
+    body+=performanceSection('effects','Conversations & workload effects','Workload-specific evidence remains qualified.',performanceMetricTable(summary.sections?.conversations));
+    body+=performanceSection('server','Server observations','Server-wide telemetry may include other traffic; runner memory is separate.',performanceMetricTable(summary.sections?.server));
+    body+=performanceSection('baseline','Baseline comparison','Comparability and measurement coverage govern every comparison.',performanceMetricTable(summary.sections?.baseline));
+  }else body=`<section id="performance-overview" class="performance-section"><h2>Performance overview</h2><div class="empty-state"><h3>${reportView.pending?'Loading measurements…':'No performance measurements available'}</h3><p>Request evidence and check verdicts remain available in Test results.</p>${!reportView.pending?'<button class="button small" data-action="refresh-performance">Load measurements</button>':''}</div></section>${reportSections.slice(1).map(([id,label])=>performanceSection(id,label,'','<p class="hint">No measurements available for this selection.</p>')).join('')}`;
+  return `<section id="report-performance" role="tabpanel" aria-labelledby="tab-performance" data-live-key="report-performance" ${reportView.tab==='performance'?'':'hidden'}>${terminal}${data?.coverage?.partial?notice(data.coverage.reason||'Live measurements cover only retained requests.','warning'):''}${reportView.error?notice(reportView.error,'warning'):''}${body}</section>`;
 }
+
 async function loadPerformance({force=false}={}) {
   if(!state.detail)return;
   if(reportView.pending){if(force)reportView.again=true;return;}
@@ -2907,7 +3109,7 @@ function renderLive() {
   <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Activity</h2><span class="hint">Updates live</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderResources(d.report,d)}</section>`,{landing:true});
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
-  if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,requestIdentityContent(record,d.live_requests));}
+  if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}
   refreshSpotTip();refreshConditionDialog();
   if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance();
 }
@@ -2961,6 +3163,15 @@ function renderEvaluationEvidence(record,report) {
 }
 let requestEvidenceSequence=0,requestEvidenceFocus=null;
 const requestEvidenceCache=new Map();
+function conditionEvidenceIdentityText(context) {
+  const width=Math.max(4,String(context.total||context.number).length);
+  return `<strong>Request #${String(context.number).padStart(width,'0')} of ${number(context.total)} · ${escape(context.label)}</strong>`;
+}
+function renderConditionEvidenceIdentity(context) {return `<p class="request-identity condition-evidence-identity">${conditionEvidenceIdentityText(context)}</p>`;}
+function renderRequestEvidenceContext(record,report,context) {
+  const content=renderRequestContext(record,report.requests);
+  return context?content.replace(/<p class="request-identity">[\s\S]*?<\/p>/,renderConditionEvidenceIdentity(context)):content;
+}
 function closeRequestEvidence() {
   requestEvidenceSequence++;$('#request-dialog')?.close();
   const back=$('#test-dialog')?.open?$$('[data-condition-request]',$('#test-dialog')).find(node=>node.dataset.conditionRequest===requestEvidenceFocus?.id):null;
@@ -2969,11 +3180,11 @@ function closeRequestEvidence() {
   (back||retained||fallback)?.focus?.({preventScroll:true});
 }
 async function openRequest(id) {
-  const detail=state.detail,report=detail?.report;
+  const detail=state.detail,report=detail?.report,conditionContext=conditionRequestContext(id);
   if(!detail)return;
   if(!report){
     const record=detail.live_requests?.find(record=>record.id===id);
-    if(record?.slot!=null){requestEvidenceFocus={id,element:document.activeElement};openLiveRequest(record.slot);const footer=$('#request-dialog .dialog-footer');if(footer&&$('#test-dialog')?.open)footer.innerHTML='<button class="button" data-action="back-to-test">Back to test details</button>';return;}
+    if(record?.slot!=null){requestEvidenceFocus={id,element:document.activeElement};openLiveRequest(record.slot);if(conditionContext){const identity=$('#request-dialog .request-identity');if(identity){identity.innerHTML=conditionEvidenceIdentityText(conditionContext);identity.setAttribute('data-condition-request-context',JSON.stringify(conditionContext));}}const footer=$('#request-dialog .dialog-footer');if(footer&&$('#test-dialog')?.open)footer.innerHTML='<button class="button" data-action="back-to-test">Back to test details</button>';return;}
   }
   let r=report?.requests?.find(x=>x.id===id);
   if(!r&&!activeState(detail))return;
@@ -2993,7 +3204,7 @@ async function openRequest(id) {
   const evidenceReport=report||{requests:detail.live_requests||[],manifest:{config:detail.config}};
   const retention=reportConfig(evidenceReport).retention || 'failures';
   // Render a full record only after the explicit inspection action; compact rows stay compact.
-  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Request evidence</div><h2 id="request-title">${escape(testLabel(r,evidenceReport))}</h2><p class="hint">${escape(conditionInfo(r,evidenceReport).purpose)}</p></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body">${renderRequestContext(r,evidenceReport.requests)}<div class="statline"><span class="pill">${escape(r.target)}</span><span>Response: ${escape(r.status)}</span>${r.score===false?badge('fail','Incorrect answer'):r.score===true?badge('pass','Correct answer'):'<span class="dim">Answer unscored</span>'}</div>${isProbe(r)?'<div class="notice" style="margin-top:20px">This request is an intentional cancellation or deadline probe. Its transport status alone does not indicate a failed suite check.</div>':''}${r.error?`<div class="notice ${isProbe(r)?'':'error'}" style="margin-top:20px">${escape(r.error)}</div>`:''}${r.score_message?`<p class="hint" style="margin-top:18px">${escape(r.score_message)}</p>`:''}${renderToolEvaluation(r)}<div class="request-comparison"><section>${renderEvaluationEvidence(r,evidenceReport)}</section><section><h3>Actual answer <span class="hint">${number(r.output_chars)} recorded characters</span></h3><div class="body-output">${r.output?`<pre>${escape(r.output)}</pre>`:r.output_chars>0?`<p class="body-not-retained">Body not retained (retention: ${escape(retention)}). Measurements and scoring are preserved.</p>`:'<p class="body-not-retained">No answer text was recorded for this request.</p>'}</div>${renderLogprobEvidence(r)}${renderActualToolCalls(r)}</section></div>${renderResponseEvents(r)}${renderJudgement(r.judgement)}<details class="request-timing"><summary>Timing & transport details</summary><dl class="metrics-grid" style="margin-top:24px">${r.traffic_stage!=null?metric('Arrival rate',`${number(r.traffic_rate_rps,2)} requests/s`,r.traffic_class || '')+metric('Local dispatch delay',ms(r.dispatch_lag_ms),'Measured from planned arrival; not server queue time'):''}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Last answer',ms(r.last_output_ms))}${metric('First reasoning',ms(r.first_reasoning_ms))}${metric('Longest stream gap',ms(r.max_stream_gap_ms))}${metric('Input / output tokens',`${r.load_point&&r.input_tokens==null?'not reported':number(r.input_tokens)} / ${r.load_point&&r.output_tokens==null?'not reported':number(r.output_tokens)}`,'Server-reported usage')}${metric('HTTP / finish reason',`${r.http_status ?? '—'} / ${r.finish_reason || '—'}`)}</dl></details><details class="request-reasoning"><summary>Reasoning output</summary><div class="body-output">${r.reasoning?`<pre>${escape(r.reasoning)}</pre>`:`<p class="body-not-retained">${retention==='all'?'No reasoning text was recorded.':'No reasoning body retained. This does not establish whether the model reasoned.'}</p>`}</div></details><p class="hint" style="margin-top:18px">${r.valid?'Valid non-empty completion':'Completion not validated'} · ${r.stream?'Streaming':'Non-streaming'} · ${r.stream_terminated?'Stream termination observed':'Stream termination not recorded'}</p></div><div class="dialog-footer"><button class="button" data-action="close-dialog">${$('#test-dialog')?.open?'Back to test details':'Close'}</button></div>`;
+  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Request evidence</div><h2 id="request-title">${escape(testLabel(r,evidenceReport))}</h2><p class="hint">${escape(conditionInfo(r,evidenceReport).purpose)}</p></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body">${renderRequestEvidenceContext(r,evidenceReport,conditionContext)}<div class="statline"><span class="pill">${escape(r.target)}</span><span>Response: ${escape(r.status)}</span>${r.score===false?badge('fail','Incorrect answer'):r.score===true?badge('pass','Correct answer'):'<span class="dim">Answer unscored</span>'}</div>${isProbe(r)?'<div class="notice" style="margin-top:20px">This request is an intentional cancellation or deadline probe. Its transport status alone does not indicate a failed suite check.</div>':''}${r.error?`<div class="notice ${isProbe(r)?'':'error'}" style="margin-top:20px">${escape(r.error)}</div>`:''}${r.score_message?`<p class="hint" style="margin-top:18px">${escape(r.score_message)}</p>`:''}${renderToolEvaluation(r)}<div class="request-comparison"><section>${renderEvaluationEvidence(r,evidenceReport)}</section><section><h3>Actual answer <span class="hint">${number(r.output_chars)} recorded characters</span></h3><div class="body-output">${r.output?`<pre>${escape(r.output)}</pre>`:r.output_chars>0?`<p class="body-not-retained">Body not retained (retention: ${escape(retention)}). Measurements and scoring are preserved.</p>`:'<p class="body-not-retained">No answer text was recorded for this request.</p>'}</div>${renderLogprobEvidence(r)}${renderActualToolCalls(r)}</section></div>${renderResponseEvents(r)}${renderJudgement(r.judgement)}<details class="request-timing"><summary>Timing & transport details</summary><dl class="metrics-grid" style="margin-top:24px">${r.traffic_stage!=null?metric('Arrival rate',`${number(r.traffic_rate_rps,2)} requests/s`,r.traffic_class || '')+metric('Local dispatch delay',ms(r.dispatch_lag_ms),'Measured from planned arrival; not server queue time'):''}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Last answer',ms(r.last_output_ms))}${metric('First reasoning',ms(r.first_reasoning_ms))}${metric('Longest stream gap',ms(r.max_stream_gap_ms))}${metric('Input / output tokens',`${r.load_point&&r.input_tokens==null?'not reported':number(r.input_tokens)} / ${r.load_point&&r.output_tokens==null?'not reported':number(r.output_tokens)}`,'Server-reported usage')}${metric('HTTP / finish reason',`${r.http_status ?? '—'} / ${r.finish_reason || '—'}`)}</dl></details><details class="request-reasoning"><summary>Reasoning output</summary><div class="body-output">${r.reasoning?`<pre>${escape(r.reasoning)}</pre>`:`<p class="body-not-retained">${retention==='all'?'No reasoning text was recorded.':'No reasoning body retained. This does not establish whether the model reasoned.'}</p>`}</div></details><p class="hint" style="margin-top:18px">${r.valid?'Valid non-empty completion':'Completion not validated'} · ${r.stream?'Streaming':'Non-streaming'} · ${r.stream_terminated?'Stream termination observed':'Stream termination not recorded'}</p></div><div class="dialog-footer"><button class="button" data-action="close-dialog">${$('#test-dialog')?.open?'Back to test details':'Close'}</button></div>`;
   if(!dialog.open)dialog.showModal();
 }
 function openBaselineDialog(){
@@ -3171,6 +3382,7 @@ async function copyCli() {
 document.addEventListener('click',async(event)=>{
   if(event.target.closest('.skip-link')){event.preventDefault();const main=$('#main');main.setAttribute('tabindex','-1');main.focus({preventScroll:true});main.scrollIntoView({block:'start'});return;}
   if(handleConditionClick(event))return;
+  if(handlePerformanceClick(event))return;
   const reportTab=event.target.closest('[data-report-tab]');if(reportTab){event.preventDefault();chooseReportTab(reportTab.dataset.reportTab,{focus:reportTab.getAttribute?.('role')==='tab'});return;}
   const section=event.target.closest('[data-report-section]');if(section){event.preventDefault();if(typeof location!=='undefined')location.hash=section.getAttribute('href');$(`#performance-${section.dataset.reportSection}`)?.scrollIntoView?.({block:'start'});return;}
   const verdict=event.target.closest('[data-verdict-check]');if(verdict){state.selectedCheck=verdict.dataset.verdictCheck;$('#result-content').innerHTML=renderChecks(state.detail.report);$('.check-detail')?.scrollIntoView?.({block:'start'});$('.check-detail h2')?.setAttribute('tabindex','-1');$('.check-detail h2')?.focus({preventScroll:true});return;}
@@ -3391,6 +3603,7 @@ document.addEventListener('input',event=>{
 });
 document.addEventListener('change',event=>{
   if(handleConditionChange(event))return;
+  if(handlePerformanceChange(event))return;
   if(event.target.id==='performance-target'||event.target.id==='performance-window'){
     if(event.target.id==='performance-target'){reportView.target=event.target.value;reportView.window=null;}else reportView.window=event.target.value;
     loadPerformance({force:true});return;
@@ -3424,6 +3637,7 @@ let navigationPrefix=0;
 document.addEventListener('keydown',event=>{
   if(event.isComposing)return;
   if(handleConditionKeydown(event))return;
+  if(handlePerformanceKeydown(event))return;
   const reportTab=event.target.closest?.('[data-report-tab]');
   if(reportTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){
     event.preventDefault();chooseReportTab(event.key==='Home'?'performance':event.key==='End'?'results':reportView.tab==='performance'?'results':'performance',{focus:true});return;
@@ -3474,11 +3688,12 @@ document.addEventListener('scroll',event=>{
 },true);
 document.addEventListener('close',event=>{if(event.target.id==='test-dialog'&&conditionDialog)conditionDialogClosed();},true);
 document.addEventListener('cancel',event=>{if(event.target.id==='test-dialog'){event.preventDefault();closeConditionDialog();}if(event.target.id==='request-dialog'){event.preventDefault();closeRequestEvidence();}if(event.target.id==='storage-dialog')state.cleanup=null;if(event.target.id==='dataset-dialog')closeDatasetDialog();},true);
-document.addEventListener('focusout',event=>{if(event.target.closest?.('.request-spot, .swarm-dot'))hideSpotTip();});
-document.addEventListener('pointerout',event=>{if(event.target.closest?.('.condition-spot')&&!event.relatedTarget?.closest?.('.condition-spot')){conditionHover=null;refreshConditionSelection();}if(event.target.closest?.('.request-spot, .swarm-dot')&&!event.relatedTarget?.closest?.('.request-spot, .swarm-dot'))hideSpotTip();});
+document.addEventListener('focusout',event=>{if(event.target.closest?.('.request-spot, .swarm-dot'))hideSpotTip();if(event.target.closest?.('[data-performance-chart]'))hidePerformanceTooltip();});
+document.addEventListener('pointerout',event=>{if(event.target.closest?.('[data-performance-chart]')&&!event.relatedTarget?.closest?.('[data-performance-chart]'))hidePerformanceTooltip();if(event.target.closest?.('.condition-spot')&&!event.relatedTarget?.closest?.('.condition-spot')){conditionHover=null;refreshConditionSelection();}if(event.target.closest?.('.request-spot, .swarm-dot')&&!event.relatedTarget?.closest?.('.request-spot, .swarm-dot'))hideSpotTip();});
 document.addEventListener('pointerover',event=>{const spot=event.target.closest?.('.request-spot, .swarm-dot');if(spot){if(spot.classList?.contains('condition-spot')){conditionHover=spot.dataset.conditionKey;updateConditionFocus(spot);}showSpotTip(spot,event.clientX,event.clientY);}else hideSpotTip();});
-document.addEventListener('focusin',event=>{if(event.target.dataset?.liveSlot!==state.mosaicAutoFocus)state.mosaicAutoFocus=null;const spot=event.target.closest?.('.request-spot, .swarm-dot');if(!spot){hideSpotTip();refreshConditionSelection();return;}if(!spot.classList?.contains('condition-spot'))refreshConditionSelection();if(spot.classList?.contains('condition-spot'))updateConditionFocus(spot);const box=spot.getBoundingClientRect();showSpotTip(spot,box.left+box.width/2,box.top);});
+document.addEventListener('focusin',event=>{if(event.target.dataset?.liveSlot!==state.mosaicAutoFocus)state.mosaicAutoFocus=null;const spot=event.target.closest?.('.request-spot, .swarm-dot');if(!spot){hideSpotTip();refreshConditionSelection();const plot=event.target.closest?.('[data-performance-chart]');if(plot)inspectPerformanceChart(plot.dataset.performanceChart,performancePlotView(plot.dataset.performanceChart).index??0);return;}if(!spot.classList?.contains('condition-spot'))refreshConditionSelection();if(spot.classList?.contains('condition-spot'))updateConditionFocus(spot);const box=spot.getBoundingClientRect();showSpotTip(spot,box.left+box.width/2,box.top);});
 document.addEventListener('pointermove',event=>{
+  if(handlePerformancePointer(event))return;
   if(!$('#spot-tip')?.hidden&&event.target.closest?.('.request-spot, .swarm-dot'))showSpotTip(event.target.closest('.request-spot, .swarm-dot'),event.clientX,event.clientY);
   const coat=document.querySelector?.('.hero-coat');if(!coat)return;
   const bounds=coat.getBoundingClientRect();

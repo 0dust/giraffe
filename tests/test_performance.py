@@ -1,6 +1,7 @@
 """Deterministic arithmetic/contract tests
     no endpoint or socket."""
 import json
+import re
 
 import pytest
 
@@ -187,8 +188,12 @@ def test_all_sections_have_contract_rows_and_no_answer_text_leaks(tmp_path):
     lines = cli_summary(saved)
     assert "Request throughput: 1 req/s" in '\n'.join(lines)
     assert "Availability:" in '\n'.join(lines)
-    assert "Request throughput: 1 req/s" in _render(saved)
-    assert "Performance KPIs" in html.read_text()
+    # The standalone report renders the same KPI as a card, with its unit in
+    # separate markup, rather than the Phase A placeholder's CLI-style line.
+    rendered = _render(saved)
+    throughput_card = re.search(r'<article class="html-kpi"><h3>Request throughput.*?</article>', rendered).group()
+    assert '<div class="html-value">1 <small>req/s</small></div>' in throughput_card
+    assert 'Performance overview</h2>' in html.read_text()
     assert not saved.requests[0].output and not saved.requests[0].reasoning
     assert summary(saved)["metrics"]["baseline_timing"]["state"] == "no_baseline"
     assert summary(saved)["metrics"]["websocket_rtt"]["state"] == "not_applicable"
