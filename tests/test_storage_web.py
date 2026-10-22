@@ -31,7 +31,7 @@ def completed(client, identifier):
 def test_storage_endpoints_preview_keep_and_stale_confirm(tmp_path):
     saved(tmp_path, "one")
     saved(tmp_path, "two")
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         summary = client.get("/api/storage").json()
         assert summary["runs_bytes"] == sum(row["bytes"] for row in summary["runs"])
         assert summary["free_bytes"] > 0
@@ -53,13 +53,13 @@ def test_storage_endpoints_preview_keep_and_stale_confirm(tmp_path):
 @pytest.mark.parametrize("body", [{"keep_latest": -1}, {"older_than_days": -1},
                                   {"max_total_bytes": -1}, {"keep_latest": 1.5}])
 def test_cleanup_validates_criteria(tmp_path, body):
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert client.post("/api/storage/cleanup-preview", json=body).status_code == 422
         assert client.post("/api/storage/cleanup", json={**body, "ids": []}).status_code == 422
 
 
 def test_cleanup_validates_ids_and_requires_json(tmp_path):
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert client.post("/api/storage/cleanup", json={"keep_latest": 0, "ids": ["../outside"]}).status_code == 404
         assert client.post("/api/storage/cleanup-preview", content="{}").status_code == 415
         assert client.post("/api/runs/missing/keep", json={"keep": True}).status_code == 404
@@ -74,7 +74,7 @@ def test_start_refuses_disk_limits_before_runner(tmp_path, monkeypatch, limit):
     monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **kw: pytest.fail("Started despite disk limit"))
     limits = {"max_total_storage": 1 if limit == "total" else 0,
               "min_free_disk": 0 if limit == "total" else 2}
-    with TestClient(create_app(tmp_path, **limits)) as client:
+    with TestClient(create_app(tmp_path, **limits), base_url="http://127.0.0.1:8787") as client:
         response = client.post("/api/runs", json={"config": config()})
         assert response.status_code == 507
         assert "1" in response.json()["detail"]
@@ -102,7 +102,7 @@ def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, su
                 full()
             return original(path, target)
         monkeypatch.setattr(Path, "replace", fail_summary)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         response = client.post("/api/runs", json={"config": config()})
         assert response.status_code == 202
         identifier = response.json()["id"]
@@ -119,7 +119,7 @@ def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, su
         assert summary["overall"] == "pass"  # Recorded result survives, run state stays error.
         assert summary["request_count"] == 1
         (tmp_path / identifier / ".web.json").unlink()
-        with TestClient(create_app(tmp_path)) as client:
+        with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
             detail = client.get(f"/api/runs/{identifier}").json()
             assert detail["state"] == "error"
             assert detail["summary"]["checks"][0]["summary"] == "Completed"
@@ -145,7 +145,7 @@ def test_export_error_takes_priority_over_partial_report_that_cannot_be_removed(
     monkeypatch.setattr("giraffe.web.run_suite", runner)
     monkeypatch.setattr("giraffe.web.write_report", partial)
     monkeypatch.setattr(Path, "unlink", cannot_remove)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         identifier = client.post("/api/runs", json={"config": config()}).json()["id"]
         detail = completed(client, identifier)
         assert detail["state"] == "error"
@@ -160,7 +160,7 @@ def test_web_startup_preserves_cleanup_protection_of_live_cli_writer(tmp_path):
     directory.mkdir()
     marker = {"id": "live-cli", "state": "running", "owner_pid": os.getpid()}
     (directory / ".web.json").write_text(json.dumps(marker))
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert client.get("/api/runs/live-cli").json()["state"] == "running"
         plan = client.post("/api/storage/cleanup-preview", json={"keep_latest": 0}).json()
         assert plan["candidates"] == []
@@ -178,7 +178,7 @@ def test_restart_recovers_complete_report_even_if_metadata_disk_is_readonly(tmp_
         raise OSError(errno.EROFS, "Read-only file system")
 
     monkeypatch.setattr("giraffe.web._write", readonly)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         detail = client.get("/api/runs/partial").json()
         assert detail["state"] == "completed"
         assert detail["report"]["overall"] == "pass"

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from giraffe.models import Limits, RunConfig, Target, TrafficConfig, required_concurrency
+from giraffe.models import Limits, TrafficConfig, required_concurrency
 from giraffe.reporting import compare_baseline
 from giraffe.runner import run_suite
 from tests.fake_endpoint import FakeEndpoint
@@ -62,7 +62,8 @@ async def test_arrivals_reach_http_server_before_prior_requests_complete():
         assert endpoint.request_started_at[setup+2] < min(endpoint.request_finished_at[setup:])
         assert endpoint.peak_active >= 3
         assert len(endpoint.requests) == 6 + setup
-    p=capacity(report).metrics['points'][0]; g=p['groups'][0]
+    p=capacity(report).metrics['points'][0]
+    g=p['groups'][0]
     assert p['scheduled'] == p['dispatched'] == g['correct_work_meeting_limits'] == 6
     assert p['status']=='pass' and p['local_drops'] == 0
     assert all(r.score for r in traffic_records(report))
@@ -72,7 +73,8 @@ async def test_mixed_http_workload_scores_short_long_input_and_long_output():
     with FakeEndpoint(first_token_delay=.001,chunk_delay=0) as endpoint:
         cfg=traffic_config(endpoint,traffic=TrafficConfig(rates=[30],duration_seconds=1,seed=42,max_in_flight=32,long_input_chars=512,long_output_words=16),limits=Limits(latency_ms=1000,min_samples=2))
         report=await run_suite(cfg)
-    rows=traffic_records(report); p=capacity(report).metrics['points'][0]
+    rows=traffic_records(report)
+    p=capacity(report).metrics['points'][0]
     assert {r.load_point['shape'] for r in rows} == {'short_short','long_short','short_long'}
     assert len(rows) == p['scheduled'] == p['dispatched'] == 30
     assert all(r.score is True for r in rows)
@@ -89,7 +91,8 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows():
         candidate=await run_suite(cfg)
     old,current=capacity(baseline).metrics,capacity(candidate).metrics
     assert old['highest_accepted'][0]['value'] == 50 and current['highest_accepted'][0]['value'] == 10
-    low,high=current['points']; lg,hg=low['groups'][0],high['groups'][0]
+    low,high=current['points']
+    lg,hg=low['groups'][0],high['groups'][0]
     assert low['status']=='pass' and high['status']=='fail'
     assert high['dispatched']==high['scheduled'] and high['local_drops']==high['late_arrivals']==0
     assert hg['completion_p95_ms'] > lg['completion_p95_ms']*3
@@ -102,7 +105,8 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows():
 async def test_stop_during_http_arrivals_preserves_partial_accounting():
     stop=asyncio.Event()
     def progress(event):
-        if event['event']=='request_started' and event['scenario'].startswith('load_primary_') and event['attempted']>=4: stop.set()
+        if event['event']=='request_started' and event['scenario'].startswith('load_primary_') and event['attempted']>=4:
+            stop.set()
     with FakeEndpoint(first_token_delay=.3,chunk_delay=0) as endpoint:
         cfg=traffic_config(endpoint,traffic=TrafficConfig(rates=[20],duration_seconds=2,max_in_flight=32,mix={'short':1,'long_input':0,'long_output':0}))
         report=await asyncio.wait_for(run_suite(cfg,progress=progress,stop_event=stop),3)
@@ -143,7 +147,7 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
 
     result = capacity(report)
     low, high = result.metrics['points']
-    lg, hg = low['groups'][0], high['groups'][0]
+    _lg, hg = low['groups'][0], high['groups'][0]
     assert low["status"] == "pass" and high["status"] == "fail"
     assert result.metrics["highest_accepted"][0]["value"] == 5
     assert next(c for c in report.checks if c.id == "correctness").metrics["request_pack"]["control_status"] == "pass"

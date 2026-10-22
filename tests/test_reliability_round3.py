@@ -10,7 +10,7 @@ import httpx
 import pytest
 import yaml
 
-from giraffe import runner, telemetry, workloads
+from giraffe import runner, telemetry
 from giraffe.fixtures import builtin_fixtures, final_answer, score_response, traffic_fixtures
 from giraffe.models import Arrival, Limits, RunConfig
 from tests.test_fixtures import record
@@ -294,7 +294,8 @@ async def test_arrivals_dispatch_wait_tolerance(threshold,wait,achieved):
     from tests.test_concurrent_load import configuration
     from tests.test_load_executor_regressions import record as load_record
     c=configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[16]},'pass_criteria':{'max_first_answer_ms':None,'max_completion_ms':threshold if threshold is not None else 1000}})
-    run=runner._Run(c,None,None); p=load_test.test_points(c.load_test)[0]
+    run=runner._Run(c,None,None)
+    p=load_test.test_points(c.load_test)[0]
     p.update(sending_start_ms=0,sending_end_ms=1000,delivered_window_seconds=1,observation_seconds=1,cut_short=False,not_run=False)
     rows=[load_record(str(i),arrival_elapsed_ms=wait+2,arrival_first_output_ms=wait+1,dispatch_lag_ms=wait,load_point={'shape':'short_short'}) for i in range(16)]
     load_test.assess_point(run,c.targets[0],c.load_test,p,rows)

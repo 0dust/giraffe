@@ -77,7 +77,7 @@ def test_successful_final_metadata_retry_clears_only_its_warning_and_cache(tmp_p
 
     monkeypatch.setattr(web, "run_suite", runner)
     monkeypatch.setattr(web, "_write", write)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         identifier = client.post("/api/runs", json={"config": config()}).json()["id"]
         detail = completed(client, identifier)
         marker = tmp_path / identifier / ".web.json"
@@ -106,8 +106,8 @@ async def test_stalled_client_does_not_hold_generation_lock(tmp_path, extension)
             await send(message)
         await app(scope, receive, slow_send)
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(slow_app), base_url="http://test") as slow, \
-            httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(slow_app), base_url="http://127.0.0.1:8787") as slow, \
+            httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
         first = asyncio.create_task(slow.get(f"/api/runs/saved/report.{extension}"))
         try:
             await asyncio.wait_for(entered.wait(), 1)
@@ -168,7 +168,7 @@ def test_download_does_not_create_legacy_state_or_invent_existing_state(tmp_path
     assert set(metadata) == {"latency_summary"}
     assert "state" not in metadata
     marker.unlink()  # A legacy report has no report-time observation metadata.
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert client.get(f"/api/runs/saved/report.{extension}").status_code == 200
         assert not marker.exists()
         marker.write_text('{"id":"saved","custom":"keep"}')
@@ -228,7 +228,7 @@ async def test_execute_final_write_merges_download_samples_saved_during_cleanup(
     monkeypatch.setattr(web, "automatic_cleanup", cleanup)
     app = create_app(tmp_path, min_free_disk=0, auto_cleanup={"keep_latest": 1})
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
             identifier = (await client.post("/api/runs", json={"config": config()})).json()["id"]
             try:
                 assert await asyncio.to_thread(entered.wait, 1)

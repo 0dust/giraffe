@@ -1,5 +1,4 @@
 import asyncio
-import random
 import time
 from contextlib import asynccontextmanager
 
@@ -108,7 +107,8 @@ def test_window_reason_codes_and_remedies_are_cause_specific(reason, code, enoug
 
 
 def test_failed_reasoning_exhaustion_is_not_an_error():
-    c,p = scored_point(); p['cut_short'] = False
+    c,p = scored_point()
+    p['cut_short'] = False
     run = _Run(c,None,None)
     r = record(status='failed',valid=False,score=None,output='',reasoning='thinking',finish_reason='length',error='response contained no useful answer output')
     load.assess_point(run,c.targets[0],c.load_test,p,[r])
@@ -120,7 +120,8 @@ def test_failed_reasoning_exhaustion_is_not_an_error():
 def test_request_warning_reserves_later_consistency_budget():
     c = configuration(max_requests=16,checks=['load','consistency'], consistency={'repetitions':2,'levels':[1],'shapes':['short'],'prompts_per_shape':2},load={'schedule':{'duration_seconds':10}})
     assert load.later_reservation(c) == 4
-    plan = request_plan(c); run = _Run(c,None,None)
+    plan = request_plan(c)
+    run = _Run(c,None,None)
     assert run.quotas == plan['target_quotas'] == {'local':16}
     assert run.quotas['local'] - load.later_reservation(c) - len(load.calibration_keys(c.load_test)) == 11
     warning, = plan['request_warnings']
@@ -130,7 +131,8 @@ def test_request_warning_reserves_later_consistency_budget():
 
 @pytest.mark.parametrize('buffered,total,expected', [(1, 4, False), (2, 4, False), (3, 4, True)])
 def test_buffering_requires_majority_and_is_counted(buffered,total,expected):
-    c,p = scored_point(); p.update(type='interference',pattern='interference',level=2,shape=None)
+    c,p = scored_point()
+    p.update(type='interference',pattern='interference',level=2,shape=None)
     records = [record(str(i),chunks=1 if i < buffered else 2,load_point={'role':'short_stream','phase':'probe'}) for i in range(total)]
     windows=[{'phase':'baseline','sending_start_ms':0},{'phase':'probe','sending_start_ms':0,'triggered':1}]
     data=load.interference_measurements(records,windows)
@@ -159,7 +161,8 @@ async def test_interference_role_scenarios_keep_baseline_groups_comparable():
     run,check,_,_=await perform(configuration(load={'combinations':{'enabled':False},'interference':{'enabled':True},'schedule':{'levels':[2]}}))
     p=point(check)
     for r in run.records:
-        if r.load_point.get('type') != 'interference': continue
+        if r.load_point.get('type') != 'interference':
+            continue
         assert r.scenario == p['id']+'.'+r.load_point['phase']
         assert r.condition_id == r.scenario
     assert {g['shape'] for g in p['groups']} == {'short_short','long_short'}
@@ -227,7 +230,8 @@ async def test_unexpected_executor_cancellation_is_propagated(other_aborted):
 
 def test_large_input_stress_still_requires_target_after_minimum_floor():
     c=configuration(load={'profile':{'short':{'input_tokens':16,'output_tokens':8},'medium':{'input_tokens':32,'output_tokens':16},'long':{'input_tokens':48,'output_tokens':32}},'combinations':{'enabled':False},'stress':{'enabled':True,'large_output':False}})
-    run=_Run(c,None,None); p=load.test_points(c.load_test)[0]
+    run=_Run(c,None,None)
+    p=load.test_points(c.load_test)[0]
     p.update(sending_start_ms=0,sending_end_ms=200,delivered_window_seconds=.2,observation_seconds=.2)
     rows=[record(str(i),input_tokens=60,load_point={'shape':'long_short'}) for i in range(2)]
     load.assess_point(run,c.targets[0],c.load_test,p,rows)
@@ -263,15 +267,21 @@ async def test_interference_buffering_scoring_uses_majority(buffered,expected):
 
 async def test_known_run_stop_cancellation_finalizes_without_reraising():
     class Paused(Client):
-        def __init__(self): super().__init__(); self.sent=asyncio.Event()
+        def __init__(self):
+            super().__init__()
+            self.sent=asyncio.Event()
         async def execute(self,spec,**kw):
             if not spec.scenario.startswith('load_calibration_'):
-                self.sent.set(); await asyncio.Event().wait()
+                self.sent.set()
+                await asyncio.Event().wait()
             return await super().execute(spec,**kw)
-    c=short_windows(configuration()); run,client=_Run(c,None,None),Paused()
+    c=short_windows(configuration())
+    run,client=_Run(c,None,None),Paused()
     task=asyncio.create_task(load.execute(run,c.targets[0],client))
     await asyncio.wait_for(client.sent.wait(),.5)
-    run.stop.set(); task.cancel(); await asyncio.wait_for(task,.5)
+    run.stop.set()
+    task.cancel()
+    await asyncio.wait_for(task,.5)
     p=point(load.result(run,c.targets[0]))
     assert p['reason_code'] == 'run_stopped' and p['cancelled'] == 1
 
@@ -312,7 +322,8 @@ async def test_real_client_blank_one_token_calibration_preserves_usage(monkeypat
 def test_plan_warning_uses_executor_target_quota(overlap,allowance):
     targets=[{'name':name,'url':'http://localhost:1/v1','model':'test'} for name in ('local','other')]
     c=configuration(targets=targets,overlap_models=overlap,max_requests=16,checks=['load','consistency'],consistency={'repetitions':2,'levels':[1],'shapes':['short'],'prompts_per_shape':2},load={'schedule':{'duration_seconds':10}})
-    run=_Run(c,None,None); plan=request_plan(c)
+    run=_Run(c,None,None)
+    plan=request_plan(c)
     assert plan['target_quotas'] == run.quotas == {'local':8,'other':8}
     assert min(run.quotas.values()) - load.later_reservation(c) - len(load.calibration_keys(c.load_test)) == 3
     warning,=plan['request_warnings']

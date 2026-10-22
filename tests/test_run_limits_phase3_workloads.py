@@ -10,7 +10,7 @@ from giraffe.fixtures import builtin_fixtures
 from giraffe.models import RequestRecord, RunConfig
 from giraffe.runner import _Run, _missing_timing, _stats, _timing_violations
 from giraffe.tool_checks import default_tool_fixture
-from giraffe.workloads import arrivals, consistency, prefixes, results, sessions, tools
+from giraffe.workloads import consistency, prefixes, results, sessions, tools
 
 
 TARGET = {"name": "local", "url": "http://unused.test/v1", "model": "test"}

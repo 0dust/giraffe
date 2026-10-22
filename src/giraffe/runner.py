@@ -1918,7 +1918,11 @@ def _verdict_summary(check, config, records, budget):
             summary += answer_difference(mismatch.evaluation.expected, final_answer(mismatch.output)[0])
 
     samples = max(2, config.samples, limits.min_samples)
-    if reason == "missing_concurrent_answers":
+    if check.id == "gpu":
+        # GPU samples are exporter readings, never scored completion answers.
+        remedy = (f"configure a reachable GPU metrics exporter with fresh per-device samples and allow at least "
+                  f"{config.gpu_min_observation_seconds:g} seconds for observation; inspect reported device errors before rerunning")
+    elif reason == "missing_concurrent_answers":
         summary += (" Plain words: answers could not be checked under concurrent load. The server appears to handle one request at a time, "
                     "or the recorded streaming/client timing did not expose overlapping answers."
                     if config.stream else " Plain words: streaming was disabled, so answers could not be checked under concurrent load; server parallelism is unverified.")
@@ -1992,7 +1996,6 @@ def _verdict_summary(check, config, records, budget):
             "capacity": "inspect the failing traffic stage and request errors, address server overload or wrong answers, then rerun the same rate plan",
             "cancellation": "enable streaming and completion token usage, verify server stop and cancellation support, then rerun the control and follow-up probes",
             "recovery": "inspect sustained-load errors and slow recovery probes, address the server issue, then rerun the same sustained workload",
-            "gpu": f"configure a reachable GPU metrics exporter with fresh per-device samples and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; inspect reported device errors before rerunning",
             "prefix": "enable cached-token usage reporting, check the server's prefix-cache configuration and rerun the repeat and independent controls",
             "sessions": "complete each configured session mode with at least two overlapping streamed conversations and inspect any wrong recall answers",
             "consistency": "inspect differing answers and token probabilities, verify deterministic serving settings and rerun the same shapes and concurrency levels",

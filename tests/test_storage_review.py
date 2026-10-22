@@ -32,7 +32,7 @@ def test_foreign_report_directories_are_never_cleanup_candidates(tmp_path, proof
         (foreign / ".web.json").write_text('{"id":"different","state":"completed"}')
     os.utime(foreign, (1, 1))
     original = {path.name: path.read_bytes() for path in foreign.iterdir()}
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         for extension in ("html", "json"):
             assert client.get(f"/api/runs/coverage/report.{extension}").status_code == 404
     assert {path.name: path.read_bytes() for path in foreign.iterdir()} == original
@@ -83,7 +83,7 @@ def test_input_hash_tampering_fails_loaders_and_downloads(tmp_path, extension):
     path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         load_report(path)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         result = client.get(f"/api/runs/saved/report.{extension}")
         assert result.status_code == 404
         assert "SHA-256 mismatch" in result.json()["detail"]
@@ -133,7 +133,7 @@ def test_real_web_baseline_failure_removes_new_directory(tmp_path, monkeypatch, 
                 RunReport.model_validate({})
             raise ValueError("changed or invalid source")
         monkeypatch.setattr(reporting, "_retained", invalid)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         result = client.post("/api/baselines", json={"run_id": "saved", "name": "chosen"})
         assert result.status_code == (422 if fault in {"invalid_source", "validation_error"} else 507)
     assert list((tmp_path / ".baselines").iterdir()) == []
@@ -180,7 +180,7 @@ async def test_downloads_are_single_flight_sampled_and_json_avoids_full_loader(t
 
         monkeypatch.setattr(Path, "read_text", no_full_read)
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
         first = asyncio.create_task(client.get(f"/api/runs/saved/report.{extensions[0]}"))
         assert await asyncio.to_thread(entered.wait, 1)
         second = asyncio.create_task(client.get(f"/api/runs/saved/report.{extensions[1]}"))
@@ -216,7 +216,7 @@ async def test_download_cancellation_waits_for_worker_before_releasing_lock(tmp_
 
     monkeypatch.setattr(web, "_render", render)
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
         first = asyncio.create_task(client.get("/api/runs/saved/report.html"))
         assert await asyncio.to_thread(entered.wait, 1)
         first.cancel()
@@ -241,7 +241,7 @@ async def test_cancelled_run_skips_cleanup_and_always_persists_final_state(tmp_p
     monkeypatch.setattr("giraffe.web.automatic_cleanup", lambda *a, **k: pytest.fail("cancelled run cleaned up"))
     app = create_app(tmp_path, min_free_disk=0, auto_cleanup={"older_than_days": 0})
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
             identifier = (await client.post("/api/runs", json={"config": config()})).json()["id"]
             await entered.wait()
             captured[0].cancel()
@@ -277,7 +277,7 @@ async def test_cancellation_during_cleanup_waits_and_records_log_before_clearing
     monkeypatch.setattr(web, "automatic_cleanup", cleanup)
     app = create_app(tmp_path, min_free_disk=0, auto_cleanup={"older_than_days": 0})
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
             identifier = (await client.post("/api/runs", json={"config": config()})).json()["id"]
             assert await asyncio.to_thread(entered.wait, 1)
             captured[0].cancel()
@@ -317,8 +317,8 @@ async def test_cancelled_json_stream_closes_lookup_and_releases_download_lease(t
             await send(message)
         await app(scope, receive, slow_send)
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(blocked_app), base_url="http://test") as blocked, \
-            httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(blocked_app), base_url="http://127.0.0.1:8787") as blocked, \
+            httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
         first = asyncio.create_task(blocked.get("/api/runs/saved/report.json"))
         await asyncio.wait_for(entered.wait(), 1)
         assert temporary_paths and temporary_paths[0].exists()
@@ -372,7 +372,7 @@ def test_recovery_does_not_adopt_foreign_state_file(tmp_path):
     original = b'{"id":"another-directory","state":"running","owner_pid":1,"owner_host":"other-host"}'
     marker.write_bytes(original)
     os.utime(marker, (1, 1))
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         plan = client.post("/api/storage/cleanup-preview", json={"older_than_days": 0}).json()
         assert not plan["candidates"]
         assert plan["protected"][0]["reason"] == "not a Giraffe run"

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from giraffe.cli import migrated_configuration
-from giraffe.fixtures import builtin_fixtures, traffic_fixtures
+from giraffe.fixtures import builtin_fixtures
 from giraffe.request_pack import pack_specs
 from giraffe.runner import _check_config
 

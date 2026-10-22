@@ -83,7 +83,8 @@ def test_capacity_highest_rate_requires_contiguous_acceptance(acceptance,highest
     assert [p['status']=='pass' for p in points] == acceptance
     values=result.metrics['highest_accepted']
     assert (values[0]['value'] if values else None) == highest
-    if values: assert values[0]['qualification'] == 'highest tested, not an absolute capacity limit'
+    if values:
+        assert values[0]['qualification'] == 'highest tested, not an absolute capacity limit'
 
 
 async def test_out_of_order_completions_during_refill_preserve_every_record():

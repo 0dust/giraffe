@@ -353,7 +353,7 @@ async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview
 
     monkeypatch.setattr(traffic, "arrival_schedule", counted_schedule)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=web.create_app(tmp_path)),
-                                 base_url="http://test") as client:
+                                 base_url="http://127.0.0.1:8787") as client:
         response = await client.post("/api/config/draft", json=configuration.model_dump(mode="json"))
     assert response.status_code == 200, response.text
     assert response.json()["request_plan"] == expected

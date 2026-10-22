@@ -8,7 +8,7 @@ from giraffe.fixtures import builtin_fixtures
 from giraffe.runner import _Run, run_suite
 from giraffe.workloads import spec
 from tests.test_condition_tracking import Client, configuration
-from tests.test_runner import FakeClient, config as runner_config, judged_pack_config, judge_summary
+from tests.test_runner import FakeClient, judged_pack_config, judge_summary
 from tests.test_web import browser, start, finished, report
 
 
@@ -71,7 +71,9 @@ async def test_arrival_pending_queue_shortfall_is_not_a_stopped_check():
     run=_Run(cfg,None,None)
     run.load_custom_specs = [spec("x", "short", "load")]
     run.slots.get_nowait()
-    async def release(): await asyncio.sleep(.02); run.release_slot()
+    async def release():
+        await asyncio.sleep(.02)
+        run.release_slot()
     await asyncio.gather(load_test.execute(run,cfg.targets[0],Client(delay=0)),release())
     p=load_test.result(run,cfg.targets[0]).metrics['points'][0]
     row=next(r for r in run.observations['local']['conditions'] if r['condition']['id'] == p['id'])

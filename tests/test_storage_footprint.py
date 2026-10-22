@@ -38,7 +38,7 @@ def test_footprint_round_trip_preserves_models_api_and_failure_evidence(tmp_path
     legacy = tmp_path / "legacy"
     legacy.mkdir()
     (legacy / "report.json").write_bytes(legacy_json)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         new = client.get("/api/runs/saved").json()["report"]
         old = client.get("/api/runs/legacy").json()["report"]
         assert new == old == expected.model_dump(mode="json")
@@ -54,7 +54,7 @@ def test_cli_html_is_explicit_and_legacy_html_is_regenerated(tmp_path, capsys):
     write_report(synthetic_report(10, 100, "failures"), directory)
     assert not (directory / "report.html").exists()
     (directory / "report.html").write_text("stale")
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert "stale" not in client.get("/api/runs/run/report.html").text
     output = tmp_path / "export.html"
     assert main(["report", str(directory), "--html", "--output", str(output)]) == 0
@@ -129,7 +129,7 @@ def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeyp
         return web_report(configuration)
 
     monkeypatch.setattr("giraffe.web.run_suite", runner)
-    with TestClient(create_app(tmp_path, min_free_disk=0, auto_cleanup=policy)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0, auto_cleanup=policy), base_url="http://127.0.0.1:8787") as client:
         assert client.get("/api/storage").json()["auto_cleanup"] == policy
         identifier = client.post("/api/runs", json={"config": config()}).json()["id"]
         detail = completed(client, identifier)
@@ -139,7 +139,7 @@ def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeyp
     assert metadata["auto_cleanup"]["deleted"] == ["old"]
     assert metadata["auto_cleanup_policy"] == policy
     assert not (tmp_path / identifier / "report.html").exists()
-    with TestClient(create_app(tmp_path, auto_cleanup=policy)) as client:
+    with TestClient(create_app(tmp_path, auto_cleanup=policy), base_url="http://127.0.0.1:8787") as client:
         assert client.get("/api/storage").json()["last_auto_cleanup"]["deleted"] == ["old"]
 
 

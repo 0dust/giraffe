@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import time
 import uuid
 from datetime import datetime, timezone

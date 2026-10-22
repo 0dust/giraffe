@@ -10,7 +10,7 @@ from tests.test_load_test_phase_a import values
 @pytest.mark.parametrize("endpoint", ["draft", "preview", "validate"])
 async def test_load_config_api_preserves_dedicated_settings(tmp_path, endpoint):
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://test"
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787"
     ) as client:
         payload = values()
         payload["load_test"]["patterns"].update(poisson={"enabled": True, "seed": 37}, rates=[10])
@@ -35,7 +35,7 @@ async def test_load_burst_ceiling_error_names_both_fields_and_actions(tmp_path, 
         "gap_seconds": 1,
     }
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://test"
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787"
     ) as client:
         response = await client.post("/api/config/" + endpoint, json=payload)
     assert response.status_code == 422, response.text
@@ -54,7 +54,7 @@ async def test_load_api_migration_notes_and_independent_schedules_roundtrip(tmp_
         "arrivals": {"mode": "burst", "burst_size": 2, "requests": 8, "interval_seconds": 3},
     }
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://test"
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787"
     ) as client:
         response = await client.post("/api/config/validate", json=payload)
         assert response.status_code == 200, response.text
@@ -83,7 +83,7 @@ async def test_budget_and_time_conflicts_warn_before_start_with_field_actions(tm
         "rates": [10],
     }
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://test"
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787"
     ) as client:
         response = await client.post("/api/config/validate", json=payload)
     assert response.status_code == 200, response.text

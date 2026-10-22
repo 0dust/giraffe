@@ -2,21 +2,18 @@ import asyncio
 import copy
 import json
 import math
-import random
 import time
 import uuid
-from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from giraffe.load_test import (
-    aggregate, calibration_keys, execute, interference_measurements, load_time_plan, measurements,
-    minimum_reservation, point_shapes, result, assess_point, score_group, test_points as load_points,
+    execute, interference_measurements, load_time_plan,
+    minimum_reservation, result, assess_point, score_group,
 )
-from giraffe.concurrent_load import prompt
-from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES, migrate_concurrent_load
+from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES
 from giraffe.planning import request_plan
 from giraffe.runner import _Run, run_suite
 from giraffe.web import _configuration_errors, create_app
@@ -360,7 +357,8 @@ async def test_budget_cut_short_failures_precede_evidence_and_later_reservation(
             g['timing_violations'] = ['response']
         assert score_group(c.load_test, p, g, [])['status'] == 'fail'
     # Enough samples never erase a truncated sending window under issue 45.
-    g = copy.deepcopy(p['groups'][0]); g['valid'] = 100
+    g = copy.deepcopy(p['groups'][0])
+    g['valid'] = 100
     assert score_group(c.load_test, p, g, [])['status'] == 'inconclusive'
 
 
@@ -406,7 +404,7 @@ async def test_error_threshold_stop_still_fails_and_remaining_points_not_run():
 @pytest.mark.parametrize("endpoint", ["draft", "validate", "preview", "plan"])
 async def test_migration_metadata_endpoints(endpoint, tmp_path):
     old = {"targets": [TARGET], "checks": ["buckets"], "buckets": {"levels": [1], "samples_per_bucket": 7}}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787") as client:
         response = await client.post(f"/api/config/{endpoint}", json=old)
     assert response.status_code == 200, response.text
     data = response.json()
@@ -514,7 +512,8 @@ def test_matching_uses_short_decode_and_probe_prefill_intersection():
     assert data['actual_overlap_request_ids'] == ['short']
     probe.timing_start_ms = 131
     assert interference_measurements([baseline,short,probe], windows)['probe']['matched_count'] == 0
-    probe.timing_start_ms = 115; short.answer_chunks = 1
+    probe.timing_start_ms = 115
+    short.answer_chunks = 1
     assert interference_measurements([baseline,short,probe], windows)['probe']['matched_count'] == 0
 
 
@@ -570,7 +569,8 @@ async def test_nonstream_load_is_client_only_and_wrong_count_allowance_is_exact(
     assert p['server_evidenced_concurrency'] == 0
     settings = run.config.load_test.model_copy(deep=True)
     settings.pass_criteria.min_correct_percent = 80
-    g = copy.deepcopy(p['groups'][0]); g.update(scored=5,correct=4,correct_percent=80)
+    g = copy.deepcopy(p['groups'][0])
+    g.update(scored=5,correct=4,correct_percent=80)
     assert score_group(settings,p,g,[])['reason_code'] == 'load_not_delivered'
     g.update(correct=3,correct_percent=60)
     assert score_group(settings,p,g,[])['status'] == 'fail'
