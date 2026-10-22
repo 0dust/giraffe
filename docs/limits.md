@@ -1,6 +1,6 @@
 # Limits and client capacity
 
-The final [run-limits design](run-limits-design.md#9-caps-review-docslimitsmd-single-source), measured 2026-10-21, accepts at most **512 simultaneous requests**. Backend policy applies to configuration loaded by CLI and web/API. The UI uses schema-derived bounds and shared field explanations from capabilities.
+Giraffe, measured 2026-10-21, accepts at most **512 simultaneous requests**. Backend policy applies to configuration loaded by CLI and web/API. The UI uses schema-derived bounds and shared field explanations from capabilities.
 
 **An accepted ceiling is not demonstrated delivery capacity.** Endpoint speed, response size, streaming cadence, CPU, sockets and the selected checks determine delivered load. Timing-health stalls and local drops remain visible; increasing a setting cannot make those measurements qualify.
 
