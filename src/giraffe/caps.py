@@ -130,14 +130,14 @@ def cap_explanations(limits):
             continue
         label, kind, reason = cap_policy(path)
         messages, descriptions = {}, []
-        ending = f" — {'an' if kind == 'implementation constraint' else 'a'} {kind} on {reason}; exceeding it rejects the configuration. See docs/limits.md."
+        ending = f" — {'an' if kind == 'implementation constraint' else 'a'} {kind} on {reason}; exceeding it rejects the configuration."
         for key, unit in (("maximum", ""), ("maxItems", " entries"), ("maxLength", " characters")):
             if key in bounds:
                 maximum = format(bounds[key], ",") if type(bounds[key]) is int else format(bounds[key], ",g")
                 if key == "maximum" and path.rsplit(".", 1)[-1] in {"min_correctness", "max_error_rate"}:
                     maximum += f" ({bounds[key] * 100:g}%)"
                 phrase = (f"can contain at most {maximum}{unit}" if unit else f"can be at most {maximum}")
-                bound_ending = (" — a software safety bound on workload combinations and evidence growth; exceeding it rejects the configuration. See docs/limits.md."
+                bound_ending = (" — a software safety bound on workload combinations and evidence growth; exceeding it rejects the configuration."
                                 if key == "maxItems" and path in {"traffic.rates", "consistency.levels", "concurrent_load.schedule.levels"} else ending)
                 messages[key] = label + " " + phrase + bound_ending
                 descriptions.append(messages[key])

@@ -286,7 +286,7 @@ async def test_cap_errors_share_field_help_values_and_api_cli_copy(tmp_path, cap
     policy = capabilities()["cap_explanations"][canonical]
     assert issue["msg"] == policy["errors"][key]
     assert issue["msg"] in policy["help"]
-    assert maximum in issue["msg"] and "docs/limits.md" in issue["msg"]
+    assert maximum in issue["msg"] and "docs/limits.md" not in issue["msg"]
     assert "rejects the configuration" in issue["msg"]
     assert issue["fields"] == [path]
     assert issue["values"]

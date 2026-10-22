@@ -19,8 +19,8 @@ LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
 
 IDENTITY_TABLE_GUIDANCE = (
     "Review request-level compatibility and update/extend _run_limits_workload_identity "
-    "in src/giraffe/reporting.py after editing concurrent_load.py, workloads.py or logprobs.py; "
-    "see Comparability source identities in docs/limits.md. Do not bridge changed workloads.")
+    "in src/giraffe/reporting.py after editing concurrent_load.py, workloads.py or logprobs.py. "
+    "Do not bridge changed workloads.")
 
 def reports(check="sessions", *, arrivals=None):
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost:8000", "model": "test"}],
@@ -139,8 +139,7 @@ def test_current_generator_sources_have_reviewed_identity_table_entries():
     for field, digest in actual.items():
         assert identity[field] == digest, (
             f"{field} changed: review request-level compatibility and update/extend "
-            "_run_limits_workload_identity in src/giraffe/reporting.py. See the "
-            "Comparability source identities section in docs/limits.md; do not bridge changed workloads.")
+            "_run_limits_workload_identity in src/giraffe/reporting.py; do not bridge changed workloads.")
 
 
 @pytest.mark.parametrize("check", ["arrivals", "concurrency"])
