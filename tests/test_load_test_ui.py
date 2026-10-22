@@ -326,3 +326,22 @@ def test_load_plan_displays_level_one_not_applicable_note_in_execution_order():
 const html=renderLoadPlan(config,plan);assert(html.includes(escape(note)));
 assert(html.indexOf(escape(note))>html.indexOf('Execution order'));
 ''', config=config)
+
+
+def test_stress_drawer_plan_and_results_keep_profile_budget_and_floor_distinct():
+    from tests.test_load_test_review2 import saved
+
+    configuration = saved(24)
+    configuration.load_test.workloads.combinations.enabled = False
+    configuration.load_test.workloads.stress.enabled = True
+    configuration.load_test.workloads.stress.cases = ['short_long']
+    plan = request_plan(configuration)
+    browser_logic('const plan='+json.dumps(plan)+r''';
+const editor=renderLoadEditor(config),summary=renderLoadPlan(config,plan);
+assert(editor.includes('At least 410 generated tokens per long-output stress response (80% of the 512-token cap)'));
+assert(summary.includes('Required long-output stress coverage: 410 tokens (80% of Long output cap 512)'));
+const coverage=loadOutputCoverage({output_covered:0,required:1,input_verified:1,threshold_tokens:410,profile_output_cap:512,min_output_percent:80,sent_budgets:[24]});
+assert(coverage.includes('at least 410 tokens (80% of Long output cap 512)'));
+assert(coverage.includes('actual sent budgets: 24 tokens'));
+assert(!coverage.includes('20 tokens'));
+''', config=configuration)

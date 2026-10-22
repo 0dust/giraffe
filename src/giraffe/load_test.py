@@ -148,15 +148,28 @@ def _shape_sources(settings, size, sources, records=()):
     return matching or sources
 
 
+def stress_output_floor(settings):
+    return math.ceil(settings.profile.long.output_tokens * settings.workloads.stress.min_output_percent / 100)
+
+
+def stress_budget_reason(settings, budget):
+    return (f"Saved question budget {budget} tokens cannot reach the required long-output stress coverage "
+            f"of {stress_output_floor(settings)} tokens ({settings.workloads.stress.min_output_percent:g}% "
+            f"of Long output cap {settings.profile.long.output_tokens})")
+
+
 def saved_shape_warnings(config):
     from giraffe.fixtures import load_custom_fixtures
 
     if "load" not in config.checks:
         return []
     estimates = []
+    budgets = []
     if config.request_source == "request_pack" and config.request_pack is not None:
         estimates = [sum(len(message.content) for message in case.messages) / 4
                      for case in config.request_pack.cases]
+        cap = config.effective_check("load").get("max_output_tokens", config.max_output_tokens)
+        budgets = [case.max_tokens or cap for case in config.request_pack.cases]
     if not estimates and config.custom_fixtures:
         try:
             sources = load_custom_fixtures(config.custom_fixtures,
@@ -166,6 +179,7 @@ def saved_shape_warnings(config):
             # source is available. Execution retains source-file validation.
             return []
         estimates = [_source_tokens(source) for source in sources]
+        budgets = [source.max_tokens or config.max_output_tokens for source in sources]
     if not estimates:
         return []
     warnings = []
@@ -176,6 +190,14 @@ def saved_shape_warnings(config):
             shapes = [" → ".join(part.title() for part in s.split("_")) for s in running_shapes(settings) if s.startswith(size + "_")]
             phrase = "long enough" if size == "long" else "in the length class"
             warnings.append(f"No saved question is {phrase} for {size.title()} input; {', '.join(shapes)} results will be inconclusive")
+        if settings.workloads.stress.enabled:
+            for shape in settings.workloads.stress.cases:
+                if not shape.endswith("_long"):
+                    continue
+                eligible = [i for i, tokens in enumerate(estimates)
+                            if _in_input_class(settings, shape.split("_")[0], tokens)] or list(range(len(estimates)))
+                for budget in sorted({budgets[i] for i in eligible if budgets[i] < stress_output_floor(settings)}):
+                    warnings.append(f"{load_shape_label(shape)}: {stress_budget_reason(settings, budget)}. Results will be inconclusive; saved budgets are preserved.")
     return list(dict.fromkeys(warnings))
 
 
@@ -360,6 +382,8 @@ def load_time_plan(settings):
             execution_summary.append(f"One random mix of {len(workloads.mixed.selected)} request types × {per_workload} traffic points." + suffix)
         if workloads.stress.enabled:
             execution_summary.append(f"{len(workloads.stress.cases)} token-stress cases × {per_workload} traffic points." + suffix)
+            if any(shape.endswith("_long") for shape in workloads.stress.cases):
+                execution_summary.append(f"Required long-output stress coverage: {stress_output_floor(value)} tokens ({workloads.stress.min_output_percent:g}% of Long output cap {value.profile.long.output_tokens})." + suffix)
         comparison = [p for p in source_points if p["type"] == "interference"]
         if comparison:
             control = sum(p["windows"] * (value.schedule.duration_seconds + value.schedule.finish_seconds) for p in comparison)
@@ -1161,17 +1185,17 @@ def measurements(run, target, settings, point, records, shape):
                 "note": f"Saved question budget {record.requested_max_tokens} tokens used instead of profile {b.title()} output cap {cap}",
             })
     if point["type"] == "stress":
-        thresholds = {r.id: math.ceil(r.requested_max_tokens * settings.workloads.stress.min_output_percent / 100) for r in valid} if b == "long" else {}
-        distinct = set(thresholds.values())
-        threshold = next(iter(distinct)) if len(distinct) == 1 else None
+        threshold = stress_output_floor(settings) if b == "long" else None
         group["coverage"] = {
             "threshold_tokens": threshold,
+            "profile_output_cap": settings.profile.long.output_tokens,
+            "min_output_percent": settings.workloads.stress.min_output_percent,
+            "sent_budgets": sorted({r.requested_max_tokens for r in rows}),
             "output_covered": sum(
-                r.output_tokens is not None and r.output_tokens >= thresholds[r.id] for r in valid
+                r.output_tokens is not None and r.output_tokens >= threshold for r in valid
             )
             if b == "long"
             else None,
-            "threshold_tokens_by_request": thresholds,
             "input_verified": sum(
                 r.input_tokens is not None
                 and abs(r.input_tokens - target_tokens) <= target_tokens * settings.input_token_tolerance
@@ -1265,10 +1289,14 @@ def score_group(settings, point, group, records):
         )
     if group["shape"].startswith("long_") and any(r.input_tokens and r.cached_prompt_tokens is not None and r.cached_prompt_tokens > r.input_tokens / 2 for r in rows):
         return result("inconclusive", "cached_input", "More than half the long input was cached.")
+    coverage = group.get("coverage")
+    if coverage and coverage["threshold_tokens"] is not None:
+        insufficient = [budget for budget in coverage.get("sent_budgets", []) if budget < coverage["threshold_tokens"]]
+        if insufficient:
+            return result("inconclusive", "insufficient_coverage", stress_budget_reason(settings, min(insufficient)))
     qualification = group.get("input_qualification")
     if qualification and not qualification["qualified"]:
         return result("inconclusive", "input_not_verified", qualification["reason"])
-    coverage = group.get("coverage")
     if coverage:
         if group["shape"].startswith("long_") and coverage["input_verified"] < group["valid"]:
             return result(

@@ -133,19 +133,103 @@ async def test_saved_pack_uses_genuinely_long_case_for_interference_probe():
     assert all(q["qualified"] for q in observed["points"][0]["interference"]["input_qualification"].values())
 
 
-async def test_stress_output_coverage_uses_saved_sent_cap_not_profile_cap():
-    c = saved(256, long_case=True)
+async def test_stress_output_coverage_keeps_profile_floor_for_smaller_saved_budget():
+    c = saved(24, long_case=True)
     c.load_test.workloads.combinations.enabled = False
     c.load_test.workloads.stress.enabled = True
     c.load_test.workloads.stress.cases = ["long_long"]
     c.load_test.workloads.stress.min_output_percent = 80
     observed, check, rows, _ = await perform(c)
     group = observed["points"][0]["groups"][0]
-    assert check.status == "pass"
-    assert rows and all(r.requested_output_tokens == r.requested_max_tokens == 256 for r in rows)
+    assert check.status == "inconclusive"
+    assert rows and all(r.requested_output_tokens == r.requested_max_tokens == 24 for r in rows)
     assert group["lengths"]["output_cap"] == 512  # Profile target stays visible separately.
-    assert group["coverage"]["threshold_tokens"] == 205
+    assert group["coverage"]["threshold_tokens"] == 410
+    assert group["coverage"]["output_covered"] == 0
+    assert group["reason"] == "Saved question budget 24 tokens cannot reach the required long-output stress coverage of 410 tokens (80% of Long output cap 512)"
+    assert observed["highest_accepted"] == []
+
+
+async def test_short_long_stress_saved_budget_warning_plan_and_report():
+    from giraffe.planning import request_plan
+
+    c = saved(24)
+    c.load_test.workloads.combinations.enabled = False
+    c.load_test.workloads.stress.enabled = True
+    c.load_test.workloads.stress.cases = ["short_long"]
+    plan = request_plan(c)
+    assert any("budget 24 tokens cannot reach" in text and "410 tokens" in text for text in plan["warnings"])
+    assert any("410" in text and "512" in text for text in plan["load_test"]["execution_summary"])
+    observed, check, rows, _ = await perform(c)
+    group = observed["points"][0]["groups"][0]
+    assert check.status == "inconclusive" and observed["highest_accepted"] == []
+    assert group["coverage"]["threshold_tokens"] == 410
+    assert all(r.requested_max_tokens == 24 for r in rows)
+    html = _load_test_html(observed)
+    assert "Saved question budget 24" in html
+    assert "Required long-output stress coverage: 410 tokens (80% of Long output cap 512)" in html
+
+
+class GeneratedOutput(Client):
+    def __init__(self, tokens):
+        super().__init__()
+        self.tokens = tokens
+
+    async def execute(self, spec, **kwargs):
+        record = await super().execute(spec, **kwargs)
+        if not spec.scenario.startswith("load_calibration"):
+            record.output_tokens = record.completion_tokens = self.tokens
+        return record
+
+
+async def test_stress_saved_budget_reaching_configured_floor_qualifies():
+    c = saved(450)
+    c.load_test.workloads.combinations.enabled = False
+    c.load_test.workloads.stress.enabled = True
+    c.load_test.workloads.stress.cases = ["short_long"]
+    observed, check, rows, _ = await perform(c, GeneratedOutput(410))
+    group = observed["points"][0]["groups"][0]
+    assert check.status == "pass" and observed["highest_accepted"][0]["value"] == 1
+    assert group["coverage"]["threshold_tokens"] == 410
     assert group["coverage"]["output_covered"] == group["valid"]
+    assert all(r.requested_max_tokens == r.requested_output_tokens == 450 and r.output_tokens == 410 for r in rows)
+
+
+async def test_stress_insufficient_budget_reason_keeps_unexercised_input_evidence():
+    c = saved(24)
+    c.load_test.workloads.combinations.enabled = False
+    c.load_test.workloads.stress.enabled = True
+    c.load_test.workloads.stress.cases = ["long_long"]
+    observed, check, _, _ = await perform(c)
+    group = observed["points"][0]["groups"][0]
+    assert check.status == "inconclusive" and observed["highest_accepted"] == []
+    assert "budget 24 tokens cannot reach" in group["reason"]
+    assert "Long input not exercised" in group["input_qualification"]["reason"]
+
+
+async def test_stress_saved_budget_violation_is_endpoint_failure():
+    c = saved(24)
+    c.load_test.workloads.combinations.enabled = False
+    c.load_test.workloads.stress.enabled = True
+    c.load_test.workloads.stress.cases = ["short_long"]
+    observed, check, _, _ = await perform(c, GeneratedOutput(25))
+    group = observed["points"][0]["groups"][0]
+    assert check.status == "fail" and group["reason_code"] == "output_cap"
+    assert group["coverage"]["threshold_tokens"] == 410
+    assert observed["highest_accepted"] == []
+
+
+async def test_builtin_long_output_stress_keeps_configured_floor():
+    c = config()
+    c.load_test.workloads.combinations.enabled = False
+    c.load_test.workloads.stress.enabled = True
+    c.load_test.workloads.stress.cases = ["short_long", "long_long"]
+    observed, check, rows, _ = await perform(c, GeneratedOutput(410))
+    assert check.status == "pass"
+    assert len(observed["highest_accepted"]) == 2
+    assert all(group["coverage"]["threshold_tokens"] == 410 and group["coverage"]["output_covered"] == group["valid"]
+               for point in observed["points"] for group in point["groups"])
+    assert rows and all(r.requested_max_tokens == r.requested_output_tokens == 512 for r in rows)
 
 
 async def test_mixed_traffic_qualifies_each_shape_independently():

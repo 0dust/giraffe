@@ -740,6 +740,11 @@ def _load_group_notes_html(group):
                      + " outside; " + str(qualification.get("unknown_valid", 0))
                      + " unknown-length valid responses. " + str(qualification.get("reason") or "Input class exercised."))
     notes.extend(row["note"] for row in group.get("saved_question_budgets", []) if row.get("note"))
+    coverage = group.get("coverage") or {}
+    if coverage.get("threshold_tokens") is not None and "profile_output_cap" in coverage:
+        notes.append(f"Required long-output stress coverage: {coverage['threshold_tokens']} tokens "
+                     f"({coverage['min_output_percent']:g}% of Long output cap {coverage['profile_output_cap']})")
+        notes.append("Actual sent output budgets: " + ", ".join(str(budget) for budget in coverage.get("sent_budgets", [])) + " tokens")
     return "".join("<br>" + _e(note) for note in notes)
 
 

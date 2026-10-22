@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261022-load-test-phasef';
+import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261022-load-test-phaseh';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -1518,7 +1518,8 @@ function loadOutputCoverage(coverage) {
   if(!coverage)return 'not required';
   const thresholds=[...new Set(Object.values(coverage.threshold_tokens_by_request||{}))].sort((a,b)=>a-b);
   const threshold=coverage.threshold_tokens!=null?`at least ${number(coverage.threshold_tokens)} tokens`:`per-request sent-cap thresholds (${thresholds.map(n=>number(n)).join(', ')} tokens)`;
-  return `${number(coverage.output_covered)} / ${number(coverage.required)} ${threshold}; ${number(coverage.input_verified)} input verified`;
+  const configured=coverage.profile_output_cap!=null&&coverage.threshold_tokens!=null?` (${number(coverage.min_output_percent)}% of Long output cap ${number(coverage.profile_output_cap)}); actual sent budgets: ${(coverage.sent_budgets||[]).map(n=>number(n)).join(', ')} tokens`:'';
+  return `${number(coverage.output_covered)} / ${number(coverage.required)} ${threshold}${configured}; ${number(coverage.input_verified)} input verified`;
 }
 function renderLoadGroupQualification(group) {
   const q=group.input_qualification,budgets=group.saved_question_budgets||[];
