@@ -28,12 +28,20 @@ async def test_plain_requests_keep_empty_workloads_and_live_record_contract():
     records = await run.group(config.targets[0], RecordingClient(), requests, "warm", count=2)
     assert all(record.workload == {} for record in records)
     assert all(request.workload == {} for request in requests)
-    expected = {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid",
-                "score", "elapsed_ms", "first_output_ms", "check_ids"}
+    expected = {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
+                "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
+                "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
+                "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
+                "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
+                "request_timeout_seconds", "termination_reason", "termination_limit_seconds"}
     for event in events:
         assert "workload" not in event
         if event["event"] == "request_completed":
             assert set(event["request"]) == expected
+            assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",
+                        "logprob_evidence", "content_reads", "reasoning_reads", "output_events"} & event["request"].keys()
+            assert all(not isinstance(value, (dict, list)) for key, value in event["request"].items() if key != "check_ids")
     parameters = run.observations["local"]["conditions"][0]["condition"]["parameters"]
     assert parameters["input_chars"] == [5, 6]
     assert parameters["output_tokens"] == 24
@@ -165,7 +173,7 @@ assert.equal(record.input_chars,0);
 """)
 
 
-async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monkeypatch):
+async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monkeypatch, local_tokenizer):
     from tests.test_web import browser, finished, report, start
 
     release = asyncio.Event()

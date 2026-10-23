@@ -8,11 +8,15 @@ import time
 import httpx
 import pytest
 
+
 from giraffe.client import LLMClient
 from giraffe.models import Consistency, Limits, Prefix, Sessions
 from giraffe.planning import request_plan
 from giraffe.runner import run_suite
 from tests.test_workloads import check, config
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 class MemoryEndpoint:
@@ -127,10 +131,14 @@ async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypa
     report = await run_suite(settings)
     assert check(report, 'consistency').status == 'fail'
     assert any(c['agreement_rate'] < 1 for c in check(report, 'consistency').metrics['cross_level'])
-    assert len(endpoint.requests) == request_plan(settings)['planned_per_target'] == 24
-    assert len({json.dumps(p['messages']) for p in endpoint.requests}) == 3
-    assert all(p['temperature'] == 0 for p in endpoint.requests)
-    assert all('Instead' not in p['messages'][0]['content'] for p in endpoint.requests)
+    probes = [r for r in report.requests if r.scenario == 'performance_evidence_probe']
+    assert len(probes) == 1
+    assert len(endpoint.requests) - len(probes) == request_plan(settings)['planned_per_target'] == 24
+    payloads = [p for p in endpoint.requests if 'temperature' in p]
+    assert len(payloads) == 24
+    assert len({json.dumps(p['messages']) for p in payloads}) == 3
+    assert all(p['temperature'] == 0 for p in payloads)
+    assert all('Instead' not in p['messages'][0]['content'] for p in payloads)
 
 
 @pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'fail'), (16, 'fail'), (1024, 'inconclusive')])
@@ -139,13 +147,13 @@ async def test_w3_prefix_requires_substantial_cached_tokens_and_separate_blocks(
     settings = config(endpoint, checks=['prefix'], context_limit=16384, prefix={'repeats': 3, 'history_turns': 2})
     report = await run_suite(settings)
     assert check(report, 'prefix').status == status
-    assert len(endpoint.requests) == request_plan(settings)['planned_per_target']
-    prompts = [p['messages'][0]['content'] for p in endpoint.requests[:6]]
+    probes = [r for r in report.requests if r.scenario == 'performance_evidence_probe']
+    assert len(probes) == 1
+    assert len(endpoint.requests) - len(probes) == request_plan(settings)['planned_per_target']
+    prompts = [p['messages'][0]['content'] for p in endpoint.requests[len(probes):len(probes)+6]]
     assert all(p.split('\n', 1)[1].startswith(' The rock') for p in prompts[:3])
     assert all(p.split('\n', 1)[1].startswith('Control') for p in prompts[3:])
     assert len(prompts[0]) > 8192
-
-
 
 
 
@@ -196,11 +204,10 @@ async def test_w7_history_mixup_fails_each_sessions_seeded_value(monkeypatch):
     report = await run_suite(config(endpoint, checks=['sessions'], sessions={
         'modes': ['live'], 'sessions': 2, 'concurrency': 2}))
     assert check(report, 'sessions').status == 'fail'
-    turns = [p['messages'][0]['content'] for p in endpoint.requests if len(p['messages']) == 1]
+    turns = [p['messages'][0]['content'] for p in endpoint.requests
+             if len(p['messages']) == 1 and 'Use this exact bakery name' in p['messages'][0]['content']]
     assert len(set(turns)) == 2
     assert all(r.score is False for r in report.requests if 'turn1' in r.scenario)
-
-
 
 
 async def test_w9_pending_queue_does_not_cap_inflight(monkeypatch):
@@ -219,10 +226,6 @@ async def test_w9_pending_queue_does_not_cap_inflight(monkeypatch):
 
 
 
-
-
-
-
 async def test_w5_session_turns_do_not_substitute_for_independent_samples(monkeypatch):
     endpoint = MemoryEndpoint(monkeypatch)
     settings = config(endpoint, checks=['sessions'], sessions={
@@ -230,11 +233,9 @@ async def test_w5_session_turns_do_not_substitute_for_independent_samples(monkey
         limits={'min_samples': 5})
     report = await run_suite(settings)
     result = check(report, 'sessions')
-    assert len(report.requests) == 6
+    assert len([r for r in report.requests if 'sessions' in r.check_ids]) == 6
     assert result.status == 'inconclusive'
     assert result.metrics['completed_sessions_per_mode'] == {'fixed': 1, 'live': 1}
-
-
 
 
 @pytest.mark.parametrize('workload', ['consistency', 'logprobs', 'prefix', 'sessions'])
@@ -264,8 +265,6 @@ async def test_round2_consistency_copy_prompts_and_wrong_answers_are_independent
         assert len(sentences) >= 3 and len(set(sentences)) == len(sentences)
 
 
-
-
 @pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'fail')])
 async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, misses, status):
     seen = 0
@@ -290,15 +289,15 @@ async def test_round2_prefix_all_cached_is_not_discriminative(monkeypatch):
     assert 'cache reporting not discriminative' in result.summary
 
 
-
-
 async def test_round2_live_session_history_strips_reasoning_and_fixed_keeps_seed(monkeypatch):
     endpoint = MemoryEndpoint(monkeypatch, mode='reasoning')
     report = await run_suite(config(endpoint, checks=['sessions'], sessions={
         'sessions': 2, 'turns': ['Choose a name.', 'Recall it.', 'Recall it again.']}))
     assert check(report, 'sessions').status == 'pass'
     assert check(report, 'sessions').metrics['evidenced_session_overlap'] >= 2
-    for payload in endpoint.requests:
+    payloads = [p for p in endpoint.requests if 'Use this exact bakery name' in p['messages'][0]['content']]
+    assert len(payloads) == 12
+    for payload in payloads:
         value = re.search(r'Use this exact bakery name for this session: (\w+)', payload['messages'][0]['content'])[1]
         assistants = [m['content'] for m in payload['messages'] if m['role'] == 'assistant']
         assert all(answer == value for answer in assistants)
@@ -315,7 +314,8 @@ async def test_round2_session_pool_refills_without_waiting_for_slowest(monkeypat
     await run_suite(config(endpoint, checks=['sessions'], sessions={
         'modes': ['fixed'], 'sessions': 3, 'concurrency': 2}))
     values = [re.search(r'Use this exact bakery name for this session: (\w+)', p['messages'][0]['content'])[1]
-              for p in endpoint.requests]
+              for p in endpoint.requests if 'Use this exact bakery name' in p['messages'][0]['content']]
+    assert len(values) == 6
     assert values.index('Session_0002_fixed') < values.index('Session_0000_fixed')
 
 
@@ -338,8 +338,6 @@ async def test_round2_nonstrict_variation_preserves_coverage_reason(monkeypatch)
     assert 'coverage' in result.summary.lower() or 'Too few' in result.summary
 
 
-
-
 @pytest.mark.parametrize('workload', ['arrivals', 'prefix', 'sessions', 'consistency', 'logprobs'])
 async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workload):
     endpoint = MemoryEndpoint(monkeypatch)
@@ -353,12 +351,12 @@ async def test_round2_workload_plan_matches_healthy_execution(monkeypatch, workl
         short_windows(settings,.03)
     report = await run_suite(settings)
     planned = request_plan(settings)
-    assert planned['count_kind'] == ('bounded' if workload == 'arrivals' else 'exact')
+    assert planned['count_kind'] == 'exact'
     if workload == 'arrivals':
         p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
-        calibration=sum(r.load_point.get('type') == 'calibration' for r in report.requests)
+        assert not any((r.load_point or {}).get('type') == 'calibration' for r in report.requests)
         assert planned['load_test']['expected_scheduled_requests'] == p['scheduled'] == p['dispatched']
-        assert len(endpoint.requests) == len(report.requests) == p['dispatched'] + calibration
+        assert len(endpoint.requests) == len(report.requests) == p['dispatched']
     else:
         assert planned['planned_per_target'] == len(endpoint.requests) == len(report.requests)
 

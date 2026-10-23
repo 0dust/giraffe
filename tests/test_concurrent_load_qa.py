@@ -10,7 +10,10 @@ from giraffe.models import RunConfig
 from giraffe.planning import request_plan
 from giraffe.reporting import _load_test_html
 from giraffe.web import _configuration_errors
-from tests.test_concurrent_load import TARGET, configuration, perform, point
+from tests.test_concurrent_load import TARGET, configuration, perform
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def test_final_default_window_and_bootstrap_match():
@@ -104,7 +107,7 @@ async def test_final_html_reports_per_response_clock_and_finish_denominator():
     _, check, _, _ = await perform(configuration(load={'pass_criteria': {'max_completion_ms': 1000}}))
     html = _load_test_html(check.metrics)
     for text in ['Timing clock:', 'Actual input tokens', 'unknown input/output',
-                 'Error denominator:', 'completions during finish allowance',
+                 'Error denominator:', 'completions after sending stopped',
                  'Correct work meeting limits', 'highest tested']:
         assert text in html
 
@@ -134,7 +137,7 @@ def test_singular_plural_final_drawer_plan_and_results():
     browser_logic('const plan=' + json.dumps(request_plan(configured)) + r''';
 config.checks=['load'];
 let html=renderLoadEditor(config)+renderLoadPlan(config,plan);
-assert.match(html,/Scheduled load tests/);assert.match(html,/Duration per workload, pattern and level/);
+assert.match(html,/Scheduled load tests/);assert.match(html,/Send new requests for/);
 const point={id:'one',source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:1,groups:[]};
 html+=renderLoadTestResults({points:[point]});assert.match(html,/1 concurrent request/);assert.doesNotMatch(html,/1 concurrent requests/);
 point.level=2;assert.match(renderLoadTestResults({points:[point]}),/2 concurrent requests/);
@@ -180,3 +183,6 @@ console.log(JSON.stringify('<form id="new-run-form">'+renderTestCard(bootstrap.c
                 'tables=>tables.every(node=>node.scrollWidth>node.clientWidth && getComputedStyle(node).overflowX==="auto")')
         finally:
             browser.close()
+
+
+# Fake inference clients in this module use the matching local tokenizer.

@@ -81,6 +81,32 @@ class _ReportReader:
             self.position = end
             return value
 
+    def discard(self, limit: int, depth: int = 0) -> None:
+        """Validate derived collections one scalar at a time, without retaining them."""
+        if depth > 64:
+            raise ValueError("Product report JSON exceeds supported nesting depth")
+        first = self.peek()
+        if first not in {"{", "["}:
+            self.value(limit)
+            return
+        closing = "}" if first == "{" else "]"
+        self.consume(first)
+        keys = set()
+        while self.peek() != closing:
+            if first == "{":
+                key = self.value(limit)
+                if not isinstance(key, str) or key in keys:
+                    raise ValueError("Invalid or duplicate derived report key")
+                keys.add(key)
+                self.consume(":")
+            self.discard(limit, depth + 1)
+            if self.peek() == closing:
+                break
+            self.consume(",")
+            if self.peek() == closing:
+                raise ValueError("Trailing comma in derived report data")
+        self.consume(closing)
+
 
 def iter_report_requests(path: Path, *, metadata: dict | None = None) -> Iterator[dict]:
     """Yield requests without materializing the report; validate its complete JSON."""
@@ -150,6 +176,10 @@ def iter_report_requests(path: Path, *, metadata: dict | None = None) -> Iterato
                     if reader.peek() == "]":
                         raise ValueError("Trailing comma in product request array")
                 reader.consume("]")
+            elif key in {"performance", "conditions"}:
+                # Full request series can exceed metadata limits; validation
+                # normalization consumes raw requests, not these derived views.
+                reader.discard(limits["metadata_value_bytes"])
             else:
                 value = reader.value(limits["metadata_value_bytes"])
                 if key == "report_format":

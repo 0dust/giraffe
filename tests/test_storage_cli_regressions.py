@@ -23,7 +23,7 @@ def run_arguments(directory):
             "--output-format", "json"]
 
 
-def test_cli_symlinked_runs_root_for_run_storage_and_cleanup(tmp_path, monkeypatch, capsys):
+def test_cli_symlinked_runs_root_for_run_storage_and_cleanup(tmp_path, monkeypatch, capsys, local_tokenizer):
     root = tmp_path / "runs"
     root.mkdir()
     linked = tmp_path / "linked"
@@ -61,7 +61,7 @@ def test_storage_command_reports_user_configured_limits(tmp_path, capsys):
     assert "protected runs count toward N" in parser()._subparsers._group_actions[0].choices["cleanup"].format_help()
 
 
-def test_cli_heartbeat_refreshes_during_traffic_and_export_then_stops(tmp_path, monkeypatch, capsys):
+def test_cli_heartbeat_refreshes_during_traffic_and_export_then_stops(tmp_path, monkeypatch, capsys, local_tokenizer):
     import giraffe.cli
     import giraffe.reporting
     from giraffe.storage import cleanup_plan
@@ -114,7 +114,7 @@ def test_cli_heartbeat_refreshes_during_traffic_and_export_then_stops(tmp_path, 
 
 
 @pytest.mark.parametrize("overall, expected_code", [("pass", 0), ("fail", 1), ("inconclusive", 2)])
-def test_cli_html_only_write_failure_keeps_json_and_original_verdict(tmp_path, monkeypatch, capsys, overall, expected_code):
+def test_cli_html_only_write_failure_keeps_json_and_original_verdict(tmp_path, monkeypatch, capsys, overall, expected_code, local_tokenizer):
     import giraffe.reporting
 
     directory = tmp_path / "one"
@@ -142,7 +142,7 @@ def test_cli_html_only_write_failure_keeps_json_and_original_verdict(tmp_path, m
     assert "export" in metadata["resources"]["sampled_peak_rss_bytes"]
 
 
-def test_cli_metadata_write_failure_keeps_completed_verdict_and_json(tmp_path, monkeypatch, capsys):
+def test_cli_metadata_write_failure_keeps_completed_verdict_and_json(tmp_path, monkeypatch, capsys, local_tokenizer):
     import giraffe.reporting
 
     directory = tmp_path / "one"

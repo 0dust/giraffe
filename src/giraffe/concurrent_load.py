@@ -7,8 +7,9 @@ import uuid
 from collections import Counter
 from statistics import median
 
-from giraffe.fixtures import deterministic_options, reasoning_budget
+from giraffe.fixtures import reasoning_budget
 from giraffe.models import RequestSpec, load_shape_label
+from giraffe.local_tokenizer import prepare_messages
 from giraffe.overlap import answer_window, peak_evidenced_concurrency, scheduling_delay_windows
 from giraffe.timing import run_quality
 
@@ -78,14 +79,14 @@ def calibration_keys(settings):
 
 
 def minimum_reservation(settings):
-    return len(test_points(settings)) + len(calibration_keys(settings))
+    return len(test_points(settings))
 
 
-def prompt(filler_chars, variant):
+def prompt(filler_chars, variant, *, nonce=None):
     instruction = ("Write the box label first, with no introduction." if variant == "short_answer" else
                    "Write the box label first, then continue a numbered list from 1 to 1000000, well beyond the output cap.")
     filler = ("The team reviewed the neutral delivery notes. " * (filler_chars // 44 + 1))[:filler_chars]
-    return f"Request {uuid.uuid4().hex}. The box label is K7P4.\n{filler}\n{instruction}"
+    return f"Request {nonce or uuid.uuid4().hex}. The box label is K7P4.\n{filler}\n{instruction}"
 
 
 def prompt_overhead(variant):
@@ -116,53 +117,18 @@ def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=Fal
 
 
 async def calibrate(run, target, client, settings, size, variant):
-    config = run.config.model_copy(update={"request_timeout_seconds":settings.request_timeout_seconds})
-    target_tokens = getattr(settings.profile, size).input_tokens
-    overhead = len(prompt(0, variant))
-    filler = max(0, target_tokens * 4 - overhead)
-    scenario = f"load_calibration_v45_{size}_{variant}"
-    run.plan_condition(target.name, scenario, planned=settings.calibration_attempts, planned_kind="upper_bound")
-    run.start_condition(target.name, scenario, planned=settings.calibration_attempts, planned_kind="upper_bound")
-    result = {"size": size, "variant": variant, "target_tokens": target_tokens, "status": "inconclusive",
-              "reason": "input length not calibrated", "reason_code": "input_not_calibrated", "filler_chars": filler,
-              "input_tokens": None, "request_ids": []}
-    shape = f"{size}_{'short' if variant == 'short_answer' else 'long'}"
-    try:
-        for _ in range(settings.calibration_attempts):
-            if not run.allowed(target.name):
-                result.update(reason=run.condition_reason(target.name), reason_code=window_cause(run.condition_reason(target.name)))
-                break
-            spec = make_spec(settings, shape, scenario, {"type": "calibration", "input_size": size, "variant": variant}, filler, calibration=True,
-                             request_timeout_seconds=config.request_timeout_seconds)
-            spec.stream = run.config.stream
-            spec.options = deterministic_options(run.config)
-            record = await run.request(target, client, spec)
-            if record is None:
-                result.update(reason=run.condition_reason(target.name), reason_code=window_cause(run.condition_reason(target.name)))
-                break
-            result["request_ids"].append(record.id)
-            tokens = record.input_tokens
-            if record.status == "timeout" or (record.http_status is not None and record.http_status >= 400) or record.status == "failed" and tokens is None:
-                result.update(status="fail", reason=f"Calibration failed: {record.error or record.status}", reason_code="calibration_failed")
-                break
-            if record.status not in {"completed", "failed"}:
-                reason = run.condition_reason(target.name)
-                result.update(reason=reason, reason_code=window_cause(reason))
-                break
-            result.update(input_tokens=tokens, filler_chars=filler)
-            if tokens is None:
-                result.update(status="estimated", reason="estimated; endpoint did not report token counts", reason_code="tokens_not_reported")
-                break
-            if abs(tokens - target_tokens) <= target_tokens * settings.input_token_tolerance:
-                result.update(status="calibrated", reason=None, reason_code=None)
-                break
-            if filler == 0 and tokens > target_tokens:
-                result.update(status="calibrated", reason_code="minimum_prompt_length",
-                    reason=f"{size.capitalize()} input target {target_tokens} is below the minimum prompt length (≈{tokens} tokens); measured at {tokens}")
-                break
-            filler = max(0, round((overhead + filler) * target_tokens / max(1, tokens)) - overhead)
-    finally:
-        run.finish_condition(target.name, scenario, reason=result["reason"])
+    """Prepare prompt length locally; this compatibility entry point sends no requests."""
+    nonce = uuid.uuid4().hex
+    result = await prepare_messages(
+        run, target, f"load_preparation_{size}_{variant}",
+        lambda chars: [{"role": "user", "content": prompt(chars, variant, nonce=nonce)}],
+        getattr(settings.profile, size).input_tokens,
+        tolerance=settings.input_token_tolerance,
+    )
+    # Runtime requests retain unique nonces to avoid artificial prefix-cache hits.
+    # This count is preparation provenance; returned usage still qualifies results.
+    result.pop("messages", None)
+    result.update(size=size, variant=variant, count_scope="reference_prompt_with_same_width_nonce")
     return result
 
 
@@ -456,7 +422,7 @@ def remedies(metrics, config):
         ("calibration_failed", "correct the endpoint errors during token calibration and rerun"),
         ("output_cap", "configure the endpoint to enforce the requested output cap"),
         ("insufficient_responses", "allow enough valid responses to meet Minimum valid responses"),
-        ("input_not_calibrated", "enable prompt token usage and adjust the input target or calibration attempts"),
+        ("input_not_calibrated", "check tokenizer setup and local cache access, or select the built-in tokenizer and rerun"),
         ("input_not_verified", "enable accurate prompt token usage to verify large-input coverage"),
         ("cached_input", "disable prefix caching for the long input and rerun"),
         ("buffered_stream", "disable response buffering so short-stream interruptions can be measured"),

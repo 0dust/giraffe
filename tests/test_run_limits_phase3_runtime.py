@@ -81,7 +81,7 @@ def test_context_fixture_uses_its_check_output_and_context_window():
 
 @pytest.mark.parametrize('check', ['serving', 'first_output', 'generation', 'context',
                                   'correctness', 'json', 'cancellation', 'recovery'])
-async def test_core_builders_place_their_own_request_settings_on_every_spec(check, monkeypatch):
+async def test_core_builders_place_their_own_request_settings_on_every_spec(check, monkeypatch, local_tokenizer):
     from tests.test_runner import FakeClient
 
     specs = []

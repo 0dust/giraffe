@@ -1,7 +1,6 @@
 """Measured shape qualification uses endpoint lengths, never selection estimates."""
 from types import SimpleNamespace
 
-import pytest
 
 from giraffe.load_test import build_spec, input_class_bounds, input_qualification, saved_shape_warnings, test_points as load_points
 from tests.test_load_test_phase_a import config, values

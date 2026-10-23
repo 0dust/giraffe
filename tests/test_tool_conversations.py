@@ -1,3 +1,4 @@
+from tests.evidence_helpers import workload_records, workload_payloads
 import copy
 import json
 
@@ -34,10 +35,10 @@ def config(endpoint, conversations=None, **updates):
 async def test_complete_and_stream_preserve_actual_history_and_consume_stub():
     with FakeEndpoint(mode='conversation_success') as endpoint:
         report = await run_suite(config(endpoint))
-        sent = endpoint.requests
+        sent = workload_payloads(endpoint.requests)
     assert report.overall == 'pass'
-    assert len(report.requests) == len(sent) == 4
-    for initial, final, first_payload, final_payload in zip(report.requests[::2], report.requests[1::2], sent[::2], sent[1::2]):
+    assert len(workload_records(report.requests)) == len(sent) == 4
+    for initial, final, first_payload, final_payload in zip(workload_records(report.requests)[::2], workload_records(report.requests)[1::2], sent[::2], sent[1::2]):
         assert initial.tool_conversation['status'] == final.tool_conversation['status'] == 'pass'
         assert final_payload['messages'][1] == initial.assistant_message
         assert final_payload['messages'][1]['content'] == 'Checking.'
@@ -49,7 +50,7 @@ async def test_complete_and_stream_preserve_actual_history_and_consume_stub():
         assert json.loads(final.output) == stub
         assert stub['observation_id'] not in first_payload['messages'][0]['content']
         assert initial.tool_conversation['calls'][0]['supplied_in_request'] == final.id
-    assert report.requests[0].tool_conversation['session_id'] != report.requests[2].tool_conversation['session_id']
+    assert workload_records(report.requests)[0].tool_conversation['session_id'] != workload_records(report.requests)[2].tool_conversation['session_id']
     assert sent[1]['messages'][2]['content'] != sent[3]['messages'][2]['content']
 
 
@@ -70,24 +71,24 @@ async def test_failures_are_classified_without_executing_unexpected_calls(mode, 
     assert len(outcomes) == 2
     assert {item['reason'] for item in outcomes} == {reason}
     if reason == 'repeated_satisfied_call':
-        for first, final in zip(report.requests[::2], report.requests[1::2]):
+        for first, final in zip(workload_records(report.requests)[::2], workload_records(report.requests)[1::2]):
             assert first.tool_calls[0]['id'] != final.tool_calls[0]['id']
             assert final.tool_conversation['repetition_count'] == 1
             assert final.score is False
     if reason in {'unexpected_call', 'invalid_call', 'protocol_or_api_failure'}:
-        assert len(report.requests) == 2
+        assert len(workload_records(report.requests)) == 2
 
 
 @pytest.mark.parametrize('limit', [1, 2, 3])
 async def test_budget_exhaustion_never_promotes_first_stage_to_conversation_pass(limit):
     with FakeEndpoint(mode='conversation_success') as endpoint:
         report = await run_suite(config(endpoint, max_requests=limit))
-    assert len(report.requests) == limit
+    assert len(report.requests) == len(workload_records(report.requests)) == limit
     assert report.overall == 'inconclusive'
     assert next(check for check in report.checks if check.id == 'tools').metrics['missing_cases']
     if limit == 1:
-        assert report.requests[0].score is True
-        assert report.requests[0].tool_conversation['calls'][0]['supplied_in_request'] is None
+        assert workload_records(report.requests)[0].score is True
+        assert workload_records(report.requests)[0].tool_conversation['calls'][0]['supplied_in_request'] is None
 
 
 @pytest.mark.parametrize('mode', ['conversation_truncated', 'conversation_timeout'])
@@ -148,7 +149,7 @@ async def test_declared_followup_operations_do_not_trigger_blanket_function_loop
     with FakeEndpoint(mode='conversation_success') as endpoint:
         report = await run_suite(config(endpoint, [value]))
     assert report.overall == 'pass'
-    assert len(report.requests) == 6
+    assert len(workload_records(report.requests)) == 6
     assert all(item['repetition_count'] == 0 for item in next(check for check in report.checks if check.id == 'tools').metrics['conversations'])
 
 
@@ -159,18 +160,18 @@ async def test_retention_covers_dynamic_history_results_and_assertions(policy, m
     from giraffe.reporting import write_report
     with FakeEndpoint(mode=mode) as endpoint:
         report = await run_suite(config(endpoint, retention=policy))
-    marker = report.requests[0].tool_conversation['calls'][0]['result']['observation_id']
+    marker = workload_records(report.requests)[0].tool_conversation['calls'][0]['result']['observation_id']
     json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     keep = policy == 'all' or (policy == 'failures' and mode == 'conversation_repeat')
     assert (marker in json_path.read_text()) is keep
     assert (marker in html_path.read_text()) is keep
     assert marker in report.model_dump_json()  # Export must not mutate the working report.
-    for record in saved.requests:
+    for record in workload_records(saved.requests):
         assert bool(record.evaluation.messages) is keep
         assert bool(record.assistant_message) is keep
         assert record.tool_conversation['session_id']
-    assert saved.requests[0].tool_conversation['calls'][0]['fingerprint']
+    assert workload_records(saved.requests)[0].tool_conversation['calls'][0]['fingerprint']
     assert 'Tool-result conversation' in html_path.read_text()
 
 
@@ -182,9 +183,9 @@ async def test_parallel_calls_link_results_by_actual_ids_after_stream_reconstruc
     value['steps'][0]['expected_calls'].append(second)
     with FakeEndpoint(mode='conversation_success') as endpoint:
         report = await run_suite(config(endpoint, [value]))
-        sent = endpoint.requests
+        sent = workload_payloads(endpoint.requests)
     assert report.overall == 'pass'
-    for first, payload in zip(report.requests[::2], sent[1::2]):
+    for first, payload in zip(workload_records(report.requests)[::2], sent[1::2]):
         assert len(first.tool_calls) == 2
         assert [m['tool_call_id'] for m in payload['messages'] if m['role'] == 'tool'] == [
             call['id'] for call in first.tool_calls]
@@ -195,9 +196,9 @@ async def test_two_fixtures_have_isolated_histories_and_operation_sets():
     values = [fixture(), fixture(fixture_id='second')]
     with FakeEndpoint(mode='conversation_success') as endpoint:
         report = await run_suite(config(endpoint, values))
-        sent = endpoint.requests
+        sent = workload_payloads(endpoint.requests)
     assert report.overall == 'pass'
-    assert len({r.tool_conversation['session_id'] for r in report.requests}) == 4
+    assert len({r.tool_conversation['session_id'] for r in workload_records(report.requests)}) == 4
     assert [len(p['messages']) for p in sent] == [1, 3] * 4
     assert len({json.loads(p['messages'][-1]['content'])['observation_id'] for p in sent[1::2]}) == 4
 
@@ -207,7 +208,7 @@ async def test_context_admission_stops_before_sending_oversized_history():
     value['steps'][0]['expected_calls'][0]['result']['padding'] = 'x' * 1024
     with FakeEndpoint(mode='conversation_success') as endpoint:
         report = await run_suite(config(endpoint, [value], context_limit=512))
-        assert len(endpoint.requests) == 2
+        assert len(workload_payloads(endpoint.requests)) == 2
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert {o['reason'] for o in outcomes} == {'history_limit'}
     assert report.overall == 'inconclusive'
@@ -227,7 +228,7 @@ async def test_timeout_remains_inconclusive_alongside_passing_single_response_fi
 async def test_stop_after_errors_leaves_unstarted_sessions_inconclusive():
     with FakeEndpoint(mode='conversation_timeout') as endpoint:
         report = await run_suite(config(endpoint, request_timeout_seconds=.05, stop_after_errors=1))
-    assert len(report.requests) == 2
+    assert len(workload_records(report.requests)) == 2
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert [o['reason'] for o in outcomes] == ['timeout', 'budget_exhausted']
     assert report.overall == 'inconclusive'
@@ -272,7 +273,7 @@ async def test_api_preview_run_export_and_bounded_plan(tmp_path):
             identifier = await start(client, normalized)
             result = await finished(client, identifier)
             assert result['report']['overall'] == 'pass'
-            assert len(result['report']['requests']) == 4
+            assert len(workload_records(result['report']['requests'])) == 4
             saved = (await client.get(f'/api/runs/{identifier}/config.json')).json()
             assert saved['tool_checks'] == normalized['tool_checks']
             exported = (await client.get(f'/api/runs/{identifier}/report.json')).json()
@@ -315,7 +316,7 @@ async def test_repetition_uses_semantics_not_argument_bytes_or_call_ids():
     with FakeEndpoint(mode='conversation_repeat_semantic') as endpoint:
         report = await run_suite(config(endpoint, [value]))
     assert report.overall == 'fail'
-    for initial, repeated in zip(report.requests[::2], report.requests[1::2]):
+    for initial, repeated in zip(workload_records(report.requests)[::2], workload_records(report.requests)[1::2]):
         assert initial.tool_calls[0]['function']['arguments'] != repeated.tool_calls[0]['function']['arguments']
         assert initial.tool_calls[0]['id'] != repeated.tool_calls[0]['id']
         assert initial.tool_conversation['calls'][0]['fingerprint'] == repeated.tool_conversation['calls'][0]['fingerprint']
@@ -326,16 +327,18 @@ async def test_live_completion_events_publish_final_conversation_verdicts():
     events = []
     with FakeEndpoint(mode='conversation_wrong_answer') as endpoint:
         report = await run_suite(config(endpoint), progress=events.append)
-    completions = [e['request'] for e in events if e['event'] == 'request_completed']
+    all_completions = [e['request'] for e in events if e['event'] == 'request_completed']
+    assert len(all_completions) == len(report.requests)
+    completions = workload_records(all_completions)
     assert [e['score'] for e in completions] == [True, False, True, False]
-    assert [r.score for r in report.requests] == [e['score'] for e in completions]
-    assert all('output' not in e and 'assistant_message' not in e for e in completions)
+    assert [r.score for r in workload_records(report.requests)] == [e['score'] for e in completions]
+    assert all('output' not in e and 'assistant_message' not in e for e in all_completions)
 
 
 async def test_assistant_null_content_and_reasoning_survive_both_transports():
     with FakeEndpoint(mode='conversation_reasoning') as endpoint:
         report = await run_suite(config(endpoint))
-        payloads = endpoint.requests
+        payloads = workload_payloads(endpoint.requests)
     assert report.overall == 'pass'
     for payload in payloads[1::2]:
         assistant = payload['messages'][1]
@@ -350,20 +353,37 @@ async def test_run_duration_limit_leaves_no_false_conversation_pass():
     assert report.overall == 'inconclusive'
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert all(o['status'] == 'inconclusive' for o in outcomes)
-    assert len(report.requests) <= 2
+    assert len(workload_records(report.requests)) <= 2
 
 
-async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence():
+async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence(monkeypatch):
+    from giraffe.runner import _Run
+
+    # Exercise the final conversation timeout without imposing a 50 ms socket
+    # deadline on unrelated successful single-response requests.
+    original_request = _Run.request
+
+    async def final_turn_deadline(self, target, client, spec, *args, **kwargs):
+        if spec.workload.get('selection') == 'conversation' and spec.workload.get('stage') == 'final':
+            spec = spec.model_copy(update={'request_timeout_seconds': .05})
+        return await original_request(self, target, client, spec, *args, **kwargs)
+
+    monkeypatch.setattr(_Run, 'request', final_turn_deadline)
     value = fixture()
     single = ToolFixture.model_validate({k: value[k] for k in ['fixture_id', 'messages', 'tools']} | {
         'fixture_id': 'single', 'expected_calls': [{'name': 'get_weather', 'arguments': {'city': 'Warsaw'}}]})
     with FakeEndpoint(mode='conversation_timeout') as endpoint:
-        cfg = config(endpoint, request_timeout_seconds=.05)
+        cfg = config(endpoint)
         cfg.tool_checks.fixtures = [single]
         report = await run_suite(cfg)
-    singles = [r for r in report.requests if r.workload.get('tool_fixture_id') == 'single']
+    singles = [r for r in workload_records(report.requests) if r.workload.get('tool_fixture_id') == 'single']
     assert len(singles) == 2
     assert all(r.score is True and r.status == 'completed' for r in singles)
+    assert all(r.request_timeout_seconds == cfg.request_timeout_seconds for r in singles)
+    final_turns = [r for r in workload_records(report.requests) if r.workload.get('stage') == 'final']
+    assert len(final_turns) == 2
+    assert all(r.status == 'timeout' and r.request_timeout_seconds == .05
+               and r.termination_limit_seconds == .05 for r in final_turns)
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert len(outcomes) == 2
     assert all(o['reason'] == 'timeout' and o['status'] == 'inconclusive' for o in outcomes)
@@ -410,7 +430,7 @@ def test_fixture_ids_are_unique_across_single_response_and_conversations():
 async def test_conflicting_stream_call_ids_fail_before_supplying_any_result():
     with FakeEndpoint(mode='conversation_conflicting_id') as endpoint:
         report = await run_suite(config(endpoint))
-        sent = endpoint.requests
+        sent = workload_payloads(endpoint.requests)
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert [o['status'] for o in outcomes] == ['pass', 'fail']
     assert outcomes[1]['reason'] == 'protocol_or_api_failure'
@@ -423,7 +443,7 @@ async def test_verified_repeat_survives_later_stream_timeout():
     with FakeEndpoint(mode='conversation_repeat_timeout') as endpoint:
         report = await run_suite(config(endpoint, request_timeout_seconds=.05))
     assert report.overall == 'fail'
-    stream_final = report.requests[-1]
+    stream_final = workload_records(report.requests)[-1]
     assert stream_final.stream and stream_final.status == 'timeout'
     assert stream_final.tool_conversation['reason'] == 'repeated_satisfied_call'
     assert stream_final.score is False

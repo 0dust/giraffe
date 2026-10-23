@@ -1,10 +1,15 @@
 """PR #50 review reproductions through the real executor, without sockets."""
 
+import pytest
+
 from giraffe.load_test import execute, result
 from giraffe.models import RunConfig
 from giraffe.reporting import _load_test_html
 from giraffe.runner import _Run
 from tests.test_load_test_phase_a import Client, config, values
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def saved(cap=256, *, shape="short_short", interference=False, long_case=False):
@@ -37,7 +42,6 @@ class MissingUsage(Client):
 async def perform(c, client=None):
     # Small internal windows retain the scheduler/scorer path without long tests.
     c.load_test.schedule.duration_seconds = 0.15
-    c.load_test.schedule.finish_seconds = 0.1
     run, client = _Run(c, None, None), client or Client()
     observed = await execute(run, c.targets[0], client)
     rows = [r for r in run.records if r.load_point and r.load_point.get("point_id")]
@@ -95,7 +99,7 @@ async def test_missing_usage_keeps_metrics_but_cannot_establish_capacity():
     assert group["reason"] == (
         "Input token counts not reported by the endpoint; timing and correctness are shown but capacity is not established"
     )
-    assert [calibration["status"] for calibration in observed["calibrations"]] == ["estimated"]
+    assert [calibration["status"] for calibration in observed["calibrations"]] == ["calibrated"]
     assert rows and all(r.input_tokens is None and r.output_tokens is None for r in rows)
     assert group["input_qualification"]["actual_median"] is None
     assert group["input_qualification"]["unknown_valid"] == group["valid"]
@@ -247,3 +251,6 @@ async def test_mixed_traffic_qualifies_each_shape_independently():
     assert not groups["long_short"]["input_qualification"]["qualified"]
     assert check.status == "inconclusive"
     assert observed["highest_accepted"] == []
+
+
+# Fake inference clients in this module use the matching local tokenizer.

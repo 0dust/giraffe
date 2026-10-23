@@ -48,14 +48,15 @@ The quick run above prints limits and live progress, followed by output shaped
 like this (summaries and paths vary):
 
 ```text
-Giraffe: 1 target(s), at most 300 requests, 1 in flight, 300s total, 30s/request, 128 output tokens/request. Ctrl-C saves a partial report.
+Giraffe: 1 target(s), Stop after this many requests: Not set, Limit simultaneous requests: 1, Stop test traffic after: Not set, Request defaults: 300s timeout, 128 output tokens. Check and saved-request overrides apply. Ctrl-C saves a partial report.
+Per-check request timeouts: access=300s, serving=300s, correctness=300s. Saved requests may override these.
 ...
-PASS: 13 requests
   local / access: pass — ...
   local / serving: pass — ...
   local / correctness: pass — ...
 JSON: /your/checkout/giraffe/runs/<timestamp>/report.json
 Export HTML: giraffe report /your/checkout/giraffe/runs/<timestamp> --html
+PASS: ... requests
 ```
 
 **PASS** means the selected required checks have sufficient evidence and meet their
@@ -80,6 +81,65 @@ without rerunning the suite with `giraffe report runs/<timestamp> --html`
 (optionally `--output PATH`). Add `--html` to `giraffe run` to save HTML at completion.
 Once the suite starts, failed or interrupted runs also save reports. Ctrl-C stops
 new requests and saves partial results.
+
+## Preparation, timeouts and automatic measurements
+
+The first setup page has one editable **Token ID** box, defaulting to **Automatic**.
+It resolves and loads the tokenizer on that page before allowing continuation to
+Checks. If resolution fails, the page says that built-in `o200k_base` will be used;
+enter a model name in the same box to retry, or choose `builtin` from its dropdown.
+The fallback uses the same established encoding as AIPerf's `builtin` option,
+not a character-count approximation. Its reference counts can differ from
+the served model and exclude chat formatting. Preparation and request evidence
+identify the tokenizer; only server-reported usage establishes actual input-size
+coverage and measured token counts. Missing server usage remains unknown.
+
+Automatic tries a cached tokenizer or Hugging Face exact/repository-suffix name
+resolution. The first-page check sends no requests to the inference endpoint.
+CLI automatic resolution can also use matching server metadata. For
+example, `qwen2.5-7b` can resolve to `Qwen/Qwen2.5-7B`. Like AIPerf, multiple exact
+suffix matches prefer the most downloaded repository; partial/fuzzy matches are
+not guessed. If lookup or loading fails, Giraffe uses the built-in tokenizer.
+Discovery has a five-second total budget; each tokenizer load/download has a
+30-second deadline. Built-in fallback loading has its own 30-second deadline.
+
+Encoding/tokenizer files download automatically **on the machine running Giraffe**
+and are reused locally. First use needs internet access; offline runs need cached
+files. The built-in cache defaults to `~/.cache/giraffe/tiktoken` (respects
+`XDG_CACHE_HOME` and `TIKTOKEN_CACHE_DIR`); model-specific tokenizers use the normal
+Hugging Face cache (`HF_HOME` is supported). Model weights and remote Python code
+are never loaded. Hugging Face offline settings also disable built-in downloads.
+
+For CLI configurations, `targets[].tokenizer` accepts `null` or `auto` (default),
+`builtin`, or an optional explicit model ID/local directory. Explicit overrides that
+cannot load produce a setup error; select `builtin` to use the built-in tokenizer. Successfully loaded
+identities are remembered per endpoint and served model for automatic mode.
+
+Prompt sizing then runs locally and offline, with a 10-second deadline per
+preparation and a 20-second total per target. No inference requests are sent to
+calibrate input length. When the tokenizer has a chat template, the local count
+includes that template. Otherwise it counts message text and explicitly excludes
+chat formatting. Actual server usage still determines measured input lengths.
+Saved request packs and custom load fixtures do not need synthetic prompt sizing.
+Preparation progress and elapsed time appear above the results.
+
+New runs default to a **300-second request timeout**. Checks can override it;
+load uses `load_test.request_timeout_seconds`, and saved timeout values remain
+unchanged. **Send new requests for** controls the sending window. Already sent
+requests retain their own deadlines after that window ends; there is no separate
+finishing wait limit. User stop and run limits can terminate them sooner, with
+the exact reason and effective deadline retained in request evidence.
+
+Timing, token usage and supported runtime telemetry are collected automatically.
+Preparation can send up to three one-token compatibility probes sharing one
+`request_timeout_seconds` budget, bounded by the remaining run duration and
+using only spare request budget. Only explicit optional-field rejections trigger
+another probe; timeouts do not retry. These setup calls are separate from
+the planned test requests; local input sizing still sends no inference calls.
+Unsupported token boundaries or usage remain unavailable. Runtime metric discovery uses
+supported endpoints; `metrics_url` and `host_metrics_url` can supply additional
+exporters. These measurements do not require selecting the optional GPU health
+check, which separately evaluates fresh GPU evidence against its criteria.
 
 ## Ollama
 
@@ -388,6 +448,12 @@ the report distinguishes measured token usage from character counts. A service U
 does not establish which replicas or GPUs were reached. Client disconnect does not
 prove backend work was reclaimed. Buffered responses can prevent a valid interference
 measurement. The report preserves these limits.
+
+First-content timing starts before the HTTP request and includes connection setup
+and connection-pool waiting. Streamed request timing ends after processing `[DONE]`;
+bounded transport cleanup happens afterward so completed HTTP/1.1 connections can
+be reused. Tools that start their clock at HTTP header transmission exclude some
+of this waiting, so their first-content values are not directly interchangeable.
 
 Generation pace is a client-observed estimate: `(output tokens - 1) / seconds from
 first useful answer chunk to last answer chunk`. Prompt waiting and trailing

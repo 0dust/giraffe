@@ -84,7 +84,7 @@ def test_start_refuses_disk_limits_before_runner(tmp_path, monkeypatch, limit):
 
 
 @pytest.mark.parametrize("summary_fails", [False, True])
-def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, summary_fails):
+def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, summary_fails, local_tokenizer):
     async def runner(configuration, **kwargs):
         return report(configuration)
 
@@ -125,7 +125,7 @@ def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, su
             assert detail["summary"]["checks"][0]["summary"] == "Completed"
 
 
-def test_export_error_takes_priority_over_partial_report_that_cannot_be_removed(tmp_path, monkeypatch):
+def test_export_error_takes_priority_over_partial_report_that_cannot_be_removed(tmp_path, monkeypatch, local_tokenizer):
     from pathlib import Path
 
     async def runner(configuration, **kwargs):

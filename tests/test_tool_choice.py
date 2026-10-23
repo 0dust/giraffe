@@ -1,3 +1,4 @@
+from tests.evidence_helpers import workload_records, workload_payloads
 import json
 
 import pytest
@@ -152,12 +153,12 @@ async def test_honored_choice_matrix_sends_and_retains_exact_rules_for_both_tran
         configuration = run_config(endpoint, fixtures, forced_tool_diagnostic=True,
                                    request_options={'tool_choice': 'none', 'parallel_tool_calls': False})
         report = await run_suite(configuration)
-        sent = list(endpoint.requests)
-    assert len(sent) == len(report.requests) == 8
+        sent = list(workload_payloads(endpoint.requests))
+    assert len(sent) == len(workload_records(report.requests)) == 8
     assert report.overall == 'pass'
     result = next(c for c in report.checks if c.id == 'tools')
     assert result.status == 'pass' and result.metrics['missing_cases'] == []
-    for record, payload in zip(report.requests, sent, strict=True):
+    for record, payload in zip(workload_records(report.requests), sent, strict=True):
         assert record.tool_evaluation.choice.status == 'pass'
         assert record.tool_request_options['tool_choice'] == payload['tool_choice']
         assert record.tool_request_options['tools'] == payload['tools']
@@ -181,8 +182,8 @@ async def test_http_success_cannot_hide_contract_or_completeness_failures(endpoi
     with FakeEndpoint(mode=endpoint_mode) as endpoint:
         report = await run_suite(run_config(endpoint, [configured]))
     assert report.overall == ('inconclusive' if endpoint_mode == 'tool_choice_truncated' else 'fail')
-    assert any(r.score is not True for r in report.requests)
-    assert all(r.http_status == 200 for r in report.requests)
+    assert any(r.score is not True for r in workload_records(report.requests))
+    assert all(r.http_status == 200 for r in workload_records(report.requests))
 
 
 @pytest.mark.parametrize('support,status', [('required', 'fail'), ('discover', 'inconclusive')])
@@ -192,11 +193,11 @@ async def test_rejected_discovery_is_inconclusive_without_error_rate_overriding_
     with FakeEndpoint(mode='tool_rejection') as endpoint:
         report = await run_suite(run_config(endpoint, [fixture('required', support=support)]))
     assert report.overall == status
-    assert all(r.tool_evaluation.support == 'rejected' for r in report.requests)
+    assert all(r.tool_evaluation.support == 'rejected' for r in workload_records(report.requests))
     if support == 'discover':
-        assert len(report.requests) == 2
+        assert len(workload_records(report.requests)) == 2
         assert report.abort_reason is None
-        assert all(r.score is None for r in report.requests)
+        assert all(r.score is None for r in workload_records(report.requests))
 
 
 async def test_unexercised_contract_mode_prevents_pass_with_shared_request_budget():
@@ -206,7 +207,7 @@ async def test_unexercised_contract_mode_prevents_pass_with_shared_request_budge
         report = await run_suite(run_config(endpoint, [fixture('none'), fixture('required')], max_requests=3))
     result = next(c for c in report.checks if c.id == 'tools')
     assert result.status == 'inconclusive'
-    assert len(report.requests) == 3
+    assert len(workload_records(report.requests)) == 3
     assert result.metrics['missing_cases'] == [{'fixture_id': 'required', 'mode': 'stream'}]
 
 
@@ -231,7 +232,7 @@ async def test_each_rule_has_independent_wire_expectations_and_plan_count():
         config = run_config(endpoint, fixtures, forced_tool_diagnostic=True)
         plan = request_plan(config)
         report = await run_suite(config)
-        sent = endpoint.requests
+        sent = workload_payloads(endpoint.requests)
     assert report.overall == 'pass'
     assert next(row for row in plan['rows'] if row['id'] == 'tools')['requests_per_target'] == 8
     assert len(sent) == 8
@@ -256,8 +257,8 @@ async def test_http_failure_identifies_the_specific_component(endpoint_mode, con
     from tests.fake_endpoint import FakeEndpoint
     with FakeEndpoint(mode=endpoint_mode) as endpoint:
         report = await run_suite(run_config(endpoint, [configured]))
-    assert len(report.requests) == 2
-    for record in report.requests:
+    assert len(workload_records(report.requests)) == 2
+    for record in workload_records(report.requests):
         if endpoint_mode == 'tool_choice_eof' and not record.stream:
             assert record.score is True
         else:
@@ -274,8 +275,8 @@ async def test_parallel_calls_reassemble_and_validate_with_explicit_permission()
     with FakeEndpoint(mode='tool_choice_parallel') as endpoint:
         report = await run_suite(run_config(endpoint, [fixture('required', parallel_tool_calls=True)]))
     assert report.overall == 'pass'
-    assert len(report.requests) == 2
-    for record in report.requests:
+    assert len(workload_records(report.requests)) == 2
+    for record in workload_records(report.requests):
         assert len(record.tool_calls) == 2
         assert record.tool_evaluation.arguments.status == 'pass'
 
@@ -291,7 +292,7 @@ async def test_contract_report_retains_rules_and_verdicts_under_every_policy(pol
         report = await run_suite(run_config(endpoint, [fixture(mode)], retention=policy))
     json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
-    for record in saved.requests:
+    for record in workload_records(saved.requests):
         assert record.tool_evaluation.choice.status == ('fail' if mode == 'none' else 'pass')
         assert record.evaluation.tool_expectation.expected_calls is None
         assert record.tool_request_options['tool_choice'] == mode
@@ -331,11 +332,11 @@ async def test_api_normalizes_runs_and_exports_contract_matrix(tmp_path):
             identifier = await start(client, normalized)
             result = await finished(client, identifier)
             assert result['report']['overall'] == 'pass'
-            assert len(result['report']['requests']) == 4
+            assert len(workload_records(result['report']['requests'])) == 4
             saved = (await client.get(f'/api/runs/{identifier}/config.json')).json()
             assert saved['tool_checks'] == normalized['tool_checks']
             exported = (await client.get(f'/api/runs/{identifier}/report.json')).json()
-            assert exported['requests'][2]['tool_request_options']['tool_choice'] == 'required'
+            assert workload_records(exported['requests'])[2]['tool_request_options']['tool_choice'] == 'required'
 
 
 async def test_choice_policy_changes_baseline_identity():
@@ -373,10 +374,10 @@ async def test_discovery_rejections_still_respect_global_error_stop_bound():
     with FakeEndpoint(mode='tool_rejection') as endpoint:
         report = await run_suite(run_config(endpoint, [fixture('required', support='discover')],
                                             stop_after_errors=1))
-    assert len(report.requests) == 1
+    assert len(workload_records(report.requests)) == 1
     assert report.abort_reason is not None
     assert report.overall == 'inconclusive'
-    assert report.requests[0].tool_evaluation.support == 'rejected'
+    assert workload_records(report.requests)[0].tool_evaluation.support == 'rejected'
     assert next(c for c in report.checks if c.id == 'tools').metrics['missing_cases']
 
 

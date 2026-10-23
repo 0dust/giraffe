@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 import pytest
 
 from giraffe import runner, traffic, load_test
+from giraffe.models import Limits, RequestRecord, TrafficConfig
+from giraffe.runner import run_suite
 from tests.test_concurrent_load import Client as TokenClient, configuration as load_configuration, short_windows
+from tests.fake_endpoint import FakeEndpoint
+from tests.test_load_reliability import LoadClient
+from tests.test_runner import check, config
 
 
 async def load_run(*, client=None, duration=.5, rates=(20,), pattern="constant", criteria=None, **values):
@@ -18,12 +23,9 @@ async def load_run(*, client=None, duration=.5, rates=(20,), pattern="constant",
     run = runner._Run(cfg,None,None)
     await load_test.execute(run,cfg.targets[0],client or TokenClient())
     return run,load_test.result(run,cfg.targets[0])
-from giraffe.models import Limits, RequestRecord, TrafficConfig
-from giraffe.runner import run_suite
-from tests.fake_endpoint import FakeEndpoint
-from tests.test_load_reliability import LoadClient
-from tests.test_runner import check, config
-from tests.test_workloads import config as workload_config
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 @pytest.fixture
@@ -90,11 +92,15 @@ class QueueClient(LoadClient):
 @pytest.mark.parametrize("arrival,seed", [("steady", 42), ("poisson", 35)])
 async def test_short_stage_above_service_rate_is_not_accepted_while_queue_grows(monkeypatch,arrival,seed):
     class FIFO(TokenClient):
-        def __init__(self): super().__init__(); self.service=asyncio.Lock()
+        def __init__(self):
+            super().__init__()
+            self.service=asyncio.Lock()
         async def execute(self,spec,**kw):
-            if spec.scenario.startswith('load_calibration_'): return await super().execute(spec,**kw)
+            if spec.scenario.startswith('load_calibration_'):
+                return await super().execute(spec,**kw)
             start=time.monotonic()
-            async with self.service: await asyncio.sleep(.08)
+            async with self.service:
+                await asyncio.sleep(.08)
             r=await super().execute(spec,**kw)
             r.elapsed_ms=(time.monotonic()-start)*1000
             r.first_output_ms=r.elapsed_ms-1
@@ -110,7 +116,8 @@ async def test_short_stage_above_service_rate_is_not_accepted_while_queue_grows(
 async def test_steady_stage_below_service_rate_still_passes(monkeypatch):
     class Service(TokenClient):
         async def execute(self,spec,**kw):
-            if not spec.scenario.startswith('load_calibration_'): await asyncio.sleep(.08)
+            if not spec.scenario.startswith('load_calibration_'):
+                await asyncio.sleep(.08)
             return await super().execute(spec,**kw)
     _,result=await load_run(client=Service(),rates=(5,10),concurrency=16,criteria={'max_completion_ms':400})
     assert result.status == 'pass'
@@ -171,12 +178,15 @@ def test_rising_latency_with_normal_inflight_work_is_not_queue_growth():
 
 async def test_three_cancelled_arrivals_leave_eight_request_schedule_unqualified(endpoint,monkeypatch):
     class Cancelled(TokenClient):
-        def __init__(self): super().__init__(); self.count=0
+        def __init__(self):
+            super().__init__()
+            self.count=0
         async def execute(self,spec,**kw):
             r=await super().execute(spec,**kw)
             if not spec.scenario.startswith('load_calibration_'):
                 self.count+=1
-                if self.count>5: r.status,r.valid='cancelled',False
+                if self.count>5:
+                    r.status,r.valid='cancelled',False
             return r
     _,result=await load_run(client=Cancelled(),duration=.4,rates=(20,),concurrency=8)
     p=result.metrics['points'][0]
@@ -198,11 +208,13 @@ async def test_arrivals_need_timing_limit_and_preserve_real_failures(endpoint,li
     _,result=await load_run(duration=.2,rates=(20,),criteria=criteria,concurrency=4)
     g=result.metrics['points'][0]['groups'][0]
     # A pause limit alone measures streaming but cannot qualify accepted capacity.
-    if limits.stream_gap_ms and not limits.latency_ms and not limits.first_output_ms: status='inconclusive'
+    if limits.stream_gap_ms and not limits.latency_ms and not limits.first_output_ms:
+        status='inconclusive'
     assert result.status == status
     if limits.min_output_tokens_per_second is not None:
         assert 'generation_tokens_per_second' in g['missing_timing']
-    elif status == 'inconclusive': assert g['reason_code'] == 'measure_only'
+    elif status == 'inconclusive':
+        assert g['reason_code'] == 'measure_only'
 
 async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
     with FakeEndpoint(first_token_delay=.4) as server:
@@ -210,7 +222,7 @@ async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
         report=await run_suite(c)
     result=next(v for v in report.checks if v.id == 'load')
     p=result.metrics['points'][0]
-    assert any(r.status == 'cancelled' for r in report.requests if r.load_point.get('point_id') == p['id'])
+    assert any(r.status == 'cancelled' for r in report.requests if (r.load_point or {}).get('point_id') == p['id'])
     assert p['cancelled']>0 and p['status'] == result.status == 'inconclusive'
 
 
@@ -400,3 +412,6 @@ async def test_unscored_sustained_completions_block_a_recovery_pass(endpoint, mo
     report = await runner.run_suite(config(checks=["recovery"], limits=Limits(latency_ms=5000, min_samples=2)))
     result = check(report, "recovery")
     assert result.metrics["unscored_completions"] > 0 and result.status == "inconclusive"
+
+
+# Match fake endpoint token usage while exercising the real local-sizing path.

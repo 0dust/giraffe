@@ -1,6 +1,11 @@
 """Concurrent load's browser contract, exercised through the real UI in node VM."""
+
+import pytest
 from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_results import run_render_checks
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def test_drawer_structure_and_labels():
@@ -81,7 +86,7 @@ def test_plan_breakdown_and_duration_rows_use_server_numbers():
     plan=request_plan(config)
     browser_logic('const plan='+json.dumps(plan)+r''';
 config.checks=['load'];const html=renderRunBlueprint(config,plan);
-assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/6m 0s/);assert.match(html,/Unknown \+ 135/);
+assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);assert.match(html,/Unknown \+ 135/);
 assert.match(html,/Expected scheduled requests/);assert.match(html,/Execution order/);
 assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);
 assert.doesNotMatch(renderLoadPlan(config),/12<\/dd>|3m 0s/); // No independent planner fallback.
@@ -158,20 +163,32 @@ def test_live_conditions_group_by_load_type_and_level_with_point_verdicts():
 const conditions=['load_combo_long_short_c4','load_combo_short_long_c4','load_mixed_c4','load_mixed_c8','load_interference_control_c4','load_interference_probe_c4','load_stress_output_c4'].map(id=>({target:'local',condition:{id,check:'concurrency',label:phaseName(id)},planned:null,sent:0,status:'waiting'}));
 state.detail={id:'live',config:{targets:[{name:'local'}]},live_conditions:conditions};
 let html=renderTests([],{conditions,live:true});
-for(const type of ['combinations','mixed','interference','stress'])assert(html.includes('data-condition-load-type="'+type+'"'));
-assert.match(html,/Mixed traffic · 8 concurrent requests/);assert.match(html,/Long input → Short output at 4 concurrent requests/);
-assert.equal((html.match(/data-condition-load-type="mixed"/g)||[]).length,2);
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,7);
+assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
+const views=()=>[...conditionViews.values()];
+for(const name of ['Short-only control','Long input during short streams','Large-output stress'])assert(views().some(view=>view.name===name),name);
+assert.equal(views().filter(view=>view.name==='Mixed load').length,2);
+assert(views().some(view=>view.name==='Mixed load'&&view.description==='8 at once'));
+assert(views().some(view=>/Long input.*Short output/.test(view.name)&&view.description==='4 at once'));
+assert(views().every(view=>view.checkName==='Concurrent load'));
+assert.doesNotMatch(html,/test-condition|Inspect test/);
 conditions[0].status='finished';conditions[0].reason='criteria met';conditions[0].load_point_result={status:'pass',cut_short:false,not_run:false};
-html=renderTests([],{conditions,live:true});let first=html.match(/<article[\s\S]*?<\/article>/)[0];
-assert.match(first,/Finished/);assert.match(first,/class="status pass"/);assert.doesNotMatch(first,/Stopped early/);
-conditions[0].load_point_result.cut_short=true;html=renderTests([],{conditions,live:true});assert.match(html.match(/<article[\s\S]*?<\/article>/)[0],/Stopped early/);
+html=renderTests([],{conditions,live:true});let first=html.match(/<g class="condition-spot[\s\S]*?<\/g>/)[0];
+assert.match(first,/data-state="pass"/);assert.match(first,/>✓<\/text>/);assert.doesNotMatch(first,/Finished|Stopped early/);
+// Sending-window shortfall remains check evidence; it cannot override an authoritative verdict.
+conditions[0].load_point_result.cut_short=true;renderTests([],{conditions,live:true});
+assert.equal(views()[0].status,'passed');assert.equal(views()[0].summary.load_point_result.cut_short,true);
+assert.equal(views()[0].summary.reason,'criteria met');
 const record={scenario:'load_mixed_c4.long_short',target:'local'};
 assert.equal(conditionInfo(record).id,'load_mixed_c4');assert.equal(conditionInfo(record).check,'concurrency');
 const completed=report([check('concurrency','fail',{metrics:{load_types:{combinations:{points:[{id:'load_combo_long_short_c4',status:'fail'}]}}}})]);
-html=renderTests([],{conditions,report:completed});
-assert.match(html,/class="status fail"/);
+// The saved point verdict is used when no live point verdict is supplied.
+const savedConditions=conditions.map(({load_point_result,...condition})=>({...condition,reason:null}));
+html=renderTests([],{conditions:savedConditions,report:completed});
+assert.match(html.match(/<g class="condition-spot[\s\S]*?<\/g>/)[0],/data-state="fail"/);
 const calibration=[{target:'local',condition:{id:'load_calibration_long_long_output',check:'concurrency',load_type:'calibration',label:phaseName('load_calibration_long_long_output')}}];
-html=renderTests([],{conditions:calibration,live:true});assert.match(html,/Input token calibration/);assert.doesNotMatch(html,/undefined|— concurrent requests/);
+html=renderTests([],{conditions:calibration,live:true});assert.equal(conditionViews.size,0);assert.doesNotMatch(html,/condition-spot|Input token calibration/);
+assert.equal(phaseName(calibration[0].condition.id),'Calibrating Long input tokens (long-output prompt)'); // Inspection labels still exist.
 ''')
 
 
@@ -188,3 +205,6 @@ async def test_live_finished_conditions_carry_authoritative_point_measurements()
     assert len(finished)==1
     assert finished[0]['condition_summary']['load_point_result']=={key:value for key,value in obs['points'][0].items() if key!='offers'}
     assert finished[0]['condition_summary']['load_point_result']['groups']
+
+
+# Fake inference clients in this module use the matching local tokenizer.

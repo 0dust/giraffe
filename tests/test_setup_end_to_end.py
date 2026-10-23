@@ -133,6 +133,7 @@ process.stdout.write(JSON.stringify(config));
     ("tools", {"forced_tool_diagnostic": True}),
 ])
 async def test_fixed_specialist_plan_matches_runner_requests(check, options):
+    from tests.evidence_helpers import workload_records, workload_payloads
     with FakeEndpoint() as endpoint:
         config = RunConfig(
             targets=[{"name": "local", "url": endpoint.url, "model": "fake-model"}],
@@ -144,5 +145,5 @@ async def test_fixed_specialist_plan_matches_runner_requests(check, options):
         assert endpoint.requests == []
         report = await run_suite(config)
         assert report.abort_reason is None
-        assert len(report.requests) == plan["planned_total"]
-        assert len(endpoint.requests) == plan["planned_total"]
+        assert len(workload_records(report.requests)) == plan["planned_total"]
+        assert len(workload_payloads(endpoint.requests)) == plan["planned_total"]

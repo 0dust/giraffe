@@ -63,7 +63,8 @@ async def test_v2_stream_end_is_observed_before_slow_close(monkeypatch):
         await asyncio.sleep(.02)
     monkeypatch.setattr(Chunks, "aclose", close)
     r = await one(monkeypatch, [ev("answer"), .002, ev(finish="stop"), DONE])
-    assert r.stream_end_ms is not None and r.elapsed_ms-r.stream_end_ms >= 15
+    # HTTP cleanup is now background work, outside the completed response timer.
+    assert r.stream_end_ms is not None and 0 <= r.elapsed_ms-r.stream_end_ms < 15
 
 
 @pytest.mark.parametrize("scenario", ["sustained", "recovery_baseline", "recovery"])
@@ -352,7 +353,7 @@ async def test_v2_socket_free_server_release_precedes_client_cleanup(monkeypatch
         rows = await asyncio.gather(*(client.execute(spec) for _ in range(4)))
     for r in rows:
         r.timing_start_ms = r._timing_started_monotonic * 1000
-        assert r.valid and r.elapsed_ms-r.stream_end_ms >= 4
+        assert r.valid and 0 <= r.elapsed_ms-r.stream_end_ms < 4
     assert peak_evidenced_concurrency(rows) <= 1 if serial else peak_evidenced_concurrency(rows) == 4
     assert max_evidenced_overlap(rows, rows) == (1 if serial else 2)
 

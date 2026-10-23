@@ -84,7 +84,7 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
     controls = [node['name'] for node in tree.nodes if node.get('name') and limits in node['parents']]
     assert set(controls) == {'max_requests', 'max_requests_enabled', 'concurrency', 'concurrency_enabled',
                              'max_duration_seconds', 'max_duration_seconds_enabled', 'max_duration_unit',
-                             'max_memory_mb', 'max_memory_mb_enabled'}
+                             'max_memory_mb', 'max_memory_mb_enabled', 'request_timeout_seconds'}
     for check in capabilities()['checks']:
         for name in check['option_fields'] + ['limit_' + name for name in check['limit_fields']]:
             fields = tree.named(f'test_{check["id"]}_{name}')
@@ -98,7 +98,8 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
     assert any(parent.get('id') == 'setup-panel-1' for parent in stream['parents'])
     regression, = tree.named('limit_regression_percent')
     assert any(parent.get('id') == 'setup-panel-3' for parent in regression['parents'])
-    for name in ['samples', 'max_output_tokens', 'request_timeout_seconds', 'context_limit']:
+    assert len(tree.named('request_timeout_seconds')) == 1
+    for name in ['samples', 'max_output_tokens', 'context_limit']:
         assert not tree.named(name)
     browser_logic("nodes['#setup-panel-1']={};nodes['#setup-title']={};state.setupStep=2;"
                   "syncSetupIdentity=()=>{};syncSetupStep=syncSetupStep;"

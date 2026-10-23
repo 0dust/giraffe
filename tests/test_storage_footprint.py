@@ -41,7 +41,13 @@ def test_footprint_round_trip_preserves_models_api_and_failure_evidence(tmp_path
     with TestClient(create_app(tmp_path)) as client:
         new = client.get("/api/runs/saved").json()["report"]
         old = client.get("/api/runs/legacy").json()["report"]
-        assert new == old == expected.model_dump(mode="json")
+        assert new == old
+        assert new["requests_compact"] and new["request_count"] == len(expected.requests)
+        assert {k: v for k, v in new.items() if k not in {"requests", "request_count", "requests_compact"}} == expected.model_dump(mode="json", exclude={"requests"})
+        for record in expected.requests:
+            evidence = client.get(f"/api/runs/saved/requests/{record.id}")
+            assert evidence.status_code == 200
+            assert evidence.json() == record.model_dump(mode="json")
         assert client.get("/api/runs/saved/report.json").content == client.get("/api/runs/legacy/report.json").content
         html = client.get("/api/runs/saved/report.html")
         assert html.status_code == 200 and "attachment" in html.headers["content-disposition"]
@@ -119,7 +125,7 @@ def test_json_limit_measures_deduplicated_bytes(tmp_path):
 
 
 @pytest.mark.parametrize("policy", [{"keep_latest": 1}, {"older_than_days": 0}, {"max_total_bytes": 1}])
-def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeypatch, policy):
+def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeypatch, policy, local_tokenizer):
     from tests.test_storage_web import completed
     from tests.test_web import config, report as web_report
 
@@ -144,7 +150,7 @@ def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("html", [False, True])
-def test_cli_automatic_cleanup_and_explicit_html(tmp_path, monkeypatch, capsys, html):
+def test_cli_automatic_cleanup_and_explicit_html(tmp_path, monkeypatch, capsys, html, local_tokenizer):
     from tests.test_storage_cli_regressions import report, run_arguments
 
     write_report(synthetic_report(2, 10, "none"), tmp_path / "old")
@@ -234,3 +240,17 @@ def test_baseline_import_keeps_retention_and_default_fields(tmp_path):
     assert raw["report_format"] == 2
     assert raw["requests"][0]["client_wait_ms"] is None
     assert raw["requests"][0]["response_events"] == []
+
+
+def test_synthetic_thousand_performance_is_derived_not_persisted(tmp_path):
+    from tests.performance_fixture import synthetic_report_1000
+    from giraffe.reporting import _report_json_chunks
+
+    report = synthetic_report_1000()
+    path, _ = write_report(report, tmp_path / 'synthetic')
+    raw = json.loads(path.read_text())
+    assert 'performance' not in raw
+    baseline = _retained(report).model_copy(update={'performance': {}})
+    baseline_size = len(''.join(_report_json_chunks(baseline)).encode('utf-8'))
+    assert path.stat().st_size <= baseline_size * 1.1
+    assert load_report(path).performance['targets'][0]['summaries']

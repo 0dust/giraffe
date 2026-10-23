@@ -59,7 +59,7 @@ def test_bounded_import_and_duplicate_json_keys():
 
 
 @pytest.mark.parametrize("checks,load_timeout,expected_timeout", [
-    (["load", "correctness"], None, 60),
+    (["load", "correctness"], None, 300),
     (["load", "correctness"], 7, 7),
     (["correctness"], None, 2),
 ])
@@ -108,3 +108,11 @@ def test_dataset_preview_warns_when_exact_answer_is_in_messages(canonical):
                              **({} if canonical else {"input_field": "question", "expected_field": "answer"}))
     assert result["request_pack"] and not result["errors"]
     assert any("echo would pass" in warning for warning in result["warnings"])
+
+
+def test_try_example_does_not_collect_host_telemetry():
+    draft = ConfigDraft.model_validate(judged_config())
+    draft.targets[0].host_metrics_url = "http://host/metrics"
+    selected = try_example_config(draft, draft.request_pack.cases[0].fixture_id, draft.targets[0].name)
+    assert selected.targets[0].host_metrics_url is None
+    assert draft.targets[0].host_metrics_url == "http://host/metrics"

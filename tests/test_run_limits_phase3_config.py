@@ -237,7 +237,7 @@ def test_load_migration_preserves_current_timeout_while_noting_only_legacy_overr
     assert RunConfig.model_validate(migrated).load_test.request_timeout_seconds == 90
 
 
-def test_load_timeout_above_suite_default_survives_cli_save_and_reload(tmp_path, monkeypatch, capsys):
+def test_load_timeout_above_suite_default_survives_cli_save_and_reload(tmp_path, monkeypatch, capsys, local_tokenizer):
     import json
 
     from giraffe.cli import configuration, main, parser

@@ -206,7 +206,7 @@ async def test_api_validates_sensitive_inputs_and_creates_no_run_artifacts(tmp_p
     assert not list(tmp_path.iterdir())
 
 
-async def test_active_run_blocks_extra_connection_traffic(tmp_path, monkeypatch):
+async def test_active_run_blocks_extra_connection_traffic(tmp_path, monkeypatch, local_tokenizer):
     async def running(configuration, *, progress, stop_event):
         await stop_event.wait()
         return report(configuration, cancelled=True)

@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 import errno
 from fractions import Fraction
+from hashlib import sha256
 from html import escape
 import json
 import math
@@ -752,7 +753,7 @@ def _load_test_html(metrics):
     parts = ['<h4>Load test</h4><p>Sequential workload × traffic tests. Highest accepted values are highest tested, not absolute capacity limits. Burst overlays are separate from steady-arrival capacity.</p>']
     for calibration in metrics.get("calibrations", []):
         if calibration.get("reason"):
-            parts.append('<p>Input token calibration: ' + _e(calibration["reason"]) + '</p>')
+            parts.append('<p>Local input preparation: ' + _e(calibration["reason"]) + '</p>')
     if metrics.get("workload_source"):
         parts.append('<p>Active workload source: '+_e(metrics["workload_source"])+'. '+_e(metrics.get("context_note", ""))+'</p>')
     for row in metrics.get("highest_accepted", []):
@@ -764,7 +765,7 @@ def _load_test_html(metrics):
         parts.append('<div class="table"><table><tr><th>Request type / delivery</th><th>Completions and evidence</th><th>Timing and throughput</th></tr>')
         for group in point.get('groups', []):
             lengths = group.get('lengths', {})
-            parts.append('<tr><td>'+_e(load_shape_label(group['shape']))+'<br>Requested: '+_e(group.get('requested'))+' · scheduled: '+_e(group.get('scheduled'))+' · dispatched: '+_e(group.get('dispatched'))+'<br>Not sent: '+_e(group.get('not_sent'))+' (local drops '+_e(group.get('local_drops'))+', late '+_e(group.get('late_arrivals'))+', not offered '+_e(group.get('not_offered'))+')</td><td>'+_e(group.get('status'))+' · '+_e(group.get('reason'))+'<br>Valid '+_e(group.get('valid'))+' · failed '+_e(group.get('failed'))+' · timeout '+_e(group.get('timed_out'))+' · cancelled '+_e(group.get('cancelled'))+'<br>Error denominator: '+_e(group.get('error_denominator'))+'. '+_e(group.get('error_denominator_description'))+'<br>Scored '+_e(group.get('scored'))+' · correct '+_e(group.get('correct'))+' · unknown judgments '+_e(group.get('unscored'))+'<br>Actual input tokens '+_e(lengths.get('input_tokens'))+'; output tokens '+_e(lengths.get('output_tokens'))+'; unknown input/output '+_e(lengths.get('unknown_input_count'))+'/'+_e(lengths.get('unknown_output_count'))+'. '+_e(lengths.get('input_method'))+'; '+_e(lengths.get('output_method'))+_load_group_notes_html(group)+'<br>Coverage: '+_e(group.get('coverage','not required'))+'</td><td>First-answer p50/p95 ms: '+_e(group.get('first_answer_p50_ms'))+'/'+_e(group.get('first_answer_p95_ms'))+'<br>Completion p50/p95 ms: '+_e(group.get('completion_p50_ms'))+'/'+_e(group.get('completion_p95_ms'))+'<br>Longest pause ms '+_e(group.get('longest_stream_pause_ms'))+' · generation tokens/sec '+_e(group.get('generation_tokens_per_second'))+'<br>'+_e(lengths.get('generation_speed_method'))+'<br>Dispatch delay ms '+_e(group.get('dispatch_delay_ms'))+'<br>Completed requests/sec '+_e(group.get('completed_requests_per_second'))+' · aggregate output tokens/sec '+_e(group.get('aggregate_output_tokens_per_second'))+'<br>Correct work meeting limits '+_e(group.get('correct_work_meeting_limits'))+' ('+_e(group.get('correct_work_per_second'))+'/sec)<br>Window '+_e(group.get('throughput_window_seconds'))+' seconds; '+_e(group.get('completed_during_finish'))+' completions during finish allowance. '+_e(group.get('throughput_description'))+'</td></tr>')
+            parts.append('<tr><td>'+_e(load_shape_label(group['shape']))+'<br>Requested: '+_e(group.get('requested'))+' · scheduled: '+_e(group.get('scheduled'))+' · dispatched: '+_e(group.get('dispatched'))+'<br>Not sent: '+_e(group.get('not_sent'))+' (local drops '+_e(group.get('local_drops'))+', late '+_e(group.get('late_arrivals'))+', not offered '+_e(group.get('not_offered'))+')</td><td>'+_e(group.get('status'))+' · '+_e(group.get('reason'))+'<br>Valid '+_e(group.get('valid'))+' · failed '+_e(group.get('failed'))+' · timeout '+_e(group.get('timed_out'))+' · cancelled '+_e(group.get('cancelled'))+'<br>Error denominator: '+_e(group.get('error_denominator'))+'. '+_e(group.get('error_denominator_description'))+'<br>Scored '+_e(group.get('scored'))+' · correct '+_e(group.get('correct'))+' · unknown judgments '+_e(group.get('unscored'))+'<br>Actual input tokens '+_e(lengths.get('input_tokens'))+'; output tokens '+_e(lengths.get('output_tokens'))+'; unknown input/output '+_e(lengths.get('unknown_input_count'))+'/'+_e(lengths.get('unknown_output_count'))+'. '+_e(lengths.get('input_method'))+'; '+_e(lengths.get('output_method'))+_load_group_notes_html(group)+'<br>Coverage: '+_e(group.get('coverage','not required'))+'</td><td>First-answer p50/p95 ms: '+_e(group.get('first_answer_p50_ms'))+'/'+_e(group.get('first_answer_p95_ms'))+'<br>Completion p50/p95 ms: '+_e(group.get('completion_p50_ms'))+'/'+_e(group.get('completion_p95_ms'))+'<br>Longest pause ms '+_e(group.get('longest_stream_pause_ms'))+' · generation tokens/sec '+_e(group.get('generation_tokens_per_second'))+'<br>'+_e(lengths.get('generation_speed_method'))+'<br>Dispatch delay ms '+_e(group.get('dispatch_delay_ms'))+'<br>Completed requests/sec '+_e(group.get('completed_requests_per_second'))+' · aggregate output tokens/sec '+_e(group.get('aggregate_output_tokens_per_second'))+'<br>Correct work meeting limits '+_e(group.get('correct_work_meeting_limits'))+' ('+_e(group.get('correct_work_per_second'))+'/sec)<br>Window '+_e(group.get('throughput_window_seconds'))+' seconds; '+_e(group.get('completed_during_finish'))+' completions after sending stopped. '+_e(group.get('throughput_description'))+'</td></tr>')
         parts.append('</table></div>')
         for key,label in (('observed_mix','Observed request shares'),('interference','Short-only vs long-request comparison'),('burst_delivery','Burst delivery and actual spread'),('response_by_origin','Steady-arrival and burst response degradation')):
             if point.get(key):
@@ -828,7 +829,7 @@ def _concurrent_load_html(metrics):
     parts.append("<p><strong>How these are measured.</strong> Sending windows begin at first dispatch; individual slots refill until the window ends. In-flight requests drain and remain in latency, correctness and error counts. Client concurrency is a time-weighted mean and peak during sending; server concurrency needs overlapping streamed output. Interference qualifies its N−1 continuous short streams plus enough matched probes in both groups; probe trigger idle time does not count against short-stream load. Throughput uses completions from the first completion through the sending-window end, excluding drain. With few samples p95 is effectively the maximum. Missing token counts are not reported, never zero. Input tokens are targets; output tokens are caps and answers may finish sooner.</p>")
     for calibration in metrics.get("calibrations", []):
         if calibration.get("reason_code") == "minimum_prompt_length":
-            parts.append("<p>Input token calibration: " + _e(calibration["reason"]) + "</p>")
+            parts.append("<p>Local input preparation: " + _e(calibration["reason"]) + "</p>")
     if metrics.get("migration_notes"):
         parts.append("<p>Configuration migration: " + _e(" ".join(metrics["migration_notes"])) + "</p>")
     return "".join(parts)
@@ -1020,7 +1021,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     result.overall = overall_status(result.checks, result.abort_reason,
         memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted
                                      for check in result.checks))
-    return result
+    from .performance import refresh_performance
+    return refresh_performance(result)
 
 
 def _retained(report: RunReport) -> RunReport:
@@ -1051,7 +1053,8 @@ def _retained(report: RunReport) -> RunReport:
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
         result.requests.append(record if keep else _without_response(record))
-    return result
+    from .performance import refresh_performance
+    return refresh_performance(result)
 
 
 def _without_response(record: RequestRecord) -> RequestRecord:
@@ -1092,7 +1095,7 @@ def _request_json(record: RequestRecord) -> str:
 
 def _report_json_chunks(report: RunReport):
     # Keep defaults for raw consumers. Only exact input messages move to the table.
-    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests"})
+    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests", "performance"})
     yield metadata[:-1] + ',"report_format":2,"inputs":{'
     seen = set()
     for record in report.requests:
@@ -1115,7 +1118,7 @@ def _report_json_chunks(report: RunReport):
 
 
 def _portable_json_chunks(report: RunReport):
-    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests"})
+    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests", "performance"})
     yield metadata[:-1] + ',"requests":['
     for index, record in enumerate(report.requests):
         yield "," if index else ""
@@ -1243,7 +1246,12 @@ def _preview(value: Any, limit: int = MAX_HTML_PREVIEW_CHARS) -> str:
 
 
 def _json(value: Any, limit: int = MAX_HTML_JSON_PREVIEW_CHARS) -> str:
-    return _preview(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), limit)
+    # This helper emits text inside <pre>, never an attribute. Quote entities
+    # inflate retained JSON substantially without adding protection in text.
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    content = escape(text[:limit], quote=False)
+    return content + ('… [Preview truncated; <a href="report.json">full evidence in report.json</a>]'
+                      if len(text) > limit else '')
 
 
 def _tool_evidence(record: RequestRecord) -> str:
@@ -1469,6 +1477,10 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
 
 
 def _render(report: RunReport) -> str:
+    from .performance import build_performance, refresh_performance
+    from .performance_html import STYLE, render_performance
+
+    report = refresh_performance(report.model_copy())
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
     ordered = sorted(report.requests, key=lambda r: (
@@ -1484,27 +1496,38 @@ def _render(report: RunReport) -> str:
                 else "Giraffe acceptance results")
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", """<style>
-*{box-sizing:border-box}body{margin:0;background:#f6f7f8;color:#17212c;font:15px/1.55 system-ui,sans-serif}
-main{max-width:1160px;margin:auto;padding:28px}h1{font-size:30px;margin-bottom:8px}h2{font-size:22px;margin-top:30px}
-h3{font-size:17px}a{color:#17569b}p{max-width:95ch}.muted{color:#53616e}.card,details{background:white;border:1px solid #d7dfe5;border-radius:8px;padding:14px 18px;margin:12px 0}
-.badge{display:inline-block;border-radius:4px;padding:2px 9px;font-size:13px;font-weight:650;background:#edf0f3;color:#3d4752}
-.pass{background:#e2f2e8;color:#1b6539}.fail,.blocked{background:#ffe8e5;color:#932c21}.inconclusive{background:#fff0cb;color:#795300}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:9px;border-bottom:1px solid #e1e6ea;vertical-align:top}
-th{background:#f2f5f7;white-space:nowrap}.table{overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:#f4f6f8;padding:12px}
-summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{padding-left:22px}section{scroll-margin-top:16px}
-@media(max-width:640px){main{padding:16px}h1{font-size:25px}td,th{padding:7px}}
-</style><main>""", f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
-             f'{_e(report.started_at)} → {_e(report.finished_at)}</p>',
-             '<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
-             '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
-             '<a href="#reproduction">Reproduce</a></p>']
+             f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     if headline == "Giraffe acceptance results":
         for summary in disconnected.values():
             parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
+    for target in config.get("targets", []):
+        parts.append(f'<p class="muted"><strong>{_e(target.get("name", ""))}</strong> · '
+                     f'{_e(target.get("route", "unknown"))} · Model: <code>{_e(target.get("model", ""))}</code>'
+                     f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></p>')
+    # Native radio navigation keeps the portable report keyboard-accessible
+    # without scripts, external assets, or duplicating the aggregation layer.
+    parts.append('<div class="html-tabs" role="group" aria-label="Report tabs">'
+                 '<label><input id="html-tab-performance" name="report-tab" type="radio" '
+                 'aria-controls="html-performance" checked>Performance</label>'
+                 '<label><input id="html-tab-results" name="report-tab" type="radio" '
+                 'aria-controls="html-results">Test results '
+                 + str(len(report.checks)) + '</label><small>Measurement: default window per target · '
+                 '<a href="report.json">JSON export</a></small></div>'
+                 '<div id="html-performance" aria-label="Performance">')
+    for entry in report.performance["available_targets"]:
+        selected = (report.performance if entry["target"] == report.performance["selected_target"]
+                    else build_performance(report, target=entry["target"]))
+        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))))
+    if not report.performance["available_targets"]:
+        parts.append(render_performance(report.performance))
+    parts.append('</div><div id="html-results" aria-label="Test results">')
+    parts.append('<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
+                 '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
+                 '<a href="#reproduction">Reproduce</a></p>')
     storage = report.manifest.get("storage", {})
     if storage.get("response_bodies_omitted") or storage.get("limit_exceeded"):
         omitted = storage.get("response_bodies_omitted", 0)
@@ -1516,10 +1539,6 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     for reason in report.observations.get("target_abort_reasons", {}).values():
         if reason != report.abort_reason:
             parts.append(f'<p class="card">Target stopped: {_e(reason)}</p>')
-    for target in config.get("targets", []):
-        parts.append(f'<div class="card"><strong>{_e(target.get("name", ""))}</strong> · '
-                     f'{_e(target.get("route", "unknown"))}<br>Model: <code>{_e(target.get("model", ""))}</code>'
-                     f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></div>')
     for check in report.checks:
         if check.id == "capacity":
             if check.target in disconnected:
@@ -1652,6 +1671,7 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
                  'Retention does not cap disk usage; storage limits do.</p>'
                  f'<p>Showing {len(detailed)} of {len(report.requests)} request details, failures first. '
                  '<a href="report.json">All requests and complete retained bodies in report.json</a>.</p>')
+    input_previews = {}
     for record in detailed:
         label = f"{record.target} · {record.scenario} · {record.fixture_id} · {record.status}"
         parts.append(f'<details id="{anchors[record.id]}"><summary>{_e(label)}'
@@ -1662,8 +1682,14 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
             parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
-            parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>'
-                         f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
+            messages_key = sha256(json.dumps(evidence.messages, ensure_ascii=False, sort_keys=True).encode()).digest()
+            if messages_key in input_previews:
+                parts.append('<h3>Input messages</h3><p>Same recorded input as '
+                             f'<a href="#{input_previews[messages_key]}">earlier request evidence</a>.</p>')
+            else:
+                input_previews[messages_key] = anchors[record.id]
+                parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>')
+            parts.append(f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
             if evidence.tool_expectation is None:
                 if evidence.expected_provided:
                     expected = _json(evidence.expected) if evidence.scorer == "json" else _preview(evidence.expected)
@@ -1702,7 +1728,7 @@ summary{cursor:pointer;overflow-wrap:anywhere}code{overflow-wrap:anywhere}ul{pad
     if report.observations:
         parts.append(f'<details><summary>Additional observations</summary><pre>'
                      f'{_json(report.observations)}</pre></details>')
-    parts.append('</section></main></html>')
+    parts.append('</section></div></main></html>')
     return "".join(parts)
 
 

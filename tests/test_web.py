@@ -15,6 +15,8 @@ from giraffe.models import (
 from giraffe.reporting import write_report
 from giraffe.web import create_app
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
 
 @pytest.mark.parametrize("endpoint", ["preview", "draft", "validate", "plan"])
 async def test_config_conflicts_include_fields_and_safe_values(tmp_path, endpoint):
@@ -279,7 +281,9 @@ async def test_pack_saved_config_download_preserves_inputs_under_response_retent
         result = await finished(client, identifier)
         saved = (await client.get(f"/api/runs/{identifier}/config.json")).json()
         assert saved["request_pack"] == values["request_pack"]
-        assert result["report"]["requests"][0]["output"] == ""
+        assert result["report"]["requests_compact"]
+        evidence = await client.get(f"/api/runs/{identifier}/requests/{result['report']['requests'][0]['id']}")
+        assert evidence.json()["output"] == ""
         command = await client.post("/api/config/cli", json={"config": saved})
         assert command.status_code == 200
         assert "api_key=literal-case-content" in command.json()["command"]
@@ -582,7 +586,9 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         identifier = await start(client)
         detail = await finished(client, identifier)
         assert detail["state"] == "completed"
-        assert detail["report"]["requests"][0]["output"] == ""
+        assert detail["report"]["requests_compact"]
+        evidence = await client.get(f"/api/runs/{identifier}/requests/{detail['report']['requests'][0]['id']}")
+        assert evidence.json()["output"] == ""
         assert detail["report"]["run_id"] == "suite-run-id"
         listing = (await client.get("/api/runs")).json()
         assert listing["active_run_id"] is None
@@ -593,7 +599,9 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         saved = await client.get(f"/api/runs/{identifier}/report.json")
         assert saved.status_code == 200
         assert "attachment" in saved.headers["content-disposition"]
-        assert saved.json() == detail["report"]
+        assert saved.json()["requests"][0] == evidence.json()
+        assert {k: v for k, v in saved.json().items() if k != "requests"} == {
+            k: v for k, v in detail["report"].items() if k not in {"requests", "request_count", "requests_compact"}}
         html = await client.get(f"/api/runs/{identifier}/report.html")
         assert html.status_code == 200
         assert "private successful answer" not in html.text

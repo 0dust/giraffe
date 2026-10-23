@@ -149,7 +149,7 @@ async def test_web_preview_and_cli_use_recent_summary_from_selected_runs_directo
 
 
 @pytest.mark.parametrize("command", ["validate", "preview", "run"])
-def test_cli_announces_time_coverage_and_estimate_risk_without_changing_budget(tmp_path, monkeypatch, capsys, command):
+def test_cli_announces_time_coverage_and_estimate_risk_without_changing_budget(tmp_path, monkeypatch, capsys, command, local_tokenizer):
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                        checks=["capacity"], max_duration_seconds=5,
                        traffic={"rates": [1], "duration_seconds": 20})

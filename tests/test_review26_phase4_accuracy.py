@@ -11,11 +11,15 @@ from types import SimpleNamespace
 
 import pytest
 
+
 from giraffe import runner
 from giraffe.latency import latency_summary
 from giraffe.models import RunConfig
 from giraffe.planning import request_plan
 from tests.test_runner import FakeClient
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 TARGET = {"name": "service", "url": "http://endpoint.invalid/v1", "model": "model"}
@@ -92,6 +96,12 @@ class VirtualLoop(asyncio.SelectorEventLoop):
 
 def run_virtual(monkeypatch, coroutine):
     """Keep elapsed records and runner deadlines on the same deterministic clock."""
+    async def no_exporter_network(run, target, phase):
+        """Synthetic-clock runs measure mocked inference, with no real exporter I/O."""
+        run.observations[target.name]["runtime_metrics_discovery"] = {
+            "status": "unavailable", "reason": "No runtime exporter in this deterministic fixture."}
+
+    monkeypatch.setattr(runner, "_metrics", no_exporter_network)
     for name in ("client", "traffic", "workloads", "concurrent_load", "deployment", "telemetry", "timing"):
         import_module("giraffe." + name)
     with asyncio.Runner(loop_factory=VirtualLoop) as execution:

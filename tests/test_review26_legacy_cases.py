@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from giraffe.cli import migrated_configuration
-from giraffe.fixtures import builtin_fixtures, traffic_fixtures
+from giraffe.fixtures import builtin_fixtures
 from giraffe.request_pack import pack_specs
 from giraffe.runner import _check_config
 
@@ -27,9 +27,10 @@ def request_values(specs):
 
 
 @pytest.mark.parametrize('name', CASES)
-def test_legacy_request_settings_match_old_main(name):
+def test_legacy_explicit_timeout_request_settings_match_old_main(name):
     case = CASES[name]
-    config = migrated_configuration(case['source'])
+    # Freeze the archived 30 s default explicitly; new omitted timeouts are 300 s.
+    config = migrated_configuration({'request_timeout_seconds': 30, **case['source']})
     expected = case['expected']
     for check, settings in expected['settings'].items():
         if check in {'capacity', 'arrivals', 'concurrency'}:

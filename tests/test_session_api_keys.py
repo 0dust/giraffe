@@ -132,7 +132,10 @@ async def test_real_suite_uses_pasted_key_and_saved_surfaces_exclude_it(tmp_path
         identifier = r.json()["id"]
         detail = await finished(ui, identifier)
         assert detail["state"] == "completed", detail
-        assert requests and all(r.headers.get("Authorization") == f"Bearer {KEY}" for r in requests)
+        inference = [r for r in requests if r.method == "POST"]
+        discovery = [r for r in requests if r.method == "GET"]
+        assert inference and all(r.headers.get("Authorization") == f"Bearer {KEY}" for r in inference)
+        assert discovery and all("Authorization" not in r.headers for r in discovery)
         assert any(row["valid"] for row in detail["report"]["requests"])
         for route in [f"/api/runs/{identifier}", f"/api/runs/{identifier}/config.json",
                       f"/api/runs/{identifier}/report.json", f"/api/runs/{identifier}/report.html",
@@ -172,7 +175,7 @@ async def test_try_example_keeps_key_only_for_selected_target(tmp_path, monkeypa
         assert KEY not in json.dumps(detail)
 
 
-async def test_active_run_key_is_not_overwritten_by_another_request(tmp_path, monkeypatch):
+async def test_active_run_key_is_not_overwritten_by_another_request(tmp_path, monkeypatch, local_tokenizer):
     started, release = asyncio.Event(), asyncio.Event()
     observed = []
 

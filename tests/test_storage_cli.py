@@ -133,7 +133,7 @@ def test_storage_start_limits_refuse_before_network(tmp_path, monkeypatch, capsy
     assert not (root / "new").exists()
 
 
-def test_disk_full_export_saves_summary_and_error_metadata(tmp_path, monkeypatch, capsys):
+def test_disk_full_export_saves_summary_and_error_metadata(tmp_path, monkeypatch, capsys, local_tokenizer):
     async def run(config, **kwargs):
         return RunReport(run_id="full", started_at="now", finished_at="now", overall="pass", manifest={},
                          checks=[CheckResult(id="correctness", target="local", title="Correctness", status="pass", summary="All good")],
@@ -157,7 +157,7 @@ def test_disk_full_export_saves_summary_and_error_metadata(tmp_path, monkeypatch
     assert not (directory / "report.json").exists()
 
 
-def test_cli_marks_running_during_export_and_forwards_per_run_limit(tmp_path, monkeypatch, capsys):
+def test_cli_marks_running_during_export_and_forwards_per_run_limit(tmp_path, monkeypatch, capsys, local_tokenizer):
     import giraffe.reporting
     from giraffe.storage import cleanup_plan
 

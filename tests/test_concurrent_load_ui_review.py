@@ -5,10 +5,10 @@ from pydantic import TypeAdapter
 
 from giraffe.models import ConfigDraft, migrate_load_test, migrate_concurrent_load
 from giraffe.web import ConfigDraftInput, create_app
-TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_results import run_render_checks
 
+TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 
 FORM = r'''
 config.checks=['load'];state.config=structuredClone(config);state.setupStep=3;
@@ -157,11 +157,16 @@ def test_old_records_group_with_their_original_check_and_concurrency():
     run_render_checks(r'''
 const r={id:'old',target:'local',scenario:'bucket_c1_short_short',check_ids:['concurrency'],status:'completed',valid:true,elapsed_ms:10};
 assert.equal(conditionInfo(r).check,'concurrency');
-assert.match(renderTests([r]),/>1 at once</);
-// Historical bucket ownership must also survive without a condition summary.
+let html=renderTests([r]);let view=[...conditionViews.values()][0];
+assert.equal(view.checkName,'Concurrent load');assert.equal(view.description,'1 at once');
+assert.match(html,/aria-label="Condition #01 · Concurrent load · Short input \/ short output · 1 at once/);
+// Historical bucket ownership and concurrency survive without any condition summary.
 const bucket={...r,check_ids:['buckets']};
-let html=renderTests([bucket]);assert.match(html,/>1 at once</);assert.match(html,/>1 test</);assert.doesNotMatch(html,/— at once|>1 tests</);
-html=renderTests([bucket,{...bucket,id:'old2',scenario:'bucket_c1_long_short'}]);assert.match(html,/>2 tests</);
+html=renderTests([bucket]);view=[...conditionViews.values()][0];assert.equal(view.condition.check,'buckets');
+assert.equal(view.description,'1 at once');assert.match(html,/>1 test condition</);assert.doesNotMatch(html,/— at once|>1 tests</);
+html=renderTests([bucket,{...bucket,id:'old2',scenario:'bucket_c1_long_short'}]);assert.match(html,/>2 test conditions</);
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,2);
+assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
 const generic={...r,scenario:'custom_old',check_ids:['correctness']};assert.equal(conditionInfo(generic).check,'correctness');
 ''')
 

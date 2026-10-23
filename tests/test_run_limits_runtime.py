@@ -6,13 +6,15 @@ import math
 import httpx
 import pytest
 
-from giraffe import concurrent_load, runner, workloads
+
+from giraffe import concurrent_load, runner
 from giraffe.client import LLMClient
 from giraffe.conditions import condition_for
-from giraffe.fixtures import builtin_fixtures
 from giraffe.models import RunConfig, required_concurrency
-from tests.test_concurrent_load import Client, configuration, perform, point, short_windows
 from tests.test_runner import FakeClient, pack_config
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 TARGET = {"name": "one", "url": "http://local", "model": "m"}

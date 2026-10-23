@@ -433,7 +433,7 @@ nodes['#main']=element({focus(options){assert(options.preventScroll);this.focuse
 state.setupStep=2;state.config={targets:[{model:'draft-model'}]};
 for(const hash of ['#new','#runs/saved-run']){
   location.hash=hash;nodes['#main'].focused=false;
-  await listeners.click({target:{closest(q){assert.equal(q,'.skip-link');return this;}},preventDefault(){prevented=true;}});
+  await listeners.click({target:{closest(q){return q==='.skip-link'?this:null;}},preventDefault(){prevented=true;}});
   assert.equal(location.hash,hash);assert.equal(state.setupStep,2);
   assert.equal(state.config.targets[0].model,'draft-model');
   assert.equal(nodes['#main'].attributes.tabindex,'-1');assert(nodes['#main'].focused);

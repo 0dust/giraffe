@@ -11,7 +11,7 @@ from tests.test_storage_web import completed
 from tests.test_web import config, report
 
 
-def test_progress_queued_after_failure_does_not_resurrect_active_run(tmp_path, monkeypatch):
+def test_progress_queued_after_failure_does_not_resurrect_active_run(tmp_path, monkeypatch, local_tokenizer):
     attempts = []
 
     async def suite(configuration, *, progress, **kwargs):
@@ -31,7 +31,7 @@ def test_progress_queued_after_failure_does_not_resurrect_active_run(tmp_path, m
         assert completed(client, second.json()["id"])["state"] == "completed"
 
 
-def test_real_sampler_exception_after_high_rss_allows_another_web_run(tmp_path, monkeypatch):
+def test_real_sampler_exception_after_high_rss_allows_another_web_run(tmp_path, monkeypatch, local_tokenizer):
     from giraffe import resources, runner
 
     samplers = []

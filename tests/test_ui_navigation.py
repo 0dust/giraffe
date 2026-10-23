@@ -321,7 +321,7 @@ const summary='Could not connect to <local> (ConnectError); no checks could run'
 report.observations={summary};
 const before=JSON.stringify(report);
 renderDetail();
-const markup=nodes['#main'].innerHTML,heading=markup.split('<div class="evidence-band')[0];
+const markup=nodes['#main'].innerHTML,heading=markup.split('<div class="report-toolbar')[0];
 assert.match(heading,/<h1>Could not connect to &lt;local&gt; \\(ConnectError\\); no checks could run<\\/h1>/);
 assert.doesNotMatch(heading,/capacity|highest tested acceptable arrival rate|not established/i);
 // Keep diagnostic detail and verdicts intact beneath the overall summary.
@@ -331,7 +331,7 @@ assert.equal(JSON.stringify(report),before);
 // Reports written before observations.summary retain their existing headline and guidance.
 for(const observations of [undefined,{}, {summary:''}, {summary:'  '}, {summary:null}]){
   report.observations=observations;renderDetail();
-  const fallback=nodes['#main'].innerHTML.split('<div class="evidence-band')[0];
+  const fallback=nodes['#main'].innerHTML.split('<div class="report-toolbar')[0];
   assert.match(fallback,/<h1>Capacity under load is inconclusive<\\/h1>/);
   assert.match(fallback,/Highest tested acceptable arrival rate: not established/);
 }
