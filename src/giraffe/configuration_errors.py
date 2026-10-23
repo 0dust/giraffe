@@ -132,7 +132,7 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
                 message = label + ": " + message
         elif path.startswith("concurrent_load."):
             parts = path.split(".")[1:]
-            label = {"schedule.levels": "Concurrency levels", "schedule.duration_seconds": "Duration per workload at each concurrency level",
+            label = {"schedule.levels": "Concurrency levels", "schedule.duration_seconds": "Send new requests for",
                 "combinations.selected": "Input/output combinations", "combinations.enabled": "Input → output combinations",
                 "mixed.shares": "Share of requests", "mixed.seed": "Mixed load seed",
                 "interference.trigger": "Introduce the long input", "interference.trigger_chunks": "Answer chunks per short stream",

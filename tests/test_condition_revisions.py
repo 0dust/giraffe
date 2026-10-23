@@ -3,6 +3,7 @@ import asyncio
 
 import pytest
 
+
 from giraffe import runner, workloads
 from giraffe.fixtures import builtin_fixtures
 from giraffe.runner import _Run, run_suite
@@ -10,6 +11,8 @@ from giraffe.workloads import spec
 from tests.test_condition_tracking import Client, configuration
 from tests.test_runner import FakeClient, judged_pack_config, judge_summary
 from tests.test_web import browser, start, finished, report
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 async def test_dynamic_condition_stays_running_between_requests_without_event_churn():
@@ -52,7 +55,7 @@ async def test_intentional_timeout_is_completed_without_failed_count_live_and_re
     assert row["failed"] == 0
 
 
-async def test_capacity_local_drop_shortfall_names_busy_slots(monkeypatch):
+async def test_capacity_local_drop_shortfall_names_busy_slots(monkeypatch, local_tokenizer):
     from giraffe import load_test
     from tests.test_concurrent_load import configuration as load_configuration,short_windows
     cfg=short_windows(load_configuration(concurrency=1,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.005)
@@ -135,7 +138,11 @@ async def test_condition_events_do_not_occupy_activity_feed(tmp_path, monkeypatc
         detail = (await client.get(f"/api/runs/{identifier}")).json()
         assert all(not event["event"].startswith("condition_") for event in detail["events"])
         assert any(event["event"] == "request_completed" for event in detail["events"])
-        assert len(detail["live_conditions"]) == 111
+        from giraffe.conditions import planned_conditions
+        from giraffe.models import RunConfig
+        planned = {row["condition_id"] for row in planned_conditions(RunConfig.model_validate(detail["config"]))}
+        observed = {"warm", *(f"extra_{index}" for index in range(110))}
+        assert {row["condition"]["id"] for row in detail["live_conditions"]} == planned | observed
         assert detail["progress"]["event"] == "scenario_finished"
         await client.post(f"/api/runs/{identifier}/cancel", json={})
         await finished(client, identifier)
@@ -145,7 +152,7 @@ async def test_condition_events_do_not_occupy_activity_feed(tmp_path, monkeypatc
     ("dropped_late", "dropped: scheduler was late"),
     ("not_offered", "not offered: sending window ended"),
 ])
-async def test_capacity_condition_preserves_stage_shortfall_facts(monkeypatch,outcome,reason):
+async def test_capacity_condition_preserves_stage_shortfall_facts(monkeypatch,outcome,reason,local_tokenizer):
     from dataclasses import replace
     from giraffe import load_test
     from tests.test_concurrent_load import configuration as load_configuration,short_windows

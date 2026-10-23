@@ -89,13 +89,25 @@ class FakeClient:
 
 
 @pytest.fixture(autouse=True)
-def client(monkeypatch):
+def client(monkeypatch, local_tokenizer):
     for name, value in {"delay": .004, "active": 0, "peak": 0, "closed": [], "scenarios": [],
                         "bad_target": None, "useful_event": True, "input_usage": True,
                         "bad_sustained": False, "bad_mixed_gap": False,
                         "initial_slow": False}.items():
         monkeypatch.setattr(FakeClient, name, value)
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    # These runner tests exercise request lifecycles with fake endpoints. Runtime
+    # discovery and evidence negotiation have dedicated transport integration tests.
+    from giraffe import telemetry
+    original_scrape = telemetry.scrape
+    async def no_discovery(run, target, phase, **kwargs):
+        if target.metrics_url or run.config.metrics or "gpu" in run.config.checks:
+            return await original_scrape(run, target, phase, **kwargs)
+        return {"status": "unavailable", "reason": "Fake endpoint has no exporter", "samples": [],
+                "elapsed_seconds": 0, "unavailable": []}
+    monkeypatch.setattr("giraffe.telemetry.scrape", no_discovery)
+    from giraffe.client import LLMClient
+    monkeypatch.setattr(LLMClient, "token_evidence_probe", lambda self: None)
     return FakeClient
 
 
@@ -542,7 +554,11 @@ async def test_user_stop_stops_submissions_and_saves_partial(client):
     client.delay = .5
     stop = asyncio.Event()
     task = asyncio.create_task(runner.run_suite(config(), stop_event=stop))
-    await asyncio.sleep(.01)
+    for _ in range(100):
+        if client.active:
+            break
+        await asyncio.sleep(.002)
+    assert client.active
     stop.set()
     report = await task
     assert report.abort_reason == "cancelled by user"
@@ -630,16 +646,17 @@ async def test_deliberate_deadline_and_cancellation_not_serving_failures():
 
 
 @pytest.mark.parametrize("checks", [["context"], ["capacity", "context"]])
-async def test_context_sizing_uses_actual_usage_and_records_reproduction(checks):
+async def test_context_sizing_is_local_and_records_reproduction(checks):
     report = await runner.run_suite(config(checks=checks))
     result = check(report, "context")
     assert result.status == "pass"
     assert result.metrics["near_limit_coverage"]
     assert result.metrics["observed_max_input_tokens"] >= 512*.8
     calibration = result.metrics["calibration"]
-    assert calibration["fixture_context_limit"] > 512
+    assert calibration["method"] == "local_tokenizer"
+    assert len(calibration["preparations"]) == 6
     assert len({r.fixture_id for r in report.requests if r.scenario == "context"}) == 6
-    assert any(r.scenario == "context_calibration" for r in report.requests)
+    assert not any(r.scenario == "context_calibration" for r in report.requests)
 
 
 async def test_context_without_token_usage_never_claims_declared_limit(client):
@@ -649,7 +666,22 @@ async def test_context_without_token_usage_never_claims_declared_limit(client):
     assert result.status == "inconclusive" and not result.metrics["near_limit_coverage"]
 
 
-async def test_context_corrects_undershoot_from_fixed_chat_template_tokens(client, monkeypatch):
+async def test_builtin_context_without_usage_never_claims_model_token_lengths(client):
+    client.input_usage = False
+    c = config(checks=["context"])
+    c.targets[0].tokenizer = "builtin"
+    report = await runner.run_suite(c)
+    outcome = check(report, "context")
+    assert outcome.status == "inconclusive"
+    assert not outcome.metrics["near_limit_coverage"]
+    context = [r for r in report.requests if r.scenario == "context"]
+    assert len(context) == 6
+    assert all(r.workload["calibrated_input_tokens"] > 0 for r in context)
+    assert all(r.workload["token_count_scope"] == "builtin_reference" for r in context)
+    assert all(r.workload["tokenizer"] == "builtin" for r in context)
+
+
+async def test_context_uses_one_locally_sized_batch_even_when_server_usage_differs(client, monkeypatch):
     original = client.execute
 
     async def with_template_overhead(self, spec, **kwargs):
@@ -664,15 +696,11 @@ async def test_context_corrects_undershoot_from_fixed_chat_template_tokens(clien
                                                    "long_input_chars": 1024}))
     result = check(report, "context")
     context = [r for r in report.requests if r.scenario == "context"]
-    assert max(r.input_tokens for r in context[:6]) < 1024 * .8
     assert result.status == "pass"
     assert result.metrics["observed_max_input_tokens"] >= 1024 * .8
-    assert len(context) == 12
-    adjustments = result.metrics["calibration"]["adjustments"]
-    assert len(adjustments) == 1
-    source = next(r for r in context if r.id == adjustments[0]["source_request_id"])
-    assert source.input_tokens == adjustments[0]["source_input_tokens"]
-    assert {r.fixture_id for r in context[6:]} == {r.fixture_id for r in context[:6]}
+    assert len(context) == 6
+    assert result.metrics["calibration"]["method"] == "local_tokenizer"
+    assert not result.metrics["calibration"].get("adjustments")
 
 
 @pytest.mark.parametrize("max_requests", [10, 100])
@@ -693,7 +721,7 @@ async def test_context_corrections_are_bounded_and_respect_request_budget(
     assert result.status == "inconclusive"
     assert len(report.requests) <= max_requests
     context = [r for r in report.requests if r.scenario == "context"]
-    assert len(context) == (6 if max_requests == 10 else 18)
+    assert len(context) == 6
     assert len(result.metrics["calibration"].get("adjustments", [])) <= 2
 
 
@@ -936,7 +964,7 @@ async def test_stale_gpu_samples_are_unavailable(monkeypatch):
     assert len(result.metrics["unavailable_families"]) == 5
     assert all(sample["stale"] for snapshot in result.metrics["snapshots"] for sample in snapshot["samples"])
     assert "GPU metrics exporter" in result.summary
-    assert "complete scored answers" not in result.summary
+    assert "scored answers" not in result.summary and "output budget" not in result.summary
 
 
 async def test_operator_stop_is_missing_evidence_not_endpoint_failure(client):
@@ -1360,6 +1388,19 @@ async def test_pack_quiet_budget_shortfall_prevents_acceptable_load_claim():
     assert not check(report, "correctness").metrics["request_pack"]["coverage_complete"]
 
 
+async def test_unscored_pack_explains_disabled_scoring_without_claiming_unfinished_inference():
+    cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
+    for case in cases:
+        case.update(scorer="none", expected=None)
+    report = await runner.run_suite(_pack_config(checks=["correctness"], concurrency=1,
+        request_pack={"version": 1, "cases": cases}, max_requests=4))
+    result = check(report, "correctness")
+    assert len(report.requests) == 4 and all(record.valid for record in report.requests)
+    assert result.status == "inconclusive" and result.metrics["reason_code"] == "scoring_disabled"
+    assert "scoring disabled" in result.summary and "configure an answer scorer" in result.summary
+    assert "did not complete" not in result.summary and "raise max_requests" not in result.summary
+
+
 @pytest.mark.parametrize("scorer", ["exact", "none"])
 async def test_rare_case_missing_loaded_evidence_blocks_full_pack_claim(scorer):
     cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
@@ -1432,7 +1473,7 @@ async def test_judging_waits_for_every_target_telemetry_and_monitor(client, monk
 
     async def scrape(run, target, phase, **kwargs):
         result = await original_scrape(run, target, phase, **kwargs)
-        if phase == "not collected":
+        if phase == "end":
             closed_telemetry.add(target.name)
         return result
 
@@ -1635,8 +1676,18 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         record = event["request"]
         assert record["elapsed_ms"] == by_id[record["id"]].elapsed_ms
         assert record["score"] == by_id[record["id"]].score
-        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid",
-                               "score", "elapsed_ms", "first_output_ms", "check_ids"}
+        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
+                "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
+                "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
+                "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
+                "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
+                "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason"}
+        assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",
+                    "logprob_evidence", "content_reads", "reasoning_reads", "output_events"} & record.keys()
+        assert all(not isinstance(value, (dict, list)) for key, value in record.items() if key != "check_ids")
+        for field in ["dispatch_ms", "completed_ms", "timing_schema", "output_tokens", "first_token_ms"]:
+            assert record[field] == getattr(by_id[record["id"]], field)
         assert event["budget_used"] >= event["attempted"]
 
 
@@ -1927,7 +1978,7 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
 
 
 @pytest.mark.parametrize("phase,settings", [
-    ("initial", {}), ("warm", {}), ("context_calibration", {"checks": ["context"]}),
+    ("initial", {}), ("warm", {}), ("context", {"checks": ["context"]}),
     ("session_", {"checks": ["sessions"], "context_limit": 4096}),
     ("load_primary_", {"checks": ["load"], "load_test": {
         "workloads": {"combinations": {"selected": ["short_short"]}},

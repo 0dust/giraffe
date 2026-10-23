@@ -136,7 +136,7 @@ async def test_live_metadata_comes_from_actual_builders_and_survives_report_save
     assert matrix["parameters"] == {"concurrency": point["level"], "same_prompt": True,
         "input_chars": len(request.messages[0]["content"]),
         "input_tokens_target": request.requested_input_tokens,
-        "output_tokens": request.max_tokens}
+        "output_tokens": request.max_tokens, "request_timeout_seconds": config.load_test.request_timeout_seconds}
     arrival = rows[1]["condition"]
     assert arrival["rate_rps"] == 1000
     assert arrival["parameters"]["same_prompt"] is True
@@ -207,7 +207,11 @@ const record={id:'partial',target:'local',scenario:condition.id,condition_id:con
 const summary={target:'local',condition,planned:32,started:1,completed:1,status:'finished'};
 const saved=report([],{requests:[record],observations:{targets:{local:{conditions:[summary]}}}});
 state.detail={id:'partial-run',report:saved,state:'completed'};
-assert(renderTests([record],{report:saved}).includes('aria-label="'+condition.label+'. Request 1 of 32'));
+const html=renderTests([record],{report:saved}),view=[...conditionViews.values()][0];
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,1);
+assert.match(html,/1 of 32 requests finished · 0 active/);
+assert.equal(view.summary.planned,32);assert.equal(view.summary.started,1);assert.equal(view.summary.completed,1);
+const counts=conditionDialogCounts(view);assert.match(counts,/<dt>Planned<\/dt><dd>32<\/dd>/);assert.match(counts,/<dt>Started<\/dt><dd>1<\/dd>/);
 assert(renderMosaic([record]).includes('aria-label="'+condition.label+'. Request 1 of 32'));
 """)
 

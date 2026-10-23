@@ -335,7 +335,8 @@ config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;upd
 assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
 assert(!catalogue.includes('id="shared-settings"')); // Run limits is a preceding sibling in renderNew.
-assert.doesNotMatch(markup,/name="samples"|name="max_output_tokens"|name="request_timeout_seconds"|name="context_limit"|name="stream"|name="limit_/);
+assert.match(markup,/name="request_timeout_seconds"[^>]*value="300"/);
+assert.doesNotMatch(markup,/name="samples"|name="max_output_tokens"|name="context_limit"|name="stream"|name="limit_/);
 assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
 assert.doesNotMatch(catalogue,/catalogue-view-hint/);

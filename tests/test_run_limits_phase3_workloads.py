@@ -13,6 +13,9 @@ from giraffe.tool_checks import default_tool_fixture
 from giraffe.workloads import consistency, prefixes, results, sessions, tools
 
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
 TARGET = {"name": "local", "url": "http://unused.test/v1", "model": "test"}
 
 
@@ -333,3 +336,6 @@ def test_load_per_response_criteria_change_verdict_without_changing_suite_limits
     assert changed.limits.model_dump() == configured.limits.model_dump() == before
     point, group = group_fixture(configured, rows)
     assert score_group(configured.load_test, point, group, rows)["status"] == "pass"
+
+
+# Match fake endpoint token usage while exercising the real local-sizing path.

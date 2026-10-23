@@ -16,10 +16,13 @@ SNAPSHOTS = json.loads(Path('tests/fixtures/run-limits-phase3-defaults.json').re
 
 @pytest.mark.parametrize('name', SNAPSHOTS)
 @pytest.mark.parametrize('legacy', [False, True], ids=['current-example', 'legacy-main'])
-def test_unconfigured_requests_match_main_through_each_check_path(name, legacy):
+def test_historical_requests_with_explicit_timeout_match_each_check_path(name, legacy):
     expected = SNAPSHOTS[name]
     source = (expected['source'] if legacy or name == 'default' else
               yaml.safe_load(Path(name).read_text()))
+    # Pin the historical timeout: this snapshot verifies payload compatibility,
+    # while dedicated default tests cover the new 300-second default.
+    source = {"request_timeout_seconds": 30, **source}
     config = migrated_configuration({**source, **({'config_version': 2} if name == 'default' and not legacy else {})})
     actual = {}
     for check, groups in expected['requests'].items():

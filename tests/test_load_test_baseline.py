@@ -9,6 +9,9 @@ from tests.test_concurrent_load import configuration
 from tests.test_web import report as empty_report
 
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
 @pytest.mark.parametrize("request_source", ["builtin", "request_pack"])
 @pytest.mark.parametrize("load_result", ["absent", "skipped", "empty_points"])
 def test_correctness_baseline_ignores_unselected_load_without_cohorts(request_source, load_result):
@@ -205,3 +208,5 @@ def test_observed_mixed_share_variation_does_not_change_work_within_each_shape()
     rows = compared.baseline["targets"][0]["load_test"]["points"]
     assert [row["status"] for row in rows] == ["pass", "fail"]
 
+
+# Fake inference clients in this module use the matching local tokenizer.

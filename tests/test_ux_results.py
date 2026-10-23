@@ -295,25 +295,20 @@ assert.match(html,/No request evidence was recorded for this check/);
 
 def test_report_tabs_keep_one_tab_stop_and_support_keyboard_navigation():
     run_render_checks(r"""
-const value=report([check('access','pass')]);
-let html=detail(value);
-assert.match(html,/id="tab-checks" aria-selected="true" tabindex="0"/);
-assert.match(html,/id="tab-baseline" aria-selected="false" tabindex="-1"/);
-assert.match(html,/id="tab-config" aria-selected="false" tabindex="-1"/);
-for(const tab of ['checks','baseline','config'])nodes['#tab-'+tab]={focus(){this.focused=true;}};
-const target={closest(q){return q==='[data-tab]'?this:null;}};
+const value=report([check('access','pass')]);detail(value);
+assert.equal($$('[role="tab"]').length,2);
+assert.equal($('#tab-performance').getAttribute('aria-selected'),'true');
+assert.equal($('#tab-results').getAttribute('tabindex'),'-1');
 let prevented=0;
-listeners.keydown({target,key:'ArrowRight',preventDefault(){prevented++;}});
-html=nodes['#main'].innerHTML;
-assert.equal(state.tab,'baseline');assert(nodes['#tab-baseline'].focused);
-assert.match(html,/id="tab-baseline" aria-selected="true" tabindex="0"/);
-assert.match(html,/id="tab-checks" aria-selected="false" tabindex="-1"/);
-listeners.keydown({target,key:'End',preventDefault(){prevented++;}});
-assert.equal(state.tab,'config');assert(nodes['#tab-config'].focused);
-listeners.keydown({target,key:'ArrowRight',preventDefault(){prevented++;}});
-assert.equal(state.tab,'checks');assert(nodes['#tab-checks'].focused);
-assert.equal(prevented,3);
-""")
+const key=key=>listeners.keydown({target:document.activeElement,key,preventDefault(){prevented++;}});
+$('#tab-performance').focus({preventScroll:true});key('ArrowRight');
+assert.equal(reportView.tab,'results');assert.equal(document.activeElement,$('#tab-results'));
+assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
+assert.equal($('#tab-performance').getAttribute('tabindex'),'-1');
+key('Home');assert.equal(reportView.tab,'performance');
+key('ArrowLeft');assert.equal(reportView.tab,'results');
+assert.equal(prevented,3);assert.equal($$('[role="tab"][tabindex="0"]').length,1);
+""", dom=True)
 
 
 def test_tool_request_evidence_separates_outcomes_and_escapes_bodies():

@@ -13,6 +13,9 @@ from giraffe.runner import _Run
 from tests.test_concurrent_load import Client, configuration, perform, point, short_windows
 
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
 def record(name='r', role='short_stream', sub=0, start=0, first=10, last=30, chunks=2, **updates):
     values = dict(id=name, target='local', fixture_id='x', scenario='x', check_ids=['load'], started_at='now',
         status='completed', valid=True, output='K7P4', score=True, first_output_ms=first, last_output_ms=last,
@@ -55,6 +58,7 @@ async def test_blank_calibration_output_uses_received_prompt_usage():
 async def test_below_minimum_prompt_length_calibrates_short_and_warns_in_plan():
     c = configuration(load={'profile': {'short': {'input_tokens': 16, 'output_tokens': 8},
         'medium': {'input_tokens': 96, 'output_tokens': 16}, 'long': {'input_tokens': 128, 'output_tokens': 32}}})
+    c.targets[0].tokenizer = "builtin"
     class Floor(Client):
         async def execute(self, spec, **kw):
             r = await super().execute(spec, **kw)
@@ -62,12 +66,16 @@ async def test_below_minimum_prompt_length_calibrates_short_and_warns_in_plan():
             return r
     _, check, _, _ = await perform(c, Floor())
     calibration = check.metrics['calibrations'][0]
-    assert calibration['status'] == 'calibrated' and calibration['input_tokens'] == 52
+    assert calibration['status'] == 'calibrated' and calibration['input_tokens'] == round(len(load.make_spec(c.load_test, 'short_short', 'load', {}, 0).messages[0]['content']) / 4)
     assert calibration['filler_chars'] == 0
-    assert calibration['reason'] == 'Short input target 16 is below the minimum prompt length (≈52 tokens); measured at 52'
-    assert point(check)['dispatched'] > 0 and check.status == 'pass'
+    assert 'Input target 16 is below the minimum prompt length' in calibration['reason']
+    assert 'reference token counts' in calibration['reason']
+    assert not any(point(check)['input_class_floors'].values())
+    assert point(check)['dispatched'] > 0
+    assert calibration['method'] == 'local_tokenizer'
     from giraffe.reporting import _load_test_html
-    assert calibration['reason'] in _load_test_html(check.metrics)
+    from html import unescape
+    assert calibration['reason'] in unescape(_load_test_html(check.metrics))
     warnings = request_plan(configuration(load={'profile': c.load_test.profile.model_dump()}))['load_warnings']
     assert any('minimum prompt length' in w['msg'] and w['fields'] == ['load_test.profile.short.input_tokens'] for w in warnings)
 
@@ -240,29 +248,39 @@ def test_large_input_stress_still_requires_target_after_minimum_floor():
 
 @pytest.mark.parametrize('status,http,tokens,error', [('timeout', None, 52, 'request timed out'),
     ('failed', 400, 52, 'context window exceeded'), ('failed', None, None, 'missing response')])
-async def test_calibration_failures_remain_failures_despite_floor(status, http, tokens, error):
+async def test_endpoint_failures_are_measured_requests_after_local_preparation(status, http, tokens, error):
     class Failed(Client):
         async def execute(self, spec, **kw):
             r = await super().execute(spec, **kw)
             r.status, r.http_status, r.input_tokens, r.error = status, http, tokens, error
             return r
     _, check, client, _ = await perform(client=Failed())
-    assert check.status == 'fail' and point(check)['reason_code'] == 'calibration_failed'
-    assert all(s.scenario.startswith('load_calibration_') for s in client.specs)
+    assert check.status == 'fail' and point(check)['reason_code'] == 'error_rate'
+    assert all(not s.scenario.startswith('load_calibration_') for s in client.specs)
 
 
 @pytest.mark.parametrize('buffered,expected', [(1, 'pass'), (4, 'inconclusive')])
-async def test_interference_buffering_scoring_uses_majority(buffered,expected):
+def test_interference_buffering_scoring_uses_majority(buffered, expected, monkeypatch):
+    from giraffe import runner
+    from tests.test_review26_phase4_accuracy import run_virtual
+
     class Buffered(Client):
         async def execute(self,spec,**kw):
             r=await super().execute(spec,**kw)
             if spec.load_point.get('role') == 'short_stream':
                 r.answer_chunks = 1 if buffered == 4 else 5
             return r
-    _,check,_,_=await perform(configuration(load={'combinations':{'enabled':False},'interference':{'enabled':True},'schedule':{'levels':[2]}}),Buffered())
-    p=point(check)
-    assert p['status'] == expected
-    assert p['interference']['buffered_stream'] is (buffered == 4)
+    async def scenario():
+        # Buffering classification must not depend on wall-clock scheduling jitter.
+        monkeypatch.setattr("tests.test_concurrent_load.time", runner.time)
+        _, check, _, _ = await perform(configuration(load={
+            'combinations': {'enabled': False}, 'interference': {'enabled': True},
+            'schedule': {'levels': [2]}}), Buffered())
+        p = point(check)
+        assert p['status'] == expected, (p['reason'], p['interference'])
+        assert p['interference']['buffered_stream'] is (buffered == 4)
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_known_run_stop_cancellation_finalizes_without_reraising():
@@ -286,7 +304,7 @@ async def test_known_run_stop_cancellation_finalizes_without_reraising():
     assert p['reason_code'] == 'run_stopped' and p['cancelled'] == 1
 
 
-async def test_real_client_blank_one_token_calibration_preserves_usage(monkeypatch):
+async def test_real_client_blank_answer_counts_as_error_without_inference_calibration(monkeypatch):
     import json
     from giraffe.client import LLMClient
     calls = 0
@@ -314,8 +332,8 @@ async def test_real_client_blank_one_token_calibration_preserves_usage(monkeypat
     check = load.result(run, c.targets[0])
     assert check.metrics['calibrations'][0]['status'] == 'calibrated'
     assert run.records[0].status == 'failed' and run.records[0].input_tokens == 64
-    assert run.errors == 0 and point(check)['dispatched'] > 0
-    assert run.records[0].check_ids == ['load']
+    assert run.errors == 1 and point(check)['dispatched'] > 0
+    assert set(run.records[0].check_ids) == {'load', 'access', 'serving'}
 
 
 @pytest.mark.parametrize('overlap,allowance', [(False, 1), (True, 1)])
@@ -402,3 +420,6 @@ def test_finite_arrival_corrections_revalidate_or_explain_impossible_minimum(rat
         assert 'minimum valid sending window' in issue['msg']
         assert all('value' not in action for action in actions)
         assert any(a['field'] == 'load_test.patterns.bursts.gap_seconds' for a in actions)
+
+
+# Fake inference clients in this module use the matching local tokenizer.

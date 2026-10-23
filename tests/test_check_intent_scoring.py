@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 
+
 from giraffe import runner
 from giraffe.client import LLMClient
 from giraffe.fixtures import final_answer, score_response
@@ -15,6 +16,9 @@ from tests.test_tool_contract import call, evaluate_fixture, fixture as tool_fix
 from tests.test_tool_conversations import fixture as conversation_fixture
 from tests.test_workload_reliability import MemoryEndpoint
 from tests.test_workloads import check, config
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def record(spec, output="", **changes):
@@ -267,11 +271,12 @@ async def test_x1_calibrated_near_limit_rejections_are_inconclusive(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_x1_uncalibrated_context_rejection_is_clear_and_inconclusive(monkeypatch):
+async def test_x1_locally_sized_context_rejection_without_usage_is_failure(monkeypatch):
     mock_transport(monkeypatch, lambda request: httpx.Response(422, text="context size too small"))
     result = check(await runner.run_suite(tool_config(checks=["context"], context_limit=4096)), "context")
-    assert result.status == "inconclusive" and "server rejected" in result.summary
-    assert "calibrat" in result.summary
+    # Even the medium case is locally known to be inside the safe context budget.
+    assert result.status == "fail", result.summary
+    assert "server rejected" in result.summary.lower()
 
 
 def context_run():
@@ -375,7 +380,9 @@ async def test_p3_prefix_plan_matches_token_admission_and_nonce_boundary(
     planned = request_plan(settings)
     report = await runner.run_suite(settings)
     assert planned["count_kind"] == "exact"
-    assert len(endpoint.requests) == len(report.requests) == planned["planned_total"] == expected
+    probes = [r for r in report.requests if r.scenario == "performance_evidence_probe"]
+    assert len(endpoint.requests) == len(report.requests) == expected + len(probes)
+    assert planned["planned_total"] == expected
     if not expected:
         assert check(report, "prefix").status == "inconclusive"
         assert any("prefix" in warning.lower() for warning in planned["warnings"])

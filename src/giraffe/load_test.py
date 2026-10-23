@@ -44,7 +44,7 @@ from giraffe.overlap import (
     scheduling_delay_windows,
 )
 from giraffe.timing import configured_metrics, qualified_violations, run_quality
-from giraffe.traffic import arrival_schedule, run_stage
+from giraffe.traffic import ScheduleObservation, arrival_schedule, run_stage
 
 LOAD_TITLES = {
     "combinations": "Input → output combinations",
@@ -53,6 +53,9 @@ LOAD_TITLES = {
     "interference": "Long input during an active short stream",
 }
 SCHEDULER_LAG_MS = 100  # Same delivery-evidence policy as traffic.py, not an acceptance criterion.
+AUTHORITATIVE_TERMINATION_REASONS = {
+    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "run_duration_limit",
+}
 
 
 def settings_sets(settings):
@@ -346,7 +349,7 @@ def load_time_plan(settings):
         return bursts + constant
     windows = sum(p["windows"] for p in points)
     sending = sum(p["windows"] * own[p["source"]].schedule.duration_seconds for p in points)
-    allowances = sum(p["windows"] * own[p["source"]].schedule.finish_seconds for p in points)
+    allowances = sum(p["windows"] * own[p["source"]].request_timeout_seconds for p in points)
     rows = {}
     for kind in LOAD_TITLES:
         selected = [p for p in points if p["type"] == kind]
@@ -359,7 +362,7 @@ def load_time_plan(settings):
                     p["windows"] * own[p["source"]].schedule.duration_seconds for p in selected
                 ),
                 "finish_allowance_seconds": sum(
-                    p["windows"] * own[p["source"]].schedule.finish_seconds for p in selected
+                    p["windows"] * own[p["source"]].request_timeout_seconds for p in selected
                 ),
                 "expected_requests": sum(
                     scheduled_count(own[p["source"]], p) or 0 for p in selected
@@ -386,8 +389,8 @@ def load_time_plan(settings):
                 execution_summary.append(f"Required long-output stress coverage: {stress_output_floor(value)} tokens ({workloads.stress.min_output_percent:g}% of Long output cap {value.profile.long.output_tokens})." + suffix)
         comparison = [p for p in source_points if p["type"] == "interference"]
         if comparison:
-            control = sum(p["windows"] * (value.schedule.duration_seconds + value.schedule.finish_seconds) for p in comparison)
-            execution_summary.append(f"{len(comparison)} short-answer checks at concurrency {', '.join(str(p['level']) for p in comparison)}: short answers alone, then with a long request. {int(control // 60)}m {round(control % 60)}s including finish allowances." + suffix)
+            control = sum(p["windows"] * (value.schedule.duration_seconds + value.request_timeout_seconds) for p in comparison)
+            execution_summary.append(f"{len(comparison)} short-answer checks at concurrency {', '.join(str(p['level']) for p in comparison)}: short answers alone, then with a long request. {int(control // 60)}m {round(control % 60)}s including the per-request timeout upper bound." + suffix)
     return {
         "scheduled_tests": sum(p["type"] != "interference" for p in points),
         "comparison_checks": sum(p["type"] == "interference" for p in points),
@@ -677,6 +680,14 @@ def build_spec(
             request_timeout_seconds=settings.request_timeout_seconds,
         )
         spec.condition_id = scenario
+        prepared = calibration[key]
+        spec.workload["input_preparation"] = {
+            name: prepared[name] for name in (
+                "method", "tokenizer", "tokenizer_source", "input_tokens", "target_tokens",
+                "chat_template", "local_files_only", "count_scope", "token_count_scope",
+                "encoding", "reason",
+            ) if name in prepared
+        }
     spec.stream = run.config.stream
     spec.request_timeout_seconds = settings.request_timeout_seconds
     spec.options = deterministic_options(run.config, spec.options)
@@ -695,6 +706,13 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     triggered = 0
     scenario = point["id"] + ("." + phase if phase else "")
     run.start_condition(target.name, scenario, planned=None, planned_kind="duration")
+    intent = ScheduleObservation(
+        run.observations[target.name].setdefault("schedule_transitions", []),
+        start=begin, origin=run.start, stage_id=scenario, check_id="load",
+        kind="concurrency", label=point_label(point) + (f" · {phase}" if phase else ""),
+        pattern=point["pattern"],
+        concurrency=point["level"] - (1 if phase == "control" else 0),
+    )
 
     def ended():
         nonlocal reason, cutoff
@@ -780,6 +798,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     if phase == "probe":
         tasks.append(asyncio.create_task(probe()))
     cancelled = None
+    sending_end = None
     try:
         # Do not await workers directly: requests may outlive the sending window.
         while time.monotonic() < end and not ended():
@@ -791,7 +810,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             except TimeoutError:
                 pass
         sending_end = min(end, cutoff if cutoff is not None else time.monotonic())
-        finish_end = min(run.deadline, sending_end + settings.schedule.finish_seconds)
+        intent.begin_drain(sending_end)
+        finish_end = run.deadline
         while any(not t.done() for t in tasks) and time.monotonic() < finish_end:
             stop = run.stop_reason(target.name)
             if stop and stop != "maximum request budget reached":
@@ -803,6 +823,9 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         reason = run.stop_reason(target.name) or "execution cancelled"
         cancelled = exc
     finally:
+        if sending_end is None:
+            sending_end = min(end, time.monotonic())
+        intent.begin_drain(sending_end)
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -813,13 +836,15 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             except asyncio.CancelledError as exc:
                 cancelled = exc
                 reason = run.stop_reason(target.name) or "execution cancelled"
+        intent.finish(time.monotonic())
     now = time.monotonic()
     for record in records:
         if record.status == "cancelled":
-            record.error = reason or "finish allowance expired"
+            if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
+                record.error = reason or "overall run deadline reached"
             record.load_point["cancellation_reason"] = record.error
     if any(r.status == "cancelled" for r in records) and reason is None:
-        reason = "finish allowance expired"
+        reason = "overall run deadline reached"
     window = {
         "phase": phase,
         "sending_start_ms": (begin - run.start) * 1000,
@@ -861,7 +886,7 @@ async def arrival_window(run, target, client, settings, point, calibration):
         rates=[point["rate"] or 1],
         arrival="poisson" if point["pattern"] == "poisson" else "steady",
         max_in_flight=admission_limit(run.config, settings),
-        drain_timeout_seconds=settings.schedule.finish_seconds,
+        drain_timeout_seconds=None,
         seed=settings.patterns.poisson.seed,
         scheduler_lag_tolerance_ms=SCHEDULER_LAG_MS,
     )
@@ -893,6 +918,10 @@ async def arrival_window(run, target, client, settings, point, calibration):
         run_start=run.start,
         return_evidence=True,
         on_drop=lambda: run.drop_offer(target.name, point["id"]),
+        schedule_observations=run.observations[target.name].setdefault("schedule_transitions", []),
+        schedule_stage_id=point["id"],
+        schedule_label=point_label(point),
+        schedule_pattern=point["pattern"],
     )
     begin = evidence.started_monotonic
     for index, (offer, outcome) in enumerate(zip(offers, evidence.outcomes)):
@@ -900,11 +929,12 @@ async def arrival_window(run, target, client, settings, point, calibration):
         offer["scheduler_lag_ms"] = evidence.offer_lags_ms[index]
     for index, record in evidence.records:
         if record.status == "cancelled":
-            record.error = (
-                "finish allowance expired"
-                if evidence.drain_expired
-                else "; ".join(evidence.reasons) or "run stopped"
-            )
+            if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
+                record.error = (
+                    "overall run deadline reached"
+                    if evidence.drain_expired
+                    else "; ".join(evidence.reasons) or "run stopped"
+                )
             record.load_point["cancellation_reason"] = record.error
         record.load_point["origin"] = offers[index]["origin"]
         record.load_point["burst_index"] = offers[index]["burst_index"]
@@ -1151,7 +1181,7 @@ def measurements(run, target, settings, point, records, shape):
         completed_during_finish=finish_count,
         throughput_window_seconds=observation,
         sending_window_seconds=sending,
-        throughput_description="Completions through finish allowance / sending plus actual finishing time; cancelled work excluded.",
+        throughput_description="Completions after sending stops are included; throughput uses sending plus actual drain time, excluding cancelled work.",
         completed_requests_per_second=len(completed) / observation if observation else None,
         aggregate_output_tokens_per_second=sum(tokens) / observation
         if observation and tokens and all(n is not None for n in tokens)
@@ -1259,10 +1289,10 @@ def score_group(settings, point, group, records):
         return result(
             "inconclusive",
             "cancelled",
-            "Unfinished requests were cancelled after the finish allowance or run stop.",
+            "Unfinished requests were cancelled by the run deadline or Stop.",
         )
     if point.get("input_not_calibrated"):
-        return result("inconclusive", "input_not_calibrated", "Input target calibration was incomplete.")
+        return result("inconclusive", "input_not_calibrated", point.get("preparation_reason") or "Local input preparation was unavailable.")
     if group["valid"] < c.min_valid_responses:
         return result(
             "inconclusive",
@@ -1590,11 +1620,13 @@ async def execute(run, target, client):
                     point["calibration_failure"] = next(
                         v["reason"] for v in cache.values() if v["status"] == "fail"
                     )
-                elif any(v["status"] == "inconclusive" for v in cache.values()):
+                elif any(v["status"] in {"inconclusive", "unavailable"} for v in cache.values()):
                     point["input_not_calibrated"] = True
+                    point["preparation_reason"] = next(v["reason"] for v in cache.values() if v["status"] in {"inconclusive", "unavailable"})
                 point["input_class_floors"] = {
                     variant: {size: value["input_tokens"] for (size, kind), value in cache.items()
                               if kind == variant and value["status"] == "calibrated"
+                              and value.get("token_count_scope") != "builtin_reference"
                               and value["reason_code"] == "minimum_prompt_length"
                               and value["input_tokens"] is not None}
                     for variant in ("short_answer", "long_output")

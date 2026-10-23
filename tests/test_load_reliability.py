@@ -13,6 +13,9 @@ from giraffe.models import Limits, RequestRecord
 from tests.test_runner import check, config
 
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
 class LoadClient:
     """An in-process streaming endpoint with independently controlled answer/close times."""
 
@@ -67,9 +70,6 @@ def endpoint(monkeypatch):
         calls = []
     monkeypatch.setattr(runner, "LLMClient", Endpoint)
     return Endpoint
-
-
-
 
 
 
@@ -151,8 +151,6 @@ async def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(
 
 
 
-
-
 async def test_recovery_consumed_allowance_can_qualify_before_duration(endpoint):
     report = await runner.run_suite(config(checks=['recovery'], max_requests=40,
         sustained_seconds=10, limits=Limits(recovery_max_ratio=10, min_samples=2)))
@@ -185,8 +183,6 @@ async def test_recovery_sustained_timeouts_and_errors_fail(endpoint, monkeypatch
     assert result.metrics['sustained_non_timeout_error_rate'] == (0 if failure == 'timeout' else 1)
 
 
-
-
 @pytest.mark.parametrize('check_id,scenario,expected', [
     ('recovery', 'recovery_baseline', 'inconclusive'),
     ('recovery', 'recovery', 'inconclusive'),
@@ -213,3 +209,6 @@ async def test_matched_ratio_qualifies_client_delay_in_both_controls_and_probes(
     assert outcome.status == expected
     assert outcome.metrics['timing_quality']['status'] == (
         'qualified' if expected == 'pass' else 'client_delayed')
+
+
+# Fake inference clients in this module use the matching local tokenizer.

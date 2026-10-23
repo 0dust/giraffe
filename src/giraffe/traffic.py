@@ -19,6 +19,48 @@ from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, Tr
 from .timing import qualify, qualified_violations
 
 
+class ScheduleObservation:
+    """Record scheduler intent, independently of admission or actual occupancy.
+
+    Intervals use the run's monotonic origin, as do request dispatch timestamps.
+    They are appended when entered (including live/partial runs), then closed in
+    place. A zero target during drain means no further work is intended, even
+    though outstanding requests can remain active above that target.
+    """
+
+    def __init__(self, rows, *, start, origin, stage_id, check_id, kind,
+                 concurrency=None, rate=None, label=None, pattern=None):
+        self.rows = rows
+        self.origin = origin
+        self.sending = {
+            "stage_id": stage_id, "check_id": check_id, "kind": kind,
+            "label": label or stage_id, "pattern": pattern,
+            "start_ms": (start - origin) * 1000, "end_ms": None,
+            "intended_concurrency": concurrency, "intended_rate_rps": rate,
+        }
+        self.drain = None
+        if rows is not None:
+            rows.append(self.sending)
+
+    def begin_drain(self, when):
+        if self.drain is not None:
+            return
+        elapsed = max(self.sending["start_ms"], (when - self.origin) * 1000)
+        self.sending["end_ms"] = elapsed
+        self.drain = {
+            **self.sending, "stage_id": self.sending["stage_id"] + ".drain",
+            "kind": "drain", "label": "Drain", "start_ms": elapsed, "end_ms": None,
+            "intended_concurrency": 0 if self.sending["intended_concurrency"] is not None else None,
+            "intended_rate_rps": 0 if self.sending["intended_rate_rps"] is not None else None,
+        }
+        if self.rows is not None:
+            self.rows.append(self.drain)
+
+    def finish(self, when):
+        self.begin_drain(when)
+        self.drain["end_ms"] = max(self.drain["start_ms"], (when - self.origin) * 1000)
+
+
 def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int = 0, *, poisson_unconditioned: bool = False):
     """Return a bounded, reproducible list of (offset seconds, workload class)."""
     arrivals, choices = random.Random(traffic.seed + stage_index), random.Random(
@@ -173,6 +215,10 @@ async def run_stage(
     scenario: str | None = None,
     run_start: float | None = None,
     return_evidence: bool = False,
+    schedule_observations: list[dict] | None = None,
+    schedule_stage_id: str | None = None,
+    schedule_label: str | None = None,
+    schedule_pattern: str | None = None,
 ) -> dict:
     """Run one stage; callbacks own shared run budgets and global admission slots.
 
@@ -199,6 +245,16 @@ async def run_stage(
         schedule = [(offset, spec.workload["case_id"])
                     for (offset, _), spec in zip(schedule, selected_specs, strict=True)]
     started_at = time.monotonic()
+    intent = ScheduleObservation(
+        schedule_observations, start=started_at,
+        origin=run_start if run_start is not None else started_at,
+        stage_id=schedule_stage_id or scenario or f"traffic_stage_{stage_index}",
+        check_id=check_id, kind="arrival_rate", label=schedule_label,
+        pattern=schedule_pattern or traffic.arrival,
+        # A synthetic rate used to drive a finite burst schedule is not an
+        # intended continuous arrival rate.
+        rate=None if schedule_pattern == "bursts" else rate_rps,
+    )
     stage_end = started_at + traffic.duration_seconds
     sending_finished_at = None
     offer_lags_ms = [None] * len(schedule)
@@ -327,7 +383,9 @@ async def run_stage(
                     interrupted = True
 
         sending_finished_at = time.monotonic()
-        drain_deadline = min(deadline, sending_finished_at + traffic.drain_timeout_seconds)
+        intent.begin_drain(sending_finished_at)
+        drain_deadline = (deadline if traffic.drain_timeout_seconds is None else
+                          min(deadline, sending_finished_at + traffic.drain_timeout_seconds))
         while tasks:
             if reason := interruption():
                 reasons.append(reason)
@@ -345,6 +403,7 @@ async def run_stage(
     finally:
         if sending_finished_at is None:
             sending_finished_at = time.monotonic()
+        intent.begin_drain(sending_finished_at)
         # Copy: task completion callbacks remove tasks from the live set.
         pending = list(tasks)
         for task in pending:
@@ -360,6 +419,7 @@ async def run_stage(
                 except asyncio.CancelledError:
                     reasons.append("Traffic stage cancelled.")
                     interrupted = True
+        intent.finish(time.monotonic())
 
     # A task cancelled before its coroutine starts still consumed an offer.
     for index, outcome in enumerate(outcomes):

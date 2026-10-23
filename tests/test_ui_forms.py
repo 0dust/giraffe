@@ -178,7 +178,7 @@ class FormValues {{
 }}
 const context={{assert,structuredClone,...formConfig,nodes,form,controls,listeners,snapshots,FormData:FormValues,location:{{hash:'#new'}},
  document:{{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn}},window:{{addEventListener(){{}}}},
- setTimeout(){{}},console}};
+ setTimeout(){{}},clearTimeout(){{}},console}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 context.bootstrap={json.dumps(capabilities())};context.config={json.dumps(config.model_dump(mode='json'))};
 await vm.runInNewContext(source+`
@@ -250,6 +250,8 @@ captureFormDraft=()=>{{state.config=readForm(true).config;}};
 await listeners.click({{target:{{closest:q=>q==='[data-reset-test]'?{{dataset:{{resetTest:'load'}}}}:null}}}});
 assert.equal(loadSettings(readForm(true).config).pass_criteria.max_completion_ms,30000);
 // My questions can remain an empty saved draft while generated-only work executes.
+// Token ID readiness is covered separately; this fixture exercises source normalization.
+currentTokenizerSelection=()=>({{status:'ready',tokenizer:'builtin'}});
 state.config=applySetupPreset(config,'concurrent',state.bootstrap.load_test.defaults);state.config.checks=['access'];
 state.config.request_source='request_pack';state.config.request_pack=null;renderNew('concurrent');
 toast=()=>{{}};api=async(path,options)=>{{const body=JSON.parse(options.body);snapshots.push({{path,config:body}});return {{config:body}};}};
@@ -345,7 +347,8 @@ def test_load_controls_and_request_budget_guidance():
     from tests.test_concurrent_load_ui_review import FORM
     browser_logic(FORM + r'''
 const before=JSON.stringify(config),html=renderLoadEditor(config);
-for(const name of ['load_patterns_concurrent_levels','load_schedule_duration_seconds','load_schedule_finish_seconds','load_patterns_rates'])assert(html.includes('name="'+name+'"'));
+for(const name of ['load_patterns_concurrent_levels','load_schedule_duration_seconds','load_request_timeout_seconds','load_patterns_rates'])assert(html.includes('name="'+name+'"'));
+assert(!html.includes('name="load_schedule_finish_seconds"'));
 assert.doesNotMatch(html,/Samples per|Pairs per|Maximum seconds per|p95/);assert.equal(JSON.stringify(config),before);
 assert.doesNotMatch(renderLoadPlan(config),/0 requests/);
 for(const invalid of ['', '0','2, 2','2, 1','1.5','1025','Infinity','oops']){
@@ -369,7 +372,7 @@ form.elements.load_workloads_combinations_enabled.checked=false;
 form.elements.load_workloads_mixed_enabled.checked=true;form.elements.load_workloads_stress_enabled.checked=true;
 for(const shape of loadShapes)form.elements['load_workloads_mixed_selected_'+shape].checked=['short_short','long_long'].includes(shape);
 form.elements.load_workloads_mixed_share_mode.value='custom';form.elements.load_workloads_mixed_shares_short_short.value='40';form.elements.load_workloads_mixed_shares_long_long.value='60';
-form.elements.load_patterns_concurrent_levels.value='2, 4';form.elements.load_schedule_duration_seconds.value='10';form.elements.load_schedule_finish_seconds.value='7';
+form.elements.load_patterns_concurrent_levels.value='2, 4';form.elements.load_schedule_duration_seconds.value='10';form.elements.load_request_timeout_seconds.value='7';
 form.elements.load_patterns_poisson_enabled.checked=true;form.elements.load_patterns_poisson_seed.value='37';
 form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_first_seconds.value='1';form.elements.load_patterns_bursts_size.value='2';
 form.elements.load_profile_long_input_tokens.value='10000';form.elements.load_profile_long_output_tokens.value='1024';form.elements.load_workloads_stress_min_output_percent.value='80';
@@ -386,7 +389,7 @@ console.log(JSON.stringify(read));
     assert config.load_test.profile.long.output_tokens==1024
     assert config.load_test.patterns.concurrent.levels==[2,4]
     assert config.load_test.patterns.poisson.seed==37 and config.load_test.patterns.bursts.enabled
-    assert config.load_test.schedule.finish_seconds==7
+    assert config.load_test.request_timeout_seconds==7
     assert config.load_test.pass_criteria.min_valid_responses==1
     assert config.load_test.pass_criteria.max_first_answer_ms is None
 
@@ -1107,7 +1110,7 @@ state.detail={report:{requests:[{id:'r',fixture_id:'refund',judgement:{status:'i
 openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI evaluation/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
 state.detail={id:'run',state:'running',config:{targets:[{name:'target',model:'m'}],judging:config.judging,max_requests:50},progress:{event:'judging_progress',attempted:20,completed:20,judge_calls_total:40,judge_calls_completed:7,elapsed_seconds:10},events:[]};
 renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
-state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert.match(nodes['#main'].innerHTML,/Requests appear as they start/);
+state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Mission control</h1>'));assert(nodes['#main'].innerHTML.includes('One spot per test. Select a spot for its requests and results.'));
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))

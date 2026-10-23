@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
+from pathlib import Path
 
 import httpx
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -84,6 +85,11 @@ class ModelDiscovery(APIKeyInput):
         return self
 
 
+class TokenizerSelection(Model):
+    model: str = Field(default="", max_length=512)
+    token_id: str = Field(default="auto", max_length=512)
+
+
 class ConnectionTest(ModelDiscovery):
     model: str | None = None
     request_options: dict = Field(default_factory=dict)
@@ -99,7 +105,8 @@ class ConnectionTest(ModelDiscovery):
         return self
 
 
-async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False) -> dict:
+async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
+                          include_tokenizers: bool = False) -> dict:
     """Read model IDs on explicit request; never send a completion or follow redirects."""
     target = body.target()
     try:
@@ -154,7 +161,20 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False) -
                     "Enter the model name to test the connection."}
         raise PreflightError("The server returned an unreadable model list. "
                             "You can still enter the model name manually.") from None
-    return {"models": models, "message": "Model list received. No inference requests were sent."
+    extra = {}
+    if include_tokenizers:
+        import re
+        roots = {}
+        for item in data:
+            if not isinstance(item, dict) or item.get("id") not in models:
+                continue
+            root = item.get("root")
+            # A remote filesystem path must never become a local file lookup.
+            if (isinstance(root, str) and re.fullmatch(r"[A-Za-z0-9][\w.-]{0,95}/[A-Za-z0-9][\w.-]{0,95}", root)
+                    and ".." not in root and not Path(root).exists()):
+                roots.setdefault(item["id"], set()).add(root)
+        extra["tokenizers"] = {model: next(iter(values)) for model, values in roots.items() if len(values) == 1}
+    return {**extra, "models": models, "message": "Model list received. No inference requests were sent."
             if models else "The server returned no models. Enter an installed model name manually."}
 
 

@@ -157,7 +157,7 @@ def test_direct_pydantic_traffic_error_has_structured_context_without_web_depend
 
 
 @pytest.mark.parametrize("legacy_metadata", [False, True])
-async def test_capacity_estimate_is_advisory_for_actual_requests_and_baseline_matching(monkeypatch, legacy_metadata):
+async def test_capacity_estimate_is_advisory_for_actual_requests_and_baseline_matching(monkeypatch, legacy_metadata, local_tokenizer):
     from giraffe import runner
     from giraffe.reporting import _settings_reasons
     from tests.test_runner import FakeClient

@@ -3,12 +3,15 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+
 from pydantic import ValidationError
 
 from giraffe.models import ConcurrentLoad, ConfigDraft, LoadTest, RunConfig, SHAPES
 from giraffe.planning import request_plan
 from giraffe.web import _configuration_errors, create_app
 from tests.test_concurrent_load import TARGET
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 @pytest.mark.parametrize('concurrency', [1, 2, 3])

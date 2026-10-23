@@ -107,7 +107,12 @@ def test_html_logprob_alternatives_are_visible_despite_large_token_byte_arrays(p
     assert ("ALT_ONLY_SECRET" in data) == retained
     assert "<script>" not in html
     assert ("ALT_ONLY_SECRET&lt;script&gt;" in html) == retained
-    assert html_path.stat().st_size < 40_000
+    baseline = report.model_copy(deep=True)
+    baseline.requests[0].logprob_evidence = None
+    _, baseline_html = write_report(baseline, tmp_path / "without-logprobs", html=True)
+    # Bound evidence growth independently of shared report markup. Raw byte
+    # arrays must not be duplicated into the human-readable HTML.
+    assert html_path.stat().st_size - baseline_html.stat().st_size < 6_000
     saved = RunReport.model_validate_json(data)
     if retained:
         assert saved.requests[0].logprob_evidence == record.logprob_evidence

@@ -135,12 +135,14 @@ async def test_recovery_uses_long_streamed_known_answers_for_every_phase():
     assert completion["reason"] == "duration elapsed"
     assert completion["requests"] >= settings.concurrency * 2
     assert completion["time_weighted_in_flight"] >= settings.concurrency * .9
-    assert {row.scenario for row in report.requests} == {"sustained", "recovery_baseline", "recovery", "recovery_prime"}
+    workload = [row for row in report.requests if row.scenario != "performance_evidence_probe"]
+    assert len(report.requests) == len(workload) + 1
+    assert {row.scenario for row in workload} == {"sustained", "recovery_baseline", "recovery", "recovery_prime"}
     prime, = [row for row in report.requests if row.scenario == "recovery_prime"]
     assert prime.check_ids == [] and prime.id not in result.evidence_ids
     assert result.metrics["baseline"]["attempted"] == result.metrics["baseline"]["completed"] == settings.samples
-    probes = [row for row in report.requests if row.scenario != "sustained"]
+    probes = [row for row in workload if row.scenario != "sustained"]
     assert all(row.answer_chunks > 10 and row.score is True for row in probes)
     assert len({row.fixture_id for row in probes}) == 1
-    assert all(row.score is True for row in report.requests)
+    assert all(row.score is True for row in workload)
     assert not result.metrics.get("missing_timing_metrics")

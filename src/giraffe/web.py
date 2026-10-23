@@ -10,6 +10,7 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager, closing
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -35,14 +36,15 @@ from .caps import (
 )
 from giraffe.configuration_errors import configuration_errors as _configuration_errors
 from giraffe.capabilities import capabilities
+from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, condition_aggregate, planned_conditions
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
-from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RunConfig, RunReport,
+from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport,
                             migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
-from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
+from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
                                save_baseline_report, save_failure_summary, write_report)
@@ -115,15 +117,43 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
 
 def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> None:
     """Bound live web metadata independently of the configured arrival count."""
+    # Derived performance is requested separately, never copied into polling
+    # progress/events (including events from third-party runner integrations).
+    event = {key: value for key, value in event.items() if key != "performance"}
+    if event.get("preparation"):
+        preparation = {**event["preparation"], "target": event.get("target", "")}
+        scenario = preparation.get("scenario") or event.get("scenario", "")
+        preparation["scenario"] = scenario
+        preparations = job.setdefault("live_preparations", OrderedDict())
+        key = (preparation["target"], scenario)
+        preparations[key] = preparation
+        preparations.move_to_end(key)
+        while len(preparations) > 64:
+            preparations.popitem(last=False)
     if not event["event"].startswith("condition_"):
         job["progress"] = event
         job["events"].append(event)
         del job["events"][:-MAX_LIVE_EVENTS]
+    index = job.get("condition_requests")
+    if index is None:
+        index = job["condition_requests"] = ConditionRequestIndex()
+    index.update(event)
     summary = event.get("condition_summary")
     if not summary and event["event"] in {"condition_planned", "condition_started", "condition_finished"}:
         summary = {key: event.get(key) for key in ("target", "condition", "planned", "planned_kind",
             "status", "sent", "started", "running", "completed", "failed", "not_sent", "reason")}
     if summary and summary.get("condition"):
+        key = (summary["target"], summary["condition"]["id"])
+        plan = job.get("condition_plans", {}).get(key)
+        if plan and plan.get("planned_reason"):
+            summary = {**summary, "planned_reason": plan["planned_reason"]}
+        if plan and plan.get("planned") is not None and (summary.get("planned") is None or summary["planned"] < plan["planned"]):
+            # Some executors announce successive one-request groups. Keep the
+            # full configured condition denominator, without altering dispatch.
+            summary = {**summary, "planned": plan["planned"], "planned_kind": plan["planned_kind"]}
+        summary = {**summary, **{key: value for key, value in condition_aggregate(summary).items()
+                   if key not in {"status", "lifecycle_status"}}}
+        index.summary(summary)
         key = (summary["target"], summary["condition"]["id"])
         if key in job["conditions"] or len(job["conditions"]) < MAX_LIVE_CONDITIONS:
             job["conditions"][key] = summary
@@ -265,6 +295,47 @@ def _directory(root: Path, identifier: str) -> Path:
     if path.is_symlink() or path.resolve().parent != root.resolve():
         raise HTTPException(404, "Unknown run or baseline")
     return path
+
+
+
+def _merged_condition_rows(planned: list[dict], observed: list[dict], *, terminal=False, reason=None) -> list[dict]:
+    """Keep configured cell order through completion; evidence owns verdicts."""
+    rows = {(row.get("target"), (row.get("condition") or {}).get("id")): row for row in planned}
+    for observed_row in observed:
+        key = (observed_row.get("target"), (observed_row.get("condition") or {}).get("id"))
+        prior = rows.get(key, {})
+        row = {**prior, **observed_row}
+        if prior.get("planned") is not None and (row.get("planned") is None or row["planned"] < prior["planned"]):
+            row.update(planned=prior["planned"], planned_kind=prior["planned_kind"])
+        rows[key] = row
+    result = []
+    for row in rows.values():
+        lifecycle = row.get("status") if row.get("status") in {"waiting", "running", "finished"} else row.get("lifecycle_status", row.get("status"))
+        row = {**row, "status": lifecycle}
+        if terminal and lifecycle in {"waiting", "running"}:
+            row.update(status="finished", running=0,
+                       reason=reason or "Work was not completed before the run ended.")
+            # A stale running aggregate is never a terminal passing verdict.
+            row.pop("aggregate_status", None)
+        verdict = {"passed": "pass", "failed": "fail"}.get(row.get("aggregate_status"), row.get("aggregate_status"))
+        result.append(condition_aggregate(row, verdict=verdict))
+    return result
+
+
+def _api_report(report: RunReport) -> dict:
+    """Keep dispatch/condition metadata; fetch retained evidence on demand."""
+    result = report.model_dump(mode="json", exclude={"requests"})
+    fields = {"id", "target", "fixture_id", "scenario", "condition_id", "check_ids", "status",
+              "valid", "score", "elapsed_ms", "first_output_ms", "dispatch_ms", "completed_ms",
+              "started_at", "completed_at", "intentional", "http_status", "error", "score_message",
+              "output_chars", "stream", "finish_reason", "input_tokens", "output_tokens", "evaluation_error",
+              "requested_input_tokens", "requested_output_tokens", "input_chars", "requested_max_tokens",
+              "traffic_stage", "traffic_rate_rps", "traffic_class", "load_point", "workload"}
+    result.update(request_count=len(report.requests), requests_compact=True,
+                  requests=[{**row.model_dump(mode="json", include=fields, exclude_defaults=True),
+                             "valid": row.valid, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars}
+                            for row in report.requests])
+    return result
 
 
 def _report(path: Path) -> RunReport:
@@ -566,17 +637,26 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     if persisted is None:
                         raise HTTPException(404, "Saved report is unreadable")
                 else:
-                    persisted = _report(report_path).model_dump(mode="json")
+                    persisted = _api_report(_report(report_path))
             except (HTTPException, FileNotFoundError, NotADirectoryError):
                 meta = {**meta, "state": "error", "error": "Saved report is unreadable."}
         live = active if active.get("id") == identifier else {}
-        return {"id": identifier, "state": live.get("state", meta.get("state", "completed")),
+        state = live.get("state", meta.get("state", "completed"))
+        condition_rows = list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", [])
+        if not listing:
+            condition_rows = _merged_condition_rows(condition_rows, (persisted or {}).get("conditions", []),
+                terminal=state not in {"running", "queued", "stopping"},
+                reason=(persisted or {}).get("abort_reason") or meta.get("error"))
+            if persisted is not None:
+                persisted["conditions"] = condition_rows
+        return {"id": identifier, "state": state,
                 "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
+                "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
                 "live_requests": list(live.get("requests", {}).values()),
                 "live_request_summary": live.get("live_request_summary", meta.get("live_request_summary", {})),
                 "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
-                "live_conditions": list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", []),
+                "live_conditions": condition_rows,
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": meta.get("baseline_id"), "report": persisted, "summary": summary,
@@ -584,6 +664,81 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "bytes": run_size(directory), "kept": (directory / ".keep").is_file(),
                 "started_at": (persisted or summary or {}).get("started_at", meta.get("started_at")),
                 "finished_at": (persisted or summary or {}).get("finished_at", meta.get("finished_at"))}
+
+    # Two selections per run, four runs total. Cache derived values only, never
+    # expanded retained request evidence. File identity invalidates saved values.
+    performance_cache = OrderedDict()
+
+    def selected_performance(identifier, target=None, window=None):
+        from .performance import build_performance
+
+        directory = _directory(root, identifier)
+        live = active if active.get("id") == identifier and active.get("state") in {"running", "stopping"} else None
+        path = directory / "report.json"
+        if live is None:
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(404, "Report is not available")
+            stat = path.stat()
+            revision = (stat.st_mtime_ns, stat.st_size)
+        else:
+            revision = "live"
+        cached = performance_cache.get(identifier)
+        if cached is None or cached["revision"] != revision:
+            cached = {"revision": revision, "selections": OrderedDict()}
+            performance_cache[identifier] = cached
+        performance_cache.move_to_end(identifier)
+        while len(performance_cache) > 4:
+            performance_cache.popitem(last=False)
+        selections = cached["selections"]
+        selection = (target, window)
+        now = time.monotonic()
+        prior = selections.get(selection)
+        # Debounce live requests independently of incoming request event volume.
+        if prior is not None and (live is None or now - prior[0] < .5):
+            selections.move_to_end(selection)
+            return prior[1]
+        if live is None:
+            report = _report(path)
+        else:
+            records = []
+            for row in live.get("requests", {}).values():
+                if row.get("status") == "running" or not row.get("id"):
+                    continue
+                records.append({**{key: value for key, value in row.items()
+                                   if key in RequestRecord.model_fields and value is not None},
+                                "started_at": row.get("started_at") or live["meta"]["started_at"]})
+            conditions = list(live.get("conditions", {}).values())
+            targets = {}
+            for condition in conditions:
+                targets.setdefault(condition["target"], {"conditions": []})["conditions"].append(condition)
+            report = RunReport.model_validate(dict(run_id=identifier, started_at=live["meta"]["started_at"],
+                finished_at=_now(), overall="inconclusive", manifest={"config": live["meta"]["config"]},
+                requests=records, observations={"targets": targets}), context={"metadata_only": True})
+        try:
+            value = build_performance(report, target=target, window=window)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
+        # Window selections share the target series object in the cache as
+        # well as in the wire schema. No cached copy per measurement window.
+        if live is None:
+            for _, previous in selections.values():
+                if previous["selected_target"] == value["selected_target"] and value["targets"]:
+                    value["targets"][0]["request_series"] = previous["targets"][0]["request_series"]
+                    break
+        if live is not None:
+            started = live.get("live_request_count", 0)
+            retained = len(report.requests)
+            value["coverage"] = dict(retained_requests=retained, started_requests=started,
+                partial=True, reason="Live view uses bounded retained completed measurements; running and evicted requests are not included.")
+        selections[selection] = (now, value)
+        selections.move_to_end(selection)
+        while len(selections) > 2:
+            selections.popitem(last=False)
+        return value
+
+    @lru_cache(maxsize=8)
+    def saved_condition_requests(path: str, modified: int, size: int) -> ConditionRequestIndex:
+        return ConditionRequestIndex.from_report(_report(Path(path)))
 
     def run_summary(detail: dict) -> dict:
         report = detail["report"] or detail["summary"] or {}
@@ -628,6 +783,17 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             report.manifest["open_files"] = job["open_files"]
             if baseline is not None:
                 report = compare_baseline(report, baseline)
+            # Persist the same condition cohort shown while live, including
+            # work a stop/budget never reached. These are report observations,
+            # not executor counters or invented request records.
+            merged = _merged_condition_rows(list(job["conditions"].values()), report.conditions,
+                terminal=True, reason=report.abort_reason)
+            targets = report.observations.setdefault("targets", {})
+            for target in config.targets:
+                targets.setdefault(target.name, {})["conditions"] = [
+                    {**row, "status": row["lifecycle_status"]}
+                    for row in merged if row.get("target") == target.name]
+            report.conditions = aggregate_conditions(report)
             meta["run_id"] = report.run_id
             sampler = PhaseSampler("export")
             try:
@@ -656,6 +822,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         finally:
             finished = True
             meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
+                        live_preparations=list(job.get("live_preparations", {}).values()),
                         conditions=list(job["conditions"].values()),
                         live_request_summary=job["live_request_summary"],
                         live_request_count=job["live_request_count"])
@@ -725,6 +892,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.post("/api/targets/models")
     async def target_models(body: ModelDiscovery):
         return await discover_models(body)
+
+    @app.post("/api/targets/tokenizer")
+    async def target_tokenizer(body: TokenizerSelection):
+        from giraffe.local_tokenizer import TokenizerUnavailable, preview_tokenizer
+
+        async with start_lock:
+            if active:
+                raise HTTPException(409, "A run is active. Wait for it to finish or stop it "
+                                    "before preparing another tokenizer.")
+            try:
+                return await preview_tokenizer(body.model, body.token_id)
+            except TokenizerUnavailable as error:
+                raise HTTPException(422, str(error)) from None
 
     @app.post("/api/targets/test-connection")
     async def target_connection(body: ConnectionTest):
@@ -884,24 +1064,85 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 await run_in_threadpool(check_start, root, limits)
             except ValueError as error:
                 raise HTTPException(507, str(error)) from None
+            from giraffe.local_tokenizer import TokenizerUnavailable, ensure_tokenizers
+            try:
+                await ensure_tokenizers(config)
+            except TokenizerUnavailable as error:
+                raise HTTPException(422, detail=[{
+                    "loc": ["targets", error.target_index, "tokenizer"],
+                    "msg": str(error), "type": "tokenizer_unavailable",
+                }]) from None
             identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
             directory = _directory(root, identifier)
             directory.mkdir(parents=True)
             meta = {"id": identifier, "state": "running", "started_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                     "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
             save_metadata(directory, meta)
+            waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
+            condition_index = ConditionRequestIndex()
+            for summary in waiting:
+                condition_index.summary(summary)
             active.update(id=identifier, state="running", directory=directory, meta=meta,
                           open_files=guard,
-                          progress={}, events=[], requests=OrderedDict(), conditions={}, phases=[],
+                          progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
+                          conditions={(row["target"], row["condition_id"]): row for row in waiting},
+                          condition_requests=condition_index,
+                          condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],
                           live_request_summary={"evicted": 0, "through_slot": None, "statuses": {}},
                           live_request_count=0, evicted_running=set(), stop=asyncio.Event())
             active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": "running", "migration_notes": config._migration_notes}
+            return {"id": identifier, "state": "running", "migration_notes": config._migration_notes,
+                    "live_conditions": waiting}
 
 
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
         return run_detail(identifier)
+
+    @app.get("/api/runs/{identifier}/performance")
+    async def performance_selection(identifier: str, target: str | None = None, window: str | None = None):
+        return selected_performance(identifier, target, window)
+
+    @app.get("/api/runs/{identifier}/requests/{request_id}")
+    async def request_evidence(identifier: str, request_id: str):
+        directory = _directory(root, identifier)
+        path = directory / "report.json"
+        if path.is_symlink() or not path.is_file():
+            raise HTTPException(404, "Saved request evidence is not available yet")
+        from .report_stream import load_request
+        try:
+            record = load_request(path, request_id)
+        except (OSError, ValueError) as error:
+            raise HTTPException(404, "Saved request evidence is unavailable or unreadable") from error
+        if record is None:
+            raise HTTPException(404, "Unknown request")
+        return record.model_dump(mode="json")
+
+    @app.get("/api/runs/{identifier}/conditions/{condition_id}/requests")
+    async def condition_requests(identifier: str, condition_id: str, status: str | None = None,
+                                 page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=50),
+                                 target: str | None = None):
+        if page_size not in {10, 25, 50}:
+            raise HTTPException(422, "Rows must be 10, 25 or 50")
+        directory = _directory(root, identifier)
+        if active.get("id") == identifier:
+            index = active.setdefault("condition_requests", ConditionRequestIndex())
+        else:
+            path = directory / "report.json"
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(404, "Report is not available")
+            stat = path.stat()
+            index = saved_condition_requests(str(path), stat.st_mtime_ns, stat.st_size)
+            meta = metadata(directory)
+            for summary in _merged_condition_rows(meta.get("conditions", []), list(index.summaries.values()),
+                    terminal=True, reason=meta.get("error") or (meta.get("progress") or {}).get("reason")):
+                index.summary({**summary, "status": summary["lifecycle_status"]})
+        try:
+            return index.page(condition_id, target=target, status=status, page=page, page_size=page_size)
+        except KeyError:
+            raise HTTPException(404, "Unknown condition") from None
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
 
     @app.get("/api/runs/{identifier}/config.json")
     async def download_config(identifier: str):

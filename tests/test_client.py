@@ -310,8 +310,26 @@ async def test_stream_gap_measures_only_inter_answer_intervals(monkeypatch, dela
     async with client:
         result = await client.execute(spec())
     assert result.valid and result.answer_chunks == 2
-    assert result.elapsed_ms - result.last_output_ms >= 35
+    if delayed == "close":
+        # Transport cleanup follows [DONE] and is excluded from response timing.
+        assert result.elapsed_ms - result.last_output_ms < 35
+        assert response.closed  # Client shutdown still joins response cleanup.
+    else:
+        assert result.elapsed_ms - result.last_output_ms >= 35
     assert result.max_stream_gap_ms == pytest.approx(result.last_output_ms - result.first_output_ms)
+
+
+@pytest.mark.parametrize("tail", [b"\xff", b"data: unfinished"])
+async def test_malformed_transport_tail_after_done_preserves_completed_response(monkeypatch, tail):
+    client, response, _ = setup_client(monkeypatch, [
+        event("42", finish="stop"), b"data: [DONE]\n\n", tail,
+    ])
+    async with client:
+        result = await client.execute(spec())
+        body_bytes = result.response_body_bytes
+    assert result.status == "completed" and result.valid and result.output == "42"
+    assert result.response_body_bytes == body_bytes
+    assert response.closed and not client._stream_drains
 
 
 @pytest.mark.asyncio

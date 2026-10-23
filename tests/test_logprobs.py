@@ -14,6 +14,7 @@ from giraffe.planning import request_plan
 from giraffe.reporting import _settings_reasons, write_report
 from giraffe.runner import run_suite
 from tests.fake_endpoint import FakeEndpoint
+from tests.evidence_helpers import workload_records, workload_payloads
 from tests.test_workloads import check, config
 from tests.test_ux_catalogue import browser_logic
 
@@ -193,7 +194,7 @@ async def test_identical_answers_with_probability_drift_are_detected_through_htt
         configuration = run_config(endpoint, repetitions=4, options={
             'strict': strict, 'tolerance': .04, 'compare_levels': True, 'priming_rounds': 2})
         report = await run_suite(configuration)
-        payloads = endpoint.requests
+        payloads = workload_payloads(endpoint.requests)
     result = check(report, 'consistency')
     assert result.status == expected
     probabilities = result.metrics['logprobs']
@@ -203,8 +204,8 @@ async def test_identical_answers_with_probability_drift_are_detected_through_htt
     assert all(g['agreement_rate'] == 1 for g in result.metrics['buckets'].values())
     assert len(payloads) == 24 and all(not p['stream'] and p['logprobs'] and p['top_logprobs'] == 2 for p in payloads)
     assert all(p['messages'] == payloads[0]['messages'] and p['temperature'] == 0 and p['seed'] == 17 for p in payloads)
-    assert len({r.request_hash for r in report.requests}) == 1
-    assert len({r.history_hash for r in report.requests}) == 1
+    assert len({r.request_hash for r in workload_records(report.requests)}) == 1
+    assert len({r.history_hash for r in workload_records(report.requests)}) == 1
     assert all(m['role'] != 'assistant' for p in payloads for m in p['messages'])
 
 
@@ -226,7 +227,7 @@ async def test_rounds_priming_and_budget_coverage_are_explicit():
         plan = request_plan(configuration)
         report = await run_suite(configuration)
         limited = await run_suite(configuration.model_copy(update={'max_requests': 11}))
-    assert plan['planned_per_target'] == len(report.requests) == 16
+    assert plan['planned_per_target'] == len(workload_records(report.requests)) == 16
     result = check(report, 'consistency')
     assert result.status == 'inconclusive'
     for cohort in result.metrics['logprobs']['conditions']:
@@ -236,7 +237,7 @@ async def test_rounds_priming_and_budget_coverage_are_explicit():
         assert all(r['achieved_overlap'] == 0 for r in cohort['rounds'])
     assert len(limited.requests) == 11 and check(limited, 'consistency').status == 'inconclusive'
     assert any(c['missing_requests'] for c in check(limited, 'consistency').metrics['logprobs']['conditions'])
-    modified = copy.deepcopy(report.requests)
+    modified = copy.deepcopy(workload_records(report.requests))
     for r in modified:
         if r.workload['level'] == 2 and r.workload['round'] == 1:
             r.workload["load_qualified"] = False
@@ -252,9 +253,9 @@ async def test_disabled_mode_uses_text_workload_count_and_wire_contract():
         configuration = run_config(endpoint)
         configuration.consistency.logprobs = None
         report = await run_suite(configuration)
-        assert len(endpoint.requests) == 21
-        assert all('logprobs' not in p and 'top_logprobs' not in p for p in endpoint.requests)
-    assert all(r.logprob_evidence is None for r in report.requests)
+        assert len(workload_payloads(endpoint.requests)) == 21
+        assert all('logprobs' not in p and 'top_logprobs' not in p for p in workload_payloads(endpoint.requests))
+    assert all(r.logprob_evidence is None for r in workload_records(report.requests))
     assert 'logprobs' not in check(report, 'consistency').metrics
 
 
@@ -274,7 +275,7 @@ async def test_retention_and_export_preserve_measurements_without_token_leakage(
         index = next(i for i, r in enumerate(stored['requests']) if r['id'] == rid)
         assert f'href="#request-{index}"' in html
     assert 'Token log probabilities' in html
-    assert report.requests[0].logprob_evidence.tokens  # export does not mutate in-memory evidence
+    assert workload_records(report.requests)[0].logprob_evidence.tokens  # export does not mutate in-memory evidence
 
 
 async def test_logprob_settings_prevent_comparing_timings_with_ordinary_run():
@@ -313,7 +314,7 @@ assert.match(renderLogprobEvidence({logprob_evidence:{tokens:[{token:'<script>'}
 async def test_http_probability_evidence_classification_and_eligibility(mode, evidence_status, probability_status):
     with FakeEndpoint(mode=f'logprob_{mode}') as endpoint:
         report = await run_suite(run_config(endpoint))
-    assert {r.logprob_evidence.status for r in report.requests} == {evidence_status}
+    assert {r.logprob_evidence.status for r in workload_records(report.requests)} == {evidence_status}
     result = check(report, 'consistency').metrics['logprobs']
     assert result['status'] == probability_status
     assert not any(c['coverage_complete'] for c in result['conditions'])
@@ -390,7 +391,16 @@ async def test_api_preview_export_execution_retention_and_rerun(tmp_path):
             detail = await finished(client, identifier)
             result = next(c for c in detail['report']['checks'] if c['id'] == 'consistency')
             assert result['status'] == 'inconclusive'
-            assert all(not r['logprob_evidence']['tokens'] for r in detail['report']['requests'])
+            assert detail['report']['requests_compact']
+            assert all('logprob_evidence' not in r for r in detail['report']['requests'])
+            for row in workload_records(detail['report']['requests']):
+                evidence = await client.get(f"/api/runs/{identifier}/requests/{row['id']}")
+                assert evidence.status_code == 200
+                retained = evidence.json()
+                assert retained['id'] == row['id']
+                assert retained['logprob_evidence']['tokens'] == []
+                assert retained['output'] == retained['reasoning'] == ''
+                assert retained['logprob_evidence']['status'] == 'available'
             saved = (await client.get(f'/api/runs/{identifier}/config.json')).json()
             assert saved['consistency']['logprobs'] == normalized['consistency']['logprobs']
             rerun = await start(client, saved)
@@ -400,7 +410,8 @@ async def test_api_preview_export_execution_retention_and_rerun(tmp_path):
             invalid['consistency']['logprobs']['response_mode'] = 'stream'
             count = len(endpoint.requests)
             assert (await client.post('/api/runs', json={'config': invalid})).status_code == 422
-            assert len(endpoint.requests) == count == 32
+            assert len(endpoint.requests) == count
+            assert len(workload_payloads(endpoint.requests)) == 32
 
 
 def test_cli_example_and_execution(tmp_path, capsys):

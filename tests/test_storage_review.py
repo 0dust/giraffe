@@ -229,7 +229,7 @@ async def test_download_cancellation_waits_for_worker_before_releasing_lock(tmp_
         assert (await second).status_code == 200
 
 
-async def test_cancelled_run_skips_cleanup_and_always_persists_final_state(tmp_path, monkeypatch):
+async def test_cancelled_run_skips_cleanup_and_always_persists_final_state(tmp_path, monkeypatch, local_tokenizer):
     captured, entered = [], asyncio.Event()
 
     async def runner(configuration, **kwargs):
@@ -253,7 +253,7 @@ async def test_cancelled_run_skips_cleanup_and_always_persists_final_state(tmp_p
     assert "auto_cleanup" not in meta
 
 
-async def test_cancellation_during_cleanup_waits_and_records_log_before_clearing_active(tmp_path, monkeypatch):
+async def test_cancellation_during_cleanup_waits_and_records_log_before_clearing_active(tmp_path, monkeypatch, local_tokenizer):
     import giraffe.web as web
 
     write_report(synthetic_report(2, 10, "none"), tmp_path / "old")
@@ -331,7 +331,7 @@ async def test_cancelled_json_stream_closes_lookup_and_releases_download_lease(t
         assert all(not path.exists() for path in temporary_paths)
 
 
-def test_default_runs_root_cleanup_does_not_adopt_cwd(tmp_path, monkeypatch, capsys):
+def test_default_runs_root_cleanup_does_not_adopt_cwd(tmp_path, monkeypatch, capsys, local_tokenizer):
     from tests.test_storage_cli_regressions import run_arguments
 
     monkeypatch.chdir(tmp_path)

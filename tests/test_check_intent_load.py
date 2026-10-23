@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 import pytest
 
 from giraffe import runner, traffic, load_test
-from tests.test_concurrent_load import Client as TokenClient, configuration as load_configuration, short_windows
 from giraffe.models import Limits, RequestRecord, TrafficConfig
 from giraffe.runner import run_suite
+from tests.test_concurrent_load import Client as TokenClient, configuration as load_configuration, short_windows
 from tests.fake_endpoint import FakeEndpoint
 from tests.test_load_reliability import LoadClient
 from tests.test_runner import check, config
@@ -23,6 +23,9 @@ async def load_run(*, client=None, duration=.5, rates=(20,), pattern="constant",
     run = runner._Run(cfg,None,None)
     await load_test.execute(run,cfg.targets[0],client or TokenClient())
     return run,load_test.result(run,cfg.targets[0])
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 @pytest.fixture
@@ -219,7 +222,7 @@ async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
         report=await run_suite(c)
     result=next(v for v in report.checks if v.id == 'load')
     p=result.metrics['points'][0]
-    assert any(r.status == 'cancelled' for r in report.requests if r.load_point.get('point_id') == p['id'])
+    assert any(r.status == 'cancelled' for r in report.requests if (r.load_point or {}).get('point_id') == p['id'])
     assert p['cancelled']>0 and p['status'] == result.status == 'inconclusive'
 
 
@@ -409,3 +412,6 @@ async def test_unscored_sustained_completions_block_a_recovery_pass(endpoint, mo
     report = await runner.run_suite(config(checks=["recovery"], limits=Limits(latency_ms=5000, min_samples=2)))
     result = check(report, "recovery")
     assert result.metrics["unscored_completions"] > 0 and result.status == "inconclusive"
+
+
+# Match fake endpoint token usage while exercising the real local-sizing path.

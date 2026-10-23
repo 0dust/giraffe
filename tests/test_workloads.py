@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+
 from pydantic import ValidationError
 
 from giraffe.models import RequestRecord, RunConfig, Sessions, Target
@@ -14,6 +15,9 @@ from giraffe.runner import _checks, _missing_timing, _stats, _timing_violations,
 from giraffe.workloads import results, spec
 from giraffe.fixtures import score_response
 from tests.fake_endpoint import FakeEndpoint
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def config(endpoint, **extra):
@@ -146,8 +150,6 @@ async def test_failed_semantic_turn_stops_session_before_next_user_turn(repeat_p
     assert (
         "failed task" in check(report, "sessions").metrics["sessions"]["sessions"][0]["stop_reason"]
     )
-
-
 
 
 
@@ -345,7 +347,10 @@ async def test_cancellation_stops_arrival_scheduler_and_saves_partial_evidence()
     "mode", ["healthy", "variable_correct", "wrong", "http_error", "overlap_variation"]
 )
 async def test_consistency_hashes_before_retention_and_separates_task_correctness(tmp_path, mode):
-    with FakeEndpoint(mode=mode, first_token_delay=0.02, chunk_delay=0.006) as endpoint:
+    # The one-word wrong answer needs a long enough stream to evidence overlap.
+    # Keep the same pass/correctness assertions without depending on a 6ms window.
+    with FakeEndpoint(mode=mode, first_token_delay=0.02,
+                      chunk_delay=0.03 if mode == "wrong" else 0.006) as endpoint:
         report = await run_suite(
             config(endpoint, consistency={"repetitions": 4, "shapes": ["short"]},
                    retention="none", stop_after_errors=100)
@@ -385,8 +390,6 @@ async def test_strict_consistency_and_insufficient_samples_are_explicit():
         short = await run_suite(config(endpoint, max_requests=4, consistency={"shapes": ["short"]}))
     assert check(strict, "consistency").status == "fail"
     assert check(short, "consistency").status == "inconclusive"
-
-
 
 
 
@@ -464,10 +467,9 @@ async def test_retained_unselected_workloads_send_no_workload_requests():
             sessions={}, consistency={}, tool_calling=True,
         ))
     assert {check.id for check in report.checks if check.status != "skipped"} == {"serving"}
-    assert not any(record.workload for record in report.requests)
+    assert {r.scenario for r in report.requests} == {"initial", "warm", "performance_evidence_probe"}
+    assert not any(r.load_point for r in report.requests)
     assert not any(payload.get("tools") for payload in endpoint.requests)
-
-
 
 
 def text_tool_fixture(identifier='weather-text'):
@@ -489,14 +491,17 @@ async def test_configured_tool_content_scored_independently_over_real_http(mode,
     with FakeEndpoint(mode=mode) as endpoint:
         configuration = config(endpoint, checks=['tools'], tool_checks={'fixtures': [text_tool_fixture()]})
         report = await run_suite(configuration)
-        requests = list(endpoint.requests)
+        requests = [p for p in endpoint.requests if p.get("tools")]
+    records = [r for r in report.requests if "tools" in r.check_ids]
+    assert len(records) == 2
+    assert len(report.requests) == len(records) + 1
     result = check(report, 'tools')
     assert result.status == expected_status
     assert len(requests) == 2 and {p['stream'] for p in requests} == {False, True}
-    assert all(r.tool_evaluation.calls.status == 'pass' for r in report.requests)
-    assert all(r.tool_evaluation.content.status == expected_status for r in report.requests)
-    assert all(r.tool_evaluation.protocol.status == 'pass' for r in report.requests)
-    assert all(r.evaluation.tool_expectation.expected_calls[0].arguments == {'city': 'Warsaw'} for r in report.requests)
+    assert all(r.tool_evaluation.calls.status == 'pass' for r in records)
+    assert all(r.tool_evaluation.content.status == expected_status for r in records)
+    assert all(r.tool_evaluation.protocol.status == 'pass' for r in records)
+    assert all(r.evaluation.tool_expectation.expected_calls[0].arguments == {'city': 'Warsaw'} for r in records)
     assert result.metrics['parity']['status'] == 'not_established'
     assert result.metrics['parity']['basis'] == 'independent_generations'
     assert len(result.metrics['outcomes']) == 2

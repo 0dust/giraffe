@@ -1,227 +1,151 @@
-"""Condition cards keep a test distinct from its individual request evidence."""
+"""Shared condition skin, bounded dialog pages and stable live evidence."""
+
+from pathlib import Path
 
 from tests.test_ux_results import run_render_checks
 
 
-def test_one_condition_has_one_card_and_all_32_request_spots():
+DIALOG_SETUP = r"""
+state.detail={id:'condition-run',state:'running',config:{targets:[{name:'local'}]}};
+if(!$('#test-dialog')){const dialog=document.createElement('dialog');dialog.setAttribute('id','test-dialog');document.body.insertBefore(dialog,null);}
+const condition={id:'bucket_c1000_short_short',label:'Short input / short output · 1,000 at once',check:'buckets',parameters:{concurrency:1000}};
+let aggregate={target:'local',condition,condition_id:condition.id,check_id:'buckets',name:condition.label,concurrency_description:'1,000 at once',aggregate_status:'running',status:'running',planned:1000,planned_kind:'exact',started:1000,running:1000,completed:0,failed:0,not_started:0};
+let remaining=1000,empty=false,calls=[];
+api=async path=>{
+ calls.push(path);const query=Object.fromEntries(path.split('?')[1].split('&').map(part=>part.split('=').map(decodeURIComponent)));
+ const size=Number(query.page_size),total=empty?0:remaining,pages=Math.max(1,Math.ceil(total/size)),page=Math.min(Number(query.page),pages),start=(page-1)*size;
+ return {aggregate,condition_id:condition.id,target:'local',page,page_size:size,pages,total,range_start:total?start+1:0,range_end:Math.min(start+size,total),number_width:4,totals:{running:remaining,passed:0,failed:0,timed_out:0,cancelled:0,unscored:0,not_started:0},rows:Array.from({length:Math.min(size,Math.max(0,total-start))},(_,i)=>({number:start+i+1,request_id:'r'+(start+i+1),status:'running',result_text:'Awaiting response'}))};
+};
+const draw=()=>patchHTML($('#main'),renderTests([],{live:true,conditions:[aggregate]}));
+const settle=async()=>{await Promise.resolve();await Promise.resolve();await Promise.resolve();};
+const click=name=>handleConditionClick({target:$('[data-condition-action="'+name+'"]')});
+draw();
+"""
+
+
+def test_shared_skin_has_one_glyph_only_cell_at_32_and_1000_concurrency():
     run_render_checks(r"""
-const condition={id:'bucket_c32_short_short',label:'Short input / short output · 32 at once',check:'size_matrix'};
-const records=Array.from({length:32},(_,slot)=>({slot,id:'r'+slot,target:'local',scenario:condition.id,condition_id:condition.id,status:'completed',valid:true,score:true}));
-const html=renderTests(records,{live:true,conditions:[{target:'local',condition,planned:32,planned_kind:'exact',started:32,completed:32,running:0,failed:0,not_sent:0,status:'finished'}]});
-assert.equal((html.match(/class="test-condition"/g)||[]).length,1);
-assert.match(html,/Short input \/ short output · 32 at once/);
-for(const label of ['Planned','Started','Running','Completed','Failed/timed out','Not started'])assert(html.includes(label));
-assert.match(html,/<dt>Planned<\/dt><dd>32<\/dd>/);
-assert.match(html,/<dt>Completed<\/dt><dd>32<\/dd>/);
-assert.match(html,/Finished/);
-assert.equal((html.match(/class="request-spot /g)||[]).length,32);
-assert.match(html,/data-live-slot="31"/);
-assert.match(html,/<details class="condition-requests"[^>]*><summary>Individual requests · 32<\/summary>/);
-""")
-
-
-def test_partial_dispatch_and_live_totals_survive_capped_request_evidence():
-    run_render_checks(r"""
-const condition={id:'partial',label:'Partial cell',check:'size_matrix'};
-const html=renderTests([{slot:0,target:'local',condition_id:'partial',status:'timeout'}],{live:true,conditions:[{target:'local',condition,planned:32,planned_kind:'upper_bound',started:24,completed:24,running:0,failed:3,not_sent:8,status:'finished',reason:'sending window ended'}]});
-assert.match(html,/<dt>Planned<\/dt><dd>up to 32<\/dd>/);
-assert.match(html,/<dt>Started<\/dt><dd>24<\/dd>/);
-assert.match(html,/<dt>Failed\/timed out<\/dt><dd>3<\/dd>/);
-assert.match(html,/Stopped early/);assert.match(html,/8 not sent: sending window ended/);
-assert.match(html,/3 of 24 requests failed/);
-""")
-
-
-def test_saved_condition_keeps_group_check_verdict_separate_from_request_failures():
-    run_render_checks(r"""
-const condition={id:'cell',label:'Cell <32>',check:'buckets'};
-const records=Array.from({length:32},(_,i)=>({id:'r'+i,target:'local',condition_id:'cell',status:i<3?'timeout':'completed',valid:true,score:true}));
-const saved=report([check('concurrency','fail',{metrics:{scenarios:{size_matrix:{id:'buckets',status:'inconclusive'}}}})],{requests:records,observations:{targets:{local:{conditions:[{condition,planned:32,planned_kind:'exact',status:'finished',started:32,completed:32,running:0,failed:3,not_sent:0}]}}}});
-const html=renderTests(records,{report:saved});
-assert.match(html,/Cell &lt;32&gt;/);assert.match(html,/Finished/);
-assert.match(html,/<div class="test-check-heading">[\s\S]*?class="status fail"/);assert.match(html,/3 of 32 requests failed/);
-assert.doesNotMatch(html.match(/<article[\s\S]*?<\/article>/)[0],/class="status /);
-assert.equal((html.match(/data-request=/g)||[]).length,32);
-""")
-
-
-def test_legacy_saved_requests_group_by_scenario_and_target():
-    run_render_checks(r"""
-const records=[{id:'a',target:'local',scenario:'warm',status:'completed'},
- {id:'b',target:'local',scenario:'warm',status:'timeout'},
- {id:'c',target:'other',scenario:'warm',status:'completed'}];
-const html=renderTests(records,{report:report([],{requests:records})});
-assert.equal((html.match(/class="test-condition"/g)||[]).length,2);
-assert.equal((html.match(/<h3>Warm-up<\/h3>/g)||[]).length,2);
-assert.match(html,/<h3 class="test-target">local<\/h3>/);assert.match(html,/<h3 class="test-target">other<\/h3>/);
-assert.match(html,/1 of 2 requests failed/);
-assert.equal((html.match(/class="request-spot /g)||[]).length,3);
-""")
-
-
-def test_individual_request_mosaic_is_secondary_closed_and_preserved_live_and_saved():
-    run_render_checks(r"""
-const records=[{id:'one',target:'local',scenario:'warm',status:'completed'}];
-let html=detail(report([check('access','pass')],{requests:records}));
-assert(html.indexOf('<h2>Tests</h2>')<html.indexOf('class="all-requests"'));
-assert.match(html,/<details class="all-requests"[^>]*><summary>Individual requests · 1<\/summary>/);
-assert.doesNotMatch(html,/<details class="all-requests"[^>]*\bopen\b/);
-assert.match(html,/<details class="all-requests"[\s\S]*class="request-mosaic/);
-state.detail={id:'live',state:'running',config:{targets:[],max_requests:32},live_requests:[{slot:0,target:'local',scenario:'warm',status:'running'}]};renderLive();html=nodes['#main'].innerHTML;
-assert.match(html,/<details class="all-requests"[^>]*><summary>Individual requests · 1<\/summary>/);
-assert.match(html,/request-mosaic is-live/);assert.match(html,/data-live-slot="0"/);
-""")
-
-
-def test_closed_condition_spots_stay_current_without_running_after_completion():
-    run_render_checks(r"""
-state.detail={id:'cached',state:'running'};
-const record={slot:0,target:'local',scenario:'warm',status:'running'};
-let html=renderTests([record],{live:true});
-assert.match(html,/class="request-spot running"/);
-record.status='timeout';html=renderTests([record],{live:true});
-assert.match(html,/1 of 1 requests failed/);assert.match(html,/class="request-spot timeout"/);assert.doesNotMatch(html,/class="request-spot running"/);
-const key=[...conditionViews.keys()][0],content={innerHTML:''};
-const disclosure={open:true,dataset:{conditionKey:key},matches:s=>s==='.condition-requests',querySelector:()=>content};
-listeners.toggle({target:disclosure});assert.match(content.innerHTML,/class="request-spot timeout"/);
-html=renderTests([record],{live:true});assert.match(html,/<details class="condition-requests"[^>]* open>/);assert.match(html,/class="request-spot timeout"/);
-""")
-
-
-def test_legacy_unscored_requests_and_unknown_plans_stay_qualified():
-    run_render_checks(r"""
-const records=[{id:'null',target:'local',scenario:'warm',status:'completed',valid:true,score:null},
- {id:'missing',target:'local',scenario:'warm',status:'completed',valid:true}];
-let html=renderTests(records,{report:report([check('serving','inconclusive',{evidence_ids:['null','missing']})],{requests:records})});
-assert.equal((html.match(/class="request-spot inconclusive"/g)||[]).length,2);
-assert.match(html,/class="status inconclusive"/);assert.doesNotMatch(html,/requests failed/);
-html=renderTests(records,{live:true,conditions:[{target:'local',condition:{id:'warm',label:'Warm-up',check:'serving'},planned:null,not_sent:null,status:'running',started:2,completed:2,failed:0,running:0}]});
-assert.match(html,/<dt>Planned<\/dt><dd>—<\/dd>/);
-assert.match(html,/<dt>Not started<\/dt><dd>—<\/dd>/);
-""")
-
-
-def test_disclosures_keep_open_state_when_run_finishes():
-    run_render_checks(r"""
-state.detail={id:'same-run',state:'running'};
-const record={id:'r',slot:0,target:'local',scenario:'warm',status:'completed'};
-renderTests([record],{live:true});const key=[...conditionViews.keys()][0];conditionOpen.add(key);state.allRequestsOpen=true;
-state.detail.state='completed';
-const html=renderTests([record],{report:report([],{requests:[record]})});
-assert.match(html,/<details class="condition-requests"[^>]* open>/);assert.match(html,/data-request="r"/);assert.doesNotMatch(html,/data-live-slot=/);
-assert.match(renderAllRequests([record]),/<details class="all-requests" open>/);
-""")
-
-
-def test_live_poll_preserves_condition_and_all_requests_summary_focus():
-    from tests.test_ui_navigation import run_browser_script
-
-    run_browser_script(r"""
-const page=browser();await page.run('init()');
-await page.run(`
-(async()=>{
-state.detail={id:'focus-run',state:'running',config:state.config,live_requests:[{slot:0,target:'local',scenario:'warm',status:'running'}]};
-renderLive();const key=[...conditionViews.keys()][0];
-let focused=0;
-const condition={dataset:{conditionKey:key},querySelector:()=>({focus(options){assert(options.preventScroll);focused++;}})};
-const all={querySelector:()=>({focus(options){assert(options.preventScroll);focused++;}})};
-nodes['.all-requests']=all;const help={};nodes['.condition-count-help > summary']={focus(options){assert(options.preventScroll);focused++;}};
-document.querySelectorAll=q=>q==='.condition-requests'?[condition]:[];
-api=async()=>state.detail;
-for(const selected of [condition,all,help]){
- document.activeElement={tagName:'SUMMARY',closest:q=>q==='.condition-requests'?selected===condition?condition:null:q==='.all-requests'?selected===all?all:null:q==='.condition-count-help'?selected===help?help:null:null};
- await pollDetail(state.routeVersion);
+for(const count of [32,1000])for(const status of ['waiting','running','passed']){
+ state.detail={id:count+'-'+status,state:'running'};
+ const condition={id:'cell',label:'Short input / short output',check:'buckets',parameters:{concurrency:count}};
+ const html=renderTests([],{live:true,conditions:[{target:'local',condition,aggregate_status:status,status,planned:count,started:status==='waiting'?0:count,running:status==='running'?count:0,completed:status==='passed'?count:0,failed:0}]});
+ assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
+ assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,1);
+ assert.equal((html.match(/class="spot-glyph"/g)||[]).length,1);
+ const cell=html.match(/<g class="condition-spot[\s\S]*?<\/g>/)[0];
+ assert.doesNotMatch(cell.match(/<text[\s\S]*?<\/text>/)[0],/>[^<]*\d/);
+ assert.doesNotMatch(html,/test-condition|Inspect test|condition-requests|data-live-slot/);
+ assert.match(html,/1 test condition/);assert.match(html,/mosaic-legend/);
 }
-assert.equal(focused,3);
-})()
-`);
 """)
 
 
-def test_saved_verdict_uses_record_evidence_when_default_check_was_not_selected():
+def test_shared_geometry_identity_and_terminal_animation_survive_live_updates_and_extension():
     run_render_checks(r"""
-const record={id:'first',target:'local',scenario:'initial',condition_id:'initial',status:'completed'};
-const saved=report([check('access','skipped'),check('serving','pass',{evidence_ids:['first']})],{requests:[record],observations:{targets:{local:{conditions:[{condition:{id:'initial',label:'First request',check:'access'},planned:1,status:'finished',started:1,completed:1,running:0,failed:0,not_sent:0}]}}}});
-const html=renderTests([record],{report:saved});assert.match(html,/class="status pass"/);assert.doesNotMatch(html,/class="status skipped"/);
-""")
+state.detail={id:'skin',state:'running'};
+const summary=(id,status)=>({target:'local',condition:{id,label:id,check:'buckets'},aggregate_status:status,status,planned:32,started:32,running:status==='running'?32:0,completed:status==='running'?0:32,failed:0});
+let conditions=[summary('first','passed'),summary('second','running')];
+const draw=()=>patchHTML($('#main'),renderTests([],{live:true,conditions}),{landing:true});
+draw();const first=$$('.condition-spot')[0],running=$$('.condition-spot')[1],polygon=$('polygon',running),points=polygon.getAttribute('points');
+first.focus({preventScroll:true});draw();assert.equal($$('.condition-spot')[0],first);assert.equal(document.activeElement,first);assert.equal($('polygon',running),polygon);
+conditions.push(summary('new','waiting'));draw();assert.equal($('polygon',running).getAttribute('points'),points);
+conditions[1]=summary('second','passed');draw();assert(!running.classList.contains('running'));const animations=running.animationCalls.length;draw();assert.equal(running.animationCalls.length,animations);
+assert.equal($$('.condition-spot.running').length,0);assert.equal($$('.condition-spot').length,3);
+assert.equal($$('polygon',first).length,1);
+""", dom=True)
 
 
-def test_live_poll_restores_mosaic_spot_in_its_own_disclosure():
-    from tests.test_ui_navigation import run_browser_script
+def test_css_pulses_only_active_cells_and_respects_reduced_motion():
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    assert '.request-spot:is(.running, .stopping) polygon { animation: spot-live' in css
+    assert '@media(prefers-reduced-motion:reduce) { .condition-spot polygon { animation:none!important; } }' in css
+    assert '.condition-spot.pass polygon { animation:' not in css
+    assert '.test-condition {' not in css
 
-    run_browser_script(r"""
-const page=browser();await page.run('init()');
-await page.run(`
+
+def test_aggregate_progress_never_scans_request_evidence_and_counts_stay_whole_condition():
+    run_render_checks(DIALOG_SETUP+r"""
 (async()=>{
-state.detail={id:'slots',state:'running',config:state.config,live_requests:[{slot:0,target:'local',scenario:'warm',status:'running'}]};renderLive();
-let restored=0,hiddenFocused=0;
-const visible={focus(){restored++;}},hidden={focus(){hiddenFocused++;}};
-nodes['[data-live-slot="0"]']=hidden;
-nodes['.all-requests']={querySelector:q=>q==='[data-live-slot="0"]'?visible:null};
-document.activeElement={dataset:{liveSlot:'0'},closest:()=>null};api=async()=>state.detail;
-await pollDetail(state.routeVersion);assert.equal(restored,1);assert.equal(hiddenFocused,0);
+ const requests=new Proxy([],{get(){throw Error('must use aggregate without scanning requests');}});
+ renderTests(requests,{live:true,conditions:[aggregate]});
+ openConditionDialog([...conditionViews.keys()][0]);await settle();
+ const dialog=$('#test-dialog');assert(dialog.open);assert.match(dialog.textContent,/RUNNING/);
+ for(const label of ['Planned','Started','Running','Completed','Failed / timed out','Not started'])assert(dialog.textContent.includes(label));
+ assert.equal($$('tbody tr',dialog).length,10);assert.match(dialog.textContent,/1–10 of 1,000 requests/);
+ assert.match(dialog.textContent,/1,000/);assert.match(calls.at(-1),/status=all&page=1&page_size=10/);
+ assert.match(dialog.textContent,/Back to tests/);
 })()
-`);
-""")
+""", dom=True)
 
 
-def test_restored_open_disclosure_toggle_does_not_replace_focused_spots():
+def test_dialog_pagination_jump_sizes_filters_empty_state_and_validation():
+    run_render_checks(DIALOG_SETUP+r"""
+(async()=>{
+ openConditionDialog([...conditionViews.keys()][0]);await settle();
+ click('last');await settle();assert.equal(conditionDialog.page,100);assert.match($('#test-dialog').textContent,/991–1,000 of 1,000 requests/);assert.equal($$('tbody tr').length,10);
+ click('prev');await settle();assert.equal(conditionDialog.page,99);
+ click('first');await settle();assert.equal(conditionDialog.page,1);
+ const jump=$('#condition-page-number');jump.value='100';click('go');await settle();assert.equal(conditionDialog.page,100);
+ jump.value='101';click('go');assert.match($('#condition-page-error').textContent,/Enter a page from 1 to 100/);assert.equal(conditionDialog.page,100);
+ for(const size of [25,50,10]){const select=$('#condition-page-size');select.value=String(size);handleConditionChange({target:select});await settle();assert.equal(conditionDialog.page,1);assert.equal($$('tbody tr').length,size);assert.match(calls.at(-1),new RegExp('page_size='+size));}
+ empty=true;const filter=$('#condition-filter');filter.value='failed';handleConditionChange({target:filter});await settle();
+ assert.equal(conditionDialog.filter,'failed');assert.equal(conditionDialog.page,1);assert.match($('#test-dialog').textContent,/No requests match this status/);assert.match($('#test-dialog').textContent,/0–0 of 0 requests/);assert.equal($$('[data-condition-request]').length,0);
+ assert.match($('#test-dialog').textContent,/1,000/,'whole-condition counts survive empty filter');
+})()
+""", dom=True)
+
+
+def test_dialog_live_updates_preserve_filter_size_focus_and_clamp_shrinking_page():
+    run_render_checks(DIALOG_SETUP+r"""
+(async()=>{
+ openConditionDialog([...conditionViews.keys()][0]);await settle();
+ $('#condition-page-size').value='25';handleConditionChange({target:$('#condition-page-size')});await settle();
+ $('#condition-filter').value='running';handleConditionChange({target:$('#condition-filter')});await settle();click('last');await settle();assert.equal(conditionDialog.page,40);
+ const focused=$('#condition-page-number');focused.value='40';focused.focus({preventScroll:true});
+ remaining=27;aggregate={...aggregate,running:27,completed:973};draw();await refreshConditionDialog({force:true});
+ assert.equal(conditionDialog.page,2);assert.equal(conditionDialog.size,25);assert.equal(conditionDialog.filter,'running');assert.equal(document.activeElement,focused);assert.equal(focused.value,'2');assert.match($('#test-dialog').textContent,/26–27 of 27 requests/);
+ assert.equal($$('tbody tr').length,2);assert.match($('#test-dialog').textContent,/973/);
+ closeConditionDialog();assert(!$('#test-dialog').open);assert.equal(document.activeElement,$('.condition-spot'));
+})()
+""", dom=True)
+
+
+def test_dialog_keyboard_navigation_tooltips_request_evidence_and_escape_focus_return():
+    run_render_checks(DIALOG_SETUP+r"""
+(async()=>{
+ aggregate={...aggregate,condition:{...condition,id:'second'},condition_id:'second'};
+ patchHTML($('#main'),renderTests([],{live:true,conditions:[{...aggregate,condition:{...condition,id:'first'}},aggregate]}));
+ const cells=$$('.condition-spot');let prevented=0;const key=(target,key)=>handleConditionKeydown({target,key,preventDefault(){prevented++;}});
+ cells[0].focus({preventScroll:true});key(cells[0],'ArrowRight');assert.equal(document.activeElement,cells[1]);assert.equal(cells[1].getAttribute('tabindex'),'0');assert.equal(cells[0].getAttribute('tabindex'),'-1');
+ assert.match($('title',cells[1]).textContent,/Concurrent load|Input|output|1,000/);
+ key(cells[1],'Enter');await settle();assert($('#test-dialog').open);
+ let request=null;openRequest=id=>request=id;handleConditionClick({target:$('[data-condition-request]')});assert.equal(request,'r1');assert($('#test-dialog').open);
+ key($('#condition-page-number'),'Escape');assert(!$('#test-dialog').open);assert.equal(document.activeElement,cells[1]);assert(prevented>=3);
+})()
+""", dom=True)
+
+
+def test_saved_and_legacy_conditions_use_same_skin_without_promoting_finished_to_passed():
     run_render_checks(r"""
-state.detail={id:'native-toggle',state:'running'};
-const record={slot:0,target:'local',scenario:'warm',status:'running'};
-renderTests([record],{live:true});const key=[...conditionViews.keys()][0];
-conditionOpen.add(key);renderTests([record],{live:true});
-let writes=0;
-const content={get innerHTML(){return conditionSpots.get(key);},set innerHTML(value){writes++;}};
-const disclosure={open:true,dataset:{conditionKey:key},matches:s=>s==='.condition-requests',querySelector:()=>content};
-listeners.toggle({target:disclosure});
-assert.equal(writes,0,'queued toggle on recreated open details must retain restored focused spot');
+const conditions=[{target:'local',condition:{id:'a',label:'Explicit pass',check:'buckets'},status:'finished',planned:32,started:32,completed:32,failed:0},{target:'local',condition:{id:'b',label:'Unscored',check:'buckets'},status:'finished',planned:null,started:32,completed:32,failed:0}];
+const saved=report([check('concurrency','fail',{metrics:{scenarios:{size_matrix:{id:'buckets',status:'fail',metrics:{buckets:{a:{status:'pass'}}}}}}})],{conditions});
+let html=renderTests([],{report:saved});const cells=html.match(/<g class="condition-spot[\s\S]*?<\/g>/g);assert.equal(cells.length,2);assert.match(cells[0],/request-spot pass/);assert.match(cells[1],/request-spot inconclusive/);
+assert.equal(conditionViews.get(JSON.stringify(['local','b'])).summary.planned,null);
+const legacy=[{id:'one',target:'local',scenario:'short',status:'completed'},{id:'two',target:'local',scenario:'short',status:'timeout'},{id:'three',target:'other',scenario:'short',status:'completed'}];
+html=renderTests(legacy,{report:report([],{requests:legacy})});assert.equal((html.match(/class="condition-spot /g)||[]).length,2);assert.match(html,/request-spot fail/);assert.match(html,/request-spot inconclusive/);
+assert.doesNotMatch(html,/test-condition|condition-requests/);
 """)
 
 
-def test_condition_cards_only_show_explicit_condition_results_and_group_check_verdict_once():
-    run_render_checks(r"""
-const conditions=['short','long'].map(shape=>({condition:{id:'bucket_c32_'+shape+'_short',label:shape,check:'buckets',level:32},planned:32,status:'finished',started:32,completed:32,failed:0,not_sent:0}));
-const saved=report([check('concurrency','fail',{metrics:{scenarios:{size_matrix:{id:'buckets',status:'fail',metrics:{buckets:{bucket_c32_short_short:{status:'pass'},bucket_c32_long_short:{coverage_gaps:['Not enough overlap']}}}}}}})],{observations:{targets:{local:{conditions}}}});
-const html=renderTests([],{report:saved});
-assert.equal((html.match(/class="status fail"/g)||[]).length,1,'owning verdict appears on the check header once');
-assert.match(html,/<div class="test-check-heading"><h3>Concurrent load<\/h3>[\s\S]*?class="status fail"/);
-assert.match(html,/data-condition-check="concurrency"/);assert.match(html,/2 tests/);
-const cards=html.match(/<article class="test-condition"[\s\S]*?<\/article>/g);
-assert.match(cards[0],/class="status pass"/);assert.doesNotMatch(cards[0],/class="status fail"/);
-assert.doesNotMatch(cards[1],/class="status (?:pass|fail|inconclusive)"/,'unassessed cell must not inherit check verdict');
-""")
-
-
-def test_explicit_consistency_stress_and_tool_results_map_to_own_cards():
-    run_render_checks(r"""
-const checks=[check('consistency','fail',{metrics:{logprobs:{conditions:[{shape:'short',level:4,status:'pass'},{shape:'long',level:4,status:'fail'}]}}}),check('concurrency','fail',{metrics:{scenarios:{token_stress:{id:'token_stress',status:'fail',metrics:{cases:{reasoning:{levels:{4:{status:'pass'}}}}}}}}}),check('tools','fail',{metrics:{conversations:[{fixture_id:'weather',mode:'stream',status:'pass'}]}})];
-const conditions=[['consistency_c4_short','consistency'],['stress_reasoning_c4','token_stress'],['tools_weather_stream','tools']].map(([id,check])=>({condition:{id,label:id,check},planned:1,started:1,completed:1,status:'finished',failed:0,not_sent:0}));
-const html=renderTests([],{report:report(checks,{observations:{targets:{local:{conditions}}}})});
-const cards=html.match(/<article class="test-condition"[\s\S]*?<\/article>/g);
-assert.equal(cards.length,3);for(const card of cards){assert.match(card,/class="status pass"/);assert.doesNotMatch(card,/class="status fail"/);}
-""")
-
-
-def test_matrix_54_waiting_cards_are_compact_grouped_by_six_levels():
-    run_render_checks(r"""
-state.detail={id:'planned-matrix',state:'running',config:{targets:[{name:'local'}]}};
-const conditions=[1,2,4,8,16,32].flatMap(level=>['short','medium','long'].flatMap(input=>['short','medium','long'].map(output=>({target:'local',condition:{id:`bucket_c${level}_${input}_${output}`,label:`${input} / ${output}`,check:'buckets',level},planned:Math.max(8,level),planned_kind:'upper_bound',started:0,completed:0,failed:0,running:0,not_sent:Math.max(8,level),status:'waiting'}))));
-const html=renderTests([],{conditions,live:true});
-assert.equal((html.match(/class="test-condition"/g)||[]).length,54);
-assert.equal((html.match(/class="test-check"/g)||[]).length,1);
-assert.equal((html.match(/class="test-level"/g)||[]).length,6);
-assert.match(html,/<h4 class="test-level">32 at once<\/h4>/);
-assert.equal((html.match(/class="condition-status"[^>]*><span[^>]*>○<\/span> Waiting/g)||[]).length,54);
-assert.match(html,/Started 0\/up to 8 · Failed 0 · Not started 8/);
-const card=html.match(/<article class="test-condition"[\s\S]*?<\/article>/)[0];
-assert(card.indexOf('class="condition-counts"')>card.indexOf('<details class="condition-requests"'));
-assert.doesNotMatch(card.split('<details')[0],/<dl/);
-assert.match(html,/<details class="condition-count-help"><summary>What do these counts mean\?<\/summary>/);
-assert.doesNotMatch(html,/<details class="condition-count-help" open/);
-""")
-
-
+def test_partial_unknown_upper_bound_and_failed_counts_are_honest_in_dialog():
+    run_render_checks(DIALOG_SETUP+r"""
+(async()=>{
+ aggregate={...aggregate,aggregate_status:'stopped',status:'stopped',planned:32,planned_kind:'upper_bound',started:24,running:0,completed:24,failed:3,not_started:8,reasons:['sending window ended']};remaining=24;draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
+ assert.match($('#test-dialog').textContent,/up to 32/);assert.match($('#test-dialog').textContent,/8 not sent: sending window ended/);assert.match($('#test-dialog').textContent,/STOPPED/);
+ assert.match($('#test-dialog').innerHTML,/<dt>Completed<\/dt><dd>24<\/dd>/);assert.match($('#test-dialog').innerHTML,/<dt>Failed \/ timed out<\/dt><dd>3<\/dd>/);
+ aggregate={...aggregate,planned:null,planned_kind:'unknown',not_started:null};draw();await refreshConditionDialog({force:true});assert.match($('#test-dialog').innerHTML,/<dt>Planned<\/dt><dd>—<\/dd>/);assert.match($('#test-dialog').innerHTML,/<dt>Not started<\/dt><dd>—<\/dd>/);
+})()
+""", dom=True)
 def test_card_request_focus_does_not_pause_individual_request_mosaic_following():
     run_render_checks(r"""
 const records=[{slot:0,status:'completed'},{slot:240,status:'running'}];
@@ -242,53 +166,6 @@ state.detail={id:'events',state:'running',config:{targets:[],max_requests:32},ev
 renderLive();const html=nodes['#main'].innerHTML;
 assert.match(html,/Request completed/);assert.doesNotMatch(html,/Condition started|Condition finished|secret-start|secret-finish/);
 """)
-
-
-def test_count_definitions_disclosure_stays_open_through_live_poll_rendering():
-    run_render_checks(r"""
-state.detail={id:'count-help',state:'running'};
-renderTests([],{live:true});
-listeners.toggle({target:{open:true,matches:s=>s==='.condition-count-help'}});
-let html=renderTests([],{live:true});
-assert.match(html,/<details class="condition-count-help" open>/);
-state.detail.id='different-run';html=renderTests([],{live:true});
-assert.doesNotMatch(html,/<details class="condition-count-help" open>/);
-""")
-
-
-def test_live_polls_preserve_nodes_and_land_new_terminal_items_only_once():
-    run_render_checks(r"""
-(async()=>{
-const config={targets:[{name:'local',model:'test'}],max_requests:300};
-const first={slot:0,id:'done',target:'local',scenario:'warm',status:'completed',valid:true,score:true};
-const pending={slot:1,id:'pending',target:'local',scenario:'warm',status:'running'};
-const condition={target:'local',condition:{id:'warm',label:'Warm-up',check:'serving'},status:'running',planned:2,started:2,running:1,completed:1};
-state.detail={id:'live',state:'running',config,live_requests:[first,pending],live_conditions:[condition],phases:[{event:'scenario_started',scenario:'warm',target:'local',elapsed_seconds:0}]};
-state.runs=[{id:'live',state:'running',targets:config.targets}];renderRailRuns();renderDetail();
-const main=$('#main'),finished=$('.request-mosaic [data-live-slot="0"]'),running=$('.request-mosaic [data-live-slot="1"]'),polygon=$('polygon',running),card=$('.test-condition'),status=$('.condition-status'),badgeNode=$('.live-state .status'),phase=$('.phase-mark'),heading=$('h1'),rail=$('.status-spot'),active=$('#active-run-link .status');
-const details=$('.condition-requests');details.open=true;listeners.toggle({target:details});
-$('.all-requests').open=true;listeners.toggle({target:$('.all-requests')});
-const conditionSpot=$('[data-live-slot="1"]',details);conditionSpot.setAttribute('tabindex','0');conditionSpot.focus({preventScroll:true});
-const scroller=$('.mosaic-scroll',details);scroller.scrollTop=51;scroller.scrollLeft=29;window.scrollY=390;
-let next=structuredClone(state.detail);api=async path=>path==='/api/runs'?{runs:state.runs,active_run_id:'live'}:path==='/api/storage'?{}:structuredClone(next);
-await pollDetail(state.routeVersion);
-assert.equal(main.writes,1,'poll must not replace #main');
-for(const [selector,node] of [['.test-condition',card],['.condition-status',status],['.live-state .status',badgeNode],['.phase-mark',phase],['h1',heading],['.request-mosaic [data-live-slot="0"]',finished],['.request-mosaic [data-live-slot="1"]',running]])assert.equal($(selector),node,selector+' must retain identity');
-assert.equal($('polygon',running),polygon);assert(!finished.classList.contains('is-landing'));
-assert.equal(document.activeElement,conditionSpot);assert(details.open);assert($('.all-requests').open);assert.equal(scroller.scrollTop,51);assert.equal(scroller.scrollLeft,29);assert.equal(window.scrollY,390);assert.equal(state.mosaicFollow,true);assert.match(main.textContent,/Following live/);
-renderRailRuns();setActive('live');assert.equal($('.status-spot'),rail);assert.equal($('#active-run-link .status'),active);
-next.live_requests[1]={...pending,status:'timeout'};next.live_conditions[0]={...condition,status:'finished',completed:2,running:0,failed:1};
-await pollDetail(state.routeVersion);
-assert.equal($('.request-mosaic [data-live-slot="1"]'),running);assert(running.classList.contains('timeout'));assert.equal(running.animationCalls.length,1);assert.equal(conditionSpot.animationCalls.length,1);assert.equal(status.animationCalls.length,1);assert.equal($$('.is-landing').length,0);
-const landed=landedItems.size;assert(landed>=3);
-for(const animation of document.body.getAnimations({subtree:true}))animation.finish();await Promise.resolve();
-await pollDetail(state.routeVersion);
-assert.equal(landedItems.size,landed);assert.equal($$('.is-landing').length,0);assert.equal($('.request-mosaic [data-live-slot="0"]'),finished);assert.equal($('.condition-status'),status);
-// A correction of terminal evidence, or paging away and back, must not replay landing.
-next.live_requests[1]={...pending,status:'completed',valid:true,score:true};await pollDetail(state.routeVersion);assert.equal($$('.is-landing').length,0);
-state.mosaicFollow=false;state.mosaicPage=1;renderDetail();state.mosaicPage=0;renderDetail();assert.equal($$('.is-landing').length,0);assert.equal(state.mosaicFollow,false);
-})()
-""", dom=True)
 
 
 def test_final_poll_and_saved_reopen_leave_no_active_or_animation_classes():
@@ -327,19 +204,6 @@ window.matchMedia=()=>({matches:false});renderLive();assert.equal(document.body.
 """, dom=True)
 
 
-def test_condition_spot_cache_only_rebuilds_changed_rendered_evidence():
-    run_render_checks(r"""
-state.detail={id:'cache',state:'running'};
-const records=[{slot:0,target:'local',scenario:'warm',status:'completed',valid:true,score:true}];
-const original=renderConditionSpots;let renders=0;renderConditionSpots=(...args)=>{renders++;return original(...args);};
-renderTests(records,{live:true});assert.equal(renders,1);
-renderTests(structuredClone(records),{live:true});assert.equal(renders,1);
-records[0].elapsed_ms=123;renderTests(records,{live:true});assert.equal(renders,2);assert.match([...conditionSpots.values()][0],/123 ms/);
-records[0].status='timeout';renderTests(records,{live:true});assert.equal(renders,3);assert.match([...conditionSpots.values()][0],/Timed out/);
-state.detail.state='cancelled';renderTests([{...records[0],status:'running'}],{live:false});assert.equal(renders,4);assert.match([...conditionSpots.values()][0],/Cancelled/);
-""")
-
-
 def test_run_finishing_before_first_live_request_snapshot_has_no_entrance_replay():
     run_render_checks(r"""
 state.detail={id:'quick',state:'running',config:{targets:[],max_requests:4}};renderDetail();
@@ -366,4 +230,56 @@ for(const status of ['queued','stopping']){
   const badgeNode=$('.live-state .status'),icon=$('.status-icon',badgeNode),heading=$('h1');
   renderDetail();assert.equal($('.live-state .status'),badgeNode);assert.equal($('.status-icon',badgeNode),icon);assert.equal($('h1'),heading);assert(badgeNode.classList.contains(status));assert.equal($$('.is-landing').length,0);
 }
+""", dom=True)
+
+
+def test_planned_matrix_is_one_skin_with_54_waiting_cells_and_one_tab_stop():
+    run_render_checks(r"""
+state.detail={id:'matrix',state:'running'};
+const conditions=[1,2,4,8,16,32].flatMap(concurrency=>['short','medium','long'].flatMap(input=>['short','medium','long'].map(output=>({target:'local',condition:{id:`bucket_c${concurrency}_${input}_${output}`,label:`${input} input / ${output} output`,check:'buckets',parameters:{concurrency}},aggregate_status:'waiting',status:'waiting',planned:Math.max(8,concurrency),planned_kind:'upper_bound',started:0,completed:0,running:0,failed:0}))));
+const html=renderTests([],{conditions,live:true});
+assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);assert.equal((html.match(/class="condition-spot /g)||[]).length,54);assert.equal((html.match(/tabindex="0"/g)||[]).length,1);assert.match(html,/54 waiting/);assert.match(html,/54 test conditions/);
+const glyphs=html.match(/<text[\s\S]*?<\/text>/g);assert.equal(glyphs.length,54);for(const glyph of glyphs){assert.match(glyph,/>○<\/text>/);assert.doesNotMatch(glyph,/>[^<]*\d/);}
+""")
+
+
+def test_pending_dialog_fetches_are_bounded_and_stale_pages_do_not_overwrite_filter():
+    run_render_checks(DIALOG_SETUP+r"""
+(async()=>{
+ let release,pending=0,peak=0;const normal=api;
+ api=async path=>{pending++;peak=Math.max(peak,pending);if(!release)await new Promise(resolve=>release=resolve);const result=await normal(path);pending--;return result;};
+ openConditionDialog([...conditionViews.keys()][0]);assert.equal(pending,1);
+ $('#condition-filter').value='failed';handleConditionChange({target:$('#condition-filter')});
+ $('#condition-page-size').value='50';handleConditionChange({target:$('#condition-page-size')});
+ await refreshConditionDialog({force:true});assert.equal(pending,1);release();for(let i=0;i<12;i++)await settle();
+ assert.equal(peak,1);assert.equal(conditionDialog.filter,'failed');assert.equal(conditionDialog.size,50);assert.match(calls.at(-1),/status=failed&page=1&page_size=50/);assert.equal(conditionDialog.payload.page_size,50);
+})()
+""", dom=True)
+
+
+def test_nonstandard_filter_remains_selected_when_live_population_reaches_zero():
+    run_render_checks(DIALOG_SETUP+r"""
+(async()=>{
+ const normal=api;api=async path=>({...await normal(path),totals:{cancelled:remaining}});
+ openConditionDialog([...conditionViews.keys()][0]);await settle();assert.match($('#condition-filter').textContent,/Cancelled/);
+ $('#condition-filter').value='cancelled';handleConditionChange({target:$('#condition-filter')});await settle();remaining=0;empty=true;await refreshConditionDialog({force:true});
+ assert.equal($('#condition-filter').value,'cancelled');assert.match($('#condition-filter').textContent,/Cancelled/);assert.match($('#test-dialog').textContent,/No requests match this status/);
+})()
+""", dom=True)
+
+
+def test_focused_strip_returns_to_running_or_last_condition_after_hover_and_blur():
+    run_render_checks(r"""
+state.detail={id:'strip',state:'running',config:{targets:[]}};
+const conditions=[{target:'local',condition_id:'one',check_id:'access',name:'First condition',aggregate_status:'running',started:1,running:1,completed:0},{target:'local',condition_id:'two',check_id:'access',name:'Second condition',aggregate_status:'waiting',started:0,running:0,completed:0}];
+const draw=()=>patchHTML($('#main'),renderTests([],{conditions,live:true}));draw();
+const first=$$('.condition-spot')[0],second=$$('.condition-spot')[1];
+assert.match($('#condition-selection').textContent,/First condition/);
+listeners.pointerover({target:second,clientX:10,clientY:10});assert.match($('#condition-selection').textContent,/Second condition/);
+listeners.pointerout({target:second,relatedTarget:document.body});assert.match($('#condition-selection').textContent,/First condition/);
+second.focus({preventScroll:true});listeners.focusin({target:second});draw();assert.match($('#condition-selection').textContent,/Second condition/);
+document.body.focus({preventScroll:true});listeners.focusin({target:document.body});assert.match($('#condition-selection').textContent,/First condition/);
+conditions[0].aggregate_status='passed';conditions[0].running=0;conditions[0].completed=1;conditions[1].aggregate_status='running';conditions[1].started=1;conditions[1].running=1;draw();
+assert.match($('#condition-selection').textContent,/Second condition/);assert.equal($$('.condition-spot')[0],first);assert.equal($$('.condition-spot')[1],second);
+conditions[1].aggregate_status='passed';conditions[1].running=0;conditions[1].completed=1;draw();assert.match($('#condition-selection').textContent,/Second condition/);
 """, dom=True)

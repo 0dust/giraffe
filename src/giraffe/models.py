@@ -368,7 +368,15 @@ class LoadPatterns(Model):
 
 class LoadWindow(Model):
     duration_seconds: StrictInt = Field(default=15, ge=1, le=MAX_STAGE_SECONDS)
-    finish_seconds: float = Field(default=15, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_finish_limit(cls, value):
+        # Older saved runs remain readable; admission windows no longer cancel
+        # outstanding requests before their own timeout.
+        if isinstance(value, dict):
+            return {key: item for key, item in value.items() if key != "finish_seconds"}
+        return value
 
 
 class ResponseCriteria(Model):
@@ -392,7 +400,7 @@ class LoadTestSettings(Model):
     workloads: LoadWorkloads = Field(default_factory=LoadWorkloads)
     patterns: LoadPatterns = Field(default_factory=LoadPatterns)
     schedule: LoadWindow = Field(default_factory=LoadWindow)
-    request_timeout_seconds: float = Field(default=60, gt=0)
+    request_timeout_seconds: float = Field(default=300, gt=0)
     pass_criteria: ResponseCriteria = Field(default_factory=ResponseCriteria)
 
     @field_validator("profile", mode="plain", json_schema_input_type=LoadTestProfile)
@@ -505,7 +513,7 @@ def migrate_load_test(value):
                 details.append({"type": PydanticCustomError(item["type"], item["msg"], context),
                                 "loc": (prefix, *item["loc"]), "input": item.get("input")})
             raise ValidationError.from_exception_data("Legacy load configuration", details) from None
-    timeout = value.get("request_timeout_seconds", 30)
+    timeout = value.get("request_timeout_seconds", 300)
     for check in dict.fromkeys(selected):
         settings = LoadTestSettings().model_dump()
         settings["legacy_source"] = check
@@ -516,7 +524,6 @@ def migrate_load_test(value):
             patterns[k]["enabled"] = False
         own = plain(options.get(check))
         settings["request_timeout_seconds"] = own.get("request_timeout_seconds") or timeout
-        settings["schedule"]["finish_seconds"] = settings["request_timeout_seconds"]
         if check == "concurrency":
             old_input = plain(value.get("concurrent_load"))
             explicit_levels = "levels" in plain(old_input.get("schedule"))
@@ -542,13 +549,13 @@ def migrate_load_test(value):
             settings["schedule"]["duration_seconds"] = old["schedule"]["duration_seconds"]
             settings["pass_criteria"].update({k: v for k,v in old["pass_criteria"].items() if k in settings["pass_criteria"]})
             if old["input_token_tolerance"] != .1 or old["calibration_attempts"] != 3:
-                notes.append(f"Legacy input_token_tolerance={old['input_token_tolerance']} and calibration_attempts={old['calibration_attempts']} replaced by the Load test calibration policy (0.1 tolerance, 3 attempts). Review calibration coverage in the results.")
-            notes.append("Concurrent load migrated to Load test. Finish allowance uses the old request timeout (drain bound). Old p95 limits were not converted to per-response limits; new per-response defaults (2,000 ms first answer / 30,000 ms completion) apply. Review per-response criteria. Old mixed seed is now the shared schedule/mix seed; interference uses full baseline/probe windows and a five-chunk trigger.")
+                notes.append(f"Legacy input_token_tolerance={old['input_token_tolerance']} and calibration_attempts={old['calibration_attempts']} are replaced by bounded local tokenization with 0.1 tolerance. No inference requests are used for prompt sizing.")
+            notes.append("Concurrent load migrated to Load test. Existing per-test request timeout is preserved; outstanding requests finish under that timeout. Old p95 limits were not converted to per-response limits; new per-response defaults (2,000 ms first answer / 30,000 ms completion) apply. Review per-response criteria. Old mixed seed is now the shared schedule/mix seed; interference uses full baseline/probe windows and a five-chunk trigger.")
         elif check == "capacity":
             old = validate_legacy(TrafficConfig, plain(value.get("traffic")), "traffic")
             patterns["poisson" if old.arrival == "poisson" else "constant"]["enabled"] = True
             patterns["rates"], patterns["poisson"]["seed"] = old.rates, old.seed
-            settings["schedule"].update(duration_seconds=math.ceil(old.duration_seconds), finish_seconds=old.drain_timeout_seconds)
+            settings["schedule"].update(duration_seconds=math.ceil(old.duration_seconds))
             shares = {"short_short": old.mix.short*100, "long_short": old.mix.long_input*100, "short_long": old.mix.long_output*100}
             shapes = [s for s,v in shares.items() if v > 0]
             if len(shapes) == 1:
@@ -1165,6 +1172,9 @@ class Consistency(Model):
 
 
 class Target(Model):
+    tokenizer: str | None = Field(default=None, min_length=1,
+        description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
+    _tokenizer_setup: dict = PrivateAttr(default_factory=dict)
     # Supplied separately by the local UI; never part of config/schema/report serialization.
     _api_key: SecretStr | None = PrivateAttr(default=None)
     name: str = Field(min_length=1)
@@ -1176,6 +1186,7 @@ class Target(Model):
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
     metrics_url: str | None = None
+    host_metrics_url: str | None = Field(default=None, description="Optional node_exporter Prometheus-text URL for server host CPU/RAM; independent of runtime metrics credentials.")
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
     metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "unknown"
@@ -1183,6 +1194,11 @@ class Target(Model):
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
+
+    @field_validator("tokenizer", mode="before")
+    @classmethod
+    def trim_tokenizer(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def validate_target(self) -> Target:
@@ -1199,6 +1215,14 @@ class Target(Model):
                 raise ValueError("metrics_url must be an http(s) endpoint")
             if metrics.username or metrics.password or metrics.query or metrics.fragment:
                 raise ValueError("metrics_url must not contain credentials, query or fragment")
+        if self.host_metrics_url is not None:
+            host_metrics = urlsplit(self.host_metrics_url)
+            if host_metrics.scheme not in {"http", "https"} or not host_metrics.hostname:
+                raise ValueError("host_metrics_url must be an http(s) endpoint")
+            if any(char.isspace() for char in self.host_metrics_url) or host_metrics.port == 0:
+                raise ValueError("host_metrics_url must have a valid host and port")
+            if host_metrics.username or host_metrics.password or host_metrics.query or host_metrics.fragment:
+                raise ValueError("host_metrics_url must not contain credentials, query or fragment")
         if self.route == "replica" and not self.parent:
             raise ValueError("replica targets require parent service name")
         if self.deployment.collector_url:
@@ -1267,7 +1291,8 @@ class TrafficConfig(Model):
     seed: int = Field(default=42, ge=0)
     mix: TrafficMix = Field(default_factory=TrafficMix)
     scheduler_lag_tolerance_ms: float = Field(default=100, gt=0)
-    drain_timeout_seconds: float = Field(default=30, gt=0)
+    drain_timeout_seconds: float | None = Field(default=None, gt=0,
+        description="Legacy traffic drain limit; null lets each request finish or reach its own timeout.")
     long_input_chars: int = Field(default=4096, ge=128, le=1_000_000)
     long_output_words: int = Field(default=32, ge=2, le=4096)
 
@@ -1859,7 +1884,7 @@ class RunConfig(Model):
     max_duration_seconds: float | None = Field(default=None, gt=0)
     max_memory_mb: int = Field(default=4096, ge=0,
         description="Memory limit (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
-    request_timeout_seconds: float = Field(default=30, gt=0)
+    request_timeout_seconds: float = Field(default=300, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
     context_limit: int = Field(default=4096, ge=128)
@@ -2326,12 +2351,25 @@ class RequestRecord(Model):
     http_status: int | None = None
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
+    request_timeout_seconds: float | None = None
+    termination_reason: str | None = None
+    termination_limit_seconds: float | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
     client_cancelled_monotonic_ns: int | None = None
     client_cancelled_ms: float | None = None
     elapsed_ms: float = 0
     stream_end_ms: float | None = None
+    # Version 0 denotes saved records without receipt-event evidence. All times
+    # below are monotonic milliseconds relative to the same request timer.
+    timing_schema: int = 0
+    first_token_ms: float | None = None
+    first_token_reason: str | None = "Timing schema predates client content-event collection."
+    output_events: list[dict[str, Any]] = Field(default_factory=list)
+    output_events_truncated: bool = False
+    answer_read_timestamps_ms: list[float] = Field(default_factory=list)
+    reasoning_read_timestamps_ms: list[float] = Field(default_factory=list)
+    read_timestamps_truncated: bool = False
     first_output_ms: float | None = None
     last_output_ms: float | None = None
     answer_chunks: int = 0
@@ -2398,6 +2436,84 @@ class RequestRecord(Model):
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
+    def read_gaps_ms(self) -> list[float] | None:
+        """Answer-bearing network read gaps; these are not token ITL."""
+        if not self.timing_schema or not self.stream or self.read_timestamps_truncated:
+            return None
+        return [right - left for left, right in zip(
+            self.answer_read_timestamps_ms, self.answer_read_timestamps_ms[1:])]
+
+    @property
+    def reasoning_read_gaps_ms(self) -> list[float] | None:
+        if not self.timing_schema or not self.stream or self.read_timestamps_truncated:
+            return None
+        return [right - left for left, right in zip(
+            self.reasoning_read_timestamps_ms, self.reasoning_read_timestamps_ms[1:])]
+
+    @property
+    def tpot_estimate_ms(self) -> float | None:
+        """Reciprocal of the existing character-allocation generation estimate."""
+        pace = self.generation_tokens_per_second if self.timing_schema else None
+        return 1000 / pace if pace is not None and pace > 0 else None
+
+    @property
+    def tpot_direct_reason(self) -> str | None:
+        if not self.timing_schema:
+            return "Timing schema predates client content-event collection."
+        if not self.stream:
+            return "Non-streamed replies do not provide token arrival timing."
+        if not self.valid or self.status != "completed":
+            return "A valid completed answer and matching usage are required."
+        if self.output_tokens is None:
+            return "Answer-token usage is missing or includes unseparated reasoning."
+        if self.output_tokens <= 1:
+            return "Single-token answers have no subsequent-token interval."
+        if self.output_events_truncated or self.read_timestamps_truncated:
+            return "Receipt-event evidence was truncated; collect a shorter response."
+        if self.reasoning_stripped:
+            return "Inline reasoning lacks an independently aligned answer-token population."
+        events = [event for event in self.output_events if event["kind"] == "answer"]
+        if not events or events[0].get("token_count") != 1:
+            return "The first answer event is not proven to contain exactly one token; collect aligned streamed logprobs."
+        if (any(event.get("token_count") is None for event in events)
+                or sum(event["token_count"] for event in events) != self.output_tokens):
+            return "Streamed token-boundary evidence does not match answer usage."
+        if (len(events) < 2 or len({event["read_id"] for event in events}) != len(events)
+                or events[-1]["at_ms"] <= events[0]["at_ms"]):
+            return "Buffered answer events do not supply independent token arrival times."
+        return None
+
+    @property
+    def tpot_direct_ms(self) -> float | None:
+        """Mean answer-token interval, excluding one proven first-event token.
+
+        Later multi-token events retain their actual shared receipt timestamp;
+        this mean is not an observed individual-token latency distribution.
+        """
+        if self.tpot_direct_reason is not None:
+            return None
+        events = [event for event in self.output_events if event["kind"] == "answer"]
+        return (events[-1]["at_ms"] - events[0]["at_ms"]) / (self.output_tokens - 1)
+
+    @property
+    def itl_reason(self) -> str | None:
+        reason = self.tpot_direct_reason
+        if reason is not None:
+            return reason
+        if any(event.get("token_count") != 1 for event in self.output_events
+               if event["kind"] == "answer"):
+            return "Multi-token answer events lack individual token arrival timestamps."
+        return None
+
+    @property
+    def itl_ms(self) -> list[float] | None:
+        """Only proven one-token, independent-read events yield token ITL."""
+        if self.itl_reason is not None:
+            return None
+        times = [event["at_ms"] for event in self.output_events if event["kind"] == "answer"]
+        return [right - left for left, right in zip(times, times[1:])]
+
+    @property
     def stream_gap_applicable(self) -> bool:
         return not (self.stream and self.answer_reads <= 1 and self.completion_tokens in (1, 2))
 
@@ -2459,12 +2575,22 @@ class RunReport(Model):
     overall: Status
     manifest: dict[str, Any]
     checks: list[CheckResult] = Field(default_factory=list)
+    conditions: list[dict[str, Any]] = Field(default_factory=list)
+    performance: dict[str, Any] = Field(default_factory=dict)
     requests: list[RequestRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     observations: dict[str, Any] = Field(default_factory=dict)
     baseline: dict[str, Any] | None = None
     abort_reason: str | None = None
     limits_reached: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def aggregate_performance(self, info: ValidationInfo):
+        if not (info.context or {}).get("metadata_only"):
+            from .performance import refresh_performance
+
+            refresh_performance(self)
+        return self
 
     @model_validator(mode="before")
     @classmethod

@@ -176,7 +176,7 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
     assert run.errors == 0 and runner.time.monotonic()-run.start < .2
 
 
-async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch):
+async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch, local_tokenizer):
     from tests.test_concurrent_load import configuration,short_windows,Client as TokenClient
     class Healthy(TokenClient):
         def __init__(self,*args,max_connections=None): super().__init__()
@@ -189,7 +189,8 @@ async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(
     g=p['groups'][0]
     assert p['scheduled'] == p['dispatched'] == g['completed'] == 60
     assert g['failed'] == g['error_percent'] == 0
-    assert len(report.requests) == 67 and report.abort_reason is None
+    assert len(report.requests) == 66 and report.abort_reason is None
+    assert not any('calibration' in record.scenario for record in report.requests)
     assert all(r.overlap == 1 for r in report.requests if r.scenario == 'correctness_c1')
 
 

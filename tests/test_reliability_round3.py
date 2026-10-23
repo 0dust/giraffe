@@ -89,6 +89,12 @@ async def test_blackholed_connect_fails_access_before_request_deadline(monkeypat
     observed = []
 
     async def never_connect(request):
+        if request.method == "GET":
+            return httpx.Response(404)
+        payload = json.loads(request.content)
+        if payload.get("max_tokens") == 1 and payload["messages"] == [{"role": "user", "content": "Reply with 1."}]:
+            field = "logprobs" if "logprobs" in payload else "stream_options"
+            return httpx.Response(400, json={"error": {"param": field}})
         timeout = request.extensions['timeout']['connect']
         observed.append(timeout)
         # A network backend consumes this extension before opening a socket.
@@ -155,7 +161,12 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
 
     async def handle(request):
         nonlocal heavy_open, heavy_started, hangs, interrupted, phase_end
+        if request.method == 'GET':
+            return httpx.Response(404)
         payload = json.loads(request.content)
+        if payload.get('max_tokens') == 1 and payload['messages'] == [{'role': 'user', 'content': 'Reply with 1.'}]:
+            field = 'logprobs' if 'logprobs' in payload else 'stream_options'
+            return httpx.Response(400, json={'error': {'param': field}})
         prompt = tuple(m['content'] for m in payload['messages'])
         is_heavy = prompt in heavy_prompts
         timer = None
@@ -214,7 +225,9 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
         assert len(sustained) >= 5 and all(r.status == 'completed' and r.valid for r in sustained)
         assert outcome.metrics['sustained']['error_rate'] == 0
         return
-    assert outcome.status == report.overall == ('inconclusive' if mode == 'phase_cancel' else 'fail')
+    assert outcome.status == report.overall == ('inconclusive' if mode == 'phase_cancel' else 'fail'), (
+        outcome.model_dump(), report.abort_reason,
+        [(record.scenario, record.status, record.error) for record in report.requests])
     assert heavy_started == 3 and hangs == 2
     assert sum(r.status == 'completed' and r.valid for r in sustained) == 1
     assert completion['requests'] < completion['required_requests'] == 5
@@ -314,7 +327,7 @@ def test_single_chunk_gap_is_inapplicable_only_for_known_short_stream(tokens, st
 
 
 @pytest.mark.parametrize('tokens,expected', [(2, 'pass'), (3, 'inconclusive')])
-async def test_capacity_single_chunk_gap_qualification(monkeypatch,tokens,expected):
+async def test_capacity_single_chunk_gap_qualification(monkeypatch,tokens,expected,local_tokenizer):
     from giraffe import load_test
     from tests.test_concurrent_load import Client as TokenClient,configuration,short_windows
     class Client(TokenClient):

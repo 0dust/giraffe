@@ -4,11 +4,14 @@ import uuid
 
 import pytest
 
+
 from giraffe.logprob_workload import refill
 from giraffe.models import RequestRecord, RunConfig
 from giraffe.runner import _Run, run_suite
 from giraffe.workloads import sessions, spec
 from tests.test_web import browser, start, finished, report
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def configuration(**updates):
@@ -101,7 +104,7 @@ async def test_web_condition_summaries_survive_event_cap(tmp_path, monkeypatch):
             await asyncio.sleep(0)
         assert len(detail["events"]) == 100
         assert {r["condition_id"] for r in detail["live_requests"]} == {"warm"}
-        condition = detail["live_conditions"][0]
+        condition = next(row for row in detail["live_conditions"] if row["condition"]["id"] == "warm")
         assert condition["completed"] == condition["planned"] == 120
         assert condition["not_sent"] == 0 and condition["reason"] is None
         await client.post(f"/api/runs/{identifier}/cancel", json={})
@@ -170,7 +173,7 @@ async def test_saved_condition_failures_include_post_run_judging(monkeypatch):
 
 
 
-async def test_arrivals_have_rate_condition_and_exact_plan():
+async def test_arrivals_have_rate_condition_and_exact_plan(local_tokenizer):
     from giraffe import load_test
     from tests.test_concurrent_load import configuration as load_configuration,short_windows
     cfg=short_windows(load_configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.002)

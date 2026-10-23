@@ -2,10 +2,16 @@
 
 import asyncio
 
+import pytest
+
+
 from giraffe.models import Limits, TrafficConfig, required_concurrency
 from giraffe.reporting import compare_baseline
 from giraffe.runner import run_suite
 from tests.fake_endpoint import FakeEndpoint
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def traffic_config(endpoint, **overrides):
@@ -58,7 +64,7 @@ async def test_arrivals_reach_http_server_before_prior_requests_complete():
         cfg=traffic_config(endpoint,traffic=TrafficConfig(rates=[20],duration_seconds=.3,max_in_flight=32,mix={'short':1,'long_input':0,'long_output':0}),limits=Limits(latency_ms=1000,min_samples=5))
         assert required_concurrency(cfg)['per_target_peak'] == 32
         report=await run_suite(cfg)
-        setup=sum(r.load_point.get('type') == 'calibration' for r in report.requests)
+        setup=sum(r.scenario == 'performance_evidence_probe' for r in report.requests)
         assert endpoint.request_started_at[setup+2] < min(endpoint.request_finished_at[setup:])
         assert endpoint.peak_active >= 3
         assert len(endpoint.requests) == 6 + setup
@@ -147,7 +153,7 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
 
     result = capacity(report)
     low, high = result.metrics['points']
-    _lg, hg = low['groups'][0], high['groups'][0]
+    hg = high['groups'][0]
     assert low["status"] == "pass" and high["status"] == "fail"
     assert result.metrics["highest_accepted"][0]["value"] == 5
     assert next(c for c in report.checks if c.id == "correctness").metrics["request_pack"]["control_status"] == "pass"
@@ -155,9 +161,12 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
     assert all(r.score is True for r in traffic_records(report) if r.load_point["point_id"] == high["id"] and r.workload.get("case_id") == "beta")
     assert hg["correct_work_per_second"] < hg["completed_requests_per_second"]
     assert all(record.valid for record in report.requests)
-    assert len(report.requests) == len(payloads) == 20
+    probes = [r for r in report.requests if r.scenario == "performance_evidence_probe"]
+    assert len(probes) == 1
+    assert len(report.requests) == len(payloads) == 20 + len(probes)
     assert next(check for check in report.checks if check.id == "correctness").status == "fail"
-    for first in payloads[:2]:
+    pack_payloads = [p for p in payloads if "PACK_" in p["messages"][0]["content"]]
+    for first in pack_payloads[:2]:
         repeated = [payload for payload in payloads if payload["messages"] == first["messages"]]
         assert all(payload == first for payload in repeated)
     alpha = next(payload for payload in payloads if "ALPHA" in payload["messages"][0]["content"])

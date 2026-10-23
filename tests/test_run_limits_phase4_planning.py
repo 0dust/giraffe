@@ -14,7 +14,19 @@ TARGET = {"name": "service", "url": "http://endpoint.invalid/v1", "model": "mode
 
 
 def config(**updates):
-    return RunConfig.model_validate({"targets": [TARGET], "checks": ["correctness"], **updates})
+    return RunConfig.model_validate({"targets": [TARGET], "checks": ["correctness"],
+                                    "request_timeout_seconds": 30, **updates})
+
+
+@pytest.fixture(autouse=True)
+def isolated_endpoint_preparation(monkeypatch, local_tokenizer):
+    # Planning latency tests measure target requests. Discovery and negotiation
+    # are setup I/O covered by dedicated integration tests, not fake endpoint work.
+    async def unavailable(*args, **kwargs):
+        return {"status": "unavailable", "reason": "Fake endpoint has no exporter",
+                "samples": [], "elapsed_seconds": 0, "unavailable": []}
+    monkeypatch.setattr("giraffe.telemetry.scrape", unavailable)
+    monkeypatch.setattr("giraffe.client.LLMClient.token_evidence_probe", lambda self: None)
 
 
 def tail(p50, p90, *, n=200):
@@ -127,7 +139,7 @@ def test_sequential_targets_sum_and_overlapping_targets_use_per_target_slots():
 
 def test_time_limit_warns_when_cancellation_work_starts_before_cleanup_wait():
     configured = ConfigDraft.model_validate({"targets": [TARGET], "checks": ["cancellation", "recovery"],
-        "max_duration_seconds": 2, "test_options": {"cancellation": {"cleanup_seconds": 5},
+        "max_duration_seconds": 2, "request_timeout_seconds": 30, "test_options": {"cancellation": {"cleanup_seconds": 5},
                                                   "recovery": {"sustained_seconds": 3}}})
     plan = request_plan(configured)
     assert plan["errors"] == []
@@ -245,6 +257,15 @@ def test_fixed_latency_inprocess_traffic_finishes_inside_estimated_range(monkeyp
 @pytest.mark.parametrize("confidence", ["high", "medium"])
 def test_fixed_latency_httpx_endpoint_finishes_inside_estimated_range(monkeypatch, confidence):
     from tests.test_review26_phase4_accuracy import run_virtual
+    from giraffe.client import LLMClient
+
+    async def enter_mock_client(self):
+        # MockTransport construction performs no real TLS/DNS I/O. Keep it on
+        # this deterministic loop rather than scheduling a real worker thread.
+        self._client = self._create_client()
+        return self
+
+    monkeypatch.setattr(LLMClient, "__aenter__", enter_mock_client)
 
     async def scenario():
         import asyncio
@@ -381,8 +402,8 @@ async def test_concurrent_load_plan_windows_and_calibration_bounds_match_inproce
     load = await execute(run, configured.targets[0], Client())
     rows = {row["id"]: row for row in preview["rows"]}
     calibration_count = sum("calibration" in record.scenario for record in run.records)
-    assert 0 < calibration_count <= rows["load_calibration"]["requests_per_target"]
-    assert rows["load_calibration"]["kind"] == "bounded"
+    assert calibration_count == rows["load_calibration"]["requests_per_target"] == 0
+    assert rows["load_calibration"]["kind"] == "exact"
     assert load["plan"]["configured_load_seconds"] == preview["configured_load_seconds"] == .06
     assert len(load["points"]) == 1
     assert rows["load_combinations"]["kind"] == "duration"
@@ -424,13 +445,12 @@ async def test_nonstream_consistency_summary_drives_its_next_estimate(monkeypatc
     assert plan["estimated_high_seconds"] > 0
 
 
-def test_observed_initial_context_does_not_predict_adaptive_resized_inputs():
+def test_context_preparation_keeps_locally_sized_batch_duration_unknown():
     configured = config(checks=["context"])
     plan = request_plan(configured, observations=observations(configured, "context"))
     assert plan["time_components"] == []
-    assert [item["id"] for item in plan["unknown_time_components"]] == ["context_first_batch", "context"]
+    assert [item["id"] for item in plan["unknown_time_components"]] == ["context_first_batch"]
     assert plan["unknown_time_components"][0]["requests"] == 6
-    assert plan["unknown_time_components"][1]["requests"] == 13
     assert plan["confidence"] == "low"
 
 

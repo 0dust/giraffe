@@ -108,8 +108,8 @@ def test_metrics_keep_retraction_gauge_distinct_from_counter_and_cache_ratio():
 
 
 @pytest.mark.parametrize("profile", ["unknown", "vllm-v1", "sglang"])
-def test_metrics_require_explicit_matching_runtime_profile(profile):
+def test_metrics_detect_unknown_profile_but_respect_explicit_runtime_profile(profile):
     target = Target(name="service", url="http://localhost:30000", model="llama",
                     metrics_profile=profile)
     parsed = telemetry.parse('sglang:num_running_reqs 2\n', target, RunConfig(targets=[target]))
-    assert parsed["status"] == ("available" if profile == "sglang" else "absent_families")
+    assert parsed["status"] == ("available" if profile in {"unknown", "sglang"} else "absent_families")

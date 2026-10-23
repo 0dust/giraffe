@@ -58,7 +58,7 @@ def test_four_generic_strings_are_not_giraffe_proof(tmp_path, schema):
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_successful_final_metadata_retry_clears_only_its_warning_and_cache(tmp_path, monkeypatch, failure):
+def test_successful_final_metadata_retry_clears_only_its_warning_and_cache(tmp_path, monkeypatch, failure, local_tokenizer):
     import giraffe.web as web
 
     async def runner(configuration, **kwargs):
@@ -208,7 +208,7 @@ def test_reader_handles_escape_and_scalar_boundaries_without_rescanning(size, va
     assert reader.peek() == ","
 
 
-async def test_execute_final_write_merges_download_samples_saved_during_cleanup(tmp_path, monkeypatch):
+async def test_execute_final_write_merges_download_samples_saved_during_cleanup(tmp_path, monkeypatch, local_tokenizer):
     import giraffe.web as web
 
     entered, release = threading.Event(), threading.Event()

@@ -191,6 +191,8 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     if config is not None and scenario == "arrival" and config.arrivals:
         workload.setdefault("requests_per_second", config.arrivals.requests_per_second)
     condition = _identity(scenario, workload)
+    if scenario == "performance_evidence_probe":
+        condition.update(label="Streamed token evidence capability", load_type="preparation")
     check = condition["check"]
     parameters = {}
     if condition.get("level") is not None:
@@ -205,6 +207,16 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     if check == "fairness":
         parameters["concurrency"] = 1 if scenario in {"fairness", "fairness_baseline"} else 2
     if config is not None:
+        if check == "load":
+            from .load_test import settings_sets
+            source = workload.get("source", "primary")
+            own = dict(settings_sets(config.load_test)).get(source, config.load_test)
+            parameters["request_timeout_seconds"] = own.request_timeout_seconds
+        else:
+            from .models import CHECK_OPTION_FIELDS
+            effective = config.effective_initial() if scenario == "initial" else (
+                config.effective_check(check) if check in CHECK_OPTION_FIELDS else {})
+            parameters["request_timeout_seconds"] = effective.get("request_timeout_seconds", config.request_timeout_seconds)
         if check == "consistency" and config.consistency:
             settings = config.consistency
             level = condition.get("level", 1)
@@ -229,7 +241,7 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
             parameters["concurrency"] = config.effective_check("recovery")["concurrency"] if scenario == "sustained" else 1
         if check in {"correctness", "json"}:
             parameters.setdefault("concurrency", 1)
-    for key in ("input_chars", "output_tokens", "repetitions_per_prompt", "concurrency"):
+    for key in ("input_chars", "output_tokens", "repetitions_per_prompt", "concurrency", "request_timeout_seconds"):
         if details.get(key) is not None:
             parameters[key] = details[key]
     if "output_tokens" not in parameters and workload.get("requested_output_tokens") is not None:
@@ -253,3 +265,432 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     }.get(scenario, _PURPOSES[check])
     condition.update(purpose=purpose, parameters=parameters)
     return condition
+
+
+
+def planned_conditions(config: Any) -> list[dict[str, Any]]:
+    """Describe configured test cells before execution, without building requests.
+
+    IDs come from the same point/scenario constructors as the executors. These
+    are waiting UI/index summaries, not reservations or execution counters;
+    authoritative lifecycle events replace them under the same target/id key.
+    Setup, calibration and warm-up remain request/check evidence only.
+    """
+    from .fixtures import builtin_fixtures
+    from .load_test import scheduled_count, settings_sets, test_points
+    from .logprob_workload import corpus_width, sample_count
+    from .planning import request_plan
+    from .session_metrics import workload_plan
+    from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+
+    selected = set(config.checks)
+    scenarios: dict[str, dict[str, Any]] = {}
+
+    def add(scenario, planned=None, kind="unknown", workload=None):
+        condition = condition_for(scenario, workload, config)
+        key = condition["id"]
+        if key in scenarios:
+            previous = scenarios[key]
+            if previous["planned"] is not None and planned is not None:
+                previous["planned"] += planned
+                previous["not_sent"] = previous["planned"]
+            return
+        scenarios[key] = {"condition": condition, "planned": planned, "planned_condition": True,
+            "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
+            "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
+            "not_sent": planned, "reason": None, "request_statuses": {}}
+
+    # The request preview already accounts for shared initial work and finite
+    # core batches; only rows that actually have a meaningful executor scenario
+    # are cells (never check aliases that merely reuse another request).
+    plan = request_plan(config)
+    plan_rows = {row["id"]: row for row in plan["rows"]}
+    # Preview/catalogue order differs from dispatch order. Match _target first,
+    # then workloads.execute; ordering changes metadata only, never execution.
+    for identifier in ("initial", "generation", "context_first_batch", "pack_control",
+                       "pack_loaded", "correctness", "json"):
+        row = plan_rows.get(identifier)
+        if row is None:
+            continue
+        if identifier in {"correctness", "json"}:
+            if not row["requests_per_target"]:
+                continue
+            identifier += f"_c{config.effective_check(identifier)['concurrency']}"
+        elif identifier == "context_first_batch":
+            identifier = "context"
+        count = row["requests_per_target"]
+        kind = "exact" if row["kind"] == "exact" else "upper_bound" if count is not None else "unknown"
+        if identifier == "context":
+            count, kind = None, "unknown"  # Adaptive repeated batches share one condition.
+        if count != 0:
+            add(identifier, count, kind)
+
+    if "cancellation" in selected:
+        options = config.effective_check("cancellation")
+        fixtures = builtin_fixtures(config, check_id="cancellation")["limits"]
+        normal = sum(spec.cancel_after_ms is None and not spec.fixture_id.startswith("limits.stop_control") for spec in fixtures)
+        cancelled = sum(spec.cancel_after_ms is not None for spec in fixtures)
+        add("stop_control", 1, "exact")
+        add("limits", max(options["samples"], normal), "exact")
+        if cancelled:
+            add("cancellation_baseline", 1, "exact")
+            add("client_cancel", cancelled, "exact")
+        add("cancellation_probe", options["samples"], "exact")
+        if cancelled:
+            add("client_deadline", 1, "exact")
+    for identifier in ("recovery_baseline", "sustained", "recovery"):
+        row = plan_rows.get(identifier)
+        if row and row["requests_per_target"] != 0:
+            count = row["requests_per_target"]
+            kind = "exact" if row["kind"] == "exact" else "upper_bound" if count is not None else "unknown"
+            add(identifier, count, kind)
+    if "prefix" in selected and config.prefix:
+        settings = config.prefix
+        add("prefix_shared", settings.repeats, "exact")
+        add("prefix_independent", settings.repeats, "exact")
+        add("prefix_history", settings.history_turns, "upper_bound")
+    if "load" in selected:
+        settings = dict(settings_sets(config.load_test))
+        for point in test_points(config.load_test):
+            own = settings[point["source"]]
+            count = scheduled_count(own, point)
+            # Poisson uses unconditioned draws: an expectation is not a plan.
+            if point["pattern"] == "poisson":
+                count = None
+            for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
+                workload = {"source": point["source"]}
+                if point["rate"] is not None:
+                    workload["rate_rps"] = point["rate"]
+                identifier = point["id"] + (f".{phase}" if phase else "")
+                add(identifier, count, "exact" if count is not None else "unknown", workload)
+                if point["pattern"] in {"concurrent", "interference"}:
+                    scenarios[identifier]["planned_reason"] = "Unknown — duration-based"
+    if "capacity" in selected:
+        traffic = config.effective_traffic()
+        if traffic is not None:
+            from .models import MAX_PLANNED_ARRIVALS
+            from .planning import _steady_count
+            for stage, rate in enumerate(traffic.rates):
+                count = (_steady_count(rate, traffic.duration_seconds) if traffic.arrival == "steady"
+                         else min(round(rate * traffic.duration_seconds), MAX_PLANNED_ARRIVALS))
+                add(f"traffic_stage_{stage}", count, "exact", {"rate_rps": rate})
+    if "arrivals" in selected and config.arrivals:
+        add("arrival", config.arrivals.requests, "exact",
+            {"requests_per_second": config.arrivals.requests_per_second})
+    if "sessions" in selected and config.sessions:
+        settings = config.sessions
+        count = (sum(len(item.turns) for item in workload_plan(settings.workloads, settings.sessions))
+                 if settings.profile == "performance" else settings.sessions * len(settings.turns))
+        for mode in settings.modes:
+            add(f"session_{mode}_turn0", count, "upper_bound")
+    if "consistency" in selected and config.consistency:
+        settings = config.consistency
+        for shape in settings.shapes:
+            for level in dict.fromkeys([1, *settings.levels]):
+                count = (corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
+                         if settings.logprobs else settings.prompts_per_shape * sample_count(settings.repetitions, level))
+                add(f"consistency_c{level}_{shape}", count, "exact")
+    if "tools" in selected:
+        custom = bool(config.tool_checks and config.tool_checks.fixtures)
+        for fixture in config.tool_checks.conversations if config.tool_checks else []:
+            for mode in resolved_tool_modes(config):
+                add(f"tools_{fixture.fixture_id}_{mode}_turn0", len(fixture.steps) + 1, "upper_bound")
+        for forced in ([False, True] if config.forced_tool_diagnostic else [False]):
+            for fixture in resolved_tool_fixtures(config):
+                if forced and fixture.choice:
+                    continue
+                choice = "forced" if forced else fixture.choice.mode if fixture.choice else "auto"
+                prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
+                for mode in resolved_tool_modes(config):
+                    add(f"{prefix}_{choice}_{mode}", 1, "exact")
+    return [condition_aggregate({"target": target.name, **summary})
+            for target in config.targets for summary in scenarios.values()]
+
+
+def request_status(record: Mapping[str, Any]) -> str:
+    """UI result classes; transport completion alone never establishes correctness."""
+    status = record.get("status")
+    if status == "running":
+        return "running"
+    if status in {"timeout", "timed_out"}:
+        return "timed_out"
+    if status == "cancelled":
+        return "cancelled"
+    if status == "failed" or record.get("score") is False or record.get("valid") is False:
+        return "failed"
+    return "passed" if record.get("score") is True else "unscored"
+
+
+def request_result_text(record: Mapping[str, Any]) -> str:
+    status = request_status(record)
+    reason = {"request_timeout": "Request timeout", "request_deadline": "Request timeout",
+              "connect_timeout": "Connection timeout", "read_timeout": "Response read timeout",
+              "write_timeout": "Request write timeout", "pool_timeout": "Connection pool timeout",
+              "user_stop": "Stopped by user", "run_duration_limit": "Overall run time limit",
+              "memory_limit": "Run memory limit", "error_threshold": "Run error threshold",
+              "endpoint_unresponsive": "Endpoint unresponsive", "intentional_deadline": "Intentional test deadline",
+              "intentional_cancellation": "Intentional test cancellation", "intentional_cancellation_deadline": "Intentional test cancellation",
+              "generation_chunk_limit": "Intentional generated-chunk limit", "workload_cancelled": "Workload cancelled"}.get(record.get("termination_reason"))
+    if reason and status in {"timed_out", "cancelled", "failed"}:
+        limit = record.get("termination_limit_seconds")
+        return f"{reason} ({limit:g} s)" if isinstance(limit, (int, float)) else reason
+    if status == "failed" and record.get("http_status") and record["http_status"] >= 400:
+        return f"HTTP {record['http_status']}"
+    return {"running": "Awaiting response", "passed": "Correct answer", "failed": "Wrong answer" if record.get("score") is False else "Request failed",
+            "timed_out": "Timed out", "cancelled": "Cancelled", "unscored": "Unscored"}[status]
+
+
+def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = None,
+                        statuses: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """Present lifecycle totals without treating finished requests as passing tests.
+
+    Unknown and duration plans have no numeric denominator. An upper bound is
+    retained for counts, but is never expanded into invented request rows.
+    """
+    condition = dict(summary.get("condition") or {})
+    parameters = condition.get("parameters") or {}
+    started = summary.get("started", summary.get("sent", 0)) or 0
+    running = summary.get("running", 0) or 0
+    completed = summary.get("completed", max(0, started - running)) or 0
+    planned = summary.get("planned")
+    kind = summary.get("planned_kind", "unknown") if planned is not None else "unknown"
+    if kind not in {"exact", "upper_bound"}:
+        kind = "unknown"
+    statuses = dict(statuses if statuses is not None else summary.get("request_statuses") or {})
+    failed = summary.get("failed", statuses.get("failed", 0) + statuses.get("timed_out", 0)) or 0
+    not_started = max(0, planned - started) if planned is not None else None
+    reason = summary.get("reason")
+    terminal = summary.get("status") not in {"waiting", "running"}
+    explicit = verdict or (summary.get("load_point_result") or {}).get("status")
+    if running or not terminal and summary.get("status") == "running":
+        status = "running"
+    elif not terminal:
+        status = "waiting"
+    elif not started and ((summary.get("load_point_result") or {}).get("status") == "skipped"
+                         or (summary.get("load_point_result") or {}).get("input_not_calibrated")):
+        status = "skipped"
+    elif explicit in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
+        status = {"pass": "passed", "fail": "failed", "blocked": "inconclusive"}.get(explicit, explicit)
+    elif failed:
+        status = "failed"
+    elif reason and (not started or kind == "exact" and not_started or any(
+            word in reason.lower() for word in ("run stopped", "time limit", "request budget", "cancelled", "aborted"))):
+        status = "stopped" if started else "skipped"
+    elif completed and statuses.get("passed", 0) == completed:
+        status = "passed"
+    else:
+        status = "inconclusive"
+    rate = parameters.get("rate_rps", condition.get("rate_rps"))
+    concurrency = parameters.get("concurrency", condition.get("level"))
+    description = f"{rate:g} requests/s" if isinstance(rate, (int, float)) else (
+        f"{concurrency:,} at once" if isinstance(concurrency, int) else "Concurrency not recorded")
+    return {**dict(summary), "condition_id": condition.get("id"), "check_id": condition.get("check"),
+            "name": condition.get("label") or condition.get("id"), "concurrency_description": description,
+            "aggregate_status": status, "status": status, "lifecycle_status": summary.get("status"),
+            "planned": planned, "planned_kind": kind, "started": started, "running": running,
+            "completed": completed, "failed": failed, "not_started": not_started,
+            "reasons": [reason] if reason else [], "request_statuses": statuses}
+
+
+def _condition_verdicts(checks: list[dict]) -> dict[tuple[str, str], str]:
+    verdicts = {}
+    severity = {"fail": 0, "blocked": 1, "inconclusive": 2, "skipped": 3, "pass": 4}
+
+    def add(target, identifier, status):
+        if identifier is None or status not in severity:
+            return
+        identifier = _identity(str(identifier))["id"]
+        key = target, identifier
+        if key not in verdicts or severity[status] < severity[verdicts[key]]:
+            verdicts[key] = status
+
+    def visit(check, target):
+        metrics = check.get("metrics") or {}
+        for point in metrics.get("points", []):
+            add(target, point.get("id"), point.get("status"))
+            if point.get("type") == "interference":
+                for suffix in (".baseline", ".probe"):
+                    add(target, str(point.get("id")) + suffix, point.get("status"))
+        for group in (metrics.get("load_types") or {}).values():
+            for point in group.get("points", []):
+                add(target, point.get("id"), point.get("status"))
+                if point.get("type") == "interference":
+                    add(target, str(point.get("id")).replace("_probe_", "_control_"), point.get("status"))
+        for identifier, row in (metrics.get("buckets") or {}).items():
+            add(target, identifier, row.get("status"))
+        for row in (metrics.get("logprobs") or {}).get("conditions", []):
+            add(target, f"consistency_c{row['level']}_{row['shape']}", row.get("status"))
+        for name, item in (metrics.get("cases") or {}).items():
+            for level, row in item.get("levels", {}).items():
+                add(target, f"stress_{name}_c{level}", row.get("status"))
+        for row in metrics.get("conversations", []):
+            add(target, f"tools_{row.get('fixture_id')}_{row.get('mode')}", row.get("status"))
+        for scenario in (metrics.get("scenarios") or {}).values():
+            visit(scenario, target)
+
+    for check in checks:
+        visit(check, check.get("target"))
+    return verdicts
+
+
+def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
+    """Build condition aggregates once, with scenario grouping for legacy reports."""
+    def plain(value):
+        return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+
+    observations = report.get("observations", {}) if isinstance(report, Mapping) else report.observations
+    records = report.get("requests", []) if isinstance(report, Mapping) else report.requests
+    checks = report.get("checks", []) if isinstance(report, Mapping) else report.checks
+    groups = {}
+    for target, observation in observations.get("targets", {}).items():
+        for summary in observation.get("conditions", []):
+            condition = summary.get("condition") or {}
+            groups[target, condition.get("id")] = {**summary, "target": target}
+    counts = {}
+    for item in records:
+        record = plain(item)
+        condition = condition_for(record.get("condition_id") or record.get("scenario") or "unknown", record.get("workload"))
+        key = record.get("target"), condition["id"]
+        if key not in groups:
+            groups[key] = {"target": key[0], "condition": condition, "status": "finished", "planned": None,
+                           "planned_kind": "unknown", "started": 0, "running": 0, "completed": 0, "failed": 0}
+        status = request_status(record)
+        statuses = counts.setdefault(key, {})
+        statuses[status] = statuses.get(status, 0) + 1
+    check_rows = [plain(check) for check in checks]
+    verdicts = _condition_verdicts(check_rows)
+    # A check verdict is a condition verdict only when it owns one condition.
+    # Matrix checks must retain their per-condition evidence instead.
+    owners = {}
+    for key, summary in groups.items():
+        owners.setdefault((key[0], summary["condition"].get("check")), []).append(key)
+    for check in check_rows:
+        owned = owners.get((check.get("target"), check.get("id")), [])
+        if len(owned) == 1 and check.get("status") in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
+            verdicts.setdefault(owned[0], check["status"])
+    for key, statuses in counts.items():
+        summary = groups[key]
+        total = sum(statuses.values())
+        # Saved lifecycle evidence can describe work absent from retained records.
+        summary["started"] = max(summary.get("started", summary.get("sent", 0)) or 0, total)
+        summary["completed"] = max(summary.get("completed", 0) or 0, total - statuses.get("running", 0))
+        # Executor failure totals already account for intentional negative probes.
+        if "failed" not in summary:
+            summary["failed"] = statuses.get("failed", 0) + statuses.get("timed_out", 0)
+        elif summary.get("planned_kind") == "unknown" and summary.get("planned") is None:
+            summary["failed"] = max(summary["failed"], statuses.get("failed", 0) + statuses.get("timed_out", 0))
+    return [condition_aggregate(summary, verdict=verdicts.get(key), statuses=counts.get(key))
+            for key, summary in groups.items()]
+
+
+class ConditionRequestIndex:
+    """Compact keyed rows for live polling; completed rows survive UI-cache eviction.
+
+    Updates touch only one request and its condition. Sorting/filtering is done
+    only for an explicitly requested page, never for each live progress event.
+    Bodies, reasoning and arbitrary endpoint error strings are never retained.
+    """
+
+    def __init__(self):
+        self.rows: dict[int, dict] = {}
+        self.slots: dict[tuple[str, str], list[int]] = {}
+        self.statuses: dict[tuple[str, str], dict[str, set[int]]] = {}
+        self.summaries: dict[tuple[str, str], dict] = {}
+
+    def summary(self, value):
+        condition = value.get("condition") or {}
+        if condition.get("id"):
+            self.summaries[value.get("target"), condition["id"]] = dict(value)
+
+    def update(self, event):
+        if event.get("condition_summary"):
+            self.summary(event["condition_summary"])
+        slot = event.get("request_slot")
+        if not isinstance(slot, int) or slot < 0 or event.get("event") not in {"request_started", "request_completed"}:
+            return
+        previous = self.rows.get(slot)
+        record = {**(previous or {}), **(event.get("request") or {})}
+        for key in ("target", "scenario", "condition_id"):
+            if event.get(key) is not None:
+                record[key] = event[key]
+        if event["event"] == "request_started":
+            record["status"] = "running"
+        elif not event.get("request"):
+            return
+        condition_id = record.get("condition_id") or condition_for(record.get("scenario") or "unknown")["id"]
+        key = record.get("target"), condition_id
+        if previous:
+            old_key = previous["_key"]
+            self.statuses[old_key][previous["_status"]].discard(slot)
+        else:
+            from bisect import insort
+            insort(self.slots.setdefault(key, []), slot)
+        status = request_status(record)
+        self.statuses.setdefault(key, {}).setdefault(status, set()).add(slot)
+        self.rows[slot] = {key: record.get(key) for key in ("id", "target", "scenario", "condition_id", "status", "valid", "score", "http_status", "request_timeout_seconds", "termination_reason", "termination_limit_seconds")} | {
+            "_key": key, "_status": status, "result_text": request_result_text(record)}
+
+    @classmethod
+    def from_report(cls, report):
+        result = cls()
+        values = report if isinstance(report, Mapping) else report.model_dump(mode="json")
+        for summary in aggregate_conditions(values):
+            result.summary({**summary, "status": summary["lifecycle_status"]})
+        # Reports retain dispatch order; timing evidence refines it if available.
+        records = list(enumerate(values.get("requests", [])))
+        records.sort(key=lambda item: (item[1].get("dispatch_ms") if item[1].get("dispatch_ms") is not None else float("inf"), item[0]))
+        for slot, (_, record) in enumerate(records):
+            result.update({"event": "request_completed", "request_slot": slot, "request": record})
+        return result
+
+    def page(self, condition_id, *, target=None, status=None, page=1, page_size=10):
+        keys = [key for key in self.summaries.keys() | self.slots.keys() if key[1] == condition_id and (target is None or key[0] == target)]
+        if not keys:
+            raise KeyError(condition_id)
+        if len(keys) != 1:
+            raise ValueError("Condition IDs are target-local; select a target with ?target=.")
+        key = keys[0]
+        slots = self.slots.get(key, [])
+        statuses = self.statuses.get(key, {})
+        summary = self.summaries.get(key) or {
+            "target": key[0], "condition": condition_for(key[1]), "status": "running" if statuses.get("running") else "finished",
+            "started": len(slots), "running": len(statuses.get("running", set())),
+            "completed": len(slots) - len(statuses.get("running", set())),
+            "failed": len(statuses.get("failed", set())) + len(statuses.get("timed_out", set()))}
+        planned = summary.get("planned")
+        missing = max(0, planned - (summary.get("started", summary.get("sent", len(slots))) or 0)) if planned is not None else 0
+        exact = summary.get("planned_kind") == "exact" and planned is not None
+        placeholder_count = missing if exact else 0
+        totals = {name: len(statuses.get(name, set())) for name in ("running", "passed", "failed", "timed_out", "cancelled", "unscored")}
+        totals["not_started"] = missing if planned is not None else None
+        aliases = {"timeout": "timed_out", "not-started": "not_started", "pass": "passed", "fail": "failed"}
+        status = aliases.get(status, status)
+        if status and status not in {"all", "running", "passed", "failed", "timed_out", "not_started", "cancelled", "unscored"}:
+            raise ValueError("Unknown request status")
+        selected = sorted(statuses.get(status, set())) if status and status != "all" and status != "not_started" else slots if status != "not_started" else []
+        include_placeholders = status in {None, "", "all", "not_started"}
+        total = len(selected) + (placeholder_count if include_placeholders else 0)
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(max(1, page), pages)
+        start = (page - 1) * page_size
+        rows = []
+        positions = None
+        for offset in range(start, min(start + page_size, total)):
+            if offset < len(selected):
+                slot = selected[offset]
+                record = self.rows[slot]
+                if positions is None:
+                    positions = {slot: number for number, slot in enumerate(slots, 1)}
+                rows.append({"number": positions[slot], "request_id": record["id"], "status": record["_status"], "result_text": record["result_text"]})
+            else:
+                reason = summary.get("reason") or "Not dispatched"
+                rows.append({"number": len(slots) + offset - len(selected) + 1, "request_id": None,
+                             "status": "not_started", "result_text": f"Not sent: {reason}"})
+        aggregate = condition_aggregate(summary, statuses={name: len(values) for name, values in statuses.items()})
+        if aggregate["status"] != "running" and summary.get("aggregate_status"):
+            aggregate["status"] = aggregate["aggregate_status"] = summary["aggregate_status"]
+        return {"condition_id": condition_id, "target": key[0], "page": page, "page_size": page_size,
+                "total": total, "pages": pages, "range_start": start + 1 if total else 0,
+                "range_end": min(start + len(rows), total), "rows": rows, "totals": totals,
+                "number_width": max(4, len(str(max(len(slots) + placeholder_count, planned or 0)))),
+                "placeholder_rows": exact, "aggregate": aggregate}

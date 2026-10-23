@@ -10,13 +10,15 @@ import pytest
 from pydantic import ValidationError
 
 from giraffe.load_test import (
-    execute, interference_measurements, load_time_plan,
-    minimum_reservation, result, assess_point, score_group,
+    execute, interference_measurements, load_time_plan, minimum_reservation, result, assess_point, score_group,
 )
 from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES
 from giraffe.planning import request_plan
 from giraffe.runner import _Run, run_suite
 from giraffe.web import _configuration_errors, create_app
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
@@ -153,10 +155,11 @@ def point(check):
 def test_defaults_and_planning_numbers():
     settings = LoadTest()
     assert settings.profile.long.output_tokens == 512
-    assert settings.schedule.duration_seconds == settings.schedule.finish_seconds == 15
+    assert settings.schedule.duration_seconds == 15
+    assert not hasattr(settings.schedule, "finish_seconds")
     default = load_time_plan(settings)
     assert default['scheduled_tests'] == 12 and default['configured_load_seconds'] == 180
-    assert default['time_with_allowances_seconds'] == 360
+    assert default['time_with_allowances_seconds'] == 180 + 12 * settings.request_timeout_seconds
     assert CHECK_OPTION_FIELDS['load'] == set()
     assert CHECK_LIMIT_FIELDS['load'] == set()
     c = configuration(concurrency=8, max_duration_seconds=1000,
@@ -248,19 +251,19 @@ async def test_individual_refill_duration_drain_nonce_and_conditions():
     assert check.status == "pass" and p["groups"][0]["completed_requests_per_second"] > 0
     assert len(set(client.prompts)) == len(client.prompts)
     assert len({len(p) for p in client.prompts}) == 1
-    assert all(r.load_point and r.requested_input_tokens and not r.workload for r in run.records)
+    assert all(r.load_point and r.requested_input_tokens and r.workload["input_preparation"]["method"] == "local_tokenizer" for r in run.records)
     assert {"condition_planned", "condition_started", "condition_finished"} <= {e["event"] for e in events}
     assert all(r.condition_id == p["id"] for r in run.records if r.load_point["type"] != "calibration")
 
 
 @pytest.mark.parametrize("client,code", [(Client(serial=True), "load_not_delivered"), (Client(cached=True), "cached_input"),
     (Client(wrong=True), "correctness"), (Client(cap_violation=True), "output_cap"), (Client(reasoning=True), "insufficient_responses"),
-    (Client(failure=True), "calibration_failed")])
+    (Client(failure=True), "error_rate")])
 async def test_evidence_and_failure_classification(client, code):
     load = {"schedule": {"levels": [2]}, "combinations": {"selected": ["long_short"]}}
     _, check, _, _ = await perform(configuration(load=load), client)
     assert point(check)["reason_code"] == code
-    if code in {"correctness", "output_cap", "calibration_failed"}:
+    if code in {"correctness", "output_cap", "error_rate"}:
         assert check.status == "fail"
     else:
         assert check.status == "inconclusive"
@@ -275,7 +278,8 @@ async def test_unknown_tokens_and_stress_never_report_zero():
     assert p["status"] == "inconclusive" and p["reason_code"] == "input_not_verified"
     assert p["groups"][0]["lengths"]["input_tokens"] == {"median": None, "min": None, "max": None}
     assert p["groups"][0]["aggregate_output_tokens_per_second"] is not None
-    assert check.metrics["calibrations"][0]["reason"].startswith("estimated")
+    assert check.metrics["calibrations"][0]["status"] == "calibrated"
+    assert check.metrics["calibrations"][0]["method"] == "local_tokenizer"
 
 
 async def test_mixed_seed_and_scenarios():
@@ -320,7 +324,10 @@ async def test_interference_alternates_and_triggers_after_chunks():
 
 
 @pytest.mark.parametrize("slowdown,limit,status", [(2, 1.5, "fail"), (1.1, 1.5, "pass"), (1.1, None, "inconclusive")])
-async def test_interference_slowdown_scoring(slowdown, limit, status):
+def test_interference_slowdown_scoring(slowdown, limit, status, monkeypatch):
+    from giraffe import runner
+    from tests.test_review26_phase4_accuracy import run_virtual
+
     # Slowdown now compares matched completion times in independent windows.
     c = configuration(load={'combinations': {'enabled': False}, 'interference': {'enabled': True}, 'schedule': {'levels': [2]}})
     if limit is None:
@@ -328,24 +335,31 @@ async def test_interference_slowdown_scoring(slowdown, limit, status):
             type(c.load_test.workloads.interference)(max_slowdown=None)
         return
     c.load_test.workloads.interference.max_slowdown = limit
-    run, check, _, _ = await perform(c)
-    p = point(check)
-    rows = [r for r in run.records if r.load_point.get('point_id') == p['id']]
-    # Change completion measurements only; retain actual overlap and occupancy.
-    baseline = p['interference']['baseline']['completion_median_ms']
-    for r in rows:
-        if r.load_point.get('phase') == 'probe' and r.load_point.get('role') == 'short_stream':
-            r.elapsed_ms = baseline * slowdown
-    assess_point(run, c.targets[0], c.load_test, p, rows)
-    assert p['interference']['slowdown'] == pytest.approx(slowdown)
-    assert p['status'] == status
+
+    async def scenario():
+        # Keep synthetic client timestamps and scheduling on the same clock.
+        # Real wall-clock jitter must not change this scoring-only assertion.
+        monkeypatch.setattr("tests.test_concurrent_load.time", runner.time)
+        run, check, _, _ = await perform(c)
+        p = point(check)
+        rows = [r for r in run.records if r.load_point.get('point_id') == p['id']]
+        # Change completion measurements only; retain actual overlap and occupancy.
+        baseline = p['interference']['baseline']['completion_median_ms']
+        for r in rows:
+            if r.load_point.get('phase') == 'probe' and r.load_point.get('role') == 'short_stream':
+                r.elapsed_ms = baseline * slowdown
+        assess_point(run, c.targets[0], c.load_test, p, rows)
+        assert p['interference']['slowdown'] == pytest.approx(slowdown)
+        assert p['status'] == status, (p['reason'], p['interference'])
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_budget_cut_short_failures_precede_evidence_and_later_reservation():
     c = configuration(max_requests=8, checks=['load','consistency'], consistency={'repetitions':2,'levels':[1],'shapes':['short'],'prompts_per_shape':2})
     run, check, _, _ = await perform(c)
     p = point(check)
-    assert p['request_allowance'] == 3 and p['reserved_later_requests'] == 4
+    assert p['request_allowance'] == 4 and p['reserved_later_requests'] == 4
     assert run.remaining('local') == 4 and p['cut_short'] and check.status == 'inconclusive'
     for kind in ('error', 'wrong', 'timing'):
         g = copy.deepcopy(p['groups'][0])
@@ -444,7 +458,7 @@ async def test_socket_endpoint_load_integration():
     assert point['dispatched'] > 2
     assert len(point['request_ids']) == point['dispatched']
     assert point['not_sent'] == point['cancelled'] == 0
-    assert report.requests[0].scenario.startswith('load_calibration_')
+    assert all(not r.scenario.startswith('load_calibration_') for r in report.requests)
 
 
 async def test_request_timeout_drain_and_deadline_cancellation():
@@ -475,17 +489,17 @@ async def test_missing_completion_counts_leave_throughput_unknown():
     assert point(check)['groups'][0]['lengths']['output_tokens']['median'] is None
 
 
-async def test_calibration_variants_and_attempt_limit():
+async def test_local_preparation_variants_do_not_send_inference_probes():
     class Miscalibrated(Client):
         async def execute(self, spec, **kwargs):
             r = await super().execute(spec, **kwargs)
             r.input_tokens = spec.requested_input_tokens // 2
             return r
     _, check, client, _ = await perform(configuration(load={'combinations': {'selected': ['short_short', 'short_long']}}), Miscalibrated())
-    assert len(client.specs) == 6
-    assert all(s.scenario.startswith('load_calibration_') and s.max_tokens == 1 for s in client.specs)
+    assert client.specs
+    assert all(not s.scenario.startswith('load_calibration_') and s.max_tokens > 1 for s in client.specs)
     assert {c['variant'] for c in check.metrics['calibrations']} == {'short_answer', 'long_output'}
-    assert all(p['status'] == 'inconclusive' and p['reason_code'] == 'input_not_calibrated' for p in check.metrics['points'])
+    assert all(c['status'] == 'calibrated' and not c['request_ids'] for c in check.metrics['calibrations'])
 
 
 async def test_interference_never_triggered_is_reported():
@@ -627,7 +641,12 @@ async def test_partial_point_failure_is_scored_when_executor_is_interrupted():
     assert check.status == 'fail' and point(check)['failed'] == 1
 
 
-async def test_calibration_failure_remains_failure_for_unreached_dependent_levels():
+async def test_endpoint_failure_does_not_mislabel_unreached_levels_as_calibration_failures():
     _, check, _, _ = await perform(configuration(stop_after_errors=1, load={'schedule': {'levels': [1, 2]}}), Client(failure=True))
     rows = check.metrics['points']
-    assert len(rows) == 2 and all(p['status'] == 'fail' and p['reason_code'] == 'calibration_failed' for p in rows)
+    assert len(rows) == 2
+    assert rows[0]['status'] == 'fail' and rows[0]['reason_code'] == 'error_rate'
+    assert rows[1]['not_run'] and rows[1]['status'] == 'inconclusive'
+
+
+# Fake inference clients in this module use the matching local tokenizer.

@@ -168,10 +168,21 @@ def test_cli_rejects_seeded_completion_failures(tmp_path, mode):
     assert next(check for check in report["checks"] if check["id"] == "serving")["status"] == "fail"
 
 
-def test_cli_honors_request_budget_and_never_runs_restart_hook_by_default(tmp_path):
+def test_cli_honors_request_budget_and_never_runs_restart_hook_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    # This subprocess cannot use the in-memory tokenizer mock. Provide genuine
+    # local tokenizer assets so prerequisite validation is exercised offline.
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer_path = tmp_path / "tokenizer"
+    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]").save_pretrained(tokenizer_path)
     marker = tmp_path / "restart-was-run"
     with FakeEndpoint() as endpoint:
         config = run_config(endpoint, max_requests=3)
+        config.targets[0].tokenizer = str(tokenizer_path)
         config.targets[0].restart_command = [
             sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('run')",
         ]
