@@ -26,7 +26,7 @@ def test_cli_memory_flag_rejects_negative(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("output_format", ["text", "json"])
-def test_cli_prints_export_ram_and_saves_it_in_metadata(tmp_path, monkeypatch, capsys, output_format):
+def test_cli_prints_export_ram_and_saves_it_in_metadata(tmp_path, monkeypatch, capsys, output_format, local_tokenizer):
     async def suite(configuration, **kwargs):
         result = report(configuration)
         result.observations["resources"] = {
@@ -54,7 +54,7 @@ def test_cli_prints_export_ram_and_saves_it_in_metadata(tmp_path, monkeypatch, c
 
 
 @pytest.mark.parametrize("write_fails", [False, True])
-def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypatch, write_fails):
+def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypatch, write_fails, local_tokenizer):
     async def suite(configuration, **kwargs):
         return report(configuration)
 
@@ -84,7 +84,7 @@ def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypa
         assert client.get(f"/api/runs/{identifier}").json()["resources"] == saved["resources"]
 
 
-def test_unavailable_export_rss_is_saved_as_null(tmp_path, monkeypatch, capsys):
+def test_unavailable_export_rss_is_saved_as_null(tmp_path, monkeypatch, capsys, local_tokenizer):
     async def suite(configuration, **kwargs):
         return report(configuration)
 

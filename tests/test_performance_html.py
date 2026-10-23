@@ -56,7 +56,8 @@ def test_standalone_old_empty_reports_show_availability_without_empty_charts():
     assert 'No request timing observations' in html
     assert 'No completed-request bucket observations' in html
     assert 'No request lifetime observations' in html
-    assert 'Not collected' in html and 'Not supported' in html
+    assert 'Not collected' in html and 'Not applicable' in html
+    assert 'no runtime telemetry collection evidence' in html
     assert '<svg' not in html
     assert 'Request evidence' in html and 'Reproduce this run' in html
 

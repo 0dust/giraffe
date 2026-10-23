@@ -125,7 +125,7 @@ def test_json_limit_measures_deduplicated_bytes(tmp_path):
 
 
 @pytest.mark.parametrize("policy", [{"keep_latest": 1}, {"older_than_days": 0}, {"max_total_bytes": 1}])
-def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeypatch, policy):
+def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeypatch, policy, local_tokenizer):
     from tests.test_storage_web import completed
     from tests.test_web import config, report as web_report
 
@@ -150,7 +150,7 @@ def test_web_automatic_cleanup_is_logged_and_policy_is_visible(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("html", [False, True])
-def test_cli_automatic_cleanup_and_explicit_html(tmp_path, monkeypatch, capsys, html):
+def test_cli_automatic_cleanup_and_explicit_html(tmp_path, monkeypatch, capsys, html, local_tokenizer):
     from tests.test_storage_cli_regressions import report, run_arguments
 
     write_report(synthetic_report(2, 10, "none"), tmp_path / "old")

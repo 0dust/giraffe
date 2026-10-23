@@ -5,10 +5,19 @@ import pytest
 from giraffe.models import CHECK_NAMES, ConfigDraft, RunConfig
 
 
+@pytest.fixture(autouse=True)
+def isolated_endpoint_preparation(monkeypatch):
+    async def unavailable(*args, **kwargs):
+        return {"status": "unavailable", "reason": "Fake endpoint has no exporter",
+                "samples": [], "elapsed_seconds": 0, "unavailable": []}
+    monkeypatch.setattr("giraffe.telemetry.scrape", unavailable)
+    monkeypatch.setattr("giraffe.client.LLMClient.token_evidence_probe", lambda self: None)
+
+
 def config(**updates):
     return RunConfig.model_validate({
         "targets": [{"name": "local", "url": "http://localhost:11434/v1", "model": "test"}],
-        "checks": ["access", "correctness"], **updates,
+        "checks": ["access", "correctness"], "request_timeout_seconds": 30, **updates,
     })
 
 
@@ -27,7 +36,10 @@ def load_config(*, duration=10, finish=2, rates=None, concurrent=False, poisson=
                    "patterns": {"concurrent": {"enabled": concurrent, "levels": [1]},
                                 "constant": {"enabled": not poisson},
                                 "poisson": {"enabled": poisson}, "rates": rates or [2]},
-                   "schedule": {"duration_seconds": duration, "finish_seconds": finish},
+                   # Keep the shared fixture argument for existing callers; the
+                   # allowance now comes only from each request's timeout.
+                   "schedule": {"duration_seconds": duration},
+                   "request_timeout_seconds": max(finish, .000001),
                    "pass_criteria": {"max_completion_ms": 1000}}, **updates)
 
 
@@ -88,7 +100,7 @@ def test_readiness_is_excluded_and_unmeasured_target_work_stays_separate():
 def test_context_unknown_timeout_bounds_and_sessions_include_fixed_pauses():
     result = plan(config(checks=["context"], samples=2, request_timeout_seconds=10))
     first = next(row["requests_per_target"] for row in result["rows"] if row["id"] == "context_first_batch")
-    assert sum(row["timeout_bound_seconds"] for row in result["unknown_time_components"]) == (3 * first + 1) * 10
+    assert sum(row["timeout_bound_seconds"] for row in result["unknown_time_components"]) == first * 10
     assert result["estimated_seconds"] is None
     sessions = plan(config(checks=["sessions"], request_timeout_seconds=10,
                            sessions={"modes": ["live"], "sessions": 2, "delay_seconds": 3}))
@@ -264,7 +276,6 @@ def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
 
 @pytest.mark.parametrize("updates,known", [
     ({"checks": ["access", "recovery"]}, 14),
-    ({"checks": ["access", "context"]}, 7),
     ({"checks": ["access"], "restart_target": "local"}, 1),
     ({"checks": ["access", "correctness"], "custom_fixtures": "/unread/questions.json"}, 1),
 ])
@@ -275,6 +286,14 @@ def test_adaptive_and_unread_workloads_do_not_claim_a_full_count(updates, known)
     assert result["required_request_limit"] is None
     assert result["known_per_target"] == known
     assert any(row["requests_per_target"] is None for row in result["rows"])
+
+
+def test_context_plan_counts_one_locally_prepared_batch():
+    result = plan(config(checks=["access", "context"]))
+    assert result["count_kind"] == "exact"  # Local sizing adds no inference requests.
+    assert result["planned_total"] == result["known_per_target"] == 7
+    assert not result["adaptive_estimates"].get("context")
+    assert next(row for row in result["rows"] if row["id"] == "context")["requests_per_target"] == 0
 
 
 def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_effects(monkeypatch):
@@ -361,7 +380,7 @@ async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview
 
 
 @pytest.mark.parametrize('dataset', [False, True])
-async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch, dataset):
+async def test_plan_fixed_rows_match_real_inprocess_run_per_scenario(monkeypatch, dataset, local_tokenizer):
     from collections import Counter
     from giraffe import runner
     from giraffe.models import DEFAULT_CHECKS
@@ -399,7 +418,7 @@ def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
                         concurrency=4, samples=4)
     preview = plan(configured)
     assert preview['known_per_target'] == 9
-    assert preview['conservative_requests_per_target'] == 26
+    assert preview['conservative_requests_per_target'] == 17
     assert preview['adaptive_estimates']['sustained'] >= 8
     assert preview["request_warnings"][-1]["kind"] == "adaptive_risk"
     assert "unfinished" in preview["request_warnings"][-1]["msg"]
@@ -413,12 +432,12 @@ def test_local_recovery_warmup_is_reserved_once_in_adaptive_estimate(quota):
     configuration = RunConfig.model_validate({**values, "max_requests": quota})
     result = plan(configuration)
     warmup = next(row for row in result["rows"] if row["id"] == "recovery_prime")
-    assert warmup["kind"] == "bounded" and warmup["requests_per_target"] == 1
-    # The example now selects the native #45 defaults: three shapes × (1+2)/s × 15 s.
-    assert result["known_per_target"] == 59 + 135
+    assert warmup["kind"] == "exact" and warmup["requests_per_target"] == 1
+    # Recovery priming is exact once; three shapes × (1+2)/s × 15 s remain scheduled.
+    assert result["known_per_target"] == 60 + 135
     assert result["minimum_reserved_per_target"] > result["known_per_target"]
-    assert result["adaptive_estimates"] == {"context": 13, "sustained": 5}
-    assert result["conservative_requests_per_target"] == sum(row["requests_per_target"] if row["requests_per_target"] is not None else row.get("expected_scheduled_requests", 0) for row in result["rows"]) + 18
+    assert result["adaptive_estimates"] == {"sustained": 5}
+    assert result["conservative_requests_per_target"] == sum(row["requests_per_target"] if row["requests_per_target"] is not None else row.get("expected_scheduled_requests", 0) for row in result["rows"]) + 5
     assert result["request_warnings"][-1]["kind"] == "adaptive_risk"
 
 
@@ -442,7 +461,7 @@ def test_unknown_refills_preserve_additive_arrival_counts_in_global_headline(poi
     assert result["load_test"]["expected_requests_label"] == ("Unknown + ≈ 20" if poisson else "Unknown + 20")
 
 
-def test_load_budget_action_covers_calibration_allowance_and_groups_visible_names():
+def test_load_budget_action_excludes_local_preparation_and_groups_visible_names():
     from tests.test_load_test_phase_a import values
 
     settings = values()
@@ -451,12 +470,12 @@ def test_load_budget_action_covers_calibration_allowance_and_groups_visible_name
         "constant": {"enabled": True}, "rates": [20]}
     result = plan(RunConfig.model_validate(settings))
     assert result["known_total"] == 20
-    assert result["planned_total"] == 23  # Scheduled offers plus three calibration attempts.
+    assert result["planned_total"] == 20  # Local preparation sends no target requests.
     coverage = next(row for row in result["request_warnings"] if row["kind"] == "incomplete_coverage")
     assert coverage["actions"] == [
-        {"label": "Use 23 total requests", "field": "max_requests", "value": 23},
+        {"label": "Use 20 total requests", "field": "max_requests", "value": 20},
         {"label": "Edit Load test", "field": "load_test.schedule.duration_seconds"}]
-    assert coverage["cut_checks"] == ["load_combinations", "load_calibration"]
+    assert coverage["cut_checks"] == ["load_combinations"]
     assert coverage["msg"].count("Load test") == 1
 
 

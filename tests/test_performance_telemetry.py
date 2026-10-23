@@ -154,8 +154,10 @@ async def test_host_collection_is_independent_of_runtime_enabled_and_never_forwa
     run = SimpleNamespace(config=config, start=time.monotonic(), deadline=time.monotonic()+5,
                           stop=asyncio.Event(), observations={target.name: {}})
     result = await telemetry.scrape(run, target, "load")
-    assert result["status"] == "not_enabled" and result["host"]["status"] == "available"
-    assert len(requests) == 1 and "authorization" not in requests[0].headers
+    assert result["status"] == "absent_families" and result["host"]["status"] == "available"
+    assert len(requests) == 2
+    host_request = next(request for request in requests if request.url.host == "host")
+    assert "authorization" not in host_request.headers
     assert result["host"]["host_identity"] == "host"
     assert result["host"]["collection_period_seconds"] == config.metrics_interval_seconds
     metadata = capabilities()["telemetry"]["host_metrics_url"]
@@ -169,7 +171,7 @@ def test_summarize_preserves_legacy_rows_and_adds_derived_contract():
     assert result["derived"]["server_ttft_mean_ms"]["value"] == 1000
 
 
-async def test_runner_host_sampling_does_not_enable_deselected_runtime_exporter(monkeypatch):
+async def test_runner_collects_configured_runtime_and_host_independently_of_gpu_check(monkeypatch):
     from giraffe.runner import _Run, _metrics
 
     target, config = settings(host_metrics_url="http://host/metrics", metrics_url="http://runtime/metrics")
@@ -182,9 +184,11 @@ async def test_runner_host_sampling_does_not_enable_deselected_runtime_exporter(
     run = _Run(config, None, None)
     await _metrics(run, target, "start")
     await _metrics(run, target, "end")
-    assert len(requests) == 2 and all(request.url.host == "host" for request in requests)
+    assert len(requests) == 4
+    assert [request.url.host for request in requests].count("runtime") == 2
+    assert [request.url.host for request in requests].count("host") == 2
     rows = run.observations[target.name]["serving_telemetry"]["snapshots"]
-    assert len(rows) == 2 and all(row["status"] == "not_enabled" for row in rows)
+    assert len(rows) == 2 and all(row["status"] == "absent_families" for row in rows)
     assert all(row["host"]["status"] == "available" for row in rows)
 
 

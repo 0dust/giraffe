@@ -5,6 +5,8 @@ import pytest
 
 from giraffe.cli import main
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
 
 @pytest.mark.parametrize("output_format", ["text", "json"])
 def test_failed_preflight_stops_before_artifacts(tmp_path, monkeypatch, capsys, output_format):
@@ -359,6 +361,9 @@ def test_request_pack_replay_keeps_exact_traffic_after_unrecorded_probe(source, 
     saved = json.loads((tmp_path / "output" / "report.json").read_text())
     assert requests[0].headers.get("X-Giraffe-Preflight") == "1"
     assert all("X-Giraffe-Preflight" not in request.headers for request in requests[1:])
+    discovery = [request for request in requests if request.method == "GET"]
+    assert len(discovery) == 1 and discovery[0].url.path == "/metrics"
+    requests = [request for request in requests if request.method == "POST"]
     assert len(requests) == len(saved["requests"]) + 1 == 13
     expected = [{"model": "tiny", "messages": case["messages"], "max_tokens": config.max_output_tokens,
                  "stream": False, "n": 1} for case in pack["cases"]]

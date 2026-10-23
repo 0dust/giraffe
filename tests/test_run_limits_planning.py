@@ -21,7 +21,9 @@ def test_unbounded_plan_has_no_quota_or_time_budget_warning(checks):
     configured = config(checks=checks, max_requests=None, max_duration_seconds=None, concurrency=None)
     result = request_plan(configured)
     assert result["request_limit"] is None
-    assert result["required_concurrency"]["peak"] == (120 if checks == ["capacity"] else 30 if checks == ["arrivals"] else 4)
+    # The 300-second request default allows more arrivals to remain in flight;
+    # capacity still caps its own in-flight population at 512.
+    assert result["required_concurrency"]["peak"] == (512 if checks == ["capacity"] else 300 if checks == ["arrivals"] else 4)
     assert result["target_quotas"] == {"local": None}
     assert result["errors"] == result["time_warnings"] == []
     assert not any("quota" in warning or "Raise the total request limit" in warning
@@ -52,7 +54,7 @@ def test_correctness_estimate_uses_effective_parallelism_instead_of_ceiling():
     bounded = request_plan(config(**common, concurrency=40))
     assert bounded["estimated_seconds"] is unbounded["estimated_seconds"] is None
     assert bounded["unknown_time_components"] == unbounded["unknown_time_components"]
-    assert bounded["unknown_time_components"][0]["timeout_bound_seconds"] == 120
+    assert bounded["unknown_time_components"][0]["timeout_bound_seconds"] == 4 * 300
 
 
 def test_inherited_concurrency_notice_is_structured_and_nonblocking_in_plan():

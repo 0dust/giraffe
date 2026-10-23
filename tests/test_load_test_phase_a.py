@@ -31,6 +31,9 @@ from giraffe.planning import request_plan
 from giraffe.runner import _Run, _checks
 from giraffe.reporting import _load_test_html
 
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
 TARGET = {"name": "local", "url": "http://unused.test/v1", "model": "test"}
 
 
@@ -107,7 +110,7 @@ def test_worked_burst_plans(constant, poisson, expected, tests):
     plan = request_plan(c)["load_test"]
     assert plan["expected_scheduled_requests"] == expected
     assert plan["scheduled_tests"] == tests
-    assert plan["time_with_allowances_seconds"] == tests * 60.02
+    assert plan["time_with_allowances_seconds"] == tests * (60 + c.load_test.request_timeout_seconds)
     assert ("160 additional requests" if constant or poisson else "160 scheduled requests") in plan["burst_previews"][0]["text"]
     for p in load_points(c.load_test):
         offers, _ = planned_arrivals(c.load_test, p)
@@ -163,7 +166,6 @@ def test_mixed_shares_and_bursts_use_one_seeded_random_mix():
         ("patterns.bursts.first_seconds", -1, "load_test.patterns.bursts.first_seconds"),
         ("patterns.bursts.gap_seconds", 0, "load_test.patterns.bursts.gap_seconds"),
         ("schedule.duration_seconds", 0, "load_test.schedule.duration_seconds"),
-        ("schedule.finish_seconds", -1, "load_test.schedule.finish_seconds"),
         ("request_timeout_seconds", 0, "load_test.request_timeout_seconds"),
         ("pass_criteria.max_error_percent", 101, "load_test.pass_criteria.max_error_percent"),
         ("pass_criteria.min_correct_percent", -1, "load_test.pass_criteria.min_correct_percent"),
@@ -361,18 +363,17 @@ async def test_sustained_individual_replenishment_and_not_sample_count():
     )
 
 
-async def test_finish_allowance_then_cancellation_is_accounted_and_sequential():
+async def test_active_requests_finish_after_sending_stops_and_points_stay_sequential():
     c = config()
     c.load_test.schedule.duration_seconds = 0.015
-    c.load_test.schedule.finish_seconds = 0.01
     c.load_test.patterns.concurrent.levels = [1, 2]
     run, client = _Run(c, None, None), Client((0.2,))
     obs = await execute(run, c.targets[0], client)
     assert len(client.started) == 3
     for p in obs["points"]:
-        assert sum(g["cancelled"] for g in p["groups"]) == p["level"]
-        assert p["status"] == "inconclusive"
-        assert p["drain_seconds"] >= 0.009
+        assert sum(g["cancelled"] for g in p["groups"]) == 0
+        assert sum(g["completed"] for g in p["groups"]) == p["level"]
+        assert p["drain_seconds"] >= 0.15
     a, b = obs["points"]
     assert (
         max(r.completed_ms for r in run.records if r.load_point.get("point_id") == a["id"])
@@ -593,7 +594,7 @@ def test_virtual_clock_run_suite_uses_unified_load_and_preserves_accounting(monk
         assert load.metrics["points"][0]["delivered_window_seconds"] == pytest.approx(1)
         assert load.metrics["points"][0]["dispatched"] > 100
         assert all("load" in r.check_ids for r in report.requests)
-        assert report.manifest["config"]["load_test"]["schedule"]["finish_seconds"] == 0.02
+        assert "finish_seconds" not in report.manifest["config"]["load_test"]["schedule"]
         measured = latency_summary(report)
         entries = {t["name"]: t["measurements"] for t in measured["targets"]}
         row = next(
@@ -867,7 +868,6 @@ def test_accepted_timeout_can_exceed_response_limit_even_when_errors_allowed():
 async def test_active_request_finishes_inside_allowance_without_cancellation():
     c = config()
     c.load_test.schedule.duration_seconds = 0.01
-    c.load_test.schedule.finish_seconds = 0.03
     run, client = _Run(c, None, None), Client((0.015,))
     obs = await execute(run, c.targets[0], client)
     group = obs["points"][0]["groups"][0]
@@ -887,14 +887,15 @@ def test_defaults_follow_mock_except_the_smaller_default_schedule():
         cfg.profile.medium.output_tokens,
         cfg.profile.long.output_tokens,
     ] == [64, 256, 512]
-    assert cfg.request_timeout_seconds == 60
+    assert cfg.request_timeout_seconds == 300
     assert cfg.pass_criteria.max_first_answer_ms == 2000
     assert cfg.pass_criteria.max_completion_ms == 30000
     assert cfg.patterns.concurrent.levels == [1, 4]
     assert cfg.patterns.rates == [1, 2]
-    assert cfg.schedule.duration_seconds == cfg.schedule.finish_seconds == 15
+    assert cfg.schedule.duration_seconds == 15
+    assert not hasattr(cfg.schedule, "finish_seconds")
     assert load_time_plan(cfg)["scheduled_tests"] == 12
-    assert load_time_plan(cfg)["time_with_allowances_seconds"] == 360
+    assert load_time_plan(cfg)["time_with_allowances_seconds"] == 180 + 12 * cfg.request_timeout_seconds
 
 
 def test_explicit_parallel_endpoint_concurrency_must_fit_shared_run_ceiling():
@@ -935,3 +936,6 @@ async def test_repeated_cancellation_preserves_partial_window_records_and_slots(
     assert drain["end_ms"] >= drain["start_ms"]
     assert drain["intended_concurrency"] == 0
     assert run.slots.qsize() == run.slots.maxsize
+
+
+# Fake inference clients in this module use the matching local tokenizer.

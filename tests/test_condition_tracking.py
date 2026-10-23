@@ -4,11 +4,14 @@ import uuid
 
 import pytest
 
+
 from giraffe.logprob_workload import refill
 from giraffe.models import RequestRecord, RunConfig
 from giraffe.runner import _Run, run_suite
 from giraffe.workloads import sessions, spec
 from tests.test_web import browser, start, finished, report
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def configuration(**updates):
@@ -170,7 +173,7 @@ async def test_saved_condition_failures_include_post_run_judging(monkeypatch):
 
 
 
-async def test_arrivals_have_rate_condition_and_exact_plan():
+async def test_arrivals_have_rate_condition_and_exact_plan(local_tokenizer):
     from giraffe import load_test
     from tests.test_concurrent_load import configuration as load_configuration,short_windows
     cfg=short_windows(load_configuration(load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.002)

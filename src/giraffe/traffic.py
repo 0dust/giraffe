@@ -384,7 +384,8 @@ async def run_stage(
 
         sending_finished_at = time.monotonic()
         intent.begin_drain(sending_finished_at)
-        drain_deadline = min(deadline, sending_finished_at + traffic.drain_timeout_seconds)
+        drain_deadline = (deadline if traffic.drain_timeout_seconds is None else
+                          min(deadline, sending_finished_at + traffic.drain_timeout_seconds))
         while tasks:
             if reason := interruption():
                 reasons.append(reason)

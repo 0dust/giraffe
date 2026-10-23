@@ -5,10 +5,10 @@ from pydantic import TypeAdapter
 
 from giraffe.models import ConfigDraft, migrate_load_test, migrate_concurrent_load
 from giraffe.web import ConfigDraftInput, create_app
-TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_results import run_render_checks
 
+TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 
 FORM = r'''
 config.checks=['load'];state.config=structuredClone(config);state.setupStep=3;
@@ -159,7 +159,7 @@ const r={id:'old',target:'local',scenario:'bucket_c1_short_short',check_ids:['co
 assert.equal(conditionInfo(r).check,'concurrency');
 let html=renderTests([r]);let view=[...conditionViews.values()][0];
 assert.equal(view.checkName,'Concurrent load');assert.equal(view.description,'1 at once');
-assert.match(html,/aria-label="Concurrent load · Short input \/ short output · 1 at once/);
+assert.match(html,/aria-label="Condition #01 · Concurrent load · Short input \/ short output · 1 at once/);
 // Historical bucket ownership and concurrency survive without any condition summary.
 const bucket={...r,check_ids:['buckets']};
 html=renderTests([bucket]);view=[...conditionViews.values()][0];assert.equal(view.condition.check,'buckets');

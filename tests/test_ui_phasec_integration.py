@@ -25,10 +25,14 @@ def test_condition_row_keeps_later_page_number_and_existing_request_evidence():
 
 def test_host_exporter_field_is_optional_labeled_and_explains_its_scope():
     browser_logic(r"""
-config.checks=['gpu'];config.targets[0].host_metrics_url='http://node:9100/metrics';
-const markup=renderTestCard(bootstrap.checks.find(check=>check.id==='gpu'),config);
+config.checks=['access'];config.targets[0].host_metrics_url='http://node:9100/metrics';
+nodes['#main']={};nodes['#config-editor']={};
+nodes['#new-run-form']={elements:new Proxy({}, {get(target,name){return target[name] ||= {dataset:{},value:''};}})};
+state.jsonDraft=state.jsonBase='synced';
+syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=()=>{};
+renderNew();const markup=nodes['#main'].innerHTML;
 assert.match(markup,/name="host_metrics_url" type="url" value="http:\/\/node:9100\/metrics"/);
-assert.match(markup,/Host metrics exporter URL \(optional\)/);assert.match(markup,/server-wide CPU and host RAM/);assert.match(markup,/inference credentials are not forwarded/);
+assert.match(markup,/Host metrics exporter URL \(optional\)/);assert.match(markup,/server-wide CPU and host RAM/);assert.match(markup,/Inference and runtime metrics credentials are not forwarded/);
 assert.doesNotMatch(markup,/name="host_metrics_url"[^>]*required/);
 """)
 

@@ -200,7 +200,7 @@ Exit codes:
         run.add_argument("--max-memory", type=int, dest="max_memory_mb",
                          help="Memory limit (RAM growth during this run) in MiB (default: 4096); 0 disables. Only unfinished work stops when sampled RAM growth exceeds the limit; completed checks keep their results")
         run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Stop test traffic after this many seconds (default: Not set)")
-        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Default per-request timeout in seconds")
+        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Default per-request timeout in seconds; per-check overrides and load_test.request_timeout_seconds take precedence")
         run.add_argument("--max-output-tokens", type=int, help="Default output-token budget per request")
         run.add_argument("--context-limit", type=int, help="Context window for context and history checks; Concurrent load uses profile token targets")
         run.add_argument("--samples", type=int, help="Samples for count-based checks; Concurrent load uses its configured duration")
@@ -697,6 +697,14 @@ def main(argv: list[str] | None = None) -> int:
             warnings.extend(item["msg"] for item in guard["warnings"])
             for item in guard["warnings"]:
                 print(f"Warning: {item['msg']}", file=sys.stderr)
+        from giraffe.local_tokenizer import TokenizerUnavailable, ensure_tokenizers
+        try:
+            asyncio.run(ensure_tokenizers(config))
+        except TokenizerUnavailable as error:
+            print(f"giraffe: {error}", file=sys.stderr)
+            if json_output:
+                emit("blocked", 3, message=str(error))
+            return 3
         if args.command == "run" and not args.skip_preflight:
             async def preflight():
                 for target in config.targets:
@@ -742,8 +750,19 @@ def main(argv: list[str] | None = None) -> int:
         duration = f"{config.max_duration_seconds:,g}s" if config.max_duration_seconds is not None else "Not set"
         print(f"Giraffe: {len(config.targets)} target(s), Stop after this many requests: {requests}, "
               f"Limit simultaneous requests: {simultaneous}, Stop test traffic after: {duration}, "
-              f"{config.request_timeout_seconds:g}s/request, {config.max_output_tokens} output "
-              "tokens/request. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
+              f"Request defaults: {config.request_timeout_seconds:g}s timeout, {config.max_output_tokens} output "
+              "tokens. Check and saved-request overrides apply. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
+        timeouts = []
+        for check_id in config.checks:
+            if check_id == "load":
+                from giraffe.load_test import settings_sets
+                timeouts.extend(f"load/{name}={settings.request_timeout_seconds:g}s"
+                                for name, settings in settings_sets(config.load_test))
+            elif (timeout := config.effective_check(check_id).get("request_timeout_seconds")) is not None:
+                timeouts.append(f"{check_id}={timeout:g}s")
+        if timeouts:
+            print("Per-check request timeouts: " + ", ".join(timeouts)
+                  + ". Saved requests may override these.", file=sys.stderr, flush=True)
         from giraffe.reporting import _retained, compare_baseline, html_failure_warning, save_failure_summary, write_report
 
         warning = None

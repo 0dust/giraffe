@@ -54,7 +54,10 @@ def test_arrivals_capacity_and_own_load_profile_defaults():
     config = RunConfig(targets=[TARGET], checks=['load'], default_concurrency=8, max_output_tokens=1)
     assert config.load_test.patterns.concurrent.levels == [1, 4]
     assert config.load_test.profile.long.output_tokens == 512
-    assert required_concurrency(config)['peak'] == 120
+    # The longer default per-request timeout raises the conservative arrival
+    # admission requirement to the existing 512-request safety ceiling.
+    assert config.load_test.request_timeout_seconds == 300
+    assert required_concurrency(config)['peak'] == 512
     assert config.load_test.patterns.constant.enabled
 
 

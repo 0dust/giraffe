@@ -59,7 +59,7 @@ def test_bounded_import_and_duplicate_json_keys():
 
 
 @pytest.mark.parametrize("checks,load_timeout,expected_timeout", [
-    (["load", "correctness"], None, 60),
+    (["load", "correctness"], None, 300),
     (["load", "correctness"], 7, 7),
     (["correctness"], None, 2),
 ])

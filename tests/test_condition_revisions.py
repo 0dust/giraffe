@@ -3,13 +3,16 @@ import asyncio
 
 import pytest
 
+
 from giraffe import runner, workloads
 from giraffe.fixtures import builtin_fixtures
 from giraffe.runner import _Run, run_suite
 from giraffe.workloads import spec
 from tests.test_condition_tracking import Client, configuration
-from tests.test_runner import FakeClient, config as runner_config, judged_pack_config, judge_summary
+from tests.test_runner import FakeClient, judged_pack_config, judge_summary
 from tests.test_web import browser, start, finished, report
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 async def test_dynamic_condition_stays_running_between_requests_without_event_churn():
@@ -52,7 +55,7 @@ async def test_intentional_timeout_is_completed_without_failed_count_live_and_re
     assert row["failed"] == 0
 
 
-async def test_capacity_local_drop_shortfall_names_busy_slots(monkeypatch):
+async def test_capacity_local_drop_shortfall_names_busy_slots(monkeypatch, local_tokenizer):
     from giraffe import load_test
     from tests.test_concurrent_load import configuration as load_configuration,short_windows
     cfg=short_windows(load_configuration(concurrency=1,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.005)
@@ -71,7 +74,9 @@ async def test_arrival_pending_queue_shortfall_is_not_a_stopped_check():
     run=_Run(cfg,None,None)
     run.load_custom_specs = [spec("x", "short", "load")]
     run.slots.get_nowait()
-    async def release(): await asyncio.sleep(.02); run.release_slot()
+    async def release():
+        await asyncio.sleep(.02)
+        run.release_slot()
     await asyncio.gather(load_test.execute(run,cfg.targets[0],Client(delay=0)),release())
     p=load_test.result(run,cfg.targets[0]).metrics['points'][0]
     row=next(r for r in run.observations['local']['conditions'] if r['condition']['id'] == p['id'])
@@ -147,7 +152,7 @@ async def test_condition_events_do_not_occupy_activity_feed(tmp_path, monkeypatc
     ("dropped_late", "dropped: scheduler was late"),
     ("not_offered", "not offered: sending window ended"),
 ])
-async def test_capacity_condition_preserves_stage_shortfall_facts(monkeypatch,outcome,reason):
+async def test_capacity_condition_preserves_stage_shortfall_facts(monkeypatch,outcome,reason,local_tokenizer):
     from dataclasses import replace
     from giraffe import load_test
     from tests.test_concurrent_load import configuration as load_configuration,short_windows

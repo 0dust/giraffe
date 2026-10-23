@@ -54,7 +54,8 @@ def test_dialog_title_tooltip_and_focused_strip_share_readable_shape():
  assert.equal($('#test-title').textContent,'Short input / short output');assert.match($('#test-dialog').textContent,/Load test · 4 at once/);
  assert.match($('#condition-selection').textContent,/Short input \/ short output · 4 at once/);
  assert.match($('.condition-spot').getAttribute('aria-label'),/Short input \/ short output · 4 at once/);
- assert.doesNotMatch($('#test-dialog').textContent,/Combinations short short concurrent|load_primary/);
+ assert.match($('.condition-plan-identity').textContent,/load_primary_combinations_short_short_concurrent_c4/);
+ assert.doesNotMatch($('#test-title').textContent,/Combinations short short concurrent|load_primary/);
 })()
 """, dom=True)
 

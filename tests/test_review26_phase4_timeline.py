@@ -4,12 +4,16 @@ from collections import Counter
 
 import pytest
 
+
 from giraffe import runner
 from giraffe.fixtures import builtin_fixtures
 from giraffe.latency import input_bucket, latency_summary
 from giraffe.models import RunConfig
 from giraffe.planning import request_plan
 from tests.test_runner import FakeClient
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 TARGET = {"name": "service", "url": "http://endpoint.invalid/v1", "model": "model"}
@@ -55,7 +59,9 @@ def test_full_timeline_remedy_completes_windows_and_later_finite_work(monkeypatc
 
 def test_unknown_after_covered_windows_is_risk_without_a_lower_budget_action():
     configured = config(checks=["capacity", "json"], max_duration_seconds=2,
+                        structured_json=True,
                         traffic={"rates": [1], "duration_seconds": .5, "drain_timeout_seconds": .1})
+    configured.load_test.request_timeout_seconds = .1
     plan = request_plan(configured)
     risk, = plan["time_warnings"]
     assert risk["kind"] == "estimate_risk"
@@ -63,7 +69,7 @@ def test_unknown_after_covered_windows_is_risk_without_a_lower_budget_action():
     assert not any(action.get("field") == "max_duration_seconds" for action in risk.get("actions", []))
 
 
-@pytest.mark.parametrize("budget", [300, 600, 1200, 2400])
+@pytest.mark.parametrize("budget", [300, 600, 1200, 2400, 5000])
 def test_default_suite_cut_detection_uses_known_highs_and_unknown_lower_bounds(budget):
     plan = request_plan(config(max_duration_seconds=budget, checks=list(RunConfig(targets=[TARGET]).checks)))
     assert plan["errors"] == []
@@ -71,8 +77,9 @@ def test_default_suite_cut_detection_uses_known_highs_and_unknown_lower_bounds(b
         for action in notice.get("actions", []):
             if action.get("field") == "max_duration_seconds":
                 assert action["value"] > budget
-    # Default #45 load windows add finish allowances to the configured timeline.
-    assert any(notice["kind"] == "incomplete_coverage" for notice in plan["time_warnings"]) == (budget == 300)
+    # Each window reserves the full 300 s request timeout for outstanding work.
+    assert plan["budget_high_seconds"] == 4390
+    assert any(notice["kind"] == "incomplete_coverage" for notice in plan["time_warnings"]) == (budget < 4390)
     assert any(notice["kind"] == "estimate_risk" for notice in plan["time_warnings"])
 
 
@@ -114,13 +121,23 @@ async def test_context_observations_use_actual_calibrated_buckets(monkeypatch):
     first, = plan["time_components"]
     assert first["id"] == "context_first_batch"
     assert first["requests"] == 6
-    assert {item["id"] for item in plan["unknown_time_components"]} == {"context"}
+    assert plan["unknown_time_components"] == []
     assert plan["confidence"] == "low"
+    from giraffe.latency import calibrated_context_fixtures
+    recovered = calibrated_context_fixtures(measured, "service", configured)
+    assert {spec.fixture_id: spec.input_chars for spec in recovered} == {
+        row.fixture_id: row.input_chars for row in saved.requests if "context" in row.check_ids}
+    changed = configured.model_copy(deep=True)
+    changed.targets[0].tokenizer = "different/tokenizer"
+    assert calibrated_context_fixtures(measured, "service", changed) is None
+    missing = {"service": [dict(row, context_profile={**row["context_profile"],
+        "fixtures": row["context_profile"]["fixtures"][:-1]}) for row in measured["service"]]}
+    assert calibrated_context_fixtures(missing, "service", configured) is None
     for row in measured["service"]:
         row.pop("context_profile", None)
     unknown = request_plan(configured, observations=measured)
     assert unknown["time_components"] == []
-    assert {item["id"] for item in unknown["unknown_time_components"]} == {"context", "context_first_batch"}
+    assert {item["id"] for item in unknown["unknown_time_components"]} == {"context_first_batch"}
 
 
 def test_one_component_cannot_mix_fixture_latencies_from_different_runs():
@@ -187,7 +204,7 @@ def test_context_precedes_pack_controls_when_capacity_is_not_selected():
             "fixture_id": "question", "messages": [{"role": "user", "content": "Question?"}], "scorer": "none"}]})
     plan = request_plan(configured)
     assert [item["id"] for item in plan["time_timeline"]] == [
-        "context_first_batch", "context", "pack_control", "pack_loaded"]
+        "context_first_batch", "pack_control", "pack_loaded"]
     assert [row["id"] for row in plan["rows"]][:2] == ["pack_control", "pack_loaded"]
     assert [notice["kind"] for notice in plan["time_warnings"]] == ["estimate_risk"]
     assert plan["errors"] == []

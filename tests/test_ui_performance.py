@@ -60,7 +60,7 @@ assert.match($('#performance-throughput').textContent,/partial/i);
 assert.match($('#performance-throughput').textContent,/count|completed requests/i);
 assert.match($('#performance-outcomes').textContent,/Requests started/);
 assert.match($('#performance-tokens').textContent,/Token accounting/);
-assert.match($('#performance-server').textContent,/Server telemetry was not collected/);
+assert.match($('#performance-server').textContent,/This saved run has no runtime telemetry collection evidence/);
 assert.match($('#performance-baseline').textContent,/baseline/i);
 """)
 
@@ -256,7 +256,7 @@ def test_condition_skin_scales_to_its_panel_content_width():
     css = (Path(__file__).parents[1] / "src/giraffe/static/styles.css").read_text()
     rules = [(selector, row) for selector, row, parents in stylesheet_rules(css)
              if not parents and ".condition-mosaic" in selector]
-    assert any(row.get("width") == "100%" for _, row in rules), "The SVG should fill the panel through its viewBox"
+    assert any(row.get("width", "").replace(" ", "") == "var(--condition-display-width,100%)" for _, row in rules), "Large mosaics fill the panel; one or two conditions use their compact width"
     assert not any(row.get("max-width") not in (None, "none", "100%") for _, row in rules)
 
 

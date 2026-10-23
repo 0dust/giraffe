@@ -12,6 +12,7 @@ import pytest
 
 from giraffe.models import RunConfig
 from tests.fake_endpoint import FakeEndpoint
+from tests.evidence_helpers import workload_payloads, workload_records
 from tests.test_web import browser, finished, start
 
 
@@ -84,13 +85,15 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
                 r["fixture_id"] for r in original["report"]["requests"]
             }
             if request_source == "request_pack":
-                assert len(replay["requests"]) == 12
-                assert replay["requests"][0]["fixture_id"] == "pack:operator-question-0"
-                replayed = traffic[1:]
+                test_records = workload_records(replay["requests"])
+                assert len(test_records) == 12
+                assert test_records[0]["fixture_id"] == "pack:operator-question-0"
+                replayed = workload_payloads(traffic[1:])
+                original_traffic = workload_payloads(endpoint.requests[:before])
                 assert replayed[0]["messages"] == config["request_pack"]["cases"][0]["messages"]
-                assert replayed[:6] == endpoint.requests[:6]
+                assert replayed[:6] == original_traffic[:6]
                 assert Counter(json.dumps(request, sort_keys=True) for request in replayed[6:]) == Counter(
-                    json.dumps(request, sort_keys=True) for request in endpoint.requests[6:before])
+                    json.dumps(request, sort_keys=True) for request in original_traffic[6:])
             if compare:
                 assert replay["baseline"]["run_id"] == original["report"]["run_id"]
                 assert replay["baseline"]["status"] == "pass"

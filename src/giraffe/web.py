@@ -43,7 +43,7 @@ from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, 
                             migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
-from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, attach_api_key
+from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
                                save_baseline_report, save_failure_summary, write_report)
@@ -119,6 +119,16 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
     # Derived performance is requested separately, never copied into polling
     # progress/events (including events from third-party runner integrations).
     event = {key: value for key, value in event.items() if key != "performance"}
+    if event.get("preparation"):
+        preparation = {**event["preparation"], "target": event.get("target", "")}
+        scenario = preparation.get("scenario") or event.get("scenario", "")
+        preparation["scenario"] = scenario
+        preparations = job.setdefault("live_preparations", OrderedDict())
+        key = (preparation["target"], scenario)
+        preparations[key] = preparation
+        preparations.move_to_end(key)
+        while len(preparations) > 64:
+            preparations.popitem(last=False)
     if not event["event"].startswith("condition_"):
         job["progress"] = event
         job["events"].append(event)
@@ -614,6 +624,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return {"id": identifier, "state": state,
                 "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
+                "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
                 "live_requests": list(live.get("requests", {}).values()),
                 "live_request_summary": live.get("live_request_summary", meta.get("live_request_summary", {})),
                 "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
@@ -783,6 +794,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         finally:
             finished = True
             meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
+                        live_preparations=list(job.get("live_preparations", {}).values()),
                         conditions=list(job["conditions"].values()),
                         live_request_summary=job["live_request_summary"],
                         live_request_count=job["live_request_count"])
@@ -852,6 +864,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.post("/api/targets/models")
     async def target_models(body: ModelDiscovery):
         return await discover_models(body)
+
+    @app.post("/api/targets/tokenizer")
+    async def target_tokenizer(body: TokenizerSelection):
+        from giraffe.local_tokenizer import TokenizerUnavailable, preview_tokenizer
+
+        async with start_lock:
+            if active:
+                raise HTTPException(409, "A run is active. Wait for it to finish or stop it "
+                                    "before preparing another tokenizer.")
+            try:
+                return await preview_tokenizer(body.model, body.token_id)
+            except TokenizerUnavailable as error:
+                raise HTTPException(422, str(error)) from None
 
     @app.post("/api/targets/test-connection")
     async def target_connection(body: ConnectionTest):
@@ -1011,6 +1036,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 await run_in_threadpool(check_start, root, limits)
             except ValueError as error:
                 raise HTTPException(507, str(error)) from None
+            from giraffe.local_tokenizer import TokenizerUnavailable, ensure_tokenizers
+            try:
+                await ensure_tokenizers(config)
+            except TokenizerUnavailable as error:
+                raise HTTPException(422, detail=[{
+                    "loc": ["targets", error.target_index, "tokenizer"],
+                    "msg": str(error), "type": "tokenizer_unavailable",
+                }]) from None
             identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
             directory = _directory(root, identifier)
             directory.mkdir(parents=True)
@@ -1023,7 +1056,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 condition_index.summary(summary)
             active.update(id=identifier, state="running", directory=directory, meta=meta,
                           open_files=guard,
-                          progress={}, events=[], requests=OrderedDict(),
+                          progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
                           conditions={(row["target"], row["condition_id"]): row for row in waiting},
                           condition_requests=condition_index,
                           condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],

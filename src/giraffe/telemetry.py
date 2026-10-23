@@ -1,4 +1,4 @@
-"""Optional bounded Prometheus scrapes; shared counters never imply causality."""
+"""Automatic bounded Prometheus scrapes; shared counters never imply causality."""
 
 from __future__ import annotations
 
@@ -289,6 +289,18 @@ def _metrics_headers(target):
 
 
 def parse(body, target, config, *, host=False):
+    # Identify only published exact-name contracts. User-selected contracts win;
+    # unrelated exporters and similarly named metrics cannot invent a runtime.
+    detected = None
+    if not host and target.metrics_profile == "unknown":
+        names = {match[1] for line in body.splitlines() if (match := LINE.fullmatch(line))}
+        vllm = "vllm-legacy" if names.intersection(set(LEGACY) - set(V1)) else "vllm-v1"
+        candidates = [name for name, mapping in {vllm: LEGACY, "sglang": SGLANG, **ENGINE_METRICS}.items()
+                      if names.intersection(mapping)]
+        if len(candidates) == 1:
+            detected = candidates[0]
+        if detected:
+            target = target.model_copy(update={"metrics_profile": detected})
     profile = (
         V1
         if target.metrics_profile == "vllm-v1"
@@ -365,6 +377,8 @@ def parse(body, target, config, *, host=False):
         "missing_families": sorted(required - families),
         "series_limit_reached": truncated,
         "mapping": "node_exporter" if host else target.metrics_profile,
+        "profile": "node_exporter" if host else target.metrics_profile,
+        "profile_source": "observed exact metric names" if detected else "configured profile",
         "mapping_reference": "https://prometheus.io/docs/guides/node-exporter/" if host else "vLLM 0.30.0 v1/metrics/loggers.py"
         if target.metrics_profile == "vllm-v1"
         else SGLANG_REFERENCE
@@ -373,7 +387,8 @@ def parse(body, target, config, *, host=False):
         if target.metrics_profile == "vllm-legacy"
         else ENGINE_METRIC_REFERENCES.get(target.metrics_profile, "No serving metric-name contract selected."),
         "runtime_version": target.metrics_runtime_version,
-        "version_verification": "user-supplied profile/version; verify with recorded deployment discovery",
+        "version_verification": ("Metric-name contract detected; runtime identity/version require deployment evidence."
+                                 if detected else "user-supplied profile/version; verify with recorded deployment discovery"),
         "instrumentation": target.instrumentation,
         "instrumentation_provenance": "user-supplied; unverified",
         "reason": {
@@ -395,6 +410,9 @@ def _metrics_client(config, target, timeout):
 
 
 async def _scrape_runtime(run, target, phase, *, force=False):
+    # A single same-origin conventional route is safe to discover. Never scan
+    # ports, follow redirects, or forward inference credentials to an exporter.
+    url = target.metrics_url or str(httpx.URL(target.url).copy_with(path="/metrics", query=None, fragment=None))
     result = {
         "phase": phase,
         "collected_at": stamp(),
@@ -403,11 +421,12 @@ async def _scrape_runtime(run, target, phase, *, force=False):
         "profile": target.metrics_profile,
         "samples": [],
         "scope": "published label series; may include unrelated shared traffic",
+        "endpoint": url,
+        "endpoint_source": "configured metrics_url" if target.metrics_url else "same-origin /metrics discovery",
     }
-    if not run.config.metrics and not force:
-        return result | {"status": "not_enabled", "reason": "Collection not enabled."}
-    if not target.metrics_url:
-        return result | {"status": "no_endpoint", "reason": "No statistics endpoint configured."}
+    previous = run.observations[target.name].get("runtime_metrics_discovery")
+    if not target.metrics_url and previous and previous["status"] not in {"available", "stale_samples"}:
+        return result | {"status": previous["status"], "reason": previous["reason"], "attempted": False}
     remaining = min(run.config.metrics_timeout_seconds, run.deadline - time.monotonic())
     if run.stop.is_set() or remaining <= 0:
         return result | {"status": "run_stopped", "reason": "Run stopped or deadline reached."}
@@ -415,26 +434,29 @@ async def _scrape_runtime(run, target, phase, *, force=False):
         async with asyncio.timeout(remaining):
             client = await asyncio.to_thread(_metrics_client, run.config, target, remaining)
             async with client:
-                async with client.stream("GET", target.metrics_url) as response:
+                async with client.stream("GET", url) as response:
                     result["http_status"] = response.status_code
                     if response.status_code in {401, 403}:
-                        return result | {
+                        result.update({
                             "status": "authentication_denied",
-                            "reason": "Statistics authentication denied.",
-                        }
+                            "reason": f"Metrics endpoint {url} denied access (HTTP {response.status_code}); inference credentials were not forwarded.",
+                        })
+                        return _remember_discovery(run, target, result)
                     if response.status_code == 404:
-                        return result | {
+                        result.update({
                             "status": "endpoint_absent",
-                            "reason": "Configured statistics endpoint returned 404.",
-                        }
+                            "reason": f"Metrics endpoint {url} returned HTTP 404; no runtime exporter was available at that route.",
+                        })
+                        return _remember_discovery(run, target, result)
                     response.raise_for_status()
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
-                            return result | {
+                            result.update({
                                 "status": "response_limit",
                                 "reason": "Statistics response exceeds 1 MiB.",
-                            }
+                            })
+                            return _remember_discovery(run, target, result)
                         body.extend(chunk)
         result.update(parse(body.decode("utf-8"), target, run.config))
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
@@ -453,6 +475,13 @@ async def _scrape_runtime(run, target, phase, *, force=False):
         result["instrumentation"] = instrument["value"]
         result["instrumentation_provenance"] = instrument["provenance"]
     result["scrape_duration_seconds"] = time.monotonic() - run.start - result["elapsed_seconds"]
+    return _remember_discovery(run, target, result)
+
+
+def _remember_discovery(run, target, result):
+    result["attempted"] = True
+    run.observations[target.name]["runtime_metrics_discovery"] = {
+        key: result[key] for key in ("status", "reason", "endpoint", "endpoint_source", "profile") if key in result}
     return result
 
 
@@ -777,14 +806,22 @@ def derive_server_metrics(data, *, host_configured=False):
         row["details"].setdefault("partial_coverage", bool(row["details"].get("excluded_intervals")))
         if row["value"] is None and not key.startswith("host_"):
             if not snapshots or all(snap.get("status") == "not_enabled" for snap in snapshots):
-                row.update(state="not_collected", reason="Runtime telemetry was not collected.",
-                           action="Configure and enable a supported runtime metrics endpoint.")
+                row.update(state="not_collected", reason="This saved run has no runtime metrics discovery or collection evidence.",
+                           action="New runs discover same-origin /metrics automatically; set targets[].metrics_url only for a different exporter route.")
+            elif not any(snap.get("status") in {"available", "absent_families", "stale_samples"} for snap in snapshots):
+                latest = snapshots[-1]
+                row.update(state="not_collected", reason=latest.get("reason", "Runtime metrics discovery did not return usable evidence."),
+                    action=("Supply targets[].metrics_url for an existing exporter at a different route." if latest.get("status") == "endpoint_absent"
+                            else "Supply metrics_api_key_env or metrics_headers_env for the exporter." if latest.get("status") == "authentication_denied"
+                            else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
+                row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
+                                      endpoint_source=latest.get("endpoint_source"))
             elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
                 family = key.rsplit("_", 2)[0]
                 required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
                 if required not in support:
-                    row.update(state="not_supported", reason="Selected runtime profile has no explicit contract for this measurement.",
-                               action="Use an adapter exposing documented matching duration counters or histogram buckets.")
+                    row.update(state="not_supported", reason=f"Runtime profile {', '.join(sorted(profiles))} exposes no documented {required} family in Giraffe's metric contract.",
+                               action=None)
     return metrics
 
 

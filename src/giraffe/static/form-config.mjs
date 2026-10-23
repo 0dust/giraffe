@@ -144,7 +144,7 @@ export function loadTestIssues(config, defaults, limits={}) {
   const list=(path,values,integer)=>{if(!Array.isArray(values)||!values.length||values.length>(limits['load_test.'+path]?.maxItems??Infinity)||values.some((n,i)=>typeof n!=='number'||!Number.isFinite(n)||n<=0||(integer&&!Number.isInteger(n))||(i&&n<=values[i-1])||n>(limits['load_test.'+path]?.items?.maximum??Infinity)))issue(path,'Enter positive, increasing '+(integer?'whole-number levels':'rates')+' separated by commas.');};
   if(standard&&p.concurrent.enabled||w.interference.enabled)list('patterns.concurrent.levels',levels,true);
   if(standard&&(p.constant.enabled||p.poisson.enabled))list('patterns.rates',rates,false);
-  if(standard||w.interference.enabled){valid('schedule.duration_seconds',s.schedule.duration_seconds,1,{integer:true,label:'Duration per workload, pattern and level (seconds)'});valid('schedule.finish_seconds',s.schedule.finish_seconds,0,{label:'Wait for unfinished requests after each test (seconds)'});}
+  if(standard||w.interference.enabled)valid('schedule.duration_seconds',s.schedule.duration_seconds,1,{integer:true,label:'Send new requests for (seconds)'});
   if(standard&&p.poisson.enabled)valid('patterns.poisson.seed',p.poisson.seed,0,{integer:true,label:'Random seed'});
   if(standard&&p.bursts.enabled){
     valid('patterns.bursts.size',p.bursts.size,1,{integer:true,label:'Requests per burst'});
@@ -203,7 +203,7 @@ export function configureLoadTest(source, values, defaults, {allowInvalid=false,
   }
   set('patterns.poisson.seed',p.poisson,'seed',standard&&p.poisson.enabled);
   for(const key of ['size','first_seconds','gap_seconds'])set('patterns.bursts.'+key,p.bursts,key,standard&&p.bursts.enabled);
-  for(const key of ['duration_seconds','finish_seconds'])set('schedule.'+key,settings.schedule,key,standard||w.interference.enabled);
+  set('schedule.duration_seconds',settings.schedule,'duration_seconds',standard||w.interference.enabled);
   set('request_timeout_seconds',settings,'request_timeout_seconds');
   for(const key of Object.keys(settings.pass_criteria))set('pass_criteria.'+key,settings.pass_criteria,key,true,!['max_error_percent','min_correct_percent','min_valid_responses'].includes(key));
   config.load_test=settings;

@@ -27,7 +27,7 @@ def test_explicit_cli_budget_covers_default_preview(output_format, tmp_path, mon
         "--max-requests", "300", "--max-duration", "300", "--concurrency", "4",
     ]))
     assert config.max_requests == 300
-    assert (config.max_duration_seconds, config.request_timeout_seconds, config.max_output_tokens) == (300, 30, 128)
+    assert (config.max_duration_seconds, config.request_timeout_seconds, config.max_output_tokens) == (300, 300, 128)
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config.model_dump(mode="json")))
     capsys.readouterr()
@@ -264,6 +264,25 @@ def test_baseline_save_json_preserves_explicit_replace_boundary(tmp_path, capsys
     assert result["kind"] == "baseline.save" and result["destination"] == str(destination.resolve())
     assert main(arguments) == 4
     assert json.loads(capsys.readouterr().out)["outcome"] == "error"
+
+
+def test_run_banner_distinguishes_default_and_effective_load_timeout(tmp_path, capsys, monkeypatch):
+    async def run(config, **kwargs):
+        return RunReport(run_id="timeouts", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")})
+
+    async def prepared(config):
+        pass
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    monkeypatch.setattr("giraffe.local_tokenizer.ensure_tokenizers", prepared)
+    assert main(["run", "--url", "http://localhost:1234/v1", "--model", "alias",
+                 "--checks", "load", "--request-timeout", "1", "--skip-preflight",
+                 "--output", str(tmp_path)]) == 0
+    stderr = capsys.readouterr().err
+    assert "Request defaults: 1s timeout" in stderr
+    assert "Per-check request timeouts: load/primary=300s" in stderr
+    assert "Saved requests may override these" in stderr
 
 
 def operator_pack():

@@ -177,7 +177,12 @@ def capabilities(config: RunConfig | None = None) -> dict:
              **({"request_settings": pack_settings(configured)}
                 if key == "correctness" and configured.request_source == "request_pack" else {})} for key, title in CHECK_NAMES.items()
         ],
-        "telemetry": {"host_metrics_url": {"field": "targets[].host_metrics_url",
+        "telemetry": {"runtime": {"collection": "Automatic alongside inference, independent of GPU checks and the legacy metrics flag.",
+            "discovery": "Configured metrics_url, otherwise one same-origin /metrics route; no port scanning or inference credential forwarding.",
+            "profiles": "Explicit metric-name contracts; unknown profiles are detected only from published exact names."},
+            "token_evidence": {"collection": "Bounded, request-budgeted setup probes negotiate streamed logprobs and usage before timed workloads.",
+                "limitation": "Exact token ITL requires matching usage and distinct single-token reads; buffered events remain unavailable."},
+            "host_metrics_url": {"field": "targets[].host_metrics_url",
             "label": "Server host exporter URL", "optional": True, "profile": "node_exporter",
             "metrics": ["host_cpu_percent", "host_ram_used_bytes", "host_ram_total_bytes"],
             "scope": "server-wide", "credentials": "No inference or runtime metrics credentials are forwarded.",

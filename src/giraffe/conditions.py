@@ -191,6 +191,8 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     if config is not None and scenario == "arrival" and config.arrivals:
         workload.setdefault("requests_per_second", config.arrivals.requests_per_second)
     condition = _identity(scenario, workload)
+    if scenario == "performance_evidence_probe":
+        condition.update(label="Streamed token evidence capability", load_type="preparation")
     check = condition["check"]
     parameters = {}
     if condition.get("level") is not None:
@@ -205,6 +207,16 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     if check == "fairness":
         parameters["concurrency"] = 1 if scenario in {"fairness", "fairness_baseline"} else 2
     if config is not None:
+        if check == "load":
+            from .load_test import settings_sets
+            source = workload.get("source", "primary")
+            own = dict(settings_sets(config.load_test)).get(source, config.load_test)
+            parameters["request_timeout_seconds"] = own.request_timeout_seconds
+        else:
+            from .models import CHECK_OPTION_FIELDS
+            effective = config.effective_initial() if scenario == "initial" else (
+                config.effective_check(check) if check in CHECK_OPTION_FIELDS else {})
+            parameters["request_timeout_seconds"] = effective.get("request_timeout_seconds", config.request_timeout_seconds)
         if check == "consistency" and config.consistency:
             settings = config.consistency
             level = condition.get("level", 1)
@@ -229,7 +241,7 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
             parameters["concurrency"] = config.effective_check("recovery")["concurrency"] if scenario == "sustained" else 1
         if check in {"correctness", "json"}:
             parameters.setdefault("concurrency", 1)
-    for key in ("input_chars", "output_tokens", "repetitions_per_prompt", "concurrency"):
+    for key in ("input_chars", "output_tokens", "repetitions_per_prompt", "concurrency", "request_timeout_seconds"):
         if details.get(key) is not None:
             parameters[key] = details[key]
     if "output_tokens" not in parameters and workload.get("requested_output_tokens") is not None:
@@ -283,7 +295,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                 previous["planned"] += planned
                 previous["not_sent"] = previous["planned"]
             return
-        scenarios[key] = {"condition": condition, "planned": planned,
+        scenarios[key] = {"condition": condition, "planned": planned, "planned_condition": True,
             "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
             "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
             "not_sent": planned, "reason": None, "request_statuses": {}}
@@ -346,7 +358,9 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
             if point["pattern"] == "poisson":
                 count = None
             for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
-                workload = {"rate_rps": point["rate"]} if point["rate"] is not None else {}
+                workload = {"source": point["source"]}
+                if point["rate"] is not None:
+                    workload["rate_rps"] = point["rate"]
                 identifier = point["id"] + (f".{phase}" if phase else "")
                 add(identifier, count, "exact" if count is not None else "unknown", workload)
                 if point["pattern"] in {"concurrent", "interference"}:
@@ -409,6 +423,17 @@ def request_status(record: Mapping[str, Any]) -> str:
 
 def request_result_text(record: Mapping[str, Any]) -> str:
     status = request_status(record)
+    reason = {"request_timeout": "Request timeout", "request_deadline": "Request timeout",
+              "connect_timeout": "Connection timeout", "read_timeout": "Response read timeout",
+              "write_timeout": "Request write timeout", "pool_timeout": "Connection pool timeout",
+              "user_stop": "Stopped by user", "run_duration_limit": "Overall run time limit",
+              "memory_limit": "Run memory limit", "error_threshold": "Run error threshold",
+              "endpoint_unresponsive": "Endpoint unresponsive", "intentional_deadline": "Intentional test deadline",
+              "intentional_cancellation": "Intentional test cancellation", "intentional_cancellation_deadline": "Intentional test cancellation",
+              "generation_chunk_limit": "Intentional generated-chunk limit", "workload_cancelled": "Workload cancelled"}.get(record.get("termination_reason"))
+    if reason and status in {"timed_out", "cancelled", "failed"}:
+        limit = record.get("termination_limit_seconds")
+        return f"{reason} ({limit:g} s)" if isinstance(limit, (int, float)) else reason
     if status == "failed" and record.get("http_status") and record["http_status"] >= 400:
         return f"HTTP {record['http_status']}"
     return {"running": "Awaiting response", "passed": "Correct answer", "failed": "Wrong answer" if record.get("score") is False else "Request failed",
@@ -441,6 +466,9 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
         status = "running"
     elif not terminal:
         status = "waiting"
+    elif not started and ((summary.get("load_point_result") or {}).get("status") == "skipped"
+                         or (summary.get("load_point_result") or {}).get("input_not_calibrated")):
+        status = "skipped"
     elif explicit in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
         status = {"pass": "passed", "fail": "failed", "blocked": "inconclusive"}.get(explicit, explicit)
     elif failed:
@@ -599,7 +627,7 @@ class ConditionRequestIndex:
             insort(self.slots.setdefault(key, []), slot)
         status = request_status(record)
         self.statuses.setdefault(key, {}).setdefault(status, set()).add(slot)
-        self.rows[slot] = {key: record.get(key) for key in ("id", "target", "scenario", "condition_id", "status", "valid", "score", "http_status")} | {
+        self.rows[slot] = {key: record.get(key) for key in ("id", "target", "scenario", "condition_id", "status", "valid", "score", "http_status", "request_timeout_seconds", "termination_reason", "termination_limit_seconds")} | {
             "_key": key, "_status": status, "result_text": request_result_text(record)}
 
     @classmethod

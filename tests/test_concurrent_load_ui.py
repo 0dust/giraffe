@@ -1,6 +1,11 @@
 """Concurrent load's browser contract, exercised through the real UI in node VM."""
+
+import pytest
 from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_results import run_render_checks
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def test_drawer_structure_and_labels():
@@ -81,7 +86,7 @@ def test_plan_breakdown_and_duration_rows_use_server_numbers():
     plan=request_plan(config)
     browser_logic('const plan='+json.dumps(plan)+r''';
 config.checks=['load'];const html=renderRunBlueprint(config,plan);
-assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/6m 0s/);assert.match(html,/Unknown \+ 135/);
+assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);assert.match(html,/Unknown \+ 135/);
 assert.match(html,/Expected scheduled requests/);assert.match(html,/Execution order/);
 assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);
 assert.doesNotMatch(renderLoadPlan(config),/12<\/dd>|3m 0s/); // No independent planner fallback.
@@ -200,3 +205,6 @@ async def test_live_finished_conditions_carry_authoritative_point_measurements()
     assert len(finished)==1
     assert finished[0]['condition_summary']['load_point_result']=={key:value for key,value in obs['points'][0].items() if key!='offers'}
     assert finished[0]['condition_summary']['load_point_result']['groups']
+
+
+# Fake inference clients in this module use the matching local tokenizer.

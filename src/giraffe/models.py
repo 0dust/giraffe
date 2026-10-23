@@ -368,7 +368,15 @@ class LoadPatterns(Model):
 
 class LoadWindow(Model):
     duration_seconds: StrictInt = Field(default=15, ge=1, le=MAX_STAGE_SECONDS)
-    finish_seconds: float = Field(default=15, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_finish_limit(cls, value):
+        # Older saved runs remain readable; admission windows no longer cancel
+        # outstanding requests before their own timeout.
+        if isinstance(value, dict):
+            return {key: item for key, item in value.items() if key != "finish_seconds"}
+        return value
 
 
 class ResponseCriteria(Model):
@@ -392,7 +400,7 @@ class LoadTestSettings(Model):
     workloads: LoadWorkloads = Field(default_factory=LoadWorkloads)
     patterns: LoadPatterns = Field(default_factory=LoadPatterns)
     schedule: LoadWindow = Field(default_factory=LoadWindow)
-    request_timeout_seconds: float = Field(default=60, gt=0)
+    request_timeout_seconds: float = Field(default=300, gt=0)
     pass_criteria: ResponseCriteria = Field(default_factory=ResponseCriteria)
 
     @field_validator("profile", mode="plain", json_schema_input_type=LoadTestProfile)
@@ -481,7 +489,7 @@ def migrate_load_test(value):
                 details.append({"type": PydanticCustomError(item["type"], item["msg"], context),
                                 "loc": (prefix, *item["loc"]), "input": item.get("input")})
             raise ValidationError.from_exception_data("Legacy load configuration", details) from None
-    timeout = value.get("request_timeout_seconds", 30)
+    timeout = value.get("request_timeout_seconds", 300)
     for check in dict.fromkeys(selected):
         settings = LoadTestSettings().model_dump()
         settings["legacy_source"] = check
@@ -492,7 +500,6 @@ def migrate_load_test(value):
             patterns[k]["enabled"] = False
         own = plain(options.get(check))
         settings["request_timeout_seconds"] = own.get("request_timeout_seconds") or timeout
-        settings["schedule"]["finish_seconds"] = settings["request_timeout_seconds"]
         if check == "concurrency":
             old_input = plain(value.get("concurrent_load"))
             explicit_levels = "levels" in plain(old_input.get("schedule"))
@@ -518,13 +525,13 @@ def migrate_load_test(value):
             settings["schedule"]["duration_seconds"] = old["schedule"]["duration_seconds"]
             settings["pass_criteria"].update({k: v for k,v in old["pass_criteria"].items() if k in settings["pass_criteria"]})
             if old["input_token_tolerance"] != .1 or old["calibration_attempts"] != 3:
-                notes.append(f"Legacy input_token_tolerance={old['input_token_tolerance']} and calibration_attempts={old['calibration_attempts']} replaced by the Load test calibration policy (0.1 tolerance, 3 attempts). Review calibration coverage in the results.")
-            notes.append("Concurrent load migrated to Load test. Finish allowance uses the old request timeout (drain bound). Old p95 limits were not converted to per-response limits; new per-response defaults (2,000 ms first answer / 30,000 ms completion) apply. Review per-response criteria. Old mixed seed is now the shared schedule/mix seed; interference uses full baseline/probe windows and a five-chunk trigger.")
+                notes.append(f"Legacy input_token_tolerance={old['input_token_tolerance']} and calibration_attempts={old['calibration_attempts']} are replaced by bounded local tokenization with 0.1 tolerance. No inference requests are used for prompt sizing.")
+            notes.append("Concurrent load migrated to Load test. Existing per-test request timeout is preserved; outstanding requests finish under that timeout. Old p95 limits were not converted to per-response limits; new per-response defaults (2,000 ms first answer / 30,000 ms completion) apply. Review per-response criteria. Old mixed seed is now the shared schedule/mix seed; interference uses full baseline/probe windows and a five-chunk trigger.")
         elif check == "capacity":
             old = validate_legacy(TrafficConfig, plain(value.get("traffic")), "traffic")
             patterns["poisson" if old.arrival == "poisson" else "constant"]["enabled"] = True
             patterns["rates"], patterns["poisson"]["seed"] = old.rates, old.seed
-            settings["schedule"].update(duration_seconds=math.ceil(old.duration_seconds), finish_seconds=old.drain_timeout_seconds)
+            settings["schedule"].update(duration_seconds=math.ceil(old.duration_seconds))
             shares = {"short_short": old.mix.short*100, "long_short": old.mix.long_input*100, "short_long": old.mix.long_output*100}
             shapes = [s for s,v in shares.items() if v > 0]
             if len(shapes) == 1:
@@ -1139,6 +1146,9 @@ class Consistency(Model):
 
 
 class Target(Model):
+    tokenizer: str | None = Field(default=None, min_length=1,
+        description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
+    _tokenizer_setup: dict = PrivateAttr(default_factory=dict)
     # Supplied separately by the local UI; never part of config/schema/report serialization.
     _api_key: SecretStr | None = PrivateAttr(default=None)
     name: str = Field(min_length=1)
@@ -1158,6 +1168,11 @@ class Target(Model):
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
+
+    @field_validator("tokenizer", mode="before")
+    @classmethod
+    def trim_tokenizer(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def validate_target(self) -> Target:
@@ -1250,7 +1265,8 @@ class TrafficConfig(Model):
     seed: int = Field(default=42, ge=0)
     mix: TrafficMix = Field(default_factory=TrafficMix)
     scheduler_lag_tolerance_ms: float = Field(default=100, gt=0)
-    drain_timeout_seconds: float = Field(default=30, gt=0)
+    drain_timeout_seconds: float | None = Field(default=None, gt=0,
+        description="Legacy traffic drain limit; null lets each request finish or reach its own timeout.")
     long_input_chars: int = Field(default=4096, ge=128, le=1_000_000)
     long_output_words: int = Field(default=32, ge=2, le=4096)
 
@@ -1841,7 +1857,7 @@ class RunConfig(Model):
     max_duration_seconds: float | None = Field(default=None, gt=0)
     max_memory_mb: int = Field(default=4096, ge=0,
         description="Memory limit (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
-    request_timeout_seconds: float = Field(default=30, gt=0)
+    request_timeout_seconds: float = Field(default=300, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
     context_limit: int = Field(default=4096, ge=128)
@@ -2300,6 +2316,9 @@ class RequestRecord(Model):
     http_status: int | None = None
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
+    request_timeout_seconds: float | None = None
+    termination_reason: str | None = None
+    termination_limit_seconds: float | None = None
     server_request_id: str | None = None
     client_cancelled_at_ns: int | None = None
     client_cancelled_monotonic_ns: int | None = None

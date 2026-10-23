@@ -61,7 +61,10 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path):
             evidence = await client.get(f"/api/runs/{response.json()['id']}/requests/{request_id}")
             assert evidence.status_code == 200
         assert len(endpoint.requests) == 1
-        assert endpoint.collector_reads == endpoint.metrics_reads == 0
+        assert endpoint.collector_reads == 0
+        # Automatic start/end telemetry can also sample periodically during a
+        # slow run; inference remains exactly one request.
+        assert endpoint.metrics_reads >= 2
         assert endpoint.requests[0]["messages"][0]["content"] == "What is the return window?"
         assert len(saved["requests"]) == 1 and saved["requests"][0]["score"] is True
         assert saved["manifest"]["config"]["max_requests"] == 1

@@ -2,12 +2,15 @@ import json
 from pathlib import Path
 
 import pytest
+
 import yaml
 
 from giraffe.caps import MAX_SIMULTANEOUS_REQUESTS
 from giraffe.cli import main
 from giraffe.models import Deployment, RunConfig, migrate_concurrent_load, migrate_load_test, migrate_run_limits
 from tests.test_concurrent_load import TARGET, configuration
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def load_saved(value):

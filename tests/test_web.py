@@ -15,6 +15,8 @@ from giraffe.models import (
 from giraffe.reporting import write_report
 from giraffe.web import create_app
 
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
 
 @pytest.mark.parametrize("endpoint", ["preview", "draft", "validate", "plan"])
 async def test_config_conflicts_include_fields_and_safe_values(tmp_path, endpoint):

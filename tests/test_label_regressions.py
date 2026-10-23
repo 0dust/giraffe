@@ -33,7 +33,8 @@ async def test_plain_requests_keep_empty_workloads_and_live_record_contract():
                 "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
                 "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
                 "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
-                "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason"}
+                "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
+                "request_timeout_seconds", "termination_reason", "termination_limit_seconds"}
     for event in events:
         assert "workload" not in event
         if event["event"] == "request_completed":
@@ -172,7 +173,7 @@ assert.equal(record.input_chars,0);
 """)
 
 
-async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monkeypatch):
+async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monkeypatch, local_tokenizer):
     from tests.test_web import browser, finished, report, start
 
     release = asyncio.Event()

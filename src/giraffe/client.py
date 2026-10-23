@@ -29,6 +29,8 @@ _MAX_RESPONSE_EVENTS = 256
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 _MAX_CONTENT_READS = 65536
 _MAX_OUTPUT_EVENTS = 4096
+# Reuse completed HTTP/1.1 streams without waiting on servers that never send EOF.
+_STREAM_DRAIN_SECONDS = 0.1
 _REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
@@ -163,6 +165,31 @@ def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _rejected_evidence_field(body: bytes) -> str | None:
+    """Retain a known field name only, never arbitrary endpoint error content."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    allowed = {"logprobs", "top_logprobs", "stream_options"}
+    if isinstance(error, dict) and isinstance(error.get("param"), str) and error["param"] in allowed:
+        return error["param"]
+    for item in data.get("detail", []) if isinstance(data.get("detail"), list) else []:
+        if isinstance(item, dict) and item.get("type") == "extra_forbidden":
+            for field in item.get("loc", []) if isinstance(item.get("loc"), list) else []:
+                if isinstance(field, str) and field in allowed:
+                    return field
+    message = error.get("message") if isinstance(error, dict) else error
+    if isinstance(message, str) and any(word in message.lower() for word in ("not support", "unsupported", "unknown field")):
+        for field in sorted(allowed):
+            if re.search(r"\b" + field + r"\b", message):
+                return field
+    return None
+
+
 def _answer_spans(output: str) -> list[tuple[int, int]] | None:
     """Raw-output spans that fixtures.final_answer keeps; None when reasoning is unclosed."""
     cursor, spans, stack = 0, [], []
@@ -204,7 +231,56 @@ class LLMClient:
         self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | None = None
+        self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
+        self._evidence_fields = {"logprobs", "stream_options"}
+        self._evidence_probe_attempts = 0
+        self._evidence_probe_finished = False
+        self.token_evidence = {"status": "not_probed", "logprobs": "unverified", "usage": "unverified"}
+
+    def token_evidence_probe(self) -> RequestSpec | None:
+        """Return bounded setup traffic; callers account for it outside timed workloads.
+
+        Only an explicit optional-field rejection permits another setup probe.
+        Measured requests are never retried or used to discover compatibility.
+        """
+        if self._evidence_probe_finished or self._evidence_probe_attempts >= 3 or not self.config.stream:
+            return None
+        self._evidence_probe_attempts += 1
+        options = {}
+        if "logprobs" in self._evidence_fields:
+            options.update(logprobs=True, top_logprobs=0)
+        if "stream_options" in self._evidence_fields:
+            options["stream_options"] = {"include_usage": True}
+        return RequestSpec(fixture_id="performance-evidence", scenario="performance_evidence_probe",
+            check_ids=[], messages=[{"role": "user", "content": "Reply with 1."}], max_tokens=1,
+            request_timeout_seconds=self.config.request_timeout_seconds, options=options,
+            workload={"performance_evidence_probe": True, "role": "setup", "phase": "preparation",
+                      "evidence_fields": sorted(self._evidence_fields)})
+
+    def observe_token_evidence_probe(self, record: RequestRecord) -> dict:
+        rejected = record.workload.get("rejected_evidence_field")
+        if rejected in {"logprobs", "top_logprobs", "stream_options"}:
+            field = "logprobs" if rejected == "top_logprobs" else rejected
+            self._evidence_fields.discard(field)
+            self.token_evidence["logprobs" if field == "logprobs" else "usage"] = "rejected"
+            self.token_evidence.update(status="probing", reason=f"Endpoint rejected {rejected} (HTTP {record.http_status}).")
+            self._evidence_probe_finished = not self._evidence_fields or self._evidence_probe_attempts >= 3
+        else:
+            self._evidence_probe_finished = True
+            completed = record.http_status == 200 and record.stream_terminated
+            returned_tokens = any(event.get("token_count") is not None for event in record.output_events)
+            returned_usage = record.input_tokens is not None or record.completion_tokens is not None
+            for key, available in (("logprobs", returned_tokens), ("usage", returned_usage)):
+                if self.token_evidence[key] != "rejected":
+                    self.token_evidence[key] = "supported" if available else "not_returned" if completed else "unverified"
+            self.token_evidence.update(status="observed" if completed else "unavailable",
+                reason=("Compatibility probe inspected streamed token boundaries and usage; request-specific coverage is checked separately."
+                        if completed else f"Compatibility probe did not complete ({record.error or record.status})."))
+        self.token_evidence["probe_requests"] = self._evidence_probe_attempts
+        if self._evidence_probe_finished and self.token_evidence["status"] == "probing":
+            self.token_evidence["status"] = "unavailable"
+        return dict(self.token_evidence)
 
     def _create_client(self) -> httpx.AsyncClient:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
@@ -227,9 +303,31 @@ class LLMClient:
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        try:
+            if self._stream_drains:
+                await asyncio.gather(*self._stream_drains, return_exceptions=True)
+        finally:
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
+
+    @staticmethod
+    async def _drain_stream(
+        response: httpx.Response, events: AsyncIterator[tuple[str, str, float]],
+    ) -> None:
+        # [DONE] completes the measured response. Consume only the transport tail
+        # in the background so HTTPX can return the connection to its pool.
+        try:
+            async with asyncio.timeout(_STREAM_DRAIN_SECONDS):
+                async for _ in events:
+                    pass
+        except (TimeoutError, httpx.HTTPError, OSError, _ProtocolError, UnicodeDecodeError):
+            pass
+        finally:
+            try:
+                await response.aclose()
+            except (httpx.HTTPError, OSError):
+                pass  # Transport cleanup cannot invalidate a completed response.
 
     async def ready(self, deadline: float) -> bool:
         """Poll the advertised model route without spending an inference request."""
@@ -281,9 +379,30 @@ class LLMClient:
                 payload.update(spec.tool_expectation.choice.request_options())
             record.tool_request_options = {key: payload[key] for key in
                 ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
-        if stream:
-            payload.setdefault("stream_options", {"include_usage": True})
+        probing = spec.workload.get("performance_evidence_probe")
+        if stream and not probing:
+            if self.token_evidence["usage"] == "supported":
+                payload.setdefault("stream_options", {"include_usage": True})
+            if self._evidence_probe_attempts:
+                # Explicit caller options still take precedence over automatic evidence.
+                # A plain-text probe does not certify combinations with tools or
+                # constrained output. Explicit workload options remain authoritative.
+                compatible_shape = spec.scorer != "tool" and not payload.get("tools") and not payload.get("response_format")
+                if self.token_evidence["logprobs"] == "supported" and "logprobs" not in payload and compatible_shape:
+                    payload["logprobs"] = True
+                    payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
+        if not probing and self._evidence_probe_attempts:
+            record.workload["token_evidence"] = dict(self.token_evidence)
+            evidence = record.workload["token_evidence"]
+            evidence["requested_logprobs"] = payload.get("logprobs") is True
+            evidence["requested_usage"] = isinstance(payload.get("stream_options"), dict) and payload["stream_options"].get("include_usage") is True
+            if not stream:
+                evidence["logprobs"] = "non_streamed"
+            if stream and not evidence["requested_logprobs"] and evidence["logprobs"] == "supported":
+                evidence["logprobs"] = "disabled_by_request" if "logprobs" in payload else "shape_unverified"
+                evidence["reason"] = ("Explicit request options disabled logprobs." if "logprobs" in payload else
+                    "Plain-text probe does not establish logprobs compatibility with tools or structured-output options; no automatic logprobs were added.")
 
         def body_received(size):
             record.response_body_bytes += size
@@ -312,8 +431,9 @@ class LLMClient:
 
         def stream_body_received(size):
             nonlocal read_id
-            read_id += 1
-            body_received(size)
+            if not record.stream_terminated:
+                read_id += 1
+                body_received(size)
 
         def output_event(kind: str, text: str, at: float, *, tokens=None):
             # Client receipt time, not server generation time. Tool-only TTFT
@@ -519,6 +639,7 @@ class LLMClient:
 
         request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                            else self.config.request_timeout_seconds)
+        record.request_timeout_seconds = request_timeout
         intentional = spec.cancel_after_ms is not None and (
             spec.cancel_after_ms / 1000 < request_timeout
         )
@@ -526,15 +647,21 @@ class LLMClient:
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
         try:
             async with asyncio.timeout(timeout):
-                async with self._client.stream("POST", completion_url(self.target.url),
-                                               json=payload, timeout=httpx.Timeout(
-                                                   None, connect=min(request_timeout * .9, 10))) as response:
+                response = await self._client.send(self._client.build_request(
+                    "POST", completion_url(self.target.url), json=payload,
+                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10))), stream=True)
+                events = None
+                try:
                     record.http_status = response.status_code
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
+                        if probing and response.status_code in {400, 422}:
+                            rejected_field = _rejected_evidence_field(error_body)
+                            if rejected_field:
+                                record.workload["rejected_evidence_field"] = rejected_field
                         if spec.workload.get("logprobs"):
                             from giraffe.models import LogprobEvidence
                             try:
@@ -559,7 +686,8 @@ class LLMClient:
                         if "application/json" in response.headers.get("content-type", ""):
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        async for event_type, event, observed_at in _sse_events(response, on_read=stream_body_received):
+                        events = _sse_events(response, on_read=stream_body_received)
+                        async for event_type, event, observed_at in events:
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
@@ -611,17 +739,35 @@ class LLMClient:
                     if conversation and record.tool_calls:
                         record.assistant_message["tool_calls"] = record.tool_calls
                     record.status, record.valid = "completed", True
+                finally:
+                    if events is not None and record.stream_terminated and response.http_version == "HTTP/1.1":
+                        task = asyncio.create_task(self._drain_stream(response, events))
+                        self._stream_drains.add(task)
+                        task.add_done_callback(self._stream_drains.discard)
+                    else:
+                        await response.aclose()
         except _IntentionalCancellation:
             record.status, record.error = "cancelled", "intentional cancellation after generation chunks"
+            record.termination_reason = "generation_chunk_limit"
         except TimeoutError:
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
+            record.termination_reason = "intentional_cancellation_deadline" if intentional else "request_deadline"
+            record.termination_limit_seconds = timeout
         except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
             record.status, record.error = "failed", f"request failed ({type(exc).__name__})"
+            if isinstance(exc, httpx.ConnectTimeout):
+                record.termination_reason = "connect_timeout"
+                record.termination_limit_seconds = min(request_timeout * .9, 10)
         except httpx.TimeoutException as exc:
             record.status, record.error = "timeout", f"request timeout ({type(exc).__name__})"
+            record.termination_reason = {httpx.ReadTimeout: "read_timeout", httpx.WriteTimeout: "write_timeout",
+                                         httpx.PoolTimeout: "pool_timeout"}.get(type(exc), "transport_timeout")
         except asyncio.CancelledError:
             record.status, record.error = "cancelled", "run cancelled"
+            # The runner supplies the authoritative stop reason and enclosing limit.
+            # Cancellation payloads may contain arbitrary text; never persist them.
+            record.termination_reason = "external_cancellation"
         except _ProtocolError as exc:
             record.error = str(exc)
         except UnicodeDecodeError:

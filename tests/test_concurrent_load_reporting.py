@@ -1,8 +1,13 @@
 """Final Load test groups, baseline clocks and retained historical rendering."""
+
+import pytest
 from giraffe.models import CheckResult
 from giraffe.reporting import _groups, _metric_values, _render, compare_baseline, write_report
 from tests.test_concurrent_load import configuration, perform
 from tests.test_web import report as empty_report
+
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 async def saved_report(interference=False):
@@ -91,3 +96,6 @@ async def test_arrival_baseline_missing_one_response_clock_cannot_establish_pass
                 if row['metric'] == 'latency_ms' and changed.id in row['evidence_ids']]
     assert affected and all(row['status'] == 'inconclusive' for row in affected)
     assert compared.baseline['status'] == 'inconclusive'
+
+
+# Fake inference clients in this module use the matching local tokenizer.

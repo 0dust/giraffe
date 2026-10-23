@@ -4,10 +4,13 @@ import asyncio
 import httpx
 import pytest
 
+
 from giraffe.conditions import ConditionRequestIndex, planned_conditions
 from giraffe.load_test import test_points as load_points
 from giraffe.models import RunConfig, RunReport
 from giraffe.web import create_app
+
+pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def load_config(levels=(4, 8, 16)):

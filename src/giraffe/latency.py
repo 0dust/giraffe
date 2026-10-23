@@ -164,7 +164,7 @@ def latency_summary(report: RunReport) -> dict:
             if gaps:
                 measurement["batch_overhead_ms"] = max(0, span - modeled) / gaps
         calibration = observation.get("context_calibration", {})
-        if isinstance(calibration, dict) and calibration.get("status") in {"sized_from_observed_usage", "unavailable"}:
+        if isinstance(calibration, dict) and calibration.get("status") in {"sized_locally", "sized_from_observed_usage", "unavailable"}:
             from .fixtures import FIXTURE_VERSION
 
             configured = report.manifest.get("effective_checks", {}).get("context", {})
@@ -172,6 +172,13 @@ def latency_summary(report: RunReport) -> dict:
                 "context", {}).get("context_limit") or config.get("context_limit", 4096))
             profile = {"fixture_version": FIXTURE_VERSION, "context_limit": context_limit,
                        "fixture_context_limit": calibration.get("fixture_context_limit", context_limit)}
+            if calibration.get("status") == "sized_locally":
+                # Keep only request-shape metadata, never the prepared prompt.
+                shapes = {record.fixture_id: {"fixture_id": record.fixture_id,
+                          "input_chars": record.input_chars, "output_cap": record.requested_max_tokens}
+                          for key, records in timings.items() if key[0] == "context" for record in records}
+                profile.update(method="local_tokenizer", tokenizer=target.get("tokenizer") or target["model"],
+                               fixtures=[shapes[key] for key in sorted(shapes)])
             for measurement in measurements:
                 if measurement["family"] == "context":
                     measurement["context_profile"] = profile
@@ -427,7 +434,7 @@ def _merge_block(block: list[dict], *, distribution: bool = True) -> dict:
 
 def calibrated_context_fixtures(observations: dict | None, target_name: str, config: RunConfig, *,
                                 cohort: str | None = None) -> list | None:
-    """Rebuild the first calibrated batch, leaving later adaptive inputs unknown."""
+    """Recover matching request shapes for planning; these specs are never sent."""
     from .fixtures import FIXTURE_VERSION, builtin_fixtures
 
     options = config.effective_check("context")
@@ -445,5 +452,24 @@ def calibrated_context_fixtures(observations: dict | None, target_name: str, con
             continue
         effective = config.model_copy(update={**{key: value for key, value in options.items() if key != "limits"},
                                               "context_limit": fixture_limit})
-        return builtin_fixtures(effective, check_id="context")["context"]
+        specs = builtin_fixtures(effective, check_id="context")["context"]
+        if profile.get("method") == "local_tokenizer":
+            target = next((target for target in config.targets if target.name == target_name), None)
+            if target is None or profile.get("tokenizer") != (target.tokenizer or target.model):
+                continue
+            shapes = profile.get("fixtures")
+            if (not isinstance(shapes, list) or len(shapes) != len(specs)
+                    or any(not isinstance(shape, dict) or not isinstance(shape.get("fixture_id"), str)
+                           for shape in shapes)):
+                continue
+            by_id = {shape.get("fixture_id"): shape for shape in shapes}
+            if set(by_id) != {spec.fixture_id for spec in specs}:
+                continue
+            if any(type(by_id[spec.fixture_id].get("input_chars")) is not int
+                   or not 1 <= by_id[spec.fixture_id]["input_chars"] <= _MAX_CONTEXT_PREVIEW_CHARS
+                   or by_id[spec.fixture_id].get("output_cap") != spec.max_tokens for spec in specs):
+                continue
+            for spec in specs:
+                spec.input_chars = by_id[spec.fixture_id]["input_chars"]
+        return specs
     return None

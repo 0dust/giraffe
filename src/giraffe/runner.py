@@ -115,7 +115,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if (scenario == "sustained" or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+    if (scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
@@ -280,6 +280,14 @@ class _Run:
         self.timing_health = TimingHealth(self.start)
         self.inflight = _InflightPeaks()
         self.conditions = {}
+        from .conditions import planned_conditions
+        self.planned_condition_ids = {(row["target"], row["condition_id"]) for row in planned_conditions(config)}
+        from .planning import request_plan
+        # Optional evidence probes must not displace finite planned work,
+        # including bounded tool conversations that are excluded from "known".
+        self.planned_request_reserve_per_target = sum(
+            row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+            for row in request_plan(config)["rows"])
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
         self.target_tasks = {}
@@ -301,7 +309,7 @@ class _Run:
         if row is None:
             if len(self.observations[target]["conditions"]) >= 1024:
                 return None
-            row = {"target": target, "condition": condition, "planned": None,
+            row = {"target": target, "condition": condition, "planned": None, "planned_condition": key in self.planned_condition_ids,
                    "planned_kind": "exact", "status": "waiting", "sent": 0,
                    "started": 0, "running": 0, "completed": 0, "failed": 0,
                    "not_sent": None, "reason": None, "request_statuses": {}}
@@ -322,7 +330,7 @@ class _Run:
     def plan_condition(self, target, scenario, workload=None, planned=None, planned_kind="exact"):
         row = self._condition(target, scenario, workload)
         if row is not None:
-            row.update(planned=planned, planned_kind=planned_kind,
+            row.update(planned=planned, planned_kind=planned_kind, planned_condition=True,
                        not_sent=max(0, planned-row["sent"]) if planned is not None else None)
             self.emit_condition("condition_planned", scenario, row)
         return row
@@ -387,6 +395,24 @@ class _Run:
                            "dropped_offers": self.dropped_offers,
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
+
+    def preparation(self, target, scenario, step, status, reason=None, **metadata):
+        """Publish preparation independently from planned workload execution."""
+        now = time.monotonic() - self.start
+        previous = self.observations[target].get("preparation", {})
+        continuing = previous.get("status") == "running" and previous.get("scenario") == scenario
+        started = previous["started_elapsed_seconds"] if continuing else now
+        value = {**metadata, "scenario": scenario, "step": step, "status": status,
+                 "started_elapsed_seconds": started, "elapsed_seconds": max(0, now - started),
+                 "reason": reason}
+        self.observations[target]["preparation"] = value
+        history = self.observations[target].setdefault("preparations", {})
+        history.pop(scenario, None)
+        history[scenario] = value
+        while len(history) > 64:
+            history.pop(next(iter(history)))
+        event = ("preparation_progress" if continuing else "preparation_started") if status == "running" else "preparation_finished"
+        self.emit(event, target, scenario, preparation=value)
 
     def mark_unfinished(self, target, checks):
         self.unfinished[target].update(check for check in checks if not self.memory_limit_reached
@@ -540,6 +566,7 @@ class _Run:
         spec = spec.model_copy(update={"check_ids": check_ids})
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
+        evidence_probe = spec.scenario == "performance_evidence_probe"
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         async with self.slot(slot_reserved, slot_deadline) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
@@ -554,6 +581,7 @@ class _Run:
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
             request_parameters = {**(request_parameters or {}),
                 "input_chars": spec.input_chars or sum(len(str(message.get("content") or "")) for message in spec.messages),
+                "request_timeout_seconds": spec.request_timeout_seconds or self.config.request_timeout_seconds,
                 "output_tokens": output_cap, "requested_input_tokens": spec.requested_input_tokens}
             condition_scenario = spec.condition_id or spec.scenario
             condition = self._condition(target.name, condition_scenario, spec.workload, request_parameters=request_parameters)
@@ -569,12 +597,14 @@ class _Run:
                     condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
             request_slot = self.attempted - 1
             self.counts[target.name] += 1
-            if not readiness:
+            if not readiness and not evidence_probe:
                 self.endpoint_attempt(target.name)
             key = (target.name, spec.scenario)
             self.active[key] += 1
             self.peak[key] = max(self.peak[key], self.active[key])
             global_deadline = False
+            deadline = None
+            intentional_deadline_applies = False
             started, started_at = time.monotonic(), _now()
             token = self.inflight.start(target.name)
             try:
@@ -590,6 +620,7 @@ class _Run:
                 if deadline_override is not None:
                     timeout_override = min(timeout_override or request_timeout,
                                            deadline_override - time.monotonic())
+                intentional_deadline_applies = timeout_override is not None and timeout_override < request_timeout
                 remaining = self.deadline - time.monotonic()
                 global_deadline = remaining <= min(request_timeout, timeout_override or request_timeout)
                 timeout = max(.001, min(request_timeout,
@@ -603,12 +634,13 @@ class _Run:
                     record.error = "maximum run duration reached" if global_deadline else (
                         "intentional request deadline" if timeout_override else "request deadline exceeded")
             except (asyncio.CancelledError, TimeoutError) as exc:
+                run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
                 record = RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
                     scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="cancelled" if isinstance(exc, asyncio.CancelledError) or global_deadline else "timeout",
+                    status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
                     error="run cancelled" if isinstance(exc, asyncio.CancelledError)
-                    else ("maximum run duration reached" if global_deadline else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
+                    else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
                     input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
                 )
             except Exception as exc:
@@ -627,12 +659,40 @@ class _Run:
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
             record.completed_at = _now()
+            record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
+            if record.status in {"timeout", "cancelled"}:
+                reason = self.stop_reason(target.name)
+                if self.stop.is_set() or reason == "cancelled by user":
+                    record.termination_reason, record.termination_limit_seconds = "user_stop", None
+                    record.error = "cancelled by user"
+                elif time.monotonic() >= self.deadline:
+                    record.termination_reason = "run_duration_limit"
+                    record.termination_limit_seconds = self.config.max_duration_seconds
+                    record.error = "maximum run duration reached"
+                elif self.memory_limit_reached:
+                    record.termination_reason, record.termination_limit_seconds = "memory_limit", None
+                    record.error = self.reason
+                elif reason == "error threshold reached":
+                    record.termination_reason, record.termination_limit_seconds = "error_threshold", None
+                    record.error = f"stopped after {self.config.stop_after_errors} request errors"
+                elif self.endpoint_health[target.name]["abort_reason"]:
+                    record.termination_reason, record.termination_limit_seconds = "endpoint_unresponsive", self.config.unresponsive_for_seconds
+                    record.error = self.endpoint_health[target.name]["abort_reason"]
+                elif intentional_deadline_applies and deadline is not None and deadline.expired():
+                    record.termination_reason = "intentional_deadline"
+                    record.termination_limit_seconds = timeout
+                elif record.status == "timeout" and record.termination_reason in {None, "external_cancellation"}:
+                    record.termination_reason = "request_timeout"
+                    record.termination_limit_seconds = record.request_timeout_seconds
+                elif not record.termination_reason:
+                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms or spec.cancel_after_chunks else "workload_cancelled"
+                    record.termination_limit_seconds = spec.cancel_after_ms / 1000 if spec.cancel_after_ms else None
             record.condition_id = condition_id
             record.dispatch_ms = (started-self.start)*1000
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
             record.completed_ms = (time.monotonic()-self.start)*1000
-            record.workload = dict(spec.workload)
+            record.workload = {**spec.workload, **record.workload}
             record.load_point = dict(spec.load_point) if spec.load_point else None
             record.requested_input_tokens = spec.requested_input_tokens
             record.requested_output_tokens = spec.requested_output_tokens
@@ -651,10 +711,10 @@ class _Run:
             record.intentional = intentional
             # Real clients report body reads immediately, including SSE
             # comments/reasoning. Test/alternate clients can provide record evidence.
-            if (not getattr(client, "reports_response_activity", False)
+            if (not evidence_probe and not getattr(client, "reports_response_activity", False)
                     and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
                 self.endpoint_response(target.name)
-            if (not readiness and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+            if (not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
                     and not intentional and timeout_override is None
                     and deadline_override is None and spec.cancel_after_ms is None
                     and spec.cancel_after_chunks is None and not self.stop.is_set()
@@ -694,6 +754,7 @@ class _Run:
                       request_slot=request_slot, request=record.model_dump(mode="json", include={
                           "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                           "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                          "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                           "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
                           "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
                           "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
@@ -819,8 +880,7 @@ async def _metrics(run, target, phase):
         return
     # Calling this helper explicitly requests runtime telemetry. Host-only collection
     # shares the scheduler but must not implicitly enable the runtime exporter.
-    runtime_requested = not target.host_metrics_url or run.config.metrics or "gpu" in run.config.checks
-    snapshot = await scrape(run, target, phase, force=runtime_requested)
+    snapshot = await scrape(run, target, phase, force=True)
     data["snapshots"].append(snapshot)
     run.observations[target.name]["metrics"].append(_gpu_snapshot(snapshot))
 
@@ -852,41 +912,43 @@ async def _finish_gpu_observation(run, target):
 
 
 async def _context_fixtures(run, target, client, fixtures, source=None):
-    """Use observed token usage to size deterministic filler, never claim estimated coverage."""
+    """Size recall cases locally with the target tokenizer, without inference."""
+    from .fixtures import _context_request
+    from .local_tokenizer import prepare_messages
+
     config = _check_config(run.config, "context")
-    if source is None:
-        long_fixture_ids = {spec.fixture_id for spec in fixtures["long"]}
-        candidates = [r for r in run.records if r.target == target.name and r.valid and
-                      (r.fixture_id in long_fixture_ids or r.traffic_class == "long_input")
-                      and r.input_tokens and r.input_chars]
-        if not candidates:
-            candidates = await run.group(target, client, [fixtures["context"][-2]],
-                                         "context_calibration", count=1, checks=["context"])
-        source = next((r for r in candidates if r.valid and r.input_tokens and r.input_chars), None)
-    if source is None:
-        run.observations[target.name]["context_calibration"] = {"status": "unavailable", "reason": "Server input token usage unavailable"}
-        return fixtures["context"]
-    output_budget = fixtures["context"][0].max_tokens
-    desired_tokens = max(1, int((config.context_limit - output_budget) * .85))
-    character_budget = int(source.input_chars * desired_tokens / source.input_tokens)
-    fixture_context_limit = max(128, min(config.context_limit * 16,
-                                        character_budget + output_budget + 32))
-    calibration = {
-        "status": "sized_from_observed_usage", "source_request_id": source.id,
-        "source_input_tokens": source.input_tokens, "source_input_chars": source.input_chars,
-        "desired_input_tokens": desired_tokens, "fixture_context_limit": fixture_context_limit,
-        "method": "builtin_fixtures(config with this fixture_context_limit); actual coverage uses returned usage",
-    }
-    previous = run.observations[target.name].get("context_calibration")
-    if previous and previous["status"] == "sized_from_observed_usage":
-        previous.setdefault("adjustments", []).append(calibration)
-    else:
-        run.observations[target.name]["context_calibration"] = calibration
-    specs = builtin_fixtures(config.model_copy(update={"context_limit": fixture_context_limit}), check_id="context")["context"]
-    for spec in specs:
-        # Density is extrapolated from another fixture; rejection needs a margin.
-        spec.workload["calibrated_input_tokens"] = int(spec.input_chars * source.input_tokens / source.input_chars)
-    return specs
+    prepared, evidence = [], []
+    for original in fixtures["context"]:
+        _, size, position, *_ = original.fixture_id.split(".")
+        output_budget = original.max_tokens or config.max_output_tokens
+        desired = max(1, int((config.context_limit - output_budget) * .85))
+        if size != "long":
+            desired = max(1, desired // 3)
+
+        def build(chars):
+            # The fixture builder takes a character allowance; the tokenizer
+            # determines that allowance using the complete rendered chat prompt.
+            allowance = chars if size == "long" else chars * 3
+            local = config.model_copy(update={"context_limit": max(128, allowance + output_budget + 32)})
+            return _context_request(local, size, position, "context")
+
+        result = await prepare_messages(run, target, "context_preparation", lambda chars: build(chars).messages, desired, tolerance=.01)
+        evidence.append({key: value for key, value in result.items() if key != "messages"})
+        if result["status"] != "calibrated":
+            run.observations[target.name]["context_calibration"] = {
+                "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer", "preparations": evidence}
+            run.mark_unfinished(target.name, {"context"})
+            return []
+        spec = build(result["filler_chars"])
+        spec.messages = result["messages"]
+        spec.requested_input_tokens = desired
+        spec.workload.update(calibrated_input_tokens=result["input_tokens"], input_token_source=result["method"],
+                             token_count_scope=result["token_count_scope"],
+                             tokenizer=result["tokenizer"], context_group=f"{desired} target tokens")
+        prepared.append(spec)
+    run.observations[target.name]["context_calibration"] = {
+        "status": "sized_locally", "method": "local_tokenizer", "preparations": evidence}
+    return prepared
 
 
 async def _target(run: _Run, target: Target, fixtures: dict):
@@ -910,14 +972,14 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         async with LLMClient(target, config, max_connections=run.connection_limits[target.name]) as client:
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
-            if "gpu" in enabled and not config.metrics:
-                await _metrics(run, target, "start")
-            if config.metrics or target.host_metrics_url:
-                data = run.observations[target.name]["serving_telemetry"]
-                data["host_configured"] = bool(target.host_metrics_url)
-                await _metrics(run, target, "start")
-                telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
-            elif target.deployment.collector_url:
+            data = run.observations[target.name]["serving_telemetry"]
+            data["host_configured"] = bool(target.host_metrics_url)
+            run.preparation(target.name, "runtime_metrics_discovery", "Checking available runtime telemetry", "running")
+            await _metrics(run, target, "start")
+            available = data["snapshots"] and data["snapshots"][-1]["status"] in {"available", "stale_samples"}
+            discovery = run.observations[target.name].get("runtime_metrics_discovery", {})
+            run.preparation(target.name, "runtime_metrics_discovery", "Runtime telemetry capability", "completed" if available else "unavailable", discovery.get("reason"))
+            if available or target.metrics_url or config.metrics or target.host_metrics_url or target.deployment.collector_url:
                 telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
             restart = run.observations[target.name]["restart"]
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
@@ -957,6 +1019,28 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 else:
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
+            if config.stream and hasattr(client, "token_evidence_probe"):
+                # A one-token inference can still have a slow first response.
+                # Share one configured timeout across compatibility retries.
+                probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
+                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage evidence", "running")
+                client.on_response = None
+                probe_count = 0
+                while (run.allowed(target.name) and time.monotonic() < probe_end
+                       and (run.remaining(target.name) is None or run.remaining(target.name) > max(
+                           1, run.planned_request_reserve_per_target - (run.budget_counts[target.name] - probe_count)))):
+                    spec = client.token_evidence_probe()
+                    if spec is None:
+                        break
+                    spec = spec.model_copy(update={"request_timeout_seconds": min(spec.request_timeout_seconds, max(.001, probe_end - time.monotonic()))})
+                    record = await run.request(target, client, spec)
+                    if record is None:
+                        break
+                    probe_count += 1
+                    run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
+                client.on_response = lambda: run.endpoint_response(target.name)
+                evidence = run.observations[target.name].setdefault("token_evidence", {"status": "unavailable", "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
+                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage capability", "completed" if evidence.get("status") in {"available", "observed"} else "unavailable", evidence.get("reason"))
             if enabled & {"serving", "first_output"}:
                 response = config.effective_response()
                 response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}), check_id="serving")["short"]
@@ -972,19 +1056,12 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 check_fixtures = builtin_fixtures(effective, check_id="context")
                 context_fixtures = await _context_fixtures(run, target, client, check_fixtures)
                 count = max(effective.samples, len(check_fixtures["context"]))
-                for attempt in range(3):
-                    records = await run.group(target, client, context_fixtures, "context",
-                                              count=count, checks=["context"])
-                    source = max((r for r in records if r.valid and r.input_tokens
-                                  and r.input_chars), key=lambda r: r.input_tokens, default=None)
-                    if source is None or source.input_tokens >= effective.context_limit * .8:
-                        break
-                    remaining = run.remaining(target.name)
-                    if attempt == 2 or len(records) < count or (remaining is not None and remaining < count):
-                        break
-                    context_fixtures = await _context_fixtures(
-                        run, target, client, check_fixtures, source=source,
-                    )
+                if context_fixtures:
+                    await run.group(target, client, context_fixtures, "context", count=count, checks=["context"])
+                else:
+                    run.plan_condition(target.name, "context")
+                    run.finish_condition(target.name, "context", reason=run.observations[target.name]["context_calibration"]["reason"],
+                                         load_point_result={"status": "skipped"})
             run.finish_checks(target.name, {"context"})
             for check_id in ("correctness", "json"):
                 if check_id in enabled:
@@ -1131,6 +1208,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         run.unfinished[target.name].update(enabled)
 
     finally:
+        preparation = run.observations[target.name].get("preparation", {})
+        if preparation.get("status") == "running":
+            reason = run.stop_reason(target.name)
+            run.preparation(target.name, preparation["scenario"], preparation["step"],
+                            "cancelled" if reason else "unavailable", reason or "Preparation did not complete")
         for row in run.observations[target.name]["conditions"]:
             if row["status"] != "finished":
                 run.finish_condition(target.name, row["condition"]["id"])
@@ -1140,13 +1222,12 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         data = run.observations[target.name]["serving_telemetry"]
         if "gpu" in enabled and "gpu_observation_window" not in run.observations[target.name]:
             await _finish_gpu_observation(run, target)
-        elif config.metrics or target.host_metrics_url:
+        elif data["snapshots"] or target.host_metrics_url:
             await _metrics(run, target, "end")
         elif len(data["snapshots"]) < config.metrics_max_samples:
             data["snapshots"].append(await telemetry.scrape(run, target, "not collected"))
         telemetry.summarize(data, config.cache_pressure_threshold)
-        if config.metrics:
-            run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
+        run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
         current = run.observations[target.name]["deployment"]
         if current and (target.deployment.discovery != "none" or target.deployment.collector_url):
             end = await deployment.snapshot(target, config, run.deadline, run.stop)
@@ -1337,6 +1418,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             if window and not window["complete"] and status != "fail":
                 status, summary = "inconclusive", ("GPU end scrape did not return fresh device samples; the observation window is incomplete."
                     if window.get("end_scrape_fresh") is False else "GPU observation window shorter than exporter refresh.")
+        elif not records and check_id == "context" and observations.get("context_calibration", {}).get("status") == "unavailable":
+            status, summary = "inconclusive", "Context preparation unavailable: " + observations["context_calibration"]["reason"]
+            metrics.update(calibration=observations["context_calibration"], declared_context_limit=config.context_limit,
+                           near_limit_coverage=False, observed_max_input_tokens=None)
         elif not records and check_id != "capacity":
             status, summary = "inconclusive", "No applicable requests completed within the run budget."
         elif check_id == "access":
@@ -1472,17 +1557,18 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics["reduced_position_coverage"] = any(row["reduced"] for row in coverage.values())
                 rejected = [r for r in records if _context_rejection(r)]
                 disproving = sorted(tokens for r in rejected if (tokens := (
-                    r.input_tokens if r.input_tokens is not None else r.workload.get("calibrated_input_tokens"))) is not None
+                    r.input_tokens if r.input_tokens is not None else
+                    r.workload.get("calibrated_input_tokens") if r.workload.get("token_count_scope") not in {"message_content", "builtin_reference"} else None)) is not None
                     and tokens <= config.context_limit * (.85 if r.input_tokens is not None else .70))
                 metrics["context_rejections"] = {"rejected": len(rejected), "calibrated_rejected_input_tokens": disproving}
                 # Require every position at each observed near-limit size; probes cannot supply recall evidence.
                 recall = [r for r in records if r.scenario in {"context", "context_calibration"}
                           and r.fixture_id.startswith("context.") and len(r.fixture_id.split(".")) >= 3]
-                near_sizes = {(r.fixture_id.split(".")[1], r.input_chars) for r in recall
+                near_sizes = {(r.fixture_id.split(".")[1], r.workload.get("context_group", r.input_chars)) for r in recall
                               if r.input_tokens is not None and r.input_tokens >= config.context_limit * .8}
                 near_positions, near_missed, near_unverified = {}, [], []
                 for size, chars in sorted(near_sizes):
-                    items = [r for r in recall if (r.fixture_id.split(".")[1], r.input_chars) == (size, chars)]
+                    items = [r for r in recall if (r.fixture_id.split(".")[1], r.workload.get("context_group", r.input_chars)) == (size, chars)]
                     required = {position for r in items for position in
                                 r.workload.get("position_coverage", {}).get("positions", ["beginning", "middle", "end"])}
                     positions = {}
@@ -1491,10 +1577,12 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                         row = {"attempted": len(samples), "scored": sum(r.score is not None for r in samples),
                                "correct": sum(r.score is True for r in samples)}
                         positions[position] = row
-                        label = f"{size}/{chars} chars/{position}"
+                        input_label = f"{chars} chars" if isinstance(chars, int) else chars
+                        label = f"{size}/{input_label}/{position}"
                         if row["scored"] > row["correct"]:
                             near_missed.append(label)
-                        if not samples or row["scored"] < len(samples):
+                        if (not samples or row["scored"] < len(samples) or any(
+                                r.input_tokens is None or r.input_tokens < config.context_limit * .8 for r in samples)):
                             near_unverified.append(label)
                     near_positions[f"{size}:{chars}"] = positions
                 metrics["near_limit_positions"] = near_positions
@@ -1504,7 +1592,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 delays = scheduling_delay_windows(run)
                 metrics["evidenced_overlap"] = max_evidenced_overlap((r for r in records if r.score is not None), all_records, delays)
                 metrics["evidenced_overlap_capped_at"] = 2
-            if check_id == "context" and any(_serving_failure(r, r.scenario) for r in records):
+            if check_id == "context" and not records and observations.get("context_calibration", {}).get("status") == "unavailable":
+                status, summary = "inconclusive", "Context preparation unavailable: " + observations["context_calibration"]["reason"]
+            elif check_id == "context" and any(_serving_failure(r, r.scenario) for r in records):
                 status, summary = "fail", "Context prompts encountered HTTP or protocol failures."
             elif check_id == "context" and disproving:
                 status, summary = "fail", (f"Server rejected a prompt sized at {disproving[0]} tokens, below the safety margin "
@@ -1521,6 +1611,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "context" and rejected:
                 status, summary = "inconclusive", ("server rejected a context prompt without calibrated size evidence below the safety margin "
                                                    "(70% estimated, 85% server-reported); the declared context_limit remains unverified.")
+            elif check_id == "correctness" and run.pack_specs and any(spec.scorer == "none" for spec in run.pack_specs):
+                metrics["reason_code"] = "scoring_disabled"
+                status, summary = "inconclusive", "Some request-pack cases have scoring disabled; answer correctness cannot be established."
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
             elif check_id == "context" and metrics["reduced_position_coverage"]:
@@ -1789,7 +1882,7 @@ def _budget_guidance(config, check_id=None):
     from .planning import request_plan
     plan = request_plan(config)
     if check_id in {"load", "concurrency"}:
-        return ("Allow the configured Load test sending windows plus calibration and finish allowances; "
+        return ("Allow the configured Load test sending windows, local preparation, and outstanding request timeouts; "
                 "set the request limit (Stop after this many requests) using observed throughput. Duration-based requests have no fixed count.")
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
@@ -1932,7 +2025,11 @@ def _verdict_summary(check, config, records, budget):
             summary += answer_difference(mismatch.evaluation.expected, final_answer(mismatch.output)[0])
 
     samples = max(2, config.samples, limits.min_samples)
-    if reason == "missing_concurrent_answers":
+    if check.id == "gpu":
+        remedy = ("configure a reachable GPU metrics exporter with fresh per-device samples "
+                  f"and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; "
+                  "inspect reported device errors before rerunning")
+    elif reason == "missing_concurrent_answers":
         summary += (" Plain words: answers could not be checked under concurrent load. The server appears to handle one request at a time, "
                     "or the recorded streaming/client timing did not expose overlapping answers."
                     if config.stream else " Plain words: streaming was disabled, so answers could not be checked under concurrent load; server parallelism is unverified.")
@@ -1958,6 +2055,8 @@ def _verdict_summary(check, config, records, budget):
         }[check.id]
         option = " or ".join(f"limits.{name}" for name in options)
         remedy = f"set {option} to your service's acceptance target and rerun"
+    elif reason == "scoring_disabled":
+        remedy = "configure an answer scorer for each unscored request-pack case, then complete its quiet and loaded passes; performance measurements remain available without answer scoring"
     elif metrics.get("request_pack") and check.status == "inconclusive" and (
             not metrics["request_pack"]["coverage_complete"] or not metrics["request_pack"]["all_cases_scored"]):
         remedy = ("finish quiet and loaded scoring for every request-pack case and inspect any evaluator errors or unfinished answers; "
@@ -2006,7 +2105,6 @@ def _verdict_summary(check, config, records, budget):
             "capacity": "inspect the failing traffic stage and request errors, address server overload or wrong answers, then rerun the same rate plan",
             "cancellation": "enable streaming and completion token usage, verify server stop and cancellation support, then rerun the control and follow-up probes",
             "recovery": "inspect sustained-load errors and slow recovery probes, address the server issue, then rerun the same sustained workload",
-            "gpu": f"configure a reachable GPU metrics exporter with fresh per-device samples and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; inspect reported device errors before rerunning",
             "prefix": "enable cached-token usage reporting, check the server's prefix-cache configuration and rerun the repeat and independent controls",
             "sessions": "complete each configured session mode with at least two overlapping streamed conversations and inspect any wrong recall answers",
             "consistency": "inspect differing answers and token probabilities, verify deterministic serving settings and rerun the same shapes and concurrency levels",
@@ -2017,6 +2115,8 @@ def _verdict_summary(check, config, records, budget):
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None) -> RunReport:
+    from .local_tokenizer import ensure_tokenizers
+    await ensure_tokenizers(config)
     with PhaseSampler("traffic") as sampler:
         try:
             return await _run_suite(config, progress=progress, stop_event=stop_event, sampler=sampler)

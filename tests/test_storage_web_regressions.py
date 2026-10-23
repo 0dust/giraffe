@@ -98,7 +98,7 @@ def test_failed_new_baseline_save_removes_its_directory(tmp_path, monkeypatch, f
         assert [row["id"] for row in preview["candidates"]] == ["saved"]
 
 
-def test_json_only_export_ignores_html_disk_failure_and_downloads_on_demand(tmp_path, monkeypatch):
+def test_json_only_export_ignores_html_disk_failure_and_downloads_on_demand(tmp_path, monkeypatch, local_tokenizer):
     import giraffe.reporting
 
     async def runner(configuration, **kwargs):
@@ -169,7 +169,7 @@ async def test_filesystem_endpoints_use_threadpool(tmp_path, monkeypatch, path, 
     assert calls and all(value != loop_thread for value in calls)
 
 
-async def test_prestart_storage_check_yields_loop_without_double_start(tmp_path, monkeypatch):
+async def test_prestart_storage_check_yields_loop_without_double_start(tmp_path, monkeypatch, local_tokenizer):
     entered, release = threading.Event(), threading.Event()
     loop_thread = threading.get_ident()
     thread_ids = []

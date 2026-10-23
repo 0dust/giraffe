@@ -7,6 +7,7 @@ from tests.test_ux_setup import run_browser_logic
 def test_editing_from_review_returns_directly_after_validation():
     run_browser_logic(r"""
 state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
+tokenizerSetupReady=()=>true;
 nodes['#new-run-form']={};
 const validations=[];
 validateRunForm=(form,step)=>{validations.push(step);return true;};

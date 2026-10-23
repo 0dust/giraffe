@@ -27,8 +27,7 @@ ISSUES=[
     ("for(const type of ['concurrent','constant','poisson','bursts'])form.elements['load_patterns_'+type+'_enabled'].checked=false",'load_test.patterns.poisson.enabled','Select a traffic pattern for the selected workloads.'),
     ("form.elements.load_patterns_concurrent_levels.value='2, 1'",'load_test.patterns.concurrent.levels','Enter positive, increasing whole-number levels separated by commas.'),
     ("form.elements.load_patterns_rates.value='0'",'load_test.patterns.rates','Enter positive, increasing rates separated by commas.'),
-    ("form.elements.load_schedule_duration_seconds.value='0'",'load_test.schedule.duration_seconds','Enter a whole number of at least 1 and no more than 3600 for Duration per workload, pattern and level (seconds).'),
-    ("form.elements.load_schedule_finish_seconds.value='-1'",'load_test.schedule.finish_seconds','Enter a number of at least 0 for Wait for unfinished requests after each test (seconds).'),
+    ("form.elements.load_schedule_duration_seconds.value='0'",'load_test.schedule.duration_seconds','Enter a whole number of at least 1 and no more than 3600 for Send new requests for (seconds).'),
     ("form.elements.load_patterns_poisson_enabled.checked=true;form.elements.load_patterns_poisson_seed.value='-1'",'load_test.patterns.poisson.seed','Enter a whole number of at least 0 and no more than 9007199254740991 for Random seed.'),
     ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_size.value='0'",'load_test.patterns.bursts.size','Enter a whole number of at least 1 and no more than 1024 for Requests per burst.'),
     ("form.elements.load_patterns_bursts_enabled.checked=true;form.elements.load_patterns_bursts_first_seconds.value='-1'",'load_test.patterns.bursts.first_seconds','Enter a number of at least 0 for First burst after (seconds).'),
@@ -181,7 +180,8 @@ for(const [path,label] of [
  ['load_test.patterns.concurrent.levels','Concurrency levels'],
  ['load_test.patterns.rates','Rates (requests/second)'],
  ['load_test.patterns.bursts.first_seconds','First burst after (seconds)'],
- ['load_test.schedule.finish_seconds','Wait for unfinished requests after each test (seconds)'],
+ ['load_test.schedule.duration_seconds','Send new requests for (seconds)'],
+ ['load_test.request_timeout_seconds','Request timeout (seconds)'],
  ['load_test.pass_criteria.min_correct_percent','Correct answers required (%)']]){
  assert.equal(settingDestination(path).label,label,path);assert(settingActions([path]).includes('Edit '+escape(label)));
 }
@@ -245,12 +245,13 @@ def test_historical_condition_labels_remain_readable_without_active_legacy_traff
     assert condition_for('traffic_stage_0',{'rate_rps':3},config)['label']=='3 requests/s'
 
 
-@pytest.mark.parametrize('poisson,label,headline',[(False,'20','20 known requests + adaptive checks'),(True,'≈ 20','≈ 20 expected requests + adaptive checks')])
-def test_bounded_calibration_keeps_scheduled_count_qualification(poisson,label,headline):
+@pytest.mark.parametrize('poisson,label,headline',[(False,'20','20 requests planned'),(True,'≈ 20','≈ 20 requests')])
+def test_local_preparation_preserves_exact_and_expected_scheduled_counts(poisson,label,headline):
     config=RunConfig(targets=[{'name':'local','url':'http://unused.test/v1','model':'test'}],checks=['load'],
         load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':not poisson},'poisson':{'enabled':poisson},'rates':[2]},'schedule':{'duration_seconds':10,'finish_seconds':0}})
     plan=request_plan(config)
-    assert plan['count_kind']=='bounded'
+    assert plan['count_kind']==('estimate' if poisson else 'exact')
+    assert next(row for row in plan['rows'] if row['id']=='load_calibration')['requests_per_target']==0
     assert plan['request_count_label']==label
     browser_logic('const plan='+json.dumps(plan)+',headline='+json.dumps(headline)+r""";
 nodes['#request-plan']={};nodes['#dock-summary']={};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;

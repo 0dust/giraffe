@@ -115,12 +115,11 @@ detail(report([],{requests:records.map(({condition_id,...r})=>r)}));html=nodes['
 
 
 async def test_live_metadata_comes_from_actual_builders_and_survives_report_save(tmp_path):
-    from giraffe.fixtures import builtin_fixtures
     from giraffe.runner import _Run
     from giraffe.models import RunConfig
     from giraffe.load_test import build_spec, test_points
     from giraffe.reporting import write_report
-    from tests.test_condition_tracking import Client, configuration
+    from tests.test_condition_tracking import Client
     from tests.test_web import report
 
     config = RunConfig(targets=[{"name":"local","url":"http://unused.test/v1","model":"test"}],checks=["load"],load_test={"workloads":{"combinations":{"selected":["short_long"]}},"patterns":{"concurrent":{"levels":[2]},"constant":{"enabled":True},"rates":[1000]}})
@@ -137,7 +136,7 @@ async def test_live_metadata_comes_from_actual_builders_and_survives_report_save
     assert matrix["parameters"] == {"concurrency": point["level"], "same_prompt": True,
         "input_chars": len(request.messages[0]["content"]),
         "input_tokens_target": request.requested_input_tokens,
-        "output_tokens": request.max_tokens}
+        "output_tokens": request.max_tokens, "request_timeout_seconds": config.load_test.request_timeout_seconds}
     arrival = rows[1]["condition"]
     assert arrival["rate_rps"] == 1000
     assert arrival["parameters"]["same_prompt"] is True

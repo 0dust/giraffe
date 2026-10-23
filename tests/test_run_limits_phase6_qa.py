@@ -32,13 +32,13 @@ def test_budget_copy_uses_catalogue_names_and_grouped_numbers_without_changing_r
                                "patterns": {"concurrent": {"enabled": False}, "rates": [100]},
                                "schedule": {"duration_seconds": 1000}})
     plan = request_plan(configured)
-    assert plan["planned_total"] == 100010  # 100k arrivals + connection + answers + calibration allowance
+    assert plan["planned_total"] == 100007  # 100k arrivals + connection + answers; local sizing sends no requests.
     assert [(row["id"], row["title"]) for row in plan["rows"]] == [
         ("initial", "Connection check"), ("access", "Network and access"),
         ("correctness", "Known-answer correctness"),
-        ("load_combinations", "Input → output combinations"), ("load_calibration", "Input token calibration")]
+        ("load_combinations", "Input → output combinations"), ("load_calibration", "Local prompt preparation")]
     notice = next(item for item in plan["request_warnings"] if item["kind"] == "incomplete_coverage")
-    assert notice["actions"][0] == {"label": "Use 100,010 total requests", "field": "max_requests", "value": 100010}
+    assert notice["actions"][0] == {"label": "Use 100,007 total requests", "field": "max_requests", "value": 100007}
     assert "Answer correctness, Load test" in notice["msg"]
     assert [action["label"] for action in notice["actions"][1:]] == [
         "Edit Answer correctness", "Edit Load test"]
@@ -51,14 +51,14 @@ const plan=PLAN;state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
 nodes['#request-plan']={};renderRequestPlan(config);
 for(const markup of [renderRunBlueprint(config,plan),nodes['#request-plan'].innerHTML]){
-  assert.match(markup,/Use 100,010 total requests/);
+  assert.match(markup,/Use 100,007 total requests/);
   assert.match(markup,/Answer correctness, Load test/);
-  assert.match(markup,/data-budget="100010"/);
+  assert.match(markup,/data-budget="100007"/);
 }
 const elements={max_requests:{value:'1',disabled:true},max_requests_enabled:{checked:false}};
 nodes['#new-run-form']={elements};nodes['#config-error']={};configChanged=updateBounds=()=>{};
-await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'use-request-budget'}}:q==='[data-budget]'?{dataset:{budget:'100010'}}:null}});
-assert.equal(elements.max_requests.value,100010);assert.equal(elements.max_requests_enabled.checked,true);
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'use-request-budget'}}:q==='[data-budget]'?{dataset:{budget:'100007'}}:null}});
+assert.equal(elements.max_requests.value,100007);assert.equal(elements.max_requests_enabled.checked,true);
 assert.equal(elements.max_requests.disabled,false);assert.equal(elements.max_requests.required,true);
 """.replace('PLAN', json.dumps(plan)), configured)
 
@@ -73,13 +73,13 @@ def test_time_budget_warning_formats_action_without_changing_numeric_value():
     configured = RunConfig(targets=[TARGET], checks=["load"], max_duration_seconds=1,
                            load_test={"workloads": {"combinations": {"selected": ["short_short"]}},
                                       "patterns": {"concurrent": {"enabled": False}, "rates": [25]},
-                                      "schedule": {"duration_seconds": 3600, "finish_seconds": 30}})
+                                      "schedule": {"duration_seconds": 3600}})
     warning = request_plan(configured)["time_warnings"][0]
-    assert warning["actions"][0] == {"label": "Use 3,630 s (covers fixed windows only)", "field": "max_duration_seconds", "value": 3630}
+    assert warning["actions"][0] == {"label": "Use 3,900 s", "field": "max_duration_seconds", "value": 3900}
     assert "Load test" in warning["msg"]
     assert warning["values"]["minimum_seconds"] == 3600
-    assert warning["values"]["suggested_seconds"] == 3630
-    assert warning["values"]["fully_known"] is False  # token calibration depends on endpoint latency
+    assert warning["values"]["suggested_seconds"] == 3900
+    assert warning["values"]["fully_known"] is True  # One sending window plus the 300-second request timeout.
 
 
 @pytest.mark.parametrize("command", ["validate", "preview", "run"])

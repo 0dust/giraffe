@@ -369,10 +369,28 @@ def _window_summary(report, target, window, records, series, observation):
     dist("generation_pace", generation_rates, "Generation pace", "tok/s",
          "Answer streaming estimate; first-read tokens estimated by character share" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
+    evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
+    if good and not any(r.stream for r in good):
+        itl_state, itl_reason = "not_applicable", "Non-streamed replies provide no individual token arrival timestamps."
+    elif evidence_states.get("supported"):
+        itl_state, itl_reason = "insufficient_evidence", "Streamed logprobs were requested automatically, but these responses lack separate single-token reads with matching answer usage."
+    elif evidence_states.get("rejected"):
+        itl_state, itl_reason = "not_supported", "The endpoint rejected logprobs during the compatibility probe; chunk receipt gaps cannot establish individual token arrival times."
+    elif evidence_states.get("not_returned"):
+        itl_state, itl_reason = "insufficient_evidence", "The endpoint accepted the compatibility probe but did not return matching streamed logprob token boundaries."
+    elif evidence_states.get("shape_unverified"):
+        itl_state, itl_reason = "not_collected", "Plain-text probe did not establish logprobs compatibility with this tool or structured-output request shape; automatic fields were not added."
+    elif evidence_states.get("disabled_by_request"):
+        itl_state, itl_reason = "not_collected", "Explicit request options disabled logprobs; automatic collection preserves those options."
+    else:
+        itl_state, itl_reason = "not_collected", "No successful streamed token-evidence compatibility probe was recorded for these requests."
     dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled",
-         state="measured" if itl else "not_supported",
-         reason=None if itl else "Chunk reads do not establish individual token arrival times.",
-         action="Enable streamed per-token logprobs and matching usage on a compatible endpoint.")
+         state="measured" if itl else itl_state, reason=None if itl else itl_reason,
+         action=None if itl or evidence_states.get("supported") or evidence_states.get("rejected") else
+                "A new run probes token-evidence compatibility automatically; exact ITL still requires unbuffered single-token events and matching usage.")
+    metrics["itl"]["capability_evidence"] = dict(evidence_states)
+    if itl or itl_state == "not_applicable" or any(evidence_states.get(state) for state in ("supported", "rejected", "shape_unverified", "disabled_by_request")):
+        metrics["itl"]["action"] = distributions["itl"]["action"] = None
     metrics["itl"]["exclusion_reasons"] = dict(Counter(getattr(r, "itl_reason", "Missing timing evidence") for r in good if getattr(r, "itl_reason", None)))
     for key, prop in (("answer_read_gap", "read_gaps_ms"), ("reasoning_read_gap", "reasoning_read_gaps_ms"), ("itl", "itl_ms")):
         eligible_records = modern if key == "itl" else event_records
@@ -637,13 +655,14 @@ def _server_rows(report, target, window, observation, put, metrics):
     for key, derived_key, label, unit in mapping:
         row = derived.get(derived_key, {})
         if row.get("value") is None and key not in {"host_cpu", "host_ram"} and not telemetry.get("snapshots"):
-            row = {**row, "state": "not_collected", "reason": "Server telemetry was not collected.",
-                   "action": "Configure a supported metrics endpoint and enable telemetry for the run."}
+            row = {**row, "state": "not_collected", "reason": "This saved run has no runtime telemetry collection evidence.",
+                   "action": "New runs discover same-origin /metrics automatically; an exporter at another route requires targets[].metrics_url."}
         put(key, row.get("value"), label, row.get("unit", unit), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"),
             reason=row.get("reason"), action=row.get("action"), scope="server-wide",
             collection_window="telemetry sample interval; may extend beyond selected request window",
             details={**row.get("details", {}), "selected_window_attribution": "not established"})
+        metrics[key]["action"] = row.get("action")
         metrics[key]["eligible_count"] = row.get("eligible_count", 0)
         metrics[key]["counts"] = {"sample": row.get("sample_count", 0), "eligible": row.get("eligible_count", 0),
                                   "missing": max(0, row.get("eligible_count", 0)-row.get("sample_count", 0))}
@@ -657,6 +676,7 @@ def _server_rows(report, target, window, observation, put, metrics):
         put(key, row.get("value"), key.replace('_', ' ').capitalize(), row.get("unit", ""), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"), reason=row.get("reason"), action=row.get("action"),
             scope="server-wide", collection_window="telemetry sample interval", details=row.get("details", {}))
+        metrics[key]["action"] = row.get("action")
     put("websocket_rtt", None, "WebSocket round-trip time", "ms", "Inference transport: HTTP/SSE", state="not_applicable",
         reason="HTTP/SSE requests have no WebSocket round trip.", action="An actual WebSocket transport and request/response timing would be required.")
 

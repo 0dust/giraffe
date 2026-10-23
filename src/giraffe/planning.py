@@ -355,10 +355,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     settings = own[point["source"]]
                     before = len(timeline)
                     fixed(target.name, row, point["windows"] * settings.schedule.duration_seconds,
-                          "load_test.schedule.duration_seconds", count=point["windows"], timeout=settings.schedule.finish_seconds)
+                          "load_test.schedule.duration_seconds", count=point["windows"], timeout=settings.request_timeout_seconds)
                     for item in timeline[before:]:
-                        # Finish allowances are explicit configured load windows,
-                        # so budget conflict navigation includes them without samples.
+                        # Outstanding requests can use their remaining request
+                        # timeout after sending stops, even without timing samples.
                         item["coverage_high_seconds"] = item["high_seconds"]
                 continue
             if name == "capacity":
@@ -369,7 +369,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 specs = [spec for group in fixtures.values() for spec in group]
                 observed = measured(target.name, "capacity", min(settings.max_in_flight, shares[target.name]), specs)
                 fixed(target.name, row, len(settings.rates) * settings.duration_seconds, "traffic.duration_seconds",
-                      count=len(settings.rates), timeout=min(options.request_timeout_seconds, settings.drain_timeout_seconds), observed=observed,
+                      count=len(settings.rates), timeout=min(options.request_timeout_seconds, settings.drain_timeout_seconds or options.request_timeout_seconds), observed=observed,
                       last_gaps=[1 / rate for rate in settings.rates] if settings.arrival == "steady" else [math.inf] * len(settings.rates))
                 continue
             if name == "sustained":
@@ -710,7 +710,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             ] if any(item["kind"] == "finite" for item in components) else []) + list(dict.fromkeys(observation_notes)) +
                 (["Confidence remains low because these components have unknown duration: " +
                   ", ".join(dict.fromkeys(item["title"] for item in unknowns)) + "."] if unknowns else []) +
-                ([f"Configured drain timeouts contribute {combine('drain_uncertainty_seconds'):g} seconds of uncertainty; more latency samples cannot remove that configured bound."]
+                ([f"Request deadlines after sending stops contribute {combine('drain_uncertainty_seconds'):g} seconds of uncertainty; more latency samples cannot remove that configured bound."]
                  if confidence == "low" and drain_fraction > .2 else []),
             "errors": errors, "time_warnings": warnings}
 
@@ -856,15 +856,14 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 + "Scheduled requests use the run limit even when Giraffe cannot send them because all request slots are busy.",
                 source="your dataset" if pack else "generated examples", kind=kind)
 
-    context_count = 0
     if "context" in selected:
         context_options = config.effective_check("context")
         context_shapes = builtin_fixtures(config.model_copy(update={**{key: value for key, value in context_options.items() if key != "limits"}, "context_limit": min(512, context_options["context_limit"])}))["context"]
-        context_count = count = max(context_options["samples"], len(context_shapes))
+        count = max(context_options["samples"], len(context_shapes))
         add("context_first_batch", count, "The first generated context batch.", title="Initial context cases")
-        add("context", None,
-            f"Observed input usage may require a calibration request and up to two further batches of {count} requests.",
-            kind="bounded")
+        add("context", 0,
+            "Prompts are sized locally with the selected tokenizer; Automatic resolves the model name with a built-in fallback. Server usage determines actual input-size coverage.",
+            kind="exact")
 
     if "correctness" in selected:
         if pack_selected:
@@ -950,8 +949,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             rows[-1]["known_scheduled_requests"] = detail["known_scheduled_requests"]
             rows[-1]["approximate"] = detail["approximate"]
         if config.request_source != "request_pack" and not config.custom_fixtures:
-            calibration_count = sum(len(calibration_keys(own))*own.calibration_attempts for _,own in settings_sets(config.load_test))
-            add("load_calibration", calibration_count, "Up to three token-calibration attempts per input size and instruction variant; separate from scheduled load.", title="Input token calibration", kind="bounded")
+            add("load_calibration", 0, "Prompts use the selected local tokenizer; Automatic resolves the model name with a built-in fallback. Preparation sends no inference requests.", title="Local prompt preparation", kind="exact")
             for source, own in settings_sets(config.load_test):
                 floors = {}
                 for size, variant in calibration_keys(own):
@@ -963,7 +961,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     if target < floor:
                         load_warnings.append({"fields": [f"{prefix}.profile.{size}.input_tokens"],
                             "msg": f"{size.capitalize()} input target {target} is below the minimum prompt length "
-                                   f"(≈{floor} tokens); calibration reports the actual input length."})
+                                   f"(≈{floor} tokens); local tokenization reports the actual input length."})
         criteria = config.load_test.pass_criteria
         if criteria.max_first_answer_ms is None and criteria.max_completion_ms is None:
             load_warnings.append({"fields":["load_test.pass_criteria.max_first_answer_ms","load_test.pass_criteria.max_completion_ms"],
@@ -1054,8 +1052,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     counted = sum(row["requests_per_target"] if row["requests_per_target"] is not None
                   else row.get("expected_scheduled_requests", 0) for row in rows)
     adaptive_estimates = {}
-    if "context" in selected:
-        adaptive_estimates["context"] = 1 + 2 * context_count
     if config.max_requests is not None and "recovery" in selected and config.effective_check("recovery")["sustained_seconds"] > 0:
         adaptive_estimates["sustained"] = max(config.effective_check("recovery")["limits"]["min_samples"],
             config.effective_check("recovery")["concurrency"] * 2)

@@ -52,8 +52,11 @@ async def execute(monkeypatch, events, *, stream=True, body=None, **spec_options
     monkeypatch.setattr(module, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     async with httpx.AsyncClient(transport=transport) as http:
         client._client = http
-        record = await client.execute(RequestSpec(fixture_id="synthetic", scenario="serving",
-            check_ids=["serving"], messages=[{"role": "user", "content": "synthetic"}], **spec_options))
+        try:
+            record = await client.execute(RequestSpec(fixture_id="synthetic", scenario="serving",
+                check_ids=["serving"], messages=[{"role": "user", "content": "synthetic"}], **spec_options))
+        finally:
+            await client.__aexit__()  # Join transport cleanup as a real client owner does.
     return record, source
 
 
