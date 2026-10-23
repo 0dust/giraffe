@@ -298,7 +298,9 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
         result["reason"] = f"Local prompt preparation reached its {TARGET_PREPARATION_TIMEOUT_SECONDS:g}s target budget; no inference calibration was sent."
         _progress(run, target, scenario, "unavailable", reason=result["reason"])
         return result
-    deadline = min(getattr(run, "deadline", float("inf")), started + min(remaining, PREPARATION_TIMEOUT_SECONDS))
+    run_deadline = getattr(run, "deadline", float("inf"))
+    target_deadline = started + remaining
+    deadline = min(run_deadline, target_deadline, started + PREPARATION_TIMEOUT_SECONDS)
     try:
         async with asyncio.timeout(max(.001, deadline - started)):
             process = await _start_worker(tokenizer)
@@ -347,11 +349,23 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 result.update(reason="Local prompt sizing could not reach the requested token target within its bounded attempts.",
                               reason_code="input_sizing_unavailable")
     except asyncio.CancelledError:
-        _progress(run, target, scenario, "cancelled", reason="Preparation cancelled")
+        reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
+        if reason == "maximum request budget reached":
+            reason = None
+        _progress(run, target, scenario, "cancelled", reason=reason or "Preparation cancelled")
         raise
     except TimeoutError:
-        result["reason"] = f"Local tokenizer preparation exceeded {PREPARATION_TIMEOUT_SECONDS:g}s; no inference calibration was sent."
-        failures[tokenizer] = result["reason"]
+        if deadline == run_deadline:
+            # Observe the execution deadline here, before worker cleanup. The
+            # monitor may wake only after this unavailable result finishes.
+            reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
+            result["reason"] = (f"Local prompt preparation stopped: {reason or 'maximum run duration reached'}; "
+                                "no inference calibration was sent.")
+        elif deadline == target_deadline:
+            result["reason"] = f"Local prompt preparation reached its {TARGET_PREPARATION_TIMEOUT_SECONDS:g}s target budget; no inference calibration was sent."
+        else:
+            result["reason"] = f"Local tokenizer preparation exceeded {PREPARATION_TIMEOUT_SECONDS:g}s; no inference calibration was sent."
+            failures[tokenizer] = result["reason"]
     except (TokenizerUnavailable, OSError, ValueError, KeyError) as exc:
         result["reason"] = str(exc)
         failures[tokenizer] = result["reason"]

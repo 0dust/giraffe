@@ -86,7 +86,8 @@ async def test_hung_tokenizer_is_killed_and_other_event_loop_work_continues(monk
     assert not task.done()
     result = await task
     assert time.monotonic() - began < .5
-    assert result["status"] == "unavailable" and "exceeded" in result["reason"]
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "Local tokenizer preparation exceeded 0.08s; no inference calibration was sent."
     assert workers[0].returncode is not None
     assert events[-1][0][3] == "unavailable"
 
@@ -147,3 +148,119 @@ class AutoTokenizer:
     assert result["status"] == "calibrated"
     assert result["input_tokens"] in {99, 100, 101}
     assert result["input_tokens"] == 7 + result["filler_chars"]
+
+
+@pytest.mark.parametrize("budget", ["run", "target"])
+async def test_preparation_timeout_reports_the_binding_budget_without_a_monitor(monkeypatch, budget):
+    from giraffe import runner
+
+    clock = SimpleNamespace(now=0.)
+    local_time = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(sizing, "time", local_time)
+    monkeypatch.setattr(runner, "time", local_time)
+
+    class Worker:
+        returncode = None
+
+        async def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    worker = Worker()
+
+    async def start(_):
+        return worker
+
+    async def blocked(_):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            clock.now = .02
+            raise
+
+    monkeypatch.setattr(sizing, "_start_worker", start)
+    monkeypatch.setattr(sizing, "_read_worker", blocked)
+    configured = config()
+    configured.max_duration_seconds = .01 if budget == "run" else None
+    run = runner._Run(configured, None, None)
+    target = configured.targets[0]
+    if budget == "target":
+        run._tokenizer_preparation_seconds = {target.name: sizing.TARGET_PREPARATION_TIMEOUT_SECONDS - .01}
+    result = await sizing.prepare_messages(run, target, "load", lambda n: [], 128)
+    assert result["status"] == "unavailable" and result["request_ids"] == []
+    assert worker.returncode == -9
+    if budget == "run":
+        assert "maximum run duration reached" in result["reason"]
+        assert "exceeded 10s" not in result["reason"]
+        assert run.reason == "maximum run duration reached"
+        assert run.limits_reached == {"max_duration_seconds"}
+    else:
+        assert "20s target budget" in result["reason"]
+        assert "exceeded 10s" not in result["reason"]
+        assert run.reason is None and not run.limits_reached
+        assert not run._tokenizer_unavailable
+
+
+@pytest.mark.parametrize("reason", ["cancelled by user", None])
+async def test_cancelled_preparation_retains_stop_cause_and_does_not_cache_failure(monkeypatch, reason):
+    entered = asyncio.Event()
+
+    async def blocked(_):
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(sizing, "_start_worker", blocked)
+    run, target, events = run_and_target()
+    run.stop_reason = lambda name: reason
+    task = asyncio.create_task(sizing.prepare_messages(run, target, "load", lambda n: [], 128))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events[-1][0][3] == "cancelled"
+    assert events[-1][1]["reason"] == (reason or "Preparation cancelled")
+    assert not run._tokenizer_unavailable
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_successful_preparation_cleanup_does_not_create_a_later_run_deadline_abort(monkeypatch):
+    from giraffe import runner
+
+    clock = SimpleNamespace(now=0.)
+    local_time = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(sizing, "time", local_time)
+    monkeypatch.setattr(runner, "time", local_time)
+    original_start = sizing._start_worker
+
+    async def start(name):
+        worker = await original_start(name)
+
+        async def cleanup():
+            clock.now = 2.
+            return worker.returncode
+
+        worker.wait = cleanup
+        return worker
+
+    monkeypatch.setattr(sizing, "_start_worker", start)
+    configured = config()
+    configured.max_duration_seconds = 1
+    run = runner._Run(configured, None, None)
+    result = await sizing.prepare_messages(run, configured.targets[0], "load", lambda n: [
+        {"role": "user", "content": "x" * n}], 128)
+    assert result["status"] == "calibrated"
+    assert clock.now > run.deadline
+    assert run.reason is None and not run.limits_reached
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_request_budget_does_not_become_a_preparation_timeout():
+    run = _Run(config(), None, None)
+    run.reason = "maximum request budget reached"
+    result = await sizing.prepare_messages(run, run.config.targets[0], "load", lambda n: [
+        {"role": "user", "content": "x" * n}], 128)
+    assert result["status"] == "calibrated"
+    assert run.reason == "maximum request budget reached"
+    assert not run._tokenizer_unavailable
