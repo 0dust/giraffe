@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+
 from giraffe import concurrent_load, runner
 from giraffe.client import LLMClient
 from giraffe.conditions import condition_for

@@ -10,8 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from giraffe.load_test import (
-    execute, interference_measurements, load_time_plan,
-    minimum_reservation, result, assess_point, score_group,
+    execute, interference_measurements, load_time_plan, minimum_reservation, result, assess_point, score_group,
 )
 from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES
 from giraffe.planning import request_plan

@@ -10,7 +10,6 @@ from tests.test_ux_results import run_render_checks
 
 TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
 
-
 FORM = r'''
 config.checks=['load'];state.config=structuredClone(config);state.setupStep=3;
 state.jsonDraft=state.jsonBase=null;

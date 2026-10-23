@@ -112,7 +112,7 @@ def test_connection_setup_has_one_editable_token_id_box():
     assert 'First use needs internet access' in connection
     assert 'automatically collects supported timing' in connection
     assert 'name="metrics_url"' in connection and 'Server metrics URL (optional)' in connection
-    assert 'up to 3 one-token compatibility probes within 5 seconds, using spare request budget' in connection
+    assert 'up to 3 one-token compatibility probes sharing the configured request timeout, bounded by remaining run time and spare request budget' in connection
     assert 'separate from the planned test requests' in connection
     browser_logic(r'''
 const gpu=renderTestCard(bootstrap.checks.find(c=>c.id==='gpu'),config);

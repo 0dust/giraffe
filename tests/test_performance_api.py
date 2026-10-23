@@ -15,7 +15,7 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
     path, _ = write_report(report, tmp_path / 'saved')
     raw = json.loads(path.read_text())
     assert 'performance' not in raw
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://127.0.0.1') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://localhost') as client:
         response = await client.get('/api/runs/saved')
         assert response.status_code == 200
         assert len(response.content) < 1_500_000
@@ -58,7 +58,7 @@ async def test_saved_selection_cache_is_small_and_invalidated_by_file_revision(t
         return original(report, **selection)
 
     monkeypatch.setattr(performance, 'build_performance', counting)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://127.0.0.1') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://localhost') as client:
         url = '/api/runs/saved/performance'
         default = (await client.get(url)).json()
         count = len(calls)
@@ -108,7 +108,7 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
     monkeypatch.setattr(web, 'run_suite', runner)
     app = create_app(tmp_path)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://localhost') as client:
             response = await client.post('/api/runs', json={'config':{'targets':[{'name':'local','url':'http://localhost/v1','model':'test'}],'checks':['serving']}})
             assert response.status_code == 202
             identifier = response.json()['id']
