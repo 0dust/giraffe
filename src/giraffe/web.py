@@ -594,7 +594,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if request.headers.get("sec-fetch-site") == "cross-site" or not same_origin:
                 return JSONResponse({"detail": "Use the local Giraffe page to make changes"},
                                     status_code=403)
-        return await call_next(request)
+        response = await call_next(request)
+        path = request.url.path
+        # Mutable frontend assets must revalidate across upgrades, including 304 responses.
+        if path == "/" or (path.startswith("/static/")
+                           and Path(path).suffix in {".html", ".css", ".js", ".mjs"}):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
