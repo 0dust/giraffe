@@ -423,14 +423,16 @@ Output lengths are caps, so early endings can leave coverage inconclusive.
 
 Defaults select three combinations, maintained concurrency at levels `[1, 4]`,
 and constant arrivals at `[1, 2]` requests/second. At 15 seconds per workload,
-pattern and level, that is 12 tests and 3 minutes of sending time, plus finish and
-setup allowances. A simultaneous-request ceiling can reduce inherited levels;
+pattern and level, that is 12 tests and 3 minutes of sending time, plus setup and
+draining in-flight requests within their configured request deadlines.
+A simultaneous-request ceiling can reduce inherited levels;
 explicit levels must fit the ceiling. Mixed traffic, interference, Poisson arrivals,
 bursts and token stress are off by default. Interference requires streaming and
 levels of at least 2, alternating short and long probes against replenished streams.
 Use [the token-stress example](examples/concurrent-workloads.yaml) for 10,000-token
-input and output targets. Inputs calibrate against server token usage independently
-of `context_limit`; ordinary-request output caps do not resize this profile.
+input and output targets. Inputs are sized locally with the selected tokenizer,
+independently of `context_limit`; actual server token usage establishes input-length
+coverage. Ordinary-request output caps do not resize this profile.
 
 Legacy concurrency, capacity and arrival checks migrate into separate sequential
 Load tests with CLI and web migration notes. Old sample counts, weights and
