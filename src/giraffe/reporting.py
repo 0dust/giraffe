@@ -1715,7 +1715,11 @@ def _render(report: RunReport) -> str:
                 parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>')
             parts.append(f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
             if evidence.tool_expectation is None:
-                if evidence.expected_provided:
+                if evidence.scorer == "none":
+                    purpose = evidence.expected.get("purpose") if isinstance(evidence.expected, dict) else None
+                    if isinstance(purpose, str) and purpose:
+                        parts.append(f'<h3>Purpose</h3><p>{_preview(purpose)}</p>')
+                elif evidence.expected_provided:
                     expected = _json(evidence.expected) if evidence.scorer == "json" else _preview(evidence.expected)
                     parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
                 else:

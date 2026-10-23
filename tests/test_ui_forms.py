@@ -1274,6 +1274,12 @@ const record={evaluation:{messages:[{role:'user',content:'<question>'}],scorer:'
 let html=renderEvaluationEvidence(record,{});assert.match(html,/&lt;question&gt;/);assert.match(html,/&lt;Paris&gt;/);assert.match(html,/No &lt;invention&gt;/);assert.match(html,/AI evaluator/);assert(!html.includes('<question>'));
 record.evaluation={messages:[],scorer:'json',expected:null,expected_provided:true,schema:{type:'null'}};
 html=renderEvaluationEvidence(record,{});assert(html.includes("<pre>null</pre>"));assert.match(html,/JSON schema/);
+record.evaluation={messages:[],scorer:'json',expected:{purpose:'<semantic target>'},expected_provided:true};
+html=renderEvaluationEvidence(record,{});assert.match(html,/Expected answer/);assert.match(html,/&lt;semantic target&gt;/);assert(!html.includes('<h3>Purpose</h3>'));assert(!html.includes('[object Object]'));
+record.evaluation={messages:[],scorer:'none',expected:{purpose:'observe <sustained> answer generation'},expected_provided:true};
+html=renderEvaluationEvidence(record,{});assert.match(html,/No answer check/);assert(html.includes('<h3>Purpose</h3>'));assert.match(html,/observe &lt;sustained&gt; answer generation/);assert(!html.includes('Expected answer'));assert(!html.includes('[object Object]'));assert(!html.includes('<sustained>'));
+record.evaluation={messages:[],scorer:'none',expected:'unused reference',expected_provided:true};
+html=renderEvaluationEvidence(record,{});assert.match(html,/No answer check/);assert.doesNotMatch(html,/Expected answer|unused reference/);
 const old={manifest:{config:{request_source:'request_pack',request_pack:{cases:[{fixture_id:'city',messages:[{role:'user',content:'Capital?'}],scorer:'exact',expected:'Paris'}]}}}};
 assert.match(renderEvaluationEvidence({fixture_id:'pack:city'},old),/Paris/);
 assert.match(renderEvaluationEvidence({fixture_id:'missing'},old),/not saved/);

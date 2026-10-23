@@ -759,6 +759,26 @@ def test_evaluation_context_and_schema_error_survive_report_retention(policy, tm
     assert "<question>" not in html
 
 
+@pytest.mark.parametrize("scorer", ["none", "json", "judge"])
+def test_request_evidence_distinguishes_unscored_purpose_from_expected_answer(scorer):
+    from giraffe.models import EvaluationEvidence
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    record = report.requests[0]
+    record.score = None
+    record.evaluation = EvaluationEvidence(
+        messages=[], scorer=scorer, expected={"purpose": "observe <sustained> answer generation"},
+        expected_provided=True,
+    )
+    html = _render(report)
+    assert "observe &lt;sustained&gt; answer generation" in html
+    assert "<sustained>" not in html
+    assert ("<h3>Purpose</h3>" in html) is (scorer == "none")
+    assert ("<h3>Expected answer</h3>" in html) is (scorer != "none")
+    assert record.score is None
+
+
 @pytest.mark.parametrize("side", ["current", "baseline"])
 def test_schema_evaluation_error_cannot_produce_passing_comparison(side):
     current, baseline = make_report(), make_report("baseline")
