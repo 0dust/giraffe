@@ -65,7 +65,7 @@ def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypa
     monkeypatch.setattr("giraffe.resources.current_rss_bytes", lambda: 321)
     if write_fails:
         monkeypatch.setattr("giraffe.web.write_report", full)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         started = client.post("/api/runs", json={"config": config()})
         assert started.status_code == 202
         identifier = started.json()["id"]
@@ -80,7 +80,7 @@ def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypa
         saved = json.loads((tmp_path / identifier / ".web.json").read_text())
         assert saved["resources"] == detail["resources"]
         assert "memory_limit_bytes" not in client.get("/api/storage").json()
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert client.get(f"/api/runs/{identifier}").json()["resources"] == saved["resources"]
 
 

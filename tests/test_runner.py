@@ -572,6 +572,9 @@ async def test_missing_optional_telemetry_does_not_block_api():
     assert check(report, "gpu").status == "inconclusive"
     assert report.overall == "pass"
     assert check(report, "gpu").metrics["unavailable_families"]
+    summary = check(report, "gpu").summary
+    assert "GPU metrics exporter" in summary
+    assert "complete scored answers" not in summary
 
 
 async def test_normal_run_never_invokes_configured_restart(tmp_path):
@@ -1708,6 +1711,21 @@ def test_no_acceptance_limit_remedy_only_names_limits_the_check_reads(check_id, 
                          else {"reason_code": "missing_acceptance_limit"})
     summary = runner._verdict_summary(result, config(), [], "Raise max_requests")
     assert set(re.findall(r"limits\.([a-z_]+)", summary)) == set(options)
+
+
+@pytest.mark.parametrize("summary", [
+    "GPU end scrape did not return fresh device samples; the observation window is incomplete.",
+    "GPU device samples are stale or missing in the first or last successful scrape.",
+    "GPU observations lack per-device coverage or freshness evidence.",
+])
+def test_gpu_remedy_uses_gpu_check_identity_instead_of_summary_words(summary):
+    from giraffe.models import CheckResult
+
+    result = CheckResult(id="gpu", target="service", title="GPU", status="inconclusive", summary=summary)
+    guidance = runner._verdict_summary(result, config(), [], "Raise max_requests")
+    assert "GPU metrics exporter" in guidance
+    assert "fresh per-device samples" in guidance
+    assert "complete scored answers" not in guidance
 
 
 def test_timing_client_delay_remedy_uses_quality_instead_of_summary_wording():

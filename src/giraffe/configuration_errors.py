@@ -109,6 +109,9 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
         path = ".".join(map(str, parts))
         if item["type"] == "missing" and parts[-1:] == ["name"] and "targets" in parts:
             message = "Target name is required; add e.g. name: local"
+        if path == "config_version":
+            message = ("Unsupported configuration version. Use config_version: 2; "
+                       "older unversioned files can omit config_version.")
         fields = [path] if path else []
         override = re.search(r"test_options\.([a-z_]+)\.([a-z_]+) must not exceed", message)
         levels = re.search(r"(consistency)\.levels must not exceed", message)

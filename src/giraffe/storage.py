@@ -216,24 +216,27 @@ def run_alive(directory: Path | str, meta: dict | None = None, *, active_id: str
     if directory.name == active_id:
         return True
     meta = _read(directory / ".web.json") if meta is None else meta
+    pid = meta.get("owner_pid")
+    if (meta.get("owner_host") == socket.gethostname() and isinstance(pid, int)
+            and not isinstance(pid, bool) and pid > 0 and pid != os.getpid()):
+        # A fresh marker cannot keep a known-dead local writer alive after restart.
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+        except (OSError, OverflowError):
+            pass  # An unprobeable owner falls back to the freshness grace below.
+        else:
+            return True
+    # Only active_id proves a current-process row still has an active job.
+    # Other hosts and legacy metadata retain their existing freshness grace.
     try:
         modified = (directory / ".web.json").stat().st_mtime
     except (FileNotFoundError, NotADirectoryError):
         modified = 0
-    if max(modified, _timestamp(meta.get("heartbeat_at"), 0)) >= time.time() - 120:
-        return True
-    pid = meta.get("owner_pid")
-    if meta.get("owner_host") != socket.gethostname() or isinstance(pid, bool) or not isinstance(pid, int):
-        return False
-    if pid <= 0 or pid == os.getpid():
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (OSError, OverflowError):
-        return False
-    return True
+    return max(modified, _timestamp(meta.get("heartbeat_at"), 0)) >= time.time() - 120
 
 
 def _run(directory: Path, active_id: str | None, sources: set[str], unknown_source: bool) -> dict | None:

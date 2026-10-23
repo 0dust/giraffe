@@ -37,7 +37,7 @@ def test_stale_running_with_valid_report_recovers_complete_evidence(tmp_path, ow
     marker = directory / ".web.json"
     marker.write_text(json.dumps(metadata))
     os.utime(marker, (time.time() - 181, time.time() - 181))
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         detail = client.get("/api/runs/saved").json()
         assert detail["state"] == "completed"
         assert detail["report"]["run_id"] == "suite-run-id"
@@ -51,7 +51,7 @@ def test_stale_running_without_report_recovers_interrupted_and_cleanable(tmp_pat
     marker = directory / ".web.json"
     marker.write_text(json.dumps({"id": "orphan", "state": "running", "owner_pid": 1, "owner_host": "other-container"}))
     os.utime(marker, (1, 1))
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         detail = client.get("/api/runs/orphan").json()
         assert detail["state"] == "interrupted" and detail["report"] is None
         plan = client.post("/api/storage/cleanup-preview", json={"older_than_days": 0}).json()
@@ -61,7 +61,7 @@ def test_stale_running_without_report_recovers_interrupted_and_cleanable(tmp_pat
 def test_valid_report_is_not_hidden_by_error_metadata_without_failure_summary(tmp_path):
     directory = saved(tmp_path)
     (directory / ".web.json").write_text(json.dumps({"state": "error", "error": "Status write warning"}))
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         detail = client.get("/api/runs/saved").json()
         assert detail["report"]["overall"] == "pass"
         assert detail["error"] == "Status write warning"
@@ -90,7 +90,7 @@ def test_failed_new_baseline_save_removes_its_directory(tmp_path, monkeypatch, f
             return original_replace(path, target)
 
         monkeypatch.setattr(Path, "replace", fail_publish)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         result = client.post("/api/baselines", json={"run_id": "saved", "name": "new"})
         assert result.status_code == 507
         assert list((tmp_path / ".baselines").iterdir()) == []
@@ -114,7 +114,7 @@ def test_json_only_export_ignores_html_disk_failure_and_downloads_on_demand(tmp_
 
     monkeypatch.setattr("giraffe.web.run_suite", runner)
     monkeypatch.setattr(giraffe.reporting, "_atomic_write", full_html)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         identifier = client.post("/api/runs", json={"config": config()}).json()["id"]
         detail = completed(client, identifier)
         assert detail["state"] == "completed" and detail["report"]["overall"] == "pass"
@@ -135,7 +135,7 @@ def test_cleanup_total_requires_positive_api_value(tmp_path, target, value):
     body = {"max_total_bytes": value}
     if target == "cleanup":
         body["ids"] = ["saved"]
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         response = client.post(f"/api/storage/{target}", json=body)
         assert response.status_code == 422
         assert "--older-than 0" in response.text

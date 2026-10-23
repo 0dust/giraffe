@@ -152,7 +152,8 @@ def test_final_profile_grids_and_result_tables_fit_viewport(width):
     from tests.test_ux_catalogue import browser_logic
     playwright = pytest.importorskip('playwright.sync_api', reason='Browser layout checks require Playwright and Chromium')
     html = browser_logic(r'''
-config.checks=['load'];state.openTest='load';state.loadPanels={combinations:true,mixed:true,interference:true,stress:true};
+config.load_test=loadSettings(config);config.load_test.workloads.mixed.enabled=true;config.load_test.workloads.mixed.share_mode='custom';config.load_test.workloads.mixed.selected=[...loadShapes];
+config.checks=['load'];state.loadPanels={combinations:true,mixed:true,interference:true,stress:true};
 console.log(JSON.stringify('<form id="new-run-form">'+renderTestCard(bootstrap.checks.find(c=>c.id==='load'),config)+'</form><section class="check-detail">'+renderLoadTestResults({points:[{id:'one',type:'combinations',shape:'short_short',pattern:'concurrent',level:1,groups:[{id:'group',shape:'short_short'}]}]})+'</section>'));
 ''')
     styles = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
@@ -162,8 +163,14 @@ console.log(JSON.stringify('<form id="new-run-form">'+renderTestCard(bootstrap.c
             page = browser.new_page(viewport={'width': width, 'height': 900}, offline=True)
             page.emulate_media(reduced_motion='reduce')
             page.set_content('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>' + styles + '</style>' + html)
+            editor = page.locator('#settings-load')
+            editor.evaluate("node => {node.hidden=false;node.closest('.test-card').classList.add('is-editing');}")
+            assert editor.is_visible()
+            assert page.locator('#load-shares').is_visible()
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1')
-            assert page.locator('.load-profile thead th').evaluate_all('''cells => cells.every(cell => {
+            headers = page.locator('.load-profile thead th:not(:empty)')
+            assert headers.count() == 2
+            assert headers.evaluate_all('''cells => cells.every(cell => {
                 const text=document.createRange();text.selectNodeContents(cell);
                 const rect=text.getBoundingClientRect(),box=cell.getBoundingClientRect();
                 return rect.right<=box.right+1 && rect.left>=box.left-1;
@@ -172,13 +179,16 @@ console.log(JSON.stringify('<form id="new-run-form">'+renderTestCard(bootstrap.c
                 bounds = page.locator(f'.load-profile input[name$="_{kind}_tokens"]').evaluate_all(
                     'inputs=>inputs.map(input=>{const r=input.getBoundingClientRect();return [r.x,r.width];})')
                 assert len(bounds) == 3 and all(row == bounds[0] for row in bounds)
-            for selector in ['.load-shape-grid', '.load-share-grid']:
-                assert page.locator(selector).evaluate('''grid => {
+            for selector, count in [('.load-shape-grid', 2), ('.load-share-grid', 1)]:
+                grids = page.locator(selector + ':visible')
+                assert grids.count() == count
+                assert grids.evaluate_all('''grids => grids.every(grid => {
                     const cells=[...grid.children].map(cell=>cell.getBoundingClientRect()),r=grid.getBoundingClientRect();
-                    return cells.length===9 && cells.every(cell=>cell.left>=r.left-1 && cell.right<=r.right+1)
+                    return r.width>0 && cells.length===9 && cells.every(cell=>cell.width>0 && cell.height>0
+                        && cell.left>=r.left-1 && cell.right<=r.right+1)
                         && cells[0].left<cells[1].left && cells[1].left<cells[2].left
                         && Math.abs(cells[3].left-cells[0].left)<1;
-                }''')
+                })''')
             assert page.locator('.load-results-table').evaluate_all(
                 'tables=>tables.every(node=>node.scrollWidth>node.clientWidth && getComputedStyle(node).overflowX==="auto")')
         finally:

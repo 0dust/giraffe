@@ -2026,6 +2026,7 @@ def _verdict_summary(check, config, records, budget):
 
     samples = max(2, config.samples, limits.min_samples)
     if check.id == "gpu":
+        # GPU samples are exporter readings, never scored completion answers.
         remedy = ("configure a reachable GPU metrics exporter with fresh per-device samples "
                   f"and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; "
                   "inspect reported device errors before rerunning")

@@ -16,6 +16,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from functools import lru_cache
+from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -172,6 +173,29 @@ def _validated_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | Non
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0," + str(MAX_WEB_IDENTIFIER_CHARS - 1) + r"}\Z")
 _SHUTDOWN_SECONDS = 5
+_LOCAL_AUTHORITY = re.compile(
+    r"(?P<host>localhost|[0-9.]+|\[[0-9a-f:.]+\])(?::(?P<port>[0-9]+))?",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def _is_local_authority(authority: str) -> bool:
+    """Validate the complete Host value without resolving an untrusted DNS name."""
+    match = _LOCAL_AUTHORITY.fullmatch(authority)
+    if match is None:
+        return False
+    if match["port"] is not None:
+        port = match["port"].lstrip("0") or "0"
+        if len(port) > 5 or int(port) > 65535:
+            return False
+    host = match["host"]
+    if host.lower() == "localhost":
+        return True
+    try:
+        address = IPv6Address(host[1:-1]) if host.startswith("[") else IPv4Address(host)
+    except ValueError:
+        return False
+    return address.is_loopback
 
 
 class TargetAPIKey(APIKeyInput):
@@ -552,6 +576,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.middleware("http")
     async def local_mutations(request: Request, call_next):
+        # Validate before request.url uses Host, for reads as well as mutations.
+        hosts = request.headers.getlist("host")
+        if len(hosts) != 1 or not _is_local_authority(hosts[0]):
+            return JSONResponse({"detail": "Use a local Giraffe host"}, status_code=400)
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
                 return JSONResponse({"detail": "Use application/json"}, status_code=415)

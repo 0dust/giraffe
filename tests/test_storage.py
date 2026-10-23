@@ -230,36 +230,63 @@ def test_disabled_start_limits_do_not_inspect_storage(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("kind,alive", [("active", True), ("legacy", False), ("foreign", False),
                                        ("self", False), ("dead", False), ("local", True),
-                                       ("denied", True), ("heartbeat", True), ("recent", True)])
+                                       ("denied", True), ("heartbeat", True), ("recent", True),
+                                       ("recent-self", True), ("recent-dead", False),
+                                       ("heartbeat-dead", False), ("active-dead", True),
+                                       ("recent-foreign", True), ("recent-legacy", True),
+                                       ("recent-overflow", True), ("overflow", False),
+                                       ("recent-unknown-error", True), ("unknown-error", False)])
 def test_run_liveness_uses_host_pid_and_recent_heartbeat(tmp_path, monkeypatch, kind, alive):
     import socket
     from giraffe.storage import run_alive
 
     metadata = {"state": "running", "owner_host": socket.gethostname(), "owner_pid": os.getpid() + 12345}
-    if kind == "legacy":
+    if kind in {"legacy", "recent-legacy"}:
         metadata.pop("owner_host")
-    elif kind == "foreign":
+    elif kind in {"foreign", "recent-foreign"}:
         metadata["owner_host"] = "another-host"
         metadata["owner_pid"] = 1
-    elif kind == "self":
+    elif kind in {"self", "recent-self"}:
         metadata["owner_pid"] = os.getpid()
     elif kind == "heartbeat":
         metadata["owner_host"] = "another-host"
         metadata["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    if kind == "heartbeat-dead":
+        metadata["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
     run = saved(tmp_path, "run", **metadata)
     old = (datetime.now(timezone.utc) - timedelta(minutes=3)).timestamp()
-    if kind != "recent":
+    if not kind.startswith("recent"):
         os.utime(run / ".web.json", (old, old))
     def kill(pid, signal):
-        if kind == "dead":
+        assert signal == 0 and pid > 0 and pid != os.getpid()
+        assert metadata.get("owner_host") == socket.gethostname()
+        if kind in {"overflow", "recent-overflow"}:
+            raise OverflowError()
+        if kind in {"unknown-error", "recent-unknown-error"}:
+            raise OSError()
+        if kind in {"dead", "recent-dead", "heartbeat-dead", "active-dead"}:
             raise ProcessLookupError()
         if kind == "denied":
             raise PermissionError()
     monkeypatch.setattr("giraffe.storage.os.kill", kill)
-    active_id = "run" if kind == "active" else None
+    active_id = "run" if kind in {"active", "active-dead"} else None
     assert run_alive(run, active_id=active_id) is alive
     plan = cleanup_plan(tmp_path, keep_latest=0, active_id=active_id)
     assert bool(plan["protected"]) is alive
+
+
+@pytest.mark.parametrize("pid", [None, True, "123", 0, -1])
+@pytest.mark.parametrize("recent", [False, True])
+def test_unknown_owner_pid_uses_freshness_without_probing_process_groups(tmp_path, monkeypatch, pid, recent):
+    import socket
+    from giraffe.storage import run_alive
+
+    run = saved(tmp_path, "unknown", state="running", owner_pid=pid, owner_host=socket.gethostname())
+    if not recent:
+        os.utime(run / ".web.json", (1, 1))
+    monkeypatch.setattr("giraffe.storage.os.kill", lambda *args: pytest.fail("invalid PID was probed"))
+    assert run_alive(run) is recent
+    assert bool(cleanup_plan(tmp_path, keep_latest=0)["protected"]) is recent
 
 
 @pytest.mark.parametrize("temporary", [False, True])

@@ -156,7 +156,7 @@ async def test_run_start_accepts_notes_as_metadata_and_manifest_stores_them(tmp_
         return saved
     monkeypatch.setattr('giraffe.web.run_suite', run)
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
         response = await client.post('/api/runs', json={'config': configuration().model_dump(), 'migration_notes': ['Original limits dropped']})
         assert response.status_code == 202
         import asyncio
@@ -225,7 +225,7 @@ async def test_web_legacy_nullable_or_invalid_sustained_duration_never_crashes(s
     import httpx
     from giraffe.web import create_app
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
         response = await client.post('/api/config/validate', json={'targets': [TARGET], 'concurrent_workloads': {}, 'sustained_seconds': sustained})
     assert response.status_code == status, response.text
     if status == 200:
@@ -301,7 +301,7 @@ async def test_invalid_legacy_requests_return_422_without_starting_traffic(field
     monkeypatch.setattr('giraffe.web.run_suite', forbidden)
     monkeypatch.setattr('giraffe.client.LLMClient.execute', forbidden)
     source = {'targets': [TARGET], 'checks': ['concurrency'], field: settings}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://127.0.0.1:8787') as client:
         for path in ['/api/config/draft', '/api/config/validate', '/api/config/preview', '/api/config/plan', '/api/runs']:
             response = await client.post(path, json={'config': source} if path == '/api/runs' else source)
             assert response.status_code == 422, (path, response.text)

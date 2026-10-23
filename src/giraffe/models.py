@@ -10,7 +10,7 @@ import re
 from typing import Annotated, Any, Literal
 
 from pydantic_core import PydanticCustomError
-from pydantic import ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
+from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
 
 
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
@@ -455,8 +455,32 @@ class LoadTest(LoadTestSettings):
     migrated_tests: list[MigratedLoadTest] = Field(default_factory=list, max_length=3)
 
 
+def _validated_migration_input(value):
+    """Validate fields migrations inspect using the canonical model contract.
+
+    Compatibility migration runs before model validation at HTTP/CLI boundaries.
+    Preserve field locations and Pydantic's accepted Python collection inputs,
+    without treating arbitrary raw values as iterable or hashable check ids.
+    """
+    if not isinstance(value, dict):
+        return value
+    validated, errors = {}, []
+    for name, adapter in _MIGRATION_INPUT_ADAPTERS.items():
+        if name not in value:
+            continue
+        try:
+            validated[name] = adapter.validate_python(value[name])
+        except ValidationError as error:
+            errors.extend({**item, "loc": (name, *item["loc"])}
+                          for item in error.errors(include_url=False))
+    if errors:
+        raise ValidationError.from_exception_data("RunConfig", errors, hide_input=True)
+    return {**value, **validated}
+
+
 def migrate_load_test(value):
     """Preserve legacy traffic as separate tests and explain changed semantics."""
+    value = _validated_migration_input(value)
     if not isinstance(value, dict):
         return value, []
     value = deepcopy(value)
@@ -656,6 +680,7 @@ def is_legacy_config(value) -> bool:
 
 def migrate_run_limits(value):
     """Upgrade saved input only; Python-constructed configs already use v2."""
+    value = _validated_migration_input(value)
     if not is_legacy_config(value):
         return value, []
     value, notes = deepcopy(value), []
@@ -833,6 +858,7 @@ def required_concurrency(config) -> dict[str, Any]:
 
 def migrate_concurrent_load(value):
     """Convert legacy input without persisting migration metadata in config."""
+    value = _validated_migration_input(value)
     if not isinstance(value, dict):
         return value, []
     value, notes = deepcopy(value), []
@@ -1848,7 +1874,8 @@ class RequestJudgement(Model):
 class RunConfig(Model):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
     targets: list[Target] = Field(min_length=1)
-    config_version: int = 2
+    config_version: Annotated[Literal[2], BeforeValidator(TypeAdapter(StrictInt).validate_python)] = Field(default=2,
+        description="Supported configuration version. Legacy files omit this field; normalized exports use version 2.")
     default_concurrency: int = Field(default=4, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     concurrency: int | None = Field(default=None, ge=1, le=MAX_SIMULTANEOUS_REQUESTS,
                              description="Maximum simultaneous target requests across the run, chosen by the user; not detected hardware capacity.")
@@ -2228,6 +2255,14 @@ class RunConfig(Model):
     @field_serializer("test_options")
     def serialize_test_options(self, options: dict[str, CheckOptions]) -> dict[str, Any]:
         return {name: value.model_dump(exclude_unset=True) for name, value in options.items()}
+
+
+# Compile the canonical fields once, after RunConfig exists, so parsing does not
+# rebuild schemas or invoke Pydantic's environment-dependent plugin discovery.
+_MIGRATION_INPUT_ADAPTERS = {
+    name: TypeAdapter(RunConfig.model_fields[name].rebuild_annotation())
+    for name in ("config_version", "checks")
+}
 
 
 class DraftTarget(Target):
