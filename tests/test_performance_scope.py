@@ -172,7 +172,7 @@ def test_existing_qualified_results_follow_the_selected_shape_cohort():
     groups = [dict(shape=shape, status='pass', correct_work_meeting_limits=count,
                    timing_quality={'status': 'qualified'}, client_mean_inflight=1)
               for shape, count in [('short_short', 1), ('long_short', 100)]]
-    value = report([row], checks=[CheckResult(id='load', target='t', title='Load test', summary='Measured', status='pass',
+    value = report([row], config={'targets': [{'name': 't'}], 'load_test': {'pass_criteria': {'max_completion_ms': 1000}}}, checks=[CheckResult(id='load', target='t', title='Load test', summary='Measured', status='pass',
         metrics={'points': [dict(id=row.load_point['point_id'], pattern='constant', rate=4, status='pass',
                                  observation_seconds=1, groups=groups)]})])
     _, data = selected(value)

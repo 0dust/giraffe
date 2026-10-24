@@ -1714,6 +1714,9 @@ def _render(report: RunReport) -> str:
                 input_previews[messages_key] = anchors[record.id]
                 parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>')
             parts.append(f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
+            if evidence.scorer == "json":
+                parts.append('<p>JSON accepts one complete Markdown code fence; surrounding prose is rejected. '
+                             'Expected values are compared structurally.</p>')
             if evidence.tool_expectation is None:
                 if evidence.scorer == "none":
                     purpose = evidence.expected.get("purpose") if isinstance(evidence.expected, dict) else None

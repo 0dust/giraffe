@@ -1359,6 +1359,31 @@ def _pack_results(run: _Run, target: Target) -> dict:
             "repeated_requests_per_target": preview["repeated_requests_per_target"]}
 
 
+def _load_conclusion_guidance(run: _Run, check: CheckResult) -> str:
+    from .load_test import settings_sets
+
+    settings = dict(settings_sets(run.config.load_test))
+    points = check.metrics.get("points", [])
+    groups = [group for point in points for group in point.get("groups", [])]
+    reasons = {point.get("reason_code") for point in points}
+    actions = []
+    if "budget_limited" in reasons:
+        actions.append("increase max_requests (or --max-requests) or shorten the selected sending windows so the request budget covers the complete workload")
+    if "time_limited" in reasons:
+        actions.append("increase max_duration_seconds (or --max-duration) or shorten the selected sending windows so the run deadline covers the complete workload")
+    if any(point.get("source", "primary") in settings and
+           settings[point.get("source", "primary")].pass_criteria.max_first_answer_ms is None and
+           settings[point.get("source", "primary")].pass_criteria.max_completion_ms is None
+           for point in points):
+        actions.append("set load_test.pass_criteria.max_first_answer_ms or max_completion_ms to your service's acceptance target; measurement-only load remains inconclusive without a latency limit")
+    unscored = sum(group.get("unscored", 0) for group in groups)
+    if unscored:
+        actions.append("answers are unscored: throughput and latency remain available, but answer correctness and full-workload correct goodput are unknown; configure answer scorers if those results are needed")
+    if not actions:
+        actions.append("complete every selected sending window and collect the required valid, scored responses with complete delivery and timing evidence")
+    return " To conclude, " + "; ".join(actions) + "."
+
+
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
@@ -1374,7 +1399,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             item = load_result(run, target) if check_id in run.config.checks else CheckResult(
                 id=check_id, title=title, target=target.name, required=False, status="skipped", summary="Not selected.")
             if item.status == "inconclusive":
-                item.summary += " To conclude, complete every selected sending window and collect the required valid, scored responses with complete delivery and timing evidence."
+                item.summary += _load_conclusion_guidance(run, item)
             result.append(item)
             continue
         config = _check_config(run.config, check_id)

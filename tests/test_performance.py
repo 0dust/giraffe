@@ -16,9 +16,9 @@ def record(identifier="a", start=0, end=1000, **values):
         dispatch_ms=start, completed_ms=end, elapsed_ms=end-start, **values)
 
 
-def report(records, **extra):
+def report(records, *, config=None, **extra):
     return RunReport(run_id="test", started_at="2026-01-01T00:00:00Z", finished_at="2026-01-01T00:00:05Z",
-        overall="inconclusive", manifest={"config": {"targets": [{"name": "t"}]}}, requests=records, **extra)
+        overall="inconclusive", manifest={"config": config or {"targets": [{"name": "t"}]}}, requests=records, **extra)
 
 
 def summary(value, target=0, window=None):
@@ -263,7 +263,7 @@ def test_sessions_and_qualified_load_evidence_are_bound_instead_of_placeholder_r
     r.scenario="load_primary_combo_short_short_c1"
     r.condition_id=r.scenario
     r.load_point={"point_id":r.scenario,"role":"request","shape":"short_short"}
-    loaded=report([r],checks=[CheckResult(id="load",target="t",title="Load test",summary="Qualified",status="pass",
+    loaded=report([r], config={"targets": [{"name": "t"}], "load_test": {"pass_criteria": {"max_completion_ms": 1000}}}, checks=[CheckResult(id="load",target="t",title="Load test",summary="Qualified",status="pass",
         metrics={"points":[{"id":r.scenario,"status":"pass","pattern":"constant","rate":1,"observation_seconds":1,
             "groups":[{"shape":"short_short","status":"pass","correct_work_meeting_limits":1,
                        "timing_quality":{"status":"qualified"},"client_mean_inflight":1}]}]})])
@@ -348,3 +348,58 @@ def test_missing_completion_clock_does_not_inflate_token_rate():
     assert data["output_throughput"]["value"] == 10
     assert data["output_throughput"]["partial"]
     assert data["total_throughput"]["value"] == 20
+
+
+@pytest.mark.parametrize("scored,limit,correct,expected", [
+    (0, None, 0, None), (0, 1000, 0, None), (16, None, 16, None),
+    (16, 1000, 0, 0), (16, 1000, 16, 8), (8, 1000, 8, 4), (16, "missing", 16, None),
+])
+def test_goodput_requires_scoring_and_latency_limits_without_losing_measured_zero(scored, limit, correct, expected):
+    from giraffe.models import CheckResult
+
+    records = [record(str(i), score=(i < correct) if i < scored else None,
+                      load_point={"point_id": "load", "shape": "short_short"}) for i in range(16)]
+    group = {"shape": "short_short", "valid": 16, "scored": scored, "unscored": 16-scored,
+             "correct_work_meeting_limits": correct, "timing_quality": {"status": "qualified"}}
+    value = report(records, checks=[CheckResult(id="load", target="t", title="Load", status="inconclusive",
+        summary="Measured", metrics={"points": [{"id": "load", "source": "primary", "observation_seconds": 2,
+            "groups": [group]}]})])
+    if limit != "missing":
+        value.manifest["config"]["load_test"] = {"pass_criteria": {
+            "max_first_answer_ms": None, "max_completion_ms": limit}}
+    data = build_performance(value)["targets"][0]
+    metric = data["summaries"][data["default_window"]]["metrics"]["goodput"]
+    assert metric["value"] == expected
+    assert metric["state"] == ("measured" if expected is not None else "insufficient_evidence")
+    assert metric["sample_count"] == (0 if expected is None else 1)
+    assert metric["eligible_count"] == 1
+    assert metric["sample_unit"] == "load points"
+    assert metric["request_coverage"] == {"sample": scored, "eligible": 16, "missing": 16-scored}
+    assert f"{scored} / 16 scored valid requests" in metric["display_note"]
+    if not scored:
+        assert "unscored" in metric["reason"].lower()
+    if limit in (None, "missing"):
+        assert "limit" in metric["reason"].lower()
+    if 0 < scored < 16:
+        assert metric["label"] == "Scored-subset correct goodput"
+        assert metric["scored_subset"]
+    # Raw workload accounting remains a count of demonstrated successes.
+    assert group["correct_work_meeting_limits"] == correct
+
+
+@pytest.mark.parametrize("scored,latency_limit,expected", [(True, None, None), (False, 150, None), (True, 150, 0)])
+def test_historical_capacity_goodput_requires_scored_answers_and_saved_latency_limit(scored, latency_limit, expected):
+    from tests.test_traffic_reporting import traffic_report
+
+    value = traffic_report(high_failure="correctness")
+    value.requests = [r for r in value.requests if r.traffic_stage == 1]
+    if not scored:
+        for item in value.requests:
+            item.score = None
+    for config in (value.manifest["config"], value.manifest["effective_checks"]["capacity"]):
+        config["limits"].update(first_output_ms=None, latency_ms=latency_limit)
+    data = build_performance(value)['targets'][0]
+    metric = data['summaries'][data['default_window']]['metrics']['goodput']
+    assert metric['value'] == expected
+    assert metric['state'] == ('measured' if expected is not None else 'insufficient_evidence')
+    assert value.checks[0].metrics['traffic_stages'][1]['goodput_rps'] == 0

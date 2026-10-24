@@ -89,8 +89,10 @@ def test_http_client_uses_same_explicit_connection_and_keepalive_limits(monkeypa
     monkeypatch.setattr(httpx, "AsyncClient", capture)
     configured = config(concurrency=40)
     transport = LLMClient(configured.targets[0], configured, max_connections=3)._create_client()
-    assert captured["limits"].max_connections == 3
-    assert captured["limits"].max_keepalive_connections == 3
+    assert transport._slots._value == 3
+    assert len(transport._clients) == 1
+    assert captured["limits"].max_connections == 1
+    assert captured["limits"].max_keepalive_connections == 1
     asyncio.run(transport.aclose())
 
 

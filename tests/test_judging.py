@@ -52,6 +52,11 @@ def transport(monkeypatch, handler):
         return client
 
     monkeypatch.setattr("giraffe.client.httpx.AsyncClient", create)
+    # MockTransport bypasses TLS; keep certificate loading outside these timed
+    # request/cancellation tests now that the client shares its TLS context.
+    import ssl
+    monkeypatch.setattr("giraffe.client.httpx.create_ssl_context",
+                        lambda **_: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
     return clients
 
 

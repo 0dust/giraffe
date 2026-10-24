@@ -146,7 +146,7 @@ def _card(row):
     info = " · ".join(str(v) for v in (row.get("source"), (row.get("action") if row.get("action") not in COMMON_GUIDANCE else None)) if v)
     note = (f'Median · P95 {_fmt(row["p95"])} {_e(row.get("unit", ""))}'
             if row.get("distribution") and row.get("p95") is not None
-            else f'{row.get("sample_count", 0)} / {row.get("eligible_count", 0)} eligible samples')
+            else f'{row.get("sample_count", 0)} / {row.get("eligible_count", 0)} eligible {_e(row.get("sample_unit", "samples"))}')
     note = _e(row['display_note']) if row.get('display_note') else note
     estimate = ' <span class="html-estimate">ESTIMATE</span>' if row.get("state") == "estimated" else ''
     missing = ('<strong>' + _e(STATES.get(row.get("state"), "Not measured")) + '</strong>. '
@@ -154,7 +154,7 @@ def _card(row):
     return ('<article class="html-kpi"><h3>' + _e(row.get("label", ""))
             + '<details class="html-info"><summary aria-label="Definition">i</summary><span>' + _e(info)
             + '</span></details></h3><div class="html-value">' + _value(row) + '</div>' + estimate
-            + '<p>' + (missing or note)
+            + '<p>' + (missing + (' ' + note if row.get("display_note") else '') if missing else note)
             + (' · Partial usage coverage' if row.get("partial") else '') + '</p></article>')
 
 

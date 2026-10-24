@@ -63,8 +63,10 @@ PASS: ... requests
 **PASS** means the selected required checks have sufficient evidence and meet their
 acceptance limits. **FAIL** means a check observed a failure. **INCONCLUSIVE** means
 evidence is insufficient to decide, for example too few samples or no concurrent
-overlap. Inconclusive check lines include a remedy describing what to change or
-collect before rerunning. **BLOCKED** means the run or check could not proceed,
+overlap. Measurement-only load runs also remain inconclusive without an explicit
+first-answer or completion latency acceptance limit; their throughput and latency
+measurements are still available. Inconclusive check lines include a remedy
+describing what to change or collect before rerunning. **BLOCKED** means the run or check could not proceed,
 for example because preflight could not connect to the model.
 
 | Exit code | Meaning |
@@ -640,7 +642,10 @@ messages: copying that value can pass without demonstrating the intended task.
 This is a warning; extraction and copy tasks can intentionally include the answer.
 JSON validates the schema and compares supplied expected values structurally,
 treating `3` and `3.0` as equal while keeping booleans distinct from numbers,
-including within arrays and objects. Schema validation alone checks structure.
+including within arrays and objects. It accepts one complete outer Markdown code
+fence (with an optional `json` language tag), but rejects surrounding prose,
+duplicate object keys and non-finite values. This checks the parsed JSON value,
+not strict raw JSON-only formatting. Schema validation alone checks structure.
 None of these establishes general chatbot quality.
 
 Semantic scoring and judging strip closed `<think>`, `<thinking>`, or `<reasoning>`
@@ -815,6 +820,11 @@ answers finishing during bounded drain belong to their original arrival stage.
 The good fraction uses all planned arrivals, including unsent ones. A stage needs
 sufficient samples and a first-output or total-response latency limit to qualify;
 stream-gap or generation-speed limits alone do not bound user waiting time.
+The shared performance view leaves goodput unavailable when answer scoring or a
+latency limit is absent, while preserving measured throughput and latency. A real
+zero means scored answers were checked against configured limits and none
+qualified. Coverage for this rate uses load points; answer-score coverage uses
+requests. Unscored answers never count as correct.
 
 The capacity plan row explains that scheduled requests consume the run limit even
 when all request slots are busy and the generator cannot send them. This accounting

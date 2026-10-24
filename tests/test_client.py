@@ -734,3 +734,33 @@ async def test_only_network_no_response_failures_qualify(monkeypatch, kind):
     async with LLMClient(target, RunConfig(targets=[target])) as client:
         record = await client.execute(spec())
     assert no_response_failure(record) == (kind not in {httpx.PoolTimeout, ValueError})
+
+
+async def test_cancelled_setup_closes_client_created_in_background(monkeypatch):
+    import asyncio
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    actual = httpx.AsyncClient
+    created = []
+
+    def slow_client(**kwargs):
+        started.set()
+        assert release.wait(timeout=1)
+        client = actual(**kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, 'AsyncClient', slow_client)
+    target = Target(name='local', url='http://local', model='test')
+    client = LLMClient(target, RunConfig(targets=[target]))
+    setup = asyncio.create_task(client.__aenter__())
+    async with asyncio.timeout(1):
+        while not started.is_set():
+            await asyncio.sleep(0)
+        setup.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await setup
+    assert created and all(item.is_closed for item in created)
+    assert client._client is None

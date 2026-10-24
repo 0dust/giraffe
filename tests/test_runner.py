@@ -2315,3 +2315,25 @@ async def test_final_load_client_delay_qualifies_timing_but_preserves_known_answ
     assert group['timing_violations'] == []
     assert group['status'] == check(report, 'load').status == expected
     assert check(report, 'load').metrics['highest_accepted'] == []
+
+
+@pytest.mark.parametrize("request_budget", [6, None])
+async def test_measure_only_load_explains_limits_unscored_answers_and_budget_separately(request_budget):
+    cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
+    for case in cases:
+        case.update(scorer="none", expected=None)
+    value = await runner.run_suite(_pack_config(checks=["load"], concurrency=1, duration=1 if request_budget else .05,
+        request_pack={"version": 1, "cases": cases}, max_requests=request_budget,
+        criteria={"max_first_answer_ms": None, "max_completion_ms": None, "min_correct_percent": 0}))
+    result = check(value, "load")
+    assert result.status == "inconclusive"
+    assert load_group(value)["scored"] == 0 and load_group(value)["valid"] > 0
+    if request_budget:
+        assert "request budget" in result.summary.lower()
+        assert "--max-requests" in result.summary
+    else:
+        assert "--max-requests" not in result.summary
+    assert "max_first_answer_ms" in result.summary and "max_completion_ms" in result.summary
+    assert "unscored" in result.summary.lower()
+    assert "throughput and latency" in result.summary.lower()
+    assert "collect the required valid, scored responses" not in result.summary
