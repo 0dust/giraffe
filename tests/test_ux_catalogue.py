@@ -326,7 +326,9 @@ for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'
 let depth=0,maximumDepth=0;
 for(const tag of markup.matchAll(/<(\/?)details\b[^>]*>/g)){depth+=tag[1]?-1:1;maximumDepth=Math.max(maximumDepth,depth);}
 assert.equal(depth,0);assert.equal(maximumDepth,1); // One disclosure; request settings and pass criteria live in check panels.
-assert.doesNotMatch(markup,/Set the limits once|run-limit-note|<p class="hint">/);
+assert.doesNotMatch(markup,/Set the limits once|run-limit-note/);
+assert.match(markup,/Used by checks unless they override it/);
+assert.match(markup,/Maximum duration takes priority and cancels requests still in progress/);
 for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.match(markup,new RegExp('id="field-'+name+'-hint"></span>')); // Empty enabled-state hint receives Not set when unchecked.
 assert.match(markup,/AI evaluator calls have separate limits/); // Available through the field help.
 assert.equal(JSON.stringify(config),before);

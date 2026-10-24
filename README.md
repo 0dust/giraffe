@@ -4,19 +4,50 @@ Run a built-in test suite against an existing OpenAI-compatible LLM endpoint.
 See which requests failed, where output stalled, whether known answers changed,
 and what regressed against a saved run. Results stay in local HTML and JSON files.
 
-Licensed under [Apache-2.0](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md)
+Licensed under [Apache-2.0](https://github.com/0dust/giraffe/blob/main/LICENSE). See [CONTRIBUTING.md](https://github.com/0dust/giraffe/blob/main/CONTRIBUTING.md)
 for the branch and approval policy.
 
-## Try it in 30 seconds
+**Alpha:** for engineers testing an existing LLM endpoint. Recent local checks cover
+macOS with Ollama and vLLM-Metal; Linux/CUDA, Docker and other engine integrations
+still need live qualification. See [tested compatibility](#tested-compatibility).
+Report problems through [GitHub Issues](https://github.com/0dust/giraffe/issues),
+including your Giraffe version, runtime/model and steps to reproduce. Remove API
+keys and private prompts or answers before attaching reports.
 
-Use Python 3.11+ on macOS or Linux, with Ollama already running and
-`llama3.2:3b` installed:
+## Install and open Giraffe
+
+You need Python 3.11+ and an existing OpenAI-compatible chat endpoint. Giraffe does
+not install or start an inference server. Install from this repository:
 
 ```sh
 git clone https://github.com/0dust/giraffe.git && cd giraffe
 python -m venv .venv
 . .venv/bin/activate
-pip install -e .
+pip install .
+giraffe ui
+```
+
+Open **http://127.0.0.1:8765**, select **New run**, and follow
+**Connect → Checks → Launch**:
+
+1. Enter your endpoint, select a model and test the connection. For local Ollama,
+   use `http://127.0.0.1:11434/v1` and a model already listed by `ollama list`.
+2. Start with the default response and known-answer checks. Review the request,
+   time and concurrency limits before launching; the full load test is optional.
+3. Inspect the result and its request evidence. A failure can be a model's wrong
+   answer; **inconclusive** means the selected check needs more evidence. Follow
+   the displayed remedy before interpreting either as a server defect.
+
+You can stop a run and keep partial results. Download HTML from the results page
+or save a baseline to compare against a later run. See [run and compare](#run-and-compare).
+First-time tokenizer setup can download files; model speed and selected tests
+determine how long a run takes.
+
+## First CLI run
+
+After installation, with Ollama already running and `llama3.2:3b` installed:
+
+```sh
 giraffe run --url http://127.0.0.1:11434/v1 --model llama3.2:3b --checks access,serving,correctness --concurrency 1
 ```
 
@@ -162,7 +193,7 @@ check, which separately evaluates fresh GPU evidence against its criteria.
 ## Ollama
 
 Connect to a running Ollama server using a model you already have installed.
-Copy [examples/local.yaml](examples/local.yaml) and edit these settings:
+Copy [examples/local.yaml](https://github.com/0dust/giraffe/blob/main/examples/local.yaml) and edit these settings:
 
 | Setting | What to enter |
 | --- | --- |
@@ -192,7 +223,7 @@ concurrency levels `[1, 2]`; duration-based and adaptive work can exhaust the li
 and leave checks unfinished. Preview the plan before running. The context and
 ordinary-request output caps do not resize Load test's token profile; review its
 input/output targets against your server. Use
-[concurrent-workloads.yaml](examples/concurrent-workloads.yaml) to customize those
+[concurrent-workloads.yaml](https://github.com/0dust/giraffe/blob/main/examples/concurrent-workloads.yaml) to customize those
 workloads.
 
 ## vLLM
@@ -201,7 +232,7 @@ Start your vLLM server separately, then connect Giraffe to its
 [Chat Completions API](https://docs.vllm.ai/en/latest/serving/online_serving/).
 Use a text-generation model with a working chat template.
 
-Copy [examples/vllm.yaml](examples/vllm.yaml) and edit these settings:
+Copy [examples/vllm.yaml](https://github.com/0dust/giraffe/blob/main/examples/vllm.yaml) and edit these settings:
 
 | Setting | What to enter |
 | --- | --- |
@@ -225,7 +256,7 @@ The example enables the nine default checks; JSON and GPU checks remain optional
 It sets a 400-request limit, a 900-second traffic limit and explicit Load test
 concurrency levels `[1, 2]`. Duration-based and adaptive work can exhaust those
 limits. Preview the plan and review Load test's independent token profile against
-your server; use [concurrent-workloads.yaml](examples/concurrent-workloads.yaml)
+your server; use [concurrent-workloads.yaml](https://github.com/0dust/giraffe/blob/main/examples/concurrent-workloads.yaml)
 to customize those workloads.
 A wrong answer can fail a load check even when requests complete successfully.
 Inspect the failed responses before treating the result as a vLLM server fault.
@@ -239,10 +270,10 @@ passes JSON, tool calling, exact-answer, timing, or concurrency checks.
 
 | Engine | Example | Default local API base | Optional discovery |
 | --- | --- | --- | --- |
-| [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | [llamacpp.yaml](examples/llamacpp.yaml) | `http://127.0.0.1:8080/v1` | `llamacpp`: `/props`, build, context per slot, parallel slots, chat-template hash |
-| [TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) | [tensorrt-llm.yaml](examples/tensorrt-llm.yaml) | `http://127.0.0.1:8000/v1` | `tensorrt-llm`: `/version`; use `trtllm-serve`, not a raw Triton inference URL |
-| [LMDeploy](https://lmdeploy.readthedocs.io/en/latest/llm/api_server.html) | [lmdeploy.yaml](examples/lmdeploy.yaml) | `http://127.0.0.1:23333/v1` | `lmdeploy`: matching `/v1/models` entry; version and resolved settings remain unknown |
-| [Hugging Face TGI](https://huggingface.co/docs/text-generation-inference/reference/api_reference) | [tgi.yaml](examples/tgi.yaml) | `http://127.0.0.1:8080/v1` | `tgi`: `/info`, runtime/model revision and configured input/total-token limits |
+| [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | [llamacpp.yaml](https://github.com/0dust/giraffe/blob/main/examples/llamacpp.yaml) | `http://127.0.0.1:8080/v1` | `llamacpp`: `/props`, build, context per slot, parallel slots, chat-template hash |
+| [TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) | [tensorrt-llm.yaml](https://github.com/0dust/giraffe/blob/main/examples/tensorrt-llm.yaml) | `http://127.0.0.1:8000/v1` | `tensorrt-llm`: `/version`; use `trtllm-serve`, not a raw Triton inference URL |
+| [LMDeploy](https://lmdeploy.readthedocs.io/en/latest/llm/api_server.html) | [lmdeploy.yaml](https://github.com/0dust/giraffe/blob/main/examples/lmdeploy.yaml) | `http://127.0.0.1:23333/v1` | `lmdeploy`: matching `/v1/models` entry; version and resolved settings remain unknown |
+| [Hugging Face TGI](https://huggingface.co/docs/text-generation-inference/reference/api_reference) | [tgi.yaml](https://github.com/0dust/giraffe/blob/main/examples/tgi.yaml) | `http://127.0.0.1:8080/v1` | `tgi`: `/info`, runtime/model revision and configured input/total-token limits |
 
 Edit the example's model ID, context length, credentials and acceptance limits,
 then run `giraffe run --config examples/llamacpp.yaml --output runs/llamacpp-first`,
@@ -399,11 +430,11 @@ can diverge. Sessions refill a conversation pool and recall unique seeded facts,
 feeding final answers without inline reasoning into live history. Concurrent load
 scores the box label on every shape. Interference needs matched control/probe
 short streams and an explicit slowdown limit. Missing evidence is inconclusive; see
-[workload evidence](docs/workloads.md).
+[workload evidence](https://github.com/0dust/giraffe/blob/main/docs/workloads.md).
 
 
-Read [the workload and telemetry guide](docs/workloads.md) and use
-[the expanded example](examples/workloads.yaml). Export a sanitized reproduction
+Read [the workload and telemetry guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md) and use
+[the expanded example](https://github.com/0dust/giraffe/blob/main/examples/workloads.yaml). Export a sanitized reproduction
 snapshot with `giraffe export runs/after`, or inspect deployment,
 telemetry and comparison evidence with `giraffe inspect runs/after`.
 New workloads stay disabled unless configured; missing internal telemetry stays
@@ -446,7 +477,7 @@ A simultaneous-request ceiling can reduce inherited levels;
 explicit levels must fit the ceiling. Mixed traffic, interference, Poisson arrivals,
 bursts and token stress are off by default. Interference requires streaming and
 levels of at least 2, alternating short and long probes against replenished streams.
-Use [the token-stress example](examples/concurrent-workloads.yaml) for 10,000-token
+Use [the token-stress example](https://github.com/0dust/giraffe/blob/main/examples/concurrent-workloads.yaml) for 10,000-token
 input and output targets. Inputs are sized locally with the selected tokenizer,
 independently of `context_limit`; actual server token usage establishes input-length
 coverage. Ordinary-request output caps do not resize this profile.
@@ -457,8 +488,9 @@ per-request limits are not silently reinterpreted. Saved reports still render;
 baseline comparisons across incompatible formats are inconclusive. Results show
 requested/client/server concurrency, latency, throughput, token lengths and coverage.
 The best result is the highest observed among tested settings. See
-[workload settings](docs/workloads.md) and
-[the implementation contract](docs/concurrent-load-design.md) for more detail.
+[workload settings](https://github.com/0dust/giraffe/blob/main/docs/workloads.md) and
+[the historical concurrent-load design](https://github.com/0dust/giraffe/blob/main/docs/concurrent-load-design.md) for background.
+The historical design predates the unified Load test; use the workload guide for current settings.
 
 Each result is `pass`, `fail`, `inconclusive`, `skipped`, or `blocked`. A required
 inconclusive check prevents an overall pass. Missing acceptance limits produce
@@ -634,7 +666,7 @@ field and set `request_source` to `request_pack`. The API equivalents are
 lists their fields. A successful single-example trial checks setup and that example,
 not deployment capacity.
 
-Start with [examples/request-pack.json](examples/request-pack.json):
+Start with [examples/request-pack.json](https://github.com/0dust/giraffe/blob/main/examples/request-pack.json):
 
 ```sh
 giraffe run --config my-config.yaml --request-pack examples/request-pack.json \
@@ -723,7 +755,7 @@ continues to add correctness cases only and cannot be combined with a selected p
 Use `scorer: "judge"` with an `expected` reference answer when correct answers may
 use different words. An optional `rubric` adds case-specific requirements. The
 default policy accepts paraphrases but rejects wrong facts, contradictions and
-missing essential details. See [examples/request-pack-judged.json](examples/request-pack-judged.json).
+missing essential details. See [examples/request-pack-judged.json](https://github.com/0dust/giraffe/blob/main/examples/request-pack-judged.json).
 
 In **New run → Add questions & expected answers**, add or import examples with expected answers. Choose
 **AI evaluator** in an example's editor or apply it to selected rows,
@@ -904,7 +936,7 @@ If JSON export fails, Giraffe records an error and tries to save a small summary
 request evidence may be lost. If only HTML fails, the complete JSON stays saved
 and the run completes with a warning. CLI writers refresh a heartbeat so crashed
 runs can eventually become cleanable. Use the same storage flags with
-`giraffe storage` to display your configured limits. See [disk measurements and limits](docs/resources.md).
+`giraffe storage` to display your configured limits. See [disk measurements and limits](https://github.com/0dust/giraffe/blob/main/docs/resources.md).
 
 Peak memory (RAM) is measured separately from saved data on disk. The default
 **Maximum memory (RAM growth during this run)** (`max_memory_mb: 4096`) guardrail
@@ -925,7 +957,7 @@ labelled separately because a web server can include earlier runs. Response bodi
 scoring and checks finish, so usage grows with request count and response size;
 response retention controls saved output, not that working set. Export streams
 JSON and copies only retained data that changes. See the measured before/after
-results and limitations in [resources](docs/resources.md).
+results and limitations in [resources](https://github.com/0dust/giraffe/blob/main/docs/resources.md).
 
 Cold-start testing is a separate, explicit command. Configure an argv list on the
 specific target, such as `restart_command: [docker, restart, my-test-service]`, then:
@@ -944,15 +976,38 @@ measuring restarts or load.
 
 ## Offline and container use
 
-After installing dependencies, the suite needs only your configured inference,
-optional metrics, and optional AI judge endpoints. It never downloads fixtures or models.
-For an offline machine, prepare wheels on a compatible online machine:
+An offline installation needs dependency wheels **and cached tokenizer files**
+for checks that size synthetic inputs. Giraffe does not download model weights or
+fixtures. During online setup it can contact Hugging Face and download tokenizer
+data, including the built-in encoding. Inference, optional metrics and optional
+AI judge requests go to the endpoints you configure.
+
+On a compatible online machine, in the Python environment where you installed
+Giraffe, prepare the wheels and built-in tokenizer cache:
 
 ```sh
 pip wheel . --wheel-dir wheelhouse
-# Transfer wheelhouse, then on the offline machine:
-pip install --no-index --find-links wheelhouse giraffe-check
+export TIKTOKEN_CACHE_DIR="$PWD/tokenizer-cache"
+python -c 'import tiktoken; tiktoken.get_encoding("o200k_base")'
 ```
+
+Transfer `wheelhouse/` and `tokenizer-cache/` to the offline machine. In its
+activated Python environment, install and point Giraffe at the transferred cache:
+
+```sh
+pip install --no-index --find-links wheelhouse giraffe-check
+export TIKTOKEN_CACHE_DIR="$PWD/tokenizer-cache"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
+
+Choose **builtin** in the Token ID field, or set `targets[].tokenizer: builtin`
+in your configuration. Built-in counts are reference counts; actual server usage
+still determines input-size coverage. For model-specific tokenization, load the
+chosen tokenizer on the online machine and transfer its Hugging Face cache too
+(set `HF_HOME` to that cache), or use a local tokenizer directory. Dependency wheels
+alone do not contain these tokenizer files. Offline mode does not prevent requests
+to your configured inference, metrics or judge endpoints.
 
 ```sh
 docker build -t giraffe .
@@ -1048,7 +1103,7 @@ or rollback.
 ## Tested compatibility
 
 The expanded workloads and deployment/telemetry capture have a separate
-[October 8 validation record](docs/validation/2026-10-08.md), with runnable
+[October 8 validation record](https://github.com/0dust/giraffe/blob/main/docs/validation/2026-10-08.md), with runnable
 configurations, real Ollama and vLLM-Metal results, endpoint failures and coverage gaps.
 
 Verified locally on October 4, 2026 with Python 3.12 on macOS:
@@ -1086,5 +1141,5 @@ need live qualification; their supported paths have local automated coverage whe
 applicable. Exported HTML report rendering was not separately visually verified.
 
 For optional token probability comparisons under concurrency, see the
-[logprob consistency guide](docs/workloads.md#token-probability-consistency) and
-[runnable vLLM configuration](examples/logprob-consistency.yaml).
+[logprob consistency guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#token-probability-consistency) and
+[runnable vLLM configuration](https://github.com/0dust/giraffe/blob/main/examples/logprob-consistency.yaml).

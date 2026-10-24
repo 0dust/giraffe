@@ -114,7 +114,11 @@ def test_ui_rejects_invalid_port_before_starting_server(capsys):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch, capsys, legacy):
+@pytest.mark.parametrize("command", ["ui", "web"])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_ui_launch_and_shutdown_stay_local_and_clear_implicit_restart(
+    tmp_path, monkeypatch, capsys, legacy, command, interrupted,
+):
     import uvicorn
     import giraffe.web
 
@@ -134,7 +138,7 @@ def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch
             return self
 
         def __exit__(self, *args):
-            pass
+            captured["listener_closed"] = True
 
         def setsockopt(self, *args):
             pass
@@ -147,11 +151,25 @@ def test_ui_launch_stays_local_and_clears_implicit_restart(tmp_path, monkeypatch
             assert captured["bound"] == ("127.0.0.1", 8765)
 
     monkeypatch.setattr("giraffe.cli.socket.socket", lambda *a: Listener())
-    monkeypatch.setattr(uvicorn.Server, "run", lambda server, **kwargs: captured.update(
-        app=server.config.app, host=server.config.host, port=server.config.port, **kwargs))
-    assert main(["ui", "--config", str(config), "--runs-dir", str(tmp_path)]) == 0
+
+    def run(server, **kwargs):
+        captured.update(app=server.config.app, host=server.config.host,
+                        port=server.config.port, **kwargs)
+        if interrupted:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(uvicorn.Server, "run", run)
+    try:
+        status = main([command, "--config", str(config), "--runs-dir", str(tmp_path)])
+    except KeyboardInterrupt:
+        pytest.fail("UI shutdown let KeyboardInterrupt escape")
+    assert status == 0
     assert captured["host"] == "127.0.0.1" and captured["port"] == 8765
-    assert "open in your browser" in capsys.readouterr().out
+    assert captured["listener_closed"]
+    output = capsys.readouterr()
+    assert "open in your browser" in output.out
+    assert ("Giraffe UI stopped." in output.out) == interrupted
+    assert not output.err
     assert captured["defaults"]["restart_target"] is None
     assert captured["defaults"]["targets"][0]["restart_command"] == ["false"]
     if legacy:

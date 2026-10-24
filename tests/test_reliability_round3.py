@@ -141,11 +141,15 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
 ):
     values = yaml.safe_load((Path(__file__).parents[1] / 'examples' / f'{example}.yaml').read_text())
     # Preserve concurrency, sample counts and all acceptance limits. Scale only
-    # time: local window/deadline/hang = .05/.3/.6; vllm = .3/1.2/.6.
+    # time: local fault window/deadline/hang = .05/.3/.6; vllm = .3/1.2/.6.
     values.update(checks=['access', 'serving', 'first_output', 'recovery'],
                   request_timeout_seconds=values['request_timeout_seconds'] / 100,
                   sustained_seconds=values['sustained_seconds'] / 100,
                   max_duration_seconds=5)
+    if mode == 'healthy':
+        # Give the healthy control enough time to establish sustained occupancy
+        # despite scheduler jitter; retain the short fault-injection windows.
+        values['sustained_seconds'] = max(.3, values['sustained_seconds'])
     values['targets'][0]['url'] = 'http://memory.test/v1'
     configured = RunConfig.model_validate(values)
     fixtures = builtin_fixtures(configured)
@@ -221,7 +225,8 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
     assert heavy_started == len(sustained) and heavy_open == 0
     assert outcome.metrics['recovery']['completed'] == configured.samples
     if mode == 'healthy':
-        assert outcome.status == report.overall == 'pass'
+        assert outcome.status == report.overall == 'pass', (
+            outcome.model_dump(), report.abort_reason, completion)
         assert len(sustained) >= 5 and all(r.status == 'completed' and r.valid for r in sustained)
         assert outcome.metrics['sustained']['error_rate'] == 0
         return
