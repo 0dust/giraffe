@@ -53,9 +53,28 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path):
             response = await client.post("/api/runs/try-example", json={
                 "config": values, "fixture_id": "refund", "target_name": "local"})
             assert response.status_code == 202, response.text
-            result = await finished(client, response.json()["id"])
+            identifier = response.json()["id"]
+            result = None
+            # Real HTTP and automatic telemetry can outlast the short helper
+            # used by mocked web tests. Wait for report publication, not inference.
+            try:
+                async with asyncio.timeout(10):
+                    while True:
+                        status = await client.get(f"/api/runs/{identifier}")
+                        assert status.status_code == 200, status.text
+                        result = status.json()
+                        assert result["state"] in {"running", "stopping", "completed"}, result
+                        if result["state"] == "completed":
+                            break
+                        await asyncio.sleep(.02)
+            except TimeoutError:
+                detail = {key: result.get(key) for key in (
+                    "state", "error", "progress", "live_preparations", "live_request_count",
+                )} if result else None
+                pytest.fail(f"Try Example {identifier} did not publish its report within 10s: {detail!r}")
             assert result["state"] == "completed", result
             saved = result["report"]
+            assert saved is not None, result
             assert saved["requests_compact"]
             request_id = saved["requests"][0]["id"]
             evidence = await client.get(f"/api/runs/{response.json()['id']}/requests/{request_id}")

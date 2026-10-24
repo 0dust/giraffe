@@ -35,7 +35,7 @@ const plan={count_kind:'exact',planned_total:4,request_limit:12,required_request
  {id:'correctness',title:'Known answers',requests_per_target:3,kind:'exact',summary:'Three questions.',source:'generated'}]};
 api=()=>{throw new Error('Preview rendering must not send traffic');};
 let html=renderRunBlueprint(state.config,plan);
-assert.match(html,/4 requests planned/);assert.match(html,/Stop after this many requests/);
+assert.match(html,/4 requests planned/);assert.match(html,/Maximum requests/);
 assert.match(html,/data-plan-row="initial"/);assert.doesNotMatch(html,/data-plan-row="access"/);
 assert.doesNotMatch(html,/data-plan-check=/);assert.match(html,/per endpoint/);
 assert.doesNotMatch(html,/Play example|800 ms|Passed/);

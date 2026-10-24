@@ -126,9 +126,9 @@ def test_a4_save_config_and_manifest_roundtrip_null_limits(tmp_path, monkeypatch
     monkeypatch.setattr("giraffe.cli._run", run)
     assert main(BASE + ["--skip-preflight", "--save-config", str(saved), "--output", str(tmp_path / "run")]) == 0
     text = capsys.readouterr()
-    assert "Stop after this many requests: Not set" in text.err
-    assert "Limit simultaneous requests: Not set" in text.err
-    assert "Stop test traffic after: Not set" in text.err
+    assert "Maximum requests: Not set" in text.err
+    assert "Simultaneous limit: Not set" in text.err
+    assert "Maximum duration: Not set" in text.err
     values = json.loads(saved.read_text())
     assert values["config_version"] == 2
     assert values["max_requests"] is values["max_duration_seconds"] is values["concurrency"] is None
@@ -146,7 +146,7 @@ def test_a4_null_limit_prints_not_set_and_serializes_null(command, tmp_path, cap
     path.write_text(json.dumps({"config_version": 2, "targets": [TARGET], "checks": ["correctness"],
                                 "max_requests": None, "max_duration_seconds": None, "concurrency": None}))
     assert main([command, "--config", str(path), "--output-format", "text"]) == 0
-    assert "Stop after this many requests: Not set" in capsys.readouterr().out
+    assert "Maximum requests: Not set" in capsys.readouterr().out
     assert main([command, "--config", str(path), "--output-format", "json"]) == 0
     values = json.loads(capsys.readouterr().out)["config"]
     assert values["config_version"] == 2

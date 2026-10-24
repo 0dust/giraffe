@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from giraffe.cli import configuration, main, parser
-from giraffe.models import RunConfig, Target
+from giraffe.models import CHECK_NAMES, RunConfig, Target
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 
@@ -98,3 +98,22 @@ def test_readme_target_settings_include_required_fields(section):
     for name, field in Target.model_fields.items():
         if field.is_required():
             assert f'| `targets[0].{name}` |' in block
+
+
+def test_readme_catalog_matches_available_checks():
+    section = README.split('## What runs\n', 1)[1].split('\n\n**Load test**', 1)[0]
+    rows = re.findall(r'^\| (\d+) \| ([^|]+) \|', section, re.MULTILINE)
+    assert [int(number) for number, _ in rows] == list(range(1, len(CHECK_NAMES) + 1))
+    assert {title.strip() for _, title in rows} == set(CHECK_NAMES.values())
+
+
+@pytest.mark.parametrize('name', ['local', 'vllm'])
+def test_primary_examples_exercise_both_intended_concurrent_levels(name):
+    values = yaml.safe_load((ROOT / 'examples' / f'{name}.yaml').read_text())
+    config = RunConfig.model_validate(values)
+    plan = request_plan(config)
+    assert config.load_test.patterns.concurrent.levels == [1, 2]
+    assert {point['level'] for point in plan['load_test']['points']
+            if point['pattern'] == 'concurrent'} == {1, 2}
+    assert not plan['errors']
+    assert not any(notice.get('check') == 'load' for notice in plan['concurrency_warnings'])

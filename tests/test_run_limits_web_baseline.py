@@ -96,7 +96,7 @@ async def test_inherited_parallelism_notice_is_nonblocking_plan_warning_with_fie
 
 def test_a9_structured_conflict_exposes_both_fields_and_only_numeric_values():
     fields = ["test_options.correctness.concurrency", "concurrency"]
-    errors = _configuration_errors([{"loc": ("body",), "msg": "Correctness runs 64 at once, above Limit simultaneous requests (40).",
+    errors = _configuration_errors([{"loc": ("body",), "msg": "Correctness runs 64 at once, above Simultaneous limit (40).",
         "type": "concurrency_conflict", "ctx": {"fields": fields,
         "values": {fields[0]: 64, "concurrency": 40, "secret": "private"}}}], {})
     assert errors[0]["fields"] == fields

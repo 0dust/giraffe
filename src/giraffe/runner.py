@@ -1359,6 +1359,31 @@ def _pack_results(run: _Run, target: Target) -> dict:
             "repeated_requests_per_target": preview["repeated_requests_per_target"]}
 
 
+def _load_conclusion_guidance(run: _Run, check: CheckResult) -> str:
+    from .load_test import settings_sets
+
+    settings = dict(settings_sets(run.config.load_test))
+    points = check.metrics.get("points", [])
+    groups = [group for point in points for group in point.get("groups", [])]
+    reasons = {point.get("reason_code") for point in points}
+    actions = []
+    if "budget_limited" in reasons:
+        actions.append("increase max_requests (or --max-requests) or shorten the selected sending windows so the request budget covers the complete workload")
+    if "time_limited" in reasons:
+        actions.append("increase max_duration_seconds (or --max-duration) or shorten the selected sending windows so the run deadline covers the complete workload")
+    if any(point.get("source", "primary") in settings and
+           settings[point.get("source", "primary")].pass_criteria.max_first_answer_ms is None and
+           settings[point.get("source", "primary")].pass_criteria.max_completion_ms is None
+           for point in points):
+        actions.append("set load_test.pass_criteria.max_first_answer_ms or max_completion_ms to your service's acceptance target; measurement-only load remains inconclusive without a latency limit")
+    unscored = sum(group.get("unscored", 0) for group in groups)
+    if unscored:
+        actions.append("answers are unscored: throughput and latency remain available, but answer correctness and full-workload correct goodput are unknown; configure answer scorers if those results are needed")
+    if not actions:
+        actions.append("complete every selected sending window and collect the required valid, scored responses with complete delivery and timing evidence")
+    return " To conclude, " + "; ".join(actions) + "."
+
+
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
@@ -1374,7 +1399,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             item = load_result(run, target) if check_id in run.config.checks else CheckResult(
                 id=check_id, title=title, target=target.name, required=False, status="skipped", summary="Not selected.")
             if item.status == "inconclusive":
-                item.summary += " To conclude, complete every selected sending window and collect the required valid, scored responses with complete delivery and timing evidence."
+                item.summary += _load_conclusion_guidance(run, item)
             result.append(item)
             continue
         config = _check_config(run.config, check_id)
@@ -1883,7 +1908,7 @@ def _budget_guidance(config, check_id=None):
     plan = request_plan(config)
     if check_id in {"load", "concurrency"}:
         return ("Allow the configured Load test sending windows, local preparation, and outstanding request timeouts; "
-                "set the request limit (Stop after this many requests) using observed throughput. Duration-based requests have no fixed count.")
+                "set the request limit (Maximum requests) using observed throughput. Duration-based requests have no fixed count.")
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
@@ -2026,6 +2051,7 @@ def _verdict_summary(check, config, records, budget):
 
     samples = max(2, config.samples, limits.min_samples)
     if check.id == "gpu":
+        # GPU samples are exporter readings, never scored completion answers.
         remedy = ("configure a reachable GPU metrics exporter with fresh per-device samples "
                   f"and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; "
                   "inspect reported device errors before rerunning")
@@ -2276,7 +2302,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
     if run.memory_limit_reached:
-        warnings.append("Memory limit (RAM growth during this run) was exceeded." +
+        warnings.append("Maximum memory (RAM growth during this run) was exceeded." +
             (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))
     if any(check.metrics.get("low_confidence") for check in checks):
         warnings.append("Some checks have too few successful samples for confident timing conclusions.")

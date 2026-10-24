@@ -32,8 +32,8 @@ Parallel serving needs additional memory; see the
 
 Use a model already installed on your server. No test authoring, model download,
 cloud account, database, or hosted judge is needed. API origins, `/v1` bases, and
-complete `/chat/completions` URLs are accepted. For a non-editable package install,
-use `pip install giraffe-check`; the command is still `giraffe`.
+complete `/chat/completions` URLs are accepted. For a non-editable installation
+from this checkout, use `pip install .`; the command is still `giraffe`.
 
 ## What your first run looks like
 
@@ -44,11 +44,27 @@ separate from the suite request count and budget. `--skip-preflight` skips these
 probes. A preflight failure prints a remedy and exits as blocked without creating
 a run directory or report.
 
-The quick run above prints limits and live progress, followed by output shaped
-like this (summaries and paths vary):
+The quick run above leaves the request-count and traffic-duration limits unset;
+add `--max-requests N` and `--max-duration SECONDS` to bound them. The UI and CLI
+use the same names for run settings:
+
+| UI setting | CLI option | Meaning |
+| --- | --- | --- |
+| Maximum duration | `--max-duration SECONDS` | Stops new requests and cancels in-progress requests at the limit; excludes AI evaluation and report saving. |
+| Maximum requests | `--max-requests N` | Request budget shared by selected checks and targets. |
+| Simultaneous limit | `--simultaneous-limit N` | Maximum unfinished target requests across the suite. |
+| Request timeout | `--request-timeout SECONDS` | Default total time allowed per request; check overrides can replace it. |
+| Maximum memory | `--max-memory MIB` | Maximum process RAM growth during the run; `0` disables it. |
+
+The legacy `--concurrency N` sets both Simultaneous limit and default check
+concurrency. Use `--simultaneous-limit` to change only the UI's run-wide limit.
+The UI duration selector accepts seconds, minutes or hours; the CLI accepts seconds.
+
+The CLI prints limits and live progress, followed by output shaped like this
+(summaries and paths vary):
 
 ```text
-Giraffe: 1 target(s), Stop after this many requests: Not set, Limit simultaneous requests: 1, Stop test traffic after: Not set, Request defaults: 300s timeout, 128 output tokens. Check and saved-request overrides apply. Ctrl-C saves a partial report.
+Giraffe: 1 target(s), Maximum requests: Not set, Simultaneous limit: 1, Maximum duration: Not set, Request timeout: 300s, Maximum output tokens: 128. Check and saved-request overrides apply. Ctrl-C saves a partial report.
 Per-check request timeouts: access=300s, serving=300s, correctness=300s. Saved requests may override these.
 ...
   local / access: pass — ...
@@ -62,8 +78,10 @@ PASS: ... requests
 **PASS** means the selected required checks have sufficient evidence and meet their
 acceptance limits. **FAIL** means a check observed a failure. **INCONCLUSIVE** means
 evidence is insufficient to decide, for example too few samples or no concurrent
-overlap. Inconclusive check lines include a remedy describing what to change or
-collect before rerunning. **BLOCKED** means the run or check could not proceed,
+overlap. Measurement-only load runs also remain inconclusive without an explicit
+first-answer or completion latency acceptance limit; their throughput and latency
+measurements are still available. Inconclusive check lines include a remedy
+describing what to change or collect before rerunning. **BLOCKED** means the run or check could not proceed,
 for example because preflight could not connect to the model.
 
 | Exit code | Meaning |
@@ -168,11 +186,14 @@ Saved run configurations use `config_version: 2`. The request, traffic-duration 
 
 This broader example uses concurrency 2; configure server parallelism before
 expecting concurrent checks to qualify. For a sequential first run, use the
-three-check command above. The example's 300-request budget covers the planned
-fixed and conservative adaptive work. It intentionally keeps a small context and
-output budget; its 10k-token stress cases remain inconclusive. Use
-[concurrent-workloads.yaml](examples/concurrent-workloads.yaml) with matching
-server limits to exercise those cases.
+three-check command above. The example selects the nine default checks plus JSON,
+with a 400-request limit and a 300-second traffic limit. Load test uses explicit
+concurrency levels `[1, 2]`; duration-based and adaptive work can exhaust the limits
+and leave checks unfinished. Preview the plan before running. The context and
+ordinary-request output caps do not resize Load test's token profile; review its
+input/output targets against your server. Use
+[concurrent-workloads.yaml](examples/concurrent-workloads.yaml) to customize those
+workloads.
 
 ## vLLM
 
@@ -200,17 +221,19 @@ giraffe ui --config my-vllm.yaml
 giraffe run --config my-vllm.yaml --output runs/vllm-first
 ```
 
-The example enables the ten standard checks; JSON and GPU checks remain optional.
-Its small context and output budgets intentionally leave the 10k-token stress
-cases inconclusive; use [concurrent-workloads.yaml](examples/concurrent-workloads.yaml)
-with matching server limits for those cases.
+The example enables the nine default checks; JSON and GPU checks remain optional.
+It sets a 400-request limit, a 900-second traffic limit and explicit Load test
+concurrency levels `[1, 2]`. Duration-based and adaptive work can exhaust those
+limits. Preview the plan and review Load test's independent token profile against
+your server; use [concurrent-workloads.yaml](examples/concurrent-workloads.yaml)
+to customize those workloads.
 A wrong answer can fail a load check even when requests complete successfully.
 Inspect the failed responses before treating the result as a vLLM server fault.
 
 ## llama.cpp, TensorRT-LLM, LMDeploy and TGI
 
 Start the engine separately and connect to its OpenAI-compatible **chat** API.
-Use a text-generation model with a working chat template. All 17 checks can be
+Use a text-generation model with a working chat template. All 15 checks can be
 selected for any engine; a supported connection does not guarantee that its model
 passes JSON, tool calling, exact-answer, timing, or concurrency checks.
 
@@ -394,44 +417,48 @@ unverified.
 | 2 | Serving success | HTTP status, completion envelope, nonempty answer and stream finish |
 | 3 | First useful output | Client-observed first answer, separately from reasoning and initial requests |
 | 4 | Generation pace | Generation rate after first output, response time and streaming pauses |
-| 5 | Arrival traffic capacity | Independent mixed arrivals; correctness, timing, local delivery limits and highest tested rate with every lower tested rate accepted |
-| 6 | Concurrent load | Duration-based input/output combinations, seeded mixed requests, active-stream interference and token stress |
-| 7 | Long-context behavior | Known facts at different positions, calibrated from actual input-token usage |
-| 8 | Known-answer correctness | Known answers with observed scored overlap required when concurrency exceeds one |
-| 9 | Structured JSON | Required fields, types and expected values under concurrency |
-| 10 | Limits and cancellation | Output caps, stop sequences, deadlines, client interruption, backend evidence and follow-ups; separate sub-results are retained |
-| 11 | Sustained load and recovery | Refilled heavy worker pool, then matched pre/post light probes with configured acceptance limits |
-| 12 | GPU observations | Existing telemetry; absent data leaves observations unverified |
-| 13 | Scheduled arrivals | Steady/burst scheduling, actual dispatch, waiting and unissued requests |
-| 14 | Shared prefixes and cache evidence | Matched independent controls, repeated history and reported cache evidence |
-| 15 | Multi-turn sessions | Fixed/live history and concurrent conversation measurements |
-| 16 | Repeated-request consistency | Answer agreement within and across sequential/concurrent levels; correctness reported separately |
-| 17 | Tool-calling capability | Parsed tool-call structure and expected arguments |
+| 5 | Load test | Input/output combinations, mixed requests, maintained concurrency, scheduled arrivals, active-stream interference and token stress |
+| 6 | Long-context behavior | Known facts at different positions, calibrated from actual input-token usage |
+| 7 | Known-answer correctness | Known answers with observed scored overlap required when concurrency exceeds one |
+| 8 | Structured JSON | Required fields, types and expected values under concurrency |
+| 9 | Limits and cancellation | Output caps, stop sequences, deadlines, client interruption, backend evidence and follow-ups; separate sub-results are retained |
+| 10 | Sustained load and recovery | Refilled heavy worker pool, then matched pre/post light probes with configured acceptance limits |
+| 11 | GPU observations | Existing telemetry; absent data leaves observations unverified |
+| 12 | Shared prefixes and cache evidence | Matched independent controls, repeated history and reported cache evidence |
+| 13 | Multi-turn sessions | Fixed/live history and concurrent conversation measurements |
+| 14 | Repeated-request consistency | Answer agreement within and across sequential/concurrent levels; correctness reported separately |
+| 15 | Tool-calling capability | Parsed tool-call structure and expected arguments |
 
-**Concurrent load** uses `concurrent_load`: a token data profile, selected input → output
-combinations, request-frequency shares for Mixed load, optional active-stream interference,
-and optional large-input / large-output stress. Each workload runs at each configured
-concurrency level for the full sending duration, replenishing individual slots as requests
-finish, then draining in-flight requests. Minimum valid responses is an evidence requirement;
-it never ends a workload. Output lengths are caps, so early endings can leave coverage inconclusive.
+**Load test** uses `load_test`: a token data profile, selected input → output
+combinations, request-frequency shares for mixed traffic, optional active-stream
+interference and optional token stress. Each selected workload runs separately
+under each selected traffic pattern and level. Maintained concurrency replenishes
+individual slots as requests finish; scheduled arrivals send independently of
+completions. Every test sends for its configured duration, then drains in-flight
+requests. Minimum valid responses is an evidence requirement, not a stopping count.
+Output lengths are caps, so early endings can leave coverage inconclusive.
 
-Defaults select three combinations and Mixed load at levels `[1, 4]`, with 15 seconds per
-workload/level: 2 minutes of configured load time. This window avoids a short-window
-throughput warning for the default output caps. Interference is off by default: it requires streaming and every level
-at least 2. It alternates short and long probes A/B/A/B against continuously replenished short streams.
-Use [the token-stress example](examples/concurrent-workloads.yaml) for 10,000-token input
-and output targets. Inputs calibrate against server token usage, independently of `context_limit`.
-Known server windows and run-wide output caps are validated before execution.
+Defaults select three combinations, maintained concurrency at levels `[1, 4]`,
+and constant arrivals at `[1, 2]` requests/second. At 15 seconds per workload,
+pattern and level, that is 12 tests and 3 minutes of sending time, plus setup and
+draining in-flight requests within their configured request deadlines.
+A simultaneous-request ceiling can reduce inherited levels;
+explicit levels must fit the ceiling. Mixed traffic, interference, Poisson arrivals,
+bursts and token stress are off by default. Interference requires streaming and
+levels of at least 2, alternating short and long probes against replenished streams.
+Use [the token-stress example](examples/concurrent-workloads.yaml) for 10,000-token
+input and output targets. Inputs are sized locally with the selected tokenizer,
+independently of `context_limit`; actual server token usage establishes input-length
+coverage. Ordinary-request output caps do not resize this profile.
 
-Legacy configs load with migration notes on CLI stderr and web response metadata. Old sample
-counts, weights and per-request limits are not silently reinterpreted. Saved old reports still
-render; baseline comparisons across the old and new formats are inconclusive. Per-load-type
-point tables show requested/client/server concurrency, latency, throughput, token lengths and
-coverage. The best result is the highest observed among tested settings.
-
-Arrival traffic capacity and Scheduled arrivals remain separate checks, with their existing
-request-rate and burst behavior. See [workload settings](docs/workloads.md) for the schema and
-[the implementation contract](docs/concurrent-load-design.md) for measurement details.
+Legacy concurrency, capacity and arrival checks migrate into separate sequential
+Load tests with CLI and web migration notes. Old sample counts, weights and
+per-request limits are not silently reinterpreted. Saved reports still render;
+baseline comparisons across incompatible formats are inconclusive. Results show
+requested/client/server concurrency, latency, throughput, token lengths and coverage.
+The best result is the highest observed among tested settings. See
+[workload settings](docs/workloads.md) and
+[the implementation contract](docs/concurrent-load-design.md) for more detail.
 
 Each result is `pass`, `fail`, `inconclusive`, `skipped`, or `blocked`. A required
 inconclusive check prevents an overall pass. Missing acceptance limits produce
@@ -535,7 +562,7 @@ environment-variable names. HTTPX honors `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PR
 `ca_bundle` supplies a private CA file. Nothing disables TLS verification.
 
 `--nonstream` exercises nonstreaming Chat Completions. `--checks serving,correctness`
-runs a selected subset. **All checks** in the UI exposes all 17 checks
+runs a selected subset. **All checks** in the UI exposes all 15 checks
 with a selection checkbox and **Settings** action. Specialist settings stay in
 advanced sections. Settings start collapsed, including saved custom settings.
 Opening settings does not change them. Edits are kept automatically, and only one
@@ -545,7 +572,7 @@ workload. Shared probes needed for a selected timing check remain visible
 in the recorded request scenarios.
 
 An explicit `checks` list is authoritative: selecting `json` or `gpu` enables it
-without a second flag. Without a list, the ten standard checks are selected, and
+without a second flag. Without a list, the nine default checks are selected, and
 legacy `structured_json` / `metrics` flags opt into their additional checks.
 `--structured-output` and `--metrics` extend a saved selection unless `--checks`
 is also given. `--json` remains a hidden alias for `--structured-output`.
@@ -630,7 +657,10 @@ messages: copying that value can pass without demonstrating the intended task.
 This is a warning; extraction and copy tasks can intentionally include the answer.
 JSON validates the schema and compares supplied expected values structurally,
 treating `3` and `3.0` as equal while keeping booleans distinct from numbers,
-including within arrays and objects. Schema validation alone checks structure.
+including within arrays and objects. It accepts one complete outer Markdown code
+fence (with an optional `json` language tag), but rejects surrounding prose,
+duplicate object keys and non-finite values. This checks the parsed JSON value,
+not strict raw JSON-only formatting. Schema validation alone checks structure.
 None of these establishes general chatbot quality.
 
 Semantic scoring and judging strip closed `<think>`, `<thinking>`, or `<reasoning>`
@@ -747,12 +777,16 @@ does not prove correctness or general model quality.
 
 ### Arrival traffic and per-test settings
 
-The capacity test sends arrivals continuously during each rate stage, independently
+Load test sends arrivals continuously during each rate stage, independently
 of previous completions. `steady` spaces arrivals evenly; `poisson` produces seeded
 uneven arrivals. Each arrival samples the configured mix of short answers, long
 input retrieval, and longer exact-copy output. Every built-in traffic request has
 a known-answer scorer. The defaults are a small smoke workload; choose rates,
 lengths, duration and service limits that represent your deployment.
+
+The legacy example below migrates `capacity` into Load test; new version-2 files
+use `load_test`. Preview its migration notes and explicit token targets before
+running.
 
 ```yaml
 checks: [capacity, correctness]
@@ -801,6 +835,11 @@ answers finishing during bounded drain belong to their original arrival stage.
 The good fraction uses all planned arrivals, including unsent ones. A stage needs
 sufficient samples and a first-output or total-response latency limit to qualify;
 stream-gap or generation-speed limits alone do not bound user waiting time.
+The shared performance view leaves goodput unavailable when answer scoring or a
+latency limit is absent, while preserving measured throughput and latency. A real
+zero means scored answers were checked against configured limits and none
+qualified. Coverage for this rate uses load points; answer-score coverage uses
+requests. Unscored answers never count as correct.
 
 The capacity plan row explains that scheduled requests consume the run limit even
 when all request slots are busy and the generator cannot send them. This accounting
@@ -868,7 +907,7 @@ runs can eventually become cleanable. Use the same storage flags with
 `giraffe storage` to display your configured limits. See [disk measurements and limits](docs/resources.md).
 
 Peak memory (RAM) is measured separately from saved data on disk. The default
-**Memory limit (RAM growth during this run)** (`max_memory_mb: 4096`) guardrail
+**Maximum memory (RAM growth during this run)** (`max_memory_mb: 4096`) guardrail
 samples current process RSS about once per second and compares growth with RSS at
 the run start. Earlier web-server allocations do not count toward the growth
 budget. RAM uses binary MiB/GiB.

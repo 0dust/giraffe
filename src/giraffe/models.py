@@ -10,7 +10,7 @@ import re
 from typing import Annotated, Any, Literal
 
 from pydantic_core import PydanticCustomError
-from pydantic import ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
+from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
 
 
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
@@ -455,8 +455,32 @@ class LoadTest(LoadTestSettings):
     migrated_tests: list[MigratedLoadTest] = Field(default_factory=list, max_length=3)
 
 
+def _validated_migration_input(value):
+    """Validate fields migrations inspect using the canonical model contract.
+
+    Compatibility migration runs before model validation at HTTP/CLI boundaries.
+    Preserve field locations and Pydantic's accepted Python collection inputs,
+    without treating arbitrary raw values as iterable or hashable check ids.
+    """
+    if not isinstance(value, dict):
+        return value
+    validated, errors = {}, []
+    for name, adapter in _MIGRATION_INPUT_ADAPTERS.items():
+        if name not in value:
+            continue
+        try:
+            validated[name] = adapter.validate_python(value[name])
+        except ValidationError as error:
+            errors.extend({**item, "loc": (name, *item["loc"])}
+                          for item in error.errors(include_url=False))
+    if errors:
+        raise ValidationError.from_exception_data("RunConfig", errors, hide_input=True)
+    return {**value, **validated}
+
+
 def migrate_load_test(value):
     """Preserve legacy traffic as separate tests and explain changed semantics."""
+    value = _validated_migration_input(value)
     if not isinstance(value, dict):
         return value, []
     value = deepcopy(value)
@@ -656,13 +680,14 @@ def is_legacy_config(value) -> bool:
 
 def migrate_run_limits(value):
     """Upgrade saved input only; Python-constructed configs already use v2."""
+    value = _validated_migration_input(value)
     if not is_legacy_config(value):
         return value, []
     value, notes = deepcopy(value), []
     descriptions = {
-        "max_requests": ("300 requests", "a request limit", "Stop after this many requests"),
-        "max_duration_seconds": ("300 seconds", "a traffic time limit", "Stop test traffic after"),
-        "concurrency": ("4 requests at once", "a simultaneous-request limit", "Limit simultaneous requests"),
+        "max_requests": ("300 requests", "a request limit", "Maximum requests"),
+        "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
+        "concurrency": ("4 requests at once", "a simultaneous-request limit", "Simultaneous limit"),
     }
     for field, (old, label, control) in descriptions.items():
         if field not in value:
@@ -833,6 +858,7 @@ def required_concurrency(config) -> dict[str, Any]:
 
 def migrate_concurrent_load(value):
     """Convert legacy input without persisting migration metadata in config."""
+    value = _validated_migration_input(value)
     if not isinstance(value, dict):
         return value, []
     value, notes = deepcopy(value), []
@@ -903,7 +929,7 @@ def migrate_concurrent_load(value):
     actual_levels = sorted(set(min(ceiling, max(1, int(n))) for n in levels))[:MAX_STAGES] or [1]
     settings["schedule"]["levels"] = actual_levels
     if "levels" in old:
-        notes.append(f"levels={levels!r} moved to schedule.levels={actual_levels!r} (bounded by Limit simultaneous requests).")
+        notes.append(f"levels={levels!r} moved to schedule.levels={actual_levels!r} (bounded by Simultaneous limit).")
     settings["combinations"].update(enabled="size_matrix" in scenarios, selected=list(SHAPES))
     if "size_matrix" in scenarios:
         notes.append("size_matrix/buckets mapped to all 9 combinations; duration replaces sample counts.")
@@ -1848,7 +1874,8 @@ class RequestJudgement(Model):
 class RunConfig(Model):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
     targets: list[Target] = Field(min_length=1)
-    config_version: int = 2
+    config_version: Annotated[Literal[2], BeforeValidator(TypeAdapter(StrictInt).validate_python)] = Field(default=2,
+        description="Supported configuration version. Legacy files omit this field; normalized exports use version 2.")
     default_concurrency: int = Field(default=4, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     concurrency: int | None = Field(default=None, ge=1, le=MAX_SIMULTANEOUS_REQUESTS,
                              description="Maximum simultaneous target requests across the run, chosen by the user; not detected hardware capacity.")
@@ -1856,7 +1883,7 @@ class RunConfig(Model):
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float | None = Field(default=None, gt=0)
     max_memory_mb: int = Field(default=4096, ge=0,
-        description="Memory limit (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
+        description="Maximum memory (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
     request_timeout_seconds: float = Field(default=300, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
@@ -2134,7 +2161,7 @@ class RunConfig(Model):
                 if targets == 1 or check == "concurrency":
                     message = (f"{CATALOGUE_NAMES[check]} runs {effective:,} at once" +
                                (f" × {targets:,} endpoints" if targets > 1 else "") +
-                               f", above Limit simultaneous requests ({self.concurrency:,}).")
+                               f", above Simultaneous limit ({self.concurrency:,}).")
                     raise ValidationError.from_exception_data("Run limits", [{
                         "type": PydanticCustomError("concurrency_conflict", message,
                                                     {"fields": fields, "values": values}),
@@ -2146,7 +2173,7 @@ class RunConfig(Model):
             elif not explicit and value * targets > self.concurrency:
                 self._concurrency_warnings.append({"fields": fields, "values": values,
                     "check": check, "effective_concurrency": effective,
-                    "msg": f"{CATALOGUE_NAMES[check]} inherits {value:,} at once; Limit simultaneous requests ({self.concurrency:,}) allows {effective:,} per endpoint. Raise limit or Use {effective:,} for {CATALOGUE_NAMES[check]}."})
+                    "msg": f"{CATALOGUE_NAMES[check]} inherits {value:,} at once; Simultaneous limit ({self.concurrency:,}) allows {effective:,} per endpoint. Raise limit or Use {effective:,} for {CATALOGUE_NAMES[check]}."})
             return effective
 
         for check in self.checks:
@@ -2228,6 +2255,14 @@ class RunConfig(Model):
     @field_serializer("test_options")
     def serialize_test_options(self, options: dict[str, CheckOptions]) -> dict[str, Any]:
         return {name: value.model_dump(exclude_unset=True) for name, value in options.items()}
+
+
+# Compile the canonical fields once, after RunConfig exists, so parsing does not
+# rebuild schemas or invoke Pydantic's environment-dependent plugin discovery.
+_MIGRATION_INPUT_ADAPTERS = {
+    name: TypeAdapter(RunConfig.model_fields[name].rebuild_annotation())
+    for name in ("config_version", "checks")
+}
 
 
 class DraftTarget(Target):

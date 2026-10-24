@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import json
 import hashlib
+from http.cookiejar import CookieJar
 import os
 import re
 import ssl
@@ -22,6 +23,7 @@ from .caps import (
 )
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget
+from giraffe.transport import HTTPClientPool, _finish_cleanup
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -230,7 +232,7 @@ class LLMClient:
             max_connections = min(required["per_target_peak"], pool)
         self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
-        self._client: httpx.AsyncClient | None = None
+        self._client: httpx.AsyncClient | HTTPClientPool | None = None
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
         self._evidence_fields = {"logprobs", "stream_options"}
@@ -282,24 +284,45 @@ class LLMClient:
             self.token_evidence["status"] = "unavailable"
         return dict(self.token_evidence)
 
-    def _create_client(self) -> httpx.AsyncClient:
+    def _request_headers(self) -> dict[str, str]:
+        return _headers(self.target)
+
+    def _create_client(self) -> HTTPClientPool:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
         # synchronous setup away from concurrent inference and the heartbeat.
-        headers = _headers(self.target)
-        verify: bool | ssl.SSLContext = True
-        if self.config.ca_bundle:
-            verify = ssl.create_default_context(cafile=self.config.ca_bundle)
-        return httpx.AsyncClient(
-            headers=headers,
-            timeout=httpx.Timeout(None, connect=min(self.config.request_timeout_seconds * .9, 10)),
-            verify=verify, proxy=self.config.proxy,
-            trust_env=True, follow_redirects=False,
-            limits=httpx.Limits(max_connections=self.max_connections,
-                                max_keepalive_connections=self.max_connections),
-        )
+        headers = self._request_headers()
+        verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
+                  if self.config.ca_bundle else
+                  httpx.create_ssl_context(verify=True, trust_env=True))
+        cookies = CookieJar()
+
+        def factory():
+            return httpx.AsyncClient(
+                headers=headers, cookies=cookies,
+                timeout=httpx.Timeout(None, connect=min(self.config.request_timeout_seconds * .9, 10)),
+                verify=verify, proxy=self.config.proxy,
+                trust_env=True, follow_redirects=False,
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            )
+
+        return HTTPClientPool(factory, self.max_connections)
 
     async def __aenter__(self) -> LLMClient:
-        self._client = await asyncio.to_thread(self._create_client)
+        setup = asyncio.create_task(asyncio.to_thread(self._create_client))
+        try:
+            self._client = await asyncio.shield(setup)
+        except asyncio.CancelledError:
+            async def close_after_setup():
+                try:
+                    client = await setup
+                except Exception:
+                    return
+                await client.aclose()
+
+            try:
+                await _finish_cleanup(asyncio.create_task(close_after_setup()))
+            finally:
+                raise
         return self
 
     async def __aexit__(self, *_: Any) -> None:

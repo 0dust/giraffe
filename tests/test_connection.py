@@ -277,3 +277,12 @@ async def test_ui_keeps_rejecting_advisory_cli_probe_failures(monkeypatch, statu
     assert error.value.status_code == 422
     assert "private" not in error.value.detail
     assert len(requests) == 1
+
+
+async def test_preflight_marker_replaces_custom_header_case_insensitively(monkeypatch):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(200, json=answer()))
+    monkeypatch.setenv("CUSTOM_PREFLIGHT_MARKER", "custom-value")
+    result = await check_connection(ConnectionTest(url="http://server", model="manual-model",
+        headers_env={"x-giraffe-preflight": "CUSTOM_PREFLIGHT_MARKER"}))
+    assert result["status"] == "connected"
+    assert requests[0].headers.get_list("X-Giraffe-Preflight") == ["1"]

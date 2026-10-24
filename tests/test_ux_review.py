@@ -31,7 +31,7 @@ state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
 assert.match(visible,/<h3>Traffic<\/h3>/);assert(visible.includes(setupPlanCount(plan)));
-assert.match(visible,/<dt>Stop after this many requests<\/dt>/);assert.match(visible,/<dt>Stop test traffic after<\/dt>/);
+assert.match(visible,/<dt>Maximum requests<\/dt>/);assert.match(visible,/<dt>Maximum duration<\/dt>/);
 assert(visible.includes(`<dd>${config.max_requests==null?'Not set':number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${config.max_duration_seconds==null?'Not set':elapsed(config.max_duration_seconds)}</dd>`));
 assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass criteria|requests per endpoint/);
 assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
@@ -145,7 +145,7 @@ nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 const original=JSON.stringify(config);renderRequestPlan();const visible=nodes['#request-plan'].innerHTML;
 assert.match(visible,/Poisson/);for(const rate of [.125,2,8])assert(visible.includes(rate+' requests/second'));
-assert.match(visible,/<dt>Limit simultaneous requests<\/dt><dd>3<\/dd>/);assert(visible.includes(plan.load_test.expected_requests_label));
+assert.match(visible,/<dt>Simultaneous limit<\/dt><dd>3<\/dd>/);assert(visible.includes(plan.load_test.expected_requests_label));
 assert.equal(JSON.stringify(config),original);
 config.checks=['access','correctness'];assert.equal(renderLoadPlan(config,plan),'');
 """,config)

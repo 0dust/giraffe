@@ -189,7 +189,7 @@ async def test_null_legacy_blocks_are_absent_without_notes(key, checks, tmp_path
     assert key not in migrated
     assert ConfigDraft.model_validate(migrated).checks == migrated["checks"]
     assert bool(TypeAdapter(ConfigDraftInput).validate_python(source)._migration_notes) == ('concurrency' in checks)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),base_url='http://127.0.0.1:8787') as client:
         response=await client.post('/api/config/draft',json=source)
     assert response.status_code==200
     assert bool(response.json()['migration_notes']) == ('concurrency' in checks)
@@ -198,7 +198,7 @@ async def test_null_legacy_blocks_are_absent_without_notes(key, checks, tmp_path
 
 async def test_bootstrap_returns_migration_notes_for_legacy_launcher(tmp_path):
     app=create_app(tmp_path,defaults={'targets':[TARGET], 'checks':['buckets'], 'concurrent_workloads':{'samples_per_bucket':7}})
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://127.0.0.1:8787') as client:
         response=await client.get('/api/bootstrap')
     assert response.status_code==200
     body=response.json()
@@ -248,7 +248,7 @@ assert.deepEqual(state.migrationNotes,posted.test_options?.concurrency?['Legacy 
 
 async def test_bootstrap_notes_show_and_are_sent_on_start(tmp_path):
     app=create_app(tmp_path,defaults={'targets':[TARGET], 'checks':['buckets'], 'buckets':{'samples_per_bucket':7}})
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://127.0.0.1:8787') as client:
         body=(await client.get('/api/bootstrap')).json()
     import json
     browser_logic(r'''
@@ -286,7 +286,7 @@ async def test_bootstrap_preserves_notes_from_prevalidated_launcher(tmp_path):
         'targets':[TARGET], 'checks':['buckets'], 'buckets':{'samples_per_bucket':7}})
     assert any('samples_per_bucket=7' in note for note in config._migration_notes)
     app=create_app(tmp_path,defaults=config.model_dump(mode='json'),migration_notes=config._migration_notes)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://127.0.0.1:8787') as client:
         response=await client.get('/api/bootstrap')
     assert response.status_code==200
     assert response.json()['migration_notes']==config._migration_notes

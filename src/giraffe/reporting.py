@@ -115,8 +115,8 @@ def _comparison_manifest(manifest: dict) -> dict:
     if "effective_checks" not in value:
         value["effective_checks"] = effective
     elif isinstance(value.get("effective_checks"), dict):
-        # Phase 3 adds request defaults to the recorded check contract. Fill only
-        # those newly introduced fields; missing earlier evidence stays unknown.
+        # Fill known historical omissions from the saved configuration. Retain
+        # recorded effective values; missing earlier evidence stays unknown.
         added = {
             "serving": {"samples", "max_output_tokens", "request_timeout_seconds"},
             "first_output": {"max_output_tokens", "request_timeout_seconds"},
@@ -124,7 +124,8 @@ def _comparison_manifest(manifest: dict) -> dict:
             "context": {"max_output_tokens", "request_timeout_seconds"},
             "correctness": {"max_output_tokens", "request_timeout_seconds"},
             "json": {"max_output_tokens", "request_timeout_seconds"},
-            "cancellation": {"max_output_tokens", "request_timeout_seconds"},
+            "cancellation": {"max_output_tokens", "request_timeout_seconds",
+                             "cancel_after_chunks", "cleanup_seconds"},
             "recovery": {"max_output_tokens", "request_timeout_seconds"},
             "capacity": {"max_output_tokens", "request_timeout_seconds"},
             "arrivals": {"max_output_tokens", "request_timeout_seconds"},
@@ -149,9 +150,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
     """Reconstruct only identities whose generator revision is known exactly."""
     raw = manifest.get("config", {})
     legacy = revision == "legacy"
-    config, _ = migrate_run_limits(deepcopy(raw))
-    config, _ = migrate_concurrent_load(config)
     try:
+        config, _ = migrate_run_limits(deepcopy(raw))
+        config, _ = migrate_concurrent_load(config)
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
@@ -256,8 +257,24 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     for label, run in (("Current", report), ("Baseline", baseline)):
         if any(record.evaluation_error for record in run.requests):
             reasons.append(f"{label} answer evaluation failed; correctness and capacity cannot be compared.")
-    current_manifest = _comparison_manifest(report.manifest)
-    old_manifest = _comparison_manifest(baseline.manifest)
+    manifests = []
+    for label, run in (("Current", report), ("Baseline", baseline)):
+        try:
+            manifests.append(_comparison_manifest(run.manifest))
+        except ValidationError as error:
+            # Older saved reports may contain inputs that current migrations reject.
+            # Their unknown workload must not discard a completed current run.
+            if any(item["loc"] and item["loc"][0] == "config_version"
+                   for item in error.errors(include_input=False, include_url=False)):
+                reasons.append(f"{label} recorded configuration has an unsupported config_version; comparison requires "
+                               "version 2 or an unversioned legacy configuration. "
+                               f"Rerun the {label.lower()} run with a supported configuration.")
+            else:
+                reasons.append(f"{label} recorded configuration is invalid; comparability is unknown. "
+                               f"Rerun the {label.lower()} run with a valid configuration.")
+    if len(manifests) != 2:
+        return reasons
+    current_manifest, old_manifest = manifests
     current_config = current_manifest["config"]
     old_config = old_manifest["config"]
     reached = _limits_reached(report) | _limits_reached(baseline)
@@ -301,11 +318,18 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
                      for check, settings in value.items()}
         if key == "effective_checks" and isinstance(value, dict):
             cancellation = value.get("cancellation")
-            if isinstance(cancellation, dict) and cancellation.get("backend_verification", "off") == "off":
-                # Legacy reports omit these fields; none affect traffic while
-                # backend verification is off. Keep executed settings strict.
-                inactive = {"backend_verification", "trace_file", "server_log",
-                            "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"}
+            if isinstance(cancellation, dict):
+                # The runner schedules every client disconnect by useful chunks;
+                # the legacy millisecond option never reaches an executed request.
+                inactive = {"cancel_after_ms"}
+                if cancellation.get("backend_verification", "off") == "off":
+                    inactive.update({"backend_verification", "trace_file", "server_log", "trace_wait_seconds"})
+                    if "recovery" not in manifest.get("config", {}).get("checks", []):
+                        inactive.add("cleanup_seconds")
+                    elif isinstance(cancellation.get("cleanup_seconds"), (int, float)):
+                        # Recovery waits at most five seconds. Backend verification,
+                        # when enabled, also uses the unbounded value as a verdict limit.
+                        cancellation = {**cancellation, "cleanup_seconds": min(5, cancellation["cleanup_seconds"])}
                 value = {**value, "cancellation": {
                     name: setting for name, setting in cancellation.items() if name not in inactive
                 }}
@@ -1690,8 +1714,15 @@ def _render(report: RunReport) -> str:
                 input_previews[messages_key] = anchors[record.id]
                 parts.append(f'<h3>Input messages</h3><pre>{_json(evidence.messages, MAX_HTML_PREVIEW_CHARS)}</pre>')
             parts.append(f'<h3>Answer check</h3><p>{_e(evidence.scorer)}</p>')
+            if evidence.scorer == "json":
+                parts.append('<p>JSON accepts one complete Markdown code fence; surrounding prose is rejected. '
+                             'Expected values are compared structurally.</p>')
             if evidence.tool_expectation is None:
-                if evidence.expected_provided:
+                if evidence.scorer == "none":
+                    purpose = evidence.expected.get("purpose") if isinstance(evidence.expected, dict) else None
+                    if isinstance(purpose, str) and purpose:
+                        parts.append(f'<h3>Purpose</h3><p>{_preview(purpose)}</p>')
+                elif evidence.expected_provided:
                     expected = _json(evidence.expected) if evidence.scorer == "json" else _preview(evidence.expected)
                     parts.append(f'<h3>Expected answer</h3><pre>{expected}</pre>')
                 else:

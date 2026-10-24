@@ -65,7 +65,7 @@ def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypa
     monkeypatch.setattr("giraffe.resources.current_rss_bytes", lambda: 321)
     if write_fails:
         monkeypatch.setattr("giraffe.web.write_report", full)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         started = client.post("/api/runs", json={"config": config()})
         assert started.status_code == 202
         identifier = started.json()["id"]
@@ -80,7 +80,7 @@ def test_web_export_memory_survives_and_is_distinct_from_disk(tmp_path, monkeypa
         saved = json.loads((tmp_path / identifier / ".web.json").read_text())
         assert saved["resources"] == detail["resources"]
         assert "memory_limit_bytes" not in client.get("/api/storage").json()
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         assert client.get(f"/api/runs/{identifier}").json()["resources"] == saved["resources"]
 
 
@@ -101,7 +101,7 @@ def test_cli_ram_help_and_output_use_growth_and_binary_units(capsys):
     from giraffe.cli import _print_memory
 
     help_text = parser()._subparsers._group_actions[0].choices["run"].format_help()
-    assert "Memory limit (RAM growth during this run)" in help_text
+    assert "Maximum memory (RAM growth during this run)" in help_text
     assert "MiB" in help_text
     _print_memory({"rss_at_start_bytes": 8 * 1024**3, "sampled_peak_rss_bytes": {"traffic": 12 * 1024**3},
                    "sampled_peak_growth_bytes": {"traffic": 4 * 1024**3}, "memory_limit_bytes": 4096 * 1024**2,
@@ -109,7 +109,7 @@ def test_cli_ram_help_and_output_use_growth_and_binary_units(capsys):
     output = capsys.readouterr().out
     assert "RAM at run start: 8.00 GiB" in output
     assert "traffic: 4.00 GiB" in output
-    assert "Memory limit (RAM growth during this run): 4.00 GiB" in output
+    assert "Maximum memory (RAM growth during this run): 4.00 GiB" in output
     assert "no work was stopped" in output
     assert "not recorded" in output
     assert "not measured on this platform" not in output

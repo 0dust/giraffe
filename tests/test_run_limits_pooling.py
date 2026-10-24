@@ -221,10 +221,10 @@ def test_budget_and_runtime_warning_sentences_are_readable_and_exact():
     from tests.test_planning import load_config
     configured = RunConfig(targets=[TARGET], checks=["correctness"], max_requests=1)
     warning, = request_plan(configured)["request_warnings"]
-    assert warning["msg"] == ("service: incomplete coverage for Answer correctness; the planned requests exceed this endpoint's share of the request limit (Stop after this many requests: 1).")
+    assert warning["msg"] == ("service: incomplete coverage for Answer correctness; the planned requests exceed this endpoint's share of the request limit (Maximum requests: 1).")
     configured = load_config(duration=2, finish=30, rates=[1], max_duration_seconds=1)
     warning = next(item for item in request_plan(configured)["time_warnings"] if item["kind"] == "incomplete_coverage")
-    assert warning["msg"] == ("Incomplete coverage: the traffic time limit (Stop test traffic after) may cut local · Load test. The full traffic timeline including the initial connection allowance needs up to 32 seconds.")
+    assert warning["msg"] == ("Incomplete coverage: the traffic time limit (Maximum duration) may cut local · Load test. The full traffic timeline including the initial connection allowance needs up to 32 seconds.")
     assert warning["actions"][0] == {"label": "Use 32 s", "field": "max_duration_seconds", "value": 32}
 
 

@@ -162,7 +162,7 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     assert result["planned_per_target"] == result["known_per_target"] == expected
     assert result["planned_total"] == result["required_request_limit"] == expected
     assert result["request_limit"] == 2
-    assert any("share of the request limit (Stop after this many requests:" in warning for warning in result["warnings"])
+    assert any("share of the request limit (Maximum requests:" in warning for warning in result["warnings"])
 
 
 @pytest.mark.parametrize("check,updates,expected", [
@@ -248,7 +248,7 @@ def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
         {"name": "first", "url": "http://localhost:1", "model": "a"},
         {"name": "second", "url": "http://localhost:2", "model": "b"},
     ])
-    assert any("share Limit simultaneous requests" in warning and "overlap" in warning
+    assert any("share Simultaneous limit" in warning and "overlap" in warning
                for warning in plan(configuration)["warnings"])
 
 
@@ -372,7 +372,7 @@ async def test_dataset_draft_plan_builds_each_schedule_once_without_full_preview
 
     monkeypatch.setattr(traffic, "arrival_schedule", counted_schedule)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=web.create_app(tmp_path)),
-                                 base_url="http://test") as client:
+                                 base_url="http://127.0.0.1:8787") as client:
         response = await client.post("/api/config/draft", json=configuration.model_dump(mode="json"))
     assert response.status_code == 200, response.text
     assert response.json()["request_plan"] == expected

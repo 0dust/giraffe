@@ -24,10 +24,10 @@ class PreflightError(Exception):
 
 
 class _PreflightClient(LLMClient):
-    def _create_client(self) -> httpx.AsyncClient:
-        client = super()._create_client()
-        client.headers["X-Giraffe-Preflight"] = "1"
-        return client
+    def _request_headers(self) -> dict[str, str]:
+        headers = httpx.Headers(super()._request_headers())
+        headers["X-Giraffe-Preflight"] = "1"
+        return dict(headers)
 
 
 class APIKeyInput(Model):

@@ -22,7 +22,7 @@ def test_progress_queued_after_failure_does_not_resurrect_active_run(tmp_path, m
         return report(configuration)
 
     monkeypatch.setattr("giraffe.web.run_suite", suite)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         first = client.post("/api/runs", json={"config": config()})
         assert first.status_code == 202
         assert completed(client, first.json()["id"])["state"] == "error"
@@ -50,7 +50,7 @@ def test_real_sampler_exception_after_high_rss_allows_another_web_run(tmp_path, 
     monkeypatch.setattr(resources, "current_rss_bytes", lambda: 100 * 1024**2)
     monkeypatch.setattr(runner, "PhaseSampler", sampler)
     monkeypatch.setattr(runner, "builtin_fixtures", failed_fixtures)
-    with TestClient(create_app(tmp_path, min_free_disk=0)) as client:
+    with TestClient(create_app(tmp_path, min_free_disk=0), base_url="http://127.0.0.1:8787") as client:
         first = client.post("/api/runs", json={"config": config(max_memory_mb=1)})
         assert first.status_code == 202
         assert completed(client, first.json()["id"])["state"] == "error"
@@ -80,7 +80,7 @@ def test_runs_listing_caches_compact_report_summaries_and_refreshes_changed_repo
         return original(path)
 
     monkeypatch.setattr(giraffe.web, "_report", load)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         for _ in range(3):
             rows = client.get("/api/runs").json()["runs"]
             assert rows[0]["request_count"] == 1
@@ -114,7 +114,7 @@ def test_unreadable_report_listing_is_cached_without_losing_error_state(tmp_path
         return original(path)
 
     monkeypatch.setattr(giraffe.web, "_report", load)
-    with TestClient(create_app(tmp_path)) as client:
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         for _ in range(2):
             rows = client.get("/api/runs").json()["runs"]
             assert rows[0]["state"] == "error"

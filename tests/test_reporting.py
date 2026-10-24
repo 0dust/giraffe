@@ -196,7 +196,10 @@ def test_legacy_cancellation_grading_cannot_claim_a_server_stop_regression(verif
 
 
 @pytest.mark.parametrize("change,expected", [
-    ("legacy", "pass"), ("inactive", "pass"), ("samples", "inconclusive"),
+    ("legacy", "pass"), ("legacy_override", "inconclusive"), ("explicit_defaults", "pass"),
+    ("inactive", "pass"), ("legacy_timer", "pass"),
+    ("chunks", "inconclusive"), ("cleanup", "inconclusive"), ("clamped_cleanup", "pass"),
+    ("unused_cleanup", "pass"), ("samples", "inconclusive"),
     ("enabled", "inconclusive"), ("required_cleanup", "inconclusive"),
 ])
 @pytest.mark.parametrize("reverse", [False, True])
@@ -208,14 +211,31 @@ def test_cancellation_baselines_ignore_only_inactive_backend_settings(change, ex
             name: config.effective_check(name) for name in config.checks
         }
     settings = previous.manifest["effective_checks"]["cancellation"]
-    if change == "legacy":
+    if change in {"legacy", "legacy_override"}:
+        if change == "legacy_override":
+            previous.manifest["config"]["test_options"] = {"cancellation": {"cancel_after_chunks": 1}}
         previous.manifest["effective_checks"]["cancellation"] = {
             name: value for name, value in settings.items()
             if name in {"samples", "cancel_after_ms", "deadline_probe_ms", "limits"}
         }
+    elif change == "explicit_defaults":
+        previous.manifest["config"]["test_options"] = {
+            "cancellation": {"cancel_after_chunks": 5, "cleanup_seconds": 5, "backend_verification": "off"}}
     elif change == "inactive":
-        settings.update(trace_file="/another/trace", server_log="/another/log",
-                        cancel_after_chunks=10, cleanup_seconds=1, trace_wait_seconds=2)
+        settings.update(trace_file="/another/trace", server_log="/another/log", trace_wait_seconds=2)
+    elif change == "legacy_timer":
+        settings["cancel_after_ms"] += 1
+    elif change == "chunks":
+        settings["cancel_after_chunks"] += 1
+    elif change == "cleanup":
+        settings["cleanup_seconds"] = 1
+    elif change == "clamped_cleanup":
+        settings["cleanup_seconds"] = 10
+    elif change == "unused_cleanup":
+        for report in (current, previous):
+            report.manifest["config"]["checks"].remove("recovery")
+            report.manifest["effective_checks"].pop("recovery")
+        settings["cleanup_seconds"] = 1
     elif change == "samples":
         settings["samples"] += 1
     elif change == "enabled":
@@ -737,6 +757,26 @@ def test_evaluation_context_and_schema_error_survive_report_retention(policy, tm
     for text in ("Input messages", "Expected answer", "Answer check", "JSON schema", "&lt;question&gt;", "No &lt;invention&gt;"):
         assert text in html
     assert "<question>" not in html
+
+
+@pytest.mark.parametrize("scorer", ["none", "json", "judge"])
+def test_request_evidence_distinguishes_unscored_purpose_from_expected_answer(scorer):
+    from giraffe.models import EvaluationEvidence
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    record = report.requests[0]
+    record.score = None
+    record.evaluation = EvaluationEvidence(
+        messages=[], scorer=scorer, expected={"purpose": "observe <sustained> answer generation"},
+        expected_provided=True,
+    )
+    html = _render(report)
+    assert "observe &lt;sustained&gt; answer generation" in html
+    assert "<sustained>" not in html
+    assert ("<h3>Purpose</h3>" in html) is (scorer == "none")
+    assert ("<h3>Expected answer</h3>" in html) is (scorer != "none")
+    assert record.score is None
 
 
 @pytest.mark.parametrize("side", ["current", "baseline"])

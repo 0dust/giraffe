@@ -81,7 +81,7 @@ def test_dormant_load_relationships_do_not_block_other_checks():
 @pytest.mark.parametrize('endpoint', ['draft', 'validate', 'preview', 'plan'])
 async def test_web_returns_derived_defaults_without_validation_errors(endpoint, tmp_path):
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
         response = await client.post('/api/config/' + endpoint, json={'config_version': 2, 'targets': [TARGET], 'checks': ['load'], 'concurrency': 2, 'max_output_tokens': 1})
     assert response.status_code == 200, response.text
     data = response.json()

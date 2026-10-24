@@ -80,7 +80,7 @@ process.stdout.write(JSON.stringify(config));
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(tmp_path / "runs")),
-            base_url="http://giraffe.test",
+            base_url="http://127.0.0.1:8787",
         ) as client:
             validation = await client.post("/api/config/validate", json=values)
             assert validation.status_code == 200, validation.text

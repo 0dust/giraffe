@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import re
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 import pytest
@@ -316,6 +318,67 @@ async def start(client, configuration=None, **values):
 @pytest.fixture
 def fake_runner(monkeypatch):
     monkeypatch.setattr("giraffe.web.run_suite", successful_runner)
+
+
+@pytest.mark.parametrize("path", [
+    "/", "/static/index.html", "/static/styles.css", "/static/app.js", "/static/form-config.mjs",
+])
+async def test_frontend_assets_require_revalidation_without_losing_validators(tmp_path, path):
+    async with browser(tmp_path) as client:
+        response = await client.get(path, params={"v": "previous-build"})
+        assert response.status_code == 200
+        assert response.headers.get("cache-control") == "no-cache"
+        assert response.headers["etag"]
+        assert response.headers["last-modified"]
+        if path == "/":
+            return  # The index route uses FileResponse; static files support conditional responses.
+        unchanged = await client.get(response.url, headers={"If-None-Match": response.headers["etag"]})
+        assert unchanged.status_code == 304
+        assert unchanged.content == b""
+        assert unchanged.headers.get("cache-control") == "no-cache"
+        assert unchanged.headers["etag"] == response.headers["etag"]
+        changed = await client.get(response.url, headers={"If-None-Match": '"previous-build"'})
+        assert changed.status_code == 200
+        assert changed.content == response.content
+        assert changed.headers.get("cache-control") == "no-cache"
+        head = await client.head(response.url)
+        assert head.status_code == 200
+        assert head.content == b""
+        assert head.headers["etag"] == response.headers["etag"]
+        assert head.headers.get("cache-control") == "no-cache"
+
+
+async def test_frontend_entrypoints_and_module_dependency_share_an_upgrade_version(tmp_path):
+    async with browser(tmp_path) as client:
+        index = await client.get("/")
+        app_match = re.search(r'<script type="module" src="([^"]+)"', index.text)
+        style_match = re.search(r'<link rel="stylesheet" href="([^"]+)"', index.text)
+        assert app_match and style_match
+        app = await client.get(app_match[1])
+        style = await client.get(style_match[1])
+        assert app.status_code == style.status_code == 200
+        form_match = re.search(r"from ['\"]([^'\"]+form-config\.mjs\?[^'\"]+)['\"];", app.text)
+        assert form_match
+        form = await client.get(urljoin(str(app.url), form_match[1]))
+        assert form.status_code == 200
+        versions = [parse_qs(urlsplit(str(asset.url)).query).get("v", [None])[0]
+                    for asset in (app, style, form)]
+        assert all(versions) and len(set(versions)) == 1, versions
+        for asset in (app, style, form):
+            assert asset.headers.get("cache-control") == "no-cache"
+
+
+async def test_frontend_cache_policy_preserves_api_and_font_responses(tmp_path):
+    async with browser(tmp_path) as client:
+        bootstrap = await client.get("/api/bootstrap")
+        assert bootstrap.status_code == 200
+        assert "cache-control" not in bootstrap.headers
+        font = await client.get("/static/fonts/Geist-Variable.woff2")
+        assert font.status_code == 200
+        assert "cache-control" not in font.headers
+        unchanged = await client.get(font.url, headers={"If-None-Match": font.headers["etag"]})
+        assert unchanged.status_code == 304
+        assert "cache-control" not in unchanged.headers
 
 
 async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monkeypatch):

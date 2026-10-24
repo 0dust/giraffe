@@ -98,7 +98,7 @@ def test_disabled_block_stays_disabled_and_absent_checks_preserve_legacy_default
 @pytest.mark.parametrize('changes,checks,note', [
     ({'max_duration_seconds': 1}, [], 'Concurrent load turned off: max_duration_seconds=1 cannot fit its minimum sending windows.'),
     ({'max_output_tokens': 8}, ['concurrency'], 'output_tokens.long=96 copied to profile.long.output_tokens=8; clipped to max_output_tokens=8.'),
-    ({'concurrency': 1}, ['concurrency'], 'levels=[1, 2] moved to schedule.levels=[1] (bounded by Limit simultaneous requests).'),
+    ({'concurrency': 1}, ['concurrency'], 'levels=[1, 2] moved to schedule.levels=[1] (bounded by Simultaneous limit).'),
     ({'targets': [{**TARGET, 'deployment': {'serving': {'context_limit': 100}}}]}, [], 'Combinations exceeding known server context window 100 were turned off.'),
     ({'targets': [TARGET, {**TARGET, 'name': 'other'}], 'overlap_models': True, 'concurrency': 1}, [], 'Concurrent load turned off: 2 overlapping targets need at least 2 request slots; concurrency=1.'),
 ])
@@ -156,7 +156,7 @@ async def test_run_start_accepts_notes_as_metadata_and_manifest_stores_them(tmp_
         return saved
     monkeypatch.setattr('giraffe.web.run_suite', run)
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
         response = await client.post('/api/runs', json={'config': configuration().model_dump(), 'migration_notes': ['Original limits dropped']})
         assert response.status_code == 202
         import asyncio
@@ -225,7 +225,7 @@ async def test_web_legacy_nullable_or_invalid_sustained_duration_never_crashes(s
     import httpx
     from giraffe.web import create_app
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
         response = await client.post('/api/config/validate', json={'targets': [TARGET], 'concurrent_workloads': {}, 'sustained_seconds': sustained})
     assert response.status_code == status, response.text
     if status == 200:
@@ -284,7 +284,7 @@ def test_valid_legacy_values_above_global_limits_preserve_old_bounding(field):
     migrated, notes = migrate_concurrent_load(migrated)
     assert migrated['concurrent_load']['schedule']['levels'] == [2]
     assert migrated['concurrent_load']['profile']['long']['output_tokens'] == 128
-    assert 'levels=[3] moved to schedule.levels=[2] (bounded by Limit simultaneous requests).' in notes
+    assert 'levels=[3] moved to schedule.levels=[2] (bounded by Simultaneous limit).' in notes
     assert 'output_tokens.long=256 copied to profile.long.output_tokens=128; clipped to max_output_tokens=128.' in notes
     config = RunConfig.model_validate(migrated)
     assert config.load_test.patterns.concurrent.levels == [2]
@@ -301,7 +301,7 @@ async def test_invalid_legacy_requests_return_422_without_starting_traffic(field
     monkeypatch.setattr('giraffe.web.run_suite', forbidden)
     monkeypatch.setattr('giraffe.client.LLMClient.execute', forbidden)
     source = {'targets': [TARGET], 'checks': ['concurrency'], field: settings}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://127.0.0.1:8787') as client:
         for path in ['/api/config/draft', '/api/config/validate', '/api/config/preview', '/api/config/plan', '/api/runs']:
             response = await client.post(path, json={'config': source} if path == '/api/runs' else source)
             assert response.status_code == 422, (path, response.text)

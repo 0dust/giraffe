@@ -53,16 +53,16 @@ for(const [name,input] of [['load_patterns_concurrent_levels',levels],['concurre
 }
 nodes['#new-run-form']={querySelectorAll:()=>[],elements:{load_patterns_concurrent_levels:levels,concurrency:ceiling}};
 nodes['[data-test-card="load"]']=element();
-const errors=[{field:'load_test.patterns.concurrent.levels',fields:['load_test.patterns.concurrent.levels','concurrency'],msg:'Concurrency level 64 exceeds Limit simultaneous requests 40.',values:{concurrency:40}}];
+const errors=[{field:'load_test.patterns.concurrent.levels',fields:['load_test.patterns.concurrent.levels','concurrency'],msg:'Concurrency level 64 exceeds Simultaneous limit 40.',values:{concurrency:40}}];
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
 syncInlineErrors();
 assert.equal(levels.attributes['aria-invalid'],'true');assert.match(levels.attributes['aria-describedby'],/field-load_patterns_concurrent_levels-error/);
 assert.match(levels.attributes['aria-describedby'],/field-load_patterns_concurrent_levels-hint/);
 assert.match(nodes['#field-concurrency-error'].textContent,/64.*40/);
 let markup=renderRunBlueprint(state.config);
-assert.match(markup,/Concurrency level 64 exceeds Limit simultaneous requests 40/);
+assert.match(markup,/Concurrency level 64 exceeds Simultaneous limit 40/);
 assert.match(markup,/data-setting-path="load_test.patterns.concurrent.levels"[^>]*>Edit Concurrency levels/);
-assert.match(markup,/data-setting-path="concurrency"[^>]*>Edit Limit simultaneous requests/);
+assert.match(markup,/data-setting-path="concurrency"[^>]*>Edit Simultaneous limit/);
 state.setupStep=3;await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-setting'}}:q==='[data-setting-path]'?{dataset:{settingPath:'load_test.patterns.concurrent.levels'}}:null}});
 assert.equal(state.setupStep,2);assert.equal(state.openTest,'load');assert(shared.open&&nested.open);assert(levels.focused&&levels.scrolled);
 assert.equal(levels.attributes['data-setting-highlight'],'true');
@@ -79,13 +79,13 @@ def test_checks_footer_reports_validation_errors_then_returns_to_a_current_plan(
 state.config={checks:['access','load','correctness'],targets:[],concurrency:40,max_requests:300,max_duration_seconds:120};
 state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 nodes['#request-plan']=element();nodes['#dock-summary']=element();
-const errors=[{field:'load_test.patterns.concurrent.levels',fields:['load_test.patterns.concurrent.levels','concurrency'],msg:'Concurrency level 64 exceeds Limit simultaneous requests 40.'}];
+const errors=[{field:'load_test.patterns.concurrent.levels',fields:['load_test.patterns.concurrent.levels','concurrency'],msg:'Concurrency level 64 exceeds Simultaneous limit 40.'}];
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors,error:errors[0].msg};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/3<\/strong> checks.*1 setting to fix/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/Planning/);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{errors,count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/1 setting to fix/); // Draft plans can carry blocking errors with HTTP 200.
 state.requestPreview.errors=errors;state.requestPreview.status='error';state.requestPreview.error='Conflict';
-state.requestPreview.errors.push({field:'max_duration_seconds',msg:'Stop test traffic after is too short.'});renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/2 settings to fix/);
+state.requestPreview.errors.push({field:'max_duration_seconds',msg:'Maximum duration is too short.'});renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/2 settings to fix/);
 configChanged();assert.match(nodes['#dock-summary'].innerHTML,/Planning/);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan:{count_kind:'exact',planned_total:30,rows:[],warnings:[]}};
 renderRequestPlan();assert.match(nodes['#dock-summary'].innerHTML,/30 requests planned/);assert.doesNotMatch(nodes['#dock-summary'].innerHTML,/to fix|Planning/);
@@ -98,7 +98,7 @@ def test_edit_setting_scrolls_the_field_and_error_clear_of_the_narrow_footer():
     run_browser_logic(r"""
 state.config={checks:['load']};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 syncConfigView=syncSetupStep=syncTestControls=()=>{};window.innerWidth=375;
-const error=element({hidden:false,textContent:'Concurrency level 64 exceeds Limit simultaneous requests 40.'});
+const error=element({hidden:false,textContent:'Concurrency level 64 exceeds Simultaneous limit 40.'});
 const group=element({style:{},scrollIntoView(options){assert.equal(options.block,'center');assert(!error.hidden);this.scrolled=true;}});
 const input=element({parentElement:group,closest(q){return q==='.form-field'?group:null;},scrollIntoView(){throw Error('Scroll the complete field group, not only its input');},focus(options){assert(options.preventScroll);this.focused=true;}});
 nodes['#new-run-form']={querySelectorAll:()=>[],elements:{load_patterns_concurrent_levels:input}};nodes['[data-test-card="load"]']=element();
@@ -172,7 +172,7 @@ const input=element({name:'load_patterns_concurrent_levels'});nodes['#field-load
 nodes['#new-run-form']={querySelectorAll:()=>[],elements:{load_patterns_concurrent_levels:input}};nodes['[data-test-card="load"]']=element();
 readForm=()=>({config:structuredClone(state.config)});
 let fixed=false,calls=0;
-const errors=[{field:'load_test.patterns.concurrent.levels',fields:['load_test.patterns.concurrent.levels','concurrency'],msg:'Concurrency level 64 exceeds Limit simultaneous requests 40.'}];
+const errors=[{field:'load_test.patterns.concurrent.levels',fields:['load_test.patterns.concurrent.levels','concurrency'],msg:'Concurrency level 64 exceeds Simultaneous limit 40.'}];
 api=async()=>{calls++;if(!fixed)throw Object.assign(new Error(errors[0].msg),{errors});return {config:state.config,request_plan:{rows:[],warnings:[],count_kind:'exact',planned_total:10}};};
 navigateSetup(3);await Promise.resolve();await Promise.resolve();await Promise.resolve();
 assert.equal(calls,1);assert.equal(state.setupStep,2);assert(input.focused);
@@ -204,7 +204,7 @@ for(const markup of [nodes['#request-plan'].innerHTML,renderRunBlueprint(state.c
   assert.doesNotMatch(markup,/Usually about|one second per request/);
 }
 assert(canStartRun());
-plan.errors=[{field:'max_duration_seconds',fields:['max_duration_seconds','traffic.rates'],msg:'Fixed windows exceed Stop test traffic after.'}];
+plan.errors=[{field:'max_duration_seconds',fields:['max_duration_seconds','traffic.rates'],msg:'Fixed windows exceed Maximum duration.'}];
 assert(!canStartRun());renderRequestPlan();assert.match(nodes['#request-plan'].innerHTML,/data-setting-path="traffic.rates"/);
 plan.estimated_seconds=plan.estimated_low_seconds=plan.estimated_high_seconds=null;plan.time_bound_reasons=['+ 120 requests at unknown speed (up to 1 h if every request hits its timeout).'];
 assert.match(renderPlanTime(plan),/awaiting comparable measurements/);assert.match(renderPlanTime(plan),/120 requests at unknown speed/);

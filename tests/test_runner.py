@@ -572,6 +572,9 @@ async def test_missing_optional_telemetry_does_not_block_api():
     assert check(report, "gpu").status == "inconclusive"
     assert report.overall == "pass"
     assert check(report, "gpu").metrics["unavailable_families"]
+    summary = check(report, "gpu").summary
+    assert "GPU metrics exporter" in summary
+    assert "complete scored answers" not in summary
 
 
 async def test_normal_run_never_invokes_configured_restart(tmp_path):
@@ -1710,6 +1713,21 @@ def test_no_acceptance_limit_remedy_only_names_limits_the_check_reads(check_id, 
     assert set(re.findall(r"limits\.([a-z_]+)", summary)) == set(options)
 
 
+@pytest.mark.parametrize("summary", [
+    "GPU end scrape did not return fresh device samples; the observation window is incomplete.",
+    "GPU device samples are stale or missing in the first or last successful scrape.",
+    "GPU observations lack per-device coverage or freshness evidence.",
+])
+def test_gpu_remedy_uses_gpu_check_identity_instead_of_summary_words(summary):
+    from giraffe.models import CheckResult
+
+    result = CheckResult(id="gpu", target="service", title="GPU", status="inconclusive", summary=summary)
+    guidance = runner._verdict_summary(result, config(), [], "Raise max_requests")
+    assert "GPU metrics exporter" in guidance
+    assert "fresh per-device samples" in guidance
+    assert "complete scored answers" not in guidance
+
+
 def test_timing_client_delay_remedy_uses_quality_instead_of_summary_wording():
     from giraffe.models import CheckResult
 
@@ -2297,3 +2315,25 @@ async def test_final_load_client_delay_qualifies_timing_but_preserves_known_answ
     assert group['timing_violations'] == []
     assert group['status'] == check(report, 'load').status == expected
     assert check(report, 'load').metrics['highest_accepted'] == []
+
+
+@pytest.mark.parametrize("request_budget", [6, None])
+async def test_measure_only_load_explains_limits_unscored_answers_and_budget_separately(request_budget):
+    cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
+    for case in cases:
+        case.update(scorer="none", expected=None)
+    value = await runner.run_suite(_pack_config(checks=["load"], concurrency=1, duration=1 if request_budget else .05,
+        request_pack={"version": 1, "cases": cases}, max_requests=request_budget,
+        criteria={"max_first_answer_ms": None, "max_completion_ms": None, "min_correct_percent": 0}))
+    result = check(value, "load")
+    assert result.status == "inconclusive"
+    assert load_group(value)["scored"] == 0 and load_group(value)["valid"] > 0
+    if request_budget:
+        assert "request budget" in result.summary.lower()
+        assert "--max-requests" in result.summary
+    else:
+        assert "--max-requests" not in result.summary
+    assert "max_first_answer_ms" in result.summary and "max_completion_ms" in result.summary
+    assert "unscored" in result.summary.lower()
+    assert "throughput and latency" in result.summary.lower()
+    assert "collect the required valid, scored responses" not in result.summary

@@ -418,7 +418,7 @@ async def test_error_threshold_stop_still_fails_and_remaining_points_not_run():
 @pytest.mark.parametrize("endpoint", ["draft", "validate", "preview", "plan"])
 async def test_migration_metadata_endpoints(endpoint, tmp_path):
     old = {"targets": [TARGET], "checks": ["buckets"], "buckets": {"levels": [1], "samples_per_bucket": 7}}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787") as client:
         response = await client.post(f"/api/config/{endpoint}", json=old)
     assert response.status_code == 200, response.text
     data = response.json()

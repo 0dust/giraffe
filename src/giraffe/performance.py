@@ -471,7 +471,7 @@ def _window_summary(report, target, window, records, series, observation):
         put(key+"_concurrency", occupancy[key], label, "requests", "Request lifetimes clipped to window; time weighted average", samples=occupancy["sample_count"])
     config = report.manifest.get("config", {})
     put("configured_ceiling", config.get("concurrency"), "Configured ceiling", "requests", "Configuration; never used as intended concurrency",
-        reason=None if config.get("concurrency") is not None else "Not set.", action=None if config.get("concurrency") is not None else "Optionally set Limit simultaneous requests.")
+        reason=None if config.get("concurrency") is not None else "Not set.", action=None if config.get("concurrency") is not None else "Optionally set Simultaneous limit.")
     for prefix in ("output", "total"):
         rate = metrics[prefix+"_throughput"]["value"]
         put(prefix+"_per_in_flight", rate/occupancy["average"] if rate is not None and occupancy["average"] else None,
@@ -546,8 +546,10 @@ def _bind_existing(report, target, window, records, observation, put):
     point_ids = {(row.load_point or {}).get("point_id") for row in records}
     points = [p for p in load.get("points", []) if str(p.get("id")) in point_ids]
     stage_ids = {row.traffic_stage for row in records if row.traffic_stage is not None}
-    stages = [s for index, s in enumerate(by_id.get("capacity", {}).get("traffic_stages", observation.get("capacity", [])))
-              if isinstance(s, dict) and s.get("stage_index", index) in stage_ids]
+    stage_entries = [(s.get("stage_index", index), s) for index, s in enumerate(
+        by_id.get("capacity", {}).get("traffic_stages", observation.get("capacity", [])))
+        if isinstance(s, dict) and s.get("stage_index", index) in stage_ids]
+    stages = [stage for _, stage in stage_entries]
     if points:
         delivery = [{key: p.get(key) for key in ("id", "scheduled", "dispatched", "not_sent", "local_drops", "late_drops", "not_offered", "window_reason", "reason", "reason_code")}
                     for p in points]
@@ -565,17 +567,77 @@ def _bind_existing(report, target, window, records, observation, put):
         "Existing qualified acceptance at tested rates for this cohort; not maximum deployment capacity",
         samples=len(rate_findings), state="measured" if rate_findings else "insufficient_evidence",
         reason=None if rate_findings else "No accepted arrival-rate evidence for this cohort.")
-    goodput = [s.get("goodput_rps") for s in stages if s.get("goodput_rps") is not None and not s.get("generator_limited")]
+    goodput, legacy_coverage = [], []
+    missing_goodput = set()
+    capacity_config = (report.manifest.get("effective_checks", {}).get("capacity")
+                       or report.manifest.get("config", {}))
+    capacity_limits = capacity_config.get("limits", {})
+    limited = any(capacity_limits.get(key) is not None for key in ("first_output_ms", "latency_ms"))
+    valid_counts, scored_counts = Counter(), Counter()
+    if stage_entries:
+        for record in records:
+            if record.valid and record.status == "completed":
+                valid_counts[record.traffic_stage] += 1
+                scored_counts[record.traffic_stage] += record.score is not None
+    for stage_index, stage in stage_entries:
+        stage_valid, stage_scored = valid_counts[stage_index], scored_counts[stage_index]
+        legacy_coverage.append({"scored": stage_scored, "valid": stage_valid, "unscored": stage_valid-stage_scored})
+        if not limited:
+            missing_goodput.add("No first-answer or completion latency limit is established.")
+        if not stage_scored:
+            missing_goodput.add("Answers are unscored; answer correctness is unknown.")
+        if stage.get("goodput_rps") is not None and not stage.get("generator_limited") and limited and stage_scored:
+            goodput.append(stage["goodput_rps"])
+        elif limited and stage_scored:
+            missing_goodput.add("No client-qualified goodput rate was recorded for this load point.")
     shapes = {(row.load_point or {}).get("shape") for row in records} - {None}
     point_groups = [group for point in points for group in point.get("groups", [])
                     if not shapes or group.get("shape") in shapes]
+    load_config = report.manifest.get("config", {}).get("load_test")
+    settings = {"primary": load_config} if isinstance(load_config, dict) else {}
+    for index, migrated in enumerate(settings.get("primary", {}).get("migrated_tests", [])):
+        settings[f"legacy_{index}_{migrated['source']}"] = migrated["settings"]
     for point in points:
         groups = [group for group in point.get("groups", []) if not shapes or group.get("shape") in shapes]
         seconds = point.get("observation_seconds")
-        if seconds and groups and all(g.get("correct_work_meeting_limits") is not None and
+        criteria = (settings.get(point.get("source", "primary")) or {}).get("pass_criteria")
+        limited = (any(criteria.get(key) is not None for key in ("max_first_answer_ms", "max_completion_ms"))
+                   if criteria is not None else False)
+        scored = any((_number(group.get("scored")) and group["scored"] > 0)
+                     or (_number(group.get("correct_work_meeting_limits")) and group["correct_work_meeting_limits"] > 0)
+                     for group in groups)
+        if not limited:
+            missing_goodput.add("No first-answer or completion latency limit is established.")
+        if not scored:
+            missing_goodput.add("Answers are unscored; answer correctness is unknown.")
+        if seconds and groups and limited and scored and all(g.get("correct_work_meeting_limits") is not None and
                 g.get("timing_quality", {}).get("status") == "qualified" for g in groups):
             goodput.append(sum(g["correct_work_meeting_limits"] for g in groups)/seconds)
-    put("goodput", goodput[0] if len(goodput) == 1 else None, "Goodput", "req/s", "Existing scored and timing-qualified arrival stage; no unscored answer promoted", samples=len(goodput))
+        elif not missing_goodput:
+            missing_goodput.add("Complete observation duration and qualified client timing are required.")
+    coverage_groups = point_groups + legacy_coverage
+    partial_scoring = any(group.get("unscored", 0) > 0 for group in coverage_groups)
+    reason = (" ".join(sorted(missing_goodput)) if missing_goodput else
+              "Separate load-point rates are not pooled; select one load-point window." if len(goodput) > 1 else
+              "No scored and timing-qualified load-point evidence in this scope.")
+    available_goodput = len(goodput) == 1 and not missing_goodput
+    request_coverage = None
+    if coverage_groups and all(group.get("scored") is not None and group.get("valid") is not None for group in coverage_groups):
+        scored_count = sum(group["scored"] for group in coverage_groups)
+        valid_count = sum(group["valid"] for group in coverage_groups)
+        request_coverage = {"sample": scored_count, "eligible": valid_count, "missing": valid_count-scored_count}
+    coverage_note = (f"{len(goodput)} / {len(points)+len(stages)} eligible load points"
+                     + (f" · {request_coverage['sample']} / {request_coverage['eligible']} scored valid requests"
+                        if request_coverage is not None else ""))
+    put("goodput", goodput[0] if available_goodput else None,
+        "Scored-subset correct goodput" if partial_scoring and goodput else "Goodput", "req/s",
+        "Valid, correct answers meeting configured latency limits per observation second; unscored answers are excluded",
+        samples=len(goodput), eligible=len(points)+len(stages), sample_unit="load points", request_coverage=request_coverage,
+        scored_subset=partial_scoring, display_note=coverage_note,
+        state="measured" if available_goodput else "insufficient_evidence",
+        reason=None if available_goodput else reason,
+        action=("Set a first-answer or completion latency limit and configure answer scoring to measure correct goodput; throughput and latency remain available."
+                if not available_goodput else None))
     put("knee", None, "Knee / saturation concurrency", "requests", "No adaptive knee evidence in this revision",
         state="insufficient_evidence", reason="Not established. Sampled concurrency and observed throughput do not establish saturation.",
         action="Run a supported capacity-discovery workload when available.")

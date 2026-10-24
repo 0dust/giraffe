@@ -400,11 +400,11 @@ def remedies(metrics, config):
         rates = [p["sent"] / p["delivered_window_seconds"] / p["level"] for p in points if p.get("delivered_window_seconds", 0) > 0]
         remaining = sum(p["level"] * max(0, p["configured_window_seconds"] - p.get("delivered_window_seconds", 0)) for p in points)
         suggested = config.max_requests + math.ceil(median(rates) * remaining) if rates else None
-        guidance.append(f"raise Stop after this many requests to approximately {suggested:,} (observed requests/second × remaining concurrency-seconds) and allow the configured load time" if suggested else "raise Stop after this many requests (max_requests) to allow the configured load windows")
+        guidance.append(f"raise Maximum requests to approximately {suggested:,} (observed requests/second × remaining concurrency-seconds) and allow the configured load time" if suggested else "raise Maximum requests (max_requests) to allow the configured load windows")
     if "time_limited" in codes and config.max_duration_seconds is not None:
-        guidance.append("raise Stop test traffic after (max_duration_seconds) to allow the configured load windows")
+        guidance.append("raise Maximum duration (max_duration_seconds) to allow the configured load windows")
     if "load_not_delivered" in codes:
-        guidance.append("raise Limit simultaneous requests or server concurrency (OLLAMA_NUM_PARALLEL or vLLM --max-num-seqs); disable response buffering")
+        guidance.append("raise Simultaneous limit or server concurrency (OLLAMA_NUM_PARALLEL or vLLM --max-num-seqs); disable response buffering")
     if "insufficient_coverage" in codes:
         guidance.append("raise the output cap or lower Minimum output length")
     if "context_exceeded" in codes:

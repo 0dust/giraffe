@@ -1032,7 +1032,7 @@ main:has(.live-layout) .page-heading { padding-bottom: 6px; }
   .check-navigator-toggle { display: inline-flex; margin-bottom: 10px; }
   .result-navigator:not(.is-expanded) .check-list { display: none; }
   .result-heading { flex-direction: column; }
-  .result-heading > .actions { flex-direction: row; min-width: 0; }
+  .result-heading > .actions { flex-direction: row; min-width: 0; max-width: 100%; }
   .request-comparison { grid-template-columns: 1fr; }
   .comparison-conclusion { flex-direction: column; }
   .baseline-reference { border-left: 0; padding-left: 0; }
@@ -1113,7 +1113,7 @@ main:has(.live-layout) .page-heading { padding-bottom: 6px; }
   .test-editor-head h3 { grid-column: 1; font-size: 18px; letter-spacing: -.015em; outline: none; }
   .test-editor-head .icon-button { grid-column: 2; grid-row: 1 / span 2; }
   .test-card > .test-editor:not([hidden]) .test-editor-footer { position: sticky; bottom: 0; margin-top: auto !important; margin: 0 -24px; padding: 14px 24px 18px; background: var(--surface); border-top: 1px solid var(--line); }
-  .test-card > .test-editor .fields { grid-template-columns: minmax(0, 1fr); }
+  .test-card > .test-editor .fields:not(.load-share-grid) { grid-template-columns: minmax(0, 1fr); }
 }
 @keyframes sheet-in { from { opacity: 0; transform: translateX(18px); } }
 .setup-context { border: 0; background: none; padding: 0; margin: -6px 0 22px; }

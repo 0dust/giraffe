@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -88,8 +89,10 @@ def test_http_client_uses_same_explicit_connection_and_keepalive_limits(monkeypa
     monkeypatch.setattr(httpx, "AsyncClient", capture)
     configured = config(concurrency=40)
     transport = LLMClient(configured.targets[0], configured, max_connections=3)._create_client()
-    assert captured["limits"].max_connections == 3
-    assert captured["limits"].max_keepalive_connections == 3
+    assert transport._slots._value == 3
+    assert len(transport._clients) == 1
+    assert captured["limits"].max_connections == 1
+    assert captured["limits"].max_keepalive_connections == 1
     asyncio.run(transport.aclose())
 
 
@@ -229,3 +232,101 @@ def test_workload_pool_saturation_does_not_claim_looser_ceiling_was_reached():
     assert run.try_acquire_slot() and run.try_acquire_slot()
     assert not run.try_acquire_slot()
     assert "concurrency" not in run.limits_reached
+
+
+async def test_preparation_deadline_is_saved_when_target_finishes_before_stop_monitor(client, monkeypatch):
+    from giraffe import local_tokenizer, telemetry
+    from tests.test_load_test_phase_a import config as load_config
+
+    clock = SimpleNamespace(now=0.)
+    local_time = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(local_tokenizer, "time", local_time)
+    monkeypatch.setattr(runner, "time", local_time)
+
+    async def ready(*args, **kwargs):
+        return {"ready": True}
+
+    class Worker:
+        returncode = None
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    worker = Worker()
+
+    async def start(*args, **kwargs):
+        return worker
+
+    async def blocked(_):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            clock.now = .01
+            raise
+
+    async def no_exporter(*args, **kwargs):
+        return {"status": "unavailable", "reason": "Fake endpoint has no exporter", "samples": [],
+                "elapsed_seconds": 0, "unavailable": []}
+
+    async def after_target_completion(self, tasks):
+        # Force the reported ordering: every target finishes before the first
+        # stop observation. Preparation itself must preserve its deadline cause.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    monkeypatch.setattr(local_tokenizer, "_verify_tokenizer", ready)
+    monkeypatch.setattr(local_tokenizer, "_start_worker", start)
+    monkeypatch.setattr(local_tokenizer, "_read_worker", blocked)
+    monkeypatch.setattr(telemetry, "scrape", no_exporter)
+    monkeypatch.setattr(runner._Run, "monitor", after_target_completion)
+    configured = load_config()
+    configured.max_duration_seconds = .01
+    events = []
+    report = await runner.run_suite(configured, progress=events.append)
+    assert report.abort_reason == "maximum run duration reached"
+    assert report.limits_reached == ["max_duration_seconds"]
+    assert not report.requests and not client.scenarios
+    assert worker.returncode == -9
+    target = report.observations["targets"]["local"]
+    preparation = next(value for value in target["preparations"].values()
+                       if value["scenario"].startswith("load_preparation"))
+    assert preparation["status"] == "unavailable"
+    assert "maximum run duration reached" in preparation["reason"]
+    assert "exceeded 10s" not in preparation["reason"]
+    assert any(event["event"] == "run_stopping" and event["abort_reason"] == report.abort_reason
+               for event in events)
+    check = next(check for check in report.checks if check.id == "load")
+    assert check.status == "inconclusive"
+    assert "maximum run duration reached" in check.summary
+    saved = report.model_dump(mode="json")
+    assert saved["abort_reason"] == report.abort_reason
+    assert saved["limits_reached"] == report.limits_reached
+
+
+async def test_completed_run_is_not_aborted_by_client_cleanup_crossing_deadline(client, monkeypatch):
+    from giraffe import telemetry
+
+    clock = SimpleNamespace(now=0.)
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: clock.now))
+
+    async def close(self, *_):
+        clock.now = 2.
+
+    async def no_exporter(*args, **kwargs):
+        return {"status": "unavailable", "reason": "Fake endpoint has no exporter", "samples": [],
+                "elapsed_seconds": 0, "unavailable": []}
+
+    async def after_target_completion(self, tasks):
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    monkeypatch.setattr(client, "__aexit__", close)
+    monkeypatch.setattr(telemetry, "scrape", no_exporter)
+    monkeypatch.setattr(runner._Run, "monitor", after_target_completion)
+    report = await runner.run_suite(pack_config(checks=["correctness"], max_duration_seconds=1,
+                                                max_memory_mb=0, default_concurrency=1, max_requests=None))
+    assert clock.now > 1
+    assert report.requests and all(record.status == "completed" for record in report.requests)
+    assert report.abort_reason is None and report.limits_reached == []
+    assert next(check for check in report.checks if check.id == "correctness").status == "pass"

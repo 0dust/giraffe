@@ -85,7 +85,7 @@ async def test_run_exposes_all_waiting_conditions_before_first_event_and_updates
     monkeypatch.setattr("giraffe.web.run_suite", held_runner)
     app = create_app(tmp_path)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
             started = await client.post("/api/runs", json={"config": config.model_dump(mode="json")})
             assert started.status_code == 202, started.text
             identifier = started.json()["id"]

@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -234,13 +235,43 @@ def test_product_export_checks_final_short_batch_before_publishing(tmp_path, mon
 def test_progress_pipe_delays_real_bytes_and_drains_every_byte(tmp_path):
     read_fd, write_fd = os.pipe()
     payload = ("real progress café\n" * 30).encode()
-    os.write(write_fd, payload)
-    consumer = _ProgressConsumer(os.fdopen(read_fd, "rb", buffering=0), tmp_path)
-    consumer.consume(0)
-    consumer.consume(.5)
-    consumer.consume(1)
-    os.close(write_fd)
-    summary = consumer.finish()
+    os.set_blocking(write_fd, False)
+    ready, stop = threading.Event(), threading.Event()
+    writer_errors = []
+
+    def write_progress():
+        remaining = memoryview(payload)
+        try:
+            while remaining and not stop.is_set():
+                try:
+                    written = os.write(write_fd, remaining)
+                except BlockingIOError:
+                    stop.wait(.01)
+                    continue
+                remaining = remaining[written:]
+                ready.set()
+        except Exception as error:
+            writer_errors.append(error)
+            ready.set()
+        finally:
+            os.close(write_fd)
+
+    with os.fdopen(read_fd, "rb", buffering=0) as stream:
+        consumer = _ProgressConsumer(stream, tmp_path)
+        writer = threading.Thread(target=write_progress)
+        writer.start()
+        try:
+            assert ready.wait(2), "progress writer did not make data available"
+            assert not writer_errors
+            consumer.consume(0)
+            consumer.consume(.5)
+            consumer.consume(1)
+            summary = consumer.finish()
+        finally:
+            stop.set()
+            writer.join(timeout=2)
+            assert not writer.is_alive(), "progress writer did not stop"
+        assert not writer_errors
     assert (tmp_path / "stderr.log").read_bytes() == payload
     assert summary["paced_bytes"] == 128
     assert summary["post_exit_drain_bytes"] == len(payload) - 128

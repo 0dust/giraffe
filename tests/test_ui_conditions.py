@@ -87,10 +87,11 @@ def test_dialog_pagination_jump_sizes_filters_empty_state_and_validation():
  click('first');await settle();assert.equal(conditionDialog.page,1);
  const jump=$('#condition-page-number');jump.value='100';click('go');await settle();assert.equal(conditionDialog.page,100);
  jump.value='101';click('go');assert.match($('#condition-page-error').textContent,/Enter a page from 1 to 100/);assert.equal(conditionDialog.page,100);
- for(const size of [25,50,10]){const select=$('#condition-page-size');select.value=String(size);handleConditionChange({target:select});await settle();assert.equal(conditionDialog.page,1);assert.equal($$('tbody tr').length,size);assert.match(calls.at(-1),new RegExp('page_size='+size));}
- empty=true;const filter=$('#condition-filter');filter.value='failed';handleConditionChange({target:filter});await settle();
- assert.equal(conditionDialog.filter,'failed');assert.equal(conditionDialog.page,1);assert.match($('#test-dialog').textContent,/No requests match this status/);assert.match($('#test-dialog').textContent,/0–0 of 0 requests/);assert.equal($$('[data-condition-request]').length,0);
+ for(const size of [25,50,10]){jump.value='2';click('go');await settle();const select=$('#condition-page-size');select.value=String(size);handleConditionChange({target:select});await settle();assert.equal(conditionDialog.page,1);assert.equal(jump.value,'1','row-count reset updates the visible page');assert.equal($$('tbody tr').length,size);assert.match(calls.at(-1),new RegExp('page_size='+size));click('go');await settle();assert.equal(conditionDialog.validation,'');assert.equal(conditionDialog.page,1);}
+ jump.value='2';click('go');await settle();empty=true;const filter=$('#condition-filter');filter.value='failed';handleConditionChange({target:filter});await settle();
+ assert.equal(conditionDialog.filter,'failed');assert.equal(conditionDialog.page,1);assert.equal(jump.value,'1','empty filter reset updates the visible page');click('go');await settle();assert.equal(conditionDialog.validation,'');assert.match($('#test-dialog').textContent,/No requests match this status/);assert.match($('#test-dialog').textContent,/0–0 of 0 requests/);assert.equal($$('[data-condition-request]').length,0);
  assert.match($('#test-dialog').textContent,/1,000/,'whole-condition counts survive empty filter');
+ jump.value='2';empty=false;filter.value='all';handleConditionChange({target:filter});await settle();assert.equal(jump.value,'1','restoring all statuses resets a dirty page');assert.equal(conditionDialog.page,1);assert.equal($$('tbody tr').length,10);
 })()
 """, dom=True)
 
@@ -101,10 +102,14 @@ def test_dialog_live_updates_preserve_filter_size_focus_and_clamp_shrinking_page
  openConditionDialog([...conditionViews.keys()][0]);await settle();
  $('#condition-page-size').value='25';handleConditionChange({target:$('#condition-page-size')});await settle();
  $('#condition-filter').value='running';handleConditionChange({target:$('#condition-filter')});await settle();click('last');await settle();assert.equal(conditionDialog.page,40);
- const focused=$('#condition-page-number');focused.value='40';focused.focus({preventScroll:true});
+ const focused=$('#condition-page-number');focused.value='39';focused.focus({preventScroll:true});
+ let release;const normal=api;api=path=>new Promise(resolve=>release=async()=>resolve(await normal(path)));
+ const pending=refreshConditionDialog({force:true});draw();await refreshConditionDialog();assert.equal(focused.value,'39','pending live refresh preserves an unsubmitted edit');release();await pending;await settle();api=normal;assert.equal(focused.value,'39');assert.equal(conditionDialog.page,40);assert.equal(document.activeElement,focused);
  remaining=27;aggregate={...aggregate,running:27,completed:973};draw();await refreshConditionDialog({force:true});
  assert.equal(conditionDialog.page,2);assert.equal(conditionDialog.size,25);assert.equal(conditionDialog.filter,'running');assert.equal(document.activeElement,focused);assert.equal(focused.value,'2');assert.match($('#test-dialog').textContent,/26–27 of 27 requests/);
  assert.equal($$('tbody tr').length,2);assert.match($('#test-dialog').textContent,/973/);
+ remaining=1000;await refreshConditionDialog({force:true});focused.value='40';click('go');await settle();document.body.focus({preventScroll:true});remaining=27;await refreshConditionDialog({force:true});
+ assert.equal(conditionDialog.page,2);assert.equal(focused.value,'2','API clamping updates a blurred dirty page');click('go');await settle();assert.equal(conditionDialog.validation,'');assert.equal(conditionDialog.page,2);
  closeConditionDialog();assert(!$('#test-dialog').open);assert.equal(document.activeElement,$('.condition-spot'));
 })()
 """, dom=True)

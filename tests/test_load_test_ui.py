@@ -45,9 +45,9 @@ ISSUES=[
     ("form.elements.load_pass_criteria_min_correct_percent.value='101'",'load_test.pass_criteria.min_correct_percent','Percentages must be from 0 to 100.'),
     *[(f"form.elements.load_pass_criteria_{key}.value='0'",'load_test.pass_criteria.'+key,'Enter a number greater than 0 for '+label+'.') for key,label in [
         ('max_first_answer_ms','Maximum time to first answer per response (ms)'),('max_completion_ms','Maximum completion time per response (ms)'),('max_stream_pause_ms','Maximum pause between streamed chunks (ms)'),('min_generation_tokens_per_second','Minimum generation speed per response (tokens/sec)')]],
-    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Concurrency ceiling.'),
-    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Total request budget.'),
-    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Total duration.'),
+    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Simultaneous limit.'),
+    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Maximum requests.'),
+    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Maximum duration.'),
 ]
 
 
@@ -69,7 +69,7 @@ api=()=>assert.fail('invalid local field reached API');await assert.rejects(refr
 async def test_worked_plan_examples_use_preview_numbers(tmp_path,constant,poisson,expected,tests,label):
     config=RunConfig(targets=[{'name':'local','url':'http://unused.test/v1','model':'test'}],checks=['load'],concurrency=128,max_requests=20000,max_duration_seconds=1800,
         load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':constant},'poisson':{'enabled':poisson},'bursts':{'enabled':True,'first_seconds':10,'gap_seconds':10,'size':32},'rates':[10]},'schedule':{'duration_seconds':60,'finish_seconds':30}})
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),base_url='http://test') as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),base_url='http://127.0.0.1:8787') as client:
         body=(await client.post('/api/config/preview',json=config.model_dump(mode='json'))).json()
     plan=body['request_plan']
     assert plan['load_test']==request_plan(config)['load_test']

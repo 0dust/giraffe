@@ -14,7 +14,7 @@ TARGET = {"name": "local", "url": "http://localhost/v1", "model": "test"}
 
 def test_limit_names_match_bounds_and_edit_destinations():
     browser_logic(r"""
-const labels={max_requests:'Stop after this many requests',max_duration_seconds:'Stop test traffic after',concurrency:'Limit simultaneous requests'};
+const labels={max_requests:'Maximum requests',max_duration_seconds:'Maximum duration',concurrency:'Simultaneous limit'};
 const markup=renderPlanBounds(config)+renderSharedRunSettings(config);
 for(const [path,label] of Object.entries(labels)){
   assert(markup.includes('<dt>'+label+'</dt>'));
@@ -44,7 +44,7 @@ def test_budget_copy_uses_catalogue_names_and_grouped_numbers_without_changing_r
         "Edit Answer correctness", "Edit Load test"]
     larger_budget = request_plan(configured.model_copy(update={"max_requests": 10000}))
     larger_notice = next(item for item in larger_budget["request_warnings"] if item["kind"] == "incomplete_coverage")
-    assert "request limit (Stop after this many requests: 10,000)" in larger_notice["msg"]
+    assert "request limit (Maximum requests: 10,000)" in larger_notice["msg"]
     assert larger_notice["values"]["max_requests"] == 10000
     browser_logic(r"""
 const plan=PLAN;state.jsonDraft=state.jsonBase='synced';
@@ -100,10 +100,10 @@ def test_cli_limit_labels_and_grouped_request_count(command, tmp_path, monkeypat
     assert main(args) == 0
     captured = capsys.readouterr()
     text = captured.err if command == "run" else captured.out
-    assert "Stop after this many requests: 100,007" in text
+    assert "Maximum requests: 100,007" in text
     if command == "run":
-        assert "Limit simultaneous requests: 40" in text
-        assert "Stop test traffic after: 3,600s" in text
+        assert "Simultaneous limit: 40" in text
+        assert "Maximum duration: 3,600s" in text
 
 
 def test_overlap_warning_groups_request_count_and_keeps_values_numeric():

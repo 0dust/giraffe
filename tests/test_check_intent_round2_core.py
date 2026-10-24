@@ -349,7 +349,7 @@ async def test_v2_socket_free_server_release_precedes_client_cleanup(monkeypatch
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(transport=httpx.MockTransport(handler), **kw))
     config = cfg(concurrency=4)
     spec = RequestSpec(fixture_id="f", scenario="warm", check_ids=["serving"], messages=[])
-    async with LLMClient(config.targets[0], config) as client:
+    async with LLMClient(config.targets[0], config, max_connections=4) as client:
         rows = await asyncio.gather(*(client.execute(spec) for _ in range(4)))
     for r in rows:
         r.timing_start_ms = r._timing_started_monotonic * 1000
