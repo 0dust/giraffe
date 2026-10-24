@@ -1908,7 +1908,7 @@ def _budget_guidance(config, check_id=None):
     plan = request_plan(config)
     if check_id in {"load", "concurrency"}:
         return ("Allow the configured Load test sending windows, local preparation, and outstanding request timeouts; "
-                "set the request limit (Stop after this many requests) using observed throughput. Duration-based requests have no fixed count.")
+                "set the request limit (Maximum requests) using observed throughput. Duration-based requests have no fixed count.")
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
@@ -2302,7 +2302,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
     if run.memory_limit_reached:
-        warnings.append("Memory limit (RAM growth during this run) was exceeded." +
+        warnings.append("Maximum memory (RAM growth during this run) was exceeded." +
             (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))
     if any(check.metrics.get("low_confidence") for check in checks):
         warnings.append("Some checks have too few successful samples for confident timing conclusions.")

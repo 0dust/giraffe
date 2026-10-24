@@ -191,17 +191,17 @@ Exit codes:
         run.add_argument("--model", help="Model name served by the endpoint")
         run.add_argument("--api-key-env", help="Name of an environment variable containing the key")
         run.add_argument("--concurrency", type=int, help="Set both the simultaneous-request limit and default check concurrency (legacy)")
-        run.add_argument("--simultaneous-limit", type=int, help="Limit simultaneous requests across the suite (default: Not set)")
+        run.add_argument("--simultaneous-limit", type=int, help="Simultaneous limit across the suite (default: Not set)")
         run.add_argument("--default-concurrency", type=int, help="Default parallelism for checks (default: 4)")
         run.add_argument("--no-simultaneous-limit", action="store_true", help="Leave simultaneous target requests without a suite ceiling")
-        run.add_argument("--max-requests", type=int, help="Stop after this many requests across all targets (default: Not set)")
+        run.add_argument("--max-requests", type=int, help="Maximum requests across all targets (default: Not set)")
         run.add_argument("--no-max-requests", action="store_true", help="Leave the suite request budget Not set")
         run.add_argument("--no-max-duration", action="store_true", help="Leave the suite traffic duration Not set")
         run.add_argument("--max-memory", type=int, dest="max_memory_mb",
-                         help="Memory limit (RAM growth during this run) in MiB (default: 4096); 0 disables. Only unfinished work stops when sampled RAM growth exceeds the limit; completed checks keep their results")
-        run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Stop test traffic after this many seconds (default: Not set)")
-        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Default per-request timeout in seconds; per-check overrides and load_test.request_timeout_seconds take precedence")
-        run.add_argument("--max-output-tokens", type=int, help="Default output-token budget per request")
+                         help="Maximum memory (RAM growth during this run) in MiB (default: 4096); 0 disables. Only unfinished work stops when sampled RAM growth exceeds the limit; completed checks keep their results")
+        run.add_argument("--max-duration", type=float, dest="max_duration_seconds", help="Maximum duration in seconds (default: Not set). Stops new requests and cancels in-progress requests when reached. Excludes AI evaluation and report saving")
+        run.add_argument("--request-timeout", type=float, dest="request_timeout_seconds", help="Request timeout in seconds (default per request); per-check overrides and load_test.request_timeout_seconds take precedence")
+        run.add_argument("--max-output-tokens", type=int, help="Maximum output tokens per request (default); check and saved-request overrides apply")
         run.add_argument("--context-limit", type=int, help="Context window for context and history checks; Concurrent load uses profile token targets")
         run.add_argument("--samples", type=int, help="Samples for count-based checks; Concurrent load uses its configured duration")
         run.add_argument("--sustained-seconds", type=float, help="Duration of sustained recovery load in seconds")
@@ -425,7 +425,7 @@ def _print_memory(resources: dict) -> None:
     print("RAM at run start: " + size(resources.get("rss_at_start_bytes")))
     print("Peak RAM growth during this run: " + " · ".join(f"{phase}: {size(growth.get(phase))}" for phase in ("traffic", "scoring")))
     limit = resources.get("memory_limit_bytes")
-    print("Memory limit (RAM growth during this run): " + ("Off (0 = off)" if limit == 0 else size(limit)))
+    print("Maximum memory (RAM growth during this run): " + ("Off (0 = off)" if limit == 0 else size(limit)))
     if resources.get("memory_limit_reached"):
         print("Memory limit exceeded; " + ("unfinished work stopped with partial results; completed checks keep their results."
               if resources.get("memory_limit_stopped_run") else "completed checks keep their results; no work was stopped."))
@@ -492,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Configuration is valid. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"Stop after this many requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
+                print(f"Maximum requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in warnings:
                     print(f"Warning: {warning}")
                 if args.show_config:
@@ -523,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
                 print(f"Known requests per target: {plan['known_per_target']:,}")
-                print(f"Stop after this many requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
+                print(f"Maximum requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in plan["warnings"]:
                     print(f"Warning: {warning}")
             return 0
@@ -748,10 +748,10 @@ def main(argv: list[str] | None = None) -> int:
         requests = f"{config.max_requests:,}" if config.max_requests is not None else "Not set"
         simultaneous = f"{config.concurrency:,}" if config.concurrency is not None else "Not set"
         duration = f"{config.max_duration_seconds:,g}s" if config.max_duration_seconds is not None else "Not set"
-        print(f"Giraffe: {len(config.targets)} target(s), Stop after this many requests: {requests}, "
-              f"Limit simultaneous requests: {simultaneous}, Stop test traffic after: {duration}, "
-              f"Request defaults: {config.request_timeout_seconds:g}s timeout, {config.max_output_tokens} output "
-              "tokens. Check and saved-request overrides apply. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
+        print(f"Giraffe: {len(config.targets)} target(s), Maximum requests: {requests}, "
+              f"Simultaneous limit: {simultaneous}, Maximum duration: {duration}, "
+              f"Request timeout: {config.request_timeout_seconds:g}s, Maximum output tokens: {config.max_output_tokens}. "
+              "Check and saved-request overrides apply. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
         timeouts = []
         for check_id in config.checks:
             if check_id == "load":

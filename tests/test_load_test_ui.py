@@ -45,9 +45,9 @@ ISSUES=[
     ("form.elements.load_pass_criteria_min_correct_percent.value='101'",'load_test.pass_criteria.min_correct_percent','Percentages must be from 0 to 100.'),
     *[(f"form.elements.load_pass_criteria_{key}.value='0'",'load_test.pass_criteria.'+key,'Enter a number greater than 0 for '+label+'.') for key,label in [
         ('max_first_answer_ms','Maximum time to first answer per response (ms)'),('max_completion_ms','Maximum completion time per response (ms)'),('max_stream_pause_ms','Maximum pause between streamed chunks (ms)'),('min_generation_tokens_per_second','Minimum generation speed per response (tokens/sec)')]],
-    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Concurrency ceiling.'),
-    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Total request budget.'),
-    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Total duration.'),
+    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Simultaneous limit.'),
+    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Maximum requests.'),
+    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Maximum duration.'),
 ]
 
 

@@ -661,7 +661,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                       "cut_checks": affected,
                       "actions": ([{"label": label, "field": "max_duration_seconds", "value": suggestion}]
                                   if suggestion > budget else []) + edits,
-                      "msg": f"Incomplete coverage: the traffic time limit (Stop test traffic after) may cut {', '.join(affected)}. " +
+                      "msg": f"Incomplete coverage: the traffic time limit (Maximum duration) may cut {', '.join(affected)}. " +
                              (f"The full traffic timeline including the initial connection allowance needs up to {budget_high:,g} seconds."
                               if fully_known else "Some request durations are unknown; the suggested limit covers fixed windows only.")}
             if first_start is not None and budget <= first_start:
@@ -1042,7 +1042,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if config.request_source == "request_pack" and not pack_selected:
         warnings.append("Your dataset is inactive: select Answer correctness or Capacity under load to use it.")
     if config.overlap_models and target_count > 1:
-        warnings.append("Models run at the same time and share Limit simultaneous requests. Their actual overlap depends on when request slots become free.")
+        warnings.append("Models run at the same time and share Simultaneous limit. Their actual overlap depends on when request slots become free.")
     known = sum(row.get("known_scheduled_requests", row["requests_per_target"] or 0
                         if row["kind"] == "exact" else 0) for row in rows)
     unknown = any(row["requests_per_target"] is None for row in rows)
@@ -1108,7 +1108,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             edits = list({(action["label"], action["field"]): action for action in [
                 {"label": f"Edit {_warning_title(row)}", "field": edit_field(row)} for row in cut]}.values())
             message = (f"{target}: incomplete coverage for {', '.join(titles)}; "
-                       f"the planned requests exceed this endpoint's share of the request limit (Stop after this many requests: {quota:,}).")
+                       f"the planned requests exceed this endpoint's share of the request limit (Maximum requests: {quota:,}).")
             request_warnings.append({"kind": "incomplete_coverage", "fields": fields,
                 "values": {"max_requests": config.max_requests, "required_request_limit": required, "quota": quota},
                 "cut_checks": [row["id"] for row in cut], "msg": message,
@@ -1183,7 +1183,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             "minimum_reserved_per_target": known + (minimum_reservation(config.load_test) if load_plan else 0),
             "known_per_target": known, "known_total": known * target_count,
             "request_warnings": request_warnings, "request_limit": config.max_requests, "memory_limit_bytes": config.max_memory_mb * 1024**2,
-            "memory_limit_label": "Memory limit (RAM growth during this run)",
+            "memory_limit_label": "Maximum memory (RAM growth during this run)",
             "required_request_limit": planned * target_count if kind == "exact" else None,
             "target_quotas": quotas, "rows": rows, "bucket_cases": bucket_cases,
             "bucket_levels": bucket_levels, "evaluator": evaluator, "warnings": warnings}

@@ -45,7 +45,7 @@ def test_recovery_explicit_budget_keeps_prime_gate_and_starvation_guidance():
     result = request_plan(config(checks=["recovery"], max_requests=1))
     prime = next(row for row in result["rows"] if row["id"] == "recovery_prime")
     assert prime["requests_per_target"] == 0
-    assert any("share of the request limit (Stop after this many requests:" in warning for warning in result["warnings"])
+    assert any("share of the request limit (Maximum requests:" in warning for warning in result["warnings"])
 
 
 def test_correctness_estimate_uses_effective_parallelism_instead_of_ceiling():

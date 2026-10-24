@@ -685,9 +685,9 @@ def migrate_run_limits(value):
         return value, []
     value, notes = deepcopy(value), []
     descriptions = {
-        "max_requests": ("300 requests", "a request limit", "Stop after this many requests"),
-        "max_duration_seconds": ("300 seconds", "a traffic time limit", "Stop test traffic after"),
-        "concurrency": ("4 requests at once", "a simultaneous-request limit", "Limit simultaneous requests"),
+        "max_requests": ("300 requests", "a request limit", "Maximum requests"),
+        "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
+        "concurrency": ("4 requests at once", "a simultaneous-request limit", "Simultaneous limit"),
     }
     for field, (old, label, control) in descriptions.items():
         if field not in value:
@@ -929,7 +929,7 @@ def migrate_concurrent_load(value):
     actual_levels = sorted(set(min(ceiling, max(1, int(n))) for n in levels))[:MAX_STAGES] or [1]
     settings["schedule"]["levels"] = actual_levels
     if "levels" in old:
-        notes.append(f"levels={levels!r} moved to schedule.levels={actual_levels!r} (bounded by Limit simultaneous requests).")
+        notes.append(f"levels={levels!r} moved to schedule.levels={actual_levels!r} (bounded by Simultaneous limit).")
     settings["combinations"].update(enabled="size_matrix" in scenarios, selected=list(SHAPES))
     if "size_matrix" in scenarios:
         notes.append("size_matrix/buckets mapped to all 9 combinations; duration replaces sample counts.")
@@ -1883,7 +1883,7 @@ class RunConfig(Model):
                               description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
     max_duration_seconds: float | None = Field(default=None, gt=0)
     max_memory_mb: int = Field(default=4096, ge=0,
-        description="Memory limit (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
+        description="Maximum memory (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
     request_timeout_seconds: float = Field(default=300, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
     max_output_tokens: int = Field(default=128, ge=1)
@@ -2161,7 +2161,7 @@ class RunConfig(Model):
                 if targets == 1 or check == "concurrency":
                     message = (f"{CATALOGUE_NAMES[check]} runs {effective:,} at once" +
                                (f" × {targets:,} endpoints" if targets > 1 else "") +
-                               f", above Limit simultaneous requests ({self.concurrency:,}).")
+                               f", above Simultaneous limit ({self.concurrency:,}).")
                     raise ValidationError.from_exception_data("Run limits", [{
                         "type": PydanticCustomError("concurrency_conflict", message,
                                                     {"fields": fields, "values": values}),
@@ -2173,7 +2173,7 @@ class RunConfig(Model):
             elif not explicit and value * targets > self.concurrency:
                 self._concurrency_warnings.append({"fields": fields, "values": values,
                     "check": check, "effective_concurrency": effective,
-                    "msg": f"{CATALOGUE_NAMES[check]} inherits {value:,} at once; Limit simultaneous requests ({self.concurrency:,}) allows {effective:,} per endpoint. Raise limit or Use {effective:,} for {CATALOGUE_NAMES[check]}."})
+                    "msg": f"{CATALOGUE_NAMES[check]} inherits {value:,} at once; Simultaneous limit ({self.concurrency:,}) allows {effective:,} per endpoint. Raise limit or Use {effective:,} for {CATALOGUE_NAMES[check]}."})
             return effective
 
         for check in self.checks:

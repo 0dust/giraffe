@@ -24,9 +24,9 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
     config = body.get("config", body) if isinstance(body, dict) else {}
     if not isinstance(config, dict):
         config = {}
-    labels = {"max_requests": "Stop after this many requests", "concurrency": "Limit simultaneous requests", "max_output_tokens": "Output cap (tokens)",
+    labels = {"max_requests": "Maximum requests", "concurrency": "Simultaneous limit", "max_output_tokens": "Output cap (tokens)",
               "request_timeout_seconds": "Request timeout (seconds)",
-              "max_duration_seconds": "Stop test traffic after", "max_memory_mb": "Memory limit (RAM)", "concurrent_load.schedule.levels": "Concurrency levels",
+              "max_duration_seconds": "Maximum duration", "max_memory_mb": "Maximum memory", "concurrent_load.schedule.levels": "Concurrency levels",
               "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
               "traffic.max_in_flight": "Capacity requests at once"}
 
@@ -160,13 +160,13 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
         elif levels:
             path = levels[1] + ".levels"
             fields = [path, "concurrency"]
-            message = f"Concurrency level {max(value(path) or [0])} exceeds Limit simultaneous requests {value('concurrency')}."
+            message = f"Concurrency level {max(value(path) or [0])} exceeds Simultaneous limit {value('concurrency')}."
         elif message.startswith("traffic.max_in_flight must not exceed"):
             fields = ["traffic.max_in_flight", "concurrency"]
-            message = f"Capacity requests at once {value(fields[0])} exceeds Limit simultaneous requests {value('concurrency')}."
+            message = f"Capacity requests at once {value(fields[0])} exceeds Simultaneous limit {value('concurrency')}."
         elif message.startswith("session concurrency must not exceed"):
             fields = ["sessions.concurrency", "concurrency"]
-            message = f"Session concurrency {value(fields[0])} exceeds Limit simultaneous requests {value('concurrency')}."
+            message = f"Session concurrency {value(fields[0])} exceeds Simultaneous limit {value('concurrency')}."
         elif message.startswith("session workload output budgets"):
             ceiling = value("max_output_tokens")
             fields = [f"sessions.workloads.{index}.max_tokens" for index, workload in enumerate(config.get("sessions", {}).get("workloads", []))

@@ -66,8 +66,8 @@ def test_run_limit_value_controls_have_distinct_accessible_labels():
         assert ('sr-only' in value_label.get('class', '').split()) == hidden
         toggle, = tree.named(name + '_enabled')
         toggle_label = next(node for node in toggle['parents'] if node['tag'] == 'label')
-        assert toggle_label['text'] == ('Stop after this many requests' if name == 'max_requests'
-                                        else 'Stop test traffic after' if name == 'max_duration_seconds' else 'Limit simultaneous requests')
+        assert toggle_label['text'] == ('Maximum requests' if name == 'max_requests'
+                                        else 'Maximum duration' if name == 'max_duration_seconds' else 'Simultaneous limit')
         assert toggle['aria-controls'] == control['id']
         assert control['aria-describedby'] == control['id'] + '-hint'
 
@@ -178,7 +178,7 @@ def test_a7_a16_plan_copy_observed_counts_bursts_and_distinct_controls():
 plan.estimated_seconds=3;plan.estimated_low_seconds=2;plan.estimated_high_seconds=4;plan.time_estimate_assumptions=['Finite batches use comparable observations.'];plan.confidence_details={insufficient_observations:['At least 150 comparable samples are required.']};plan.time_bound_reasons=['+ 10 requests at unknown speed'];
 const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
 for(const text of ['Confidence: low','Additional work at unknown speed','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation','Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
-assert.equal((markup.match(/Not set/g)||[]).length,3);assert.match(markup,/Memory guardrail/);
+assert.equal((markup.match(/Not set/g)||[]).length,3);assert.match(markup,/Maximum memory/);
 const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Duration-based');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Duration-based · ~12 (estimate, from your last run)');
 const editor=renderLoadEditor(config);for(const label of ['Requests per burst','Rates (requests/second)','First burst after (seconds)','Time between burst starts (seconds)','Concurrency ceiling · Run limits'])assert(editor.includes(label));assert.doesNotMatch(editor,/Pending queue|traffic_max_in_flight|profile_arrivals_max_in_flight/);
 ''',cfg)
@@ -312,11 +312,11 @@ for(const [name,input] of Object.entries(inputs)){
  assert.equal(input.attributes['aria-invalid'],'true');
  assert(input.attributes['aria-describedby'].includes('field-'+name+'-error'));
  assert.equal(nodes['#field-'+name+'-error'].hidden,false);
- assert.match(nodes['#field-'+name+'-error'].textContent,/above Limit simultaneous requests|Concurrency levels exceed the run ceiling|One burst exceeds the concurrency ceiling/);
+ assert.match(nodes['#field-'+name+'-error'].textContent,/above Simultaneous limit|Concurrency levels exceed the run ceiling|One burst exceeds the concurrency ceiling/);
  assert.equal(input.details.open,true);
 }
 const input=inputs[destination.name];
-assert.match(renderRunBlueprint(config),/above Limit simultaneous requests|Concurrency levels exceed the run ceiling|One burst exceeds the concurrency ceiling/);
+assert.match(renderRunBlueprint(config),/above Simultaneous limit|Concurrency levels exceed the run ceiling|One burst exceeds the concurrency ceiling/);
 assert(renderRunBlueprint(config).includes('data-setting-path="'+path+'"'));
 revealSetupStep=step=>assert.equal(step,2);revealCatalogueCheck=id=>assert.equal(id,destination.check);
 focusSetting(path);assert(input.focused);

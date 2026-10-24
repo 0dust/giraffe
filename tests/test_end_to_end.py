@@ -135,7 +135,7 @@ def test_cli_detects_latency_regression_and_preserves_baseline(tmp_path):
     assert main(["report", str(output), "--html"]) == 0
     html = (output / "report.html").read_text()
     assert current["run_id"] in html and "baseline" in html.lower()
-    assert "Stop after this many requests: 100" in result.stderr
+    assert "Maximum requests: 100" in result.stderr
 
 
 def test_cli_detects_semantic_regression_with_valid_http_completions(tmp_path):

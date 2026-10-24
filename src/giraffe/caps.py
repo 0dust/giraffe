@@ -62,8 +62,8 @@ MAX_REQUEST_PACK_CASES = 1000
 # Explanations carry policy, not a second copy of schema maxima. Capabilities and
 # boundary diagnostics render these same descriptions against schema-derived bounds.
 _CAP_LABELS = {
-    "max_duration_seconds": "Stop test traffic after (seconds)",
-    "concurrency": "Limit simultaneous requests", "default_concurrency": "Default check concurrency",
+    "max_duration_seconds": "Maximum duration (seconds)",
+    "concurrency": "Simultaneous limit", "default_concurrency": "Default check concurrency",
     "requests": "Arrival count", "burst_size": "Burst size", "max_pending": "Pending arrivals",
     "requests_per_second": "Arrival rate (requests/second)", "rates": "Sending rates (requests/second)",
     "max_in_flight": "In-flight requests", "duration_seconds": "Stage duration (seconds)",

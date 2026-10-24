@@ -41,9 +41,9 @@ def test_explicit_cli_budget_covers_default_preview(output_format, tmp_path, mon
         assert result["config"]["max_requests"] == result["request_plan"]["request_limit"] == 300
         warnings = result["request_plan"]["warnings"]
     else:
-        assert "Stop after this many requests: 300" in captured.out
+        assert "Maximum requests: 300" in captured.out
         warnings = captured.out.splitlines()
-    assert not any("share of the request limit (Stop after this many requests:" in warning for warning in warnings)
+    assert not any("share of the request limit (Maximum requests:" in warning for warning in warnings)
     assert not captured.err
 
 
@@ -280,7 +280,7 @@ def test_run_banner_distinguishes_default_and_effective_load_timeout(tmp_path, c
                  "--checks", "load", "--request-timeout", "1", "--skip-preflight",
                  "--output", str(tmp_path)]) == 0
     stderr = capsys.readouterr().err
-    assert "Request defaults: 1s timeout" in stderr
+    assert "Request timeout: 1s" in stderr
     assert "Per-check request timeouts: load/primary=300s" in stderr
     assert "Saved requests may override these" in stderr
 
@@ -398,7 +398,7 @@ def test_preview_includes_plan_warnings_without_traffic(flags, tmp_path, monkeyp
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(values)))
     assert main(["preview", "--config", "-", *flags]) == 0
     captured = capsys.readouterr()
-    warning = "local: incomplete coverage for Answer correctness; the planned requests exceed this endpoint's share of the request limit (Stop after this many requests: 1)."
+    warning = "local: incomplete coverage for Answer correctness; the planned requests exceed this endpoint's share of the request limit (Maximum requests: 1)."
     if any("text" in value for value in flags):
         assert "No traffic was sent." in captured.out
         assert f"Warning: {warning}\n" in captured.out

@@ -45,11 +45,26 @@ probes. A preflight failure prints a remedy and exits as blocked without creatin
 a run directory or report.
 
 The quick run above leaves the request-count and traffic-duration limits unset;
-add `--max-requests N` and `--max-duration SECONDS` to bound them. It prints limits
-and live progress, followed by output shaped like this (summaries and paths vary):
+add `--max-requests N` and `--max-duration SECONDS` to bound them. The UI and CLI
+use the same names for run settings:
+
+| UI setting | CLI option | Meaning |
+| --- | --- | --- |
+| Maximum duration | `--max-duration SECONDS` | Stops new requests and cancels in-progress requests at the limit; excludes AI evaluation and report saving. |
+| Maximum requests | `--max-requests N` | Request budget shared by selected checks and targets. |
+| Simultaneous limit | `--simultaneous-limit N` | Maximum unfinished target requests across the suite. |
+| Request timeout | `--request-timeout SECONDS` | Default total time allowed per request; check overrides can replace it. |
+| Maximum memory | `--max-memory MIB` | Maximum process RAM growth during the run; `0` disables it. |
+
+The legacy `--concurrency N` sets both Simultaneous limit and default check
+concurrency. Use `--simultaneous-limit` to change only the UI's run-wide limit.
+The UI duration selector accepts seconds, minutes or hours; the CLI accepts seconds.
+
+The CLI prints limits and live progress, followed by output shaped like this
+(summaries and paths vary):
 
 ```text
-Giraffe: 1 target(s), Stop after this many requests: Not set, Limit simultaneous requests: 1, Stop test traffic after: Not set, Request defaults: 300s timeout, 128 output tokens. Check and saved-request overrides apply. Ctrl-C saves a partial report.
+Giraffe: 1 target(s), Maximum requests: Not set, Simultaneous limit: 1, Maximum duration: Not set, Request timeout: 300s, Maximum output tokens: 128. Check and saved-request overrides apply. Ctrl-C saves a partial report.
 Per-check request timeouts: access=300s, serving=300s, correctness=300s. Saved requests may override these.
 ...
   local / access: pass — ...
@@ -892,7 +907,7 @@ runs can eventually become cleanable. Use the same storage flags with
 `giraffe storage` to display your configured limits. See [disk measurements and limits](docs/resources.md).
 
 Peak memory (RAM) is measured separately from saved data on disk. The default
-**Memory limit (RAM growth during this run)** (`max_memory_mb: 4096`) guardrail
+**Maximum memory (RAM growth during this run)** (`max_memory_mb: 4096`) guardrail
 samples current process RSS about once per second and compares growth with RSS at
 the run start. Earlier web-server allocations do not count toward the growth
 budget. RAM uses binary MiB/GiB.

@@ -16,7 +16,7 @@ assert.match(html,/0 = off.*partial results.*inconclusive unless a check failed/
 assert.match(html,/never reduces concurrency or request counts/);
 assert.match(renderSharedRunSettings({...config,max_memory_mb:undefined}),/name="max_memory_mb" type="number" value="4096"/);
 assert.equal(settingDestination('max_memory_mb').name,'max_memory_mb');
-assert.equal(settingDestination('max_memory_mb').label,'Memory limit (RAM growth during this run)');
+assert.equal(settingDestination('max_memory_mb').label,'Maximum memory');
 state.config=config;
 const values=new Map([['max_memory_mb_enabled','off'],['url','http://localhost/v1'],['model','test'],['name','local'],['max_memory_mb','0']]);
 FormData=class {constructor(){} get(key){return values.get(key) ?? null;} has(key){return values.has(key);} set(key,value){values.set(key,value);}};
@@ -39,7 +39,7 @@ assert.match(html,/<dt>Traffic<\/dt><dd>200 MiB/);assert.match(html,/<dt>Scoring
 assert.doesNotMatch(html,/1000 MB/);
 assert.match(html,/<dt>Process lifetime peak<\/dt><dd>400 MiB/);
 assert.match(html,/Includes earlier runs in the web server; never used for the memory guardrail/);
-assert.match(html,/Memory limit \(RAM growth during this run\): 4 GiB. Guardrail active/);assert.match(html,/short spikes between samples can be missed/);
+assert.match(html,/Maximum memory \(RAM growth during this run\): 4 GiB. Guardrail active/);assert.match(html,/short spikes between samples can be missed/);
 assert.match(html,/separate from saved runs on disk/);
 state.storage={runs_bytes:2*1024**2,baselines_bytes:0,free_bytes:9*1024**3,limits:{max_total_storage:5*1024**3}};
 assert.match(storageLine(),/Saved runs on disk: 2 MiB/);assert.doesNotMatch(storageLine(),/Peak memory|RAM/);

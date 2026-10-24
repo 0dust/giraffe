@@ -162,7 +162,7 @@ def test_basic_presets_have_complete_counts_before_caps(checks, expected):
     assert result["planned_per_target"] == result["known_per_target"] == expected
     assert result["planned_total"] == result["required_request_limit"] == expected
     assert result["request_limit"] == 2
-    assert any("share of the request limit (Stop after this many requests:" in warning for warning in result["warnings"])
+    assert any("share of the request limit (Maximum requests:" in warning for warning in result["warnings"])
 
 
 @pytest.mark.parametrize("check,updates,expected", [
@@ -248,7 +248,7 @@ def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
         {"name": "first", "url": "http://localhost:1", "model": "a"},
         {"name": "second", "url": "http://localhost:2", "model": "b"},
     ])
-    assert any("share Limit simultaneous requests" in warning and "overlap" in warning
+    assert any("share Simultaneous limit" in warning and "overlap" in warning
                for warning in plan(configuration)["warnings"])
 
 

@@ -471,7 +471,7 @@ def _window_summary(report, target, window, records, series, observation):
         put(key+"_concurrency", occupancy[key], label, "requests", "Request lifetimes clipped to window; time weighted average", samples=occupancy["sample_count"])
     config = report.manifest.get("config", {})
     put("configured_ceiling", config.get("concurrency"), "Configured ceiling", "requests", "Configuration; never used as intended concurrency",
-        reason=None if config.get("concurrency") is not None else "Not set.", action=None if config.get("concurrency") is not None else "Optionally set Limit simultaneous requests.")
+        reason=None if config.get("concurrency") is not None else "Not set.", action=None if config.get("concurrency") is not None else "Optionally set Simultaneous limit.")
     for prefix in ("output", "total"):
         rate = metrics[prefix+"_throughput"]["value"]
         put(prefix+"_per_in_flight", rate/occupancy["average"] if rate is not None and occupancy["average"] else None,

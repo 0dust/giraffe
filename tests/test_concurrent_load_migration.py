@@ -98,7 +98,7 @@ def test_disabled_block_stays_disabled_and_absent_checks_preserve_legacy_default
 @pytest.mark.parametrize('changes,checks,note', [
     ({'max_duration_seconds': 1}, [], 'Concurrent load turned off: max_duration_seconds=1 cannot fit its minimum sending windows.'),
     ({'max_output_tokens': 8}, ['concurrency'], 'output_tokens.long=96 copied to profile.long.output_tokens=8; clipped to max_output_tokens=8.'),
-    ({'concurrency': 1}, ['concurrency'], 'levels=[1, 2] moved to schedule.levels=[1] (bounded by Limit simultaneous requests).'),
+    ({'concurrency': 1}, ['concurrency'], 'levels=[1, 2] moved to schedule.levels=[1] (bounded by Simultaneous limit).'),
     ({'targets': [{**TARGET, 'deployment': {'serving': {'context_limit': 100}}}]}, [], 'Combinations exceeding known server context window 100 were turned off.'),
     ({'targets': [TARGET, {**TARGET, 'name': 'other'}], 'overlap_models': True, 'concurrency': 1}, [], 'Concurrent load turned off: 2 overlapping targets need at least 2 request slots; concurrency=1.'),
 ])
@@ -284,7 +284,7 @@ def test_valid_legacy_values_above_global_limits_preserve_old_bounding(field):
     migrated, notes = migrate_concurrent_load(migrated)
     assert migrated['concurrent_load']['schedule']['levels'] == [2]
     assert migrated['concurrent_load']['profile']['long']['output_tokens'] == 128
-    assert 'levels=[3] moved to schedule.levels=[2] (bounded by Limit simultaneous requests).' in notes
+    assert 'levels=[3] moved to schedule.levels=[2] (bounded by Simultaneous limit).' in notes
     assert 'output_tokens.long=256 copied to profile.long.output_tokens=128; clipped to max_output_tokens=128.' in notes
     config = RunConfig.model_validate(migrated)
     assert config.load_test.patterns.concurrent.levels == [2]

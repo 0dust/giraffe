@@ -45,7 +45,7 @@ def test_old_load_migration_bounds_explicit_levels(ceiling, targets, levels):
         values["concurrency"] = ceiling
     config, notes = saved(**values)
     assert config.load_test.patterns.concurrent.levels == levels
-    assert any("bounded by Limit simultaneous requests" in note for note in notes)
+    assert any("bounded by Simultaneous limit" in note for note in notes)
 
 
 @pytest.mark.parametrize("cap,outputs", [(8, [8, 8, 8]), (64, [32, 64, 64])])
