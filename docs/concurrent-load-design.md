@@ -1,6 +1,14 @@
 # Concurrent load: design (issue #45)
 
-This document is the implementation contract for reorganising the **Concurrent load** check (check id `concurrency`). It covers config schema, migration, execution, scoring, planning, reporting and UI. Values marked *default* are starting defaults, not fixed product decisions.
+> **Historical design — superseded.** This document records the earlier Concurrent
+> load design. Current releases combine concurrency, capacity and arrival checks
+> into **Load test** (`checks: [load]`, configured with `load_test`). The schema,
+> defaults, execution and scoring below are not the current implementation contract.
+> Use the [README](../README.md) and [workload guide](workloads.md#load-test)
+> for current configuration and measurement semantics. The original design is
+> retained below for historical context.
+
+The original implementation contract covered reorganising the **Concurrent load** check (check id `concurrency`): config schema, migration, execution, scoring, planning, reporting and UI. Values marked *default* were starting defaults, not fixed product decisions.
 
 ## 0. Scope and non-goals
 

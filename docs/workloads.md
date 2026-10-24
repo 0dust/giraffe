@@ -1,9 +1,12 @@
 # Bounded workloads, deployment snapshots and serving telemetry
 
-The public catalog has 17 checks. Concurrent load replaces the former scenario-based concurrency checks. Additional
-workloads are opt-in and share the same request, duration, concurrency and
-per-request output ceilings. Use [examples/workloads.yaml](../examples/workloads.yaml)
-as a starting point, then match its settings to your server and acceptance limits.
+The public catalog has 15 checks. **Load test** combines the former concurrency,
+capacity and arrival checks. Workloads share configured run-wide request, duration
+and concurrency ceilings; Load test has its own token profile and request timeout.
+The [expanded example](../examples/workloads.yaml) includes legacy load settings
+that are migrated on import. Review its migration notes and effective settings
+before running it, or use the current schema below. Match settings to your server
+and acceptance limits.
 
 Built-in known-answer fixtures (correctness, JSON, context, short and traffic)
 request temperature zero only when neither `request_options` nor the case options supply a temperature.
@@ -45,95 +48,142 @@ giraffe inspect runs/after/report.json
 giraffe export runs/after/report.json > reproduction.json
 ```
 
-The CLI and backend use the same `RunConfig` contract. Phase 1 implements the new
-Concurrent load backend and standalone HTML tables; the web drawer is updated in Phase 2.
-Deployment and metrics settings remain independent.
+The CLI and web backend use the same `RunConfig` contract. The browser and standalone
+HTML report show Load test results. Deployment and metrics settings remain independent.
 
-`concurrency` (**Maximum in-flight requests**) caps simultaneous target requests
+When configured, `concurrency` (**Maximum in-flight requests**) caps simultaneous target requests
 across the run. Choose the allowed load for the endpoint; Giraffe does not infer
 server capacity from the machine running the client. `max_requests` (**Total request
-limit**) caps total target requests across all selected tests and targets. It stays
+limit**), when configured, caps total target requests across all selected tests and targets. It stays
 independent of concurrency; increasing simultaneous load does not authorize more
 total traffic. AI evaluator calls use separate limits.
 
-## Concurrent load
+## Load test
 
-Configure `concurrent_load` with four independently selectable load types:
+Select `checks: [load]` and configure `load_test`. Workload selection and traffic
+patterns are independent. This example runs one input/output shape at concurrency
+one for a 15-second sending window; adjust the endpoint and acceptance limits:
+
+```yaml
+config_version: 2
+targets:
+  - name: local
+    url: http://127.0.0.1:8080/v1
+    model: replace-with-served-model-id
+checks: [load]
+concurrency: 1
+max_requests: 100
+max_duration_seconds: 120
+load_test:
+  workloads:
+    combinations:
+      selected: [short_short]
+  patterns:
+    concurrent:
+      levels: [1]
+    constant:
+      enabled: false
+  schedule:
+    duration_seconds: 15
+  request_timeout_seconds: 60
+  pass_criteria:
+    max_first_answer_ms: 2000
+    max_completion_ms: 30000
+    max_error_percent: 0
+    min_correct_percent: 100
+    min_valid_responses: 5
+```
+
+The four `load_test.workloads` options are:
 
 - `combinations`: selected input/output shapes such as `long_short`.
-- `mixed`: seeded random choices by share of requests (percentages sum to 100),
-  with observed mix reported by sent requests and in-flight time.
-- `interference`: N−1 continuous short streams plus one probe slot alternating
-  short/long inputs A/B/A/B every D/2; total 2D per level. Each probe waits for
-  first output or a configured chunk count from every active short stream.
-- `stress`: large input, large output, or both. Output coverage requires
-  `ceil(long.output_tokens × min_output_percent / 100)` tokens in enough valid
-  responses: 80% of 128 is 103; 80% of 512 is 410. Coverage alone never passes.
+- `mixed`: seeded request-frequency choices from at least two selected shapes,
+  with equal shares or positive custom shares totaling 100%. Reports retain the
+  requested and observed mix.
+- `interference`: replenished short streams compared across a full baseline window
+  and a full long-input probe window (2D per eligible concurrency level). Probes
+  wait for streaming to start or for five chunks, according to `trigger`.
+- `stress`: selected `long_short`, `short_long` or `long_long` cases. Long-output
+  coverage requires `ceil(profile.long.output_tokens × min_output_percent / 100)`
+  tokens in every valid response: 80% of the default 512-token cap is 410.
+  Coverage alone never passes; early endings leave coverage inconclusive.
 
-The shared profile defaults to input token targets 128/512/2048 and output caps
-32/64/128. Sizes must be non-decreasing; every output cap must fit the run-wide
-`max_output_tokens`. Profile inputs are independent of `context_limit`. Token
-calibration is shared per input size and short-answer/long-output instruction.
-Missing token usage remains not reported, never zero. Large-input stress cannot
-pass without verified input tokens. Every prompt starts with a fixed-length unique
-nonce and asks for the box label first, then a numbered list for longer outputs.
+The shared `profile` defaults to input token targets 128/512/2048 and output caps
+64/256/512 for Short/Medium/Long. New profiles require strictly increasing sizes.
+Profile inputs are independent of `context_limit`; ordinary-request
+`max_output_tokens` does not resize these caps. Inputs are prepared locally with
+the selected tokenizer, while endpoint-reported token usage establishes measured
+input coverage. Missing token usage is unknown, never zero. Saved questions retain
+their own output budgets; reports disclose any difference from the profile cap.
 
-The schedule defaults to levels `[1, 4]` and 15 seconds per workload/level. The
-three default combinations plus Mixed load take 2 minutes. The default output caps
-fit this window without a short-window throughput warning. Default interference
-is **off** because it needs streaming and every level ≥ 2. Nine combinations ×
-three levels × 30 seconds take 13 min 30 s. Configured load time is a fixed minimum;
-elapsed estimates additionally include calibration, drain, other checks and targets.
-Request estimates for duration-based points are unknown, not zero. Planning warns
-about request allowance and windows too short to estimate throughput reliably.
+The default combinations are `short_short`, `long_short` and `short_long`.
+`patterns.concurrent` maintains levels `[1, 4]`; `patterns.constant` sends at
+`patterns.rates: [1, 2]` requests/second. Each selected workload runs separately
+under each selected pattern and level. At the default `schedule.duration_seconds: 15`,
+these defaults produce 12 tests and 3 minutes of sending time per target, plus
+preparation and drain time. Inherited concurrency levels can shrink to fit a
+configured run ceiling; explicitly supplied levels must fit it.
 
-Every worker immediately replaces its own completed request until the sending
-window ends; `min_valid_responses` is never a stopping target. Requests already
-sent drain under the request timeout and run deadline. All sent requests, including
-drained ones, enter latency/correctness/error evidence. Each point reserves known
-later checks and minimum probes, then splits the remaining target budget fairly
-across the remaining points. Recovery also reserves this check's minimum work.
-A cut-short window can pass with enough valid, load-qualified evidence and duration
-at least max(25% of the configured window, 3 × median response time). Otherwise it
-is inconclusive. Endpoint failures are evaluated before all evidence downgrades.
+Mixed traffic, interference, stress, Poisson arrivals and bursts are off by default.
+Enable `patterns.poisson` for seeded independent arrivals. Bursts overlay enabled
+arrival patterns, or run alone when no arrival pattern is selected; they do not
+overlay maintained concurrency. Interference requires streaming and uses concurrency
+levels of at least 2. It runs separately from the other patterns.
 
-Check-local pass criteria gate p95 first-output/response times, percent errors,
-percent correct labels, and minimum valid responses. Global `limits` per-request
-thresholds do not gate Concurrent load. Interference compares median decode times
-of short streams whose first-to-last-chunk interval overlaps a short or long probe's
-prefill. Single-chunk buffered streams cannot establish interruption. A null slowdown
-limit measures only. Client-delivered load needs at least 90% mean occupancy and
-server-evidenced peak overlap ≥ requested concurrency; non-streaming concurrent
-points cannot establish server overlap. Long input with over 50% median cached
-prompt tokens is inconclusive.
+Maintained-concurrency workers replace each completed request until the sending
+window ends. Scheduled arrivals are independent of completions. In both cases,
+`min_valid_responses` is an evidence requirement, not a stopping target. Requests
+already sent drain under `load_test.request_timeout_seconds` (default 300 seconds)
+and any run deadline. Drained requests remain in the evidence. A truncated sending
+window or incomplete delivery is inconclusive unless observed endpoint failures
+already establish failure. Stopping or reaching a run limit preserves partial results.
 
-Throughput uses completions between the first completion and sending-window end,
-excluding drain; missing completion-token counts leave token throughput unknown.
-Point tables distinguish requested, client-delivered and server-evidenced concurrency.
-With few samples p95 is effectively the maximum. JSON stores dedicated `load_point`
-request metadata and `metrics.load_types[type].points`; see design §7.
+`pass_criteria` applies first-answer, completion, optional stream-pause and generation
+speed limits to individual responses, not p95. Defaults are 2,000 ms first answer,
+30,000 ms completion, 0% errors, 100% correct scored answers and five valid responses
+per result group. Global `limits` does not replace these criteria. Missing judgments,
+timing or input-length evidence can leave a group inconclusive. If both first-answer
+and completion limits are null, ordinary load groups measure without certifying
+accepted capacity. Interference also checks matched short-answer completion slowdown
+against `workloads.interference.max_slowdown` (default 1.5).
 
-Legacy `concurrent_workloads` / `buckets` settings and legacy check names are accepted
-only as migration input. Migration notes name the actual old settings and explain
-what was copied, dropped, clipped or turned off. CLI prints notes on stderr; web
-configuration endpoints return `migration_notes`, which the run start request can
-carry into `manifest.config_migration_notes`. Re-exported configs use only the new
-schema. Old reports still render, but old-vs-new baseline comparisons are inconclusive.
-Mixed load is a new experiment and is off for migrated configs. Old mixed-interference
-long-output partners and before-output ordering have no equivalent.
+Maintained concurrency above one needs at least 90% mean client occupancy and
+streamed server-evidenced peak overlap at the requested level. Without streaming,
+that server overlap cannot be established. A long-input group with a request reporting
+more than half its input cached is inconclusive. Scheduling delay can prevent a
+timing violation from being attributed to the endpoint; task/protocol failures still fail.
+
+Throughput includes completions during drain and divides by sending plus actual
+drain time; cancelled work is excluded. Missing output-token counts leave token
+throughput unknown. Correct work per second counts valid, scored-correct responses
+with all required timing measurements and within the configured timing limits.
+Point tables distinguish requested, client-delivered and server-evidenced concurrency,
+and show latency percentiles separately from per-response acceptance. With few samples,
+p95 is effectively the maximum. JSON stores request `load_point` metadata and the
+Load test check's `metrics.points`, with per-shape result groups. Highest accepted
+concurrency/rate means the highest passing setting tested, not an absolute capacity limit.
+
+Legacy `concurrent_load`, `concurrent_workloads`, `buckets`, capacity and arrival
+settings are migration input. Independent legacy schedules remain separate sequential
+tests in `load_test.migrated_tests`; rates and durations are not blended. Old p95 limits
+are not converted into per-response limits. Review migration notes for retained,
+dropped or changed settings. The CLI prints notes and the web returns `migration_notes`;
+saved manifests can retain them as `config_migration_notes`. Normalized exports use
+the current schema. Old reports still render, but comparisons across incompatible
+formats are inconclusive.
 
 ## Standard checks and load evidence
 
-Access, serving and first output exclude capacity-stage and sustained traffic entirely. Other
-stress traffic exempts timeouts and intentional cancellations, but non-timeout
+First-output and generation checks use ordinary serial requests; loaded timing
+belongs to the corresponding load check. Serving excludes sustained recovery traffic.
+Other stress traffic exempts timeouts and intentional cancellations, but non-timeout
 HTTP and protocol failures still enter serving checks and `stop_after_errors`.
 Documented context-length rejections remain coverage observations. ConnectTimeout
 and ConnectError are transport failures for access; a response timeout remains a
 timeout. Shared request and duration limits still apply.
 
-Capacity sends independent arrivals and reports the highest tested rate for which
-all tested rates at or below it were accepted. A higher-rate pass after a lower-rate
-failure is flagged in `non_monotonic_results` and does not raise that boundary.
+Load test reports each workload/pattern/level separately; a passing setting does
+not establish the behavior of untested settings or erase a failure elsewhere.
 Answer timing ends at the last answer chunk: finish/usage messages, `[DONE]` and
 connection cleanup do not extend generation time or stream gaps. A streamed
 single-chunk answer with reported `completion_tokens <= 2` has no possible
@@ -185,8 +235,8 @@ stopped; the optional log/trace verification supplies separate evidence.
 Built-in correctness and JSON with configured concurrency above one require
 observed overlap of at least two scored requests; otherwise they are inconclusive
 ("not exercised concurrently"). Configured concurrency one measures serial behavior.
-Request-pack correctness scores each case's quiet answers and loaded capacity-stage
-answers against `min_correctness`. Without capacity it runs a quiet pass and an
+Request-pack correctness scores each case's quiet answers and loaded
+answers against `min_correctness`. Without Load test it runs a quiet pass and an
 additional pass at global concurrency, covering all cases and sending at least
 `concurrency` requests. Per-check correctness `samples` and `concurrency` overrides
 are rejected in pack mode; global `samples` never selects the case count. The
@@ -205,8 +255,8 @@ error allowance.
 
 | Setting | Behavior | Evidence and limitations |
 | --- | --- | --- |
-| `concurrent_load` | Duration-based combinations, seeded mixed traffic, active-stream interference and stress | Point tables report delivered windows, load evidence, errors, valid responses, latency, throughput and token coverage. |
-| `arrivals` | Steady RPS or bursts, independent of the concurrency cap | Scheduled arrival, dispatch, completion, waiting and unissued counts; a bounded pending queue drops excess arrivals visibly. Seed is recorded; current schedule is deterministic and has no jitter. |
+| `load_test.workloads` | Combinations, seeded mixed traffic, active-stream interference and token stress | Point tables report delivered windows, load evidence, errors, valid responses, latency, throughput and token coverage. |
+| `load_test.patterns` | Maintained concurrency, constant/Poisson arrivals and bursts | Arrival timing starts at the planned arrival, including dispatch delay. Reports distinguish scheduled, sent, locally dropped, late and unsent work. Local delivery gaps are not endpoint errors. |
 | `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified; independent controls must report less than the reuse threshold. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the completed final answer after stripping inline reasoning; fixed history uses the seeded session name at every turn. Sessions refill as each conversation finishes. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
 | `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is inconclusive unless `strict: true` makes it fail; full agreement can pass. Temperature/seed support is requested, not universally verified. |
@@ -223,8 +273,9 @@ marks affected timing/rates inconclusive rather than claiming identical inputs.
 Optional `consistency.logprobs` collects and compares content token probabilities
 independently of answer hashes; see [Token probability consistency](#token-probability-consistency).
 
-Percentiles include valid completions and show sample counts. Failures, timeouts,
-cancellation, unknown lengths and finish reasons appear alongside them. Aggregate
+For the specialty workloads below, percentiles include valid completions and show
+sample counts. Failures, timeouts, cancellation, unknown lengths and finish reasons
+appear alongside them. Aggregate
 requests/s and output tokens/s use first dispatch through last completion in that
 scenario, including error time in the window. Missing output usage leaves aggregate
 token throughput unknown. Per-request generation pace remains a client-observed
@@ -237,13 +288,11 @@ limits remain inconclusive; observed task/protocol failures remain failures.
 Fixed-only session plans count character-admitted turns exactly. Live plans remain
 bounded because actual final-answer lengths determine later history admission.
 
-`arrivals.max_pending` bounds only queued, undispatched arrivals. In-flight
-requests use the global `concurrency` ceiling and do not occupy queue capacity.
-`arrivals.max_client_wait_ms` sets the tolerated scheduled-to-dispatch delay,
-defaulting to 50 ms to allow ordinary local dispatch overhead. Delays above the
-threshold leave the configured rate unqualified/inconclusive. Reports retain
-`client_wait_threshold_ms`, `max_client_wait_ms` and the delayed count; set a tighter
-or looser threshold to match your generator and arrival requirements.
+Current arrival settings belong under `load_test.patterns`. The former
+`arrivals.max_pending` and `arrivals.max_client_wait_ms` controls are legacy migration
+inputs, not controls for the current Load test scheduler. Inspect migration notes
+when importing them. The current report exposes dispatch delay and incomplete
+delivery separately from endpoint response errors.
 
 Shared-prefix repeats run back to back, followed by a separate independent-control
 block so single-slot caches can retain the shared prefix. The default shared
@@ -260,19 +309,9 @@ only a majority of the planned repeats missing reuse fails ("no prefix reuse
 observed"). At least `min_samples` reuses are required to pass. Timing improvement
 alone cannot pass.
 
-Bucket windows limit dispatch, not request duration. Requests dispatched before
-the cutoff drain under their normal server timeout; the window cannot create an
-error. Too few samples is unfinished/inconclusive. Genuine request timeouts still
-count as errors. Each request records in-flight overlap integrated over its own
-lifetime, from dispatch to completion. Level 1 always qualifies; higher levels
-require a lifetime average of at least `level - 0.5`. Peak overlap remains diagnostic.
-Cells report their overall time-weighted in-flight average and excluded tail IDs;
-at least `min_samples` qualified requests are needed. No uncounted fillers run.
-Input usage must increase short < medium < long within each level/output shape.
-The long-minus-short median token span must be at least one tenth of the requested
-character span. A fixed chat-template preamble cancels in that difference; no
-absolute upper bound rejects a healthy template. Missing or compressed length
-evidence leaves "input length not exercised" inconclusive.
+Former bucket/scenario configurations migrate into Load test. Use its token profile,
+per-response criteria and occupancy/streamed-overlap evidence described above;
+old character-span and per-request bucket-overlap rules do not describe current runs.
 
 Sessions seed a distinct index-derived bakery name in turn zero and score each
 turn against that session's original value. This detects mixed histories even

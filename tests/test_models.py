@@ -63,7 +63,7 @@ def test_sparse_check_options_inherit_suite_defaults_without_request_ceilings():
 ])
 def test_selected_overrides_above_global_ceiling_are_rejected_but_disabled_drafts_survive(check_id, options):
     target = Target(name="local", url="http://localhost", model="example")
-    with pytest.raises(ValidationError, match="above Limit"):
+    with pytest.raises(ValidationError, match=r"above Simultaneous limit \(4\)"):
         RunConfig(targets=[target], checks=[check_id], concurrency=4, test_options={check_id: options})
     saved = RunConfig(targets=[target], checks=["serving"], test_options={check_id: options})
     assert saved.model_dump()["test_options"][check_id] == options

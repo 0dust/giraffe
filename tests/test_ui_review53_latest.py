@@ -11,7 +11,8 @@ from tests.test_ux_results import run_render_checks
 def test_shared_timeout_and_load_override_are_visible_and_independent():
     browser_logic(FORM + r'''
 const shared=renderSharedRunSettings(config),load=renderLoadEditor(config);
-assert.match(shared,/Default request timeout \(seconds\)/);
+assert.match(shared,/<h3>Request default<\/h3>/);
+assert.match(shared,/Request timeout \(seconds\)/);
 assert.match(shared,/name="request_timeout_seconds"[^>]*value="300"/);
 assert.match(load,/Send new requests for \(seconds\)/);
 assert.doesNotMatch(load,/load_schedule_finish_seconds|Wait for unfinished|Duration per workload/);

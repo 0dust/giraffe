@@ -49,11 +49,12 @@ def test_yaml_examples_validate_and_preview_without_traffic(path, monkeypatch, c
 
 
 def test_readme_quickstart_uses_sequential_core_checks():
-    block = README.split('## Try it in 30 seconds\n', 1)[1].split('\n## ', 1)[0]
-    assert 'git clone https://github.com/0dust/giraffe.git && cd giraffe' in block
-    assert 'python -m venv .venv' in block
-    assert '. .venv/bin/activate' in block
-    assert 'pip install -e .' in block
+    install = README.split('## Install and open Giraffe\n', 1)[1].split('\n## ', 1)[0]
+    assert 'git clone https://github.com/0dust/giraffe.git && cd giraffe' in install
+    assert 'python -m venv .venv' in install
+    assert '. .venv/bin/activate' in install
+    assert 'pip install .' in install
+    block = README.split('## First CLI run\n', 1)[1].split('\n## ', 1)[0]
     command = next(line for line in block.splitlines() if line.startswith('giraffe run '))
     config = configuration(parser().parse_args(shlex.split(command)[1:]))
     assert config.targets[0].url == 'http://127.0.0.1:11434/v1'
