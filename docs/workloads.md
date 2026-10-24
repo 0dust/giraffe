@@ -1,5 +1,7 @@
 # Bounded workloads, deployment snapshots and serving telemetry
 
+[Documentation index](README.md) · [Running and baselines](running.md)
+
 The public catalog has 15 checks. **Load test** combines the former concurrency,
 capacity and arrival checks. Workloads share configured run-wide request, duration
 and concurrency ceilings; Load test has its own token profile and request timeout.
@@ -39,10 +41,14 @@ remain incomplete coverage. Character placement and returned token counts remain
 
 ## Configure and run
 
+Edit the endpoint, model and acceptance limits in the example before running it:
+
 ```sh
-giraffe run --config examples/workloads.yaml --output runs/expanded
-giraffe baseline save runs/expanded/report.json baselines/expanded.json
-giraffe run --config examples/workloads.yaml --baseline baselines/expanded.json \
+giraffe validate --config examples/local.yaml
+giraffe preview --config examples/local.yaml
+giraffe run --config examples/local.yaml --output runs/before
+giraffe baseline save runs/before/report.json baselines/local.json
+giraffe run --config examples/local.yaml --baseline baselines/local.json \
   --output runs/after
 giraffe inspect runs/after/report.json
 giraffe export runs/after/report.json > reproduction.json
@@ -51,12 +57,20 @@ giraffe export runs/after/report.json > reproduction.json
 The CLI and web backend use the same `RunConfig` contract. The browser and standalone
 HTML report show Load test results. Deployment and metrics settings remain independent.
 
-When configured, `concurrency` (**Maximum in-flight requests**) caps simultaneous target requests
-across the run. Choose the allowed load for the endpoint; Giraffe does not infer
-server capacity from the machine running the client. `max_requests` (**Total request
-limit**), when configured, caps total target requests across all selected tests and targets. It stays
-independent of concurrency; increasing simultaneous load does not authorize more
-total traffic. AI evaluator calls use separate limits.
+In a version-2 configuration, `concurrency` (**Simultaneous limit**) is an optional
+ceiling across all target requests. It defaults to **Not set**. Check parallelism
+is separate: `default_concurrency` defaults to 4, per-check overrides can select
+another value, and Load test uses its pattern levels/rates. Inherited parallelism
+can shrink to fit the ceiling; explicit settings that exceed it are rejected.
+Choose the allowed load for the endpoint; Giraffe does not infer server capacity
+from the machine running the client.
+
+`max_requests` (**Maximum requests**) and `max_duration_seconds` (**Maximum
+duration**) also default to **Not set**. The request budget covers all selected
+tests and targets, independently of concurrency. Increasing simultaneous load
+does not increase that budget. AI evaluator calls use separate limits.
+Use `--simultaneous-limit` and `--default-concurrency` to set the two CLI controls
+independently. The compatibility flag `--concurrency N` sets both to `N`.
 
 ## Load test
 
@@ -190,9 +204,13 @@ single-chunk answer with reported `completion_tokens <= 2` has no possible
 inter-chunk gap and is exempt from missing-gap evidence. Longer or unknown-length
 single-chunk answers still lack timing evidence (they may have been buffered).
 
-Recovery first records light probes, then refills up to `concurrency` workers with
+Recovery first records light probes, then refills up to its effective check
+concurrency with
 a rotating, scored mix of long-input and longer-output requests. Each worker starts
 its next request as soon as its previous one completes, within the shared ceilings.
+This parallelism comes from `test_options.recovery.concurrency` or
+`default_concurrency`, bounded by the run's Simultaneous limit. Here, `concurrency`
+in the completion formula means that effective worker count.
 Sustained traffic reserves planned fixed requests of later checks plus post-load
 probes. A half-remaining-quota cap applies only when later checks are selected.
 The phase completes when its duration elapses with observed configured concurrency,
@@ -232,13 +250,13 @@ finish reason also provides cap evidence when usage is absent. Follow-up request
 check continued inference. Client disconnect still does not prove backend work
 stopped; the optional log/trace verification supplies separate evidence.
 
-Built-in correctness and JSON with configured concurrency above one require
+Built-in correctness and JSON with effective check concurrency above one require
 observed overlap of at least two scored requests; otherwise they are inconclusive
-("not exercised concurrently"). Configured concurrency one measures serial behavior.
+("not exercised concurrently"). Effective concurrency one measures serial behavior.
 Request-pack correctness scores each case's quiet answers and loaded
 answers against `min_correctness`. Without Load test it runs a quiet pass and an
-additional pass at global concurrency, covering all cases and sending at least
-`concurrency` requests. Per-check correctness `samples` and `concurrency` overrides
+additional pass at its effective concurrency, covering all cases and sending at
+least that many requests. Per-check correctness `samples` and `concurrency` overrides
 are rejected in pack mode; global `samples` never selects the case count. The
 planner includes this loaded pass and recovery baselines, and the
 separate stop control. Adaptive traffic estimates warn when checks may be starved.
@@ -335,9 +353,12 @@ enable strict to enforce”; full agreement can pass. Wrong answers are reported
 and in the summary when below 1.0; they never independently fail consistency. Text repetition counts round up to full
 load groups at each level, matching the request plan.
 
-Default per-cell samples, mixed pairs, consistency repetitions and concurrent
-session count are five; prefix repeats are six (five measured reuses). Planning
-warns when a configured workload sample count is below `limits.min_samples`.
+Consistency defaults to five repetitions. Sessions default to five conversations
+per mode, with at most two active at once before applying a run ceiling. Prefix
+repeats default to six (first use plus five measured reuses). Load test uses timed
+sending windows and a per-group `min_valid_responses` requirement; legacy
+per-cell sample counts and mixed-pair counts do not control current Load tests.
+Planning warns when a count-based workload is below `limits.min_samples`.
 Budgets, missing shape evidence and inadequate overlap can still prevent a verdict.
 
 ## Assistant text alongside tool calls
@@ -592,7 +613,7 @@ credentials/settings manually when reproducing a run.
 
 Run `giraffe run --config examples/logprob-consistency.yaml --output runs/logprobs`
 after setting the example's URL and model to an existing vLLM endpoint. The
-Repeated-request consistency editor exposes the same `logprobs` JSON object;
+Answer consistency editor exposes the same `logprobs` JSON object;
 CLI YAML, API preview/export, saved runs and reruns use this configuration.
 Omit it or set it to `null` to preserve ordinary answer-only consistency.
 
@@ -696,7 +717,7 @@ succeeded); timeout waiting for an answer remains inference-timeout evidence.
 `tool_checks.conversations` adds bounded conversations to the tool check. Run
 `giraffe run --config examples/tool-result-conversation.yaml --output runs/tool-results`
 against a running tool-capable endpoint. The example targets local Ollama; edit
-its URL and model for your server. The Tools editor accepts the same fixture JSON,
+its URL and model for your server. The Tool-call correctness editor accepts the same fixture JSON,
 and configuration preview, CLI export and rerun preserve it.
 
 Each fixture declares initial `messages`, `tools`, one to four `steps`, and
