@@ -617,7 +617,10 @@ def main(argv: list[str] | None = None) -> int:
                       "Review the plan, then choose Launch.", flush=True)
                 server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port,
                                                        log_level="warning"))
-                server.run(sockets=[listener])
+                try:
+                    server.run(sockets=[listener])
+                except KeyboardInterrupt:
+                    print("\nGiraffe UI stopped.")
             return 0
         if args.command == "report":
             from giraffe.reporting import _atomic_write, _render
