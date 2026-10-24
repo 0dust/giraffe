@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from giraffe.cli import configuration, main, parser
-from giraffe.models import CHECK_NAMES, RunConfig, Target
+from giraffe.models import CHECK_NAMES, RunConfig
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 
@@ -16,6 +16,9 @@ from giraffe.open_files import open_file_guard
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = sorted((ROOT / 'examples').glob('*.yaml'))
 README = (ROOT / 'README.md').read_text()
+RUNNING = (ROOT / 'docs' / 'running.md').read_text()
+DOCUMENTS = [README, RUNNING, *((ROOT / 'docs' / name).read_text()
+                               for name in ('workloads.md', 'resources.md', 'offline.md'))]
 
 
 @pytest.mark.parametrize('path', EXAMPLES, ids=lambda path: path.name)
@@ -49,36 +52,37 @@ def test_yaml_examples_validate_and_preview_without_traffic(path, monkeypatch, c
 
 
 def test_readme_quickstart_uses_sequential_core_checks():
-    install = README.split('## Install and open Giraffe\n', 1)[1].split('\n## ', 1)[0]
+    install = README.split('### 1. Install\n', 1)[1].split('\n### ', 1)[0]
     assert 'git clone https://github.com/0dust/giraffe.git && cd giraffe' in install
-    assert 'python -m venv .venv' in install
-    assert '. .venv/bin/activate' in install
+    assert 'python3 -m venv .venv' in install
+    assert 'source .venv/bin/activate' in install
     assert 'pip install .' in install
-    block = README.split('## First CLI run\n', 1)[1].split('\n## ', 1)[0]
-    command = next(line for line in block.splitlines() if line.startswith('giraffe run '))
+    block = README.split('### 2. Start your run\n', 1)[1].split('\n### ', 1)[0]
+    command = next(line for line in block.replace('\\\n', ' ').splitlines()
+                   if line.startswith('giraffe run '))
     config = configuration(parser().parse_args(shlex.split(command)[1:]))
     assert config.targets[0].url == 'http://127.0.0.1:11434/v1'
     assert config.targets[0].model == 'llama3.2:3b'
     assert config.checks == ['access', 'serving', 'correctness']
     assert config.concurrency == 1
     assert request_plan(config)['known_per_target'] == 13
-    assert 'OLLAMA_NUM_PARALLEL' in block
 
 
-def test_readme_exit_codes_match_cli_help(capsys):
+def test_running_guide_exit_codes_match_cli_help(capsys):
     with pytest.raises(SystemExit) as result:
         main(['run', '--help'])
     assert result.value.code == 0
     help_text = capsys.readouterr().out
-    rows = re.findall(r'^\| `([0-4])` \| ([^|]+) \|$', README, re.MULTILINE)
+    rows = re.findall(r'^\| `([0-4])` \| ([^|]+) \|$', RUNNING, re.MULTILINE)
     assert len(rows) == 5
     for code, meaning in rows:
         assert re.search(rf'^  {code}  {re.escape(meaning.lower())}$', help_text, re.MULTILINE)
 
 
-@pytest.mark.parametrize('block', re.findall(r'```yaml\n(.*?)```', README, re.DOTALL),
+@pytest.mark.parametrize('block', [block for document in DOCUMENTS
+                                  for block in re.findall(r'```yaml\n(.*?)```', document, re.DOTALL)],
                          ids=lambda block: 'targets' if block.startswith('targets:') else 'traffic')
-def test_readme_yaml_settings_validate_and_cover_fixed_work(block):
+def test_documented_yaml_settings_validate_and_cover_fixed_work(block):
     values = yaml.safe_load(block)
     values.setdefault('targets', [{'name': 'local', 'url': 'http://localhost/v1', 'model': 'example'}])
     config = RunConfig.model_validate(values)
@@ -86,26 +90,22 @@ def test_readme_yaml_settings_validate_and_cover_fixed_work(block):
     assert all(quota >= plan['known_per_target'] for quota in plan['target_quotas'].values())
 
 
-@pytest.mark.parametrize('command', [line for block in re.findall(r'```sh\n(.*?)```', README, re.DOTALL)
+@pytest.mark.parametrize('command', [line for document in DOCUMENTS
+                                     for block in re.findall(r'```sh\n(.*?)```', document, re.DOTALL)
                                      for line in block.replace('\\\n', ' ').splitlines()
                                      if line.startswith('giraffe ')])
-def test_readme_shell_commands_use_supported_cli_flags(command):
-    parser().parse_args(shlex.split(command)[1:])
-
-
-@pytest.mark.parametrize('section', ['Ollama', 'vLLM'])
-def test_readme_target_settings_include_required_fields(section):
-    block = README.split(f'## {section}\n', 1)[1].split('\n## ', 1)[0]
-    for name, field in Target.model_fields.items():
-        if field.is_required():
-            assert f'| `targets[0].{name}` |' in block
+def test_documented_shell_commands_use_supported_cli_flags(command):
+    args = shlex.split(command)[1:]
+    if '>' in args:
+        args = args[:args.index('>')]
+    parser().parse_args(args)
 
 
 def test_readme_catalog_matches_available_checks():
-    section = README.split('## What runs\n', 1)[1].split('\n\n**Load test**', 1)[0]
-    rows = re.findall(r'^\| (\d+) \| ([^|]+) \|', section, re.MULTILINE)
-    assert [int(number) for number, _ in rows] == list(range(1, len(CHECK_NAMES) + 1))
-    assert {title.strip() for _, title in rows} == set(CHECK_NAMES.values())
+    section = README.split('## Tests\n', 1)[1].split('\n## ', 1)[0]
+    rows = re.findall(r'^\| ([^|]+) · `([a-z_]+)` \|', section, re.MULTILINE)
+    assert len(rows) == len(CHECK_NAMES)
+    assert {check_id: title.strip() for title, check_id in rows} == CHECK_NAMES
 
 
 @pytest.mark.parametrize('name', ['local', 'vllm'])

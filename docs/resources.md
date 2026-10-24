@@ -1,5 +1,7 @@
 # Saved reports on disk
 
+[Documentation index](README.md) · [Running and baselines](running.md)
+
 Automatic saved-run cleanup is off by default. The default storage limits are:
 
 | Setting | Default | Effect |
@@ -75,11 +77,10 @@ rather than substituting altered input evidence. Schema 2 and schema 3 remain
 measurement-compatible in the new comparator; the bump signals a changed stored
 representation.
 
-The minimum reader is the **schema-3 / report-format-2 reader introduced in
-PR #46**, including this correctness follow-up. Older pinned checkouts cannot
-read deduplicated reports directly. The package's unchanged `0.1.0` label is not
-a sufficient capability check: inspect `schema_version`/`report_format`, or use
-a reader from PR #46 or later. For portable exchange, `giraffe baseline save
+Deduplicated reports require a **schema-3 / report-format-2 reader**. Older pinned
+checkouts may not understand this representation. Inspect
+`schema_version`/`report_format` rather than relying on the package version alone.
+Current Giraffe reads both representations. For portable exchange, `giraffe baseline save
 RUN_DIR file.json` always streams expanded schema-2 JSON with input messages in
 each request and no table/reference fields. Older pinned schema-2 Giraffe readers
 can read that file. CLI baseline exports retain their previous `0644` mode and
@@ -151,10 +152,10 @@ Manual cleanup retains its preview/confirmation workflow.
 
 ## Deterministic footprint measurement
 
-Run from the checkout:
+Run from the checkout, in the Python environment where Giraffe is installed:
 
 ```sh
-PYTHONPATH=$PWD/src /Users/0dust/Documents/giraffe/.venv/bin/python scripts/measure_storage.py --requests 300 --body-sizes 16384
+PYTHONPATH="$PWD/src" python scripts/measure_storage.py --requests 300 --body-sizes 16384
 ```
 
 The fixture uses real models, fixed timestamps, 300 completed requests with 2 KiB
@@ -173,6 +174,9 @@ trimming. Measurements on 2026-10-20:
 | failures | 1,910,244 B | 130,601 B | 2,040,999 B | 1,090,372 B | 1,090,505 B | 46.57% |
 | none | 1,418,720 B | 92,673 B | 1,511,547 B | 598,848 B | 598,981 B | 60.37% |
 
+These tables record the implementation and fixtures measured on October 20.
+Re-running the current checkout can produce different artifact sizes as report
+fields and fixtures evolve. Record the source revision with new measurements.
 These are measured synthetic workloads, not production-size estimates. Formatting,
 HTML removal and input deduplication savings overlap; no default fields or required
 failure bodies were removed. Baselines normally add a link and a small metadata
@@ -183,7 +187,7 @@ counts, scores, timings and exact inputs, including legacy reads.
 
 ## Peak memory (RAM)
 
-The default `max_memory_mb` is 4,096 MiB (4 GiB); set `giraffe run --max-memory 0` or the web run's **Memory limit (RAM growth during this run)** to `0` to disable it. The guardrail measures growth in the tester process's RSS from `rss_at_start_bytes`, captured when this run starts, so allocations left from earlier runs and saved-report browsing are excluded from the starting budget. It does not measure the endpoint server. Allocations by other concurrent activity after the baseline can still contribute to growth. Traffic and scoring/aggregation record separate absolute RSS peaks in `observations.resources.sampled_peak_rss_bytes` and baseline-relative growth peaks in `sampled_peak_growth_bytes`. All RAM values use binary MiB/GiB (1 MiB = 1,048,576 bytes). Scoring begins after traffic ends and includes aggregation until the checks are built. Export is measured separately while `write_report` serializes JSON (plus optional HTML): the CLI prints that peak and web run metadata saves it for the run detail page. These are RAM measurements, separate from saved-run sizes on disk.
+The default `max_memory_mb` is 4,096 MiB (4 GiB). Use `--max-memory 0` on a CLI run, or turn off **Maximum memory** under **Run limits → Resource protection** in the UI, to disable it. The guardrail measures growth in the tester process's RSS from `rss_at_start_bytes`, captured when this run starts, so allocations left from earlier runs and saved-report browsing are excluded from the starting budget. It does not measure the endpoint server. Allocations by other concurrent activity after the baseline can still contribute to growth. Traffic and scoring/aggregation record separate absolute RSS peaks in `observations.resources.sampled_peak_rss_bytes` and baseline-relative growth peaks in `sampled_peak_growth_bytes`. All RAM values use binary MiB/GiB (1 MiB = 1,048,576 bytes). Scoring begins after traffic ends and includes aggregation until the checks are built. Export is measured separately while `write_report` serializes JSON (plus optional HTML): the CLI prints that peak and web run metadata saves it for the run detail page. These are RAM measurements, separate from saved-run sizes on disk.
 
 Sampling runs about once per second, with measurements at phase boundaries. Short spikes between samples can be missed. A sampled RSS increase above the limit stops unfinished execution, emits the normal stopping event, and saves the collected result with the reason. An unfinished check cannot pass; completed targets and checks keep their statuses. The overall result becomes inconclusive only if a required check was cut short and no check failed. If the limit is crossed after all traffic and scoring finished, it is recorded as a warning and no result is downgraded. The reason reports rounded-up growth and the exact limit in MiB so a small overrun remains visible (for example, “RAM grew by 4,113 MiB, over the 4,096 MiB limit”). Giraffe does not reduce concurrency or request counts to fit a limit. This is a sampling guardrail, not an operating-system allocation quota. Export can still raise RAM above the execution limit, so its measured peak is reported separately.
 
@@ -195,10 +199,10 @@ Export uses shallow copies for unchanged records, copies only changed response e
 
 ### Export measurement
 
-Run from the checkout:
+Run from the checkout, in the Python environment where Giraffe is installed:
 
 ```sh
-PYTHONPATH=$PWD/src /Users/0dust/Documents/giraffe/.venv/bin/python scripts/measure_memory.py
+PYTHONPATH="$PWD/src" python scripts/measure_memory.py
 ```
 
 The script uses the real models with independent response strings, every tenth
@@ -213,6 +217,10 @@ new explicit `--html` path. These checks use a 5 ms sampler for short exports;
 normal phase sampling remains about once per second.
 
 Fresh measurements on 2026-10-20 (all RSS values in MiB):
+
+These are historical measurements of that implementation and fixture set. Memory
+and artifact sizes can change with the source revision, interpreter and platform;
+the table is not a current-release memory guarantee.
 
 | Requests | Body bytes | Export path | JSON bytes | HTML bytes | Holding RSS | Export sampled peak | Process peak | Seconds |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
