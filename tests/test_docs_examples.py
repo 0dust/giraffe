@@ -53,10 +53,10 @@ def test_yaml_examples_validate_and_preview_without_traffic(path, monkeypatch, c
 
 def test_readme_quickstart_uses_sequential_core_checks():
     install = README.split('### 1. Install\n', 1)[1].split('\n### ', 1)[0]
-    assert 'git clone https://github.com/0dust/giraffe.git && cd giraffe' in install
+    assert 'git clone' not in install
     assert 'python3 -m venv .venv' in install
     assert 'source .venv/bin/activate' in install
-    assert 'pip install .' in install
+    assert 'python -m pip install "giraffe-llm==0.1.0a1"' in install
     block = README.split('### 2. Start your run\n', 1)[1].split('\n### ', 1)[0]
     command = next(line for line in block.replace('\\\n', ' ').splitlines()
                    if line.startswith('giraffe run '))
