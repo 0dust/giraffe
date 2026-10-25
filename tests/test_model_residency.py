@@ -38,6 +38,34 @@ async def test_runtime_inventory_is_required_for_residency(monkeypatch, payload,
     assert [(r.method, r.url.path) for r in calls] == [("GET", "/api/ps")]
 
 
+@pytest.mark.parametrize("requested,listed,state", [
+    ("llama3", "llama3:latest", "resident"),
+    ("library/llama3:latest", "llama3:latest", "resident"),
+    ("registry.ollama.ai/library/llama3:latest", "llama3:latest", "resident"),
+    ("REGISTRY.OLLAMA.AI/Library/LLaMa3:LATEST", "llama3:latest", "resident"),
+    ("llama3", "REGISTRY.OLLAMA.AI/Library/LLaMa3:LATEST", "resident"),
+    ("https://registry.ollama.ai/library/llama3", "llama3", "resident"),
+    ("tenant/llama3", "registry.ollama.ai/tenant/llama3:latest", "resident"),
+    ("host:5000/tenant/llama3", "HOST:5000/Tenant/LLaMa3:latest", "resident"),
+    ("tenant/llama3", "llama3:latest", "not_resident"),
+    ("host:5000/library/llama3", "llama3:latest", "not_resident"),
+    ("llama3:other", "llama3:latest", "not_resident"),
+    ("host:5000/tenant/llama3", "host:5001/tenant/llama3", "not_resident"),
+    ("llama3:", "llama3", "unknown"),
+    ("llama3", "library//llama3", "unknown"),
+])
+@pytest.mark.parametrize("field", ["model", "name"])
+async def test_ollama_name_aliases_preserve_registry_namespace_and_tag(
+    monkeypatch, requested, listed, state, field,
+):
+    inventory(monkeypatch, {"models": [{field: listed}]})
+    cfg = config()
+    cfg.targets[0].model = requested
+    result = await model_residency(cfg.targets[0], cfg)
+    assert result["state"] == state
+    assert bool(result["collected_at"]) == (state != "unknown")
+
+
 async def test_disabled_failed_and_expired_discovery_remain_unknown(monkeypatch):
     calls = inventory(monkeypatch, {"error": "secret-value"}, status=500)
     cfg = config()

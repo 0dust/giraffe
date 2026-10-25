@@ -358,6 +358,21 @@ def unknown_residency(target, reason):
             "collected_at": None, "reason": reason}
 
 
+def _ollama_model_name(name):
+    """Match Ollama ParseName defaults and Name.EqualFold, ignoring transport scheme."""
+    parts = name.rsplit("/", 2)
+    model, separator, tag = parts[-1].partition(":")
+    host = parts[0].split("://", 1)[-1] if len(parts) == 3 else "registry.ollama.ai"
+    namespace = parts[-2] if len(parts) >= 2 else "library"
+    tag = tag if separator else "latest"
+    values = (host, namespace, model, tag)
+    patterns = (r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,349}", r"[A-Za-z0-9_][A-Za-z0-9_-]{0,79}",
+                r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}", r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}")
+    if not all(re.fullmatch(pattern, value) for pattern, value in zip(patterns, values, strict=True)):
+        raise ValueError("Invalid Ollama model name")
+    return tuple(value.lower() for value in values)
+
+
 async def model_residency(target, config, *, deadline=None, stop=None):
     """Observe residency without issuing an inference request."""
     import time
@@ -386,10 +401,9 @@ async def model_residency(target, config, *, deadline=None, stop=None):
             for entry in entries
         ):
             raise ValueError("Invalid residency inventory")
-        def canonical(name):
-            return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
-        resident = any(canonical(entry.get("model", entry.get("name"))) == canonical(target.model)
-                       for entry in entries)
+        requested = _ollama_model_name(target.model)
+        names = [_ollama_model_name(entry.get("model", entry.get("name"))) for entry in entries]
+        resident = requested in names
         result.update(state="resident" if resident else "not_resident", collected_at=now(),
                       reason="Requested model listed by runtime." if resident else "Requested model absent from runtime inventory.")
     except (httpx.HTTPError, ValueError, OSError, TimeoutError):
