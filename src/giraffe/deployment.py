@@ -351,6 +351,57 @@ def _engine_metadata(engine, info, model):
     return reported
 
 
+def unknown_residency(target, reason):
+    return {"state": "unknown", "source": "ollama /api/ps" if target.deployment.discovery == "ollama" else None,
+            "target": target.name, "model": sanitize(target.model),
+            "scope": "configured endpoint; other replicas unverified",
+            "collected_at": None, "reason": reason}
+
+
+async def model_residency(target, config, *, deadline=None, stop=None):
+    """Observe residency without issuing an inference request."""
+    import time
+    from .client import _headers
+
+    result = unknown_residency(target, "Residency discovery is not enabled for this runtime.")
+    if target.deployment.discovery != "ollama":
+        return result
+    remaining = config.metrics_timeout_seconds
+    if deadline is not None:
+        remaining = min(remaining, deadline - time.monotonic())
+    if remaining <= 0 or stop is not None and stop.is_set():
+        result["reason"] = "Run stopped before residency could be observed."
+        return result
+    parsed = urlsplit(target.url)
+    url = urlunsplit((parsed.scheme, parsed.netloc, "/api/ps", "", ""))
+    try:
+        async with asyncio.timeout(remaining):
+            client = await asyncio.to_thread(_discovery_client, config, remaining)
+            async with client:
+                client.headers.update(_headers(target))
+                payload = await _read(client, url)
+        entries = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("model", entry.get("name")), str)
+            for entry in entries
+        ):
+            raise ValueError("Invalid residency inventory")
+        def canonical(name):
+            return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+        resident = any(canonical(entry.get("model", entry.get("name"))) == canonical(target.model)
+                       for entry in entries)
+        result.update(state="resident" if resident else "not_resident", collected_at=now(),
+                      reason="Requested model listed by runtime." if resident else "Requested model absent from runtime inventory.")
+    except (httpx.HTTPError, ValueError, OSError, TimeoutError):
+        result["reason"] = "Runtime residency inventory unavailable or invalid."
+    return result
+
+
+async def preparation_residency(config, *, stop=None):
+    observations = await asyncio.gather(*(model_residency(target, config, stop=stop) for target in config.targets))
+    return dict(zip((target.name for target in config.targets), observations, strict=True))
+
+
 async def snapshot(target, config, deadline, stop):
     import time
     from giraffe.client import _headers

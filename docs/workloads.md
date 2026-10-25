@@ -769,3 +769,15 @@ fixtures share the 64 KiB tool configuration limit. When conversations are set a
 diagnostics apply only to single-response fixtures without explicit choice rules.
 
 The message linkage follows the [OpenAI function-calling conversation contract](https://developers.openai.com/api/docs/guides/function-calling).
+
+
+### Model residency around preparation
+
+With `deployment.discovery: ollama`, Giraffe reads `/api/ps` before its CLI
+connection probe or run preparation, then again after preparation. The deployment
+snapshot and HTML report label both observations with their source, time and target
+scope. A missing model is `not_resident`; unsupported, disabled, failed or malformed
+discovery is `unknown`. These observations do not prove a cold start or explain a
+slow first response. A separately requested UI connection test may already have
+loaded the model before the run starts. A deliberate restart may also change state
+between observations. This is one endpoint’s inventory, not proof about every replica.
