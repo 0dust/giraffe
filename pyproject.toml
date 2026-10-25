@@ -1,9 +1,9 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
-name = "giraffe-check"
+name = "giraffe-llm"
 version = "0.1.0a1"
 description = "A built-in acceptance test suite for self-hosted LLM services"
 readme = "README.md"
@@ -28,6 +28,9 @@ Releases = "https://github.com/0dust/giraffe/releases"
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11"]
 sglang-tracing = ["opentelemetry-proto>=1.40,<2"]
+
+[dependency-groups]
+release = ["build==1.6.1", "hatchling==1.32.4", "twine==7.0.0"]
 
 [project.scripts]
 giraffe = "giraffe.cli:main"

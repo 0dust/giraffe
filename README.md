@@ -1,19 +1,19 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/giraffe-dark.svg">
-    <img alt="Giraffe" src="docs/assets/giraffe-light.svg" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/giraffe-dark.svg">
+    <img alt="Giraffe" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/giraffe-light.svg" width="360">
   </picture>
 </p>
 
 <h3 align="center">Acceptance checks for existing LLM endpoints</h3>
 
 <p align="center">
-  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Version 0.1.0a1" src="docs/assets/badges/version.svg"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Version 0.1.0a1" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/version.svg"></a>
   <a href="https://github.com/0dust/giraffe/actions/workflows/checks.yml"><img alt="CI checks" src="https://github.com/0dust/giraffe/actions/workflows/checks.yml/badge.svg?branch=main&amp;event=push"></a>
-  <a href="docs/README.md"><img alt="Documentation" src="docs/assets/badges/docs.svg"></a>
-  <a href="https://discord.gg/GBefPbWebr"><img alt="Join the Giraffe Discord" src="docs/assets/badges/discord.svg"></a>
-  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Python 3.11+" src="docs/assets/badges/python.svg"></a>
-  <a href="https://github.com/0dust/giraffe/blob/main/LICENSE"><img alt="License Apache 2.0" src="docs/assets/badges/license.svg"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/docs/README.md"><img alt="Documentation" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/docs.svg"></a>
+  <a href="https://discord.gg/GBefPbWebr"><img alt="Join the Giraffe Discord" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/discord.svg"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Python 3.11+" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/python.svg"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/LICENSE"><img alt="License Apache 2.0" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/license.svg"></a>
 </p>
 
 ---
@@ -27,6 +27,9 @@ Run repeatable tests against an existing **OpenAI-compatible text endpoint**. In
 Start your inference server separately and have a model ready to use.
 
 ### 1. Install
+
+The Python package is named `giraffe-llm`; the command is `giraffe`.
+Install from source until the first PyPI release:
 
 ```sh
 git clone https://github.com/0dust/giraffe.git && cd giraffe
@@ -98,7 +101,7 @@ giraffe run --config examples/vllm.yaml \
 
 The new report shows acceptance results and changes against the saved baseline. Keep the workload comparable; incompatible measurements stay inconclusive.
 
-In the UI, open a completed run and choose **Save as reference baseline**, then **Compare a new run with this baseline**. [Baseline guide →](docs/running.md#compare-with-a-baseline)
+In the UI, open a completed run and choose **Save as reference baseline**, then **Compare a new run with this baseline**. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
 
 ## Tests
 
@@ -126,9 +129,9 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 
 ## Documentation
 
-[Documentation index](docs/README.md) — detailed guides in the same repository:
+[Documentation index](https://github.com/0dust/giraffe/blob/main/docs/README.md) — detailed guides in the same repository:
 
-[Running & baselines](docs/running.md) · [Workloads & measurements](docs/workloads.md) · [Offline & Docker](docs/offline.md) · [Resource limits](docs/resources.md)
+[Running & baselines](https://github.com/0dust/giraffe/blob/main/docs/running.md) · [Workloads & measurements](https://github.com/0dust/giraffe/blob/main/docs/workloads.md) · [Offline & Docker](https://github.com/0dust/giraffe/blob/main/docs/offline.md) · [Resource limits](https://github.com/0dust/giraffe/blob/main/docs/resources.md)
 
 ## Community
 
