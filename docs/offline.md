@@ -22,7 +22,7 @@ Transfer `wheelhouse/` and `tokenizer-cache/` to the offline machine. In an
 activated Python environment there:
 
 ```sh
-python -m pip install --no-index --find-links wheelhouse giraffe-check
+python -m pip install --no-index --find-links wheelhouse giraffe-llm
 export TIKTOKEN_CACHE_DIR="$PWD/tokenizer-cache"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
