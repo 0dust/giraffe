@@ -97,7 +97,7 @@ Keep them in place before registering the trusted publishers.
 
 1. Update the version in `pyproject.toml` and `src/giraffe/__init__.py` together,
    run `uv lock`, and merge the reviewed change. For the first alpha, both are
-   `0.1.0a1`. Keep the README version badge in sync when changing versions.
+   `0.1.0a1`. Keep the README installation example in sync when changing versions.
 2. Run **Actions → Publish package → Run workflow** on `main`. The workflow
    checks versions, runs Ruff and pytest, builds a source archive and a wheel
    from that archive, validates metadata, and checks the installed CLI and UI

@@ -8,7 +8,7 @@
 <h3 align="center">Acceptance checks for existing LLM endpoints</h3>
 
 <p align="center">
-  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Version 0.1.0a1" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/version.svg"></a>
+  <a href="https://pypi.org/project/giraffe-llm/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/giraffe-llm"></a>
   <a href="https://github.com/0dust/giraffe/actions/workflows/checks.yml"><img alt="CI checks" src="https://github.com/0dust/giraffe/actions/workflows/checks.yml/badge.svg?branch=main&amp;event=push"></a>
   <a href="https://github.com/0dust/giraffe/blob/main/docs/README.md"><img alt="Documentation" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/docs.svg"></a>
   <a href="https://discord.gg/GBefPbWebr"><img alt="Join the Giraffe Discord" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/discord.svg"></a>
@@ -28,14 +28,12 @@ Start your inference server separately and have a model ready to use.
 
 ### 1. Install
 
-The Python package is named `giraffe-llm`; the command is `giraffe`.
-Install from source until the first PyPI release:
+Install [`giraffe-llm` from PyPI](https://pypi.org/project/giraffe-llm/) in a virtual environment. The command is `giraffe`:
 
 ```sh
-git clone https://github.com/0dust/giraffe.git && cd giraffe
 python3 -m venv .venv
 source .venv/bin/activate
-pip install .
+python -m pip install "giraffe-llm==0.1.0a1"
 ```
 
 ### 2. Start your run
@@ -66,7 +64,7 @@ Open **[localhost:8765](http://127.0.0.1:8765)**, enter your endpoint and model,
 
 Connect through the engine’s **OpenAI-compatible chat API**. Discovery, metrics and server-side evidence vary by engine.
 
-The YAML files below are included in the cloned repository’s `examples/` directory. Each file defines the endpoint, model, checks, load settings and acceptance limits for a run.
+Download a YAML configuration from the links below into a local `examples/` directory. Each file defines the endpoint, model, checks, load settings and acceptance limits for a run.
 
 | Engine | YAML configuration |
 | --- | --- |
@@ -78,7 +76,7 @@ The YAML files below are included in the cloned repository’s `examples/` direc
 | LMDeploy | [`lmdeploy.yaml`](https://github.com/0dust/giraffe/blob/main/examples/lmdeploy.yaml) |
 | Hugging Face TGI | [`tgi.yaml`](https://github.com/0dust/giraffe/blob/main/examples/tgi.yaml) |
 
-Open the file for your engine and edit its URL, model, checks and limits. From the repository root, pass that file to `--config`. For example, after editing `examples/vllm.yaml`:
+Open the file for your engine and edit its URL, model, checks and limits. From the directory containing `examples/`, pass that file to `--config`. For example, after editing `examples/vllm.yaml`:
 
 ```sh
 giraffe run --config examples/vllm.yaml \
