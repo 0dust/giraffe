@@ -243,7 +243,8 @@ def load_observations(runs_dir: Path, config: RunConfig, *, now: datetime | None
                             or saved.get("deployment_fingerprint") != fingerprint):
                         continue
                     observations[target.name].extend({**entry, "finished_at": summary["finished_at"],
-                                                     "cohort": str(path.resolve()), "run_id": path.parent.name}
+                                                     "cohort": str(path.resolve()), "run_id": path.parent.name,
+                                                     "source_target": saved.get("name")}
                                                      for entry in saved.get("measurements", []))
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue

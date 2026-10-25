@@ -30,6 +30,7 @@ def save(root, cfg=None, *, score=False, age=0, folder="previous", record_change
     report = RunReport(run_id="internal-id", started_at=timestamp, finished_at=timestamp, overall="fail",
         manifest={"config": cfg.model_dump(mode="json")}, requests=[RequestRecord(**record)])
     write_report(report, root / folder)
+    return report
 
 
 def plan(root, cfg=None):
@@ -160,3 +161,47 @@ def test_changed_evaluator_does_not_reuse_judged_failure(tmp_path):
     assert plan(tmp_path, cfg)["correctness_history"][0]["status"] == "warning"
     cfg.judging.judges[0].model = "two"
     assert plan(tmp_path, cfg)["correctness_history"][0]["status"] == "unknown"
+
+
+@pytest.mark.parametrize("builtin", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_shared_endpoint_keeps_failures_and_answer_links_with_their_target(
+    tmp_path, monkeypatch, builtin, reverse,
+):
+    from giraffe.client import _headers
+    from giraffe.web import create_app
+
+    cfg = config(builtin=builtin)
+    values = cfg.model_dump(mode="json")
+    base = values["targets"][0]
+    values["targets"] = [{**base, "name": name, "identity": {"tenant": name},
+                          "headers_env": {"X-Tenant": f"TENANT_{name.upper()}"}}
+                         for name in (["bob", "alice"] if reverse else ["alice", "bob"])]
+    for name in ("alice", "bob"):
+        monkeypatch.setenv(f"TENANT_{name.upper()}", f"private-{name}-route")
+    report = save(tmp_path, cfg)
+    cfg = RunConfig.model_validate(values)
+    assert _headers(cfg.targets[0])["X-Tenant"] != _headers(cfg.targets[1])["X-Tenant"]
+    report.manifest["config"] = cfg.model_dump(mode="json")
+    original = report.requests[0]
+    report.requests = [original.model_copy(update={"id": f"{target.name}-answer", "target": target.name,
+                                                   "score": target.name == "bob"}) for target in cfg.targets]
+    write_report(report, tmp_path / "previous")
+    direct = plan(tmp_path, cfg)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),
+                                 base_url="http://localhost") as client:
+        response = await client.post("/api/config/preview", json=cfg.model_dump(mode="json"))
+        assert response.status_code == 200
+        for result in (direct, response.json()["request_plan"]):
+            rows = {row["target"]: row for row in result["correctness_history"]
+                    if row.get("fixture_id") == original.fixture_id}
+            assert rows["alice"]["status"] == "warning"
+            assert rows["alice"]["failed_request_ids"] == ["alice-answer"]
+            assert rows["bob"]["status"] == "observed"
+            assert rows["bob"]["failed_request_ids"] == []
+            assert rows["alice"]["message"] in result["warnings"]
+            answer = await client.get(f"/api/runs/{rows['alice']['run_id']}/requests/alice-answer")
+            assert answer.status_code == 200 and answer.json()["target"] == "alice"
+    cfg.targets[0].headers_env = {"X-Tenant": "CHANGED_ROUTE"}
+    assert all(row["status"] == "unknown" for row in plan(tmp_path, cfg)["correctness_history"])
+    assert "private-" not in (tmp_path / "previous" / ".web.json").read_text()

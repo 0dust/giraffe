@@ -25,12 +25,13 @@ def fixture_keys(config):
         load.pop("pass_criteria", None)
         for migrated in load.get("migrated_tests", []):
             migrated["settings"].pop("pass_criteria", None)
-    context = fixture_hash({"fixtures": FIXTURE_VERSION, "checks": config.checks, "load": load,
+    context = fixture_hash({"version": 2, "fixtures": FIXTURE_VERSION, "checks": config.checks, "load": load,
         "judging": judging_identity(config), "stream": config.stream, "options": config.request_options,
         "concurrency": config.concurrency, "default_concurrency": config.default_concurrency,
         "correctness_concurrency": config.effective_check("correctness")["concurrency"],
         "overlap_models": config.overlap_models,
-        "targets": [{key: target.model_dump(mode="json").get(key) for key in ("name", "url", "model", "identity")}
+        "targets": [{key: target.model_dump(mode="json").get(key) for key in
+                     ("name", "url", "model", "tokenizer", "identity", "route", "parent", "api_key_env", "headers_env")}
                     for target in config.targets]})
     return {spec.fixture_id: {"key": fixture_hash({"context": context,
         "messages": spec.messages, "scorer": spec.scorer, "expected": spec.expected,
@@ -74,7 +75,8 @@ def guidance(config, observations):
     for target in config.targets:
         by_fixture = defaultdict(list)
         for entry in (observations or {}).get(target.name, []):
-            if entry.get("family") == "correctness_history" and isinstance(entry.get("fixture_id"), str):
+            if (entry.get("family") == "correctness_history" and entry.get("source_target") == target.name
+                    and isinstance(entry.get("fixture_id"), str)):
                 by_fixture[entry.get("fixture_id")].append(entry)
         for fixture_id, identity in keys.items():
             matches = []
