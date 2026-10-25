@@ -151,3 +151,18 @@ Saving is explicit. Later runs do not replace the baseline; replacement requires
 evaluate the current run while comparison reports changes against the reference.
 Incompatible workloads leave metric comparison inconclusive. See
 [deployment and comparison evidence](workloads.md#deployment-metadata).
+
+## Run provenance
+
+Reports and `giraffe export` preserve the launch source alongside the effective
+configuration. CLI runs include the original argument list (after shell expansion,
+excluding the executable); argument order and overrides are preserved. Credentials,
+unknown option values and unrecognized positional content are redacted. Environment
+variable names may be recorded, but Giraffe never expands them into this list or
+copies stdin/configuration-file contents into it. Treat redacted arguments as
+provenance, not a ready-to-execute shell command.
+
+Runs from the local browser UI or HTTP API are identified as `web_api`, and direct
+Python calls as `python_api`, with no invented command. Older reports have unknown
+launch provenance. Replaying a report records the new invocation; it does not claim
+to have used the original command. Server launch metadata remains separate.

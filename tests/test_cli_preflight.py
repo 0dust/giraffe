@@ -102,6 +102,10 @@ def test_successful_preflight_checks_each_target_with_run_settings(skip_prefligh
     from giraffe.planning import request_plan
 
     assert result["warnings"] == request_plan(RunConfig.model_validate(config))["warnings"]
+    invocation = json.loads((tmp_path / "output" / "report.json").read_text())["manifest"]["invocation"]
+    assert invocation["source"] == "cli"
+    assert invocation["argv"] == ["run", "--config", str(path), "--output", str(tmp_path / "output"),
+                                  "--output-format", "json", *(["--skip-preflight"] if skip_preflight else [])]
     assert captured.err.startswith("Warning:")
     if not skip_preflight:
         for request, model in zip(requests, ["tiny", "second"], strict=True):

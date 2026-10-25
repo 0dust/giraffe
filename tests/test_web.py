@@ -653,6 +653,7 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         evidence = await client.get(f"/api/runs/{identifier}/requests/{detail['report']['requests'][0]['id']}")
         assert evidence.json()["output"] == ""
         assert detail["report"]["run_id"] == "suite-run-id"
+        assert detail["report"]["manifest"]["invocation"] == {"source": "web_api", "argv": None}
         listing = (await client.get("/api/runs")).json()
         assert listing["active_run_id"] is None
         assert listing["runs"][0]["id"] == identifier

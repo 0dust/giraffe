@@ -772,6 +772,8 @@ def main(argv: list[str] | None = None) -> int:
         with _heartbeat(directory / ".web.json") as stop_heartbeat:
             try:
                 report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
+                from giraffe.invocation import cli_invocation
+                report.manifest["invocation"] = cli_invocation(arguments)
                 if guard is not None:
                     report.manifest["open_files"] = guard
                 if baseline:

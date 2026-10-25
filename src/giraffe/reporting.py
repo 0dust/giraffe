@@ -1050,7 +1050,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
 
 
 def _retained(report: RunReport) -> RunReport:
+    from .invocation import safe_invocation
     result = report.model_copy(update={"manifest": {**report.manifest,
+        **({"invocation": safe_invocation(report.manifest["invocation"])}
+           if "invocation" in report.manifest else {}),
         "config": safe_config(report.manifest.get("config", {}))}})
     if result.baseline:
         result.baseline = sanitize(result.baseline, bounded=False)
@@ -1881,9 +1884,11 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
 
 
 def reproduction_export(report: RunReport) -> dict:
+    from .invocation import safe_invocation
     retained = _retained(report)
     return {"schema_version": "1", "source_run_id": report.run_id,
             "source_outcome": report.overall,
+            "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
             "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},
