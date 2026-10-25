@@ -1012,6 +1012,12 @@ from validation_suite.verifier import verify_case
 stats={}
 report=verify_case(sys.argv[1],write=False,backend_statistics=stats)
 peak=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*(1 if sys.platform=='darwin' else 1024)
+if sys.platform.startswith('linux'):
+    # ru_maxrss can retain the large pytest parent's RSS across fork/exec.
+    # VmHWM measures the verifier's own address space after exec instead.
+    from pathlib import Path
+    peak=next(int(line.split()[1])*1024 for line in Path('/proc/self/status').read_text().splitlines()
+              if line.startswith('VmHWM:'))
 print(json.dumps({'peak':peak,'stats':stats,'report_sha':hashlib.sha256(json.dumps(report,sort_keys=True).encode()).hexdigest()}))
 """
     actual = json.loads(subprocess.check_output([sys.executable, "-c", script, str(tmp_path)], text=True))

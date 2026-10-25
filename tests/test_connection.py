@@ -170,12 +170,21 @@ async def test_network_errors_are_sanitized(monkeypatch, model):
 
 
 async def test_connection_deadline_does_not_retry(monkeypatch):
-    timeout = asyncio.timeout
-    monkeypatch.setattr("giraffe.preflight.asyncio.timeout", lambda seconds: timeout(.01))
+    real_timeout = asyncio.timeout
+    deadlines = []
+
+    def timeout(seconds):
+        assert seconds == 15
+        deadline = real_timeout(None)
+        deadlines.append(deadline)
+        return deadline
+
+    monkeypatch.setattr("giraffe.preflight.asyncio.timeout", timeout)
 
     async def slow(request):
-        await asyncio.sleep(.1)
-        return httpx.Response(200, json=answer())
+        # Expire after transport entry, independent of client setup or CI speed.
+        deadlines[-1].reschedule(asyncio.get_running_loop().time())
+        await asyncio.Future()
 
     requests, _ = endpoint(monkeypatch, slow)
     with pytest.raises(HTTPException, match="timed out after 15 seconds"):
