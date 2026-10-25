@@ -186,11 +186,11 @@ def latency_summary(report: RunReport) -> dict:
         fingerprint = (observed_deployment.get("fingerprint")
                        or _deployment_fingerprint(target.get("deployment", {})))
         from .correctness_history import measurements as correctness_measurements
-        measurements.extend({**entry, "deployment_known": fingerprint is not None}
-                            for entry in correctness_measurements(report, name))
+        correctness_history = [{**entry, "deployment_known": fingerprint is not None}
+                               for entry in correctness_measurements(report, name)]
         summary["targets"].append({"name": name, "url": completion_url(target["url"]),
             "model": target["model"], "deployment_fingerprint": fingerprint,
-            "measurements": measurements})
+            "measurements": measurements, "correctness_history": correctness_history})
     return summary
 
 
@@ -245,7 +245,8 @@ def load_observations(runs_dir: Path, config: RunConfig, *, now: datetime | None
                     observations[target.name].extend({**entry, "finished_at": summary["finished_at"],
                                                      "cohort": str(path.resolve()), "run_id": path.parent.name,
                                                      "source_target": saved.get("name")}
-                                                     for entry in saved.get("measurements", []))
+                                                     for entry in [*saved.get("measurements", []),
+                                                                   *saved.get("correctness_history", [])])
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue
     for key in list(cache):

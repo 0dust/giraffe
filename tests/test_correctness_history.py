@@ -97,6 +97,17 @@ def test_newer_success_supersedes_failure(tmp_path):
     assert row["status"] == "observed" and row["failed"] == 0 and row["failed_request_ids"] == []
 
 
+def test_correctness_history_keeps_latency_measurements_contract(tmp_path):
+    from giraffe.latency import latency_summary
+
+    saved = latency_summary(save(tmp_path))["targets"][0]
+    assert saved["measurements"]
+    assert all(row["p50_ms"] <= row["p90_ms"] <= row["p99_ms"] <= row["max_ms"]
+               for row in saved["measurements"])
+    assert len(saved["correctness_history"]) == 1
+    assert saved["correctness_history"][0]["failed_request_ids"] == ["failed-answer"]
+
+
 @pytest.mark.parametrize("kind", ["stale", "unknown_deployment", "invalid", "unscored", "evaluation_error"])
 def test_unknown_or_ineligible_evidence_cannot_warn(tmp_path, kind):
     cfg = config()
