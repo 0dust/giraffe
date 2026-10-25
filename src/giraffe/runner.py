@@ -2394,6 +2394,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                 if spec[field] == default:
                     del spec[field]
     manifest = {"config": config_values,
+                "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "timing_measurement_version": 2,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),

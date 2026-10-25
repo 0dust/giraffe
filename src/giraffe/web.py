@@ -786,6 +786,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
         try:
             report = await run_suite(config, progress=progress, stop_event=job["stop"])
+            report.manifest["invocation"] = {"source": "web_api", "argv": None}
             report.manifest["open_files"] = job["open_files"]
             if baseline is not None:
                 report = compare_baseline(report, baseline)
