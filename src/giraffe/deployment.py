@@ -61,7 +61,7 @@ _SECRET_TEXT = re.compile(
     r"(?i)(?:bearer\s+\S+|(?:api[-_]?key|password|secret|access[-_]?token)\s*[=:]\s*[^\s,;]+|"
     r"\bsk-[a-zA-Z0-9_-]+|\bgh[pousr]_[a-zA-Z0-9]+|\$\{?\w+\}?)"
 )
-_URL = re.compile(r"https?://[^\s\"'<>]+")
+_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 REDACTED = "[redacted]"
 
 

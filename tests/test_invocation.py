@@ -57,3 +57,36 @@ def test_report_files_redact_imported_invocation(tmp_path):
     saved = json.loads((tmp_path / "report.json").read_text())
     assert saved["manifest"]["invocation"]["argv"] == ["run", "--api-key=[redacted]"]
     assert "secret-value" not in (tmp_path / "report.html").read_text()
+
+
+@pytest.mark.parametrize("scheme", ["HTTPS", "hTtPs", "HTTP", "HtTp"])
+@pytest.mark.parametrize("equals", [False, True])
+def test_overridden_url_credentials_never_reach_saved_reports_or_exports(
+    tmp_path, monkeypatch, capsys, local_tokenizer, scheme, equals,
+):
+    from giraffe.cli import main
+
+    safe_url = "https://example.com/v1"
+    unsafe_url = f"{scheme}://alice:synthetic-url-value@example.com/v1?tenant=hidden-query#hidden-fragment"
+    arguments = ["run", *([f"--url={unsafe_url}"] if equals else ["--url", unsafe_url]),
+                 "--url", safe_url, "--model", "tiny", "--checks", "correctness",
+                 "--skip-preflight", "--html", "--output", str(tmp_path), "--output-format", "json"]
+
+    async def run(config, **kwargs):
+        assert config.targets[0].url == safe_url
+        return RunReport(run_id="r", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")})
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    assert main(arguments) == 0
+    capsys.readouterr()
+    saved = tmp_path / "report.json"
+    assert main(["export", str(saved)]) == 0
+    exported = json.loads(capsys.readouterr().out)
+    invocation = json.loads(saved.read_text())["manifest"]["invocation"]
+    assert exported["invocation"] == invocation == cli_invocation(arguments)
+    expected_url = f"{scheme.lower()}://example.com/v1[redacted]"
+    assert invocation["argv"][1 if equals else 2] == ("--url=" if equals else "") + expected_url
+    for text in (saved.read_text(), (tmp_path / "report.html").read_text(), json.dumps(exported)):
+        for private in ("alice", "synthetic-url-value", "hidden-query", "hidden-fragment"):
+            assert private not in text
