@@ -1,0 +1,55 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.11.26'
+          python-version: '3.12'
+      - run: uv sync --frozen --extra dev
+      - run: uv run --no-sync ruff check .
+
+  test:
+    name: pytest (Python 3.12, Node 22)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.11.26'
+          python-version: '3.12'
+      - run: uv sync --frozen --extra dev --extra sglang-tracing
+      - name: Run tests, including Node browser behavior checks
+        run: uv run --no-sync python -m pytest -q -ra --tb=short --junitxml="$RUNNER_TEMP/pytest.xml"
+      - name: Summarize failures and skipped coverage
+        if: always()
+        run: python3 .github/scripts/pytest_summary.py "$RUNNER_TEMP/pytest.xml" >> "$GITHUB_STEP_SUMMARY"

@@ -34,3 +34,21 @@ gh api repos/0dust/giraffe/rulesets
 gh api --method PUT repos/0dust/giraffe/rulesets/RULESET_ID \
   --input .github/main-ruleset.json
 ```
+
+## Automated checks
+
+Pull requests and pushes to `main` run separate Ruff and pytest checks. CI uses
+Python 3.12 because the validation observer tests require `sys.monitoring`, plus
+Node 22 for browser behavior tests. Dependencies come from `uv.lock`:
+
+```sh
+uv sync --frozen --extra dev --extra sglang-tracing --python 3.12
+uv run --no-sync ruff check .
+uv run --no-sync python -m pytest -q -ra --tb=short
+```
+
+Tests use fake/local endpoints and require no LLM service, GPU or repository
+secrets. CI disables Hugging Face downloads. Optional browser layout checks and
+an uncached tokenizer integration may skip; the job summary lists their names
+and reasons, and pytest logs retain full failure output. Skips are untested
+coverage, not passes. This workflow does not activate branch-protection rules.
