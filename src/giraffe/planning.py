@@ -1162,7 +1162,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     elif isinstance(setting, list) and all(type(item) in {int, float} and math.isfinite(item) for item in setting):
                         values[field] = setting
                 notice["values"] = values
-    return {**timing, "count_kind": kind, "planned_per_target": planned,
+    from .arrival_history import guidance as arrival_guidance
+    arrival_history = arrival_guidance(config, observations)
+    warnings.extend(row["message"] for row in arrival_history if row["status"] == "warning")
+    return {**timing, "arrival_history": arrival_history, "count_kind": kind, "planned_per_target": planned,
             **({"request_count_label": request_count_label} if load_plan else {}),
             "planned_total": planned * target_count if planned is not None else None,
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,

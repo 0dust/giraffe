@@ -151,3 +151,18 @@ Saving is explicit. Later runs do not replace the baseline; replacement requires
 evaluate the current run while comparison reports changes against the reference.
 Incompatible workloads leave metric comparison inconclusive. See
 [deployment and comparison evidence](workloads.md#deployment-metadata).
+
+
+## Previous arrival delivery
+
+Load planning uses compact summaries from the last 30 days. For each constant or
+Poisson rate, it can show a matching run’s date, sent/scheduled counts, local drops,
+lateness, completion p95 by request shape and scored correctness. Incomplete delivery
+suggests halving that rate for a trial; it never edits your settings or estimates
+maximum capacity. CLI previews expose `arrival_history`; the UI links the source run.
+
+Matching requires the same endpoint/model, nonempty configured deployment metadata,
+request settings, workload, duration, client limits and arrival pattern/rate. Runtime
+continuity remains unverified. Different rates, custom fixture files, old reports
+without these summaries, absent metadata and stale history remain unknown. Summaries
+contain counts and workload hashes, not prompts or answers.
