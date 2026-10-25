@@ -72,11 +72,14 @@ def guidance(config, observations):
     keys = fixture_keys(config)
     rows = []
     for target in config.targets:
+        by_fixture = defaultdict(list)
+        for entry in (observations or {}).get(target.name, []):
+            if entry.get("family") == "correctness_history" and isinstance(entry.get("fixture_id"), str):
+                by_fixture[entry.get("fixture_id")].append(entry)
         for fixture_id, identity in keys.items():
             matches = []
-            for entry in (observations or {}).get(target.name, []):
-                if (entry.get("family") != "correctness_history" or entry.get("fixture_id") != fixture_id
-                        or entry.get("fixture_key") != identity["key"] or entry.get("deployment_known") is not True):
+            for entry in by_fixture[fixture_id]:
+                if (entry.get("fixture_key") != identity["key"] or entry.get("deployment_known") is not True):
                     continue
                 scored, failed, ids = entry.get("scored"), entry.get("failed"), entry.get("failed_request_ids")
                 if (type(scored) is int and type(failed) is int and 0 <= failed <= scored and scored > 0
