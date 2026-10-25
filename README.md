@@ -18,7 +18,7 @@
 
 Run repeatable tests against an existing **OpenAI-compatible text endpoint**. Inspect request evidence and compare results with a [saved baseline](#save-a-baseline-and-compare).
 
-[Quick start](#quick-start) · [Inference engines](#inference-engines) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation)
+[Quick start](#quick-start) · [Inference engines](#inference-engines) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
 
 ## Quick start
 
@@ -127,6 +127,10 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 [Documentation index](docs/README.md) — detailed guides in the same repository:
 
 [Running & baselines](docs/running.md) · [Workloads & measurements](docs/workloads.md) · [Offline & Docker](docs/offline.md) · [Resource limits](docs/resources.md)
+
+## Community
+
+[Join the Giraffe Discord](https://discord.gg/GBefPbWebr) to get help with runs and reports, share feedback, and discuss ideas. Start a post in **#help-and-feedback** for a question, bug, or suggestion, and follow **#updates** for releases and improvements.
 
 [Report an issue](https://github.com/0dust/giraffe/issues) with your Giraffe version, engine/model and reproduction steps. Remove API keys and private prompts or answers before sharing reports.
 
