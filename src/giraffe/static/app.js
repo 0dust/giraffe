@@ -2171,7 +2171,7 @@ function renderReviewPassCriteria(config) {
 function renderArrivalHistory(plan) {
   const rows=plan.arrival_history || [];
   if(!rows.length)return '';
-  return `<details class="request-planning"><summary>Previous arrival delivery</summary>${rows.map(row=>`<p>${escape(row.message)}${row.run_id?` <a href="${linkRun(row.run_id)}">Open source run</a>`:''}</p>`).join('')}</details>`;
+  return `<details class="request-planning arrival-history"><summary>Previous arrival delivery</summary>${rows.map(row=>`<p>${escape(row.message)}${row.run_id?` <a href="${linkRun(row.run_id)}">Open source run</a>`:''}</p>`).join('')}</details>`;
 }
 function renderRequestPlan(config=null) {
   const element=$('#request-plan');if(!element)return;

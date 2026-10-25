@@ -85,6 +85,15 @@ def test_delivery_counts_correctness_and_trial_are_advisory(tmp_path):
     assert cfg.model_dump_json() == before
 
 
+def test_delivery_history_keeps_latency_measurements_contract(tmp_path):
+    from giraffe.latency import latency_summary
+
+    saved = latency_summary(save(tmp_path))["targets"][0]
+    assert saved["measurements"] == []  # This report has delivery totals, no request timings.
+    assert len(saved["arrival_history"]) == 1
+    assert saved["arrival_history"][0]["dispatched"] == 4
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -133,7 +142,7 @@ def test_missing_untrusted_or_stale_evidence_is_unknown(tmp_path, kind):
     if kind == "malformed":
         path = tmp_path / "previous" / ".web.json"
         value = json.loads(path.read_text())
-        value["latency_summary"]["targets"][0]["measurements"][0]["dispatched"] = 900
+        value["latency_summary"]["targets"][0]["arrival_history"][0]["dispatched"] = 900
         path.write_text(json.dumps(value))
     assert plan(tmp_path, cfg)["arrival_history"][0]["status"] == "unknown"
 
