@@ -10,6 +10,7 @@
 <p align="center">
   <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Version 0.1.0a1" src="docs/assets/badges/version.svg"></a>
   <a href="docs/README.md"><img alt="Documentation" src="docs/assets/badges/docs.svg"></a>
+  <a href="https://discord.gg/GBefPbWebr"><img alt="Join the Giraffe Discord" src="docs/assets/badges/discord.svg"></a>
   <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Python 3.11+" src="docs/assets/badges/python.svg"></a>
   <a href="https://github.com/0dust/giraffe/blob/main/LICENSE"><img alt="License Apache 2.0" src="docs/assets/badges/license.svg"></a>
 </p>
