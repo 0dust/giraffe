@@ -178,3 +178,41 @@ assert.ok(html.includes('#runs/saved%2Frun'));
 assert.ok(!html.includes('<private>'));
 assert.equal(renderArrivalHistory({}), '');
 """)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_shared_endpoint_keeps_each_targets_delivery_evidence(tmp_path, monkeypatch, reverse):
+    from copy import deepcopy
+    from giraffe.client import _headers
+    from giraffe.web import create_app
+
+    values = config().model_dump(mode="json")
+    base = values["targets"][0]
+    values["targets"] = [{**base, "name": name, "identity": {"tenant": name},
+                          "headers_env": {"X-Tenant": f"TENANT_{name.upper()}"}}
+                         for name in (["bob", "alice"] if reverse else ["alice", "bob"])]
+    for name in ("alice", "bob"):
+        monkeypatch.setenv(f"TENANT_{name.upper()}", f"private-{name}-route")
+    cfg = RunConfig.model_validate(values)
+    assert _headers(cfg.targets[0])["X-Tenant"] != _headers(cfg.targets[1])["X-Tenant"]
+    report = save(tmp_path)
+    observation = report.observations["targets"]["local"]
+    report.manifest["config"] = cfg.model_dump(mode="json")
+    report.observations["targets"] = {target.name: deepcopy(observation) for target in cfg.targets}
+    bob = report.observations["targets"]["bob"]["load_test"]["points"][0]["groups"][0]
+    bob.update(dispatched=10, not_sent=0, local_drops=0, completed=10, scored=10, correct=10)
+    write_report(report, tmp_path / "previous")
+    expected = {"alice": ("warning", 4, 6), "bob": ("observed", 10, 0)}
+    direct = plan(tmp_path, cfg)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),
+                                 base_url="http://localhost") as client:
+        response = await client.post("/api/config/preview", json=cfg.model_dump(mode="json"))
+    assert response.status_code == 200
+    for result in (direct, response.json()["request_plan"]):
+        assert {row["target"]: (row["status"], row.get("dispatched"), row.get("not_sent"))
+                for row in result["arrival_history"]} == expected
+        assert all(row["run_id"] == "previous" for row in result["arrival_history"])
+    # A name reused with different routing credentials is not comparable history.
+    cfg.targets[0].headers_env = {"X-Tenant": "CHANGED_ROUTE"}
+    assert all(row["status"] == "unknown" for row in plan(tmp_path, cfg)["arrival_history"])
+    assert "private-" not in (tmp_path / "previous" / ".web.json").read_text()

@@ -11,7 +11,7 @@ from .models import RunConfig
 def workload_keys(config):
     if config.custom_fixtures:
         return {}
-    shared = fixture_hash({"version": 1, "fixtures": FIXTURE_VERSION,
+    shared = fixture_hash({"version": 2, "fixtures": FIXTURE_VERSION,
         "request_source": config.request_source,
         "request_pack": config.request_pack.model_dump(mode="json") if config.request_source == "request_pack" and config.request_pack else None,
         "request_options": config.request_options, "stream": config.stream,
@@ -23,7 +23,8 @@ def workload_keys(config):
         "unresponsive_for_seconds": float(config.unresponsive_for_seconds), "checks": config.checks,
         "judging": config.judging.model_dump(mode="json"),
         "test_options": {name: options.model_dump(mode="json") for name, options in config.test_options.items()},
-        "targets": [{key: target.model_dump(mode="json").get(key) for key in ("name", "url", "model", "tokenizer", "identity")}
+        "targets": [{key: target.model_dump(mode="json").get(key) for key in
+                     ("name", "url", "model", "tokenizer", "identity", "route", "parent", "api_key_env", "headers_env")}
                     for target in config.targets]})
     settings_keys = {}
     for source, settings in settings_sets(config.load_test):
@@ -92,6 +93,7 @@ def guidance(config, observations):
             key = keys.get(point["id"])
             matches = [entry for entry in entries if key is not None
                 and entry.get("family") == "arrival_history" and entry.get("workload_key") == key
+                and entry.get("source_target") == target.name
                 and entry.get("deployment_known") is True and entry.get("rate") == point["rate"] and _valid(entry)]
             if not matches:
                 rows.append({"target": target.name, "point_id": point["id"], "status": "unknown",
