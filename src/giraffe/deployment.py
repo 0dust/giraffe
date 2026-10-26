@@ -585,6 +585,7 @@ def deployment_diff(current, baseline):
         rows.append({"field": key, "change": change, "baseline": b, "current": c})
     changed = [r["field"] for r in rows if r["change"] != "no_observed_change"]
     intended = current.get("intended_change")
+    intended_fields = intended if isinstance(intended, list) else [intended]
     return {
         "fields": rows,
         "unknown_baseline": not bool(baseline),
@@ -596,7 +597,7 @@ def deployment_diff(current, baseline):
             "current": current.get("continuity", "unverified"),
         },
         "intended_change": intended,
-        "confounded": bool(intended and any(f != intended for f in changed)),
+        "confounded": bool(intended and any(f not in intended_fields for f in changed)),
         "interpretation": "Changes are investigation context, not evidence of causality. Missing/stale/unobserved fields cannot establish unchanged configuration.",
     }
 

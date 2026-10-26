@@ -532,9 +532,39 @@ failed baseline does not approve it. Baselines are never silently replaced; `--r
 is explicit. Legacy snapshots are readable, with missing deployment fields unknown.
 Workload incompatibility can block metric comparison while the deployment diff
 still shows added, removed and changed fields. Runtime/image/backend changes alone
-do not invalidate an otherwise comparable workload. `intended_change` names a
-field (for example `serving.scheduler`); other observed changes flag the declared
-one-setting experiment as confounded. Differences are context, not causality.
+do not invalidate an otherwise comparable workload. Set
+`targets[].deployment.intended_change` to one exact field path (for example
+`serving.scheduler`), or a list of paths when one intended change is recorded in
+several fields:
+
+```yaml
+targets:
+  - name: local
+    url: http://localhost:8000/v1
+    model: example
+    deployment:
+      intended_change:
+        - extension.requested_speculative_config
+        - serving.launch_arguments
+checks: [serving]
+max_requests: 32
+```
+
+The declaration belongs in the target configuration, not the imported metadata
+file. Existing string declarations remain valid. A list must contain 1–256
+nonempty strings, each at most 8,192 characters. Paths match complete deployment
+diff field names exactly; they do not expand wildcards, prefixes or nested keys.
+Other observed additions, removals or changes still mark the experiment as
+confounded. For example, changed `extension.arm`, `extension.note` or
+`extension.status` fields remain confounders unless explicitly declared.
+
+Declarations apply to whole recorded fields: `serving.launch_arguments` includes
+all recorded launch arguments, so additional flag changes within that field are
+not distinguished. Inspect the complete diff before grouping fields. The report
+retains all differences, unknown fields and continuity qualifications; grouping
+is the user's declaration of intent, not verification that only one setting
+changed. Differences are context, not causality, and a non-confounded comparison
+does not establish a performance effect.
 
 ## Serving statistics
 
