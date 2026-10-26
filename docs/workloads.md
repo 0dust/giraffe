@@ -546,12 +546,33 @@ not prevent endpoint tests or change their correctness/performance outcomes.
 Explicit profiles map exact metric names and units:
 
 - `vllm-v1`: vLLM 0.30.0 V1 metric names for KV-cache fraction, running/waiting
-  requests, preemption count, prefix hits/queries and server TTFT sum/count.
+  requests, preemption count, prefix hits/queries, server TTFT sum/count and optional
+  speculative-decoding draft, proposed-token, accepted-token and per-position counters.
 - `vllm-legacy`: an explicit older-name contract adding GPU/CPU cache fractions;
   qualify the recorded runtime/version before interpreting it as supported.
 - `ollama` / `unknown`: no serving counter mapping is assumed. Ollama native APIs
   supply deployment information, but an inference URL alone does not provide
   scheduler or KV-cache counters.
+
+For vLLM speculative decoding, **Server observations** in the live UI and exported
+HTML report draft count, proposed/accepted token counts, average proposed tokens
+per draft, and token acceptance rate (accepted / proposed). The same evidence is
+available in JSON. These are changes over compatible adjacent telemetry scrapes,
+not lifetime counter values. Optional per-position acceptance uses **all drafts**
+on engines exposing that zero-based position as its denominator; it is not the
+probability of acceptance conditional on reaching that position.
+
+All three aggregate counters must have matching engine/model labels and valid
+intervals. Resets, changing labels, stale or missing samples, failed scrapes and
+truncated scrapes exclude affected intervals. Reports show the covered interval
+count, elapsed bounds, duration and partial-coverage warning; totals cover only
+valid intervals. Per-position evidence has its own coverage and may be absent
+while aggregate counts are available. Missing counters do not mean speculative
+decoding is disabled, and zero drafts make proposal length and acceptance rate
+unavailable. The counters are server-wide and may include other traffic or time
+outside the selected request window. They demonstrate observed activity, not a
+speedup or proof that every benchmark request used speculative decoding. These
+optional counters do not change acceptance-check outcomes or require GPUs.
 
 Published DCGM memory, utilization, temperature, throttle and device-error families
 remain available alongside serving series. GPU checks require each observed `gpu`

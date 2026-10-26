@@ -37,6 +37,14 @@ LEGACY = V1 | {
     "vllm:gpu_cache_usage_perc": ("cache_occupancy", "gauge", "fraction"),
     "vllm:cpu_cache_usage_perc": ("cpu_cache_occupancy", "gauge", "fraction"),
 }
+# Optional V1 counters: vLLM v0.30.0 v1/spec_decode/metrics.py.
+SPEC_DECODE = {
+    "vllm:spec_decode_num_drafts_total": ("spec_decode_drafts", "counter", "drafts"),
+    "vllm:spec_decode_num_draft_tokens_total": ("spec_decode_draft_tokens", "counter", "tokens"),
+    "vllm:spec_decode_num_accepted_tokens_total": ("spec_decode_accepted_tokens", "counter", "tokens"),
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total": ("spec_decode_accepted_tokens_per_pos", "counter", "tokens"),
+}
+V1 = V1 | SPEC_DECODE
 SGLANG = {
     "sglang:token_usage": ("cache_occupancy", "gauge", "fraction"),
     "sglang:num_running_reqs": ("running", "gauge", "requests"),
@@ -295,7 +303,7 @@ def parse(body, target, config, *, host=False):
     if not host and target.metrics_profile == "unknown":
         names = {match[1] for line in body.splitlines() if (match := LINE.fullmatch(line))}
         vllm = "vllm-legacy" if names.intersection(set(LEGACY) - set(V1)) else "vllm-v1"
-        candidates = [name for name, mapping in {vllm: LEGACY, "sglang": SGLANG, **ENGINE_METRICS}.items()
+        candidates = [name for name, mapping in {vllm: LEGACY if vllm == "vllm-legacy" else V1, "sglang": SGLANG, **ENGINE_METRICS}.items()
                       if names.intersection(mapping)]
         if len(candidates) == 1:
             detected = candidates[0]
@@ -379,7 +387,7 @@ def parse(body, target, config, *, host=False):
         "mapping": "node_exporter" if host else target.metrics_profile,
         "profile": "node_exporter" if host else target.metrics_profile,
         "profile_source": "observed exact metric names" if detected else "configured profile",
-        "mapping_reference": "https://prometheus.io/docs/guides/node-exporter/" if host else "vLLM 0.30.0 v1/metrics/loggers.py"
+        "mapping_reference": "https://prometheus.io/docs/guides/node-exporter/" if host else "vLLM 0.30.0 v1/metrics/loggers.py and v1/spec_decode/metrics.py"
         if target.metrics_profile == "vllm-v1"
         else SGLANG_REFERENCE
         if target.metrics_profile == "sglang"
@@ -521,6 +529,7 @@ async def sample_during(run, target):
 
 
 def summarize(data, threshold):
+    _, spec_deltas = _derive_spec_decode(data["snapshots"])
     groups = defaultdict(list)
     phases = defaultdict(set)
     for snap in data["snapshots"]:
@@ -556,6 +565,10 @@ def summarize(data, threshold):
                 if resets
                 else "shared endpoint counter window; attribution unknown",
             )
+        if first["name"] in SPEC_DECODE:
+            identity = (first["family"], tuple(sorted(first["labels"].items())))
+            row.update(delta=spec_deltas.get(identity),
+                       interpretation="Matched fresh adjacent server-wide intervals only; excluded intervals are unknown; attribution unknown.")
         rows.append(row)
     identities = {
         str(sorted(sample["labels"].items()))
@@ -680,6 +693,109 @@ def _counter_intervals(snapshots, families, *, matching=True):
     return intervals, excluded
 
 
+def _spec_positions(left, right, totals):
+    family = "spec_decode_accepted_tokens_per_pos"
+    intervals, _ = _counter_intervals([left, right], [family])
+    if not intervals or any(not float(sample["value"]).is_integer()
+                            for snap in (left, right) for sample in snap.get("samples", [])
+                            if sample.get("family") == family):
+        return None
+    deltas = intervals[0][1][family]
+    scopes = defaultdict(dict)
+    for labels, value in deltas.items():
+        labels = dict(labels)
+        position = labels.pop("position", "")
+        if not re.fullmatch(r"0|[1-9][0-9]*", position):
+            return None
+        scopes[tuple(sorted(labels.items()))][int(position)] = value
+    if scopes.keys() != totals["spec_decode_drafts"].keys():
+        return None
+    for labels, counts in scopes.items():
+        ordered = sorted(counts)
+        values = [counts[p] for p in ordered]
+        if (ordered != list(range(len(ordered)))
+                or sum(values) != totals["spec_decode_accepted_tokens"][labels]
+                or any(b > a for a, b in zip(values, values[1:]))
+                or values[0] > totals["spec_decode_drafts"][labels]):
+            return None
+    return deltas
+
+
+def _derive_spec_decode(snapshots):
+    families = ["spec_decode_drafts", "spec_decode_draft_tokens", "spec_decode_accepted_tokens"]
+    eligible = max(0, len(snapshots) - 1)
+    totals = dict.fromkeys(families, 0.0)
+    raw, positions = defaultdict(float), defaultdict(lambda: [0.0, 0.0])
+    windows, position_windows = [], []
+    for left, right in zip(snapshots, snapshots[1:]):
+        intervals, _ = _counter_intervals([left, right], families)
+        if not intervals:
+            continue
+        if any(not float(sample["value"]).is_integer()
+               for snap in (left, right) for sample in snap.get("samples", [])
+               if sample.get("family") in families):
+            continue
+        _, deltas = intervals[0]
+        if any(deltas[families[2]][labels] > proposed
+               or (deltas[families[0]][labels] == 0 and proposed != 0)
+               for labels, proposed in deltas[families[1]].items()):
+            continue
+        if any(not math.isfinite(totals[family] + sum(counters.values()))
+               for family, counters in deltas.items()):
+            continue
+        windows.append((left["elapsed_seconds"], right["elapsed_seconds"]))
+        for family, counters in deltas.items():
+            for labels, value in counters.items():
+                totals[family] += value
+                raw[(family, labels)] += value
+        positional = _spec_positions(left, right, deltas)
+        if positional is None:
+            continue
+        position_windows.append(windows[-1])
+        for labels, value in positional.items():
+            scope = dict(labels)
+            position = int(scope.pop("position"))
+            positions[position][0] += value
+            positions[position][1] += deltas[families[0]][tuple(sorted(scope.items()))]
+            raw[("spec_decode_accepted_tokens_per_pos", labels)] += value
+
+    def coverage(observed):
+        return {"observed_intervals": len(observed), "excluded_intervals": eligible - len(observed),
+                "duration_seconds": sum(end - start for start, end in observed),
+                "first_elapsed_seconds": observed[0][0] if observed else None,
+                "last_elapsed_seconds": observed[-1][1] if observed else None,
+                "partial_coverage": bool(eligible - len(observed))}
+
+    drafts, proposed, accepted = (totals[family] for family in families)
+    activity = "observed" if drafts else "not_observed" if windows else "unknown"
+    details = coverage(windows) | {
+        "activity": activity,
+        "attribution": "Server-wide counters may include unrelated shared traffic; not request-linked or evidence of speedup.",
+        "activity_scope": "Activity describes valid observed intervals only; zero or missing counters do not establish disabled speculative decoding.",
+    }
+    reason = "No fresh coherent draft/proposed/accepted counter interval; counters may be absent, stale, reset, incomplete or inconsistent."
+    metrics = {}
+    for family, unit in zip(families, ("drafts", "tokens", "tokens")):
+        metrics[family] = _derived(totals[family] if windows else None, unit,
+            "Sum of matching adjacent speculative-decoding counter deltas; server-wide",
+            samples=len(windows), eligible=eligible, reason=None if windows else reason, **details)
+    for key, value, unit, formula in (
+        ("spec_decode_proposal_length", proposed / drafts if drafts else None, "tokens/draft", "Δproposed tokens / Δdrafts"),
+        ("spec_decode_acceptance_ratio", accepted / proposed if proposed else None, "fraction", "Δaccepted tokens / Δproposed tokens"),
+    ):
+        metrics[key] = _derived(value, unit, formula + "; pooled matching server-wide intervals",
+            samples=len(windows), eligible=eligible,
+            reason=None if value is not None else reason if not windows else "No nonzero denominator in valid observed intervals; ratio unavailable.",
+            **details)
+    metrics["spec_decode_accepted_tokens"]["details"].update(
+        accepted_tokens_by_position=[{"position": position, "accepted_tokens": count, "drafts": denominator,
+                                     "acceptance_ratio": count / denominator if denominator else None}
+                                    for position, (count, denominator) in sorted(positions.items())],
+        position_coverage=coverage(position_windows),
+        position_denominator="All drafts on engines exposing this zero-based position; not conditional on the position being proposed.")
+    return metrics, dict(raw)
+
+
 def _mean_duration(snapshots, family):
     sum_family, count_family = family + "_sum", family + "_count"
     intervals, excluded = _counter_intervals(snapshots, [sum_family, count_family])
@@ -757,7 +873,7 @@ def derive_server_metrics(data, *, host_configured=False):
     polling interval. Source freshness without exporter timestamps stays unknown.
     """
     snapshots = data.get("snapshots", [])
-    metrics = {}
+    metrics, _ = _derive_spec_decode(snapshots)
     for family in ("server_ttft", "server_queue", "server_inference"):
         metrics[family + "_mean_ms"] = _mean_duration(snapshots, family)
         for percentile, row in _histogram_percentiles(snapshots, family).items():
@@ -816,6 +932,8 @@ def derive_server_metrics(data, *, host_configured=False):
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
+            elif profiles and key.startswith("spec_decode_") and "vllm-v1" not in profiles:
+                row.update(state="not_supported", reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
             elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
                 family = key.rsplit("_", 2)[0]
                 required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
