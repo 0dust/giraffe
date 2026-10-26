@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<h3 align="center">Acceptance checks for existing LLM endpoints</h3>
+<h3 align="center">Check whether your self-hosted LLM performs as expected.</h3>
 
 <p align="center">
   <a href="https://pypi.org/project/giraffe-llm/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/giraffe-llm"></a>
@@ -18,7 +18,22 @@
 
 ---
 
-Run repeatable tests against an existing **OpenAI-compatible text endpoint**. Inspect request evidence and compare results with a [saved baseline](#save-a-baseline-and-compare).
+Giraffe is a test suite for engineers running self-hosted LLMs. Point it at an
+existing **OpenAI-compatible chat API**, such as Ollama or vLLM, to check answers
+against expected results, measure response times, and test behavior under load.
+Run it from the command line or a local web UI, inspect failed requests, and
+compare results before and after a deployment change.
+
+Use it to answer questions like:
+
+- Do answers that pass individually still pass when requests run concurrently?
+- Which tested traffic rates meet our correctness and response-time limits?
+- After a server upgrade, which checks or measurements got worse?
+
+Start with built-in checks, or supply your own questions and expected answers.
+You choose the checks, traffic and acceptance limits. A passing run applies to
+those tests and settings; it does not establish general model quality or certify
+production capacity.
 
 [Quick start](#quick-start) · [Inference engines](#inference-engines) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
 
@@ -46,9 +61,15 @@ giraffe run --url http://127.0.0.1:11434/v1 \
   --concurrency 1 --html
 ```
 
-This checks endpoint access, response validity and known-answer correctness, one request at a time.
+This is a basic sequential check of endpoint access, response validity and known-answer correctness. It does not test concurrent serving or load capacity.
 
-**Outputs:** results in the terminal, plus JSON and HTML reports in `runs/<timestamp>/`. The command exits when finished.
+**Outputs:** results in the terminal, plus JSON and HTML reports in `runs/<timestamp>/`. The command exits when finished. Open `report.html` to inspect each check and its requests.
+
+A **pass** means the selected required checks have enough evidence and meet their
+limits. A **fail** means a check observed a failure. **Inconclusive** means there
+is not enough evidence to decide; **blocked** means the run or check could not
+proceed. See the [results guide](https://github.com/0dust/giraffe/blob/main/docs/running.md#results-and-stopping)
+for exit codes and partial runs.
 
 ### Prefer the browser UI?
 
@@ -85,9 +106,23 @@ giraffe run --config examples/vllm.yaml \
 
 Giraffe reads the run settings from YAML; `--output` chooses where to save the results, and `--html` adds an HTML report.
 
+## Test behavior under load
+
+Select **Load test** to repeat requests at different concurrency levels or arrival
+rates. Set the traffic and correctness, response-time and error limits for your
+service, then inspect which tested settings pass and which fail. The highest
+passing setting is a tested result, not a discovered maximum capacity.
+
+Built-in workloads cover different input and output lengths. You can also supply
+your own questions and expected answers to test the work your application needs.
+See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
+for traffic patterns, answer checks and configuration examples.
+
 ## Save a baseline and compare
 
-Save the completed `runs/before` run as a reference. After a deployment change, run the same configuration with `--baseline`:
+Save the completed `runs/before` run as a reference. After a deployment change,
+such as a server upgrade, run the same configuration with `--baseline`. Keep the
+endpoint URL, model ID, workload and acceptance settings the same across runs:
 
 ```sh
 giraffe baseline save runs/before baselines/before.json
