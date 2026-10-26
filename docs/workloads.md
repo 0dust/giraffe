@@ -605,6 +605,13 @@ time, phase, units and labels. Bounds are explicit: `metrics_interval_seconds`,
 `metrics_timeout_seconds`, `metrics_max_samples`, `metrics_max_series`; every scrape
 also has a 1 MiB response limit and the global run deadline. Collection stops on
 cancellation. Sample/cardinality limits and collection gaps remain visible.
+Existing serving and GPU samples take priority over optional speculative-decoding
+counters within the same `metrics_max_series` bound, regardless of exporter order.
+Reports identify which metric families lost samples or labels. Loss in optional
+counters does not invalidate complete GPU or serving evidence; incomplete GPU
+evidence cannot support a passing GPU check, even without a declared device count.
+Observed GPU failures still fail. Older reports with an unscoped truncation flag
+are treated conservatively as incomplete evidence.
 
 Unavailable states distinguish not enabled, no endpoint, transport/timeout,
 authentication denied, endpoint absent, empty success, unsupported format, absent

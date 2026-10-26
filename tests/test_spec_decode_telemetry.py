@@ -214,3 +214,25 @@ def test_fractional_position_counts_do_not_invalidate_integral_core():
     row = derive(first, last)["spec_decode_accepted_tokens"]
     assert row["value"] == 2
     assert row["details"]["accepted_tokens_by_position"] == []
+
+
+def test_position_only_truncation_preserves_complete_totals_but_not_position_ratios():
+    target = Target(name="test", url="http://inference/v1", model="test", metrics_profile="vllm-v1")
+    config = RunConfig(targets=[target], metrics_max_series=5)
+    snaps = [telemetry.parse(body(n, n * 3, n * 2, positions=(n, n, 0)), target, config)
+             | {"elapsed_seconds": n} for n in (1, 2)]
+    assert snaps[0]["truncated_families"] == ["spec_decode_accepted_tokens_per_pos"]
+    rows = derive(*snaps)
+    assert rows["spec_decode_drafts"]["value"] == 1
+    assert rows["spec_decode_acceptance_ratio"]["value"] == pytest.approx(2 / 3)
+    assert rows["spec_decode_accepted_tokens"]["details"]["accepted_tokens_by_position"] == []
+    assert rows["spec_decode_accepted_tokens"]["details"]["position_coverage"]["observed_intervals"] == 0
+
+
+def test_truncated_spec_totals_never_form_partial_population_ratio():
+    target = Target(name="test", url="http://inference/v1", model="test", metrics_profile="vllm-v1")
+    config = RunConfig(targets=[target], metrics_max_series=4)
+    snaps = [telemetry.parse(body(n, n * 3, n * 2, engine="a")
+                            + body(n, n * 3, n * 2, engine="b"), target, config)
+             | {"elapsed_seconds": n} for n in (1, 2)]
+    assert derive(*snaps)["spec_decode_acceptance_ratio"]["value"] is None

@@ -110,6 +110,8 @@ LINE = re.compile(
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
 GPU_FAMILIES = {entry[0] for entry in GPU.values()}
+METRIC_FAMILIES = {entry[0] for mapping in (V1, LEGACY, SGLANG, *ENGINE_METRICS.values(), GPU, HOST)
+                   for entry in mapping.values()}
 # NVIDIA DCGM adverse bits: HW slowdown, SW/HW thermal, power brake.
 # Idle/application-clock/sync-boost/display-clock reasons alone are not failures.
 GPU_THROTTLE_REASONS = {8: "hardware slowdown",
@@ -146,7 +148,7 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
         if snap.get("status") not in {"available", "stale_samples", "absent_families"}:
             continue
         samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
-        if snap.get("series_limit_reached"):
+        if _families_truncated(snap, GPU_FAMILIES):
             truncated.add(index)
         if not samples:
             continue
@@ -268,6 +270,8 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
         return metrics, "fail", "GPU telemetry reports a new XID, repeated adverse slowdown or configured temperature violation; " + qualifier
     if any(warning.get("history_unknown") for warning in warnings):
         return metrics, "inconclusive", "Initial XID history is unknown; cannot distinguish a historical XID from a new error; " + qualifier
+    if truncated:
+        return metrics, "inconclusive", "GPU telemetry was truncated; retained devices cannot establish complete coverage; " + qualifier
     if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and observed_count < gpu_count:
         return metrics, "inconclusive", f"GPU telemetry covers {observed_count} devices, fewer than the declared {gpu_count}; " + qualifier
     if any(not row["fresh_in_first_and_last_snapshot"] for row in rows):
@@ -319,50 +323,58 @@ def parse(body, target, config, *, host=False):
         else ENGINE_METRICS.get(target.metrics_profile, {})
     )
     mapping = HOST if host else profile | GPU
-    samples, recognized, truncated = [], 0, False
-    for line in body.splitlines():
-        if line.lstrip().startswith("#") or not line.strip():
-            continue
-        match = LINE.fullmatch(line)
-        if not match:
-            continue
-        recognized += 1
-        name, raw_labels, raw_value, raw_time = match.groups()
-        if name not in mapping or not math.isfinite(float(raw_value)):
-            continue
-        if len(samples) >= config.metrics_max_series:
-            truncated = True
-            continue
-        labels = {}
-        for key, value in LABEL.findall(raw_labels or ""):
-            if len(labels) >= MAX_METRICS_LABELS:
-                truncated = True
-                break
-            labels[key] = value[:MAX_METRICS_LABEL_CHARS]
-        family, kind, unit = mapping[name]
-        timestamp = float(raw_time) if raw_time else None
-        age = time.time() - timestamp / 1000 if timestamp is not None else None
-        max_age = (config.effective_check("gpu")["metrics_max_age_seconds"]
-                   if family in {entry[0] for entry in GPU.values()} and "gpu" in config.checks
-                   else config.metrics_max_age_seconds)
-        stale = age is not None and (age > max_age or age < -5)
-        samples.append(
-            {
-                "name": name,
-                "family": family,
-                "kind": kind,
-                "unit": unit,
-                "value": float(raw_value),
-                "labels": sanitize(labels),
-                "sample_timestamp_ms": timestamp,
-                "age_seconds": age,
-                "stale": stale,
-                "freshness": "source timestamp"
-                if timestamp
-                else "scrape only; source freshness unknown",
-                "provenance": "host node_exporter metrics" if host else "runtime-reported metrics",
-            }
-        )
+    samples, recognized, truncated_families = [], 0, set()
+    lines = body.splitlines()
+    passes = (False, True) if mapping.keys() & SPEC_DECODE.keys() else (False,)
+    for optional in passes:
+        for line in lines:
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            match = LINE.fullmatch(line)
+            if not match:
+                continue
+            if not optional:
+                recognized += 1
+            name, raw_labels, raw_value, raw_time = match.groups()
+            if (name in SPEC_DECODE) != optional:
+                continue
+            if name not in mapping or not math.isfinite(float(raw_value)):
+                continue
+            family, kind, unit = mapping[name]
+            if len(samples) >= config.metrics_max_series:
+                truncated_families.add(family)
+                continue
+            labels = {}
+            for key, value in LABEL.findall(raw_labels or ""):
+                if len(labels) >= MAX_METRICS_LABELS:
+                    truncated_families.add(family)
+                    break
+                if len(value) > MAX_METRICS_LABEL_CHARS:
+                    truncated_families.add(family)
+                labels[key] = value[:MAX_METRICS_LABEL_CHARS]
+            timestamp = float(raw_time) if raw_time else None
+            age = time.time() - timestamp / 1000 if timestamp is not None else None
+            max_age = (config.effective_check("gpu")["metrics_max_age_seconds"]
+                       if family in GPU_FAMILIES and "gpu" in config.checks
+                       else config.metrics_max_age_seconds)
+            stale = age is not None and (age > max_age or age < -5)
+            samples.append(
+                {
+                    "name": name,
+                    "family": family,
+                    "kind": kind,
+                    "unit": unit,
+                    "value": float(raw_value),
+                    "labels": sanitize(labels),
+                    "sample_timestamp_ms": timestamp,
+                    "age_seconds": age,
+                    "stale": stale,
+                    "freshness": "source timestamp"
+                    if timestamp
+                    else "scrape only; source freshness unknown",
+                    "provenance": "host node_exporter metrics" if host else "runtime-reported metrics",
+                }
+            )
     families = {s["family"] for s in samples if not s["stale"]}
     state = (
         "stale_samples"
@@ -383,7 +395,8 @@ def parse(body, target, config, *, host=False):
         "status": state,
         "samples": samples,
         "missing_families": sorted(required - families),
-        "series_limit_reached": truncated,
+        "series_limit_reached": bool(truncated_families),
+        "truncated_families": sorted(truncated_families),
         "mapping": "node_exporter" if host else target.metrics_profile,
         "profile": "node_exporter" if host else target.metrics_profile,
         "profile_source": "observed exact metric names" if detected else "configured profile",
@@ -651,9 +664,16 @@ def _derived(value, unit, source, *, reason=None, state=None, samples=0, eligibl
             "details": details}
 
 
+def _families_truncated(snapshot, families):
+    truncated = snapshot.get("truncated_families")
+    if isinstance(truncated, list) and truncated and all(isinstance(f, str) and f in METRIC_FAMILIES for f in truncated):
+        return bool(set(families).intersection(truncated))
+    return bool(snapshot.get("series_limit_reached") or truncated)
+
+
 def _fresh_families(snapshot, families):
     """A failed, truncated, duplicate or stale scope cannot form a counter interval."""
-    if snapshot.get("status") not in {"available", "absent_families"} or snapshot.get("series_limit_reached"):
+    if snapshot.get("status") not in {"available", "absent_families"} or _families_truncated(snapshot, families):
         return None
     rows = {family: {} for family in families}
     for sample in snapshot.get("samples", []):
