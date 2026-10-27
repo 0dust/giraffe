@@ -102,7 +102,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
 
     def measured(target, check, concurrency, specs, source=None):
         entries = (source if source is not None else observations or {}).get(target, [])
-        queries = [dict(family=check, concurrency=concurrency, stream=config.stream and spec.stream,
+        # Logprob requests override global streaming, just as they do in LLMClient.
+        use_spec_stream = check == "consistency" and config.consistency.logprobs is not None
+        queries = [dict(family=check, concurrency=concurrency,
+                        stream=spec.stream if use_spec_stream else config.stream and spec.stream,
                         output_cap=spec.max_tokens, input_bucket=input_bucket(spec.input_chars or 0)) for spec in specs]
         matched = pooled_matches(target, queries, entries)
         if matched:

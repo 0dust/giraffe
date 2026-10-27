@@ -601,11 +601,12 @@ async def test_spaced_arrivals_do_not_assume_the_pending_queue_is_full(monkeypat
     assert not any(item["id"] == "arrivals_pending" for item in preview["time_timeline"])
 
 
+@pytest.mark.parametrize("global_stream", [False, True])
 @pytest.mark.parametrize("response_mode", ["stream", "complete"])
-def test_logprob_consistency_uses_exact_response_mode_observations(response_mode):
+def test_logprob_consistency_uses_exact_response_mode_observations(response_mode, global_stream):
     from giraffe.logprob_workload import logprob_fixtures
 
-    configured = config(checks=["consistency"], consistency={"levels": [1, 3], "shapes": ["short"],
+    configured = config(checks=["consistency"], stream=global_stream, consistency={"levels": [1, 3], "shapes": ["short"],
                         "repetitions": 2, "logprobs": {"priming_rounds": 1, "response_mode": response_mode}})
     template = logprob_fixtures(configured, builtin_fixtures(configured))["short"]
     measured = {"service": [{"family": "consistency", "concurrency": level, "stream": response_mode == "stream",
@@ -616,6 +617,17 @@ def test_logprob_consistency_uses_exact_response_mode_observations(response_mode
     assert plan["unknown_time_components"] == []
     assert plan["estimated_low_seconds"] == .112  # Independent groups combine variances, not interval widths.
     assert plan["estimated_high_seconds"] == .223
+
+    incompatible = {"service": [{**row, "stream": not row["stream"], **tail(1000, 2000, n=6)}
+                                for row in measured["service"]]}
+    unknown = request_plan(configured, observations=incompatible)
+    assert len(unknown["unknown_time_components"]) == 2
+    assert unknown["estimated_low_seconds"] is unknown["estimated_high_seconds"] is None
+
+    mixed = request_plan(configured, observations={"service": measured["service"] + incompatible["service"]})
+    assert mixed["unknown_time_components"] == []
+    assert mixed["estimated_low_seconds"] == plan["estimated_low_seconds"]
+    assert mixed["estimated_high_seconds"] == plan["estimated_high_seconds"]
 
 
 def test_recovery_cleanup_wait_remains_when_sustained_duration_is_zero():
