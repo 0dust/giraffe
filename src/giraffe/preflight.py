@@ -111,9 +111,8 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
     target = body.target()
     try:
         headers = _headers(target)
-    except ValueError:
-        raise PreflightError("An authentication environment variable is not set. "
-                            "Set it before starting Giraffe, then check the API key section.") from None
+    except ValueError as error:
+        raise PreflightError(str(error)) from None
     url = completion_url(target.url).removesuffix("/chat/completions") + "/models"
     try:
         verify = ssl.create_default_context(cafile=body.ca_bundle) if body.ca_bundle else True
@@ -212,9 +211,8 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         async with asyncio.timeout(15):
             try:
                 _headers(target)
-            except ValueError:
-                raise PreflightError("An authentication environment variable is not set. "
-                                    "Set it before starting Giraffe.") from None
+            except ValueError as error:
+                raise PreflightError(str(error)) from None
             async with _PreflightClient(target, config) as client:
                 record = await client.execute(RequestSpec(
                     fixture_id="connection", scenario="connection", check_ids=["access"],
@@ -241,7 +239,20 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         raise PreflightError("Server denied access. Check your authentication: the API key, "
                             "environment variable and header settings.")
     if not record.valid:
-        blocking = record.http_status == 404
+        if record.http_status in {400, 404, 422} and record.workload.get("model_not_served"):
+            discovery = ModelDiscovery(url=target.url, api_key_env=target.api_key_env,
+                                       headers_env=target.headers_env, ca_bundle=config.ca_bundle,
+                                       proxy=config.proxy, api_key=target._api_key)
+            try:
+                available = (await discover_models(discovery, allow_manual=True))["models"]
+            except PreflightError:
+                available = []
+            message = f'Model "{target.model}" not served at {target.url}.'
+            if target.model not in available:
+                if available:
+                    message += " Available: " + ", ".join(available) + "."
+                raise PreflightError(message)
+        blocking = record.http_status == 404 and not record.workload.get("model_not_served")
         if record.http_status is None:
             error = record.error or ""
             timeout = "Timeout" in error

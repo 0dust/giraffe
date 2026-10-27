@@ -60,11 +60,14 @@ async def test_recovery_allowance_records_request_limit_before_total_exhaustion(
     assert "max_requests" in report.limits_reached
 
 
-async def test_final_request_marks_exhaustion_even_without_another_admission_check(monkeypatch):
+@pytest.mark.parametrize("samples,exhausted", [(6, False), (8, True)])
+async def test_final_request_marks_exhaustion_even_without_another_admission_check(monkeypatch, samples, exhausted):
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    report = await runner.run_suite(config(max_requests=6))
+    configured = config(max_requests=6, samples=samples)
+    report = await runner.run_suite(configured)
     assert len(report.requests) == 6
-    assert "max_requests" in report.limits_reached
+    assert ("max_requests" in report.limits_reached) == exhausted
+    assert (report.abort_reason == "maximum request budget reached") == exhausted
 
 
 async def test_legacy_custom_fixture_caps_survive_v2_export_and_v2_keeps_own_caps(tmp_path, monkeypatch):

@@ -1,40 +1,31 @@
 config_version: 2
-# Existing endpoint only. Set rates and SLOs for your deployment before running:
-# giraffe ui --config examples/traffic.yaml
+# Test Poisson arrivals. Set rates and acceptance limits for your deployment.
 targets:
   - name: local
     url: http://127.0.0.1:11434/v1
+    # Set context_limit below to the server's configured context window.
+    deployment:
+      serving:
+        context_limit: 4096
     model: qwen2.5:7b-instruct
-
-checks: [capacity, correctness]
+checks: [load]
 concurrency: 32
-default_concurrency: 32
-max_requests: 600
-max_duration_seconds: 300
-request_timeout_seconds: 30
-max_output_tokens: 128
-request_options: {temperature: 0}
-retention: failures
-
-traffic:
-  rates: [1, 2, 4]
-  duration_seconds: 20
-  arrival: poisson
-  seed: 42
-  mix: {short: 0.6, long_input: 0.2, long_output: 0.2}
-  long_input_chars: 4096
-  long_output_words: 32
-  drain_timeout_seconds: 30
-
-# Example limits, not hardware/model recommendations.
-test_options:
-  capacity:
-    limits:
-      first_output_ms: 1500
-      latency_ms: 10000
-      min_correctness: 1
-      max_error_rate: 0
-      min_samples: 5
-  correctness:
-    samples: 12
-    concurrency: 4
+context_limit: 4096
+load_test:
+  workloads:
+    combinations:
+      selected: [short_short]
+  patterns:
+    concurrent:
+      enabled: false
+    constant:
+      enabled: false
+    poisson:
+      enabled: true
+      seed: 42
+    rates: [1, 2, 4]
+  schedule:
+    duration_seconds: 20
+  pass_criteria:
+    max_first_answer_ms: 1500
+    max_completion_ms: 10000

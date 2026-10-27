@@ -12,7 +12,7 @@ import pytest
 
 from tests.fake_endpoint import FakeEndpoint
 from giraffe.models import (
-    CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, CheckResult, RequestRecord, RunConfig, RunReport,
+    CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckResult, RequestRecord, RunConfig, RunReport,
 )
 from giraffe.reporting import write_report
 from giraffe.web import create_app
@@ -390,9 +390,7 @@ async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monk
         assert result["config"]["targets"][0]["model"] == ""
         assert result["config"]["restart_target"] is None
         assert len(result["checks"]) == 15
-        assert {c["id"] for c in result["checks"] if c["optional"]} == {
-            "json", "gpu", "prefix", "sessions", "consistency", "tools",
-        }
+        assert {c["id"] for c in result["checks"] if not c["optional"]} == set(DEFAULT_CHECKS)
         assert result["active_run_id"] is None
         assert (await client.get("/api/runs")).json()["runs"] == []
 
@@ -407,7 +405,7 @@ async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
             assert set(check["limit_fields"]) <= result["limits_schema"]["properties"].keys()
         assert result["traffic_schema"]["properties"]["arrival"]["enum"] == ["steady", "poisson"]
         assert result["config"]["traffic"]["rates"] == [1, 2, 4]
-        assert result["config"]["checks"] == ["access", "correctness"]
+        assert result["config"]["checks"] == list(DEFAULT_CHECKS)
 
 
 async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkeypatch):
@@ -416,8 +414,8 @@ async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkey
     monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Setup sent traffic"))
     async with browser(tmp_path) as client:
         bootstrap = (await client.get("/api/bootstrap")).json()
-        assert bootstrap["request_plan"]["planned_per_target"] == 7
-        values = config(checks=["access", "correctness"])
+        assert bootstrap["request_plan"]["planned_per_target"] == 13
+        values = config(checks=list(DEFAULT_CHECKS))
         for endpoint in ("draft", "validate", "preview"):
             response = await client.post(f"/api/config/{endpoint}", json=values)
             assert response.status_code == 200, response.text

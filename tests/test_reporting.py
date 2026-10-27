@@ -206,6 +206,7 @@ def test_legacy_cancellation_grading_cannot_claim_a_server_stop_regression(verif
 def test_cancellation_baselines_ignore_only_inactive_backend_settings(change, expected, reverse):
     current, previous = make_report(), make_report("baseline")
     for report in (current, previous):
+        report.manifest["config"]["checks"] = ["cancellation", "recovery"]
         config = RunConfig.model_validate(report.manifest["config"])
         report.manifest["effective_checks"] = {
             name: config.effective_check(name) for name in config.checks
@@ -818,3 +819,22 @@ def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evi
     if evidence_count < 25:
         assert 'Request current-0 ' in html
     assert 'Request current-30 ' not in html
+
+
+def test_old_baseline_none_effective_defaults_match_same_explicit_config():
+    from copy import deepcopy
+    from giraffe.reporting import _settings_reasons
+    current = make_report()
+    current.manifest['config'].update(checks=['first_output', 'generation'])
+    config = RunConfig.model_validate(current.manifest['config'])
+    current.manifest['effective_checks'] = {name: config.effective_check(name) for name in config.checks}
+    previous = deepcopy(current)
+    previous.run_id = 'main-baseline'
+    # Old main saved a full config and None for the two formerly absent sanity defaults.
+    previous.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = None
+    previous.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = None
+    current.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = 10000
+    current.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = 5000
+    assert _settings_reasons(current, previous) == []
+    current.manifest['config']['test_options'] = {'generation': {'limits': {'stream_gap_ms': 2000}}}
+    assert _settings_reasons(current, previous)

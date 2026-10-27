@@ -83,6 +83,8 @@ def _comparison_config(value: dict) -> dict:
     config, _ = migrate_concurrent_load(config)
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
+        for field in ("first_output_ms", "stream_gap_ms"):
+            config["limits"].setdefault(field, None)
     default = config.setdefault("default_concurrency", 4)
     ceiling = config.get("concurrency")
     if isinstance(ceiling, int):
@@ -141,6 +143,12 @@ def _comparison_manifest(manifest: dict) -> dict:
                     **settings} if isinstance(settings, dict) else settings
             for check, settings in value["effective_checks"].items()
         }
+    for check, field in (("first_output", "first_output_ms"), ("generation", "stream_gap_ms")):
+        settings = value.get("effective_checks", {}).get(check)
+        if isinstance(settings, dict) and isinstance(settings.get("limits"), dict):
+            supplied = (config.get("test_options", {}).get(check) or {}).get("limits") or {}
+            threshold = supplied[field] if field in supplied else (config.get("limits") or {}).get(field)
+            value["effective_checks"][check] = {**settings, "limits": {**settings["limits"], field: threshold}}
     if "capacity" in resolved.checks:
         value.setdefault("effective_traffic", resolved.effective_traffic().model_dump(mode="json"))
     return value

@@ -1359,31 +1359,6 @@ def _pack_results(run: _Run, target: Target) -> dict:
             "repeated_requests_per_target": preview["repeated_requests_per_target"]}
 
 
-def _load_conclusion_guidance(run: _Run, check: CheckResult) -> str:
-    from .load_test import settings_sets
-
-    settings = dict(settings_sets(run.config.load_test))
-    points = check.metrics.get("points", [])
-    groups = [group for point in points for group in point.get("groups", [])]
-    reasons = {point.get("reason_code") for point in points}
-    actions = []
-    if "budget_limited" in reasons:
-        actions.append("increase max_requests (or --max-requests) or shorten the selected sending windows so the request budget covers the complete workload")
-    if "time_limited" in reasons:
-        actions.append("increase max_duration_seconds (or --max-duration) or shorten the selected sending windows so the run deadline covers the complete workload")
-    if any(point.get("source", "primary") in settings and
-           settings[point.get("source", "primary")].pass_criteria.max_first_answer_ms is None and
-           settings[point.get("source", "primary")].pass_criteria.max_completion_ms is None
-           for point in points):
-        actions.append("set load_test.pass_criteria.max_first_answer_ms or max_completion_ms to your service's acceptance target; measurement-only load remains inconclusive without a latency limit")
-    unscored = sum(group.get("unscored", 0) for group in groups)
-    if unscored:
-        actions.append("answers are unscored: throughput and latency remain available, but answer correctness and full-workload correct goodput are unknown; configure answer scorers if those results are needed")
-    if not actions:
-        actions.append("complete every selected sending window and collect the required valid, scored responses with complete delivery and timing evidence")
-    return " To conclude, " + "; ".join(actions) + "."
-
-
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
@@ -1398,8 +1373,6 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             from giraffe.load_test import result as load_result
             item = load_result(run, target) if check_id in run.config.checks else CheckResult(
                 id=check_id, title=title, target=target.name, required=False, status="skipped", summary="Not selected.")
-            if item.status == "inconclusive":
-                item.summary += _load_conclusion_guidance(run, item)
             result.append(item)
             continue
         config = _check_config(run.config, check_id)
@@ -1449,6 +1422,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                            near_limit_coverage=False, observed_max_input_tokens=None)
         elif not records and check_id != "capacity":
             status, summary = "inconclusive", "No applicable requests completed within the run budget."
+            if check_id in run.unfinished[target.name]:
+                metrics["reason_code"] = "unfinished"
         elif check_id == "access":
             denied = [r for r in records if r.http_status in {401, 403}]
             disconnected = [r for r in records if r.http_status is None and r.status == "failed"
@@ -1484,6 +1459,15 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             assessed_limits = limits.model_copy(update={"latency_ms": None, "stream_gap_ms": None,
                 "min_output_tokens_per_second": None}) if check_id == "first_output" else limits.model_copy(update={"first_output_ms": None})
             qualified = qualified_violations(records, assessed_limits, quality, unfinished=True)
+            if check_id == "first_output" and limits.first_output_ms is not None:
+                p95 = metrics["first_output_p95_ms"]
+                if p95 is not None and p95 <= limits.first_output_ms:
+                    # Completed answers are judged as a p95 cohort; an unfinished
+                    # request can still establish a lower-bound timing failure.
+                    unfinished_ids = {r.id for r in records if not r.valid
+                                      and "first_output_ms" in exceeded_unfinished(r, limits)}
+                    violations = [identifier for identifier in violations if identifier in unfinished_ids]
+                    qualified = [identifier for identifier in qualified if identifier in unfinished_ids]
             gap_samples = sum(r.valid and r.status == "completed" and r.measured_stream_gap for r in records)
             metrics["measured_gap_samples"] = gap_samples
             if qualified:
@@ -1626,7 +1610,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                            f"for declared context_limit {config.context_limit} (70% estimated, 85% server-reported).")
             elif accuracy is not None and accuracy < limits.min_correctness:
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
-            elif check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1 and metrics["evidenced_overlap"] < 2:
+            elif (check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1
+                  and metrics["evidenced_overlap"] < 2 and (run.config.parallelism_requested(check_id)
+                  or metrics["completed"] != metrics["attempted"]
+                  or metrics["scored"] != metrics["completed"] or not metrics["scored"])):
                 metrics["reason_code"] = "missing_concurrent_answers"
                 status, summary = "inconclusive", ("Known-answer checks were not exercised concurrently: no scored answer's streamed response "
                     "overlapped another outside recorded client scheduling delays" + (f"; {NEEDS_STREAM}." if not config.stream else
@@ -1641,6 +1628,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Some request-pack cases have scoring disabled; answer correctness cannot be established."
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
+                if metrics["cancelled"]:
+                    metrics["reason_code"] = "cancelled"
             elif check_id == "context" and metrics["reduced_position_coverage"]:
                 status, summary = "inconclusive", "reduced fact-position coverage (context_limit too small)"
             elif check_id == "context" and not metrics["near_limit_coverage"]:
@@ -1651,6 +1640,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 summary = ("Built-in deterministic checks passed under observed concurrency."
                            if check_id in {"correctness", "json"} and config.concurrency > 1
                            else "Built-in deterministic checks passed for the recorded fixtures.")
+            if (check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1
+                    and metrics["evidenced_overlap"] < 2 and not run.config.parallelism_requested(check_id)
+                    and metrics["scored"] == metrics["completed"] == metrics["attempted"]
+                    and metrics["scored"] and status in {"pass", "fail"}):
+                metrics["concurrency_evidence"] = "not observed — server answered one request at a time"
+                summary = (f"{metrics['correct']}/{metrics['scored']} correct; server answered one at a time, "
+                           "so concurrent correctness was not tested.")
         elif check_id == "cancellation":
             import re as _re
             cancelled = [r for r in all_records if r.scenario == "client_cancel"]
@@ -1799,6 +1795,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer; recovery is unverified."
             elif metrics["cancelled"]:
                 status, summary = "inconclusive", "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."
+                metrics["reason_code"] = "cancelled"
             elif accuracy is None or metrics["unscored_completions"]:
                 status, summary = "inconclusive", "Some sustained or recovery completions lack a local correctness score."
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
@@ -1812,12 +1809,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                   or after["completed"] < config.samples
                   or before["completed"] < config.samples):
                 status, summary = "inconclusive", "Sustained duration or light-load recovery was not fully observed."
+                metrics["reason_code"] = "unfinished"
             elif limits.recovery_max_ratio is not None and (latency_ratio is None or first_ratio is None):
                 status, summary = "inconclusive", "Recovery ratio requires matching latency and first-output baseline evidence."
-            elif not any((limits.recovery_max_ratio, limits.first_output_ms, limits.latency_ms,
-                          limits.stream_gap_ms, limits.min_output_tokens_per_second)):
-                status, summary = "inconclusive", "Recovery observed; no acceptance limit configured."
-                metrics["reason_code"] = "missing_acceptance_limit"
             else:
                 summary = "Bounded sustained traffic and recovery completed; unobserved internal paths remain unverified."
                 if limits.recovery_max_ratio is None:
@@ -1871,6 +1865,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                        f"answer check: {outcomes['answer']['status']}. {summary}")
         if status == "pass" and check_id in run.unfinished[target.name]:
             status, summary = "inconclusive", "This check was unfinished when a run budget or stop condition was reached."
+            metrics["reason_code"] = "unfinished"
         if metrics.get("completed", 0) < limits.min_samples and status not in {"skipped", "blocked"}:
             metrics["low_confidence"] = True
         result.append(CheckResult(id=check_id, target=target.name, title=title, status=status,
@@ -1893,12 +1888,47 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         config = _check_config(run.config, check.id)
         evidence = set(check.evidence_ids)
         records = [r for r in all_records if r.id in evidence]
+        interrupted = (check.id in run.unfinished[target.name] and check.status == "inconclusive"
+                       and check.metrics.get("reason_code") in {"unfinished", "cancelled", "run_stopped",
+                                                               "budget_limited", "time_limited"})
+        stopped_short_of_samples = (check.id in run.unfinished[target.name] and check.status == "inconclusive"
+                                    and check.metrics.get("reason_code") == "insufficient_timing_samples")
+        if (interrupted or stopped_short_of_samples) and run.reason == "cancelled by user":
+            from .planning import request_plan
+            plan = request_plan(run.config)
+            planned = plan["planned_total"]
+            if planned is None:
+                planned = run.config.max_requests
+            check.summary = (f"Stopped by you after {len(run.records)} of {max(planned, len(run.records))} planned requests."
+                             if planned is not None else
+                             f"Stopped by you after {len(run.records)} requests. This duration-based workload has no fixed request count.")
+            continue
+        if interrupted and run.reason == "maximum request budget reached" and check.id not in {"load", "recovery"}:
+            check.summary = "Request budget reached before this check finished. " + budget
+            continue
+        if interrupted and run.reason == "maximum run duration reached" and check.id not in {"load", "recovery"}:
+            check.summary = "Run deadline reached before this check finished. " + _deadline_guidance(run.config)
+            continue
         if check.id not in {"load", "concurrency"}:
             check.summary = _verdict_summary(check, config, records, budget)
-        if disconnected:
+        if disconnected and check.id == "load":
+            count = check.summary.split(": ", 1)[0]
+            check.summary = (f"{count}: {disconnected}. "
+                             "Start the server and verify the target URL, port, proxy and TLS settings.")
+        elif disconnected:
             check.summary = (f"{disconnected}. {check.summary} "
                              "Start the server and verify the target URL, port, proxy and TLS settings, then rerun.")
     return result + workload_results
+
+
+def _deadline_guidance(config):
+    from .planning import request_plan
+    plan = request_plan(config)
+    high = plan.get("budget_high_seconds")
+    if not plan["unknown_time_components"] and high is not None and math.isfinite(high):
+        return f"Raise --max-duration (max_duration_seconds) to at least {math.ceil(high)} seconds or select fewer checks."
+    current = f" (current {config.max_duration_seconds:.3g} s)" if config.max_duration_seconds is not None else ""
+    return f"Increase --max-duration{current} or select fewer checks."
 
 
 def _budget_guidance(config, check_id=None):
@@ -1912,7 +1942,7 @@ def _budget_guidance(config, check_id=None):
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
-    amount = f"to at least {planned}" if planned > config.max_requests else f"above {config.max_requests} if exhausted"
+    amount = f"to at least {max(planned, config.max_requests + 1)}"
     return (f"Raise max_requests (or --max-requests) {amount}, "
             f"or select fewer checks. The plan needs at least {plan['known_total']} fixed requests; adaptive traffic may need more.")
 
@@ -2079,7 +2109,8 @@ def _verdict_summary(check, config, records, budget):
             "arrivals": ("latency_ms", "first_output_ms", "stream_gap_ms", "min_output_tokens_per_second"),
             "recovery": ("recovery_max_ratio", "first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second"),
         }[check.id]
-        option = " or ".join(f"limits.{name}" for name in options)
+        option = " or ".join(f"limits.{name} (--{name.replace('_', '-')})"
+                             if name != "recovery_max_ratio" else f"limits.{name}" for name in options)
         remedy = f"set {option} to your service's acceptance target and rerun"
     elif reason == "scoring_disabled":
         remedy = "configure an answer scorer for each unscored request-pack case, then complete its quiet and loaded passes; performance measurements remain available without answer scoring"
@@ -2104,7 +2135,7 @@ def _verdict_summary(check, config, records, budget):
             "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."}:
         remedy = (f"allow {config.sustained_seconds:g} seconds of sustained traffic with at least {limits.min_samples} successful sustained requests "
                   f"and {config.samples} successful requests in each baseline and recovery batch; "
-                  + (f"raise max_duration_seconds (or --max-duration) above {config.max_duration_seconds:g} if the deadline stops the run. "
+                  + (_deadline_guidance(config) + " "
                      if config.max_duration_seconds is not None else "") + budget)
     elif any(word in text for word in ("run budget", "run deadline", "no applicable")):
         remedy = budget + (" Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
@@ -2136,7 +2167,7 @@ def _verdict_summary(check, config, records, budget):
             "consistency": "inspect differing answers and token probabilities, verify deterministic serving settings and rerun the same shapes and concurrency levels",
             "tools": "inspect the tool protocol and argument outcomes, enable the server's tool parser and correct the configured tool contract, then rerun",
         }.get(check.id, "inspect the failed request and coverage details, correct the reported server or workload issue, then rerun the same workload")
-    return summary.rstrip(".") + ". To conclude, " + remedy.rstrip(".") + "."
+    return summary.rstrip(".") + ". To conclude, " + remedy[:1].lower() + remedy[1:].rstrip(".") + "."
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
@@ -2308,7 +2339,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
         warnings.append("Some checks have too few successful samples for confident timing conclusions.")
     if run.max_lag_ms > 100:
         warnings.append("Client scheduling delay was observed. Timing quality is qualified by overlapping request/stage intervals; raw measurements are retained. Its cause is not established.")
-    if config.max_requests is not None and run.budget_used >= config.max_requests:
+    if (config.max_requests is not None and run.budget_used >= config.max_requests
+            and any(run.unfinished.values())):
         run.limits_reached.add("max_requests")
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
     cancellation_options = config.test_options.get("cancellation")
@@ -2430,6 +2462,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     memory_required_interrupted = any(check.required and (check.target, check.id)
                                      in run.memory_interrupted_checks for check in checks)
     verdict_reason = run.reason
+    if verdict_reason == "maximum request budget reached" and not any(run.unfinished.values()):
+        verdict_reason = None
     if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
         verdict_reason = None
     run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)

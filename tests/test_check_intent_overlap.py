@@ -19,7 +19,7 @@ from tests.fake_endpoint import FakeEndpoint
 def configuration(**extra):
     return RunConfig.model_validate({
         'targets': [{'name': 'local', 'url': 'http://localhost:1/v1', 'model': 'fake-model'}],
-        'checks': ['correctness', 'json'], 'concurrency': 2, 'samples': 2,
+        'checks': ['correctness', 'json'], 'concurrency': 2, 'default_concurrency': 2, 'samples': 2,
         'max_requests': 300, 'max_duration_seconds': 60, 'request_timeout_seconds': 5,
         'context_limit': 8192, 'max_output_tokens': 128,
         'limits': {'min_samples': 2, 'fairness_max_ratio': 100}, **extra})

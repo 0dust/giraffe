@@ -288,8 +288,6 @@ def test_default_and_example_tool_payloads_still_fit_context_admission():
                    for path in sorted(Path("examples").glob("*.yaml")))
     seen = 0
     for config in configs:
-        if "tools" not in config.checks:
-            continue
         effective = _check_config(config, "tools")
         for fixture in resolved_tool_fixtures(effective):
             history_bytes = len(json.dumps([message.model_dump() for message in fixture.messages],
