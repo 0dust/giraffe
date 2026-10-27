@@ -574,6 +574,21 @@ outside the selected request window. They demonstrate observed activity, not a
 speedup or proof that every benchmark request used speculative decoding. These
 optional counters do not change acceptance-check outcomes or require GPUs.
 
+For SGLang, **Server observations** also shows the latest reported speculative
+acceptance length and acceptance rate from `sglang:spec_accept_length` and
+`sglang:spec_accept_rate` (the optional gauge contract in [SGLang v0.5.22](https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/observability/metrics_collector.py)).
+Enable the server's `--enable-metrics` and use the `sglang` metrics profile, or
+allow exact-name metrics discovery. No additional Giraffe check is required.
+Acceptance length includes the bonus token per forward; acceptance rate is the
+scheduler's reported accepted/proposed draft ratio. These gauges are **not**
+cumulative counters, run-window acceptance rates, or draft/accepted-token totals.
+Different scheduler label series remain separate. JSON, live UI and HTML use the
+same values. Failed, missing, stale, duplicate, invalid or truncated latest
+observations stay unavailable; older values are not carried forward. Exporter
+values can describe an earlier scheduler interval even when a scrape succeeds.
+Zero or absent gauges do not prove speculation is disabled, and a positive gauge
+does not establish activity during this run, request attribution or speedup.
+
 Published DCGM memory, utilization, temperature, throttle and device-error families
 remain available alongside serving series. GPU checks require each observed `gpu`
 label (and exporter `Hostname` when present) to have every family. A recent scrape

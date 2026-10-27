@@ -24,6 +24,8 @@ SPEC_DECODE_ROWS = (
     ("spec_decode_accepted_tokens", "Accepted speculative tokens", "tokens"),
     ("spec_decode_proposal_length", "Proposed tokens per speculative draft", "tokens/draft"),
     ("spec_decode_acceptance_ratio", "Speculative decoding acceptance rate", "fraction"),
+    ("spec_decode_sglang_acceptance_length", "SGLang reported acceptance length", "tokens/forward"),
+    ("spec_decode_sglang_acceptance_ratio", "SGLang reported acceptance rate", "fraction"),
 )
 
 KPI_IDS = ("request_throughput", "output_throughput", "response_latency", "first_useful_output",
@@ -759,8 +761,16 @@ def _server_rows(report, target, window, observation, put, metrics):
                                   "missing": max(0, row.get("eligible_count", 0)-row.get("sample_count", 0))}
         if key.startswith("spec_decode_"):
             metrics[key]["partial"] = bool(row.get("details", {}).get("partial_coverage"))
-            metrics[key]["sample_unit"] = "telemetry intervals"
-            metrics[key]["display_note"] = _spec_decode_coverage(row.get("details", {}))
+            details = row.get("details", {})
+            if key.startswith("spec_decode_sglang_"):
+                metrics[key]["sample_unit"] = "label series in latest scrape"
+                metrics[key]["display_note"] = " · ".join(str(v) for v in (
+                    "Latest exporter sample", details.get("collected_at"),
+                    details.get("aggregation"), details.get("freshness"),
+                    "Server-wide; attribution to the selected request window is not established.") if v)
+            else:
+                metrics[key]["sample_unit"] = "telemetry intervals"
+                metrics[key]["display_note"] = _spec_decode_coverage(details)
         if key in {"server_ttft", "server_queue", "server_inference"}:
             family = {"server_ttft": "server_ttft", "server_queue": "server_queue", "server_inference": "server_inference"}[key]
             metrics[key]["statistic"] = "counter-delta mean; not a request median"

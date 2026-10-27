@@ -45,6 +45,13 @@ SPEC_DECODE = {
     "vllm:spec_decode_num_accepted_tokens_per_pos_total": ("spec_decode_accepted_tokens_per_pos", "counter", "tokens"),
 }
 V1 = V1 | SPEC_DECODE
+# SGLang v0.5.22 (baa9befa3815), srt/observability/metrics_collector.py:
+# scheduler gauges, NOT cumulative counters. Acceptance length includes the bonus token.
+SGLANG_SPEC_DECODE = {
+    "sglang:spec_accept_length": ("spec_decode_sglang_acceptance_length", "gauge", "tokens/forward"),
+    "sglang:spec_accept_rate": ("spec_decode_sglang_acceptance_ratio", "gauge", "fraction"),
+}
+OPTIONAL_SPEC_DECODE = SPEC_DECODE | SGLANG_SPEC_DECODE
 SGLANG = {
     "sglang:token_usage": ("cache_occupancy", "gauge", "fraction"),
     "sglang:num_running_reqs": ("running", "gauge", "requests"),
@@ -58,8 +65,10 @@ SGLANG = {
     "sglang:time_to_first_token_seconds_count": ("server_ttft_count", "counter", "requests"),
     "sglang:time_to_first_token_seconds_bucket": ("server_ttft_bucket", "counter", "requests"),
 }
+SGLANG = SGLANG | SGLANG_SPEC_DECODE
 # Exact metric contracts from the source used for the live Apple Silicon run.
-SGLANG_REFERENCE = "SGLang 44bc47886 srt/observability/metrics_collector.py"
+SGLANG_REFERENCE = ("SGLang 44bc47886 srt/observability/metrics_collector.py; "
+                    "speculative gauges: v0.5.22 baa9befa3815, same module")
 LLAMACPP = {
     "llamacpp:requests_processing": ("running", "gauge", "requests"),
     "llamacpp:requests_deferred": ("waiting", "gauge", "requests"),
@@ -323,24 +332,31 @@ def parse(body, target, config, *, host=False):
         else ENGINE_METRICS.get(target.metrics_profile, {})
     )
     mapping = HOST if host else profile | GPU
-    samples, recognized, truncated_families = [], 0, set()
+    samples, recognized, truncated_families, invalid_families = [], 0, set(), set()
     lines = body.splitlines()
-    passes = (False, True) if mapping.keys() & SPEC_DECODE.keys() else (False,)
+    passes = (False, True) if mapping.keys() & OPTIONAL_SPEC_DECODE.keys() else (False,)
     for optional in passes:
         for line in lines:
             if line.lstrip().startswith("#") or not line.strip():
                 continue
             match = LINE.fullmatch(line)
             if not match:
+                name_match = re.match(r"\s*([^\s{]+)", line)
+                if name_match and name_match[1] in SGLANG_SPEC_DECODE and name_match[1] in mapping:
+                    invalid_families.add(mapping[name_match[1]][0])
                 continue
             if not optional:
                 recognized += 1
             name, raw_labels, raw_value, raw_time = match.groups()
-            if (name in SPEC_DECODE) != optional:
+            if (name in OPTIONAL_SPEC_DECODE) != optional:
                 continue
-            if name not in mapping or not math.isfinite(float(raw_value)):
+            if name not in mapping:
                 continue
             family, kind, unit = mapping[name]
+            if not math.isfinite(float(raw_value)):
+                if name in SGLANG_SPEC_DECODE:
+                    invalid_families.add(family)
+                continue
             if len(samples) >= config.metrics_max_series:
                 truncated_families.add(family)
                 continue
@@ -397,6 +413,7 @@ def parse(body, target, config, *, host=False):
         "missing_families": sorted(required - families),
         "series_limit_reached": bool(truncated_families),
         "truncated_families": sorted(truncated_families),
+        "invalid_families": sorted(invalid_families),
         "mapping": "node_exporter" if host else target.metrics_profile,
         "profile": "node_exporter" if host else target.metrics_profile,
         "profile_source": "observed exact metric names" if detected else "configured profile",
@@ -741,6 +758,36 @@ def _spec_positions(left, right, totals):
     return deltas
 
 
+def _derive_sglang_spec_decode(snapshots):
+    """Latest scheduler values, kept per label set; never pooled or differenced."""
+    latest = snapshots[-1] if snapshots else {}
+    metrics = {}
+    for family, unit, field, definition in (
+        ("spec_decode_sglang_acceptance_length", "tokens/forward", "acceptance_length",
+         "Mean accepted draft tokens plus bonus token per forward"),
+        ("spec_decode_sglang_acceptance_ratio", "fraction", "acceptance_ratio",
+         "Accepted / proposed draft tokens in the scheduler reporting interval"),
+    ):
+        fresh = None if family in latest.get("invalid_families", []) else _fresh_families(latest, [family])
+        values = fresh[family] if fresh else {}
+        if field == "acceptance_ratio" and any(v > 1 for v in values.values()):
+            values = {}
+        series = [{"labels": dict(labels), field: value} for labels, value in sorted(values.items())]
+        value = series[0][field] if len(series) == 1 else series or None
+        row = _derived(value, unit, f"{definition}; latest SGLang-reported gauge, not a run-window total",
+            samples=len(series), eligible=sum(s.get("family") == family for s in latest.get("samples", [])),
+            reason=None if series else "No valid SGLang gauge in the latest scrape; enabled state is unknown.",
+            measurement="scheduler_gauge", activity="unknown", series=series,
+            collected_at=latest.get("collected_at"), elapsed_seconds=latest.get("elapsed_seconds"),
+            aggregation="Each scheduler label series is separate; no pooling, sums or run-window averages.",
+            freshness="Exporter values may describe an earlier scheduler interval; source freshness without timestamps is unknown. A fresh scrape does not establish activity during this run.",
+            attribution="Server-wide values are not linked to selected requests or evidence of speedup.")
+        if value is None:
+            row["action"] = "Enable SGLang metrics and collect a valid scheduler gauge; absent values do not establish disabled speculation."
+        metrics[family] = row
+    return metrics
+
+
 def _derive_spec_decode(snapshots):
     families = ["spec_decode_drafts", "spec_decode_draft_tokens", "spec_decode_accepted_tokens"]
     eligible = max(0, len(snapshots) - 1)
@@ -894,6 +941,7 @@ def derive_server_metrics(data, *, host_configured=False):
     """
     snapshots = data.get("snapshots", [])
     metrics, _ = _derive_spec_decode(snapshots)
+    metrics.update(_derive_sglang_spec_decode(snapshots))
     for family in ("server_ttft", "server_queue", "server_inference"):
         metrics[family + "_mean_ms"] = _mean_duration(snapshots, family)
         for percentile, row in _histogram_percentiles(snapshots, family).items():
@@ -952,6 +1000,9 @@ def derive_server_metrics(data, *, host_configured=False):
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
+            elif profiles and key.startswith("spec_decode_sglang_"):
+                if "sglang" not in profiles:
+                    row.update(state="not_supported", reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)
             elif profiles and key.startswith("spec_decode_") and "vllm-v1" not in profiles:
                 row.update(state="not_supported", reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
             elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
