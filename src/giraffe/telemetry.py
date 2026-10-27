@@ -117,6 +117,7 @@ LINE = re.compile(
     r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*?\})?\s+([-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?)(?:\s+(\d+(?:\.\d+)?))?\s*$"
 )
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+SPEC_LABEL = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\[\\n"]|[^"\\])*)"\s*')
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
 GPU_FAMILIES = {entry[0] for entry in GPU.values()}
 METRIC_FAMILIES = {entry[0] for mapping in (V1, LEGACY, SGLANG, *ENGINE_METRICS.values(), GPU, HOST)
@@ -309,6 +310,23 @@ def _metrics_headers(target):
     return headers
 
 
+def _spec_labels(raw_labels):
+    content = (raw_labels or "{}")[1:-1].strip()
+    labels, offset = {}, 0
+    while offset < len(content):
+        match = SPEC_LABEL.match(content, offset)
+        if not match or match[1] in labels:
+            return None
+        labels[match[1]] = match[2]
+        offset = match.end()
+        if offset == len(content):
+            break
+        if content[offset] != ",":
+            return None
+        offset += 1
+    return labels
+
+
 def parse(body, target, config, *, host=False):
     # Identify only published exact-name contracts. User-selected contracts win;
     # unrelated exporters and similarly named metrics cannot invent a runtime.
@@ -342,7 +360,7 @@ def parse(body, target, config, *, host=False):
             match = LINE.fullmatch(line)
             if not match:
                 name_match = re.match(r"\s*([^\s{]+)", line)
-                if name_match and name_match[1] in SGLANG_SPEC_DECODE and name_match[1] in mapping:
+                if name_match and name_match[1] in OPTIONAL_SPEC_DECODE and name_match[1] in mapping:
                     invalid_families.add(mapping[name_match[1]][0])
                 continue
             if not optional:
@@ -354,14 +372,22 @@ def parse(body, target, config, *, host=False):
                 continue
             family, kind, unit = mapping[name]
             if not math.isfinite(float(raw_value)):
-                if name in SGLANG_SPEC_DECODE:
+                if name in OPTIONAL_SPEC_DECODE:
                     invalid_families.add(family)
                 continue
             if len(samples) >= config.metrics_max_series:
                 truncated_families.add(family)
                 continue
+            if name in OPTIONAL_SPEC_DECODE:
+                parsed_labels = _spec_labels(raw_labels)
+                if parsed_labels is None:
+                    invalid_families.add(family)
+                    continue
+                label_items = parsed_labels.items()
+            else:
+                label_items = LABEL.findall(raw_labels or "")
             labels = {}
-            for key, value in LABEL.findall(raw_labels or ""):
+            for key, value in label_items:
                 if len(labels) >= MAX_METRICS_LABELS:
                     truncated_families.add(family)
                     break
@@ -690,7 +716,9 @@ def _families_truncated(snapshot, families):
 
 def _fresh_families(snapshot, families):
     """A failed, truncated, duplicate or stale scope cannot form a counter interval."""
-    if snapshot.get("status") not in {"available", "absent_families"} or _families_truncated(snapshot, families):
+    if (snapshot.get("status") not in {"available", "absent_families"}
+            or _families_truncated(snapshot, families)
+            or set(families).intersection(snapshot.get("invalid_families", []))):
         return None
     rows = {family: {} for family in families}
     for sample in snapshot.get("samples", []):
@@ -768,7 +796,7 @@ def _derive_sglang_spec_decode(snapshots):
         ("spec_decode_sglang_acceptance_ratio", "fraction", "acceptance_ratio",
          "Accepted / proposed draft tokens in the scheduler reporting interval"),
     ):
-        fresh = None if family in latest.get("invalid_families", []) else _fresh_families(latest, [family])
+        fresh = _fresh_families(latest, [family])
         values = fresh[family] if fresh else {}
         if field == "acceptance_ratio" and any(v > 1 for v in values.values()):
             values = {}
