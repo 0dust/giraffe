@@ -40,6 +40,12 @@ sustained_seconds: 5
 retention: failures
 request_options:
   temperature: 0
+# On import, capacity, concurrency and arrivals become separate Load tests.
+# Capacity/arrivals inherit the limits below. Concurrency instead uses
+# per-response defaults: 2,000 ms first answer, 30,000 ms completion,
+# 0% errors, 100% correct scored answers and 5 valid responses; no stream-pause
+# or generation-speed limit. Review the normalized config with validate
+# --show-config before adjusting these independent Load test criteria.
 limits:
   min_samples: 5
   first_output_ms: 10000

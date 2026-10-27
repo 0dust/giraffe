@@ -134,7 +134,7 @@ giraffe run --config examples/vllm.yaml \
 
 The new report shows acceptance results and changes against the saved baseline. Keep the workload comparable; incompatible measurements stay inconclusive.
 
-In the UI, open a completed run and choose **Save as reference baseline**, then **Compare a new run with this baseline**. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
+In the UI, open a completed run and choose **Save baseline** (fully passing runs) or **Save as reference baseline** (other completed runs). Name and save it, then choose **Compare a new run with this baseline** at the bottom of the report, or **Compare a new run** when shown at the top. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
 
 ## Tests
 

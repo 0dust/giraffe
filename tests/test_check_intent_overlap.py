@@ -368,7 +368,7 @@ async def test_complete_logprob_pass_needs_depth_and_serial_scope(monkeypatch, l
     endpoint = TokenEndpoint(monkeypatch)
     report = await run_suite(configuration(checks=['consistency'], targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
         consistency={'levels': levels, 'shapes': ['short'], 'repetitions': 3,
-                     'logprobs': {'top_logprobs': 0, 'strict': True, 'tolerance': 0}}))
+                     'logprobs': {'response_mode': 'complete', 'top_logprobs': 0, 'strict': True, 'tolerance': 0}}))
     result = next(c for c in report.checks if c.id == 'consistency')
     assert result.status == expected, result
     assert result.metrics['logprobs']['conditions'][0]['compared_positions'] >= 64

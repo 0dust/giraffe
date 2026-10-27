@@ -250,13 +250,14 @@ async def test_history_rejected_session_turns_leave_pauses_unknown(monkeypatch):
     assert "Conversation history admission determines the pauses" in plan["time_bound_reasons"][0]
 
 
-def test_logprob_gather_tail_uses_actual_batch_width_not_single_template():
+@pytest.mark.parametrize("response_mode", ["stream", "complete"])
+def test_logprob_gather_tail_uses_actual_batch_width_not_single_template(response_mode):
     from giraffe.logprob_workload import logprob_fixtures
 
     configured = config(checks=["consistency"], consistency={"levels": [1, 16], "shapes": ["short"],
-        "repetitions": 2, "logprobs": {"priming_rounds": 1}})
+        "repetitions": 2, "logprobs": {"priming_rounds": 1, "response_mode": response_mode}})
     template = logprob_fixtures(configured, builtin_fixtures(configured))["short"]
-    measured = {"service": [{"family": "consistency", "concurrency": level, "stream": False,
+    measured = {"service": [{"family": "consistency", "concurrency": level, "stream": response_mode == "stream",
         "output_cap": template.max_tokens, "input_bucket": input_bucket(template.input_chars),
         "n": 100, "p50_ms": 10, "p90_ms": 10, "p99_ms": 100, "max_ms": 1000,
         "quantiles_ms": [10] * 91 + list(range(20, 101, 10)) + [1000], "cohort": "run"}

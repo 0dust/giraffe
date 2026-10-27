@@ -184,6 +184,35 @@ class FakeEndpoint:
                 probability = -.05
                 if mode == "logprob_variable" and index >= 6:
                     probability = [-.05, -.08, -.02][((index - 6) // 2) % 3]
+                if payload.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    def event(delta, evidence=None, finish=None):
+                        choice = {"index": 0, "delta": delta, "finish_reason": finish}
+                        if mode != "logprob_absent":
+                            choice["logprobs"] = evidence
+                        self.wfile.write(("data: " + json.dumps({"model": payload["model"],
+                            "choices": [choice]}) + "\n\n").encode())
+                        self.wfile.flush()
+                    event({"role": "assistant"})
+                    for text in re.findall(r"\S+\s*", output):
+                        chosen = {"token": text, "bytes": list(text.encode()), "logprob": probability}
+                        alternatives = [chosen.copy(), {"token": "ALT_ONLY_SECRET", "bytes": list(b"ALT_ONLY_SECRET"), "logprob": -2.0}]
+                        token = {**chosen, "top_logprobs": alternatives[:payload["top_logprobs"]]}
+                        if mode == "logprob_malformed":
+                            token["logprob"] = "bad"
+                        elif mode == "logprob_sentinel":
+                            token["logprob"] = -9999.0
+                            token["top_logprobs"] = []
+                        event({"content": text}, None if mode == "logprob_missing" else {"content": [token]})
+                        endpoint._stop.wait(endpoint.chunk_delay)
+                    event({}, finish="length" if mode == "logprob_length" else "stop")
+                    if mode != "logprob_eof":
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    return
                 chosen = {"token": output, "bytes": list(output.encode()), "logprob": probability}
                 alternatives = [chosen.copy(), {"token": "ALT_ONLY_SECRET", "bytes": list(b"ALT_ONLY_SECRET"), "logprob": -2.0}]
                 token = {**chosen, "top_logprobs": alternatives[:payload["top_logprobs"]]}

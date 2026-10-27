@@ -22,16 +22,16 @@ Limits are checked before starting, without reserving space. Concurrent writers 
 
 Implementation references reviewed before building: Python's [compact JSON and incremental encoding](https://docs.python.org/3/library/json.html), [hard links and atomic replacement](https://docs.python.org/3/library/os.html), [disk usage and directory removal APIs](https://docs.python.org/3/library/shutil.html), including their symlink safety behavior, and FastAPI's [HTTP error handling](https://fastapi.tiangolo.com/tutorial/handling-errors/). Giraffe adds its own directory recognition and protection checks before deletion.
 
-CLI and web writers record their process ID and host. A run is live when it is the web server's active job, its same-host owner has a different PID whose liveness check succeeds (including permission-denied checks), or its heartbeat is newer than two minutes. CLI writers refresh the state file's mtime about every 30 seconds through execution and export. Foreign hosts, the inspecting process's own PID, and legacy metadata without a host rely on that recent heartbeat rather than an unrelated PID. Crashed stale writers become cleanup candidates without needing a web restart. At web startup, stale runs recover as completed when report.json validates, otherwise interrupted. A genuine failed-export summary still takes precedence; a general metadata error alone no longer hides a complete report. Recovery remains visible even if updating metadata on disk fails.
+CLI and web writers record their process ID and host. The web server's active job is always live. A different same-host owner PID is live if its liveness check succeeds (including permission-denied checks), and inactive if the process is known to be dead, even with a recent heartbeat. When the PID cannot establish liveness, a heartbeat newer than two minutes keeps the run live. CLI writers refresh the state file's mtime about every 30 seconds through execution and export. Foreign hosts, the inspecting process's own PID, and legacy metadata without a host rely on that recent heartbeat rather than an unrelated PID. Crashed stale writers become cleanup candidates without needing a web restart. At web startup, stale runs recover as completed when report.json validates, otherwise interrupted. A genuine failed-export summary still takes precedence; a general metadata error alone no longer hides a complete report. Recovery remains visible even if updating metadata on disk fails.
 
 ## Report artifacts and input compatibility
 
 Normal CLI and web runs save `report.json` and the small `.web.json` lifecycle file;
 HTML is generated only on request. The existing **Download HTML report** button
 uses `GET /api/runs/{id}/report.html`, rendering saved JSON with an attachment
-Content-Disposition. It never reruns a check or contacts a model, and creates no
-file on disk. The same route regenerates HTML for older runs, avoiding a stale
-HTML file disagreeing with saved JSON. Legacy `report.html` remains recognized by
+Content-Disposition. It never reruns a check or contacts a model. It creates a
+temporary response file, but no persistent run artifact. The same route regenerates
+HTML for older runs, avoiding a stale HTML file disagreeing with saved JSON. Legacy `report.html` remains recognized by
 storage accounting and cleanup.
 
 HTML and JSON downloads share a single-flight lock while generating a temporary
@@ -42,11 +42,13 @@ response files occupy disk for the lifetime of their transfers. Cancellation wai
 for in-flight generation work through a shielded completion callback, with no
 cancellation retry loop or repeated decoding.
 
-JSON generation uses a bounded-cache disk-backed input lookup and streams metadata
-followed by individual expanded requests into that response file. It never builds
-a complete request list or expanded JSON string. The decoder scans each value once
-across buffer boundaries and calls the JSON decoder once per complete value,
-avoiding repeated rescans of large records. Memory scales with metadata, the
+JSON generation uses a bounded-cache disk-backed input lookup. It first retains
+a stripped measurement record for every request to derive performance data, then
+streams the header and individual expanded requests into the response file.
+Response bodies pass through one at a time; the complete expanded JSON is never
+built as one string. Within each pass, the decoder scans each value once across
+buffer boundaries and calls the JSON decoder once per complete value. Memory
+grows with request count and derived performance data, as well as metadata, the
 largest individual JSON value/request and the lookup cache. HTML still loads one
 report to render it, with at most one HTML/JSON generation active.
 
@@ -65,9 +67,11 @@ Use `giraffe report RUN_DIR --html [--output PATH]` for a standalone HTML file, 
 All newly serialized report, baseline, summary and web-state JSON is compact.
 Eligible immutable schema-3 baseline sources can be hard-linked as-is. Older
 sources are reserialized when saving a managed baseline so newly written format-2
-evidence always carries the schema-3 signal. Default-valued fields are **not omitted**: raw consumers retain
-all fields except the explicitly versioned input representation. Saved reports
-have `schema_version: "3"`, `report_format: 2` and an `inputs` table mapping SHA-256 references to exact
+evidence always carries the schema-3 signal. Fields are not omitted merely because
+they have default values. Native and portable saved report JSON omit the derived
+`performance` field; model loading and JSON downloads regenerate it from retained
+measurements. Native saved reports also use the versioned input representation:
+they have `schema_version: "3"`, `report_format: 2` and an `inputs` table mapping SHA-256 references to exact
 message arrays. Nonempty `evaluation.messages` moves to that table; each request
 has `input_ref` instead. Empty messages stay empty. Table entries follow retention,
 so this cannot restore tool-conversation inputs stripped by `none` or `failures`.
@@ -144,11 +148,16 @@ The active policy appears in `giraffe storage` (pass the same flags as the launc
 and `/api/storage`. CLI stdout names every automatic deletion (JSON output contains
 the exact deleted-ID list). Web results and the Runs storage line show deleted IDs;
 `.web.json` on the triggering run records the policy, deleted IDs, skipped runs and
-bytes freed. The final run state is written before cleanup begins; cleanup is
-shielded through cancellation, its log is written afterwards, and the active job
-is always cleared. If a final status write first fails and a later retry succeeds,
-its temporary warning and cached unsaved state are removed; other errors remain. A run interrupted by task cancellation skips automatic cleanup. The latest result remains visible after restarting the web server.
-Manual cleanup retains its preview/confirmation workflow.
+bytes freed. The CLI saves completed state after automatic cleanup, so an
+interruption during cleanup can leave running metadata until recovery.
+
+In the web server, the final run state is written before cleanup begins; cleanup
+is shielded through cancellation, its log is written afterwards, and the active
+job is always cleared. If a final status write first fails and a later retry
+succeeds, its temporary warning and cached unsaved state are removed; other errors
+remain. A web run interrupted by task cancellation skips automatic cleanup. The
+latest result remains visible after restarting the web server. Manual cleanup
+retains its preview/confirmation workflow.
 
 ## Deterministic footprint measurement
 
