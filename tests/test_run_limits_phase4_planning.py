@@ -601,13 +601,14 @@ async def test_spaced_arrivals_do_not_assume_the_pending_queue_is_full(monkeypat
     assert not any(item["id"] == "arrivals_pending" for item in preview["time_timeline"])
 
 
-def test_logprob_consistency_uses_exact_nonstream_fixture_observations():
+@pytest.mark.parametrize("response_mode", ["stream", "complete"])
+def test_logprob_consistency_uses_exact_response_mode_observations(response_mode):
     from giraffe.logprob_workload import logprob_fixtures
 
     configured = config(checks=["consistency"], consistency={"levels": [1, 3], "shapes": ["short"],
-                        "repetitions": 2, "logprobs": {"priming_rounds": 1}})
+                        "repetitions": 2, "logprobs": {"priming_rounds": 1, "response_mode": response_mode}})
     template = logprob_fixtures(configured, builtin_fixtures(configured))["short"]
-    measured = {"service": [{"family": "consistency", "concurrency": level, "stream": False,
+    measured = {"service": [{"family": "consistency", "concurrency": level, "stream": response_mode == "stream",
         "output_cap": template.max_tokens, "input_bucket": input_bucket(template.input_chars),
         **tail(10, 20, n=6)} for level in (1, 3)]}
     plan = request_plan(configured, observations=measured)

@@ -44,11 +44,11 @@ def settings(**options):
 def run_config(endpoint, *, options=None, repetitions=3, **extra):
     return config(endpoint, checks=['consistency'], consistency={
         'repetitions': repetitions, 'levels': [1, 2], 'shapes': ['short'], 'seed': 17,
-        'logprobs': {'top_logprobs': 2, **(options or {})}}, **extra)
+        'logprobs': {'response_mode': 'complete', 'top_logprobs': 2, **(options or {})}}, **extra)
 
 
 @pytest.mark.parametrize('options', [{'strict': True}, {'tolerance': -1}, {'tolerance': float('nan')},
-    {'tolerance': float('inf')}, {'top_logprobs': -1}, {'top_logprobs': 21}, {'response_mode': 'stream'},
+    {'tolerance': float('inf')}, {'top_logprobs': -1}, {'top_logprobs': 21}, {'response_mode': 'invalid'},
     {'priming_rounds': 3}, {'unknown': 1}])
 def test_invalid_settings_rejected(options):
     with pytest.raises(ValidationError):
@@ -407,7 +407,7 @@ async def test_api_preview_export_execution_retention_and_rerun(tmp_path):
             repeated = await finished(client, rerun)
             assert next(c for c in repeated['report']['checks'] if c['id'] == 'consistency')['status'] == 'inconclusive'
             invalid = copy.deepcopy(saved)
-            invalid['consistency']['logprobs']['response_mode'] = 'stream'
+            invalid['consistency']['logprobs']['response_mode'] = 'invalid'
             count = len(endpoint.requests)
             assert (await client.post('/api/runs', json={'config': invalid})).status_code == 422
             assert len(endpoint.requests) == count
@@ -501,3 +501,110 @@ def test_round2_logprob_minimum_counts_qualified_requests_across_rounds():
     result = summarize_logprobs(rows, options, min_samples=5)
     assert result['status'] == 'pass'
     assert all(c['qualified_samples'] == 6 and c['coverage_complete'] for c in result['conditions'])
+
+
+def test_stream_collection_aligns_split_utf8_after_assembly_and_ignores_empty_events():
+    from giraffe.logprobs import LogprobCollector
+    collector = LogprobCollector(0)
+    collector.add(None)
+    collector.add({'content': None})
+    collector.add({'content': [token('�', bytes=[0xc3])]})
+    collector.add({'content': []})
+    collector.add({'content': [token('�', bytes=[0xa9])]})
+    result = collector.finish('é')
+    assert result.status == 'available'
+    assert [t.position for t in result.tokens] == [0, 1]
+    assert collector.finish('wrong').status == 'invalid'
+
+
+@pytest.mark.parametrize('limit,value', [('MAX_TOKENS', 2), ('MAX_ENTRIES', 2), ('MAX_TEXT_BYTES', 4)])
+def test_stream_collection_enforces_aggregate_limits_and_never_recovers(monkeypatch, limit, value):
+    import giraffe.logprobs as module
+    monkeypatch.setattr(module, limit, value)
+    collector = module.LogprobCollector(0)
+    for _ in range(3):
+        collector.add({'content': [token()]})
+    assert collector.finish('aaa').status == 'incomplete'
+    assert collector.tokens == []
+    collector.add({'content': [token()]})
+    assert collector.finish('a').status == 'incomplete'
+
+
+def test_stream_malformed_chunk_is_not_hidden_by_later_valid_evidence():
+    from giraffe.logprobs import LogprobCollector
+    collector = LogprobCollector(0)
+    collector.add({'content': 'bad'})
+    collector.add({'content': [token()]})
+    assert collector.finish('a').status == 'invalid'
+
+
+@pytest.mark.parametrize('mode,slots,expected', [
+    ('healthy', None, 'pass'), ('variable', None, 'fail'), ('healthy', 1, 'inconclusive'),
+    ('missing', None, 'inconclusive'), ('absent', None, 'inconclusive'),
+    ('malformed', None, 'inconclusive'), ('sentinel', None, 'inconclusive'),
+    ('length', None, 'inconclusive'), ('eof', None, 'inconclusive'),
+])
+async def test_streamed_probability_comparisons_require_real_output_overlap(mode, slots, expected):
+    with FakeEndpoint(mode='logprob_' + mode, service_slots=slots, chunk_delay=.004) as endpoint:
+        configuration = run_config(endpoint, options={'response_mode': 'stream', 'top_logprobs': 0,
+            'strict': True, 'tolerance': 0}, stream=False, max_output_tokens=192)
+        report = await run_suite(configuration)
+        payloads = workload_payloads(endpoint.requests)
+    result = check(report, 'consistency').metrics['logprobs']
+    assert result['status'] == expected
+    assert result['response_mode'] == 'stream'
+    assert all(p['stream'] for p in payloads)
+    if mode in {'healthy', 'variable'} and slots is None:
+        assert all(c['coverage_complete'] and c['compared_positions'] >= 32 for c in result['conditions'])
+        assert result['max_cross_level_delta'] == pytest.approx(0 if mode == 'healthy' else .03)
+        assert result['conditions'][1]['qualified_samples'] >= configuration.limits.min_samples
+    if slots == 1:
+        assert result['conditions'][1]['qualified_samples'] == 0
+        assert result['max_cross_level_delta'] is None
+    if mode in {'missing', 'absent', 'malformed', 'sentinel', 'eof'}:
+        assert all(r.logprob_evidence.status != 'available' for r in workload_records(report.requests))
+
+
+def test_explicit_complete_cannot_compare_loaded_samples_even_with_stale_qualification():
+    rows = [record(f'{level}-{rep}-{slot}', [token(str(i), probability=-.1 * level) for i in range(32)],
+                   level=level, repeat=rep, slot=slot, stream=False)
+            for level in (1, 2) for rep in range(3) for slot in range(2)]
+    result = summarize_logprobs(rows, settings(response_mode='complete', strict=True, tolerance=0, top_logprobs=0))
+    assert result['status'] == 'inconclusive'
+    assert result['max_cross_level_delta'] is None
+    assert result['conditions'][1]['qualified_samples'] == 0
+    assert result['response_mode'] == 'complete'
+    single = settings(response_mode='complete', strict=True, tolerance=0, top_logprobs=0).model_copy(update={'levels': [1]})
+    rows = [record(str(rep), [token(str(i)) for i in range(32)], level=1, repeat=rep, stream=False) for rep in range(3)]
+    assert summarize_logprobs(rows, single)['status'] == 'pass'
+    assert LogprobConsistency().response_mode == 'stream'
+
+
+def test_concurrent_stream_collectors_share_budget_before_completion(monkeypatch):
+    import giraffe.logprobs as module
+    monkeypatch.setattr(module, 'MAX_RUN_BYTES', 2000)
+    budget = module.LogprobBudget()
+    collectors = [module.LogprobCollector(0, budget) for _ in range(20)]
+    for collector in collectors:
+        collector.add({'content': [token('x' * 100)]})
+        assert budget.used_bytes + budget.pending_bytes <= module.MAX_RUN_BYTES
+    assert budget.exhausted
+    assert budget.used_bytes == 0
+    for collector in collectors:
+        result = budget.retain(collector.finish('x' * 100))
+        assert result.status == 'incomplete' and not result.tokens
+    assert budget.pending_bytes == 0
+
+
+def test_stream_budget_reservations_transfer_to_retained_evidence_and_release_invalid_chunks():
+    from giraffe.logprobs import LogprobBudget, LogprobCollector
+    budget = LogprobBudget()
+    first, second = LogprobCollector(0, budget), LogprobCollector(0, budget)
+    first.add({'content': [token()]})
+    second.add({'content': [token()]})
+    assert budget.pending_bytes == first.reserved_bytes + second.reserved_bytes > 0
+    second.add({'content': [token(probability='bad')]})
+    assert budget.pending_bytes == first.reserved_bytes > 0
+    assert budget.retain(first.finish('a')).status == 'available'
+    assert budget.pending_bytes == 0 and budget.used_bytes > 0
+    assert second.finish('a').status == 'invalid'

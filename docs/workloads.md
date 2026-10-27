@@ -19,8 +19,9 @@ inside reasoning opened by the chat template and end at a closing tag. Request e
 `reasoning_stripped`; raw outputs follow retention settings. Reasoning without a
 final answer is unscored. With `finish_reason: length`, exact output is unscored only if it is a strict
 normalized prefix of the expected answer; already-wrong answers fail. Incomplete
-JSON is unscored, but a complete wrong value or schema violation fails. A missing
-contains match under truncation is unscored; complete matching answers remain scorable. AI judges skip all truncated and reasoning-only outputs.
+JSON is unscored, but a complete wrong value or schema violation fails. All
+`contains` outputs with `finish_reason: length` are unscored, even when the expected
+text is present. AI judges skip all truncated and reasoning-only outputs.
 These missing scores leave coverage inconclusive rather than count as wrong answers.
 
 Contains scoring normalizes whitespace and requires alphanumeric boundaries at
@@ -36,8 +37,13 @@ Context fixtures separate fact positions by at least 32 characters within each
 input size. If the context budget cannot fit three positions, fewer are generated;
 `workload.position_coverage` records the positions, minimum separation and reduced
 coverage; reduced coverage prevents a context pass. Non-timeout HTTP/protocol
-failures on context prompts fail the check; documented context-length rejections
-remain incomplete coverage. Character placement and returned token counts remain separate evidence.
+failures on context prompts fail the check, except for recognized context-length
+rejections, which follow the size-evidence rule below. A recognized context-length rejection
+also fails when its input is at or below 85% of `context_limit` using server-reported
+tokens, or 70% using a calibrated estimate that includes the chat template.
+Message-content-only and builtin-reference estimates cannot establish that failure.
+Other recognized context-length rejections leave coverage inconclusive. Character
+placement and returned token counts remain separate evidence.
 
 ## Configure and run
 
@@ -192,8 +198,9 @@ First-output and generation checks use ordinary serial requests; loaded timing
 belongs to the corresponding load check. Serving excludes sustained recovery traffic.
 Other stress traffic exempts timeouts and intentional cancellations, but non-timeout
 HTTP and protocol failures still enter serving checks and `stop_after_errors`.
-Documented context-length rejections remain coverage observations. ConnectTimeout
-and ConnectError are transport failures for access; a response timeout remains a
+Recognized context-length rejections are excluded from serving errors; the context
+check applies the size-evidence rule described above. ConnectTimeout and ConnectError
+are transport failures for access; a response timeout remains a
 timeout. Shared request and duration limits still apply.
 
 Load test reports each workload/pattern/level separately; a passing setting does
@@ -220,14 +227,15 @@ and drain edges prevent an exact full-window average). Metrics report which
 completion condition qualified. Both completion paths require at least
 `limits.min_samples` successful sustained requests; fewer is inconclusive. Sustained
 requests already dispatched drain under their request deadlines after the dispatch
-window ends. Cancelled or unfinished sustained requests remain in recovery evidence
-and count as errors, including cancellation at phase end; they cannot disappear
-from the denominator or qualify as successful load samples. Sustained
-load uses configured concurrency, so its timeouts and errors count against recovery
-`max_error_rate` (including when duration elapsed). `sustained_error_rate` includes
-those failures; the legacy `sustained_non_timeout_error_rate` remains a narrower
-diagnostic. Sustained timing is observational; timing limits apply to recovery
-probes. Sustained outcomes stay outside serving/first-output checks. Scored
+window ends. Cancelled sustained requests remain as unfinished recovery evidence,
+but are excluded from the `sustained_error_rate` numerator and denominator. Requests
+that exhaust the output budget on reasoning without an answer are also excluded.
+Neither can qualify as successful load samples; they leave recovery inconclusive
+unless an observed failure already establishes a failure. Sustained timeouts and
+other endpoint errors count against recovery `max_error_rate`, including after the
+duration elapses. The legacy `sustained_non_timeout_error_rate` excludes timeouts
+and remains a narrower diagnostic. Sustained timing is observational; timing limits
+apply to recovery probes. Sustained outcomes stay outside serving/first-output checks. Scored
 sustained answers still enter the correctness allowance. Post-load probes use the
 same fixture as the pre-load baseline. `recovery_max_ratio` limits median latency
 and first-output ratios. Set it even when absolute timing limits are configured
@@ -236,11 +244,13 @@ absolute-only pass states both measured probe/baseline ratios and that no ratio
 limit was configured. Without a timing limit or ratio, recovery is inconclusive.
 
 Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
-interrupt an active answer stream. With streaming disabled, cancellation is
+interrupt an active generation stream after that many nonempty content or reasoning
+chunks. Reasoning output can establish that generation started before the first
+answer. With streaming disabled, cancellation is
 inconclusive: `client cancellation requires streaming`. The legacy `cancel_after_ms` setting is retained
 for config compatibility; it no longer schedules the disconnect, and explicit values
-produce a report warning. A disconnect before first output cannot establish
-mid-stream cancellation. The stop test first obtains a full-output control containing
+produce a report warning. A disconnect before any answer or reasoning output
+cannot establish mid-stream cancellation. The stop test first obtains a full-output control containing
 `blue [END] green`, then requests the same text with `[END]` as the stop sequence.
 Enforcement needs the control to reach the marker, an answer of `blue` without the
 marker or following text, and `finish_reason: stop`. Missing control/finish evidence
@@ -278,7 +288,7 @@ error allowance.
 | `prefix` | Shared prefix plus deterministic independent prose controls, then increasing fixed history | Order, character shape, observed input tokens, separate first/repeat timing and `usage.prompt_tokens_details.cached_tokens` when provided. No cache flushing; first use is not proof of an empty cache. Missing cache usage means reuse is unverified; independent controls must report less than the reuse threshold. Controls match characters; observed token counts disclose tokenizer-dependent differences. |
 | `sessions` | Fixed-history or live-response conversations, sequential turns and bounded concurrent sessions | Live history appends the completed final answer after stripping inline reasoning; fixed history uses the seeded session name at every turn. Sessions refill as each conversation finishes. Per-turn metrics, IDs, history/request hashes, requested delay and actual dispatch are saved. Failed/cancelled/truncated turns stop the session. Required history is never cropped. Conservative character admission can stop before the server context limit; actual tokens remain separate. |
 | `consistency` | Identical independent requests, sequentially then at selected load levels | SHA-256 answer hashes and modal agreement fraction are computed before retention removes bodies. Equality is byte-for-byte by default; whitespace normalization is explicit. Correctness, errors and repeatability stay separate. Variation is inconclusive unless `strict: true` makes it fail; full agreement can pass. Temperature/seed support is requested, not universally verified. |
-| `tool_calling` / `checks: [tools]` | Automatic tool selection using the built-in Delhi weather request or configured `tool_checks.fixtures` | Separate response protocol, tool-call and optional assistant-text outcomes. Calls must match the expected count, order, names, argument schemas and any exact argument values. No tool is executed. |
+| `tool_calling` / `checks: [tools]` | Automatic tool selection using the built-in Delhi weather request or configured `tool_checks.fixtures` | Separate response protocol, tool-call and optional assistant-text outcomes. Calls must match the expected count, names, argument schemas and any exact argument values; call order is not enforced. No tool is executed. |
 | `tool_checks` | Custom tool fixtures and complete/stream response modes | Every declared expectation must pass. Empty fixtures preserve the built-in weather check; omitted modes inherit the run streaming setting. See the mixed text/tool example below. |
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
@@ -388,9 +398,10 @@ most 16 fixtures, each with at most 16 tools and expected calls; the entire
 `tool_checks` configuration is limited to 64 KiB. `options` accepts supported
 request settings, such as temperature, without overriding the tool contract.
 
-`expected_calls` compares exact call count and order. Each call must have a call ID,
-a declared function name and valid strict JSON arguments satisfying its function's
-parameter schema. An `arguments` object additionally requires that exact value;
+`expected_calls` matches calls by function name and arguments, regardless of order.
+Each expected call must match a distinct returned call, so counts and duplicates
+must match exactly. Each call must have a call ID, a declared function name and
+valid strict JSON arguments satisfying its function's parameter schema. An `arguments` object additionally requires that exact value;
 `arguments: null` checks the schema without fixing the value. Numeric values compare
 by value (`1` equals `1.0`, and `-0.0` equals `0`); booleans remain distinct from
 numbers, including in nested arrays and objects.
@@ -421,13 +432,15 @@ incorrect-answer verdict. Objects, arrays and scalar values each count as one
 node; object keys do not count as separate nodes.
 
 `expected_content` is optional. Omitting it permits tool-only responses, including
-null content. When supplied, `mode: exact` compares the entire concatenated
-assistant content, including text arriving before, between or after streamed tool
-fragments. This detects missing or duplicated text. `mode: contains` only requires
-the specified nonempty substring; it permits additional and repeated prose.
-`normalization: none` preserves whitespace; `normalization: whitespace` collapses
-whitespace runs and trims the result before comparison. These checks evaluate the
-assembled content, not whether text preceded or followed a call on the wire.
+null content. When supplied, the scorer assembles assistant content from before,
+between and after streamed tool fragments, then extracts the final answer using
+the reasoning-block rules described above. `mode: exact` compares that entire
+final answer and detects missing or duplicated answer text. `mode: contains` only
+requires the specified nonempty substring; it permits additional and repeated prose.
+After final-answer extraction, `normalization: none` preserves whitespace and
+`normalization: whitespace` collapses whitespace runs and trims the result before
+comparison. These checks do not enforce whether text preceded or followed a call
+on the wire.
 
 `modes: [complete]`, `[stream]` or `[complete, stream]` selects the request modes.
 Omitting modes runs both when global `stream: true`, and complete responses when
@@ -538,28 +551,40 @@ one-setting experiment as confounded. Differences are context, not causality.
 
 ## Serving statistics
 
-Enable `metrics: true` and configure a target's separate `metrics_url`. Credentials
-use `metrics_api_key_env` and `metrics_headers_env`; inference credentials are never
-copied to statistics endpoints, even on the same origin. Collection failure does
-not prevent endpoint tests or change their correctness/performance outcomes.
+Giraffe automatically probes the target's same-origin `/metrics` route at run
+startup, even when `metrics: false`. Set `targets[].metrics_url` to use a different
+statistics endpoint. Successful discovery enables periodic collection; an explicit
+metrics URL or `metrics: true` also enables the collection loop. The probe does not
+scan ports or follow redirects. Credentials use `metrics_api_key_env` and
+`metrics_headers_env`; inference credentials are never copied to statistics
+endpoints, even on the same origin. Collection failure does not prevent endpoint
+tests or change their correctness/performance outcomes.
 
-Explicit profiles map exact metric names and units:
+With the default `metrics_profile: unknown`, Giraffe detects a profile only when
+published exact metric names identify one supported contract unambiguously.
+An explicit `targets[].metrics_profile` overrides detection. Profiles map exact
+metric names and units:
 
 - `vllm-v1`: vLLM 0.30.0 V1 metric names for KV-cache fraction, running/waiting
   requests, preemption count, prefix hits/queries and server TTFT sum/count.
 - `vllm-legacy`: an explicit older-name contract adding GPU/CPU cache fractions;
   qualify the recorded runtime/version before interpreting it as supported.
-- `ollama` / `unknown`: no serving counter mapping is assumed. Ollama native APIs
-  supply deployment information, but an inference URL alone does not provide
-  scheduler or KV-cache counters.
+- `sglang`, `llamacpp`, `lmdeploy` and `tgi`: runtime-specific Prometheus metric
+  contracts; available families depend on the runtime and exporter.
+- `ollama` and `tensorrt-llm`: no serving Prometheus counter mapping is assumed.
+  Native APIs can supply deployment information, but do not establish scheduler
+  or KV-cache counter coverage at `/metrics`.
+- `unknown`: attempts automatic contract detection; ambiguous or unrecognized
+  metric names leave serving counters unmapped.
 
 Published DCGM memory, utilization, temperature, throttle and device-error families
-remain available alongside serving series. GPU checks require each observed `gpu`
-label (and exporter `Hostname` when present) to have every family. A recent scrape
-alone has unknown source freshness: evidence requires values changing across at
+remain available alongside serving series. GPU checks identify each device by
+`UUID` or `uuid` when available; otherwise they use the `gpu` index together with
+any exporter `Hostname` and `instance` labels. Every identified device must have
+every required family. A recent scrape alone has unknown source freshness: evidence requires values changing across at
 least two scrapes for that device, or explicit source timestamps within
-`metrics_max_age_seconds`. Missing families, missing device labels or unknown
-freshness are inconclusive. `gpu_min_observation_seconds` is an optional run setting
+`metrics_max_age_seconds`. Missing families, missing both UUID and GPU-index labels,
+or unknown freshness are inconclusive. `gpu_min_observation_seconds` is an optional run setting
 (default 30, minimum 0), independent of `metrics_interval_seconds`. Match it to your
 exporter's refresh period, for example `gpu_min_observation_seconds: 1` for a
 one-second exporter. GPU runs wait only for the remaining time between their first
@@ -617,10 +642,16 @@ Answer consistency editor exposes the same `logprobs` JSON object;
 CLI YAML, API preview/export, saved runs and reruns use this configuration.
 Omit it or set it to `null` to preserve ordinary answer-only consistency.
 
-Enabling it sends `logprobs: true`, `top_logprobs` (0–20), and `stream: false`.
-`response_mode: complete` is the only supported mode; `stream` is rejected during
-configuration validation. The profile explicitly overrides global streaming for
-these requests. A non-streaming completion is not evidence about streaming.
+Enabling it sends `logprobs: true` and `top_logprobs` (0–20).
+`response_mode: stream` is the default: both the level-1 baseline and concurrent
+requests use `stream: true`, overriding the global streaming setting. The endpoint
+must supply usable token probabilities in its streamed responses.
+
+Explicit `response_mode: complete` remains available for saved configurations and
+non-streaming diagnostics. It uses `stream: false` at every level. Level-1
+probability comparisons can qualify in this mode, but levels above one cannot
+qualify because complete responses cannot establish overlapping server output.
+Use streaming mode to qualify concurrent probability comparisons.
 
 Each input shape uses a fixed corpus of identical independent prompts with
 `max(levels)` numbered slots. Every condition replays that same corpus, first at
@@ -636,10 +667,16 @@ The request count per target is
 The example sends 48 requests. Preview shows this count before a run. Requested
 concurrency, per-round client overlap, issued/completed/missing requests and
 usable samples remain visible. Client overlap does not prove which requests the
-server batched together. Rounds use a refilling worker pool. Each request records workload-local overlap;
-tail requests whose lifetime average is below `level - 0.5` are listed and
-excluded from probability comparisons (level 1 always qualifies). Each condition
-needs at least `min_samples` qualified usable samples and comparable repeat pairs.
+server batched together. Rounds use a refilling worker pool. Each request records
+workload-local overlap. Above level 1, qualification requires a lifetime average
+client in-flight count of at least `level - 0.5`, streamed output overlapping another
+request, and a round peak of server-evidenced concurrency at the requested level.
+Samples missing these conditions are listed and excluded from probability comparisons.
+Level 1 has no overlap requirement. Each condition needs at least `min_samples`
+qualified usable samples and comparable repeat pairs. Planned measured and priming
+requests must complete validly with `finish_reason: stop` and available token-probability
+evidence. Each condition and cross-level comparison needs at least 32 compared token
+positions; shorter evidence leaves coverage inconclusive.
 Each round also reports its overall time-weighted average in-flight.
 Request, duration, cancellation, context and error limits
 still apply; unfinished rounds or inadequate overlap make coverage inconclusive.
@@ -721,8 +758,8 @@ its URL and model for your server. The Tool-call correctness editor accepts the 
 and configuration preview, CLI export and rerun preserve it.
 
 Each fixture declares initial `messages`, `tools`, one to four `steps`, and
-`final_content` assertions. A step declares one to sixteen ordered
-`expected_calls`, each with a function `name`, exact `arguments`, an inert JSON
+`final_content` assertions. A step declares one to sixteen `expected_calls`, each
+with a function `name`, exact `arguments`, an inert JSON
 `result`, and optional `outcome: success` or `error`. Giraffe validates the actual
 call IDs, functions and arguments, appends the actual assistant message, and sends
 each result with that call's actual `tool_call_id`. No tool code runs. Complete
@@ -745,8 +782,9 @@ JSON key order. Fingerprints include the function and parsed arguments; numeric
 allowed only when declared in the next step. A declared error result permits a
 retry. A step's optional `user_message` starts a new question and resets the set
 of satisfied operations; this allows deliberate later reuse of a tool. Calls
-within a step must match the declared order. Unplanned calls fail without being
-supplied results.
+within a step can arrive in any order, but their count, function names and arguments
+must match the declared calls exactly. Results are linked to the matching actual
+call IDs. Unplanned calls fail without being supplied results.
 
 Request and duration limits, cancellation, error-stop limits, response-size and
 output limits still apply. Histories also use the configured context ceiling,

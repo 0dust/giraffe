@@ -465,7 +465,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                             if has_observations:
                                 from giraffe.logprob_workload import logprob_fixtures
                                 request = logprob_fixtures(options, fixtures)[shape]
-                                request.stream = False
+                                request.stream = settings.logprobs.response_mode == "stream"
                                 specs = [request]
                             rounds = settings.repetitions + settings.logprobs.priming_rounds
                             finite(target.name, row, check, requests, concurrency, specs,
@@ -999,7 +999,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             sample_count(settings.repetitions, level) for level in set([1, *settings.levels]))
         if settings.logprobs:
             count = len(settings.shapes) * levels * corpus_width(settings) * (settings.repetitions + settings.logprobs.priming_rounds)
-            add("consistency", count, f"{settings.repetitions} measured rounds plus {settings.logprobs.priming_rounds} priming rounds per shape and level; {corpus_width(settings)} fixed corpus requests per round. Complete responses with logprobs enabled; client overlap does not prove server batching.")
+            add("consistency", count, f"{settings.repetitions} measured rounds plus {settings.logprobs.priming_rounds} priming rounds per shape and level; {corpus_width(settings)} fixed corpus requests per round. {settings.logprobs.response_mode.capitalize()} responses with logprobs enabled; client overlap does not prove server batching.")
         else:
             add("consistency", count, f"At least {settings.repetitions} repeats of {settings.prompts_per_shape} distinct prompts per shape and level, rounded up to full load groups, including sequential controls once.")
     if "tools" in selected:

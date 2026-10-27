@@ -60,7 +60,8 @@ For example:
 giraffe ui --port 8768 --runs-dir runs/local --config examples/local.yaml
 ```
 
-Paste the endpoint in **Connect** and choose **Test connection**. If model listing
+Paste the endpoint in **Connect** and choose **Connect** (**Reconnect** after a
+successful test). If model listing
 returns one model, it is selected automatically; otherwise choose or enter a
 model. An explicitly entered model skips discovery. The test sends at most one
 short completion with a 32-token cap and a 15-second total timeout. It checks for
@@ -68,9 +69,10 @@ a usable response, not accuracy or load capacity, and creates no run report.
 Editing the endpoint, model or authentication clears the result. A manually
 specified model can be used without a successful connection test.
 
-**Checks** opens on the selected checks. Without `--config`, it starts with
-endpoint response and answer correctness. Use **Add checks** to search the
-catalog, the **i** button for details and **Settings** for a check's controls.
+**Checks** initially shows the full catalog. Without `--config`, **Endpoint
+response** and **Answer correctness** are selected. Use **Selected** to show only
+selected checks or **All checks** to browse and search the catalog. Use the **i**
+button for details and **Settings** for a check's controls.
 The review shows planned requests, run limits and separate evaluator calls.
 Plans update as settings change; **Launch** requires a current plan.
 
@@ -86,7 +88,7 @@ partial results.
 
 ## Credentials
 
-For an authenticated endpoint, **API key (optional)** accepts a pasted key in a
+For an authenticated endpoint, **API key** accepts a pasted key in a
 masked field. The browser keeps it in this tab's memory and sends it to the local
 runner for connection tests and runs. Reloading or changing the endpoint clears
 it; **Clear key** removes it explicitly. A running test keeps its starting key.
@@ -102,10 +104,12 @@ and evaluator endpoints use their own credentials. Open local endpoints need no 
 
 ## Results and stopping
 
-CLI runs print their request, simultaneous, duration, timeout and output settings
-before traffic. **Ctrl+C** stops new requests and saves partial results after the
-suite starts. Preflight failures do not produce a run report. Ordinary runs do not
-restart the service; cold-start checks require the explicit cold-start command.
+By default, `giraffe run` sends a bounded preflight completion request per target
+before printing its request, simultaneous, duration, timeout and output settings.
+Those settings appear before suite traffic. **Ctrl+C** stops new requests and
+saves partial results after the suite starts. A blocking preflight failure does
+not produce a run report. Ordinary runs do not restart the service; cold-start
+checks require the explicit cold-start command.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -126,10 +130,12 @@ giraffe inspect runs/before/report.json
 
 ## Compare with a baseline
 
-In the UI, open a completed run and choose **Save as reference baseline**. Give it
-a name and choose **Save baseline**. The run then offers **Compare a new run with
-this baseline**, which opens a new run using that reference and the saved setup.
-Review the settings before choosing **Launch**.
+In the UI, open a completed run. Fully passing runs offer **Save baseline**; other
+completed runs offer **Save as reference baseline**. Give it a name and choose
+**Save baseline**. Then choose **Compare a new run with this baseline** at the
+bottom of the report, or **Compare a new run** when shown at the top. Both open a
+new run using that reference and the saved setup. Review the settings before
+choosing **Launch**.
 
 From the CLI, save a completed run with `giraffe baseline save`, then pass the
 saved file to `giraffe run --baseline`:

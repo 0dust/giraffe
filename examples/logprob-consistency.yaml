@@ -20,7 +20,7 @@ consistency:
   seed: 17
   strict: false
   logprobs:
-    response_mode: complete
+    response_mode: stream
     top_logprobs: 5
     priming_rounds: 1
     compare_levels: true

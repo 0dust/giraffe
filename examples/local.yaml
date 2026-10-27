@@ -17,6 +17,10 @@ request_options:
   temperature: 0
 structured_json: true
 retention: failures
+# Load test uses separate load_test.pass_criteria: 2,000 ms first answer,
+# 30,000 ms completion, 0% errors, 100% correct scored answers, 5 valid responses.
+# It has no stream-pause or generation-speed limit unless set there.
+# The limits below apply to other checks.
 limits:
   first_output_ms: 5000
   latency_ms: 15000

@@ -126,14 +126,12 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-def test_current_generator_sources_have_reviewed_identity_table_entries():
+def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
-                           checks=["consistency"], consistency={"logprobs": {}})
+                           checks=["consistency"])
     identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue45")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
-        "logprob_source_sha256": hashlib.sha256(Path(logprobs.__file__).read_bytes()
-                                              + Path(logprob_workload.__file__).read_bytes()).hexdigest(),
     }
     assert identity is not None, IDENTITY_TABLE_GUIDANCE
     for field, digest in actual.items():
@@ -150,6 +148,28 @@ def test_replaced_load_generator_is_not_bridged_to_historical_workload(check):
     current.manifest["config"] = config.model_dump(mode="json")
     current.manifest["fixture_pack"] = deepcopy(old.manifest["fixture_pack"])
     current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({"load_test": config.load_test.model_dump()})
+    before = old.model_dump_json()
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+    assert old.model_dump_json() == before
+
+
+@pytest.mark.parametrize("response_mode", ["stream", "complete"])
+def test_streaming_logprob_generator_is_not_bridged_to_historical_evidence(response_mode):
+    current, old, _, _ = reports("consistency")
+    configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
+                           checks=["consistency"], consistency={"logprobs": {"response_mode": "complete"}})
+    old.manifest["config"] = configured.model_dump(mode="json")
+    historical = _run_limits_workload_identity(old.manifest, revision="issue45")
+    assert historical is not None
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(historical)
+    configured.consistency.logprobs.response_mode = response_mode
+    current.manifest["config"] = configured.model_dump(mode="json")
+    identity = deepcopy(historical)
+    identity["settings"]["consistency"] = configured.consistency.model_dump(mode="json")
+    identity["logprob_source_sha256"] = hashlib.sha256(
+        Path(logprobs.__file__).read_bytes() + Path(logprob_workload.__file__).read_bytes()).hexdigest()
+    assert identity["logprob_source_sha256"] != historical["logprob_source_sha256"]
+    current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     before = old.model_dump_json()
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
     assert old.model_dump_json() == before

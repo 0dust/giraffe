@@ -22,7 +22,7 @@ from .caps import (
     MAX_SERVER_ID_CHARS, MAX_TOOL_CALLS,
 )
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
-from giraffe.logprobs import LogprobBudget
+from giraffe.logprobs import LogprobBudget, LogprobCollector
 from giraffe.transport import HTTPClientPool, _finish_cleanup
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
@@ -378,7 +378,7 @@ class LLMClient:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
         preparation_start = time.perf_counter()
-        stream = self.config.stream and spec.stream
+        stream = spec.stream if spec.workload.get("logprobs") else self.config.stream and spec.stream
         budget = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
         record = RequestRecord(
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
@@ -449,6 +449,7 @@ class LLMClient:
         content_event_spans: list[tuple[dict[str, Any], int, int]] = []
         response_sequence = -1
         conversation = spec.workload.get("selection") == "conversation"
+        logprob_collector = LogprobCollector(spec.workload["top_logprobs"], self.logprob_budget) if spec.workload.get("logprobs") and stream else None
         assistant_content_present = False
         assistant_extras: dict[str, list[str]] = {}
 
@@ -559,6 +560,8 @@ class LLMClient:
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
             answer = _text(content.get("content"))
+            if logprob_collector is not None:
+                logprob_collector.add(choice.get("logprobs"))
             if spec.workload.get("logprobs") and not streaming:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
@@ -798,6 +801,11 @@ class LLMClient:
         except (httpx.HTTPError, OSError, ValueError) as exc:
             record.error = f"request failed ({type(exc).__name__})"
         finally:
+            if logprob_collector is not None and record.logprob_evidence is None:
+                evidence = logprob_collector.finish(record.output)
+                if not record.valid and evidence.status == "available":
+                    evidence = evidence.model_copy(update={"status": "incomplete", "reason": "Response did not complete validly."})
+                record.logprob_evidence = self.logprob_budget.retain(evidence)
             now = time.perf_counter()
             record.elapsed_ms = (now - start) * 1000
             record.output_chars = len(record.output)

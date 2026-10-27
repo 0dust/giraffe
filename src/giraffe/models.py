@@ -1113,7 +1113,7 @@ class Sessions(Model):
 
 
 class LogprobConsistency(Model):
-    response_mode: Literal["complete"] = "complete"
+    response_mode: Literal["stream", "complete"] = "stream"
     top_logprobs: int = Field(default=5, ge=0, le=20)
     strict: bool = False
     tolerance: float | None = Field(default=None, ge=0)

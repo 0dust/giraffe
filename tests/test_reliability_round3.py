@@ -288,7 +288,7 @@ async def test_nonstrict_consistency_does_not_certify_variation(monkeypatch, mod
     endpoint = MemoryEndpoint(monkeypatch, mode=mode)
     settings = {'shapes': ['short'], 'repetitions': 3, 'strict': strict}
     if mode == 'logprob_drift':
-        settings['logprobs'] = {'top_logprobs': 0, 'tolerance': .01}
+        settings['logprobs'] = {'response_mode': 'complete', 'top_logprobs': 0, 'tolerance': .01}
     outcome = next(c for c in (await runner.run_suite(workload_config(endpoint,
         checks=['consistency'], stream=True, consistency=settings))).checks if c.id == 'consistency')
     assert outcome.status == expected
