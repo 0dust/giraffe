@@ -14,10 +14,12 @@ from .performance import KPI_IDS
 
 STYLE = """
 :root{--bg:#09090a;--surface:#131315;--text:#f5f3ee;--text-2:#b5b2aa;--accent:#f5b544;--line:#333136;--mono:ui-monospace,monospace;color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui}main{max-width:1240px;margin:auto;padding:24px}h1{font-size:28px}h2{font-size:20px}h3{font-size:15px}a{color:var(--accent)}.muted,.html-note{color:var(--text-2)}.card,details,.html-kpi,.html-plot{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px;margin:12px 0}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 var(--mono)}code{overflow-wrap:anywhere}.badge{padding:2px 8px;border-radius:4px;background:#333136}.pass{color:#3dd68c}.fail,.blocked{color:#ff5f67}.inconclusive{color:#f5b544}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}td:nth-child(2),.html-distributions td{font-family:var(--mono)}
-.html-tabs{position:sticky;top:env(safe-area-inset-top,0px);z-index:2;display:flex;gap:24px;align-items:center;background:var(--bg);border-block:1px solid var(--line);padding:16px 0;margin:24px 0}.html-tabs label{cursor:pointer;padding:4px}.html-tabs label:has(:checked){color:var(--accent);border-bottom:2px solid}.html-tabs label:has(:focus-visible){outline:2px solid var(--accent)}.html-tabs input{position:absolute;opacity:0;width:1px;height:1px}.html-tabs small{margin-left:auto}#html-results{display:none}main:has(#html-tab-results:checked) #html-performance{display:none}main:has(#html-tab-results:checked) #html-results{display:block}
+
 .html-section{margin:32px 0;scroll-margin-top:90px}.html-section>header{display:flex;align-items:baseline;justify-content:space-between;gap:18px}.html-section h2{margin:0 0 16px}.html-section header p{font-size:12px;text-align:right}.html-cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.html-kpi{margin:0;min-width:0}.html-kpi h3{font-size:12px;margin:0 0 14px;display:flex;justify-content:space-between;gap:6px}.html-value{font:24px/1.25 var(--mono);overflow-wrap:anywhere}.html-value small,.html-kpi p,.html-note,.html-legend{font:11px/1.5 system-ui;color:var(--text-2)}.html-kpi p{margin:10px 0 0}.html-estimate{font:9px var(--mono);color:var(--accent)}.html-info{position:relative;margin:0;padding:0;border:0;display:inline-block}.html-info summary{font-size:11px;list-style:none}.html-info>span{position:absolute;right:0;z-index:3;width:240px;background:var(--surface);border:1px solid var(--line);padding:10px;font-weight:400}.html-two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.html-throughput{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:18px;align-items:start}.html-capacity{grid-template-columns:repeat(2,minmax(0,1fr))}.html-load{grid-template-columns:repeat(3,minmax(0,1fr))}.html-support{grid-template-columns:1fr 1fr;margin:14px 0}.html-plot{min-width:0;margin:0}.html-plot svg{display:block;width:100%;height:auto}.html-legend{display:flex;flex-wrap:wrap;gap:8px 16px}.html-legend i{display:inline-block;width:14px;border-top:2px solid;margin-right:5px}.html-metrics details{margin:0;padding:0;border:0}.html-scope{padding:12px 0;border-bottom:1px solid var(--line)}
-@media(max-width:800px){main{padding:14px}.html-throughput{grid-template-columns:1fr}.html-two{grid-template-columns:1fr}.html-section>header{display:block}.html-section header p{text-align:left}.html-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.html-tabs{gap:12px}.html-tabs small{font-size:10px}}
-@media(max-width:640px){.html-tabs{position:static;flex-wrap:wrap}.html-tabs small{width:100%;margin-left:0}}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}nav{margin:24px 0}.answer-finding summary{overflow-wrap:anywhere}.baseline-table td{min-width:90px}.baseline-table td:last-child{min-width:220px}
+@media(prefers-color-scheme:light){:root{--bg:#fff;--surface:#f7f7f8;--text:#18181b;--text-2:#52525b;--accent:#805500;--line:#d4d4d8;color-scheme:light}.badge{background:#ededf0}.pass{color:#087743}.fail,.blocked{color:#bf202a}.inconclusive{color:#805500}}
+@media print{:root{--bg:#fff;--surface:#fff;--text:#000;--text-2:#333;--accent:#222;--line:#bbb;color-scheme:light}main{max-width:none;padding:0}nav,a[download]{display:none}section{break-inside:auto}h1,h2,h3{break-after:avoid}tr,.html-plot,.html-kpi{break-inside:avoid}.html-cards{grid-template-columns:repeat(3,minmax(0,1fr))}details{border:0;padding:4px 0}details>*:not(summary){display:block!important}details::details-content{content-visibility:visible!important;height:auto!important}a{color:inherit}.pass,.fail,.blocked,.inconclusive{color:#000}.table{overflow:visible}table{font-size:10px}th,td{padding:5px}body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+@media(max-width:800px){main{padding:14px}.html-throughput{grid-template-columns:1fr}.html-two{grid-template-columns:1fr}.html-section>header{display:block}.html-section header p{text-align:left}.html-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
 
 CHART_STYLE = """.html-chart-frame{position:relative;margin:16px 0}.html-chart-frame svg{height:240px;width:100%}.html-axis-label,.html-stage-label{position:absolute;color:var(--text-2);font:11px/1.3 var(--mono);pointer-events:none}.html-axis-label.x-min{left:5.33%;bottom:8%}.html-axis-label.x-max{right:4%;bottom:8%}.html-axis-label.y-max{left:0;top:10%}.html-axis-label.y-min{left:0;bottom:20%}.html-axis-label.x-title{left:5.33%;right:4%;bottom:0;text-align:center}.html-axis-label.y-title{left:5.33%;top:0}.html-stage-label{top:8%;max-width:18%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.html-transition{stroke:var(--surface);stroke-width:1;vector-effect:non-scaling-stroke}@media(max-width:640px){.html-chart-frame svg{height:220px}}"""
@@ -88,7 +90,7 @@ def _structured_value(row):
                 truncated |= len(value) > 12
             else:
                 for index, item in enumerate(value[:41]):
-                    visit(item, f"{path} · {index+1}" if path else f"Entry {index+1}", depth=depth+1)
+                    visit(item, f"{path} · {index+1}" if path else f"Observation {index+1}", depth=depth+1)
                 truncated |= len(value) > 41
         elif isinstance(value, dict):
             if not value:
@@ -111,7 +113,7 @@ def _structured_value(row):
             counts = [("Local drops", item.get("local_drops") if item.get("local_drops") is not None else item.get("dropped_local")),
                       ("Late", item.get("late_drops") if item.get("late_drops") is not None else item.get("dropped_late")),
                       ("Not offered", item.get("not_offered"))]
-            summaries.append((f"Entry {index+1}: " if len(values) > 1 else "")
+            summaries.append((f"Observation {index+1}: " if len(values) > 1 else "")
                              + " · ".join(f"{label} {text(value)}" for label, value in counts))
         summary = "; ".join(summaries) + (f" · {len(values)} entries" if len(values) > 3 else "")
     empty_fields = [key for key, value in rows if value == "None"]
@@ -399,8 +401,7 @@ def render_performance(performance, *, prefix='performance'):
             + '<details><summary>Token-length distributions</summary>' + _distributions([r for key, r in summary['distributions'].items() if key.endswith('_length')], performance['percentile_convention']) + '</details>'))
         for name, title, key, note in (
             ('effects', '07 Conversations & workload effects', 'conversations', 'Workload-specific evidence remains separate.'),
-            ('telemetry', '08 Server observations', 'server', 'Server-wide counters may include other traffic; separate collection window.'),
-            ('baseline', '09 Baseline comparison', 'baseline', 'Only qualified comparable evidence; no capacity inferred.')):
+            ('telemetry', '08 Server observations', 'server', 'Server-wide counters may include other traffic; separate collection window.')):
             parts.append(_section(pfx, name, title, note, _table(sections[key])))
     content = ''.join(parts)
     return ('<style>' + CHART_STYLE + '</style>' if '<svg' in content else '') + content

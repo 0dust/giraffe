@@ -27,7 +27,7 @@ def test_completed_report_warning_does_not_override_passing_verdict():
     run_render_checks(r"""
 const warning='HTML report could not be saved: disk full; report.json is complete';
 const html=detail(report([check('access','pass')]),{state:'completed',error:warning});
-assert.match(html,/Acceptance passed/);assert.match(html,/Selected acceptance checks passed/);
+assert.match(html,/<h1>Selected acceptance checks passed<\/h1>/);assert.doesNotMatch(html,/verdict-word|Acceptance passed/);
 assert.match(html,/class="notice warning"/);assert.match(html,/HTML report could not be saved/);
 assert.match(html,/data-action="baseline-dialog">Save baseline/);
 assert.doesNotMatch(html,/Runner error|Run could not finish|class="notice error"/);
@@ -61,7 +61,7 @@ def test_check_evidence_prioritizes_invalid_and_evaluation_errors_without_missin
 const request=(id,extra={})=>({id,target:'local',scenario:id,status:'completed',elapsed_ms:1,...extra});
 const requests=[request('good',{valid:true}),request('legacy'),request('invalid',{valid:false}),request('evaluation',{valid:true,evaluation_error:'grading unavailable'}),request('legacy-evaluation',{status:'evaluation_error'}),request('failed',{status:'failed'}),request('incorrect',{score:false})];
 const value=report([check('correctness','fail',{evidence_ids:requests.map(r=>r.id)})],{overall:'fail',requests});
-const html=detail(value),list=html.slice(html.indexOf('class="evidence-table"'));
+detail(value);state.selectedCheck='local:correctness';const html=renderChecks(value),list=html.slice(html.indexOf('class="evidence-table"'));
 const position=id=>list.indexOf('data-request="'+id+'"');
 for(const id of ['incorrect','invalid','evaluation','legacy-evaluation','failed']){
   assert(position(id)>=0);assert(position(id)<position('good'));assert(position(id)<position('legacy'));

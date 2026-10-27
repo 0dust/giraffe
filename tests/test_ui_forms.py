@@ -645,13 +645,13 @@ const target={{target:'local',status:'pass',comparisons:[],
 const report={{checks:[],baseline:{{run_id:'before',status:'pass',targets:[target]}}}};
 state.comparisonFilter='all';
 let markup=renderComparison(report);
-assert.match(markup,/2 traffic stages compared/);
+assert.match(markup,/Arrival stage evidence/);
 assert.doesNotMatch(markup,/0 recorded metric comparisons|0 comparable metrics|No metric rows|comparison-filters/);
 target.comparisons.push({{check:'correctness',metric:'error_rate',status:'pass'}});
 markup=renderComparison(report);
-assert.match(markup,/comparison-filters/);
-assert.match(markup,/1 measurements, grouped by check/);
-assert.match(markup,/data-comparison-group="correctness"/);
+assert.match(markup,/<th>Metric<\\/th>/);
+assert.match(markup,/Error rate/);
+assert.match(markup,/no material change/);
 target.configuration_diff={{confounded:true,changed_fields:['runtime.version']}};
 target.telemetry={{coverage:'partial'}};
 markup=renderComparison(report);
@@ -1109,8 +1109,8 @@ markup=renderJudgement({status:'inconclusive',votes:[votes[0],{judge:'second',st
 state.detail={report:{requests:[{id:'r',fixture_id:'refund',judgement:{status:'inconclusive',votes},score:null}],manifest:{config:{retention:'all'}}}};
 openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI evaluation/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
 state.detail={id:'run',state:'running',config:{targets:[{name:'target',model:'m'}],judging:config.judging,max_requests:50},progress:{event:'judging_progress',attempted:20,completed:20,judge_calls_total:40,judge_calls_completed:7,elapsed_seconds:10},events:[]};
-renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
-state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Mission control</h1>'));assert(nodes['#main'].innerHTML.includes('One spot per test. Select a spot for its requests and results.'));
+renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Evaluation calls/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
+state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Running</h1>'));assert(nodes['#main'].innerHTML.includes('One spot per test. Select a spot for its requests and results.'));
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
