@@ -13,12 +13,11 @@ from decimal import Decimal
 import math
 import random
 import time
-from statistics import median
+from giraffe.stats import median, percentile
 
 from giraffe.concurrent_load import (
     OutputProgress,
     _distribution,
-    _percentile,
     aggregate,
     calibrate,
     context_window,
@@ -744,7 +743,13 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             ):
                 return None
             spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
-            record = await run.request(target, client, spec, event=progress, slot_reserved=True)
+            try:
+                record = await run.request(target, client, spec, event=progress, slot_reserved=True)
+            except asyncio.CancelledError as exc:
+                record = getattr(exc, "giraffe_record", None)
+                if record is not None:
+                    records.append(record)
+                raise
             if record is not None:
                 records.append(record)
             return record
@@ -765,7 +770,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             finally:
                 active.pop(index, None)
                 changed.set()
-            if record is None or asyncio.current_task().cancelling():
+            if record is None:
                 break
             await asyncio.sleep(0)
 
@@ -838,13 +843,15 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                 reason = run.stop_reason(target.name) or "execution cancelled"
         intent.finish(time.monotonic())
     now = time.monotonic()
+    if any(r.status == "cancelled" for r in records) and reason in {
+        None, "time limit reached", "maximum run duration reached"
+    }:
+        reason = "overall run deadline reached"
     for record in records:
         if record.status == "cancelled":
             if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
                 record.error = reason or "overall run deadline reached"
             record.load_point["cancellation_reason"] = record.error
-    if any(r.status == "cancelled" for r in records) and reason is None:
-        reason = "overall run deadline reached"
     window = {
         "phase": phase,
         "sending_start_ms": (begin - run.start) * 1000,
@@ -1154,10 +1161,10 @@ def measurements(run, target, settings, point, records, shape):
         if scored
         else None,
         required=criteria.min_valid_responses,
-        first_answer_p50_ms=_percentile([v for v in first if v is not None], 0.5),
-        first_answer_p95_ms=_percentile([v for v in first if v is not None], 0.95),
-        completion_p50_ms=_percentile([v for v in durations if v is not None], 0.5),
-        completion_p95_ms=_percentile([v for v in durations if v is not None], 0.95),
+        first_answer_p50_ms=percentile([v for v in first if v is not None], 0.5),
+        first_answer_p95_ms=percentile([v for v in first if v is not None], 0.95),
+        completion_p50_ms=percentile([v for v in durations if v is not None], 0.5),
+        completion_p95_ms=percentile([v for v in durations if v is not None], 0.95),
         longest_stream_pause_ms=max(
             (r.max_stream_gap_ms for r in valid if r.max_stream_gap_ms is not None), default=None
         ),
@@ -1506,7 +1513,7 @@ def assess_point(run, target, settings, point, records):
             "spread_ms": max(r.dispatch_ms for r in rows) - min(r.dispatch_ms for r in rows)
             if rows and all(r.dispatch_ms is not None for r in rows)
             else None,
-            "completion_p50_ms": _percentile(
+            "completion_p50_ms": percentile(
                 [r.arrival_elapsed_ms for r in rows if r.arrival_elapsed_ms is not None], 0.5
             ),
         }
@@ -1515,7 +1522,7 @@ def assess_point(run, target, settings, point, records):
     point["response_by_origin"] = {
         origin: {
             "dispatched": len(rows),
-            "completion_p50_ms": _percentile(
+            "completion_p50_ms": percentile(
                 [r.arrival_elapsed_ms for r in rows if r.arrival_elapsed_ms is not None], 0.5
             ),
             "failed": sum(r.status in {"failed", "timeout"} for r in rows),

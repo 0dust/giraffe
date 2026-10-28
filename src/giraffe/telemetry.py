@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import ssl
@@ -17,6 +18,9 @@ from .caps import (
     MAX_METRICS_LABEL_CHARS,
 )
 from giraffe.deployment import sanitize
+
+logger = logging.getLogger(__name__)
+
 
 # Exact names and units, not substring guesses. Profiles are explicit runtime contracts.
 # vLLM V1: vllm/v1/metrics/loggers.py; legacy: engine/metrics.py.
@@ -473,6 +477,12 @@ def _metrics_client(config, target, timeout):
     )
 
 
+def _parse_body(body, target, config, *, host=False):
+    # Decoding and Prometheus parsing share the executor, away from the loop
+    # that timestamps inference reads.
+    return parse(body.decode("utf-8"), target, config, host=host)
+
+
 async def _scrape_runtime(run, target, phase, *, force=False):
     # A single same-origin conventional route is safe to discover. Never scan
     # ports, follow redirects, or forward inference credentials to an exporter.
@@ -522,8 +532,9 @@ async def _scrape_runtime(run, target, phase, *, force=False):
                             })
                             return _remember_discovery(run, target, result)
                         body.extend(chunk)
-        result.update(parse(body.decode("utf-8"), target, run.config))
+        result.update(await asyncio.to_thread(_parse_body, body, target, run.config))
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
+        logger.debug("Statistics collection failed", exc_info=True)
         result.update(
             status="connection_failure",
             reason=f"Statistics unavailable ({type(exc).__name__}); instrumentation state unknown.",
@@ -678,11 +689,12 @@ async def _scrape_host(run, target, phase):
                         if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
                             return result | {"status": "response_limit", "reason": "Host statistics response exceeds 1 MiB."}
                         body.extend(chunk)
-        result.update(parse(body.decode("utf-8"), target, run.config, host=True))
+        result.update(await asyncio.to_thread(_parse_body, body, target, run.config, host=True))
         hosts = {s["labels"].get("nodename") for s in result["samples"]
                  if s["family"] == "host_identity" and not s["stale"]}
         result["reported_host_identities"] = sorted(h for h in hosts if h)
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
+        logger.debug("Statistics collection failed", exc_info=True)
         result.update(status="connection_failure", reason=f"Host statistics unavailable ({type(exc).__name__}).")
     result["scrape_duration_seconds"] = time.monotonic() - run.start - result["elapsed_seconds"]
     return result

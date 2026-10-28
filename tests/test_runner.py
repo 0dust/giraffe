@@ -1600,10 +1600,15 @@ async def test_cancelling_evaluation_preserves_partial_report(monkeypatch, exter
     await asyncio.wait_for(started.wait(), 1)
     if external_cancel:
         task.cancel()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(task, 1)
+        report = cancelled.value.giraffe_report
+        assert task.cancelling() == 0
     else:
         stop.set()
-    report = await asyncio.wait_for(task, 1)
-    assert stopped.is_set() and report.abort_reason == "cancelled by user"
+        report = await asyncio.wait_for(task, 1)
+    assert stopped.is_set()
+    assert report.abort_reason == ("run cancelled" if external_cancel else "cancelled by user")
     assert report.observations["judging"]["scored_requests"] == 1
     assert report.observations["judging"]["inconclusive_requests"] == 4
     assert check(report, "correctness").status == "inconclusive"

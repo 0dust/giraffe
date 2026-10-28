@@ -126,6 +126,6 @@ def test_atomic_export_does_not_follow_temp_symlink(tmp_path):
     elsewhere = tmp_path / "outside"
     elsewhere.write_text("unchanged")
     (tmp_path / "report.json.tmp").symlink_to(elsewhere)
-    with pytest.raises(OSError):
-        write_report(report_with_bodies(), tmp_path, html=True)
+    write_report(report_with_bodies(), tmp_path, html=True)
+    assert (tmp_path / "report.json").is_file()
     assert elsewhere.read_text() == "unchanged"

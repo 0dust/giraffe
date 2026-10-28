@@ -125,7 +125,9 @@ async def test_cancellation_always_detaches_sampler(monkeypatch, fake_client):
     task = asyncio.create_task(runner.run_suite(config()))
     await entered.wait()
     task.cancel()
-    await task
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await task
+    assert cancelled.value.giraffe_report.abort_reason == "run cancelled"
     assert samplers[0].run.memory_sampling_done
     assert samplers[0].on_sample is None
     assert not samplers[0]._thread.is_alive()

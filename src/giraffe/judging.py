@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import re
 import time
@@ -16,6 +17,9 @@ from giraffe.models import (
     JUDGE_PROMPT_VERSION, JudgeEndpoint, JudgeVote, RequestJudgement,
     RequestRecord, RequestSpec, RunConfig, Target,
 )
+
+logger = logging.getLogger(__name__)
+
 
 _POLICY = f"""Reference-answer correctness evaluator ({JUDGE_PROMPT_VERSION}).
 Decide whether the generated answer correctly answers the original messages using
@@ -124,6 +128,14 @@ async def judge_records(
     panels: list[list[JudgeVote | None]] = [[None] * len(judges) for _ in eligible]
     aborted: str | None = "cancelled" if stop_event and stop_event.is_set() else None
 
+    logged_failures = 0
+
+    def log_failure(message):
+        nonlocal logged_failures
+        logged_failures += 1
+        if logged_failures == 1:
+            logger.exception(message)
+
     def emit(event: str) -> None:
         if progress:
             progress({"event": event, **summary})
@@ -147,6 +159,7 @@ async def judge_records(
                 try:
                     client = await stack.enter_async_context(LLMClient(target, isolated, max_connections=settings.concurrency))
                 except (ImportError, OSError, ValueError, RuntimeError):
+                    log_failure("Judge client initialization failed")
                     client = None
                 clients.append(client)
             jobs = iter((i, j) for i in range(len(eligible)) for j in range(len(judges)))
@@ -165,6 +178,7 @@ async def judge_records(
                             # continue the worker loop after its enclosing phase was stopped.
                             vote = _error(judges[j], aborted) if aborted else _vote(judges[j], result)
                         except Exception:
+                            log_failure("Judge request failed")
                             # Endpoint-controlled content can also fail during transport
                             # finalization. Keep that failure local to this judge vote.
                             vote = _error(judges[j], "request_failed")
@@ -223,6 +237,8 @@ async def judge_records(
                                             for vote in record.judgement.votes)
         summary["duration_seconds"] = time.monotonic() - start
         summary["stop_reason"] = aborted
+        if logged_failures > 1:
+            logger.warning("%s additional judge failures; repeated tracebacks suppressed", logged_failures - 1)
         emit("judging_finished")
     if cancelled:
         raise asyncio.CancelledError

@@ -51,9 +51,11 @@ def test_observed_finite_batches_use_empirical_tail_and_effective_concurrency():
     configured = config(default_concurrency=2, concurrency=40,
                         test_options={"correctness": {"samples": 9, "request_timeout_seconds": 60}})
     plan = request_plan(configured, observations=observations(configured, p50=100, p90=400))
-    assert plan["estimated_low_seconds"] == .492
-    assert plan["estimated_high_seconds"] == 1.896
-    assert plan["estimated_seconds"] == 1.194
+    # The ordinary request pool replenishes individual completions, so it
+    # finishes sooner than the old sum-of-batch-maxima prediction.
+    assert plan["estimated_low_seconds"] == .413
+    assert plan["estimated_high_seconds"] == 1.478
+    assert plan["estimated_seconds"] == .946
     assert plan["confidence"] == "low"
     assert plan["unknown_time_components"] == []
     component, = plan["time_components"]
@@ -61,12 +63,13 @@ def test_observed_finite_batches_use_empirical_tail_and_effective_concurrency():
     assert component["requests"] == 9
     assert plan["estimate_exclusions"] == ["setup/connection", "AI evaluation", "report generation"]
     assert plan["time_estimate_assumptions"] == [
-        "Finite batches use the expected maximum from comparable recorded distributions. A nominal 99% prediction "
-        "interval combines batch variance and sample uncertainty across sequential groups, with a measured-skew "
-        "correction on the upper tail. Medium confidence requires 150 samples from one run or at least 15 samples "
+        "Finite request groups model immediate replenishment from comparable recorded distributions; explicit batch "
+        "barriers retain batch maxima. Large variable pools use conservative work/drain bounds. A nominal 99% prediction "
+        "interval combines service variance and finite-cohort uncertainty across sequential groups, with Student-t and "
+        "measured-skew corrections. Medium confidence requires 150 samples from one run or at least 15 samples "
         "per setting across 3 consistent runs, at least 99% accounted timing coverage (including small measured "
         "inter-batch overhead only after 3 runs), no unknown components and a combined relative half-width at most "
-        "50% (single-run components also require a normal half-width at most 40%). Each run has equal total weight, "
+        "50% (single-run components also require a prediction half-width at most 40%). Each run has equal total weight, "
         "so recent runs weigh no less than older runs; pooling stops at a detected latency shift.",
         "service · Answer correctness: based on 1 earlier run of this endpoint."]
 
@@ -119,21 +122,21 @@ def test_older_observations_without_tail_data_remain_low_confidence():
     assert plan["confidence"] == "low"
     assert plan["unknown_time_components"] == []
     assert len(plan["time_components"]) == 1
-    assert plan["estimated_low_seconds"] == .018
-    assert plan["estimated_high_seconds"] == .043
+    assert plan["estimated_low_seconds"] == .015
+    assert plan["estimated_high_seconds"] == .036
 
 
 def test_sequential_targets_sum_and_overlapping_targets_use_per_target_slots():
     configured = config(default_concurrency=4, concurrency=4, targets=[TARGET, {**TARGET, "name": "other"}],
                         test_options={"correctness": {"samples": 8}})
     sequential = request_plan(configured, observations=observations(configured, p50=100, p90=200))
-    assert sequential["estimated_low_seconds"] == .446
-    assert sequential["estimated_high_seconds"] == .93
+    assert sequential["estimated_low_seconds"] == .411
+    assert sequential["estimated_high_seconds"] == .871
     overlap = configured.model_copy(update={"overlap_models": True})
     measured = observations(overlap, p50=100, p90=200, concurrency=2)
     overlapping = request_plan(overlap, observations=measured)
-    assert overlapping["estimated_low_seconds"] == .39
-    assert overlapping["estimated_high_seconds"] == .807
+    assert overlapping["estimated_low_seconds"] == .389
+    assert overlapping["estimated_high_seconds"] == .734
     assert {item["concurrency"] for item in overlapping["time_components"]} == {2}
 
 
@@ -418,8 +421,9 @@ def test_finite_gather_batches_use_slowest_comparable_fixture_per_batch():
         "output_cap": spec.max_tokens, "input_bucket": input_bucket(spec.input_chars),
         **tail(delay, 2 * delay)} for spec, delay in zip(fixtures, [10, 100])]}
     plan = request_plan(configured, observations=measured)
-    assert plan["estimated_low_seconds"] == .056
-    assert plan["estimated_high_seconds"] == .284
+    # Finite-cohort variance uses Student-t rather than known-variance z.
+    assert plan["estimated_low_seconds"] == .055
+    assert plan["estimated_high_seconds"] == .285
     assert plan["confidence"] == "low"
 
 
@@ -489,10 +493,11 @@ def test_validation_preview_does_not_build_large_effective_fixture_inputs(monkey
     assert calls == [(128, {}), (512, {})]
 
 
-async def test_overlapping_targets_preserve_configured_gather_batch_barriers(monkeypatch):
+def test_overlapping_targets_keep_concurrency_bounds_while_refilling(monkeypatch):
     import asyncio
     from giraffe import runner
     from tests.test_runner import FakeClient
+    from tests.test_review26_phase4_accuracy import run_virtual
 
     class PooledClient(FakeClient):
         delay = .01
@@ -510,16 +515,21 @@ async def test_overlapping_targets_preserve_configured_gather_batch_barriers(mon
                         test_options={"correctness": {"concurrency": 3, "samples": 6}})
     preview = request_plan(configured, observations=observations(configured, concurrency=3, p50=9, p90=15))
     assert preview["estimated_low_seconds"] == .017
-    assert preview["estimated_high_seconds"] == .068
+    # Worker replenishment removes the old configured gather barriers while
+    # retaining both the requested ceiling and shared-pool contention bounds.
+    assert preview["estimated_high_seconds"] == .064
     assert {item["configured_concurrency"] for item in preview["time_components"]} == {3}
     assert {item["concurrency"] for item in preview["time_components"]} == {3}
-    previous = await runner.run_suite(configured)
-    summary = latency_summary(previous)
-    measured = {target["name"]: target["measurements"] for target in summary["targets"]}
-    preview = request_plan(configured, observations=measured)
-    report = await runner.run_suite(configured)
-    assert preview["confidence"] == "low"
-    assert preview["estimated_low_seconds"] <= report.observations["inference_duration_seconds"] <= preview["estimated_high_seconds"]
+    async def scenario():
+        previous = await runner.run_suite(configured)
+        summary = latency_summary(previous)
+        measured = {target["name"]: target["measurements"] for target in summary["targets"]}
+        preview = request_plan(configured, observations=measured)
+        report = await runner.run_suite(configured)
+        assert preview["confidence"] == "low"
+        assert preview["estimated_low_seconds"] <= report.observations["inference_duration_seconds"] <= preview["estimated_high_seconds"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_arrival_pending_queue_needs_multiple_drain_waves(monkeypatch):
@@ -615,8 +625,10 @@ def test_logprob_consistency_uses_exact_response_mode_observations(response_mode
     plan = request_plan(configured, observations=measured)
     assert plan["confidence"] == "low"
     assert plan["unknown_time_components"] == []
-    assert plan["estimated_low_seconds"] == .112  # Independent groups combine variances, not interval widths.
-    assert plan["estimated_high_seconds"] == .223
+    # Explicit round batches retain their scheduling model; six-sample cohorts
+    # widen the range through finite-cohort t uncertainty, not altered barriers.
+    assert plan["estimated_low_seconds"] == .097
+    assert plan["estimated_high_seconds"] == .241
 
     incompatible = {"service": [{**row, "stream": not row["stream"], **tail(1000, 2000, n=6)}
                                 for row in measured["service"]]}

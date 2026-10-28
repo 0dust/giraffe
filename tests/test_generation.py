@@ -22,7 +22,8 @@ def test_prefill_and_trailing_protocol_wait_do_not_reduce_generation_pace():
     assert sample.generation_tokens_per_second == 12
     stats = _stats([sample])
     assert stats["generation_tokens_per_second_p50"] == 12
-    assert stats["output_tokens_per_second_p50"] == .089
+    # Shared report statistics retain precision; formatting rounds at display time.
+    assert stats["output_tokens_per_second_p50"] == pytest.approx(4 / 45)
     limits = Limits(min_output_tokens_per_second=1)
     assert _timing_violations([sample], limits) == []
     assert _missing_timing([sample], limits) == []

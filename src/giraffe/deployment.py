@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import hashlib
 import json
 import re
@@ -18,6 +19,9 @@ from .caps import (
     MAX_REPORT_SANITIZE_DEPTH, MAX_SANITIZE_DEPTH, MAX_SANITIZE_ITEMS,
     MAX_SANITIZE_KEYS, MAX_SANITIZE_KEY_CHARS, MAX_SANITIZE_STRING_CHARS,
 )
+
+logger = logging.getLogger(__name__)
+
 
 CATEGORIES = {
     "model": {
@@ -211,6 +215,7 @@ def load_metadata(path):
                 result[key] = sanitize(data[key])[:MAX_DEPLOYMENT_SCOPE_CHARS]
         return result
     except (OSError, ValueError, UnicodeError) as exc:
+        logger.debug("Deployment metadata could not be loaded", exc_info=True)
         raise ValueError("deployment metadata file is not valid bounded JSON") from exc
 
 
@@ -526,6 +531,7 @@ async def snapshot(target, config, deadline, stop):
                         {"status": "available", "source": "configured-collector"}
                     )
         except (httpx.HTTPError, ValueError, OSError, TimeoutError) as exc:
+            logger.debug("Deployment evidence collection failed", exc_info=True)
             result["discovery"].append({"status": "unavailable", "reason": type(exc).__name__})
     for row in result["fields"].values():
         if (

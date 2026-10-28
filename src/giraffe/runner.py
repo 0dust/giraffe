@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import platform
 import socket
@@ -12,18 +13,23 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import httpx
 
+from . import __version__
 from .client import LLMClient, no_response_failure
 from .conditions import condition_aggregate, condition_for, request_status
 from .deployment import fixture_hash
-from .fixtures import (FIXTURE_VERSION, SUITE_VERSION, builtin_fixtures, load_custom_fixtures,
+from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
+from .stats import percentile
+from .local_tokenizer import TokenizerUnavailable
 from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
 from .timing import TimingHealth, configured_metrics, exceeded_unfinished, qualified_violations, run_quality
 from .models import (
@@ -33,17 +39,13 @@ from .models import (
 )
 
 
+logger = logging.getLogger(__name__)
+# A context-local sink lets web runs persist evidence without changing request()
+# or sharing a writer between concurrent CLI invocations.
+record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _percentile(values: list[float], percentile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = (len(ordered) - 1) * percentile
-    lower, upper = math.floor(index), math.ceil(index)
-    return round(ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower), 3)
 
 
 def _reasoning_budget(record) -> bool:
@@ -72,14 +74,14 @@ def _stats(records: list[RequestRecord]) -> dict:
         "timed_out": sum(r.status == "timeout" for r in records),
         "cancelled": sum(r.status == "cancelled" for r in records),
         "error_rate": errors / len(evaluated) if evaluated else None,
-        "p50_ms": _percentile(latencies, .5), "p95_ms": _percentile(latencies, .95),
-        "first_output_p50_ms": _percentile(output, .5),
-        "first_output_p95_ms": _percentile(output, .95),
+        "p50_ms": percentile(latencies, .5), "p95_ms": percentile(latencies, .95),
+        "first_output_p50_ms": percentile(output, .5),
+        "first_output_p95_ms": percentile(output, .95),
         "max_stream_gap_ms": max((r.max_stream_gap_ms for r in good
                                    if r.max_stream_gap_ms is not None), default=None),
-        "output_tokens_per_second_p50": _percentile(rates, .5),
+        "output_tokens_per_second_p50": percentile(rates, .5),
         "output_tokens_per_second_min": min(rates, default=None),
-        "generation_tokens_per_second_p50": _percentile(generation_rates, .5),
+        "generation_tokens_per_second_p50": percentile(generation_rates, .5),
         "generation_tokens_per_second_min": min(generation_rates, default=None),
         "generation_rate_samples": len(generation_rates),
         "output_tokens": (None if any(r.load_point and r.output_tokens is None for r in good)
@@ -247,6 +249,7 @@ class _Run:
         for _ in range(pool_size):
             self.slots.put_nowait(None)
         self.records: list[RequestRecord] = []
+        self.record_sink = record_sink.get()
         from giraffe.logprobs import LogprobBudget
         self.logprob_budget = LogprobBudget()
         self.attempted = 0
@@ -381,6 +384,10 @@ class _Run:
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
         self.emit_condition("condition_finished", scenario, row)
+
+    def record_finished(self, record: RequestRecord) -> None:
+        """Persist completed, pre-judging evidence through the installed sink."""
+        self.record_sink(record)
 
     def emit(self, event: str, target: str = "", scenario: str = "", **extra):
         if target and event in {"scenario_started", "scenario_finished"}:
@@ -607,6 +614,9 @@ class _Run:
             intentional_deadline_applies = False
             started, started_at = time.monotonic(), _now()
             token = self.inflight.start(target.name)
+            failure = None
+            task = asyncio.current_task()
+            cancellations = task.cancelling()
             try:
                 if on_start:
                     on_start()
@@ -634,6 +644,8 @@ class _Run:
                     record.error = "maximum run duration reached" if global_deadline else (
                         "intentional request deadline" if timeout_override else "request deadline exceeded")
             except (asyncio.CancelledError, TimeoutError) as exc:
+                if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
+                    failure = exc
                 run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
                 record = RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
@@ -644,6 +656,8 @@ class _Run:
                     input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
                 )
             except Exception as exc:
+                if not isinstance(exc, (httpx.HTTPError, OSError)):
+                    failure = exc
                 # Exception text can contain credential-bearing URLs from transports.
                 record = RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
@@ -655,13 +669,28 @@ class _Run:
             finally:
                 self.active[key] -= 1
                 overlap = self.inflight.finish(target.name, token)
+            # The transport catches cancellation to preserve partial output. Restore
+            # propagation here, after completing the record and its live condition.
+            if task.cancelling() > cancellations and failure is None:
+                failure = asyncio.CancelledError()
+                record.status, record.valid = "cancelled", False
+            if isinstance(failure, asyncio.CancelledError):
+                failure.giraffe_record = record
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
             record.completed_at = _now()
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
             if record.status in {"timeout", "cancelled"}:
-                reason = self.stop_reason(target.name)
+                try:
+                    reason = self.stop_reason(target.name)
+                except Exception:
+                    if not isinstance(failure, asyncio.CancelledError):
+                        raise
+                    # stop_reason updates state before emitting run_stopping.
+                    # Finish the terminal record even if that callback fails.
+                    logging.getLogger(__name__).exception("Progress callback failed during request cancellation")
+                    reason = self.endpoint_health[target.name]["abort_reason"] or self.reason
                 if self.stop.is_set() or reason == "cancelled by user":
                     record.termination_reason, record.termination_limit_seconds = "user_stop", None
                     record.error = "cancelled by user"
@@ -699,69 +728,88 @@ class _Run:
             record.scheduled_ms = spec.workload.get("scheduled_ms")
             record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
             record.overlap = overlap
-            try:
-                record = score_response(spec, record)
-                if evaluate_record is not None:
-                    evaluate_record(record)
-            finally:
-                self.records.append(record)
             intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
                            and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
             record.intentional = intentional
-            # Real clients report body reads immediately, including SSE
-            # comments/reasoning. Test/alternate clients can provide record evidence.
-            if (not evidence_probe and not getattr(client, "reports_response_activity", False)
-                    and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
-                self.endpoint_response(target.name)
-            if (not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
-                    and not intentional and timeout_override is None
-                    and deadline_override is None and spec.cancel_after_ms is None
-                    and spec.cancel_after_chunks is None and not self.stop.is_set()
-                    and time.monotonic() < self.deadline):
-                self.endpoint_failure(target.name, record.id)
-            if record.status == "cancelled" and not intentional and timeout_override is None:
-                reason = self.stop_reason(target.name)
-                # Stress phases can cancel their own requests while the run continues.
-                if reason or not _stress(spec.scenario):
-                    if not self.endpoint_health[target.name]["abort_reason"]:
-                        self.reason = reason or "maximum run duration reached"
-                    else:
-                        record.error = self.endpoint_health[target.name]["abort_reason"]
-                    self.mark_unfinished(target.name, _scenario_checks(spec))
-            budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
-            if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
-                self.errors += 1
-                record.check_ids = list(dict.fromkeys([*record.check_ids, *[
-                    name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
-            if budget_exempt:
-                self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
-            if condition is not None:
-                condition["running"] -= 1
-                condition["completed"] += 1
-                condition["failed"] += int(_request_failed(record))
-                result_status = request_status(record.model_dump(include={"status", "score", "valid"}))
-                statuses = condition.setdefault("request_statuses", {})
-                statuses[result_status] = statuses.get(result_status, 0) + 1
-                if record.status == "cancelled" and not intentional and (
-                        self.stop.is_set() or self.reason or time.monotonic() >= self.deadline):
-                    condition["reason"] = self.condition_reason(target.name)
-            # Live visualization gets measurements only, never retained response bodies.
-            self.emit("request_completed", target.name, spec.scenario, status=record.status,
-                      condition_id=condition_id, condition_summary=dict(condition) if condition else None,
-                      input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
-                      requested_input_tokens=spec.requested_input_tokens,
-                      request_slot=request_slot, request=record.model_dump(mode="json", include={
-                          "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
-                          "elapsed_ms", "first_output_ms", "check_ids", "http_status",
-                          "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
-                          "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
-                          "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
-                          "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
-                          "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
-                          "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
-                      }), intentional=intentional)
-            return record
+            try:
+                try:
+                    record = score_response(spec, record)
+                    if evaluate_record is not None:
+                        evaluate_record(record)
+                except Exception as exc:
+                    failure = failure or exc
+                finally:
+                    self.records.append(record)
+                if isinstance(failure, asyncio.CancelledError):
+                    # Scoring returns a copy; callers need this retained record.
+                    failure.giraffe_record = record
+                # Real clients report body reads immediately, including SSE
+                # comments/reasoning. Test/alternate clients can provide record evidence.
+                if (not evidence_probe and not getattr(client, "reports_response_activity", False)
+                        and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
+                    self.endpoint_response(target.name)
+                if (not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+                        and not intentional and timeout_override is None
+                        and deadline_override is None and spec.cancel_after_ms is None
+                        and spec.cancel_after_chunks is None and not self.stop.is_set()
+                        and time.monotonic() < self.deadline):
+                    self.endpoint_failure(target.name, record.id)
+                if record.status == "cancelled" and not intentional and timeout_override is None:
+                    reason = self.stop_reason(target.name)
+                    # Stress phases can cancel their own requests while the run continues.
+                    if reason or not _stress(spec.scenario):
+                        if not self.endpoint_health[target.name]["abort_reason"]:
+                            if reason:
+                                self.reason = reason
+                        else:
+                            record.error = self.endpoint_health[target.name]["abort_reason"]
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
+                if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
+                    self.errors += 1
+                    record.check_ids = list(dict.fromkeys([*record.check_ids, *[
+                        name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
+                if budget_exempt:
+                    self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
+                if condition is not None:
+                    condition["running"] -= 1
+                    condition["completed"] += 1
+                    condition["failed"] += int(_request_failed(record))
+                    result_status = request_status(record.model_dump(include={"status", "score", "valid"}))
+                    statuses = condition.setdefault("request_statuses", {})
+                    statuses[result_status] = statuses.get(result_status, 0) + 1
+                    if record.status == "cancelled" and not intentional and (
+                            self.stop.is_set() or self.reason or time.monotonic() >= self.deadline):
+                        condition["reason"] = self.condition_reason(target.name)
+                # Live visualization gets measurements only, never retained response bodies.
+                try:
+                    self.emit("request_completed", target.name, spec.scenario, status=record.status,
+                              condition_id=condition_id, condition_summary=dict(condition) if condition else None,
+                              input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
+                              requested_input_tokens=spec.requested_input_tokens,
+                              request_slot=request_slot, request=record.model_dump(mode="json", include={
+                                  "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
+                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                                  "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
+                                  "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                                  "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
+                                  "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
+                                  "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                                  "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
+                              }), intentional=intentional)
+                except Exception:
+                    if not isinstance(failure, asyncio.CancelledError):
+                        raise
+                    logging.getLogger(__name__).exception("Progress callback failed during request cancellation")
+                if failure is not None:
+                    raise failure
+                return record
+            finally:
+                try:
+                    self.record_finished(record)
+                except Exception:
+                    logger.exception("Could not persist terminal request %s", record.id)
 
     async def group(self, target, client, specs, scenario, count=None, concurrency=1, checks=()):
         count = count if count is not None else self.config.samples
@@ -776,16 +824,41 @@ class _Run:
             self.finish_condition(target.name, scenario, workload)
             return []
         try:
-            result = []
-            for start in range(0, count, concurrency):
-                batch = [_spec(specs[i % len(specs)], scenario, checks)
-                         for i in range(start, min(start + concurrency, count))]
-                if not self.allowed(target.name):
-                    for spec in batch:
+            results = [None] * count
+            next_index = 0
+            failed = False
+            workers = []
+
+            async def worker():
+                nonlocal next_index, failed
+                while next_index < count and not failed:
+                    if not self.allowed(target.name):
+                        spec = _spec(specs[next_index % len(specs)], scenario, checks)
                         self.mark_unfinished(target.name, _scenario_checks(spec))
-                    break
-                result.extend(r for r in await asyncio.gather(
-                    *(self.request(target, client, spec, request_parameters=request_parameters) for spec in batch)) if r is not None)
+                        return
+                    index = next_index
+                    next_index += 1
+                    spec = _spec(specs[index % len(specs)], scenario, checks)
+                    try:
+                        results[index] = await self.request(
+                            target, client, spec, request_parameters=request_parameters)
+                    except BaseException:
+                        failed = True
+                        current = asyncio.current_task()
+                        for sibling in workers:
+                            if sibling is not current and not sibling.done():
+                                sibling.cancel()
+                        raise
+
+            # Stop dispatch on the first failure, then join cancelled siblings
+            # so every in-flight request has a terminal record before returning.
+            workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, count))]
+            outcomes = await asyncio.gather(*workers, return_exceptions=True)
+            failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+            if failures:
+                # A sibling cancellation must not hide the original worker bug.
+                raise next((failure for failure in failures if isinstance(failure, Exception)), failures[0])
+            result = [record for record in results if record is not None]
             if len(result) < count:
                 self.unfinished[target.name].update(checks)
             return result
@@ -949,6 +1022,27 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
     run.observations[target.name]["context_calibration"] = {
         "status": "sized_locally", "method": "local_tokenizer", "preparations": evidence}
     return prepared
+
+
+def _expected_setup_error(exc):
+    # Transport/TLS, missing local credentials/files, and explicit tokenizer setup
+    # failures are operational. Arbitrary ValueError/RuntimeError can be bugs.
+    if isinstance(exc, (httpx.HTTPError, httpx.InvalidURL, OSError, TokenizerUnavailable)):
+        return True
+    return isinstance(exc, ValueError) and str(exc).startswith((
+        "Missing API key environment variable:", "API key environment variable ",
+        "Missing header environment variable:"))
+
+
+def _target_error(run, target, enabled, exc):
+    if _expected_setup_error(exc):
+        detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        run.observations[target.name]["client_error"] = f"Client setup failed ({detail})"
+    else:
+        logging.getLogger(__name__).exception("Internal error in Giraffe (%s)", type(exc).__name__)
+        run.observations[target.name]["client_error"] = (
+            f"Internal error in Giraffe ({type(exc).__name__}); see the Giraffe log.")
+    run.unfinished[target.name].update(enabled)
 
 
 async def _target(run: _Run, target: Target, fixtures: dict):
@@ -1171,7 +1265,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         await run.request(target, client, spec)
                 run.start_condition(target.name, "sustained", planned=allowance, planned_kind="upper_bound")
                 run.emit("scenario_started", target.name, "sustained")
-                await asyncio.gather(*(worker() for _ in range(effective.concurrency)))
+                outcomes = await asyncio.gather(*(worker() for _ in range(effective.concurrency)),
+                                                return_exceptions=True)
+                for outcome in outcomes:
+                    # A sustained worker can be cancelled by its own phase or
+                    # transport. Preserve its record and still probe recovery.
+                    # Cancellation of this target itself propagates from gather.
+                    if isinstance(outcome, asyncio.CancelledError) and not asyncio.current_task().cancelling():
+                        continue
+                    if isinstance(outcome, BaseException):
+                        raise outcome
                 run.emit("scenario_finished", target.name, "sustained")
                 run.finish_condition(target.name, "sustained", reason="sending window ended" if allowance is None or dispatched < allowance else None)
                 run.observations[target.name]["sustained_batches"] = dispatched
@@ -1201,59 +1304,62 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
         run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
+        raise
     except Exception as exc:
-        detail = str(exc) if isinstance(exc, ValueError) and str(exc).startswith((
-            "Missing API key environment variable:", "Missing header environment variable:")) else type(exc).__name__
-        run.observations[target.name]["client_error"] = f"Client setup failed ({detail})"
-        run.unfinished[target.name].update(enabled)
+        _target_error(run, target, enabled, exc)
 
     finally:
-        preparation = run.observations[target.name].get("preparation", {})
-        if preparation.get("status") == "running":
-            reason = run.stop_reason(target.name)
-            run.preparation(target.name, preparation["scenario"], preparation["step"],
-                            "cancelled" if reason else "unavailable", reason or "Preparation did not complete")
-        for row in run.observations[target.name]["conditions"]:
-            if row["status"] != "finished":
-                run.finish_condition(target.name, row["condition"]["id"])
-        if telemetry_task:
-            telemetry_task.cancel()
-            await asyncio.gather(telemetry_task, return_exceptions=True)
-        data = run.observations[target.name]["serving_telemetry"]
-        if "gpu" in enabled and "gpu_observation_window" not in run.observations[target.name]:
-            await _finish_gpu_observation(run, target)
-        elif data["snapshots"] or target.host_metrics_url:
-            await _metrics(run, target, "end")
-        elif len(data["snapshots"]) < config.metrics_max_samples:
-            data["snapshots"].append(await telemetry.scrape(run, target, "not collected"))
-        telemetry.summarize(data, config.cache_pressure_threshold)
-        run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
-        current = run.observations[target.name]["deployment"]
-        if current and (target.deployment.discovery != "none" or target.deployment.collector_url):
-            end = await deployment.snapshot(target, config, run.deadline, run.stop)
-            run.observations[target.name]["deployment_history"].append(end)
-            observations = [current, *run.observations[target.name]["deployment_history"]]
-            initial_signature = deployment.observed_signature(current)
-            changes = []
-            for item in observations[1:]:
-                signature = deployment.observed_signature(item)
-                if any(signature[key] != initial_signature[key] for key in signature.keys() & initial_signature.keys()):
-                    changes.append(item)
-            current["continuity"] = "unstable" if changes else "no_observed_change; between samples unverified"
-            current["observed_changes"] = changes
-        if current:
-            served = sorted({r.observed_model for r in run.records if r.target==target.name and r.observed_model})
-            if len(served) > 1:
-                current["continuity"] = "unstable"
-                current["observed_model_identity_changes"] = True
-            if served:
-                row = current["fields"].setdefault("model.served", {})
-                row["reported"] = deployment._fact(served, "runtime-reported", current["scope"], _now())
-                if "configured" in row and row["configured"]["value"] not in (served, served[0] if len(served) == 1 else served):
-                    row["status"] = "conflicting"
-                current["unknown_fields"] = [key for key in current["unknown_fields"] if key != "model.served"]
+        try:
+            preparation = run.observations[target.name].get("preparation", {})
+            if preparation.get("status") == "running":
+                reason = run.stop_reason(target.name)
+                run.preparation(target.name, preparation["scenario"], preparation["step"],
+                                "cancelled" if reason else "unavailable", reason or "Preparation did not complete")
+            for row in run.observations[target.name]["conditions"]:
+                if row["status"] != "finished":
+                    run.finish_condition(target.name, row["condition"]["id"])
+            if telemetry_task:
+                telemetry_task.cancel()
+                await asyncio.gather(telemetry_task, return_exceptions=True)
+            data = run.observations[target.name]["serving_telemetry"]
+            if "gpu" in enabled and "gpu_observation_window" not in run.observations[target.name]:
+                await _finish_gpu_observation(run, target)
+            elif data["snapshots"] or target.host_metrics_url:
+                await _metrics(run, target, "end")
+            elif len(data["snapshots"]) < config.metrics_max_samples:
+                data["snapshots"].append(await telemetry.scrape(run, target, "not collected"))
+            telemetry.summarize(data, config.cache_pressure_threshold)
+            run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
+            current = run.observations[target.name]["deployment"]
+            if current and (target.deployment.discovery != "none" or target.deployment.collector_url):
+                end = await deployment.snapshot(target, config, run.deadline, run.stop)
+                run.observations[target.name]["deployment_history"].append(end)
+                observations = [current, *run.observations[target.name]["deployment_history"]]
+                initial_signature = deployment.observed_signature(current)
+                changes = []
+                for item in observations[1:]:
+                    signature = deployment.observed_signature(item)
+                    if any(signature[key] != initial_signature[key] for key in signature.keys() & initial_signature.keys()):
+                        changes.append(item)
+                current["continuity"] = "unstable" if changes else "no_observed_change; between samples unverified"
+                current["observed_changes"] = changes
+            if current:
+                served = sorted({r.observed_model for r in run.records if r.target==target.name and r.observed_model})
+                if len(served) > 1:
+                    current["continuity"] = "unstable"
+                    current["observed_model_identity_changes"] = True
+                if served:
+                    row = current["fields"].setdefault("model.served", {})
+                    row["reported"] = deployment._fact(served, "runtime-reported", current["scope"], _now())
+                    if "configured" in row and row["configured"]["value"] not in (served, served[0] if len(served) == 1 else served):
+                        row["status"] = "conflicting"
+                    current["unknown_fields"] = [key for key in current["unknown_fields"] if key != "model.served"]
 
-        run.finish_checks(target.name, enabled)
+            run.finish_checks(target.name, enabled)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _target_error(run, target, enabled, exc)
 
 
 def _timing_violations(records, limits, *, unfinished=False):
@@ -1996,6 +2102,8 @@ def _output_budget_guidance(config, records, check_id):
 def _verdict_summary(check, config, records, budget):
 
     summary, metrics, limits = check.summary, check.metrics, config.limits
+    if check.status == "blocked" and summary.startswith("Internal error in Giraffe ("):
+        return summary
     if check.id == "concurrency":
         from .concurrent_load import remedies
         guidance = remedies(check.metrics, config)
@@ -2188,14 +2296,63 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     with PhaseSampler("traffic") as sampler:
         try:
             return await _run_suite(config, progress=progress, stop_event=stop_event, sampler=sampler)
+        except Exception:
+            logger.exception("Unexpected suite failure")
+            raise
         finally:
             sampler.detach()
             if hasattr(sampler, "run"):
                 sampler.run.memory_sampling_done = True
 
 
+async def _stop_judging(evaluation, run):
+    """Give cooperative judging a short cleanup window, then cancel its task."""
+    run.stop.set()
+    done, _ = await asyncio.wait({evaluation}, timeout=.25)
+    if not done:
+        evaluation.cancel()
+        done, _ = await asyncio.wait({evaluation}, timeout=.25)
+    if done and not evaluation.cancelled():
+        return evaluation.result()
+    if not done:
+        # A broken evaluator must not hold the completed target run open.
+        # Retrieve a later exception without retaining the run in a callback.
+        evaluation.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+    judged = {spec.fixture_id for spec in run.pack_specs if spec.scorer == "judge"}
+    records = [record for record in run.records if record.fixture_id in judged
+               and record.status == "completed" and record.valid]
+    votes = [vote for record in records if record.judgement for vote in record.judgement.votes]
+    return {"eligible_requests": len(records), "scored_requests": sum(r.score is not None for r in records),
+            "passed_requests": sum(r.score is True for r in records),
+            "failed_requests": sum(r.score is False for r in records),
+            "inconclusive_requests": sum(r.score is None for r in records), "skipped_requests": 0,
+            "ties": 0, "judge_calls_total": len(records) * len(run.config.judging.judges),
+            "judge_calls_completed": len(votes), "judge_calls_errors": sum(v.status == "error" for v in votes),
+            "duration_seconds": None, "stop_reason": "cancelled"}
+
+
 async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
+    outer_cancellation = None
+    suite_task = asyncio.current_task()
+    cancellations = suite_task.cancelling()
+
+    def absorb_outer_cancellation(exc):
+        nonlocal outer_cancellation
+        if suite_task.cancelling() > cancellations:
+            # Clear a lone cancellation while finishing the partial report.
+            # Competing cancellation requests remain for the enclosing context
+            # to distinguish an external stop from its own timeout cancellation.
+            # When the caller already has an outstanding request, leave both
+            # counts intact: an enclosing timeout will uncancel its own request.
+            if cancellations == 0 and suite_task.cancelling() == 1:
+                suite_task.uncancel()
+            outer_cancellation = exc
+            # Internally setting the event for cleanup must not attribute a
+            # timeout or forced task cancellation to an explicit user stop.
+            run.reason = "cancelled by user" if run.stop.is_set() else "run cancelled"
+            run.stop.set()
+
     public_config = config.model_copy(deep=True)
     config = public_config.model_copy(deep=True)
     if config.request_source == "request_pack" and "correctness" in config.checks:
@@ -2255,12 +2412,11 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     monitor = asyncio.create_task(run.monitor(tasks))
     try:
         await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        # Child cleanup can propagate the monitor's cancellation. Only a
-        # cancellation of the suite itself is a new user stop.
-        if not run.reason or asyncio.current_task().cancelling():
-            run.reason = "cancelled by user"
-            run.stop.set()
+    except asyncio.CancelledError as exc:
+        # Child cleanup can propagate the monitor's cancellation. An older
+        # cancellation count on the caller is not a new cancellation request.
+        absorb_outer_cancellation(exc)
+        run.reason = run.stop_reason() or "run cancelled"
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -2294,15 +2450,17 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                     return
                 await asyncio.sleep(.05)
         memory_monitor = asyncio.create_task(memory_watch())
+        stopped = asyncio.create_task(run.stop.wait())
         try:
-            judging_summary = await asyncio.shield(evaluation)
-        except asyncio.CancelledError:
-            # Let the evaluator close its own workers and preserve partial votes.
-            run.stop.set()
-            judging_summary = await evaluation
+            done, _ = await asyncio.wait({evaluation, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            judging_summary = evaluation.result() if evaluation in done else await _stop_judging(evaluation, run)
+        except asyncio.CancelledError as exc:
+            absorb_outer_cancellation(exc)
+            judging_summary = await _stop_judging(evaluation, run)
         finally:
+            stopped.cancel()
             memory_monitor.cancel()
-            await asyncio.gather(memory_monitor, return_exceptions=True)
+            await asyncio.gather(stopped, memory_monitor, return_exceptions=True)
         if run.stop.is_set():
             run.reason = run.reason or "cancelled by user"
         limits = _check_config(config, "capacity").limits
@@ -2324,6 +2482,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     consume_samples()
     run.verdict_budget_guidance = _budget_guidance(config)
     checks = [check for target in config.targets for check in _checks(run, target)]
+    for check in checks:
+        error = run.observations[check.target].get("client_error")
+        if error and check.id in config.checks and check.status not in {"fail", "blocked"}:
+            check.status, check.summary = "blocked", error
     sampler.close()
     consume_samples()
     sampler.detach()
@@ -2337,10 +2499,12 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
         if check.target in target_abort_reasons and check.status == "pass":
             check.status = "inconclusive"
             check.summary = target_abort_reasons[check.target] + ". This check was interrupted."
-    counts = defaultdict(dict)
-    for target in config.targets:
-        for scenario in sorted({r.scenario for r in run.records if r.target == target.name}):
-            counts[target.name][scenario] = _stats([r for r in run.records if r.target == target.name and r.scenario == scenario])
+    grouped = defaultdict(lambda: defaultdict(list))
+    for record in run.records:
+        grouped[record.target][record.scenario].append(record)
+    counts = {target.name: {scenario: _stats(records)
+                            for scenario, records in sorted(grouped[target.name].items())}
+              for target in config.targets if target.name in grouped}
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
     if run.memory_limit_reached:
@@ -2439,7 +2603,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     manifest = {"config": config_values,
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
-                "timing_measurement_version": 2,
+                "timing_measurement_version": 3,
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
@@ -2478,10 +2642,22 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
         verdict_reason = None
     if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
         verdict_reason = None
-    run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)
-    return RunReport(run_id=run_id, suite_version=SUITE_VERSION,
+    report = RunReport(run_id=run_id, suite_version=__version__,
                      started_at=started_at, finished_at=_now(),
                      overall=overall_status(checks, verdict_reason or next(iter(target_abort_reasons.values()), None),
                                             memory_limit_interrupted=memory_required_interrupted), manifest=manifest, checks=checks,
                      requests=run.records, warnings=warnings, observations=observations,
                      abort_reason=verdict_reason, limits_reached=sorted(run.limits_reached))
+    if outer_cancellation is not None:
+        # Callers can send the partial report through the existing writer even
+        # when asyncio.timeout converts this cancellation into TimeoutError.
+        outer_cancellation.giraffe_report = report
+    try:
+        run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)
+    except Exception:
+        if outer_cancellation is None:
+            raise
+        logging.getLogger(__name__).exception("Progress callback failed during run cancellation")
+    if outer_cancellation is not None:
+        raise outer_cancellation
+    return report

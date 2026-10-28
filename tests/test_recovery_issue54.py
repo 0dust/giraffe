@@ -1,4 +1,4 @@
-"""Immediate restart must resolve fresh metadata left by a dead local writer."""
+"""Restart resolves dead writers once heartbeat grace has elapsed."""
 
 from datetime import datetime, timezone
 import json
@@ -18,7 +18,7 @@ from tests.test_web import config, report
 @pytest.mark.parametrize("state", ["running", "stopping"])
 @pytest.mark.parametrize("has_report", [False, True])
 async def test_immediate_restart_recovers_dead_writer_in_history_and_cancel(tmp_path, state, has_report):
-    # A reaped process gives a real dead owner without waiting for the grace period.
+    # Reap a real dead owner and place its heartbeat outside the liveness grace.
     with subprocess.Popen([sys.executable, "-c", "pass"]) as owner:
         owner.wait(timeout=5)
     directory = tmp_path / "crashed"
@@ -31,7 +31,7 @@ async def test_immediate_restart_recovers_dead_writer_in_history_and_cancel(tmp_
         "id": "crashed", "state": state, "owner_pid": owner.pid,
         "owner_host": socket.gethostname(),
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        "heartbeat_at": "2000-01-01T00:00:00Z",
     }))
     expected = "completed" if has_report else "interrupted"
     app = create_app(tmp_path)
@@ -58,3 +58,31 @@ async def test_immediate_restart_recovers_dead_writer_in_history_and_cancel(tmp_
             else:
                 assert [row["id"] for row in plan["candidates"]] == ["crashed"]
     assert json.loads(marker.read_text())["state"] == expected
+
+
+async def test_fresh_heartbeat_retains_grace_then_recovers_dead_owner(tmp_path, monkeypatch):
+    import asyncio
+    from giraffe import web
+    from giraffe.storage import write_metadata
+    with subprocess.Popen([sys.executable, '-c', 'pass']) as owner:
+        owner.wait(timeout=5)
+    directory = tmp_path / 'fresh-crash'
+    meta = {'id': directory.name, 'state': 'running', 'owner_pid': owner.pid,
+            'owner_host': socket.gethostname(), 'heartbeat_at': web._now()}
+    write_metadata(directory, meta)
+    monkeypatch.setattr(web, '_RECOVERY_SECONDS', .01)
+    app = create_app(tmp_path)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://localhost') as client:
+            assert (await client.get('/api/runs/fresh-crash')).json()['state'] == 'running'
+            bootstrap = (await client.get('/api/bootstrap')).json()
+            assert bootstrap['active_run_id'] is None
+            assert bootstrap['disk_active_id'] == 'fresh-crash'
+            write_metadata(directory, meta | {'heartbeat_at': '2000-01-01T00:00:00Z'})
+            for _ in range(100):
+                detail = (await client.get('/api/runs/fresh-crash')).json()
+                if detail['state'] == 'interrupted':
+                    break
+                await asyncio.sleep(.01)
+            assert detail['state'] == 'interrupted'
+            assert (await client.get('/api/bootstrap')).json()['active_run_id'] is None

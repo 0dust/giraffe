@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from . import __version__
+
 from copy import deepcopy
 
 from giraffe import caps
@@ -160,7 +162,7 @@ def capabilities(config: RunConfig | None = None) -> dict:
     limits = configuration_limits(schema)
     return {
         "builtin_question_example": {"question": example.messages[0]["content"], "expected": example.expected},
-        "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION,
+        "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION, "version": __version__,
         "validation_note": "The schema describes configuration. Validate checks semantic constraints; neither command contacts endpoints or verifies runtime availability.",
         "defaults": defaults, "config_schema": schema, "limits": limits,
         "cap_explanations": caps.cap_explanations(limits),

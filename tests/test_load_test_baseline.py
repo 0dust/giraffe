@@ -144,8 +144,14 @@ def test_incomplete_or_changed_load_cannot_claim_lost_accepted_rate(change):
     else:
         current.manifest["config"]["load_test"]["patterns"]["rates"] = [10, 100]
     compared = compare_baseline(current, old)
-    assert compared.baseline["status"] == "inconclusive"
+    # AM9: the unchanged lower-rate point covers this selected check. The
+    # affected higher-rate point remains unqualified; configuration changes
+    # still prevent every point from being compared.
+    assert compared.baseline["status"] == ("inconclusive" if change == "configuration" else "pass")
     assert compared.baseline["targets"][0]["load_test"]["status"] == "inconclusive"
+    if change != "configuration":
+        assert compared.baseline["targets"][0]["load_test"]["points"][0]["status"] == "pass"
+        assert compared.baseline["targets"][0]["load_test"]["points"][1]["status"] == "inconclusive"
     assert not next(check for check in compared.checks if check.id == "baseline").evidence_ids
 
 
@@ -175,8 +181,11 @@ def test_same_config_with_changed_or_missing_actual_request_work_cannot_establis
     else:
         setattr(record, change, getattr(record, change) + 1)
     compared = compare_baseline(current, old)
-    assert compared.baseline["status"] == "inconclusive"
+    # AM9: comparable unchanged lower-rate acceptance evidence covers load;
+    # missing or changed higher-rate work cannot establish acceptance loss.
+    assert compared.baseline["status"] == "pass"
     rows = compared.baseline["targets"][0]["load_test"]["points"]
+    assert rows[0]["status"] == "pass"
     affected = next(row for row in rows if row["current"]["id"] == point["id"])
     assert affected["status"] == "inconclusive"
     assert affected["reason"] == ("Dispatched request metadata is incomplete." if change == "missing_metadata"

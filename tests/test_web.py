@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -307,6 +308,15 @@ async def finished(client, identifier):
             return detail
         await asyncio.sleep(0.01)
     pytest.fail("Run did not finish")
+
+
+async def detail_when(client, identifier, ready):
+    for _ in range(200):
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        if ready(detail):
+            return detail
+        await asyncio.sleep(0.01)
+    pytest.fail("Run progress did not become ready")
 
 
 async def start(client, configuration=None, **values):
@@ -681,10 +691,9 @@ async def test_one_active_run_progress_and_cancel_preserves_partial_report(tmp_p
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.sleep(0)
+        detail = await detail_when(client, identifier, lambda value: value["progress"].get("completed") == 149)
         second = await client.post("/api/runs", json={"config": config()})
         assert second.status_code == 409
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
         assert detail["progress"]["completed"] == 149
         assert len(detail["events"]) == 100
         assert detail["report"] is None
@@ -700,7 +709,7 @@ async def test_one_active_run_progress_and_cancel_preserves_partial_report(tmp_p
 async def test_cancel_still_stops_traffic_when_status_write_fails(tmp_path, monkeypatch):
     from giraffe.web import _write
 
-    stopped = asyncio.Event()
+    stopped = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
         await stop_event.wait()
@@ -719,16 +728,16 @@ async def test_cancel_still_stops_traffic_when_status_write_fails(tmp_path, monk
         response = await client.post(f"/api/runs/{identifier}/cancel", json={})
         assert response.status_code == 200
         assert response.json()["state"] == "stopping"
-        await asyncio.wait_for(stopped.wait(), timeout=1)
+        assert await asyncio.to_thread(stopped.wait, 1)
         detail = await finished(client, identifier)
         assert detail["report"]["abort_reason"] == "cancelled by user"
 
 
 async def test_final_state_remains_visible_when_status_write_fails(tmp_path, monkeypatch):
-    release = asyncio.Event()
+    release = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
-        await release.wait()
+        await asyncio.to_thread(release.wait, 2)
         return report(configuration)
 
     def fail_write(*args, **kwargs):
@@ -946,8 +955,8 @@ async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_pat
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.sleep(0)
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        detail = await detail_when(client, identifier,
+                                  lambda value: len(value["phases"]) == 2)
         assert len(detail["events"]) == 100
         assert len(detail["live_requests"]) == 120
         assert [r["slot"] for r in detail["live_requests"]] == list(range(120))
@@ -990,22 +999,21 @@ async def test_first_run_and_baseline_create_only_their_required_directories(tmp
 
 
 async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path, monkeypatch):
-    ready, release = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
         progress({"event": "offer_dropped", "budget_used": 4, "attempted": 2,
                   "completed": 2, "dropped_offers": 2})
         progress({"event": "judging_started", "phase": "judging", "budget_used": 4,
                   "attempted": 2, "completed": 2, "dropped_offers": 2})
-        ready.set()
-        await release.wait()
+        await asyncio.to_thread(release.wait, 2)
         return report(configuration)
 
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.wait_for(ready.wait(), timeout=1)
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        detail = await detail_when(client, identifier,
+                                  lambda value: value["progress"].get("phase") == "judging")
         assert detail["state"] == "running"
         assert detail["progress"]["phase"] == "judging"
         assert detail["progress"]["dropped_offers"] == 2

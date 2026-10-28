@@ -1,3 +1,4 @@
+import threading
 import asyncio
 import json
 
@@ -94,7 +95,7 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path):
 
 
 async def test_try_example_uses_existing_busy_and_cancel_lifecycle(tmp_path, monkeypatch):
-    started = asyncio.Event()
+    started = threading.Event()
 
     async def waiting(config, *, progress, stop_event):
         started.set()
@@ -106,7 +107,7 @@ async def test_try_example_uses_existing_busy_and_cancel_lifecycle(tmp_path, mon
     async with browser(tmp_path) as client:
         response = await client.post("/api/runs/try-example", json=body)
         assert response.status_code == 202
-        await started.wait()
+        assert await asyncio.to_thread(started.wait, 3)
         assert (await client.post("/api/runs/try-example", json=body)).status_code == 409
         identifier = response.json()["id"]
         assert (await client.post(f"/api/runs/{identifier}/cancel", json={})).status_code == 200

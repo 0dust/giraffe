@@ -8,6 +8,8 @@ from decimal import Decimal
 from functools import lru_cache
 from statistics import NormalDist
 import math
+import heapq
+import random
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
@@ -172,8 +174,75 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 third += 3 * x * x * survival * step
         return mean, max(0, second - mean * mean), max(0, third - 3 * mean * second + 2 * mean ** 3)
 
-    def prediction(mean, variance, third):
+    @lru_cache(maxsize=256)
+    def refill_moments(distributions, count, concurrency):
+        # The same FIFO worker pool as runner.group: each completion immediately
+        # admits the next request. Fixed draws keep plans reproducible.
+        curves = [(tuple(value for value, _ in curve), tuple(q for _, q in curve))
+                  for curve in distributions]
+        constant = distributions[0][0][0]
+        if all(curve[0][0] == curve[-1][0] == constant for curve in distributions):
+            return math.ceil(count / concurrency) * constant, 0., 0., None
+        rng = random.Random(0)
+        durations = []
+        simulated = min(count, 2048)
+        trials = min(4096, max(256, 131072 // simulated))
+        for _ in range(trials):
+            available = [0.] * min(concurrency, simulated)
+            for index in range(simulated):
+                values, quantiles = curves[index % len(curves)]
+                q = rng.random()
+                right = bisect_right(quantiles, q)
+                if not right:
+                    duration = values[0]
+                elif right == len(values):
+                    duration = values[-1]
+                else:
+                    fraction = (q - quantiles[right - 1]) / (quantiles[right] - quantiles[right - 1])
+                    duration = values[right - 1] + fraction * (values[right] - values[right - 1])
+                heapq.heapreplace(available, available[0] + duration)
+            durations.append(max(available))
+        mean = sum(durations) / len(durations)
+        variance = sum((value - mean) ** 2 for value in durations) / len(durations)
+        third = sum((value - mean) ** 3 for value in durations) / len(durations)
+        # Bound planning work for very large counts. The simulated pool retains
+        # its startup/drain; remaining independent service work adds at C slots.
+        for index, curve in enumerate(distributions):
+            extra = (count + len(curves) - 1 - index) // len(curves) - (simulated + len(curves) - 1 - index) // len(curves)
+            if extra:
+                work_mean, work_variance, work_third = batch_moments((curve,))
+                mean += extra * work_mean / concurrency
+                variance += extra * work_variance / concurrency ** 2
+                third += extra * work_third / concurrency ** 3
+        bound = None
+        if count > simulated:
+            work_mean = work_variance = work_third = 0
+            for index, curve in enumerate(distributions):
+                requests = (count + len(curves) - 1 - index) // len(curves)
+                service_mean, service_variance, service_third = batch_moments((curve,))
+                work_mean += requests * service_mean / concurrency
+                work_variance += requests * service_variance / concurrency ** 2
+                work_third += requests * service_third / concurrency ** 3
+            # Graham's list-scheduling bound: W/C <= makespan <=
+            # W/C + (1 - 1/C) * longest service time. Keep this coarse range
+            # rather than extrapolating away the final partial pool drain.
+            bound = (work_mean, work_variance, work_third,
+                     (1 - 1 / concurrency) * max(curve[-1][0] for curve in distributions))
+        return mean, variance, max(0, third), bound
+
+    def critical(samples=None):
         z = NormalDist().inv_cdf(.995)
+        if samples is None:
+            return z
+        # The variance is learned from finite cohorts, not known. The
+        # second-order Cornish-Fisher expansion of Student t uses nu=n-1.
+        # Medium confidence already requires n>=15, where this approximation
+        # is accurate; sparse cohorts retain their separate low-confidence gate.
+        nu = max(1, samples - 1)
+        return z + (z ** 3 + z) / (4 * nu) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * nu ** 2)
+
+    def prediction(mean, variance, third, samples=None):
+        z = critical(samples)
         uncertainty = z * math.sqrt(variance)
         # Finite small batches have a positively skewed completion time. The
         # first Cornish-Fisher correction retains the normal lower bound and
@@ -208,7 +277,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             waves = [list(group)[start:start + concurrency] for group in groups
                      for start in range(0, len(group), concurrency)]
             mean = variance = third = 0
-            for batch in range(batches):
+            pool_bound = None
+            if not explicit_batches and concurrency > 1:
+                mean, variance, third, pool_bound = refill_moments(tuple(curves), count, concurrency)
+            for batch in range(batches if explicit_batches or concurrency == 1 else 0):
                 if batch_groups is not None:
                     indices = batch_groups[batch]
                 elif explicit_batches:
@@ -222,22 +294,32 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     mean += batch_mean
                     variance += batch_variance
                     third += batch_third
-            # Predict the sum of independent batch maxima, including uncertainty
-            # in the mean learned from a finite training cohort. This is a 99%
+            # Include uncertainty in the mean learned from a finite training
+            # cohort for either explicit batches or a replenishing pool. This is a 99%
             # prediction interval with a skewed upper tail, not a sum of batch tail bounds.
             minimum_n = min(item.get("effective_n", item["n"]) for item in matches)
             mean += batches * max(item.get("batch_overhead_ms", 0) for item in matches)
             variance += batches ** 2 * max(item.get("batch_overhead_variance_ms2", 0) for item in matches) / 1e6
             variance *= 1 + count / minimum_n
             third *= (1 + count / minimum_n) ** 1.5
-            low, high = prediction(mean, variance, third)
-            uncertainty = NormalDist().inv_cdf(.995) * math.sqrt(variance)
+            low, high = prediction(mean, variance, third, minimum_n)
+            if pool_bound is not None:
+                work_mean, work_variance, work_third, drain = pool_bound
+                work_mean += batches * max(item.get("batch_overhead_ms", 0) for item in matches)
+                work_variance += batches ** 2 * max(item.get("batch_overhead_variance_ms2", 0) for item in matches) / 1e6
+                work_variance *= 1 + count / minimum_n
+                work_third *= (1 + count / minimum_n) ** 1.5
+                work_low, work_high = prediction(work_mean, work_variance, work_third, minimum_n)
+                low, high = min(low, work_low), max(high, work_high + drain)
+            uncertainty = critical(minimum_n) * math.sqrt(variance)
             item = {"id": row["id"], "title": row["title"], "target": target,
                     "kind": "finite", "requests": count, "concurrency": concurrency,
                     "configured_concurrency": configured_concurrency, "low_seconds": low,
                     "high_seconds": high, "fixed_seconds": 0,
                     "expected_seconds": mean, "prediction_variance": variance, "prediction_third": third,
-                    "pooled": observed["run_count"] >= 3}
+                    "prediction_samples": minimum_n,
+                    "pooled": observed["run_count"] >= 3,
+                    **({"upper_bound": True} if pool_bound is not None else {})}
             components.append(item)
             timeline.append({**item, "field": time_field(row["id"])})
             # With n=150, the chance of missing an independent 2% slow tail is
@@ -609,8 +691,14 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             items = [item for item in components if item["target"] == target.name]
             finite_items = [item for item in items if item["kind"] == "finite" and not item.get("upper_bound")]
             mean = sum(item["expected_seconds"] for item in finite_items)
-            finite_low, finite_high = prediction(mean, sum(item["prediction_variance"] for item in finite_items),
-                                                sum(item["prediction_third"] for item in finite_items))
+            # Welch-Satterthwaite df for independent estimated variances keeps
+            # one small cohort from setting the df for all sequential work.
+            variance = sum(item["prediction_variance"] for item in finite_items)
+            df_denominator = sum(item["prediction_variance"] ** 2 / max(1, item["prediction_samples"] - 1)
+                                 for item in finite_items)
+            samples = 1 + variance ** 2 / df_denominator if df_denominator else None
+            finite_low, finite_high = prediction(mean, variance,
+                                                sum(item["prediction_third"] for item in finite_items), samples)
             other = [item for item in items if item["kind"] != "finite" or item.get("upper_bound")]
             ranges.append((sum(item["low_seconds"] for item in other) + finite_low,
                            sum(item["high_seconds"] for item in other) + finite_high))
@@ -709,7 +797,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             "time_timeline": timeline, "budget_high_seconds": budget_high,
             "estimate_exclusions": ["setup/connection", "AI evaluation", "report generation"],
             "time_bound_reasons": reasons, "time_estimate_assumptions": ([
-                "Finite batches use the expected maximum from comparable recorded distributions. A nominal 99% prediction interval combines batch variance and sample uncertainty across sequential groups, with a measured-skew correction on the upper tail. Medium confidence requires 150 samples from one run or at least 15 samples per setting across 3 consistent runs, at least 99% accounted timing coverage (including small measured inter-batch overhead only after 3 runs), no unknown components and a combined relative half-width at most 50% (single-run components also require a normal half-width at most 40%). Each run has equal total weight, so recent runs weigh no less than older runs; pooling stops at a detected latency shift."
+                "Finite request groups model immediate replenishment from comparable recorded distributions; explicit batch barriers retain batch maxima. Large variable pools use conservative work/drain bounds. A nominal 99% prediction interval combines service variance and finite-cohort uncertainty across sequential groups, with Student-t and measured-skew corrections. Medium confidence requires 150 samples from one run or at least 15 samples per setting across 3 consistent runs, at least 99% accounted timing coverage (including small measured inter-batch overhead only after 3 runs), no unknown components and a combined relative half-width at most 50% (single-run components also require a prediction half-width at most 40%). Each run has equal total weight, so recent runs weigh no less than older runs; pooling stops at a detected latency shift."
             ] if any(item["kind"] == "finite" for item in components) else []) + list(dict.fromkeys(observation_notes)) +
                 (["Confidence remains low because these components have unknown duration: " +
                   ", ".join(dict.fromkeys(item["title"] for item in unknowns)) + "."] if unknowns else []) +

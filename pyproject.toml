@@ -40,7 +40,9 @@ packages = ["src/giraffe"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_debug = true
 testpaths = ["tests"]
+markers = ["timing_isolation: socket-free run-loop timing acceptance for CI"]
 
 [tool.ruff]
 target-version = "py311"

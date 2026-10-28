@@ -14,10 +14,10 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import math
 import re
-from statistics import fmean
+
+from .stats import PERCENTILES, distribution as sample_distribution, percentile as percentile
 
 PERFORMANCE_SCHEMA = 1
-PERCENTILES = "Linear interpolation between closest ranks: position = (n - 1) × p."
 SPEC_DECODE_ROWS = (
     ("spec_decode_drafts", "Speculative decoding drafts", "drafts"),
     ("spec_decode_draft_tokens", "Proposed speculative tokens", "tokens"),
@@ -30,16 +30,6 @@ SPEC_DECODE_ROWS = (
 
 KPI_IDS = ("request_throughput", "output_throughput", "response_latency", "first_useful_output",
            "tpot", "generation_pace", "client_ttft", "itl", "first_reasoning", "server_ttft")
-
-
-def percentile(values, fraction):
-    values = sorted(v for v in values if _number(v))
-    if not values:
-        return None
-    position = (len(values) - 1) * fraction
-    low = math.floor(position)
-    high = math.ceil(position)
-    return values[low] + (values[high] - values[low]) * (position - low)
 
 
 def _number(value):
@@ -68,11 +58,9 @@ def metric(value=None, *, label, unit, source, target, window, state=None, reaso
 
 
 def distribution(values, **kwargs):
-    values = [v for v in values if _number(v)]
-    result = dict(n=len(values), mean=fmean(values), min=min(values),
-                  median=percentile(values, .5), p90=percentile(values, .9),
-                  p95=percentile(values, .95), p99=percentile(values, .99), max=max(values)) if values else None
-    return metric(result, sample_count=len(values), percentile_convention=PERCENTILES, **kwargs)
+    result = sample_distribution(values)
+    return metric(result if result["n"] else None, sample_count=result["n"],
+                  percentile_convention=PERCENTILES, **kwargs)
 
 
 def concurrency_series(records, start_ms, end_ms):
@@ -830,13 +818,25 @@ def _baseline_rows(report, target, window, records, put):
 
 
 def build_performance(report, *, target=None, window=None):
-    """Derive one selected target/window, never persist derived report data.
+    """Use saved default metrics, or derive an explicitly selected target/window.
 
+    Only the default selection is persisted, without the raw request series.
+    Alternate selections intentionally use the current measurement code.
     The window catalog is cheap; only the selected summary is aggregated. Raw
     dispatch-ordered series occurs once per target. Summaries reference its row
     indices instead of copying rows. Missing selectors choose the first target
     and the performance workload with most valid completions (earliest on ties). Unknown explicit selectors are errors.
     """
+    if target is None and window is None and getattr(report, "_stored_derived", False):
+        # Persist the default headline; alternate target/window selections remain
+        # computed from retained request evidence. Raw rows are never duplicated on disk.
+        from copy import deepcopy
+        stored = deepcopy(report.performance)
+        for entry in stored.get("targets", []):
+            records = sorted((r for r in report.requests if r.target == entry["target"]),
+                             key=lambda r: (r.dispatch_ms is None, r.dispatch_ms or 0, r.started_at, r.id))
+            entry["request_series"] = _request_series(records)
+        return stored
     requested_window = window
     config_targets = report.manifest.get("config", {}).get("targets", [])
     names = list(dict.fromkeys([t["name"] for t in config_targets if t.get("name")] + [r.target for r in report.requests]))
@@ -939,7 +939,10 @@ def build_performance(report, *, target=None, window=None):
                 selected_target=selected, available_targets=available, targets=targets)
 
 
-def refresh_performance(report):
+def refresh_performance(report, *, force=False):
+    if getattr(report, "_stored_derived", False) and not force:
+        return report
+    report._stored_derived = False
     report.performance = build_performance(report)
     from .conditions import aggregate_conditions
     report.conditions = aggregate_conditions(report)

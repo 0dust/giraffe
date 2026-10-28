@@ -201,6 +201,44 @@ def test_runtime_support_is_distinct_from_missing_collection():
     assert rows["server_queue_mean_ms"]["state"] == "insufficient_evidence"
 
 
+@pytest.mark.parametrize("host", [False, True])
+async def test_scrape_decoding_and_parse_do_not_block_inference_loop(monkeypatch, host):
+    import threading
+
+    target, config = settings(host_metrics_url="http://host/metrics")
+    actual_client, actual_parse = httpx.AsyncClient, telemetry.parse
+    entered, release = threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    parse_threads = []
+    def parse(body, *args, **kwargs):
+        parse_threads.append(threading.get_ident())
+        entered.set()
+        release.wait(1)
+        return actual_parse(body, *args, **kwargs)
+    monkeypatch.setattr(telemetry, "parse", parse)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: actual_client(**kwargs,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200,
+            text="node_memory_MemTotal_bytes 1000\nnode_memory_MemAvailable_bytes 400\n"))))
+    run = SimpleNamespace(config=config, start=time.monotonic(), deadline=time.monotonic() + 5,
+                          stop=asyncio.Event(), observations={target.name: {}})
+    scraper = telemetry._scrape_host if host else telemetry._scrape_runtime
+    task = asyncio.create_task(scraper(run, target, "load"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        # Request I/O must still resume while parsing is held on the executor.
+        resumed = False
+        async def inference_read():
+            nonlocal resumed
+            await asyncio.sleep(0)
+            resumed = True
+        await asyncio.wait_for(inference_read(), timeout=0.025)
+        assert resumed and not task.done()
+        assert parse_threads and all(identity != loop_thread for identity in parse_threads)
+    finally:
+        release.set()
+        await task
+
+
 def test_optional_series_overflow_does_not_erase_existing_serving_counter_intervals():
     from tests.test_gpu_reliability import combined_snapshot
 

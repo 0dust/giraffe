@@ -1,5 +1,6 @@
 """Regression coverage for labels without changing request execution semantics."""
 
+import threading
 import asyncio
 import json
 
@@ -176,13 +177,13 @@ assert.equal(record.input_chars,0);
 async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monkeypatch, local_tokenizer):
     from tests.test_web import browser, finished, report, start
 
-    release = asyncio.Event()
+    release = threading.Event()
 
     async def waiting(config, *, progress, stop_event):
         shape = {"input_chars": 128, "requested_max_tokens": 24, "requested_input_tokens": 32}
         progress({"event": "request_started", "request_slot": 0, "target": "local",
                   "scenario": "warm", "fixture_id": "short", **shape})
-        await release.wait()
+        assert await asyncio.to_thread(release.wait, 3)
         progress({"event": "request_completed", "request_slot": 0, **shape,
                   "request": {"id": "one", "status": "completed"}})
         await stop_event.wait()

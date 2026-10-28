@@ -8,10 +8,10 @@ import errno
 import os
 import socket
 import json
+import logging
 import signal
 import sys
 import time
-import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,9 +21,10 @@ from pydantic import ValidationError
 
 from giraffe import __version__
 from giraffe.configuration_errors import configuration_errors
+from giraffe.diagnostics import configure_logging, run_logging
 from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
                            migrate_concurrent_load, migrate_load_test, migrate_run_limits)
-from giraffe.storage import DEFAULT_LIMITS, format_size as _disk_size, parse_size
+from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
 from giraffe.resources import PhaseSampler, SAMPLING
 
 
@@ -64,31 +65,17 @@ def _cleanup_size(value: str) -> int:
     return size
 
 
-_HEARTBEAT_SECONDS = 30
+logger = logging.getLogger(__name__)
+_HEARTBEAT_SECONDS = 5
 
 
 @contextmanager
 def _heartbeat(path: Path):
-    stopped = threading.Event()
-
-    def refresh():
-        while not stopped.wait(_HEARTBEAT_SECONDS):
-            try:
-                os.utime(path, None, follow_symlinks=False)
-            except OSError:
-                pass
-
-    thread = threading.Thread(target=refresh, daemon=True)
-    thread.start()
-
-    def stop():
-        stopped.set()
-        thread.join()
-
+    heartbeat = Heartbeat(path.parent, interval=_HEARTBEAT_SECONDS).start()
     try:
-        yield stop
+        yield heartbeat.close
     finally:
-        stop()
+        heartbeat.close()
 
 
 def _storage_flags(command: argparse.ArgumentParser) -> None:
@@ -793,15 +780,19 @@ def _main(argv: list[str] | None = None) -> int:
 
         def save_state(state: str, **details) -> None:
             from giraffe.reporting import _atomic_write
+            from giraffe.storage import metadata_lock
 
-            try:
-                saved = json.loads((directory / ".web.json").read_text())
-            except (OSError, ValueError):
-                saved = {}
-            _atomic_write(directory / ".web.json", json.dumps(
-                {"id": directory.name, "state": state, "started_at": started_at,
-                 **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
-                 "owner_pid": os.getpid(), "owner_host": socket.gethostname(), **details}, allow_nan=False, separators=(",", ":")) + "\n")
+            with metadata_lock:
+                try:
+                    saved = json.loads((directory / ".web.json").read_text())
+                except (OSError, ValueError):
+                    saved = {}
+                _atomic_write(directory / ".web.json", json.dumps(
+                    {"id": directory.name, "state": state, "started_at": started_at,
+                     **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
+                     "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+                     **({"heartbeat_at": datetime.now(timezone.utc).isoformat()}
+                        if state in {"running", "stopping"} else {}), **details}, allow_nan=False, separators=(",", ":")) + "\n")
 
         save_state("running")
         requests = f"{config.max_requests:,}" if config.max_requests is not None else "Not set"
@@ -825,17 +816,42 @@ def _main(argv: list[str] | None = None) -> int:
         from giraffe.reporting import _retained, compare_baseline, html_failure_warning, save_failure_summary, write_report
 
         warning = None
-        with _heartbeat(directory / ".web.json") as stop_heartbeat:
+        cancelled = None
+
+        async def run_with_partial_report():
             try:
-                report = asyncio.run(_run(config, json_progress=True) if json_output else
-                                     _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
+                report = await (_run(config, json_progress=True) if json_output else
+                                _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
+            except asyncio.CancelledError as error:
+                report = getattr(error, "giraffe_report", None)
+                if report is None:
+                    raise
+                return report, error
+            return report, None
+
+        with run_logging(directory), _heartbeat(directory / ".web.json") as stop_heartbeat:
+            try:
+                report, cancelled = asyncio.run(run_with_partial_report())
                 from giraffe.invocation import cli_invocation
                 report.manifest["invocation"] = cli_invocation(arguments)
                 if guard is not None:
                     report.manifest["open_files"] = guard
                 if baseline:
                     report = compare_baseline(report, baseline)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
+                stop_heartbeat()
+                try:
+                    save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
+                               abort_reason="run cancelled")
+                except OSError:
+                    pass
+                print("Stopped.", file=sys.stderr)
+                if json_output:
+                    emit("interrupted", 130, message="Stopped.")
+                return 130
             except BaseException as error:
+                logger.exception("CLI run could not finish")
                 stop_heartbeat()
                 try:
                     save_state("error", finished_at=datetime.now(timezone.utc).isoformat(),
@@ -859,6 +875,7 @@ def _main(argv: list[str] | None = None) -> int:
                     json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
                                                        html=getattr(args, "html", False))
             except OSError as error:
+                logger.exception("CLI report export failed")
                 export_resources()
                 if getattr(error, "json_complete", False):
                     warning = html_failure_warning(error)
@@ -885,7 +902,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         policy = _auto_cleanup_policy(args)
         cleanup_result = None
-        if policy:
+        if policy and cancelled is None:
             try:
                 cleanup_result = automatic_cleanup(runs_root, policy, active_id=directory.name)
             except OSError as error:
@@ -894,7 +911,7 @@ def _main(argv: list[str] | None = None) -> int:
                 if not json_output:
                     print(f"Automatic cleanup deleted run: {identifier}")
         try:
-            save_state("completed", run_id=report.run_id, finished_at=report.finished_at,
+            save_state("completed", run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
                        **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
                        **({"error": warning} if warning else {}), resources={
                 "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
@@ -904,7 +921,7 @@ def _main(argv: list[str] | None = None) -> int:
             warnings.append(warning)
             print(f"Warning: {warning}", file=sys.stderr)
         report = _retained(report)
-        exit_code = {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+        exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
         summary = report.observations.get("summary")
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
@@ -1030,6 +1047,7 @@ def _progress_print(message):
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_logging()
     stdout, stderr = sys.stdout, sys.stderr
     out, err = _PipeSafeStream(stdout), _PipeSafeStream(stderr)
     sys.stdout, sys.stderr = out, err

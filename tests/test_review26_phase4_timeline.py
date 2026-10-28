@@ -266,7 +266,6 @@ def test_logprob_gather_tail_uses_actual_batch_width_not_single_template(respons
     assert quiet["requests"] == loaded["requests"] == 48
     # Forty-eight serial requests and three 16-wide gather maxima are different
     # random sums. Their upper intervals include measured positive skew, not batch worst cases.
-    from statistics import NormalDist
     mean = .01945
     variance = .9 * .01**2 + .09 * (.01**2 + .01 * .1 + .1**2) / 3 + .01 * (.1**2 + .1 + 1) / 3 - mean**2
     # Exact raw moments of the known atom + two uniform tail segments.
@@ -276,7 +275,10 @@ def test_logprob_gather_tail_uses_actual_batch_width_not_single_template(respons
     third = raw_third - 3 * mean * second + 2 * mean**3
     predicted_variance = 48 * variance * 1.48
     predicted_third = 48 * third * 1.48**1.5
-    z = NormalDist().inv_cdf(.995)
+    # Independent NIST table: t(.995, 99 df) = 2.626 for n=100.
+    # Keep the analytic service moments and the existing quadrature tolerance.
+    # https://www.itl.nist.gov/div898/handbook/eda/section3/eda3672.htm
+    z = 2.626
     expected_high = (48 * mean + z * predicted_variance**.5
                      + (z*z - 1) * predicted_third / (6 * predicted_variance))
     assert quiet["low_seconds"] == 0

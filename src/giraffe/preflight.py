@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import ssl
 from pathlib import Path
@@ -15,6 +16,9 @@ from .caps import (
 )
 from giraffe.client import LLMClient, _headers, completion_url
 from giraffe.models import Model, RequestSpec, RunConfig, Target
+
+
+logger = logging.getLogger(__name__)
 
 
 class PreflightError(Exception):
@@ -152,9 +156,11 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
         models = list(dict.fromkeys(item["id"] for item in data if isinstance(item, dict)
                                    and isinstance(item.get("id"), str) and item["id"].strip()))
     except (httpx.HTTPError, httpx.InvalidURL, TimeoutError):
+        logger.debug("Model discovery failed", exc_info=True)
         raise PreflightError("Could not reach the model list. Check that the server is running "
                             "and check the address, TLS trust and proxy settings.") from None
     except (ValueError, UnicodeError):
+        logger.debug("Model discovery response could not be read", exc_info=True)
         if allow_manual:
             return {"models": [], "message": "The server's model list could not be read. "
                     "Enter the model name to test the connection."}
@@ -199,6 +205,7 @@ async def check_connection(body: ConnectionTest) -> dict:
         raise PreflightError("Could not load the TLS trust file. "
                             "Check ca_bundle on the machine running Giraffe.") from None
     except (ValueError, ImportError, httpx.HTTPError, httpx.InvalidURL):
+        logger.debug("Connection preflight failed", exc_info=True)
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.") from None
 
@@ -229,6 +236,7 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.") from None
     except httpx.HTTPError as error:
+        logger.debug("Target preflight failed", exc_info=True)
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.",
                             blocking=isinstance(error, (httpx.ConnectError, httpx.UnsupportedProtocol))) from None

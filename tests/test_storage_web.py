@@ -98,7 +98,7 @@ def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, su
         original = Path.replace
 
         def fail_summary(path, target):
-            if path.name == "summary.json.tmp":
+            if Path(target).name == "summary.json":
                 full()
             return original(path, target)
         monkeypatch.setattr(Path, "replace", fail_summary)

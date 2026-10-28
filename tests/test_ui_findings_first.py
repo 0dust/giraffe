@@ -219,3 +219,19 @@ def test_compact_answer_fetch_errors_are_escaped_and_do_not_retry_every_render()
  assert.match($('#main').textContent,/Evidence <unavailable>/);assert.doesNotMatch($('#main').innerHTML,/<unavailable>/);assert.equal(calls,1);renderDetail();assert.equal(calls,1);
 })()
 """, dom=True)
+
+
+def test_history_labels_completed_partial_reports_as_stopped():
+    run_render_checks(r"""
+for(const reason of ['cancelled by user','run cancelled']){
+ const run={id:'stopped-run',state:'completed',overall:'inconclusive',abort_reason:reason};
+ assert.equal(runOutcome(run),'stopped');
+ assert.equal(statusLabels[runOutcome(run)],'Stopped');
+ state.runs=[run];state.historySearch='';state.filter='stopped';
+ assert.equal(filteredRuns().length,1);
+ state.detail={...run,report:report([check('access','inconclusive')],{abort_reason:reason})};
+ renderDetail();assert.match(nodes['#main'].innerHTML,/Stopped/);
+}
+state.detail={id:'live',state:'stopping',progress:{phase:'saving_partial_report',message:'Saving partial report…'},config:{targets:[],checks:[]},events:[]};
+renderDetail();assert.match(nodes['#main'].innerHTML,/Saving partial report…/);
+""", dom=True)

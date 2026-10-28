@@ -168,7 +168,7 @@ async def test_logprob_consistency_uses_its_effective_output_timeout_and_context
 
 
 async def test_concurrent_load_profile_caps_and_timeout_are_own_settings():
-    from giraffe.concurrent_load import execute
+    from giraffe.load_test import execute
 
     config = configuration("concurrency", concurrent_load={
         "profile": {"short": {"input_tokens": 64, "output_tokens": 96},

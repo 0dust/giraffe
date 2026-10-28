@@ -363,7 +363,8 @@ def test_lost_timing_or_correctness_measurements_prevent_a_passing_comparison():
         record.score = None
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "inconclusive"
-    assert "measurement coverage" in baseline_check(result).summary
+    assert "correctness" in baseline_check(result).summary
+    assert "at least 5 measured samples" in baseline_check(result).summary
 
 
 def test_noise_is_inconclusive_when_it_crosses_material_threshold():
@@ -371,7 +372,9 @@ def test_noise_is_inconclusive_when_it_crosses_material_threshold():
     for record, timing in zip(current.requests, [80, 90, 100, 110, 140, 180, 250, 400]):
         record.elapsed_ms = timing
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
     latency = next(row for row in result.baseline["targets"][0]["comparisons"]
                    if row["metric"] == "latency_ms")
     assert latency["status"] == "inconclusive"
@@ -383,7 +386,9 @@ def test_shorter_generations_do_not_establish_performance_stability():
         record.output_chars = 1
         record.output_tokens = 5
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
     latency = next(row for row in result.baseline["targets"][0]["comparisons"]
                    if row["metric"] == "latency_ms")
     assert latency["status"] == "inconclusive"
@@ -398,7 +403,8 @@ def test_different_fixture_proportions_are_not_a_timing_regression():
             record.elapsed_ms = 1000 if record.fixture_id == "slow" else 100
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "inconclusive"
-    assert "proportions" in baseline_check(result).summary
+    assert "correctness" in baseline_check(result).summary
+    assert any("proportions" in row["reason"] for row in result.baseline["targets"][0]["comparisons"])
 
 
 def test_absolute_failure_stays_failed_even_when_baseline_comparison_passes():
@@ -430,8 +436,10 @@ def test_generator_saturation_cannot_create_timing_regressions(saturated_run):
     noisy = current if saturated_run == "current" else previous
     noisy.observations["generator_max_lag_ms"] = 500
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
-    assert result.overall == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
+    assert result.overall == "pass"
     rows = result.baseline["targets"][0]["comparisons"]
     timing = {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second",
               "generation_tokens_per_second"}
@@ -517,7 +525,9 @@ def test_missing_scenario_does_not_hide_regression_in_another_comparable_scenari
     previous.requests.append(missing)
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "fail"
-    assert result.baseline["targets"][0]["reasons"]
+    # AM9 records an unmatched scenario locally; other scenarios still compare.
+    assert not result.baseline["targets"][0]["reasons"]
+    assert any(row["metric"] == "request_shapes" for row in result.baseline["targets"][0]["comparisons"])
 
 
 @pytest.mark.parametrize("policy", ["all", "failures", "none"])
@@ -889,6 +899,7 @@ def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label)
     report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
     _, html_path = write_report(report, tmp_path, html=True)
     assert f'p95 first useful output ≤ {label}' in html_path.read_text()
+
 
 
 def test_html_baseline_table_uses_actual_comparison_contract():

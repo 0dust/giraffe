@@ -764,3 +764,62 @@ async def test_cancelled_setup_closes_client_created_in_background(monkeypatch):
             await setup
     assert created and all(item.is_closed for item in created)
     assert client._client is None
+
+
+@pytest.mark.parametrize("consumer", ["sse", "limited_body"])
+async def test_response_consumers_close_their_byte_iterator_on_early_exit(monkeypatch, consumer):
+    import asyncio
+    from types import SimpleNamespace
+    from giraffe import client as module
+
+    closed = asyncio.Event()
+
+    async def chunks():
+        try:
+            yield b"data: {}\n\n"
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    stream = chunks()
+    response = SimpleNamespace(aiter_bytes=lambda: stream)
+    events = None
+    try:
+        if consumer == "sse":
+            events = module._sse_events(response)
+            assert (await anext(events))[:2] == ("message", "{}")
+            await events.aclose()
+        else:
+            monkeypatch.setattr(module, "_MAX_RESPONSE_BYTES", 2)
+            with pytest.raises(module._ProtocolError, match="safety limit"):
+                await module._limited_body(response)
+        assert closed.is_set()
+    finally:
+        if events is not None:
+            await events.aclose()
+        await stream.aclose()
+
+
+@pytest.mark.parametrize("failure", ["protocol", "cancellation"])
+async def test_execute_closes_untransferred_sse_iterator_before_return(monkeypatch, failure):
+    import asyncio
+    import time
+    from giraffe import client as module
+
+    closed = asyncio.Event()
+
+    async def events(*args, **kwargs):
+        try:
+            payload = "{" if failure == "protocol" else json.dumps(
+                {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]})
+            yield "message", payload, time.perf_counter()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    client, response, _ = setup_client(monkeypatch, [event("42")])
+    monkeypatch.setattr(module, "_sse_events", events)
+    async with client:
+        record = await client.execute(spec(cancel_after_chunks=1 if failure == "cancellation" else None))
+        assert record.status == ("failed" if failure == "protocol" else "cancelled")
+        assert closed.is_set() and response.closed

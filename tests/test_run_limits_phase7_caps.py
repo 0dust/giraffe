@@ -63,7 +63,15 @@ async def test_request_peak_cleanup_includes_cancellation_and_client_failure():
     tasks[0].cancel()
     finish[1].set()
     finish[2].set()
-    records = await asyncio.gather(*tasks)
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    # Cancellation and unexpected client bugs propagate after terminal records
+    # and shared occupancy are finalized; joining every task proves cleanup.
+    assert isinstance(outcomes[0], asyncio.CancelledError)
+    assert isinstance(outcomes[1], ValueError)
+    assert isinstance(outcomes[2], RequestRecord)
+    assert tasks[0].cancelled() and tasks[1].exception() is outcomes[1]
+    records = run.records
+    assert len(records) == 3
     assert {r.status for r in records} == {"completed", "failed", "cancelled"}
     assert all(r.overlap == 3 for r in records)
     assert not run.inflight.counts and not run.inflight.peaks

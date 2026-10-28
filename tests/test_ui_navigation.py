@@ -55,37 +55,36 @@ function browser(config=defaults,hash='#new'){
     assert result.returncode == 0, result.stderr
 
 
-def test_archived_run_keeps_polling_active_status_without_replacing_the_report():
+def test_archived_run_only_watches_known_active_run_without_replacing_report():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
 await page.run(`
 (async()=>{
-  let callback;
-  schedulePoll=fn=>{callback=fn;};
-  location.hash='#runs/archived';await route();
-  assert.equal(callback,pollRunStatus);
-  assert.match(document.title,/Run detail/);
-  const markup=nodes['#main'].innerHTML;
-  api=async()=>({runs:[{id:'live',state:'running',label:'Another run'}],active_run_id:'live'});
-  await callback(state.routeVersion);assert.match(document.title,/In progress · Another run/);
-  assert.equal(nodes['#main'].innerHTML,markup);
-  api=async()=>({runs:[]});await callback(state.routeVersion);
-  assert.equal(document.title,'Run detail · Giraffe');
+  let callback;schedulePoll=fn=>{callback=fn;};
+  state.runs=[{id:'live',state:'running',label:'Another run'}];setActive('live');
+  location.hash='#runs/archived';await route();assert.equal(callback,pollRunStatus);
+  const markup=nodes['#main'].innerHTML,paths=[];
+  api=async path=>{paths.push(path);return path.includes('/events?')?{seq:2,state:'completed',events:[],records:[],checks:[]}:{runs:[]};};
+  await callback(state.routeVersion);
+  assert.equal(paths[0],'/api/runs/live/events?after=0');assert.equal(paths[1],'/api/runs');
+  assert.equal(nodes['#main'].innerHTML,markup);assert.equal(document.title,'Run detail · Giraffe');
+  callback=null;await pollRunStatus(state.routeVersion);assert.equal(callback,null);
 })()
 `);
 """)
 
 
-def test_live_detail_keeps_1800ms_polling_and_archived_status_uses_3000ms():
+def test_live_detail_starts_delta_poll_after_minimum_delay_and_idle_archive_has_no_timer():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
 await page.run(`
 (async()=>{
-  const delays=[];schedulePoll=(fn,version,delay=1800)=>delays.push([fn,delay]);
-  api=async()=>({id:'live',state:'running',config:state.config,progress:{},events:[]});
-  location.hash='#runs/live';await route();assert.equal(delays.at(-1)[0],pollDetail);assert.equal(delays.at(-1)[1],1800);
+  const delays=[];schedulePoll=(fn,version,delay)=>delays.push([fn,delay]);
+  api=async()=>({id:'live',state:'running',seq:0,config:state.config,progress:{},events:[]});
+  location.hash='#runs/live';await route();assert.equal(delays.at(-1)[0],pollDetail);assert.equal(delays.at(-1)[1],300);
+  setActive(null);delays.length=0;
   api=async()=>({id:'old',state:'completed',config:state.config,report:null});
-  location.hash='#runs/old';await route();assert.equal(delays.at(-1)[0],pollRunStatus);assert.equal(delays.at(-1)[1],3000);
+  location.hash='#runs/old';await route();assert.equal(delays.length,0);
 })()
 `);
 """)
@@ -158,7 +157,7 @@ for(const action of ['mosaic-live','mosaic-next','mosaic-prev']){
  renderDetail();await click(action);
  assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);assert.equal(document.activeElement,spots[240]);
  let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:480,status:'running'}]};
- api=async()=>next;refreshRuns=async()=>{};
+ api=async path=>path.includes('/events?')?{seq:(state.detail.seq || 0)+1,state:next.state,records:next.live_requests || [],events:[],checks:[]}:next;refreshRuns=async()=>{};
  await pollDetail(state.routeVersion);
  assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
  assert.equal(document.activeElement,spots[480]);assert.equal(state.mosaicAutoFocus,'480');
@@ -189,7 +188,7 @@ let restored=0;
 const spot={dataset:{liveSlot:'239'},closest:q=>q==='.request-mosaic'?{}:null,focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;restored++;}};
 document.activeElement=spot;nodes['[data-live-slot="239"]']=spot;
 let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:240,status:'running'}]};
-api=async()=>next;refreshRuns=async()=>{};
+api=async path=>path.includes('/events?')?{seq:(state.detail.seq || 0)+1,state:next.state,records:next.live_requests || [],events:[],checks:[]}:next;refreshRuns=async()=>{};
 await pollDetail(state.routeVersion);
 assert.equal(state.mosaicFollow,false);assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,1);
 assert.equal(document.activeElement,spot);assert.equal(restored,1);assert.match(nodes['#main'].innerHTML,/data-live-slot="239"/);

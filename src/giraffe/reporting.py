@@ -9,6 +9,7 @@ from fractions import Fraction
 from hashlib import sha256
 from html import escape
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,7 +17,6 @@ import random
 import re
 import shutil
 import tempfile
-from statistics import median
 from typing import Any
 
 from pydantic import ValidationError
@@ -27,10 +27,13 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
 from .models import (CHECK_NAMES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
-                     migrate_concurrent_load, migrate_run_limits)
-from .storage import DEFAULT_LIMITS, format_size
+                     migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
+from .stats import median, percentile
+from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
 from .workloads import WORKLOAD_CHECKS
 from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
+
+logger = logging.getLogger(__name__)
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
@@ -41,16 +44,6 @@ _MATCH_CONFIG = (
     "unresponsive_after_failures", "unresponsive_for_seconds",
     "limits",
 )
-
-
-def _percentile(values: list[float], percentile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * percentile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def _rate(record: RequestRecord) -> float | None:
@@ -253,11 +246,10 @@ def _limits_reached(report: RunReport) -> set[str]:
 
 def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     reasons = []
-    if report.suite_version != baseline.suite_version:
-        reasons.append("Suite versions differ.")
-    if (report.schema_version != baseline.schema_version
-            and {report.schema_version, baseline.schema_version} != {"2", "3"}):
+    if not is_supported_schema(report.schema_version) or not is_supported_schema(baseline.schema_version):
         reasons.append("Report schema versions differ.")
+    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
+        reasons.append("Client timing measurement methods differ; rerun the baseline.")
     if report.abort_reason or report.observations.get("target_abort_reasons"):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
     if baseline.abort_reason or baseline.observations.get("target_abort_reasons"):
@@ -404,7 +396,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         if key in current_manifest or key in old_manifest:
             if effective_value(current_manifest, key) != effective_value(old_manifest, key):
                 reasons.append(f"Recorded {key} differs or is missing.")
-    # The suite version identifies bundled fixtures; custom packs also need a content identity.
+    # Fixture-set identity is independent of the installed package version.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
@@ -523,7 +515,7 @@ def _compare_metric(
         c = aggregate(rng.choices(current, k=len(current)))
         b = aggregate(rng.choices(old, k=len(old)))
         bootstrap.append((c - b) * direction * scale)
-    low, high = _percentile(bootstrap, 0.025), _percentile(bootstrap, 0.975)
+    low, high = percentile(bootstrap, 0.025), percentile(bootstrap, 0.975)
     result.update(worsening=worsening, worsening_interval_95=[low, high], threshold=threshold)
     if worsening > 0 and low is not None and low >= threshold:
         result.update(status="fail", reason="Material worsening exceeds observed sample uncertainty.")
@@ -568,9 +560,6 @@ def _compare_load_tests(
     }
     if reasons:
         result["reason"] = "Load test comparison is unavailable: " + " ".join(reasons)
-        return result
-    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline."
         return result
     if current is None or old is None:
         result["reason"] = "One run lacks final Load test evidence."
@@ -671,9 +660,6 @@ def _compare_traffic(
         "method": "Matched planned arrival cohorts and acceptance criteria. Stage acceptance "
                   "changes are observed qualification results, not statistical capacity estimates.",
     }
-    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline before comparing traffic acceptance."
-        return result
     for label, metrics in (("current", current), ("baseline", old)):
         pack = (metrics or {}).get("request_pack")
         if pack and pack.get("control_status") != "pass":
@@ -926,13 +912,22 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
-        traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
-        load_tests = _compare_load_tests(report, baseline, name, target_reasons)
+        # Optional observations and checks without inference/acceptance cohorts
+        # do not participate in baseline verdicts or sample-collection guidance.
+        non_request_checks = {"gpu"}
+        non_verdict_checks = non_request_checks | {
+            check.id for run in (report, baseline) for check in run.checks
+            if check.target == name and not check.required
+        }
+        traffic = (_compare_traffic(report, baseline, name, target_reasons, threshold)
+                   if "capacity" not in non_verdict_checks else None)
+        load_tests = (_compare_load_tests(report, baseline, name, target_reasons)
+                      if "load" not in non_verdict_checks else None)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
-        if (not current_groups or not old_groups) and traffic is None:
-            target_reasons.append("Measured request samples are absent from one or both runs.")
         if not target_reasons:
             for check, scenario in sorted(set(current_groups) | set(old_groups)):
+                if check in non_verdict_checks:
+                    continue
                 current_records = current_groups.get((check, scenario), [])
                 old_records = old_groups.get((check, scenario), [])
                 # Requested shape is checked too, rather than relying on configuration alone.
@@ -941,7 +936,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                      for r in records)
                     return {shape: Fraction(count, len(records)) for shape, count in counts.items()}
                 if not current_records or not old_records or shapes(current_records) != shapes(old_records):
-                    target_reasons.append(f"{check}/{scenario}: missing or different request shapes or proportions.")
+                    rows.append({"check": check, "scenario": scenario, "metric": "request_shapes",
+                                 "status": "inconclusive", "reason": "Missing or different request shapes or proportions.",
+                                 "current_samples": len(current_records), "baseline_samples": len(old_records),
+                                 "evidence_ids": [record.id for record in current_records]})
                     continue
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
@@ -953,7 +951,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
-                    row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
+                    row = _compare_metric(metric, values, old_metrics[metric],
+                                          1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
+                                          threshold)
                     if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         row.update(status="inconclusive", reason="Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
@@ -972,19 +972,40 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
                                 row.update(status="inconclusive", reason="Per-response timing evidence is incomplete; missing clocks remain unknown.")
-                        if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-                            row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
                                evidence_ids=[record.id for record in current_records])
                     rows.append(row)
-        assessed = [row for row in rows if "worsening" in row]
+        assessed = [row for row in rows if "worsening" in row and row["status"] in {"pass", "fail"}]
         failures = [row for row in assessed if row["status"] == "fail"]
-        uncertain = [row for row in assessed if row["status"] == "inconclusive"]
-        missing_measurements = [row for row in rows if "worsening" not in row and
-                                max(row["current_samples"], row["baseline_samples"]) >= minimum]
+        # A sparse secondary metric cannot invalidate an otherwise measured check.
+        # Coverage must nevertheless concern that check's actual verdict evidence.
+        verdict_metrics = {
+            "access": {"valid_completion_rate", "error_rate"},
+            "serving": {"valid_completion_rate", "error_rate"},
+            "first_output": {"first_output_ms"},
+            "generation": {"generation_tokens_per_second", "max_stream_gap_ms", "output_tokens_per_second"},
+            **{check: {"correctness_rate"} for check in
+               ("correctness", "json", "context", "tools", "consistency")},
+        }
+        request_paths = ((set(CHECK_NAMES) - non_request_checks)
+                         | {"capacity", "concurrency", "fairness", "arrivals", "buckets", "mixed", "token_stress"}
+                         | {check for check, _ in set(current_groups) | set(old_groups)})
+        selected_checks = {check.id for check in report.checks
+                           if check.target == name and check.id != "baseline" and check.required
+                           and check.status != "skipped" and check.id not in non_verdict_checks
+                           and check.id in config.get("checks", []) and check.id in request_paths}
+        covered = {row["check"] for row in assessed
+                   if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
+        if any(row["status"] in {"pass", "fail"} for row in (traffic or {}).get("stages", [])):
+            covered.add("capacity")
+        if any(row["status"] in {"pass", "fail"} for row in (load_tests or {}).get("points", [])):
+            covered.add("load")
+        missing_checks = sorted(selected_checks - covered)
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
+        point_count = sum(row["status"] in {"pass", "fail"}
+                          for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
         if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
@@ -995,32 +1016,30 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
         elif target_reasons:
             status = "inconclusive"
-            summary = "Baseline comparison is inconclusive: " + " ".join(target_reasons)
-        elif traffic is not None and traffic["status"] == "inconclusive":
+            prefix = ("Nothing comparable between the runs. " if not assessed and not point_count
+                      else "Baseline comparison is inconclusive: ")
+            summary = prefix + " ".join(target_reasons)
+            if missing_checks:
+                summary += " No comparable verdict metric for selected check(s): " + ", ".join(missing_checks) + "."
+        elif missing_checks:
             status = "inconclusive"
-            summary = traffic["reason"]
-        elif load_tests is not None and load_tests["status"] == "inconclusive":
+            prefix = "Nothing comparable between the runs. " if not assessed and not point_count else ""
+            summary = prefix + "No comparable verdict metric for selected check(s): " + ", ".join(missing_checks) + "."
+        elif not assessed and not point_count:
             status = "inconclusive"
-            summary = load_tests["reason"]
-        elif (not assessed and traffic is None and load_tests is None) or uncertain or missing_measurements:
-            status = "inconclusive"
-            if not assessed:
-                summary = "No metric has enough comparable samples."
-            elif missing_measurements:
-                summary = "Some metrics lost measurement coverage or have undefined baseline values."
-            elif saturated_runs:
-                summary = "Overlapping client scheduling delay prevents a reliable timing/rate comparison."
-            else:
-                summary = "Sample variation or changed output lengths prevent a clear material-regression decision."
+            summary = "Nothing comparable between the runs."
         else:
             status = "pass"
-            summary = f"No material regression detected in {len(assessed)} comparable metric(s)."
+            measurements = ([f"{len(assessed)} comparable metric(s)"] if assessed else [])
+            if point_count:
+                measurements.append(f"{point_count} comparable acceptance point(s)")
+            summary = "No material regression detected in " + " and ".join(measurements) + "."
             if traffic is not None:
                 summary += " " + traffic["reason"]
         excluded = len(rows) - len(assessed)
         if excluded:
-            summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
-        if status == "inconclusive":
+            summary += f" {excluded} metric(s) not comparable (low samples, undefined values or uncertain attribution); see comparison details."
+        if status == "inconclusive" and missing_checks:
             summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
                         " using the same workload and settings; rerun longer if variation remains uncertain.")
         entry = {"target": name, "status": status, "reasons": target_reasons,
@@ -1054,7 +1073,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted
                                      for check in result.checks))
     from .performance import refresh_performance
-    return refresh_performance(result)
+    return refresh_performance(result, force=True)
 
 
 def _retained(report: RunReport) -> RunReport:
@@ -1130,7 +1149,10 @@ def _request_json(record: RequestRecord) -> str:
 
 def _report_json_chunks(report: RunReport):
     # Keep defaults for raw consumers. Only exact input messages move to the table.
-    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests", "performance"})
+    metadata = report.model_copy(update={"schema_version": CURRENT_SCHEMA, "performance": {
+        **report.performance, "targets": [{key: value for key, value in target.items() if key != "request_series"}
+                                         for target in report.performance.get("targets", [])]
+    }}).model_dump_json(exclude={"requests"})
     yield metadata[:-1] + ',"report_format":2,"inputs":{'
     seen = set()
     for record in report.requests:
@@ -1153,7 +1175,10 @@ def _report_json_chunks(report: RunReport):
 
 
 def _portable_json_chunks(report: RunReport):
-    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests", "performance"})
+    metadata = report.model_copy(update={"schema_version": CURRENT_SCHEMA, "performance": {
+        **report.performance, "targets": [{key: value for key, value in target.items() if key != "request_series"}
+                                         for target in report.performance.get("targets", [])]
+    }}).model_dump_json(exclude={"requests"})
     yield metadata[:-1] + ',"requests":['
     for index, record in enumerate(report.requests):
         yield "," if index else ""
@@ -1163,7 +1188,7 @@ def _portable_json_chunks(report: RunReport):
 
 def save_baseline_report(source: Path, destination: Path, *, replace: bool = False,
                          report: RunReport | None = None, portable: bool = False) -> None:
-    """Publish an independent snapshot, sharing immutable bytes where supported."""
+    """Publish a private snapshot; portable CLI exports remain mode 0644."""
     source, destination = Path(source), Path(destination)
     report = report if report is not None else RunReport.model_validate_json(source.read_text())
     retained = _retained(report)
@@ -1177,15 +1202,19 @@ def save_baseline_report(source: Path, destination: Path, *, replace: bool = Fal
         if portable:
             _atomic_write_chunks(temporary, _portable_json_chunks(retained))
             os.chmod(temporary, 0o644)
-        elif (source.is_symlink() or source.name != "report.json"
-              or retained != report or report.schema_version != "3"):
-            _atomic_write_chunks(temporary, _report_json_chunks(retained))
+        elif (source.name == "report.json" and not source.is_symlink() and retained == report
+              and report._source_schema == CURRENT_SCHEMA):
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as outgoing, source.open("rb") as incoming:
+                shutil.copyfileobj(incoming, outgoing, length=65536)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
         else:
-            try:
-                os.link(source, temporary)
-            except OSError:
-                with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-                    shutil.copyfileobj(incoming, outgoing, length=65536)
+            # Never chmod an inode shared with the source report. Managed
+            # baselines are independent mode-0600 snapshots.
+            _atomic_write_chunks(temporary, _report_json_chunks(retained))
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
         if replace:
             temporary.replace(destination)
         else:
@@ -1202,6 +1231,7 @@ def save_baseline_report(source: Path, destination: Path, *, replace: bool = Fal
                 except OSError:
                     destination.unlink(missing_ok=True)
                     raise
+        fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1966,10 +1996,10 @@ def _render(report: RunReport) -> str:
                      f'<td>{sum(r.status == "failed" for r in records)} / '
                      f'{sum(r.status == "timeout" for r in records)}</td>'
                      f'<td>{sum(r.status == "cancelled" for r in records)}</td>'
-                     f'<td>{_number(_percentile(times, .5))} / {_number(_percentile(times, .95))}</td>'
-                     f'<td>{_number(_percentile(first, .5))}</td>'
-                     f'<td>{_number(_percentile(generation, .5))} (n={len(generation)})</td>'
-                     f'<td>{_number(_percentile(end_to_end, .5))}</td>'
+                     f'<td>{_number(percentile(times, .5))} / {_number(percentile(times, .95))}</td>'
+                     f'<td>{_number(percentile(first, .5))}</td>'
+                     f'<td>{_number(percentile(generation, .5))} (n={len(generation)})</td>'
+                     f'<td>{_number(percentile(end_to_end, .5))}</td>'
                      f'<td>{sum(r.score is True for r in scored)} / {len(scored)}</td></tr>')
     parts.append('</table></div></section>')
     parts.append('<section id="deployment"><h2>Deployment and serving telemetry</h2>'
@@ -2062,20 +2092,27 @@ def _render(report: RunReport) -> str:
 
 
 def _atomic_write_chunks(path: Path, chunks) -> None:
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = None
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=path.name + ".",
+                                         suffix=".tmp", dir=path.parent, delete=False) as file:
+            temporary = Path(file.name)
             for chunk in chunks:
                 file.write(chunk)
             file.flush()
+            os.fsync(file.fileno())
         temporary.replace(path)
+        fsync_directory(path.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _atomic_write(path: Path, contents: str) -> None:
-    _atomic_write_chunks(path, (contents,))
+    if path.name == ".web.json":
+        write_metadata(path.parent, json.loads(contents))
+    else:
+        _atomic_write_chunks(path, (contents,))
 
 
 class ReportWriteError(OSError):
@@ -2092,11 +2129,13 @@ def _write_failure_reason(error: OSError) -> str:
 
 
 def html_failure_warning(error: OSError) -> str:
+    if getattr(error, "failed_file", "report.html") != "report.html":
+        return f"Report cleanup could not finish: {_write_failure_reason(error)}; report.json is complete"
     return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
 
 
 def write_report(report: RunReport, directory: Path, *, max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
-                 html: bool = False) -> tuple[Path, Path | None]:
+                 html: bool = False, preserve_evidence: bool = False) -> tuple[Path, Path | None]:
     """Save compact JSON; standalone HTML is an explicit optional export."""
     if isinstance(max_run_storage, bool) or not isinstance(max_run_storage, int) or max_run_storage < 0:
         raise ValueError("max_run_storage must be a non-negative integer")
@@ -2109,17 +2148,10 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = D
     json_path, html_path = directory / "report.json", directory / "report.html"
     from .latency import latency_summary
 
-    metadata_path = directory / ".web.json"
     try:
-        try:
-            metadata = json.loads(metadata_path.read_text())
-            if not isinstance(metadata, dict):
-                metadata = {}
-        except (OSError, ValueError):
-            metadata = {}
-        metadata["latency_summary"] = latency_summary(report)
-        _atomic_write(metadata_path, json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+        update_metadata(directory, {"latency_summary": latency_summary(report)})
     except Exception as error:
+        logger.exception("Could not save latency summary for %s", report.run_id)
         reason = _write_failure_reason(error) if isinstance(error, OSError) else type(error).__name__
         warning = f"Latency summary could not be saved: {reason}"
         report.warnings.append(warning)
@@ -2130,6 +2162,14 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = D
         _atomic_write_chunks(json_path, _report_json_chunks(retained))
     except OSError as error:
         raise ReportWriteError(error, "report.json", json_complete=False) from error
+    # The completed, durably published report now owns the evidence. A crash
+    # before this point must leave the journal available for recovery.
+    try:
+        if not preserve_evidence:
+            (directory / "evidence.jsonl").unlink(missing_ok=True)
+        fsync_directory(directory)
+    except OSError as error:
+        raise ReportWriteError(error, "evidence.jsonl", json_complete=True) from error
     if not html:
         return json_path, None
     try:
