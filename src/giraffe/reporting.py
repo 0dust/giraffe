@@ -1347,6 +1347,11 @@ def _number(value: float | None) -> str:
     return "—" if value is None or not math.isfinite(value) else f"{value:,.1f}"
 
 
+def _duration_ms(value: float) -> str:
+    amount, unit = (value / 1000, "s") if value >= 1000 else (value, "ms")
+    return f"{_number(amount).rstrip('0').rstrip('.')} {unit}"
+
+
 def _badge(status: str) -> str:
     return f'<span class="badge {_e(status)}">{_e(status)}</span>'
 
@@ -1622,6 +1627,14 @@ def _render(report: RunReport) -> str:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
+        applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
+        default_limits = (report.manifest.get("default_check_limits") or {}).get(check.id) or []
+        timing = {"first_output": [("first_output_ms", "p95 first useful output")],
+                  "generation": [("latency_ms", "Response time"), ("stream_gap_ms", "Stream pause")]}
+        limit_text = "; ".join(f"{label} ≤ {_duration_ms(applied[field])}" + (" (default)" if field in default_limits else "")
+                               for field, label in timing.get(check.id, []) if applied.get(field) is not None)
+        if limit_text:
+            metrics = f'<p>{_e(limit_text)}</p>' + metrics
         parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(check.title)}</strong>'
                      f'<br>{"Required" if check.required else "Optional"}</td>'
                      f'<td>{_badge(check.status)}</td><td>{_e(check.summary)}'

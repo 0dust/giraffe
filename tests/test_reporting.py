@@ -838,3 +838,51 @@ def test_old_baseline_none_effective_defaults_match_same_explicit_config():
     assert _settings_reasons(current, previous) == []
     current.manifest['config']['test_options'] = {'generation': {'limits': {'stream_gap_ms': 2000}}}
     assert _settings_reasons(current, previous)
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_saved_report_records_and_displays_applied_sanity_limits(tmp_path, monkeypatch, explicit):
+    from giraffe import runner
+    from tests.test_runner import FakeClient
+
+    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
+    values = {'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}],
+              'checks': ['first_output', 'generation']}
+    if explicit:
+        values['limits'] = {'first_output_ms': 800, 'stream_gap_ms': 700}
+    report = await runner.run_suite(RunConfig.model_validate(values))
+    json_path, html_path = write_report(report, tmp_path, html=True)
+    saved = RunReport.model_validate_json(json_path.read_text())
+    html = html_path.read_text()
+    for check_id, field, limit, label in (
+        ('first_output', 'first_output_ms', 800 if explicit else 10000, 'p95 first useful output'),
+        ('generation', 'stream_gap_ms', 700 if explicit else 5000, 'Stream pause'),
+    ):
+        assert saved.manifest['effective_checks'][check_id]['limits'][field] == limit
+        assert (field in saved.manifest['default_check_limits'][check_id]) == (not explicit)
+        duration = f'{limit / 1000:g} s' if limit >= 1000 else f'{limit} ms'
+        assert f'{label} ≤ {duration}' + ('' if explicit else ' (default)') in html
+    if not explicit:
+        assert 'default_concurrency' not in saved.manifest['config']
+
+
+def test_old_report_with_null_effective_limit_metadata_keeps_rendering(tmp_path):
+    report = make_report()
+    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
+                                status='inconclusive', summary='Timing observed; no acceptance limit configured.')]
+    report.manifest['effective_checks'] = {'first_output': {'limits': None}}
+    report.manifest['default_check_limits'] = None
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    assert 'Timing observed; no acceptance limit configured.' in html
+    assert 'p95 first useful output ≤' not in html
+
+
+@pytest.mark.parametrize('limit,label', [(999, '999 ms'), (1000, '1 s'), (1500, '1.5 s'), (10000, '10 s')])
+def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label):
+    report = make_report()
+    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
+                                status='pass', summary='Timing met the recorded limit.')]
+    report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
+    _, html_path = write_report(report, tmp_path, html=True)
+    assert f'p95 first useful output ≤ {label}' in html_path.read_text()

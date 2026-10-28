@@ -716,8 +716,6 @@ def migrate_run_limits(value):
         kept = (f"{', '.join(users)} retain legacy {value['default_concurrency']}-request parallelism"
                 if users else "no selected check inherits that parallelism")
         notes.append(f"concurrency: {value['concurrency']} now limits simultaneous requests; default_concurrency={value['default_concurrency']}; {kept}.")
-    else:
-        value.setdefault("default_concurrency", 4)
     if value.get("concurrency") is not None and value.get("overlap_models"):
         parallelism = value["concurrency"]
         checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)
@@ -2111,6 +2109,12 @@ class RunConfig(Model):
             }
         return resolved
 
+    def default_limit_fields(self, check_id: str) -> list[str]:
+        options = self.test_options.get(check_id)
+        supplied = self.limits.model_fields_set | (options.limits.model_fields_set if options and options.limits else set())
+        return [name for name, value in self.effective_check(check_id).get("limits", {}).items()
+                if value is not None and name not in supplied]
+
     def effective_response(self) -> dict[str, Any]:
         """Endpoint response owns shared initial/warm requests.
 
@@ -2240,6 +2244,13 @@ class RunConfig(Model):
                     schedule = own.model_copy(update={"levels": effective_levels})
                     schedule.__pydantic_fields_set__ = own.model_fields_set.copy()
                     self.concurrent_load = self.concurrent_load.model_copy(update={"schedule": schedule})
+
+    @model_serializer(mode="wrap")
+    def serialize_parallelism_intent(self, handler):
+        result = handler(self)
+        if "default_concurrency" not in self.model_fields_set:
+            result.pop("default_concurrency", None)
+        return result
 
     @field_serializer("limits")
     def serialize_sanity_opt_outs(self, value, info):

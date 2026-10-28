@@ -1618,6 +1618,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", ("Known-answer checks were not exercised concurrently: no scored answer's streamed response "
                     "overlapped another outside recorded client scheduling delays" + (f"; {NEEDS_STREAM}." if not config.stream else
                                                              " (client overlap alone does not show server concurrency)."))
+                if metrics["scored"] == metrics["completed"] == metrics["attempted"] and metrics["scored"]:
+                    summary += " The server answered one at a time."
             elif check_id == "context" and near_missed:
                 status, summary = "fail", f"Near-limit recall missed the fact at position(s): {', '.join(near_missed)}."
             elif check_id == "context" and rejected:
@@ -2433,6 +2435,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
                 "effective_checks": {name: public_config.effective_check(name) for name in public_config.checks},
+                "default_check_limits": {name: public_config.default_limit_fields(name) for name in public_config.checks},
                 "effective_initial": public_config.effective_initial(),
                 "effective_traffic": (config.effective_traffic().model_dump(mode="json")
                                       if "capacity" in config.checks else None),

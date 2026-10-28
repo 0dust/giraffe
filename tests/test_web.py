@@ -1017,3 +1017,51 @@ async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path
         saved = (await client.get(f"/api/runs/{identifier}")).json()
         assert saved["state"] == "completed"
         assert saved["progress"]["dropped_offers"] == 2
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_bootstrap_round_trip_keeps_serial_correctness_intent(tmp_path, monkeypatch, explicit):
+    from tests.test_check_intent_overlap import StreamEndpoint
+
+    StreamEndpoint(monkeypatch, serial=True)
+    async with browser(tmp_path) as client:
+        values = (await client.get('/api/bootstrap')).json()['config']
+        values['targets'][0].update(url='http://stream.test/v1', model='fake-model')
+        if explicit:
+            values['default_concurrency'] = 4
+        for attempt in range(2):
+            response = await client.post('/api/runs', json={'config': values})
+            assert response.status_code == 202, response.text
+            detail = await finished(client, response.json()['id'])
+            result = next(check for check in detail['report']['checks'] if check['id'] == 'correctness')
+            assert result['status'] == ('inconclusive' if explicit else 'pass')
+            assert detail['report']['overall'] == ('inconclusive' if explicit else 'pass')
+            assert result['metrics']['evidenced_overlap'] < 2
+            assert 'server answered one at a time' in result['summary'].lower()
+            values = detail['report']['manifest']['config']
+
+
+@pytest.mark.parametrize('entry', ['draft', 'launcher'])
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_legacy_ui_config_keeps_concurrency_intent(tmp_path, monkeypatch, entry, explicit):
+    from giraffe.cli import migrated_configuration
+    from tests.test_check_intent_overlap import StreamEndpoint
+
+    StreamEndpoint(monkeypatch, serial=True)
+    values = {'targets': [{'name': 'local', 'url': 'http://stream.test/v1', 'model': 'fake-model'}],
+              'checks': ['correctness']}
+    if explicit:
+        values['concurrency'] = 4
+    defaults = migrated_configuration(values).model_dump(mode='json') if entry == 'launcher' else None
+    async with browser(tmp_path, defaults=defaults) as client:
+        response = (await client.get('/api/bootstrap') if entry == 'launcher' else
+                    await client.post('/api/config/draft', json=values))
+        assert response.status_code == 200, response.text
+        normalized = response.json()['config']
+        assert RunConfig.model_validate(normalized).parallelism_requested('correctness') == explicit
+        response = await client.post('/api/runs', json={'config': normalized})
+        assert response.status_code == 202, response.text
+        detail = await finished(client, response.json()['id'])
+        result = next(check for check in detail['report']['checks'] if check['id'] == 'correctness')
+        assert result['status'] == ('inconclusive' if explicit else 'pass')
+        assert result['metrics']['evidenced_overlap'] < 2

@@ -343,3 +343,19 @@ assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
 assert.doesNotMatch(catalogue,/catalogue-view-hint/);
 """)
+
+
+def test_displayed_concurrency_defaults_are_not_saved_as_user_overrides():
+    browser_logic(r"""
+assert.equal(Object.hasOwn(config,'default_concurrency'),false);
+assert.equal(effectiveParallelism(config),4);
+const check=bootstrap.checks.find(item=>item.id==='correctness');
+assert.equal(optionValue(config,check,'concurrency'),4);
+const values=new FormData();values.append('check','correctness');
+values.set('test_mode_correctness','custom');values.set('test_correctness_concurrency','4');
+const saved=configureTests(config,values,bootstrap.checks,bootstrap.load_test.defaults);
+assert.equal(Object.hasOwn(saved,'default_concurrency'),false);
+assert.equal(Object.hasOwn(saved.test_options.correctness || {},'concurrency'),false);
+const explicit={...config,default_concurrency:4};
+assert.equal(configureTests(explicit,values,bootstrap.checks,bootstrap.load_test.defaults).default_concurrency,4);
+""", RunConfig(targets=[{'name': 'local', 'url': 'http://local', 'model': 'm'}], checks=['correctness']))
