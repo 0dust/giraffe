@@ -2,9 +2,12 @@
 
 import importlib.util
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
+
+from giraffe import __version__
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / ".github/scripts/validate_release.py"
@@ -15,6 +18,17 @@ def validator():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.validate_release
+
+
+def test_current_repository_passes_release_validation():
+    root = SCRIPT.parents[2]
+    validate_release = validator()
+    validate_release(root, "push", "x")
+
+
+def test_package_version_matches_project_metadata():
+    with (SCRIPT.parents[2] / "pyproject.toml").open("rb") as file:
+        assert __version__ == tomllib.load(file)["project"]["version"]
 
 
 def git(root, *args):

@@ -451,6 +451,7 @@ async def test_launcher_defaults_preserve_explicit_checks(tmp_path):
 
 
 async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_path, monkeypatch):
+    from giraffe import __version__
     from giraffe.capabilities import capabilities
 
     async def forbidden(*args, **kwargs):
@@ -461,6 +462,7 @@ async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_p
         discovery = (await client.get("/api/capabilities")).json()
         bootstrap = (await client.get("/api/bootstrap")).json()
         assert discovery == capabilities()
+        assert discovery["version"] == __version__
         assert discovery["checks"] == bootstrap["checks"]
         assert discovery["config_schema"] == bootstrap["config_schema"]
         assert (await client.get("/api/runs")).json()["runs"] == []
