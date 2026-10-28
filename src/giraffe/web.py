@@ -47,7 +47,7 @@ from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
-                               save_baseline_report, save_failure_summary, write_report)
+                               save_baseline_report, save_failure_summary, write_comparison_report, write_report)
 from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
 from giraffe.resources import PhaseSampler, SAMPLING
@@ -235,6 +235,10 @@ class CleanupRequest(CleanupCriteria):
 
 class KeepRun(Model):
     keep: bool = Field(strict=True)
+
+
+class CompareRun(Model):
+    baseline_id: str = Field(min_length=1, max_length=MAX_WEB_IDENTIFIER_CHARS)
 
 
 class DatasetPreview(Model):
@@ -615,6 +619,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             return None
         return {"run_id": saved.run_id, "overall": saved.overall,
                 "started_at": saved.started_at, "finished_at": saved.finished_at,
+                "baseline": {"saved_baseline_id": saved.baseline["saved_baseline_id"]}
+                if saved.baseline and "saved_baseline_id" in saved.baseline else None,
                 "request_count": len(saved.requests),
                 "checks": [{"status": check.status} for check in saved.checks],
                 "manifest": {"config": {"targets": _targets(saved.manifest.get("config", {}))}}}
@@ -665,7 +671,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_conditions": condition_rows,
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
-                "baseline_id": meta.get("baseline_id"), "report": persisted, "summary": summary,
+                "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
+                "report": persisted, "summary": summary,
                 "resources": meta.get("resources", {}), "auto_cleanup": meta.get("auto_cleanup"),
                 "bytes": run_size(directory), "kept": (directory / ".keep").is_file(),
                 "started_at": (persisted or summary or {}).get("started_at", meta.get("started_at")),
@@ -990,10 +997,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.post("/api/storage/cleanup")
     async def clean_storage(body: CleanupRequest):
-        for identifier in body.ids:
-            _directory(root, identifier)
-        return await run_in_threadpool(apply_cleanup, root, body.ids, active_id=active.get("id"),
-                                       **body.model_dump(exclude={"ids"}, exclude_none=True))
+        async with start_lock:
+            for identifier in body.ids:
+                _directory(root, identifier)
+            return await run_in_threadpool(apply_cleanup, root, body.ids, active_id=active.get("id"),
+                                           **body.model_dump(exclude={"ids"}, exclude_none=True))
 
     @app.post("/api/runs/{identifier}/keep")
     async def keep_run(identifier: str, body: KeepRun):
@@ -1109,6 +1117,36 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.get("/api/runs/{identifier}/performance")
     async def performance_selection(identifier: str, target: str | None = None, window: str | None = None):
         return selected_performance(identifier, target, window)
+
+    @app.post("/api/runs/{identifier}/compare")
+    async def compare_saved_run(identifier: str, body: CompareRun):
+        # Serialize with cleanup/start and report downloads. Comparison uses only
+        # saved evidence; it must never start a suite or replace a reference.
+        async with start_lock, download_lock:
+            if active:
+                raise HTTPException(409, "Wait for the active run to finish before comparing saved reports")
+            detail = run_detail(identifier)
+            if detail["state"] != "completed" or detail["report"] is None:
+                raise HTTPException(409, "Wait for a completed report before comparing")
+            reference = next((item for item in saved_baselines() if item["id"] == body.baseline_id), None)
+            if reference is None:
+                raise HTTPException(404, "Unknown saved baseline")
+            directory = _directory(root, identifier)
+            current = _report(directory / "report.json")
+            baseline = _report(_directory(baseline_root, body.baseline_id) / "report.json")
+            if current.run_id == baseline.run_id:
+                raise HTTPException(422, "Choose a baseline from a different run")
+            report = await run_in_threadpool(compare_baseline, current, baseline)
+            report.baseline.update(saved_baseline_id=body.baseline_id, saved_baseline_name=reference["name"])
+            warning = None
+            try:
+                await run_in_threadpool(write_comparison_report, report, directory, max_run_storage=max_run_storage)
+            except OSError as error:
+                if not getattr(error, "json_complete", False):
+                    raise HTTPException(507, "Comparison could not be saved. Check storage limits and write permissions.") from None
+                warning = html_failure_warning(error)
+            return {"id": identifier, "baseline_id": body.baseline_id,
+                    "status": report.baseline["status"], "warning": warning}
 
     @app.get("/api/runs/{identifier}/requests/{request_id}")
     async def request_evidence(identifier: str, request_id: str):

@@ -60,6 +60,40 @@ function detail(value,extra={}) {
     assert result.returncode == 0, result.stderr
 
 
+def test_post_run_baseline_picker_filters_self_and_ignores_stale_navigation():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  toast=message=>{throw Error(message);};
+  detail(report([check('serving','pass')]));
+  assert(document.querySelector('[data-action="compare-saved"]'));
+  let calls=[];
+  api=async path=>{calls.push(path);return {baselines:[
+    {id:'self',run_id:'saved-run',name:'Own snapshot'},
+    {id:'reference',run_id:'other-run',name:'Before <upgrade>',saved_at:'2026-10-15T09:00:00Z'}
+  ]};};
+  await openComparisonDialog();
+  assert(dialog.open);
+  assert.deepEqual(calls,['/api/baselines']);
+  const options=dialog.querySelectorAll('option');
+  assert.equal(options.length,1);assert.equal(options[0].getAttribute('value'),'reference');
+  assert.match(dialog.textContent,/Before <upgrade>/);
+  assert.equal(dialog.querySelector('upgrade'),null);
+  dialog.close();
+  api=async()=>({baselines:[{id:'self',run_id:'saved-run',name:'Own snapshot'}]});
+  await openComparisonDialog();
+  assert(dialog.querySelector('[type="submit"]').hasAttribute('disabled'));
+  assert.match(dialog.textContent,/No other saved baselines/);
+  dialog.close();
+  let resolve;
+  api=()=>new Promise(done=>{resolve=done;});
+  const opening=openComparisonDialog();state.routeVersion++;
+  resolve({baselines:[]});await opening;
+  assert.equal(dialog.open,false);
+})();
+""", dom=True)
+
+
 def test_live_view_retains_stop_reasons_during_stopping_and_judging():
     run_render_checks(r"""
 const config={targets:[{name:'local',model:'m'}],max_requests:50,concurrency:4,max_duration_seconds:120,request_timeout_seconds:30,max_output_tokens:128};

@@ -1019,3 +1019,112 @@ async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path
         saved = (await client.get(f"/api/runs/{identifier}")).json()
         assert saved["state"] == "completed"
         assert saved["progress"]["dropped_offers"] == 2
+
+
+def saved_comparison_fixture(root, name, *, latency=100):
+    saved = report(RunConfig.model_validate(config(checks=['serving'], retention='all')))
+    saved.run_id = name
+    saved.requests = [saved.requests[0].model_copy(update={
+        'id': f'{name}-{index}', 'elapsed_ms': latency, 'first_output_ms': latency / 2,
+        'input_chars': 20, 'requested_max_tokens': 32, 'stream': True,
+    }) for index in range(8)]
+    write_report(saved, root / name, html=True)
+    return saved
+
+
+async def test_compare_completed_run_without_inference_preserves_evidence_and_baselines(tmp_path, monkeypatch):
+    from giraffe.reporting import compare_baseline
+
+    def no_inference(*args, **kwargs):
+        pytest.fail('Post-run comparison must not call the inference runner')
+
+    monkeypatch.setattr('giraffe.web.run_suite', no_inference)
+    before = saved_comparison_fixture(tmp_path, 'before')
+    after = saved_comparison_fixture(tmp_path, 'after', latency=200)
+    saved_comparison_fixture(tmp_path, 'other', latency=200)
+    original = json.loads((tmp_path / 'after/report.json').read_text())
+    async with browser(tmp_path) as client:
+        baseline = (await client.post('/api/baselines', json={'run_id': 'before', 'name': 'Before'})).json()
+        snapshot = (await client.post('/api/baselines', json={'run_id': 'after', 'name': 'After snapshot'})).json()
+        alternate = (await client.post('/api/baselines', json={'run_id': 'other', 'name': 'Other'})).json()
+        baseline_files = {p: p.read_bytes() for p in (tmp_path / '.baselines').rglob('*.json')}
+        response = await client.post('/api/runs/after/compare', json={'baseline_id': baseline['id']})
+        assert response.status_code == 200, response.text
+        detail = (await client.get('/api/runs/after')).json()
+        expected = compare_baseline(after, before)
+        assert detail['report']['baseline']['status'] == expected.baseline['status']
+        assert detail['baseline_id'] == baseline['id']
+        assert detail['report']['baseline']['saved_baseline_name'] == 'Before'
+        disk = json.loads((tmp_path / 'after/report.json').read_text())
+        for key in ('requests', 'inputs', 'manifest', 'started_at', 'finished_at'):
+            assert disk[key] == original[key]
+        assert [c for c in disk['checks'] if c['id'] != 'baseline'] == original['checks']
+        assert all(p.read_bytes() == value for p, value in baseline_files.items())
+        listed = (await client.get('/api/runs')).json()['runs']
+        assert len(listed) == 3
+        assert next(item for item in listed if item['id'] == 'after')['baseline_id'] == baseline['id']
+        exported = (await client.get('/api/runs/after/report.json')).json()
+        assert exported['baseline']['run_id'] == 'before'
+        assert 'Baseline comparison' in (await client.get('/api/runs/after/report.html')).text
+        assert 'Baseline comparison' in (tmp_path / 'after/report.html').read_text()
+        # Replace only the comparison, not the measurements or a saved snapshot.
+        response = await client.post('/api/runs/after/compare', json={'baseline_id': alternate['id']})
+        assert response.status_code == 200
+        disk = json.loads((tmp_path / 'after/report.json').read_text())
+        assert disk['baseline']['run_id'] == 'other'
+        assert len([c for c in disk['checks'] if c['id'] == 'baseline']) == 1
+        assert disk['requests'] == original['requests']
+        assert all(p.read_bytes() == value for p, value in baseline_files.items())
+        assert (await client.post('/api/runs/after/compare', json={'baseline_id': snapshot['id']})).status_code == 422
+    # A new app instance reads the persisted reference, without depending on memory.
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/after')).json()
+        assert detail['baseline_id'] == alternate['id']
+        assert detail['report']['baseline']['saved_baseline_name'] == 'Other'
+
+
+async def test_post_run_comparison_rejects_unavailable_runs_references_and_write_failures(tmp_path, monkeypatch):
+    saved_comparison_fixture(tmp_path, 'before')
+    saved_comparison_fixture(tmp_path, 'after')
+    original = (tmp_path / 'after/report.json').read_bytes()
+    async with browser(tmp_path) as client:
+        baseline = (await client.post('/api/baselines', json={'run_id': 'before', 'name': 'Before'})).json()
+        assert (await client.post('/api/runs/after/compare', json={'baseline_id': 'unknown'})).status_code == 404
+        assert (await client.post('/api/runs/missing/compare', json={'baseline_id': baseline['id']})).status_code == 404
+        for state in ('running', 'queued', 'stopping', 'error', 'cancelled'):
+            (tmp_path / 'after/.web.json').write_text(json.dumps({'state': state}))
+            assert (await client.post('/api/runs/after/compare', json={'baseline_id': baseline['id']})).status_code == 409
+        (tmp_path / 'after/.web.json').write_text('{}')
+        def fail_write(*args, **kwargs):
+            raise OSError('disk full')
+        monkeypatch.setattr('giraffe.web.write_comparison_report', fail_write)
+        assert (await client.post('/api/runs/after/compare', json={'baseline_id': baseline['id']})).status_code == 507
+        assert (tmp_path / 'after/report.json').read_bytes() == original
+
+
+async def test_post_run_comparison_storage_limit_does_not_trim_existing_evidence(tmp_path):
+    saved_comparison_fixture(tmp_path, 'before')
+    saved_comparison_fixture(tmp_path, 'after')
+    original = (tmp_path / 'after/report.json').read_bytes()
+    async with browser(tmp_path, max_run_storage=1) as client:
+        baseline = (await client.post('/api/baselines', json={'run_id': 'before', 'name': 'Before'})).json()
+        response = await client.post('/api/runs/after/compare', json={'baseline_id': baseline['id']})
+        assert response.status_code == 507
+        assert (tmp_path / 'after/report.json').read_bytes() == original
+
+
+async def test_post_run_comparison_html_failure_keeps_saved_json(tmp_path, monkeypatch):
+    import giraffe.reporting as reporting
+
+    saved_comparison_fixture(tmp_path, 'before')
+    saved_comparison_fixture(tmp_path, 'after')
+    async with browser(tmp_path) as client:
+        baseline = (await client.post('/api/baselines', json={'run_id': 'before', 'name': 'Before'})).json()
+        def fail_html(*args, **kwargs):
+            raise PermissionError('Cannot write HTML')
+        monkeypatch.setattr(reporting, '_atomic_write', fail_html)
+        response = await client.post('/api/runs/after/compare', json={'baseline_id': baseline['id']})
+        assert response.status_code == 200
+        assert 'report.json is complete' in response.json()['warning']
+        assert not (tmp_path / 'after/report.html').exists()
+        assert (await client.get('/api/runs/after')).json()['baseline_id'] == baseline['id']
