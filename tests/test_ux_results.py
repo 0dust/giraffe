@@ -462,3 +462,29 @@ assert.doesNotMatch(html,/data-metric="first_output_ms"|data-metric="correctness
 state.comparisonFilter='all';html=renderComparison(value);
 assert.equal((html.match(/data-metric=/g)||[]).length,4);
 """)
+
+
+def test_traffic_only_comparison_preserves_accepted_rate_goodput_and_stage_loss():
+    run_render_checks(r"""
+const value=report([],{baseline:{targets:[{target:'arrival <gpu>',comparisons:[],traffic_capacity:{
+  status:'fail',reason:'Previously accepted arrival rate was lost.',
+  baseline_highest_acceptable_rate_rps:50,current_highest_acceptable_rate_rps:10,
+  delta_rps:-40,change_percent:-80,stages:[{rate_rps:50,status:'fail',
+    baseline:{goodput_rps:49},current:{goodput_rps:8},
+    reason:'This previously acceptable arrival stage now fails its configured criteria.'}]
+}}]}});
+state.detail={report:value};
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;
+  const html=renderComparison(value);
+  assert.match(html,/arrival &lt;gpu&gt;/);
+  assert.match(html,/Tested arrival capacity/);
+  assert.match(html,/Baseline accepted rate<\/dt><dd>50 req\/s/);
+  assert.match(html,/Current accepted rate<\/dt><dd>10 req\/s/);
+  assert.match(html,/-40 req\/s/);assert.match(html,/-80%/);
+  assert.match(html,/Baseline goodput/);assert.match(html,/49 req\/s/);
+  assert.match(html,/Current goodput/);assert.match(html,/8 req\/s/);
+  assert.match(html,/Previously accepted arrival rate was lost\./);
+  assert.match(html,/This previously acceptable arrival stage now fails its configured criteria\./);
+}
+""")
