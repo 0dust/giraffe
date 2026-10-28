@@ -566,7 +566,8 @@ An explicit `targets[].metrics_profile` overrides detection. Profiles map exact
 metric names and units:
 
 - `vllm-v1`: vLLM 0.30.0 V1 metric names for KV-cache fraction, running/waiting
-  requests, preemption count, prefix hits/queries and server TTFT sum/count.
+  requests, preemption count, prefix hits/queries, server TTFT sum/count and optional
+  speculative-decoding draft, proposed-token, accepted-token and per-position counters.
 - `vllm-legacy`: an explicit older-name contract adding GPU/CPU cache fractions;
   qualify the recorded runtime/version before interpreting it as supported.
 - `sglang`, `llamacpp`, `lmdeploy` and `tgi`: runtime-specific Prometheus metric
@@ -576,6 +577,41 @@ metric names and units:
   or KV-cache counter coverage at `/metrics`.
 - `unknown`: attempts automatic contract detection; ambiguous or unrecognized
   metric names leave serving counters unmapped.
+
+For vLLM speculative decoding, **Server observations** in the live UI and exported
+HTML report draft count, proposed/accepted token counts, average proposed tokens
+per draft, and token acceptance rate (accepted / proposed). The same evidence is
+available in JSON. These are changes over compatible adjacent telemetry scrapes,
+not lifetime counter values. Optional per-position acceptance uses **all drafts**
+on engines exposing that zero-based position as its denominator; it is not the
+probability of acceptance conditional on reaching that position.
+
+All three aggregate counters must have matching engine/model labels and valid
+intervals. Resets, changing labels, stale or missing samples, failed scrapes and
+truncated scrapes exclude affected intervals. Reports show the covered interval
+count, elapsed bounds, duration and partial-coverage warning; totals cover only
+valid intervals. Per-position evidence has its own coverage and may be absent
+while aggregate counts are available. Missing counters do not mean speculative
+decoding is disabled, and zero drafts make proposal length and acceptance rate
+unavailable. The counters are server-wide and may include other traffic or time
+outside the selected request window. They demonstrate observed activity, not a
+speedup or proof that every benchmark request used speculative decoding. These
+optional counters do not change acceptance-check outcomes or require GPUs.
+
+For SGLang, **Server observations** also shows the latest reported speculative
+acceptance length and acceptance rate from `sglang:spec_accept_length` and
+`sglang:spec_accept_rate` (the optional gauge contract in [SGLang v0.5.22](https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/observability/metrics_collector.py)).
+Enable the server's `--enable-metrics` and use the `sglang` metrics profile, or
+allow exact-name metrics discovery. No additional Giraffe check is required.
+Acceptance length includes the bonus token per forward; acceptance rate is the
+scheduler's reported accepted/proposed draft ratio. These gauges are **not**
+cumulative counters, run-window acceptance rates, or draft/accepted-token totals.
+Different scheduler label series remain separate. JSON, live UI and HTML use the
+same values. Failed, missing, stale, duplicate, invalid or truncated latest
+observations stay unavailable; older values are not carried forward. Exporter
+values can describe an earlier scheduler interval even when a scrape succeeds.
+Zero or absent gauges do not prove speculation is disabled, and a positive gauge
+does not establish activity during this run, request attribution or speedup.
 
 Published DCGM memory, utilization, temperature, throttle and device-error families
 remain available alongside serving series. GPU checks identify each device by
@@ -609,6 +645,13 @@ time, phase, units and labels. Bounds are explicit: `metrics_interval_seconds`,
 `metrics_timeout_seconds`, `metrics_max_samples`, `metrics_max_series`; every scrape
 also has a 1 MiB response limit and the global run deadline. Collection stops on
 cancellation. Sample/cardinality limits and collection gaps remain visible.
+Existing serving and GPU samples take priority over optional speculative-decoding
+counters within the same `metrics_max_series` bound, regardless of exporter order.
+Reports identify which metric families lost samples or labels. Loss in optional
+counters does not invalidate complete GPU or serving evidence; incomplete GPU
+evidence cannot support a passing GPU check, even without a declared device count.
+Observed GPU failures still fail. Older reports with an unscoped truncation flag
+are treated conservatively as incomplete evidence.
 
 Unavailable states distinguish not enabled, no endpoint, transport/timeout,
 authentication denied, endpoint absent, empty success, unsupported format, absent
