@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .models import (CHECK_NAMES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits)
 from .storage import DEFAULT_LIMITS, format_size
 from .workloads import WORKLOAD_CHECKS
@@ -554,18 +554,66 @@ def _traffic_metrics(report: RunReport, target: str) -> dict[str, Any] | None:
                  and "traffic_stages" in check.metrics), None)
 
 
+_LOAD_POINT_FIELDS = ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts")
+
+
+def _load_work_comparison(current, old):
+    if not current or not old:
+        return "Request samples are absent from one run.", False
+    cohorts = []
+    for records in (current, old):
+        groups = defaultdict(list)
+        for record in records:
+            groups[(record.load_point or {}).get("shape")].append(record)
+        cohorts.append(groups)
+    if set(cohorts[0]) != set(cohorts[1]):
+        return "Result-group shapes differ.", False
+    mix_changed = any(abs(Fraction(len(cohorts[0][shape]), len(current))
+                          - Fraction(len(cohorts[1][shape]), len(old))) > Fraction(1, 10)
+                      for shape in cohorts[0])
+    for shape in cohorts[0]:
+        paired = [groups[shape] for groups in cohorts]
+        calibrated = all(r.workload.get("input_preparation", {}).get("target_tokens") is not None
+                         for records in paired for r in records)
+        counts = []
+        for records in paired:
+            identities = []
+            for record in records:
+                preparation = record.workload.get("input_preparation", {})
+                input_identity = (("target_tokens", preparation["target_tokens"], tuple(
+                                   (name, name in preparation, json.dumps(preparation.get(name), sort_keys=True))
+                                   for name in ("method", "tokenizer", "chat_template", "count_scope", "token_count_scope", "encoding")))
+                                  if calibrated else ("input_chars", record.input_chars))
+                identities.append((record.fixture_id, record.requested_max_tokens, record.stream, input_identity))
+            counts.append(Counter(identities))
+        if set(counts[0]) != set(counts[1]):
+            fields = [name for index, name in enumerate(("fixtures", "requested output caps", "streaming", "input identities"))
+                      if {key[index] for key in counts[0]} != {key[index] for key in counts[1]}]
+            return "Requested work differs: " + (", ".join(fields) or "work identity combinations") + ".", False
+        mix_changed |= any(abs(Fraction(counts[0][key], len(paired[0]))
+                               - Fraction(counts[1][key], len(paired[1]))) > Fraction(1, 10)
+                           for key in counts[0])
+    return None, mix_changed
+
+
+def _load_not_delivered(point):
+    return bool(point and point.get("reason_code") == "load_not_delivered")
+
+
+def _server_limited_load(point):
+    return bool(_load_not_delivered(point) and point.get("pattern") == "concurrent"
+                and point.get("level") and point.get("server_evidenced_concurrency") is not None
+                and point.get("client_mean_inflight") is not None
+                and point["client_mean_inflight"] >= .9 * point["level"]
+                and point["server_evidenced_concurrency"] < point["level"]
+                and not point.get("concurrency_reason"))
+
+
 def _compare_load_tests(
     report: RunReport, baseline: RunReport, target: str, reasons: list[str],
 ) -> dict[str, Any] | None:
-    """Compare qualification at each tested load, separately from metric sampling.
-
-    Losing a previously passing rate/level is direct acceptance evidence. It
-    does not need enough samples to bootstrap every optional timing metric.
-    An incomplete or client-limited cohort cannot establish that loss.
-    """
+    """Compare established acceptance separately from statistical metric sampling."""
     def metrics(run):
-        # Unselected checks still have catalogue entries with empty metrics.
-        # Qualification comparison applies only to actual tested cohorts.
         return next((check.metrics for check in run.checks
                      if check.id == "load" and check.target == target
                      and check.metrics.get("points")), None)
@@ -574,7 +622,7 @@ def _compare_load_tests(
     if current is None and old is None:
         return None
     result = {
-        "status": "inconclusive", "reason": "", "points": [],
+        "status": "inconclusive", "reason": "", "points": [], "summary_counts": {},
         "current_highest_accepted": (current or {}).get("highest_accepted", []),
         "baseline_highest_accepted": (old or {}).get("highest_accepted", []),
         "method": "Matched workload, source, traffic pattern, overlays and tested level/rate; "
@@ -586,89 +634,174 @@ def _compare_load_tests(
     if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
         result["reason"] = "Client timing measurement boundaries differ; rerun the baseline."
         return result
-    if current is None or old is None:
-        result["reason"] = "One run lacks final Load test evidence."
-        return result
-    if all(value.get("points") and all(point.get("pattern") == "interference"
-                                       for point in value["points"])
-           for value in (current, old)):
-        return None  # Short-stream comparisons use their separate baseline/probe metric cohorts.
-
-    def key(point):
-        return tuple(point.get(name) for name in
-                     ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts"))
+    if all(value.get("points") and all(point.get("pattern") == "interference" for point in value["points"])
+           for value in (current or {}, old or {})):
+        return None
 
     def points(value):
-        return {key(point): point for point in value.get("points", [])
-                if point.get("pattern") != "interference"}
+        return {tuple(point.get(name) for name in _LOAD_POINT_FIELDS): point
+                for point in (value or {}).get("points", []) if point.get("pattern") != "interference"}
 
-    def complete(point):
-        return (point is not None and point.get("status") in {"pass", "fail"}
-                and point.get("dispatched", 0) > 0
-                and not any(point.get(name) for name in
-                            ("not_run", "cut_short", "schedule_overflow", "not_sent", "cancelled"))
-                and (point.get("scheduled") is None
-                     or point["scheduled"] == point["dispatched"])
-                and bool(point.get("groups"))
-                and all(group.get("status") in {"pass", "fail"} for group in point["groups"]))
+    def incomplete(point):
+        for field, message in (("not_run", "test was not run"), ("cut_short", "test was cut short"),
+                               ("schedule_overflow", "planned schedule overflowed"),
+                               ("not_sent", "scheduled requests were not sent"), ("cancelled", "requests were cancelled")):
+            if point.get(field):
+                return message
+        if point.get("scheduled") is not None and point["scheduled"] != point.get("dispatched"):
+            return "dispatched requests do not cover the schedule"
+        if not point.get("dispatched"):
+            return "no requests were dispatched"
+        return None
 
-    def snapshot(point):
+    def acceptance(point):
+        if not point:
+            return "not_established"
+        if point.get("status") == "fail":
+            return "fail"
+        if incomplete(point):
+            return "not_established"
+        if _server_limited_load(point):
+            return "fail"
+        if (point.get("status") == "pass" and point.get("groups")
+                and all(group.get("status") in {"pass", "fail"} for group in point["groups"])):
+            return "pass"
+        return "not_established"
+
+    def records_for(run, point):
+        ids = set(point.get("request_ids", []))
+        records = [r for r in run.requests if r.target == target and r.id in ids]
+        if len(records) != point.get("dispatched", 0) or len(ids) != point.get("dispatched", 0):
+            return None
+        return records
+
+    def snapshot(run, point):
         if point is None:
             return None
+        records = records_for(run, point)
+        groups = point.get("groups", [])
+        settings = run.manifest.get("effective_checks", {}).get("load", {})
+        if point.get("source", "primary") != "primary":
+            settings = next((item.get("settings", {}) for item in settings.get("migrated_tests", [])
+                             if item.get("source") == point["source"] or item.get("id") == point["source"]), settings)
+        required = point.get("required")
+        if required is None:
+            required = next((g["required"] for g in groups if g.get("required") is not None),
+                            settings.get("pass_criteria", {}).get("min_valid_responses"))
+        if required is None:
+            required = run.manifest.get("config", {}).get("load_test", {}).get("pass_criteria", {}).get("min_valid_responses")
+        valid = point.get("valid")
+        if valid is None and records is not None:
+            valid = sum(r.status == "completed" and r.valid for r in records)
         return {**{name: point.get(name) for name in (
             "id", "source", "type", "workload", "shape", "pattern", "level", "rate", "bursts",
             "status", "reason", "reason_code", "dispatched", "scheduled", "not_sent", "cancelled",
-            "cut_short", "not_run")},
+            "cut_short", "not_run", "server_evidenced_concurrency", "client_mean_inflight", "concurrency_reason")},
+            "valid": valid, "required": required,
             "groups": [{name: group.get(name) for name in ("shape", "status", "reason_code", "reason")}
-                       for group in point.get("groups", [])]}
+                       for group in groups]}
 
-    def requested_work(run, point):
-        ids = set(point.get("request_ids", []))
-        records = [record for record in run.requests if record.target == target and record.id in ids]
-        if len(records) != point["dispatched"] or len(ids) != point["dispatched"]:
-            return None
-        cohorts = defaultdict(Counter)
-        for record in records:
-            shape = (record.load_point or {}).get("shape")
-            cohorts[shape][(record.fixture_id, record.input_chars, record.requested_max_tokens, record.stream)] += 1
-        return {shape: {work: Fraction(count, sum(counts.values())) for work, count in counts.items()}
-                for shape, counts in cohorts.items()}
+    def explanation(point, evidence):
+        structural = incomplete(point)
+        detail = structural if point.get("status") == "pass" and structural else point.get("reason")
+        code = point.get("reason_code")
+        if not detail or (point.get("status") == "pass" and code == "criteria_met"):
+            if structural:
+                detail = structural
+            elif code and code != "criteria_met":
+                detail = code.replace("_", " ")
+            else:
+                detail = "point reported failure" if point.get("status") == "fail" else "result-group evidence is incomplete"
+        text = detail.rstrip(".") + (f" ({code})" if code and code != "criteria_met" else "")
+        if code == "insufficient_responses" and evidence.get("valid") is not None and evidence.get("required") is not None:
+            text += f"; {evidence['valid']} valid responses; {evidence['required']} required"
+        return text
+
+    def server_reason(point):
+        return f"the server ran at most {point['server_evidenced_concurrency']} of {point['level']} requested concurrent requests"
 
     current_points, old_points = points(current), points(old)
     for cohort in dict.fromkeys([*old_points, *current_points]):
         point, previous = current_points.get(cohort), old_points.get(cohort)
+        before, after = acceptance(previous), acceptance(point)
         row = {
-            "current": snapshot(point), "baseline": snapshot(previous),
-            "status": "inconclusive", "reason": "Incomplete or client-limited load evidence.",
+            "current": snapshot(report, point), "baseline": snapshot(baseline, previous),
+            "status": "inconclusive", "acceptance_change": "not_established", "reason": "",
+            "baseline_acceptance": before, "current_acceptance": after,
             "evidence_ids": (point or {}).get("request_ids", []),
         }
-        if complete(point) and complete(previous):
-            current_shapes = {group["shape"] for group in point["groups"]}
-            old_shapes = {group["shape"] for group in previous["groups"]}
-            if current_shapes == old_shapes:
-                current_work = requested_work(report, point)
-                old_work = requested_work(baseline, previous)
-                if current_work is None or old_work is None:
-                    row["reason"] = "Dispatched request metadata is incomplete."
-                elif current_work != old_work:
-                    row["reason"] = "Requested work or request-shape proportions differ."
-                elif previous["status"] == "pass" and point["status"] == "fail":
-                    row.update(status="fail", reason="This previously acceptable tested load now fails its configured criteria.")
-                else:
-                    row.update(status="pass", reason="No loss of previously acceptable load at this tested level/rate.")
+        if point is None or previous is None:
+            side = "current" if point is None else "baseline"
+            row.update(acceptance_change=f"not_tested_in_{side}", reason=f"This level was not tested in the {side}.")
+        else:
+            current_work, old_work = records_for(report, point), records_for(baseline, previous)
+            work_reason, mix_changed = None, False
+            if current_work is None or old_work is None:
+                work_reason = "Dispatched request metadata is incomplete."
+            elif current_work and old_work:
+                work_reason, mix_changed = _load_work_comparison(current_work, old_work)
+            current_shapes = {g["shape"] for g in point.get("groups", [])}
+            old_shapes = {g["shape"] for g in previous.get("groups", [])}
+            if current_shapes and old_shapes and current_shapes != old_shapes:
+                work_reason = "Result-group shapes differ."
+            if work_reason:
+                row.update(acceptance_change="work_changed", reason=work_reason)
+            elif before == "pass" and after == "pass":
+                row.update(acceptance_change="unchanged_accepted", status="pass", reason="This tested load remains accepted.")
+            elif before == "fail" and after == "fail":
+                row.update(acceptance_change="unchanged_not_accepted", reason="Still not accepted; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
+            elif before == "pass" and after == "fail":
+                reason = ("No longer accepted: " + server_reason(point) + "." if _server_limited_load(point)
+                          else "This previously acceptable tested load now fails; current: " + explanation(point, row["current"]) + ".")
+                row.update(acceptance_change="lost", status="fail", reason=reason)
+            elif before == "fail" and after == "pass":
+                reason = ("Newly accepted: the baseline server ran at most "
+                          f"{previous['server_evidenced_concurrency']} of {previous['level']} requested concurrent requests."
+                          if _server_limited_load(previous) else "Newly accepted; baseline: " + explanation(previous, row["baseline"]) + ".")
+                row.update(acceptance_change="gained", status="pass", reason=reason)
+            elif after == "pass":
+                row.update(acceptance_change="accepted_baseline_not_established", reason="Accepted now; not established in baseline; baseline: " + explanation(previous, row["baseline"]) + ".")
+            elif before == "pass":
+                row.update(acceptance_change="not_established_in_current", reason="Preservation is unverified; current: " + explanation(point, row["current"]) + ".")
+            elif before == "not_established" and after == "fail":
+                row.update(acceptance_change="not_established_in_baseline", reason="No loss is established; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
             else:
-                row["reason"] = "Result-group shapes differ."
+                row["reason"] = "Acceptance is not established; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + "."
+            if mix_changed and row["acceptance_change"] in {"gained", "lost"}:
+                row.update(acceptance_change="work_changed", status="inconclusive",
+                           reason="Request mix shifted by more than 10 percentage points; acceptance change is not attributable.")
         result["points"].append(row)
-    failures = [row for row in result["points"] if row["status"] == "fail"]
-    if failures:
-        result.update(status="fail", reason=f"{len(failures)} previously acceptable tested load(s) now fail.")
-    elif not result["points"] or any(row["status"] == "inconclusive" for row in result["points"]):
-        result["reason"] = "Incomplete or client-limited tests prevent a load acceptance comparison."
-    elif not any(point["status"] == "pass" for point in old_points.values()):
-        result["reason"] = "Neither a loss nor preservation of passing load can be assessed: the baseline had no passing load level. Measured differences are shown separately."
-        result["reason_code"] = "no_accepted_baseline"
+    counts = Counter(row["acceptance_change"] for row in result["points"])
+    result["summary_counts"] = {"gained": counts["gained"], "lost": counts["lost"], **counts}
+    unverified = any(row["baseline_acceptance"] == "pass" and row["acceptance_change"] in {
+        "not_established_in_current", "not_tested_in_current", "work_changed"} for row in result["points"])
+    if counts["lost"]:
+        result["status"] = "fail"
+    elif unverified:
+        result["status"] = "inconclusive"
+    elif counts["unchanged_accepted"] or counts["gained"]:
+        result["status"] = "pass"
     else:
-        result.update(status="pass", reason="Previously acceptable tested loads remain acceptable.")
+        result["reason_code"] = "no_accepted_baseline"
+    labels = {"gained": "tested load(s) newly accepted", "lost": "lost",
+              "unchanged_accepted": "still accepted", "unchanged_not_accepted": "still not accepted",
+              "accepted_baseline_not_established": "accepted now (baseline not established)",
+              "not_established": "not established", "not_established_in_baseline": "not established in baseline",
+              "not_established_in_current": "not established in current", "not_tested_in_baseline": "not tested in baseline",
+              "not_tested_in_current": "not tested in current", "work_changed": "work changed"}
+    summary = []
+    for change, label in labels.items():
+        if change in {"gained", "lost"} or counts[change]:
+            text = f"{counts[change]} {label}"
+            if change in {"gained", "lost"} and counts[change]:
+                text += " (" + ", ".join(_comparison_load_label(row["current"] or row["baseline"])
+                                         for row in result["points"] if row["acceptance_change"] == change) + ")"
+            summary.append(text)
+    result["reason"] = "; ".join(summary) + "."
+    if unverified:
+        result["reason"] += " Preservation of previously accepted load is unverified."
+    if result.get("reason_code") == "no_accepted_baseline":
+        result["reason"] += " No accepted baseline level can be assessed."
     return result
 
 
@@ -951,27 +1084,48 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        load_exclusions = []
         observed_outputs = []
         traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
         load_tests = _compare_load_tests(report, baseline, name, target_reasons)
+        load_points = {label: {point['id']: point for check in run.checks
+                              if check.id == 'load' and check.target == name
+                              for point in check.metrics.get('points', [])}
+                       for label, run in (("Current", report), ("Baseline", baseline))}
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
-        if (not current_groups or not old_groups) and traffic is None:
+        if (not current_groups or not old_groups) and traffic is None and load_tests is None:
             target_reasons.append("Measured request samples are absent from one or both runs.")
         if not target_reasons:
             for check, scenario in sorted(set(current_groups) | set(old_groups)):
                 current_records = current_groups.get((check, scenario), [])
                 old_records = old_groups.get((check, scenario), [])
+                point_records = current_records or old_records
+                load_point = ({field: point_records[0].load_point.get(field) for field in (*_LOAD_POINT_FIELDS, "point_id")}
+                              if check == "load" and point_records else None)
+                if load_point and load_point["pattern"] == "interference":
+                    load_point.update({field: point_records[0].load_point.get(field) for field in ("phase", "role")})
                 # Requested shape is checked too, rather than relying on configuration alone.
                 def shapes(records: list[RequestRecord]) -> dict[tuple, Fraction]:
                     counts = Counter((r.fixture_id, r.input_chars, r.requested_max_tokens, r.stream)
                                      for r in records)
                     return {shape: Fraction(count, len(records)) for shape, count in counts.items()}
-                if not current_records or not old_records or shapes(current_records) != shapes(old_records):
-                    target_reasons.append(f"{check}/{scenario}: missing or different request shapes or proportions.")
+                work_reason, mix_changed = (_load_work_comparison(current_records, old_records)
+                                            if check == "load" else (None, False))
+                if check != "load" and (not current_records or not old_records or shapes(current_records) != shapes(old_records)):
+                    work_reason = "missing or different request shapes or proportions."
+                if work_reason:
+                    if check == "load":
+                        load_exclusions.append({"scenario": scenario, "load_point": load_point, "reason": work_reason})
+                    else:
+                        target_reasons.append(f"{check}/{scenario}: {work_reason}")
                     continue
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
-                observed_outputs.extend(_output_observations(check, scenario, current_work, old_work))
+                outputs = _output_observations(check, scenario, current_work, old_work)
+                if load_point:
+                    for output in outputs:
+                        output["load_point"] = load_point
+                observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
                 current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
                 old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
@@ -983,9 +1137,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
-                    def warn(code, message):
+                    def warn(code, message, *, preserve_failure=False):
                         warnings.append({"code": code, "message": message})
-                        row["status"] = "inconclusive"
+                        if not preserve_failure or row["status"] != "fail":
+                            row["status"] = "inconclusive"
                     if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
@@ -994,6 +1149,18 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                              f"and {old_work['output_chars_p50']} → {current_work['output_chars_p50']} characters. "
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if metric in TIMING_METRICS:
+                        if mix_changed:
+                            warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; timings reflect different request mixes.")
+                        if load_point:
+                            for label, records in (("Current", current_records), ("Baseline", old_records)):
+                                point = load_points[label].get(records[0].load_point.get("point_id"), records[0].load_point)
+                                if _load_not_delivered(point):
+                                    if _server_limited_load(point):
+                                        message = f"{label} server ran at most {point['server_evidenced_concurrency']} of {point['level']} concurrent requests; requested load was not delivered, so the timing populations differ."
+                                    else:
+                                        detail = point.get("concurrency_reason") or point.get("reason") or "Client occupancy or stream concurrency evidence is insufficient."
+                                        message = f"{label} requested concurrency was not delivered or evidenced; {detail} Server queueing is not established."
+                                    warn("load_not_delivered", message, preserve_failure=label == "Current")
                         quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
                                    "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
@@ -1020,10 +1187,19 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
                                evidence_ids=[record.id for record in current_records])
+                    if load_point:
+                        row["load_point"] = load_point
                     rows.append(row)
-        assessed = [row for row in rows if "worsening" in row]
+        covered_load_points = {point["id"] for row in (load_tests or {}).get("points", [])
+                               for side in ("current", "baseline") if (point := row.get(side))
+                               and point.get("id") and point.get("pattern") != "interference"}
+        for exclusion in load_exclusions:
+            point = exclusion.get("load_point") or {}
+            if point.get("pattern") == "interference" or point.get("point_id") not in covered_load_points:
+                target_reasons.append(f"load/{exclusion['scenario']}: {exclusion['reason']}")
+        assessed = [row for row in rows if "worsening" in row and row["status"] in {"pass", "fail"}]
         failures = [row for row in assessed if row["status"] == "fail"]
-        uncertain = [row for row in assessed if row["status"] == "inconclusive"]
+        uncertain = [row for row in rows if "worsening" in row and row["status"] == "inconclusive"]
         missing_measurements = [row for row in rows if "worsening" not in row and
                                 max(row["current_samples"], row["baseline_samples"]) >= minimum]
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
@@ -1047,7 +1223,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             status = "inconclusive"
             summary = load_tests["reason"]
         elif (not assessed and (traffic is None or traffic["status"] != "pass")
-              and (load_tests is None or load_tests["status"] != "pass")) or uncertain or missing_measurements:
+              and (load_tests is None or load_tests["status"] != "pass"
+                   or load_tests.get("reason_code") == "no_accepted_baseline")) or uncertain or missing_measurements:
             status = "inconclusive"
             if not assessed:
                 summary = "No metric has enough comparable samples."
@@ -1063,11 +1240,15 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             if traffic is not None:
                 summary += " " + traffic["reason"]
         excluded = len(rows) - len(assessed)
+        if (load_tests and load_tests["reason"] not in summary
+                and any(load_tests.get("summary_counts", {}).get(change) for change in ("gained", "lost"))):
+            summary += " " + load_tests["reason"]
         if excluded:
-            summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
+            summary += f" {excluded} metric(s) lack a qualified comparison; see comparison details."
         if status == "inconclusive" and any(min(row["current_samples"], row["baseline_samples"]) < minimum for row in rows):
             summary += f" Collect at least {minimum} measured samples per metric in both the current and baseline runs."
         entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,
+                 "load_exclusions": load_exclusions,
                  "observed_outputs": observed_outputs,
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
@@ -1537,21 +1718,88 @@ def _traffic_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
-def _load_baseline_html(target: dict[str, Any]) -> str:
-    from .load_test import point_label
+def _comparison_load_label(point):
+    from .load_test import LOAD_TITLES
 
-    comparison = target["load_test"]
+    shape, pattern = point.get("shape") or point.get("workload"), point.get("pattern")
+    label = load_shape_label(shape) if shape in SHAPES else LOAD_TITLES.get(point.get("type"), str(shape))
+    traffic = {"constant": "constant arrivals", "poisson": "Poisson arrivals", "bursts": "bursts",
+               "interference": "short-answer comparison"}.get(pattern, str(pattern))
+    if pattern == "concurrent":
+        traffic = "maintained concurrency" + (f" {point['level']}" if point.get("level") is not None else "")
+    label += " · " + traffic
+    if point.get("rate") is not None:
+        label += f" · {point['rate']:g} requests/second"
+    if point.get("bursts") and pattern != "bursts":
+        label += " + bursts"
+    if point.get("source") and point["source"] != "primary":
+        label += " · " + point["source"].replace("_", " ").capitalize()
+    if pattern == "interference":
+        phase = "Long-input probe" if point.get("role") == "probe" else {"baseline": "Short-only control", "probe": "During long-input probe"}.get(point.get("phase"))
+        if phase:
+            label += " · " + phase
+    return label
+
+
+def _load_baseline_html(target: dict[str, Any]) -> str:
+    changes = {"gained": "Newly accepted", "lost": "Lost", "unchanged_accepted": "Still accepted",
+               "accepted_baseline_not_established": "Accepted now; not established in baseline",
+               "unchanged_not_accepted": "Still not accepted", "not_established_in_baseline": "Not established in baseline",
+               "not_established_in_current": "Not established in current", "not_established": "Not established",
+               "not_tested_in_baseline": "Not tested in baseline", "not_tested_in_current": "Not tested in current",
+               "work_changed": "Requested work changed"}
+    comparison = target.get("load_test", {"points": [], "status": "inconclusive", "reason": ""})
+    def point_status(point):
+        if point is None:
+            return "Not tested"
+        if point.get("not_run"):
+            return "Not run"
+        if point.get("cut_short"):
+            return "Cut short"
+        return point.get("status", "inconclusive")
+
     parts = [f'<h3>{_e(target["target"])} — tested load acceptance</h3>',
              f'<p>{_badge(comparison["status"])} {_e(comparison["reason"])}</p>']
+    if target.get("load_exclusions"):
+        parts.append('<h4>Load measurements not compared</h4><ul>')
+        for exclusion in target["load_exclusions"]:
+            label = _comparison_load_label(exclusion["load_point"]) if exclusion.get("load_point") else exclusion["scenario"]
+            parts.append(f'<li>{_e(label)}: {_e(exclusion["reason"])}</li>')
+        parts.append('</ul>')
+    def scope(point):
+        return tuple(point.get(name, "primary" if name == "source" else None)
+                     for name in ("source", "type", "workload", "pattern", "bursts"))
+    highest = [{scope(point): point for point in comparison.get(f"{side}_highest_accepted", [])}
+               for side in ("baseline", "current")]
+    scopes = {scope(point): point for row in comparison["points"]
+              if (point := row["current"] or row["baseline"]) and point.get("pattern") in {"concurrent", "constant", "poisson"}}
+    for key, point in {**highest[0], **highest[1]}.items():
+        scopes.setdefault(key, point)
+    for key, point in scopes.items():
+        values = [str(points[key]["value"]) if key in points else "Not established" for points in highest]
+        label = _comparison_load_label({**point, "shape": point.get("shape") or (point.get("workload") if point.get("type") == "combinations" else None), "level": None, "rate": None})
+        unit = "concurrency" if point["pattern"] == "concurrent" else "request rate"
+        parts.append(f'<p>{_e(label)} · Highest accepted {unit} (tested) · '
+                     f'Baseline: {_e(values[0])} · Current: {_e(values[1])}</p>')
     if comparison["points"]:
-        parts.append('<div class="table"><table><tr><th>Tested load</th>'
-                     '<th>Baseline / current</th><th>Finding</th></tr>')
+        parts.append('<div class="table load-acceptance-export"><table><tr><th>Tested load</th>'
+                     '<th>Baseline</th><th>Current</th><th>Change</th><th>Reason</th></tr>')
         for row in comparison["points"]:
             before, after = row["baseline"], row["current"]
-            parts.append(f'<tr><td>{_e(point_label(after or before))}</td>'
-                         f'<td>{_badge((before or {}).get("status", "inconclusive"))} / '
-                         f'{_badge((after or {}).get("status", "inconclusive"))}</td>'
-                         f'<td>{_badge(row["status"])} {_e(row["reason"])}</td></tr>')
+            parts.append(f'<tr><td>{_e(_comparison_load_label(after or before))}</td>')
+            for point in (before, after):
+                evidence = []
+                if point:
+                    for field, label in (("valid", "valid"), ("dispatched", "dispatched"), ("required", "required")):
+                        if point.get(field) is not None:
+                            evidence.append(f'{point[field]} {label}')
+                    for field, label in (("server_evidenced_concurrency", "server-evidenced concurrency"), ("client_mean_inflight", "mean client in flight")):
+                        if point.get(field) is not None:
+                            evidence.append(f'{label} {point[field]:g}')
+                parts.append(f'<td>{_e(point_status(point).capitalize())}'
+                             + (f'<small>{_e(" · ".join(evidence))}</small>' if evidence else '') + '</td>')
+            parts.append(f'<td><strong>{_e(changes.get(row.get("acceptance_change"), "Not established"))}</strong></td>'
+                         f'<td>{_e(row["reason"])}</td></tr>')
         parts.append('</table></div>')
     return "".join(parts)
 
@@ -1565,7 +1813,11 @@ def _comparison_outputs(target):
         work = row.get("output_work")
         if key not in seen and work and work.get("current") and work.get("baseline"):
             seen.add(key)
-            outputs.extend(_output_observations(*key, work["current"], work["baseline"]))
+            observations = _output_observations(*key, work["current"], work["baseline"])
+            if row.get("load_point"):
+                for observation in observations:
+                    observation["load_point"] = row["load_point"]
+            outputs.extend(observations)
     return outputs
 
 
@@ -1606,7 +1858,7 @@ def _comparison_values_html(target: dict[str, Any]) -> str:
             warnings = [row.get("reason", "Insufficient evidence to interpret this change.")]
         label = "Observed result" if row.get("descriptive") else "Interpretation limited" if warnings else "Regression detected" if row.get("status") == "fail" else "No material regression detected"
         parts.append(f'<article class="card"><h4>{_e(labels.get(row["metric"], row["metric"]))}</h4>'
-                     f'<p class="muted">{_e(row.get("check"))} · {_e(row.get("scenario"))} · {_e(row.get("aggregation", "median"))}</p>'
+                     f'<p class="muted">{_e(row.get("check"))} · {_e(_comparison_load_label(row["load_point"]) if row.get("load_point") else row.get("scenario"))} · {_e(row.get("aggregation", "median"))}</p>'
                      '<dl class="comparison-values-export">'
                      f'<div><dt>Baseline</dt><dd>{value(row, old)}</dd><small>n={_e(row.get("baseline_samples"))}</small></div>'
                      f'<div><dt>Current</dt><dd>{value(row, current)}</dd><small>n={_e(row.get("current_samples"))}</small></div>'
@@ -1642,7 +1894,7 @@ def _render(report: RunReport) -> str:
                 else "Giraffe acceptance results")
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '.comparison-values-export{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.comparison-values-export dd{margin:4px 0;font-weight:600;overflow-wrap:anywhere}.comparison-values-export dt{font-size:12px}' + '</style><main>',  f"<h1>{_e(headline)} {_badge(_acceptance_status(report))}</h1>",
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '.comparison-values-export{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.comparison-values-export dd{margin:4px 0;font-weight:600;overflow-wrap:anywhere}.comparison-values-export dt{font-size:12px}.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(headline)} {_badge(_acceptance_status(report))}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     if headline == "Giraffe acceptance results":
@@ -1799,7 +2051,7 @@ def _render(report: RunReport) -> str:
             parts.append(_comparison_values_html(target))
             if "traffic_capacity" in target:
                 parts.append(_traffic_baseline_html(target))
-            if "load_test" in target:
+            if "load_test" in target or target.get("load_exclusions"):
                 parts.append(_load_baseline_html(target))
         parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
                      f'<pre>{_json(report.baseline)}</pre></details>')

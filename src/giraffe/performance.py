@@ -803,8 +803,23 @@ def _baseline_rows(report, target, window, records, put):
     entry = next((t for t in (baseline or {}).get("targets", []) if t.get("target") == target), {})
     cohort = window["cohort_id"]
     scenarios = {r.scenario for r in records}
+    load_points = [r.load_point for r in records if r.load_point and "load" in r.check_ids]
+
+    def matches(row):
+        if row.get("check") != "load":
+            return row.get("scenario") in scenarios or row.get("scenario") == cohort
+        point = row.get("load_point") or {}
+        fields = ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts")
+        return bool(point) and any(
+            (point["point_id"] == other.get("point_id") if point.get("point_id")
+             else all(point.get(key) == other.get(key) for key in fields))
+            and point.get("shape") == other.get("shape")
+            and point.get("phase") == other.get("phase")
+            and (point.get("role") or "request") == (other.get("role") or "request")
+            for other in load_points)
+
     # Existing comparisons already carry sample/shape/timing qualifications.
-    comparisons = [r for r in entry.get("comparisons", []) if r.get("scenario") in scenarios or r.get("scenario") == cohort]
+    comparisons = [r for r in entry.get("comparisons", []) if matches(r)]
     traffic = [row for index, row in enumerate(entry.get("traffic_capacity", {}).get("stages", []))
                if index in {record.traffic_stage for record in records} and row.get("status") in {"pass", "fail"}]
     mapping = (("baseline_throughput", "Throughput change", {"output_tokens_per_second"}),
@@ -823,7 +838,10 @@ def _baseline_rows(report, target, window, records, put):
             reason=None if qualified else ("No baseline attached." if baseline is None else "No comparable qualified baseline population for this scope."),
             evidence=rows, comparable=bool(qualified),
             qualification="Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
-    capacity = [r for r in entry.get("load_test", {}).get("points", []) if (r.get("current") or {}).get("id") in {(row.load_point or {}).get("point_id") for row in records} and r.get("status") in {"pass", "fail"}]
+    point_ids = {point.get("point_id") for point in load_points}
+    capacity = [r for r in entry.get("load_test", {}).get("points", [])
+                if (r.get("current") or {}).get("id") in point_ids
+                and r.get("acceptance_change") in {"gained", "lost", "unchanged_accepted", "unchanged_not_accepted"}]
     capacity += traffic
     put("baseline_capacity", capacity or None, "Accepted capacity change", "tested load", "Existing qualified tested-load baseline; not inferred saturation",
         samples=len(capacity), state="measured" if capacity else ("no_baseline" if baseline is None else "insufficient_evidence"))

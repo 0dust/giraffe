@@ -855,6 +855,61 @@ def test_low_samples_keep_values_without_claiming_confidence():
     assert 'worsening_interval_95' not in row
 
 
+@pytest.mark.parametrize('old_status,status,label', [('inconclusive', 'pass', 'Accepted now; not established in baseline'),
+    ('fail', 'pass', 'Newly accepted'), ('pass', 'fail', 'Lost'),
+    ('pass', 'pass', 'Still accepted'), ('fail', 'fail', 'Still not accepted')])
+def test_load_comparison_html_labels_acceptance_and_response_measurements(old_status, status, label):
+    from giraffe.reporting import _comparison_values_html, _load_baseline_html
+    from tests.test_load_test_baseline import concurrent_report
+    previous, current = concurrent_report(), concurrent_report()
+    for run, outcome in [(previous, old_status), (current, status)]:
+        point = run.checks[0].metrics['points'][1]
+        point['status'] = point['groups'][0]['status'] = outcome
+    target = compare_baseline(current, previous).baseline['targets'][0]
+    html = _load_baseline_html(target)
+    assert label in html
+    assert 'Highest accepted concurrency (tested)' in html
+    assert 'Baseline:' in html and 'Current:' in html
+    assert 'Short input → Short output · maintained concurrency 4' in html
+    measurements = _comparison_values_html(target)
+    assert 'maintained concurrency 4' in measurements
+    assert 'load_primary_' not in measurements
+
+
+async def test_interference_comparison_keeps_phase_context_in_export(local_tokenizer):
+    from giraffe.reporting import _comparison_values_html
+    from tests.test_concurrent_load_reporting import saved_report
+    report = await saved_report(interference=True)
+    target = compare_baseline(report, report).baseline['targets'][0]
+    rows = [row for row in target['comparisons'] if row['load_point']['role'] == 'short_stream']
+    assert {row['load_point']['phase'] for row in rows} == {'baseline', 'probe'}
+    outputs = [row for row in target['observed_outputs'] if row['load_point']['role'] == 'short_stream']
+    assert {row['load_point']['phase'] for row in outputs} == {'baseline', 'probe'}
+    html = _comparison_values_html(target)
+    assert 'Short-only control' in html and 'During long-input probe' in html
+
+
+def test_load_acceptance_export_shows_sample_evidence_neutral_changes_and_exclusions():
+    from giraffe.reporting import _load_baseline_html
+    from tests.test_load_test_baseline import concurrent_report
+    previous, current = concurrent_report(), concurrent_report()
+    point = previous.checks[0].metrics['points'][1]
+    point.update(status='inconclusive', valid=2, reason_code='insufficient_responses',
+                 reason='Two valid responses; more required.')
+    point['groups'][0]['status'] = 'inconclusive'
+    target = compare_baseline(current, previous).baseline['targets'][0]
+    target['load_exclusions'] = [{'scenario': 'raw', 'load_point': target['comparisons'][0]['load_point'],
+                                 'reason': 'Fixture <old> differs.'}]
+    html = _load_baseline_html(target)
+    assert 'Accepted now; not established in baseline' in html
+    assert '2 valid' in html and '12 dispatched' in html and '2 required' in html
+    assert 'Load measurements not compared' in html and 'Fixture &lt;old&gt; differs.' in html
+    neutral = next(row for row in html.split('<tr>') if 'Accepted now; not established' in row)
+    assert 'badge pass' not in neutral
+    del target['load_test']
+    assert 'Fixture &lt;old&gt; differs.' in _load_baseline_html(target)
+
+
 def test_comparison_acceptance_keeps_memory_interruption_and_legacy_output_evidence():
     from giraffe.reporting import _comparison_outputs
     current, previous = make_report(), make_report('before')

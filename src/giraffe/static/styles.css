@@ -1587,6 +1587,25 @@ main > #report-results { padding-top:20px; }
 .comparison-acceptance > div { display: flex; gap: 24px; flex-wrap: wrap; }
 .comparison-acceptance .hint { margin-top: 4px; }
 .comparison-section > h3 { font-size: 18px; margin: 12px 0 6px; }
+.load-acceptance, .load-acceptance-target { min-width: 0; }
+.load-acceptance-target > h4 { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 6px; }
+.load-acceptance-target > .hint, .load-acceptance-highest { overflow-wrap: anywhere; }
+.load-acceptance-highest { margin-top: 12px; font-size: 12px; }
+.load-acceptance-highest h5 { margin-bottom: 4px; font-size: 12px; }
+.load-acceptance-table { min-width: 0; }
+.load-acceptance-table table { min-width: 680px; }
+.load-acceptance-table th, .load-acceptance-table td { white-space: normal; overflow-wrap: break-word; vertical-align: top; }
+.load-acceptance-table th:nth-child(2), .load-acceptance-table th:nth-child(3), .load-acceptance-table td:nth-child(2), .load-acceptance-table td:nth-child(3) { min-width: 150px; white-space: nowrap; overflow-wrap: normal; }
+.load-acceptance-table td small { display: block; white-space: normal; overflow-wrap: normal; margin-top: 4px; color: var(--text-3); font-size: 11px; }
+.load-acceptance-table td:nth-child(4) { min-width: 145px; }
+.load-comparison-exclusions { margin-top: 16px; font-size: 12px; overflow-wrap: anywhere; }
+.load-comparison-exclusions h5 { font-size: 12px; margin-bottom: 8px; }
+.load-comparison-exclusions ul { padding-left: 20px; }
+.load-comparison-exclusions li { margin-bottom: 8px; }
+.load-comparison-exclusions li span { display: block; color: var(--text-3); }
+.load-acceptance-table tbody th { text-transform: none; letter-spacing: normal; font-size: 13px; }
+.load-acceptance-table th:first-child { width: 24%; }
+.load-acceptance-table th:last-child { width: 32%; }
 .comparison-group-heading { max-width: none; padding: 10px 16px; margin: 0; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: 12px; }
 .comparison-values { display: grid; }
 .comparison-measurement { display: grid; grid-template-columns: minmax(150px,1fr) minmax(0,2fr); gap: 8px 20px; padding: 14px 16px; min-width: 0; border-bottom: 1px solid var(--line); }
