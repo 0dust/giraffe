@@ -1,5 +1,8 @@
 """Accepted tested loads remain comparable when optional metrics are sparse."""
 
+import json
+import random
+
 import pytest
 
 from giraffe.load_test import test_points as load_points
@@ -338,6 +341,32 @@ def test_load_request_mix_warns_only_above_ten_percentage_points(share, changed)
     assert timing['status'] == ('inconclusive' if changed else 'pass')
 
 
+@pytest.mark.parametrize('count,changed', [(36, False), (37, True)])
+def test_seeded_mixed_window_prefixes_qualify_every_shape_timing(count, changed):
+    old, current = concurrent_report(16), concurrent_report(count)
+    shapes = ['short_short', 'long_short']
+    for run in (old, current):
+        for point in run.checks[0].metrics['points']:
+            point.update(type='mixed', workload='mixed', shape=None,
+                         groups=[{'shape': shape, 'status': 'pass'} for shape in shapes])
+            rng = random.Random(42)
+            for record in (r for r in run.requests if r.id in point['request_ids']):
+                shape = rng.choices(shapes, weights=[50, 50])[0]
+                record.load_point.update(type='mixed', workload='mixed', shape=shape)
+                record.fixture_id = 'load.' + shape
+                record.elapsed_ms = 20 if run is current else 10
+    target = compare_baseline(current, old).baseline['targets'][0]
+    timing = [row for row in target['comparisons'] if row['metric'] in {'latency_ms', 'first_output_ms'}]
+    assert len(timing) == 8 and not target['load_exclusions']
+    assert target['load_test']['status'] == 'pass'
+    for row in timing:
+        assert row['status'] == ('inconclusive' if changed else 'fail' if row['metric'] == 'latency_ms' else 'pass')
+        assert ('request_mix_changed' in [warning['code'] for warning in row['warnings']]) == changed
+        assert (row['baseline_samples'], row['current_samples']) in {(9, 17), (7, count - 17)}
+        if row['metric'] == 'latency_ms':
+            assert (row['baseline'], row['current'], row['observed_change']) == (10, 20, 100)
+
+
 def test_load_delivery_warning_preserves_low_sample_reason_and_measurements():
     old, current = concurrent_report(2), concurrent_report(2)
     server_limited(old.checks[0].metrics['points'][1])
@@ -482,7 +511,7 @@ def test_server_capacity_shortfall_and_failure_are_established_not_accepted(base
     assert row['baseline']['valid'] == row['baseline']['dispatched'] == 12
     assert row['baseline']['required'] == 2
     if 'limited' in (baseline_status, current_status) and change in {'gained', 'lost'}:
-        assert 'server ran at most 1 of 4' in row['reason']
+        assert 'streamed output evidenced peak overlap of 1 against 4' in row['reason']
 
 
 @pytest.mark.parametrize('reason_code', ['insufficient_responses', 'client_delay', 'context_exceeded', 'cached_input', 'load_not_delivered', 'cut_short'])
@@ -530,9 +559,106 @@ def test_not_delivered_metric_qualification_depends_on_side(side, latency, expec
     target = compared.baseline['targets'][0]
     row = next(row for row in target['comparisons'] if row['metric'] == 'latency_ms' and row['load_point']['level'] == 4)
     assert row['status'] == expected
-    assert any(w['code'] == 'load_not_delivered' and 'server ran at most 1 of 4' in w['message'] for w in row['warnings'])
+    assert any(w['code'] == 'load_not_delivered' and 'streamed output evidenced peak overlap of 1 against 4' in w['message'] for w in row['warnings'])
     if expected != 'fail':
         assert not any(r['status'] == 'fail' for r in target['comparisons'])
+
+
+@pytest.mark.parametrize('renderer', ['export', 'browser'])
+def test_preserved_metric_failure_displays_verdict_and_delivery_warning(renderer):
+    from giraffe.reporting import _comparison_values_html
+    from tests.test_ux_results import run_render_checks
+
+    old, current = concurrent_report(), concurrent_report()
+    server_limited(current.checks[0].metrics['points'][1])
+    for record in current.requests:
+        if record.load_point['level'] == 4:
+            record.elapsed_ms = 100
+    target = compare_baseline(current, old).baseline['targets'][0]
+    row = next(row for row in target['comparisons'] if row['metric'] == 'latency_ms' and row['load_point']['level'] == 4)
+    assert row['status'] == 'fail' and row['observed_change'] == 900
+    if renderer == 'export':
+        html = _comparison_values_html({'comparisons': [row], 'observed_outputs': []})
+        assert 'Regression detected' in html
+        assert row['warnings'][0]['message'] in html
+    else:
+        run_render_checks('const row=' + json.dumps(row) + ";" + r'''
+const html=comparisonTable([row]);
+assert.match(html,/Regression detected/);
+assert(html.includes(row.warnings[0].message));
+''')
+
+
+@pytest.mark.parametrize('mode,peak', [('buffered', 0), ('nonstream', 0), ('missing_end', 0), ('serial_output', 1)])
+@pytest.mark.parametrize('side', ['baseline', 'current', 'both'])
+def test_native_stream_evidence_qualification_controls_gain_or_loss(mode, peak, side):
+    from giraffe.load_test import assess_point
+    from giraffe.models import RunConfig
+    from giraffe.runner import _Run
+
+    old, current = concurrent_report(), concurrent_report()
+    for label, report in [('baseline', old), ('current', current)]:
+        unavailable = side in {label, 'both'}
+        config = RunConfig.model_validate(report.manifest['config'])
+        config.stream = not (unavailable and mode == 'nonstream')
+        run = _Run(config, None, None)
+        point = report.checks[0].metrics['points'][1]
+        point.update(sending_start_ms=0, sending_end_ms=300)
+        records = [r for r in report.requests if r.id in point['request_ids']]
+        for index, record in enumerate(records):
+            start = index // 4 * 100
+            record.stream = config.stream
+            record.timing_start_ms = record.dispatch_ms = start
+            record.completed_ms = start + 100
+            record.elapsed_ms = 100
+            record.first_output_ms = 100 if unavailable and mode == 'buffered' else 2
+            record.stream_end_ms = None if unavailable and mode == 'missing_end' else 100
+            if unavailable and mode == 'serial_output':
+                record.first_output_ms = index % 4 * 20 + 2
+                record.stream_end_ms = record.first_output_ms + 10
+        assess_point(run, config.targets[0], config.load_test, point, records)
+        assert point['client_mean_inflight'] == 4
+        assert point['server_evidenced_concurrency'] == (peak if unavailable else 4)
+        assert point['reason_code'] == ('load_not_delivered' if unavailable else 'criteria_met')
+    row = compare_baseline(current, old).baseline['targets'][0]['load_test']['points'][1]
+    for label in ('baseline', 'current'):
+        assert row[label + '_acceptance'] == (('fail' if peak else 'not_established') if side in {label, 'both'} else 'pass')
+    if peak:
+        assert row['acceptance_change'] == {'baseline': 'gained', 'current': 'lost', 'both': 'unchanged_not_accepted'}[side]
+    else:
+        assert row['acceptance_change'] not in {'gained', 'lost', 'unchanged_not_accepted'}
+    assert 'at most' not in row['reason']
+
+
+@pytest.mark.parametrize('status', ['fail', 'pass', 'inconclusive'])
+@pytest.mark.parametrize('renderer', ['export', 'browser'])
+def test_historical_load_comparison_renders_recorded_status(status, renderer):
+    from giraffe.models import RunReport
+    from giraffe.reporting import _load_baseline_html
+    from tests.test_ux_results import run_render_checks
+
+    old, current = arrival_report(), arrival_report()
+    lose_rate(current, status=status)
+    compared = compare_baseline(current, old)
+    comparison = compared.baseline['targets'][0]['load_test']
+    for row in comparison['points']:
+        row.pop('acceptance_change')
+    # Saved reports predate acceptance_change; loading must preserve their verdict.
+    target = RunReport.model_validate_json(compared.model_dump_json()).baseline['targets'][0]
+    row = target['load_test']['points'][1]
+    assert row['status'] == status
+    expected = 'Recorded: ' + status.capitalize()
+    if renderer == 'export':
+        html = _load_baseline_html(target)
+        assert expected in html and row['reason'] in html
+        assert 'Newly accepted' not in html and 'Still accepted' not in html
+    else:
+        run_render_checks('const target=' + json.dumps(target) + ';const expected=' + json.dumps(expected) + ';' + r'''
+const html=renderLoadAcceptance([target]);
+assert(html.includes(expected));
+assert(html.includes(target.load_test.points[1].reason));
+assert(!html.includes('Newly accepted') && !html.includes('Still accepted'));
+''')
 
 
 @pytest.mark.parametrize('change', ['gained', 'lost'])

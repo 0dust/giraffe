@@ -605,7 +605,7 @@ def _server_limited_load(point):
                 and point.get("level") and point.get("server_evidenced_concurrency") is not None
                 and point.get("client_mean_inflight") is not None
                 and point["client_mean_inflight"] >= .9 * point["level"]
-                and point["server_evidenced_concurrency"] < point["level"]
+                and 0 < point["server_evidenced_concurrency"] < point["level"]
                 and not point.get("concurrency_reason"))
 
 
@@ -718,7 +718,7 @@ def _compare_load_tests(
         return text
 
     def server_reason(point):
-        return f"the server ran at most {point['server_evidenced_concurrency']} of {point['level']} requested concurrent requests"
+        return f"streamed output evidenced peak overlap of {point['server_evidenced_concurrency']} against {point['level']} requested concurrent requests"
 
     current_points, old_points = points(current), points(old)
     for cohort in dict.fromkeys([*old_points, *current_points]):
@@ -755,8 +755,7 @@ def _compare_load_tests(
                           else "This previously acceptable tested load now fails; current: " + explanation(point, row["current"]) + ".")
                 row.update(acceptance_change="lost", status="fail", reason=reason)
             elif before == "fail" and after == "pass":
-                reason = ("Newly accepted: the baseline server ran at most "
-                          f"{previous['server_evidenced_concurrency']} of {previous['level']} requested concurrent requests."
+                reason = ("Newly accepted: baseline " + server_reason(previous) + "."
                           if _server_limited_load(previous) else "Newly accepted; baseline: " + explanation(previous, row["baseline"]) + ".")
                 row.update(acceptance_change="gained", status="pass", reason=reason)
             elif after == "pass":
@@ -1092,6 +1091,15 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                               if check.id == 'load' and check.target == name
                               for point in check.metrics.get('points', [])}
                        for label, run in (("Current", report), ("Baseline", baseline))}
+        def load_shape_shares(run):
+            counts = defaultdict(Counter)
+            for record in run.requests:
+                point = record.load_point or {}
+                if record.target == name and "load" in record.check_ids and point.get("point_id"):
+                    counts[point["point_id"]][point.get("shape")] += 1
+            return {point_id: {shape: Fraction(count, sum(shapes.values())) for shape, count in shapes.items()}
+                    for point_id, shapes in counts.items()}
+        current_shares, old_shares = load_shape_shares(report), load_shape_shares(baseline)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
         if (not current_groups or not old_groups) and traffic is None and load_tests is None:
             target_reasons.append("Measured request samples are absent from one or both runs.")
@@ -1119,6 +1127,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     else:
                         target_reasons.append(f"{check}/{scenario}: {work_reason}")
                     continue
+                if load_point:
+                    current_mix = current_shares.get(current_records[0].load_point.get("point_id"), {})
+                    old_mix = old_shares.get(old_records[0].load_point.get("point_id"), {})
+                    mix_changed |= any(abs(current_mix.get(shape, 0) - old_mix.get(shape, 0)) > Fraction(1, 10)
+                                       for shape in current_mix.keys() | old_mix.keys())
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
                 outputs = _output_observations(check, scenario, current_work, old_work)
@@ -1156,7 +1169,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                 point = load_points[label].get(records[0].load_point.get("point_id"), records[0].load_point)
                                 if _load_not_delivered(point):
                                     if _server_limited_load(point):
-                                        message = f"{label} server ran at most {point['server_evidenced_concurrency']} of {point['level']} concurrent requests; requested load was not delivered, so the timing populations differ."
+                                        message = f"{label} streamed output evidenced peak overlap of {point['server_evidenced_concurrency']} against {point['level']} requested concurrent requests; requested load was not evidenced, so the timing populations differ."
                                     else:
                                         detail = point.get("concurrency_reason") or point.get("reason") or "Client occupancy or stream concurrency evidence is insufficient."
                                         message = f"{label} requested concurrency was not delivered or evidenced; {detail} Server queueing is not established."
@@ -1798,7 +1811,9 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
                             evidence.append(f'{label} {point[field]:g}')
                 parts.append(f'<td>{_e(point_status(point).capitalize())}'
                              + (f'<small>{_e(" · ".join(evidence))}</small>' if evidence else '') + '</td>')
-            parts.append(f'<td><strong>{_e(changes.get(row.get("acceptance_change"), "Not established"))}</strong></td>'
+            change = (changes.get(row["acceptance_change"], "Not established") if "acceptance_change" in row
+                      else "Recorded: " + row.get("status", "inconclusive").capitalize())
+            parts.append(f'<td><strong>{_e(change)}</strong></td>'
                          f'<td>{_e(row["reason"])}</td></tr>')
         parts.append('</table></div>')
     return "".join(parts)
@@ -1856,7 +1871,7 @@ def _comparison_values_html(target: dict[str, Any]) -> str:
         warnings = [w["message"] for w in row.get("warnings", [])]
         if not warnings and row.get("status") == "inconclusive":
             warnings = [row.get("reason", "Insufficient evidence to interpret this change.")]
-        label = "Observed result" if row.get("descriptive") else "Interpretation limited" if warnings else "Regression detected" if row.get("status") == "fail" else "No material regression detected"
+        label = "Observed result" if row.get("descriptive") else "Regression detected" if row.get("status") == "fail" else "Interpretation limited" if warnings else "No material regression detected"
         parts.append(f'<article class="card"><h4>{_e(labels.get(row["metric"], row["metric"]))}</h4>'
                      f'<p class="muted">{_e(row.get("check"))} · {_e(_comparison_load_label(row["load_point"]) if row.get("load_point") else row.get("scenario"))} · {_e(row.get("aggregation", "median"))}</p>'
                      '<dl class="comparison-values-export">'
