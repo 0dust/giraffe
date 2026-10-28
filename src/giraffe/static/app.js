@@ -778,7 +778,7 @@ async function route() {
     if(destination.tab){reportView.tab=destination.tab;reportView.explicit=true;}
     else {reportView.tab=activeState(state.detail)?'results':'performance';reportView.explicit=false;}
     renderDetail();
-    if(destination.section)$(`#performance-${destination.section}`)?.scrollIntoView?.({block:'start'});
+    if(destination.section)scrollReportSection(destination.section,destination.tab||reportView.tab);
     return;
   }
   state.reportRouteActive=false;
@@ -799,7 +799,7 @@ async function route() {
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
-      state.detail=detail;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';reportView.id=null;renderDetail();if(destination?.section)$(`#performance-${destination.section}`)?.scrollIntoView?.({block:'start'});enterRoute();
+      state.detail=detail;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';reportView.id=null;renderDetail();if(destination?.section)scrollReportSection(destination.section,destination.tab||reportView.tab);enterRoute();
       if(activeState(detail))schedulePoll(pollDetail,version);else schedulePoll(pollRunStatus,version,3000);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
@@ -2752,10 +2752,30 @@ function chooseReportTab(tab,{focus=false,anchor=true}={}) {
   if(anchor&&typeof location!=='undefined')location.hash=`${linkRun(state.detail.id)}/${tab}`;
   if(focus)$(`#tab-${tab}`)?.focus({preventScroll:true});
 }
+function resultsSections() {
+  const report=state.detail?.report;if(!report?.baseline)return [];
+  const rows=(report.baseline.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)]);
+  return [['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],...comparisonSections.filter(([id])=>rows.some(row=>comparisonCategory(row)===id)).map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
+}
+function renderResultsJump() {
+  const sections=resultsSections();if(!sections.length)return '';
+  const selected=reportRoute()?.section||'comparison';
+  return `<nav class="results-jump" aria-label="Result sections"><label for="results-section-jump">Jump to section</label><select id="results-section-jump">${sections.map(([id,label,parent])=>`<option value="${id}" ${selected===id?'selected':''}>${parent?'↳ ':''}${escape(label)}</option>`).join('')}</select></nav>`;
+}
+function scrollReportSection(section,tab=reportView.tab){
+  const node=tab==='results'&&section==='comparison'?$('#report-baseline-reference'):$(`#${tab==='results'?'results':'performance'}-${section}`);
+  const disclosure=node?.closest('details')||node?.querySelector('details.report-reference');if(disclosure)disclosure.open=true;
+  node?.scrollIntoView?.({block:'start'});
+}
 function updateReportSections() {
   const rail=$('#report-sections');if(!rail)return;
-  rail.hidden=!state.detail||reportView.tab!=='performance';
-  if(!rail.hidden)patchHTML(rail,`<h2>This report</h2><nav aria-label="This report">${reportSections.map(([id,label])=>`<a href="${linkRun(state.detail.id)}/performance/${id}" data-report-section="${id}">${escape(label)}</a>`).join('')}</nav>`);
+  const sections=reportView.tab==='performance'?reportSections.map(([id,label])=>[id,label]):resultsSections();
+  rail.hidden=!state.detail||!sections.length;
+  const link=([id,label])=>`<a href="${linkRun(state.detail.id)}/${reportView.tab}/${id}" data-report-section="${id}" data-report-section-tab="${reportView.tab}">${escape(label)}</a>`;
+  if(!rail.hidden)patchHTML(rail,`<h2>This report</h2><nav aria-label="This report"><ul class="report-section-list">${sections.filter(([, ,parent])=>!parent).map(section=>{
+    const children=sections.filter(([, ,parent])=>parent===section[0]);
+    return `<li>${link(section)}${children.length?`<ul aria-label="${escape(section[1])} sections">${children.map(child=>`<li>${link(child)}</li>`).join('')}</ul>`:''}</li>`;
+  }).join('')}</ul></nav>`);
 }
 function selectedPerformance() {
   const data=reportView.performance,target=data?.targets?.find(item=>item.target===(reportView.target||data.selected_target||data.default_target))||data?.targets?.[0];
@@ -3104,13 +3124,13 @@ function renderDetail() {
   const compareButton=d.state==='completed'?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
   patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(report.run_id)}</span></div>${badge(absolute,`Acceptance ${statusLabels[absolute]?.toLowerCase()}`)}<div class="verdict-word ${absolute}">${escape(statusLabels[absolute])}</div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1><p class="result-guidance">${escape(absolute==='error'?'Review the error below before trying again.':resultGuidance(report))}</p><div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${savedBaseline&&!hasFinding?`<button class="button primary" data-action="compare-run">Compare a new run</button>`:completePass?'<button class="button primary" data-action="baseline-dialog">Save baseline</button>':compareNext?'<button class="button primary" data-tab="baseline">Inspect comparison</button>': '<button class="button primary" data-action="rerun">Review settings</button>'}${completePass||compareNext?`<button class="button" data-action="rerun">${icon('repeat')} Run again</button>`:''}${compareButton}</div></div>
   ${report.abort_reason?notice(`Partial run: ${report.abort_reason}`,'warning'):''}${d.error?notice(d.error,d.state==='error'?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
-  <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderCheckVerdicts(report)}
+  <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}<details id="report-baseline-reference" class="report-reference report-result-section comparison-container" ${report.baseline||state.tab==='baseline'?'open':''}><summary><h2>Baseline comparison</h2></summary><div id="baseline-content">${renderComparison(report)}</div></details><section id="results-checks" class="report-result-section">${renderCheckVerdicts(report)}
   <div class="result-summary"><div class="summary-bar" aria-hidden="true">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<span class="summary-seg ${k}" style="flex-grow:${counts[k]}"></span>`).join('')}</div><div class="summary-items">${['fail','blocked','inconclusive','pass','skipped'].filter(k=>counts[k]).map(k=>`<div class="summary-item ${k}"><strong data-count="${counts[k]}">${counts[k]}</strong>${badge(k,k==='skipped'?'Not run':undefined)}</div>`).join('')}${(config.targets || []).length>1?`<span class="hint summary-targets">${escape(config.targets.map(t=>`${t.name} · ${t.route || 'direct'}`).join(' / '))}</span>`:''}</div></div>
   ${renderTests(report.requests,{report})}
-  <section id="result-content">${renderChecks(report)}</section>
-  <details id="report-baseline-reference" class="report-reference" ${state.tab==='baseline'?'open':''}><summary>Baseline comparison</summary><div id="baseline-content">${renderComparison(report)}</div></details>
-  <details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary>Run configuration</summary>${renderConfig(report)}</details>
-  ${renderAllRequests(orderedRequests(report))}${renderResources(report,d)}</section>
+  <section id="result-content">${renderChecks(report)}</section></section>
+
+  <section id="results-configuration" class="report-result-section"><details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary><h2>Run configuration</h2></summary>${renderConfig(report)}</details></section>
+  <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderResources(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
   syncComparisonFilters();refreshConditionDialog();
   if(reportView.tab==='performance'&&!reportView.performance&&typeof fetch==='function')loadPerformance();
@@ -3218,14 +3238,59 @@ function renderTrafficComparison(capacity){
   return `<div class="traffic-summary"><h3>Tested arrival capacity ${badge(capacity.status)}</h3><p class="hint">${escape(capacity.reason || '')}</p><dl class="metrics-grid"><div class="metric"><dt>Baseline accepted rate</dt><dd>${rate(capacity.baseline_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Current accepted rate</dt><dd>${rate(capacity.current_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Capacity change</dt><dd>${capacity.delta_rps==null?'Unconfirmed':`${capacity.delta_rps>0?'+':''}${number(capacity.delta_rps,2)} req/s`}</dd><small>${capacity.change_percent==null?'Matching, complete stages required':`${capacity.change_percent>0?'+':''}${number(capacity.change_percent,1)}%`}</small></div></dl></div>${capacity.stages?.length?`<div class="metric-table"><table><thead><tr><th>Rate</th><th>Baseline goodput</th><th>Current goodput</th><th>Capacity evidence</th></tr></thead><tbody>${capacity.stages.map(stage=>`<tr><td>${rate(stage.rate_rps)}</td><td>${rate(stage.baseline?.goodput_rps)}</td><td>${rate(stage.current?.goodput_rps)}</td><td>${badge(stage.status)}<small>${escape(stage.reason || '')}</small>${stage.timing_comparable===false?`<small>${escape(stage.timing_comparison_reason || '')}</small>`:''}</td></tr>`).join('')}</tbody></table></div>`:''}`;
 }
 function isProbe(r){return ['client_cancel','client_deadline','deadline_probe'].includes(r.scenario)||/intentional cancellation/i.test(r.error || '');}
+function comparisonOutputs(target) {
+  if(target.observed_outputs)return target.observed_outputs;
+  const seen=new Set(),rows=[];
+  for(const row of target.comparisons||[]){
+    const key=JSON.stringify([row.check,row.scenario]),work=row.output_work;
+    if(seen.has(key)||!work?.current||!work?.baseline)continue;
+    seen.add(key);
+    for(const [metric,valueKey,countKey] of [['output_tokens','reported_output_tokens_p50','reported_token_samples'],['output_chars','output_chars_p50','valid_completions']])rows.push({metric,check:row.check,scenario:row.scenario,baseline:work.baseline[valueKey],current:work.current[valueKey],baseline_samples:work.baseline[countKey],current_samples:work.current[countKey],descriptive:true,aggregation:'median'});
+  }
+  return rows;
+}
+function comparisonChange(row) {
+  if(row.current==null||row.baseline==null)return 'Not measured';
+  const delta=row.current-row.baseline;
+  if(delta===0)return 'No change';
+  if(row.metric.endsWith('_rate'))return `${delta>0?'+':''}${number(delta*100,1)} percentage points`;
+  if(row.baseline===0)return `${delta>0?'+':''}${comparisonValue(row,delta)} · from zero`;
+  const percent=delta*100/row.baseline;
+  return `${percent>0?'+':''}${number(percent,1)}%`;
+}
+function comparisonMetricLabel(row) {
+  return ({correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
+}
+function comparisonWarnings(row) {
+  return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
+}
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
+function comparisonCategory(row){return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonWarningSummary(row) {
+  const notes=[];
+  for(const warning of row.warnings||[]){
+    if(warning.code==='output_work_changed'){
+      const before=row.output_work?.baseline?.reported_output_tokens_p50,after=row.output_work?.current?.reported_output_tokens_p50;
+      notes.push(before!=null&&after!=null?`Answer length changed: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
+    }else if(warning.code==='client_delayed'){
+      for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
+    }else if(warning.code==='sample_uncertainty')notes.push('Sample uncertainty limits this assessment.');
+    else if(warning.code==='input_work_changed')notes.push('Input workload differs.');
+    else if(warning.code==='missing_timing')notes.push('Some response timings are missing.');
+    else if(warning.code==='timing_version')notes.push('Timing measurement methods differ.');
+    else notes.push(warning.message);
+  }
+  return [...new Set(notes.length?notes:comparisonWarnings(row))];
+}
 function comparisonTable(rows) {
-  return `<div class="comparison-table"><table><thead><tr><th>Measurement / scenario</th><th>Baseline</th><th>Current</th><th>Worsening</th><th>Result</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${escape(row.metric==='output_tokens_per_second'?'End-to-end output rate':row.metric==='generation_tokens_per_second'?'Generation pace (estimate)':human(row.metric))}<small>${escape(scenarioLabel(row))}</small><small>${escape(row.reason || '')}</small></td><td class="mono">${comparisonValue(row,row.baseline)}<small>n=${number(row.baseline_samples)}</small></td><td class="mono">${comparisonValue(row,row.current)}<small>n=${number(row.current_samples)}</small></td><td class="mono">${row.worsening==null?'—':`${row.worsening>0?'+':''}${number(row.worsening,1)}${row.change_unit==='percentage_points'?' pp':'%'}`}<small>${row.threshold==null?'':`Threshold ${number(row.threshold,1)}${row.change_unit==='percentage_points'?' pp':'%'}`}</small></td><td>${badge(row.status)}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="comparison-values">${rows.map(row=>{
+    const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row);
+    const label=row.descriptive?'Observed':warnings.length?'Warning':row.status==='fail'?'Regression detected':'No material regression';
+    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${row.aggregation==='mean'?'Rate':'Median'} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
+  }).join('')}</div>`;
 }
 function comparisonGroup(id,rows) {
-  const status=rows.some(row=>row.status==='fail')?'fail':rows.some(row=>row.status==='inconclusive')?'inconclusive':rows.every(row=>row.status==='pass')?'pass':rows[0]?.status || 'inconclusive';
-  const reasons=[...new Set(rows.map(row=>row.reason).filter(Boolean))];
-  const counts=['fail','inconclusive','pass'].map(key=>[key,rows.filter(row=>row.status===key).length]).filter(([,count])=>count);
-  return `<details class="comparison-check-group" data-comparison-group="${escape(id)}"><summary><span class="comparison-group-name">${escape(catalogTitle(id))}<small>${counts.map(([key,count])=>`${number(count)} ${key==='fail'?'regressed':key==='pass'?'without material regression':'inconclusive'}`).join(' · ')}</small></span>${badge(status)}<span class="disclosure-arrow" aria-hidden="true">⌄</span></summary><div class="comparison-group-body">${reasons.length?`<ul class="comparison-reason-list">${reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul>`:''}${comparisonTable(rows)}</div></details>`;
+  return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(rows[0]?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(scenarioLabel(rows[0]))}</p>${comparisonTable(rows)}</div>`;
 }
 function baselineIdentity(baseline) {
   const saved=state.baselines.find(item=>item.id===state.detail?.baseline_id || (baseline.run_id&&item.run_id===baseline.run_id));
@@ -3235,21 +3300,21 @@ function baselineIdentity(baseline) {
   return `<strong>${escape(label)}</strong>${when?`<span>${date(when)}</span>`:''}<details class="baseline-identifier"><summary>Reference ID</summary><code>${escape(baseline.run_id || 'Not recorded')}</code></details>`;
 }
 function renderComparison(report) {
-  const b=report.baseline;if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><p>Choose a saved baseline to compare this completed run. No new requests will be sent. This run still evaluates its own acceptance limits.</p><button class="button" data-action="compare-saved">Compare with baseline</button><button class="button" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
-  const allRows=(b.targets || []).flatMap(t=>t.comparisons || []),checkIds=[...new Set(allRows.map(row=>row.check))].sort();
-  state.comparisonFilter ??= allRows.some(row=>row.status!=='pass')?'attention':'all';
-  const conclusion=b.status==='fail'?'A material regression was detected':b.status==='pass'?'No material regression detected':'The comparison is inconclusive';
-  const guidance=b.status==='inconclusive'?'The recorded evidence does not establish improvement or regression. Open a check to see which measurements could not resolve the comparison.':b.status==='pass'?'The comparable measurements stayed within the configured regression limits. This is separate from the run’s acceptance result.':'Open the affected checks to inspect the changes and the conditions under which they were measured.';
-  const filters=allRows.length?`<div class="comparison-filters"><div><label for="comparison-outcome">Show</label><select id="comparison-outcome"><option value="attention">Needs attention</option><option value="all">All outcomes</option><option value="fail">Regressions</option><option value="inconclusive">Inconclusive</option><option value="pass">No material regression</option></select></div><div><label for="comparison-check">Check</label><select id="comparison-check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div><span class="hint">${number(allRows.length)} measurements, grouped by check</span></div>`:'';
-  const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='attention'?row.status!=='pass':row.status===state.comparisonFilter))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
-  return `<header class="comparison-conclusion"><div>${badge(b.status,'Comparison '+(statusLabels[b.status] || b.status).toLowerCase())}<h2>${escape(conclusion)}</h2><p>${escape(guidance)}</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}</div></header>${filters}${(b.targets || []).map(target=>{
-    const rows=[...(target.comparisons || [])].filter(filterRow).sort((a,c)=>(order[a.status]??5)-(order[c.status]??5));
-    const groups=new Map();for(const row of rows){if(!groups.has(row.check))groups.set(row.check,[]);groups.get(row.check).push(row);}
-    return `<section class="comparison-section"><div class="comparison-target-heading"><h3>${escape(target.target || target.name || 'Target')}${!(target.comparisons || []).length&&target.traffic_capacity?` <span class="hint">${target.traffic_capacity.stages?.length || 0} traffic stages compared</span>`:''}</h3>${badge(target.status)}</div>${(target.comparisons || []).length&&target.summary?`<p class="hint comparison-target-summary">${escape(target.summary)}</p>`:''}${target.traffic_capacity?renderTrafficComparison(target.traffic_capacity):''}${(target.reasons || []).length?`<ul class="comparison-reason-list">${target.reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul>`:''}${[...groups].map(([id,values])=>comparisonGroup(id,values)).join('')}${!groups.size&&(target.comparisons || []).length?'<p class="comparison-reasons">No measurements match these filters.</p>':''}<details class="comparison-support"><summary>Deployment and comparison details</summary><p class="hint">${target.configuration_diff?.confounded?'Confounded experiment':'Causality unverified'}. Baseline comparisons are separate from absolute acceptance checks.</p><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></details></section>`;
-  }).join('')}<details class="comparison-support"><summary>Comparison method</summary><p class="hint">${escape(b.method || 'Method was not recorded in this report.')}</p></details>`;
+  const b=report.baseline;
+  if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><button class="button" data-action="compare-saved">Compare with baseline</button><button class="button" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
+  const allRows=(b.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)].map(row=>({...row,targetName:t.target||t.name||'Target'}))),checkIds=[...new Set(allRows.map(row=>row.check))].sort();
+  if(!['all','with_warnings','without_warnings'].includes(state.comparisonFilter))state.comparisonFilter='all';
+  const warningCount=allRows.filter(row=>comparisonWarnings(row).length).length,acceptance=b.acceptance||{};
+  const acceptanceLabel=value=>value?escape(statusLabels[value]||value):'Not recorded';
+  const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='with_warnings'?comparisonWarnings(row).length>0:comparisonWarnings(row).length===0))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
+  return `<header id="results-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="results-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section><div class="comparison-filters">${allRows.length?`<div><label for="comparison-outcome">Show</label><select id="comparison-outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="comparison-check">Check</label><select id="comparison-check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
+    const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
+    for(const row of rows){const key=JSON.stringify([row.targetName,row.check,row.scenario]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+    return `<section id="results-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
+  }).join('')}`;
 }
 function syncComparisonFilters(){if($('#comparison-outcome'))$('#comparison-outcome').value=state.comparisonFilter;if($('#comparison-check'))$('#comparison-check').value=state.comparisonCheck;}
-function comparisonValue(row,value){if(value==null)return '—';if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':''}`;}
+function comparisonValue(row,value){if(value==null)return '—';if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':row.metric==='output_tokens'?' tokens':row.metric==='output_chars'?' chars':''}`;}
 function renderDeployment(report){
   return `<section class="panel"><div class="section-heading"><h2>Deployment and serving observations</h2></div><p class="hint">Changes provide investigation context, not proof of causality. Source freshness and other replicas remain qualified in the evidence.</p>${Object.entries(report.observations?.targets || {}).map(([name,obs])=>`<h3>${escape(name)}</h3><details><summary>Deployment snapshot and unknown fields</summary><pre>${escape(JSON.stringify(obs.deployment,null,2))}</pre></details><details><summary>Deployment observations during the run</summary><pre>${escape(JSON.stringify(obs.deployment_history || [],null,2))}</pre></details><details><summary>Serving telemetry and phase coverage</summary><pre>${escape(JSON.stringify(obs.serving_telemetry,null,2))}</pre></details>`).join('')}<a class="button" href="${runPath(state.detail.id)}/reproduction.json" download>Export reproduction JSON</a></section>`;
 }
@@ -3284,12 +3349,12 @@ function renderLive() {
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
   patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p></div><button class="button danger" data-action="stop" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':'Stop run'}</button></div>
-  ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
+  ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section id="results-checks" class="report-result-section"><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
   ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
   <dl class="live-numbers"><div><dt>${judging?'Judge calls completed':'Requests finished / started'}</dt><dd>${number(judging?judgeDone:finished)} <span class="dim">/ ${number(judging?judgeTotal:started)}</span></dd></div><div><dt>${judging?'Target requests finished':'Active requests'}</dt><dd>${number(judging?finished:active)}</dd></div><div><dt>Elapsed</dt><dd>${elapsed(secs)}</dd></div></dl>
   ${judging||c.max_requests!=null?`<div class="budget-track" aria-hidden="true"><span style="width:${Math.min(100,judging?judgeDone/(judgeTotal || 1)*100:started/c.max_requests*100)}%"></span></div>`:''}<div class="budget-caption"><span>${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:c.max_requests==null?'No request limit set':`Requests started · ${number(started)} / ${number(c.max_requests)} limit`}</span><span>${judging?'Inference timing is unchanged':c.max_requests==null?`${number(started)} requests started`:'Request starts, not completions'}</span></div></section>
   <section class="panel" style="margin-top:20px"><div class="section-heading"><h2>Activity</h2><span class="hint">Updates live</span></div><div class="event-list">${[...events].reverse().slice(0,15).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span><span class="phase">${String(e.event || '').startsWith('judging_')?`${number(e.judge_calls_completed || 0)} / ${number(e.judge_calls_total || 0)} judge calls`:`${escape(e.target || '')} · ${number(e.completed || 0)} finished`}</span></div>`).join('') || '<p class="hint" style="padding:20px 0">Preparing the first requests…</p>'}</div></section></div>
-  <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderResources(d.report,d)}</section>`,{landing:true});
+  <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div></section>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderResources(d.report,d)}</section>`,{landing:true});
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
   if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}
   refreshSpotTip();refreshConditionDialog();
@@ -3609,7 +3674,7 @@ document.addEventListener('click',async(event)=>{
   if(handleConditionClick(event))return;
   if(handlePerformanceClick(event))return;
   const reportTab=event.target.closest('[data-report-tab]');if(reportTab){event.preventDefault();chooseReportTab(reportTab.dataset.reportTab,{focus:reportTab.getAttribute?.('role')==='tab'});return;}
-  const section=event.target.closest('[data-report-section]');if(section){event.preventDefault();if(typeof location!=='undefined')location.hash=section.getAttribute('href');$(`#performance-${section.dataset.reportSection}`)?.scrollIntoView?.({block:'start'});return;}
+  const section=event.target.closest('[data-report-section]');if(section){event.preventDefault();if(typeof location!=='undefined')location.hash=section.getAttribute('href');scrollReportSection(section.dataset.reportSection,section.dataset.reportSectionTab||reportView.tab);return;}
   const verdict=event.target.closest('[data-verdict-check]');if(verdict){state.selectedCheck=verdict.dataset.verdictCheck;$('#result-content').innerHTML=renderChecks(state.detail.report);$('.check-detail')?.scrollIntoView?.({block:'start'});$('.check-detail h2')?.setAttribute('tabindex','-1');$('.check-detail h2')?.focus({preventScroll:true});return;}
 
   const newRun=event.target.closest('a[href="#new"]');if(newRun&&!event.metaKey&&!event.ctrlKey&&!event.shiftKey){event.preventDefault();startNewRun();return;}
@@ -3832,6 +3897,10 @@ document.addEventListener('input',event=>{
   updateBounds();
 });
 document.addEventListener('change',event=>{
+  if(event.target.id==='results-section-jump'){
+    location.hash=`${linkRun(state.detail.id)}/results/${event.target.value}`;
+    scrollReportSection(event.target.value,'results');return;
+  }
   if(handleConditionChange(event))return;
   if(handlePerformanceChange(event))return;
   if(event.target.id==='performance-target'||event.target.id==='performance-window'){

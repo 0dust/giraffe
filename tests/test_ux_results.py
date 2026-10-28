@@ -269,17 +269,17 @@ const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'lo
 const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
 state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
 let html=renderComparison(value);
-assert.match(html,/The comparison is inconclusive/);assert.match(html,/does not establish improvement or regression/);
+assert.match(html,/measurements/);assert.match(html,/Pass \/ fail/);assert.match(html,/Why this warning/);
 assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
-assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
 assert.match(html,/data-comparison-group="context"/);assert.match(html,/Context recall/);
-assert.match(html,/1 regressed · 1 inconclusive/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/Regression detected/);assert.match(html,/Change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
 assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
 assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
 state.comparisonFilter='all';html=renderComparison(value);
 assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
-assert.equal((html.match(/<tr>/g)||[]).length,5); // Three measurements and two group headers.
-state.comparisonFilter='pass';state.comparisonCheck='context';html=renderComparison(value);
+assert.equal((html.match(/data-metric=/g)||[]).length,3); // All measured differences are visible by default.
+state.comparisonFilter='with_warnings';state.comparisonCheck='correctness';html=renderComparison(value);
 assert.match(html,/No measurements match/);
 assert.equal(JSON.stringify(value),original);
 """)
@@ -429,3 +429,36 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
             assert '.queued' not in selector and '.reserved' not in selector
     assert animated, 'The parser must inspect real animation rules'
     assert '.is-landing' not in css
+
+
+def test_comparison_changes_are_directional_and_multiple_warnings_are_visible():
+    run_render_checks(r"""
+assert.equal(comparisonChange({metric:'correctness_rate',baseline:.4,current:.5}),'+10 percentage points');
+assert.equal(comparisonChange({metric:'generation_tokens_per_second',baseline:20,current:10}),'-50%');
+assert.equal(comparisonChange({metric:'latency_ms',baseline:0,current:10}),'+10 ms · from zero');
+assert.equal(comparisonChange({metric:'latency_ms',baseline:null,current:10}),'Not measured');
+const rows=[{check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,baseline_samples:5,current_samples:5,status:'inconclusive',warnings:[{message:'Answers are longer'},{message:'Client delayed <8/10>'}]}];
+const html=comparisonTable(rows);
+assert.match(html,/Answers are longer/);assert.match(html,/Client delayed &lt;8\/10&gt;/);
+assert.match(html,/Baseline/);assert.match(html,/Current/);assert.match(html,/Change/);
+assert.doesNotMatch(html,/Regression detected/);
+""")
+
+
+def test_comparison_warning_filter_is_independent_of_regression_status():
+    run_render_checks(r"""
+const row=(metric,status,warnings=[])=>({check:'load',scenario:'same',metric,status,warnings,baseline:10,current:20});
+const value=report([],{baseline:{targets:[{target:'local',comparisons:[
+  row('latency_ms','fail'),row('first_output_ms','pass',[{message:'Partial timing evidence'}]),
+  row('correctness_rate','inconclusive')],observed_outputs:[{...row('output_tokens',null),descriptive:true}]}]}});
+state.detail={report:value};state.comparisonFilter='with_warnings';
+let html=renderComparison(value);
+assert.match(html,/data-metric="first_output_ms"/);assert.match(html,/data-metric="correctness_rate"/);
+assert.doesNotMatch(html,/data-metric="latency_ms"|data-metric="output_tokens"/);
+state.comparisonFilter='without_warnings';html=renderComparison(value);
+assert.match(html,/data-metric="latency_ms"/);assert.match(html,/Regression detected/);
+assert.match(html,/data-metric="output_tokens"/);
+assert.doesNotMatch(html,/data-metric="first_output_ms"|data-metric="correctness_rate"/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-metric=/g)||[]).length,4);
+""")

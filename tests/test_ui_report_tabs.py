@@ -259,7 +259,7 @@ def test_inspect_comparison_opens_preserved_disclosure_on_results_tab():
     run_render_checks(r"""
 (async()=>{
  const value=report([check('access','pass')],{overall:'fail',baseline:{status:'fail',rows:[]}});
- detail(value);const reference=$('#report-baseline-reference');assert(!reference.open);
+ detail(value);const reference=$('#report-baseline-reference');assert(reference.open);reference.open=false;
  await listeners.click({target:$('[data-tab="baseline"]'),preventDefault(){}});
  assert.equal(reportView.tab,'results');assert.equal(reference.open,true);
  assert.equal(document.activeElement,$('summary',reference));
@@ -324,3 +324,42 @@ await page.run(`
 })()
 `);
 """)
+
+
+def test_results_sections_navigate_without_reloading_and_reopen_comparison():
+    run_render_checks(r"""
+(async()=>{
+const baseline={run_id:'reference',status:'inconclusive',targets:[{target:'local',comparisons:[
+  {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'},
+  {check:'load',scenario:'same',metric:'correctness_rate',baseline:.5,current:.6,status:'pass'},
+  {check:'load',scenario:'same',metric:'error_rate',baseline:0,current:0,status:'pass'}]}]};
+detail(report([check('load','fail')],{baseline}));chooseReportTab('results');
+const links=[...$('#report-sections').querySelectorAll('a')];
+assert.equal(links.length,9);
+for(const link of links){
+  assert.equal(link.dataset.reportSectionTab,'results');
+  assert($('#results-'+link.dataset.reportSection));
+}
+assert.equal($('#results-section-jump').querySelectorAll('option').length,9);
+assert.match($('#baseline-content').innerHTML,/data-action="compare-saved"/);
+assert.equal($('#report-sections').querySelectorAll('ul ul a').length,4);
+assert.equal($('#results-timing').closest('.report-result-section').id,'report-baseline-reference');
+assert.equal($('#results-configuration').closest('#report-baseline-reference'),null);
+assert.equal($('#results-checks').closest('#report-baseline-reference'),null);
+assert.doesNotMatch($('#baseline-content').textContent,/Assessment details|load and regression assessment/);
+const method=[...$('#baseline-content').querySelectorAll('details')].find(node=>node.querySelector('summary')?.textContent==='How comparison is done');
+assert(method);assert.equal(method.open,false);assert(method.closest('.comparison-filters'));assert.equal(method.closest('.comparison-section'),null);
+api=async()=>{throw Error('Section navigation must not reload the run');};
+$('#report-baseline-reference').open=false;
+const jump=$('#results-section-jump');jump.value='timing';
+listeners.change({target:jump});await route();
+assert.equal(location.hash,'#runs/saved-run/results/timing');
+assert.equal($('#report-baseline-reference').open,true);
+assert.equal(reportView.tab,'results');
+assert.equal($('#results-section-jump').value,'timing');
+$('#report-baseline-reference').open=false;
+jump.value='configuration';listeners.change({target:jump});await route();
+assert.equal($('#report-config-reference').open,true);
+assert.equal($('#report-baseline-reference').open,false);
+})()
+""", dom=True)
