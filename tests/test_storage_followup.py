@@ -106,7 +106,8 @@ async def test_stalled_client_does_not_hold_generation_lock(tmp_path, extension)
             await send(message)
         await app(scope, receive, slow_send)
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(slow_app), base_url="http://127.0.0.1:8787") as slow, \
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(slow_app), base_url="http://127.0.0.1:8787",
+                                 headers={"X-Giraffe-Token": app.state.giraffe_token}) as slow, \
             httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
         first = asyncio.create_task(slow.get(f"/api/runs/saved/report.{extension}"))
         try:

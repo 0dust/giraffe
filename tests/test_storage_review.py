@@ -332,7 +332,9 @@ async def test_cancelled_json_stream_closes_lookup_and_releases_download_lease(t
             await send(message)
         await app(scope, receive, slow_send)
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(blocked_app), base_url="http://127.0.0.1:8787") as blocked, \
+    # The streaming wrapper hides app.state from the shared client fixture.
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(blocked_app), base_url="http://127.0.0.1:8787",
+                                 headers={"X-Giraffe-Token": app.state.giraffe_token}) as blocked, \
             httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
         first = asyncio.create_task(blocked.get("/api/runs/saved/report.json"))
         await asyncio.wait_for(entered.wait(), 1)

@@ -10,6 +10,8 @@ import socket
 import json
 import logging
 import signal
+import secrets
+import ipaddress
 import sys
 import time
 from contextlib import contextmanager
@@ -43,7 +45,31 @@ class ModelSelectionError(ValueError):
     """A URL-only run needs an explicit model choice before it can start."""
 
 
+class LegacyNonstream(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.stream = False
+        namespace._legacy_nonstream = True
+
+
+class FullHelp(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.show_advanced = True
+        parser.print_help()
+        parser.exit()
+
+
 class ArgumentParser(argparse.ArgumentParser):
+    def format_help(self) -> str:
+        hidden = [(action, action.help) for action in self._actions
+                  if getattr(action, "advanced", False) and not getattr(self, "show_advanced", False)]
+        try:
+            for action, _ in hidden:
+                action.help = argparse.SUPPRESS
+            return super().format_help()
+        finally:
+            for action, help_text in hidden:
+                action.help = help_text
+
     def error(self, message: str) -> None:
         raise UsageError(message)
 
@@ -140,16 +166,25 @@ def parser() -> argparse.ArgumentParser:
     _storage_flags(trial)
     web = commands.add_parser("ui", aliases=["web"], help="Open the local web interface")
     web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    web.add_argument("--no-browser", action="store_true", help="Print the access link without opening a browser")
+    web.add_argument("--allow-restart-command", action="store_true", help="Allow configured server restart commands")
     web.add_argument("--runs-dir", type=Path, default=Path("runs"))
     web.add_argument("--config", type=Path, help="Prefill the run form from a YAML/JSON config")
     _storage_flags(web)
     _auto_cleanup_flags(web)
-    storage = commands.add_parser("storage", help="Show saved-run sizes and configured limits on disk")
+    init = commands.add_parser("init", help="Write a starter configuration")
+    from giraffe.init_config import ENGINES
+    init.add_argument("--engine", choices=list(ENGINES), default="ollama")
+    init.add_argument("--url", help="Endpoint to discover the served model from")
+    init.add_argument("--output", type=Path, default=Path("giraffe.yaml"))
+    init.add_argument("--force", action="store_true", help="Replace an existing configuration")
+    storage = commands.add_parser("storage", help=argparse.SUPPRESS)
     storage.add_argument("--runs-dir", type=Path, default=Path("runs"))
     storage.add_argument("--output-format", choices=["text", "json"], default="text")
     _storage_flags(storage)
     _auto_cleanup_flags(storage)
-    cleanup = commands.add_parser("cleanup", help="Preview saved runs to delete; --yes applies the preview")
+    cleanup = commands.add_parser("cleanup", help=argparse.SUPPRESS)
     cleanup.add_argument("--runs-dir", type=Path, default=Path("runs"))
     cleanup.add_argument("--older-than", type=_nonnegative, dest="older_than_days", metavar="DAYS")
     cleanup.add_argument("--keep-latest", type=_nonnegative, metavar="N",
@@ -157,9 +192,19 @@ def parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--max-total", type=_cleanup_size, dest="max_total_bytes", metavar="SIZE",
                          help="Positive target size on disk; use --older-than 0 to remove all unprotected runs")
     cleanup.add_argument("--yes", action="store_true", help="Delete the previewed candidates")
-    keep = commands.add_parser("keep", help="Protect a saved run from cleanup")
+    keep = commands.add_parser("keep", help=argparse.SUPPRESS)
     keep.add_argument("run_dir", type=Path, metavar="RUN_DIR")
     keep.add_argument("--off", action="store_true", help="Remove the cleanup protection marker")
+    runs = commands.add_parser("runs", help="List, clean up or protect saved runs")
+    run_actions = runs.add_subparsers(dest="runs_action", required=True)
+    for name, parent, description in (("list", storage, "Show saved-run sizes and limits"),
+                                       ("cleanup", cleanup, "Preview or delete old runs"),
+                                       ("keep", keep, "Protect a run from cleanup")):
+        nested = run_actions.add_parser(name, parents=[parent], add_help=False, help=description)
+        nested.set_defaults(command={"list": "storage"}.get(name, name))
+    hidden_commands = {"storage", "cleanup", "keep"}
+    commands._choices_actions[:] = [action for action in commands._choices_actions
+                                   if action.dest not in hidden_commands]
     for name in ("run", "cold-start"):
         run = commands.add_parser(name, help="Run the suite" if name == "run" else
                                   "Explicitly restart one configured target and test readiness",
@@ -182,7 +227,7 @@ Exit codes:
         run.add_argument("--model", help="Model name served by the endpoint")
         run.add_argument("--api-key-env", help="Name of an environment variable containing the key")
         run.add_argument("--concurrency", type=int, help="Set both the simultaneous-request limit and default check concurrency (legacy)")
-        run.add_argument("--simultaneous-limit", type=int, help="Simultaneous limit across the suite (default: Not set)")
+        run.add_argument("--simultaneous-limit", "--max-concurrency", type=int, help="Simultaneous limit across the suite (default: Not set)")
         run.add_argument("--default-concurrency", type=int, help="Default parallelism for checks (default: 4)")
         run.add_argument("--no-simultaneous-limit", action="store_true", help="Leave simultaneous target requests without a suite ceiling")
         run.add_argument("--max-requests", type=int, help="Maximum requests across all targets (default: Not set)")
@@ -212,7 +257,8 @@ Exit codes:
         run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"], help="Metrics format used by the statistics endpoint")
         run.add_argument("--tool-calling", action="store_true", default=None, help="Include tool-calling capability checks")
         run.add_argument("--metrics", action="store_true", default=None, help="Include GPU metrics observations")
-        run.add_argument("--nonstream", action="store_false", default=None, dest="stream", help="Disable streaming responses")
+        run.add_argument("--nonstream", action=LegacyNonstream, nargs=0, default=None, dest="stream", help=argparse.SUPPRESS)
+        run.add_argument("--no-stream", action="store_false", default=None, dest="stream", help="Disable streaming responses")
         run.add_argument("--overlap-models", action="store_true", default=None, help="Run targets concurrently within the shared request limit")
         run.add_argument("--fixtures", dest="custom_fixtures", help="Optional custom fixture JSON")
         run.add_argument("--request-pack", dest="request_pack_file", metavar="PATH",
@@ -230,6 +276,12 @@ Exit codes:
         run.add_argument("--output-format", choices=["text", "json"], default="text", help="Result format on stdout; progress is written to stderr")
         run.add_argument("--json", action="store_const", const="json", dest="output_format",
                          help="Alias for --output-format json")
+        run.add_argument("--quiet", action="store_true", help="Print only the final verdict; warnings stay on stderr")
+        run.add_argument("--fail-on", choices=["fail", "inconclusive", "never"], default="inconclusive",
+                         help="Gate on fail/inconclusive (default), fail only, or never; errors still exit nonzero")
+        run.add_argument("--junit", type=Path, metavar="PATH", help="Write JUnit XML")
+        run.add_argument("--summary-md", type=Path, metavar="PATH", help="Write a Markdown summary")
+        run.add_argument("--help-all", action=FullHelp, nargs=0, help="Show advanced options too")
         run.add_argument("--verbose", action="store_true", help="Show internal stages and memory observations")
         _storage_flags(run)
         _auto_cleanup_flags(run)
@@ -237,9 +289,26 @@ Exit codes:
         run.add_argument("--html", action="store_true", help="Also save a standalone HTML report")
         if name == "cold-start":
             run.add_argument("--restart", required=True, help="Name of target with restart_command")
+        legacy = {"--concurrency", "--metrics", "--structured-output", "--tool-calling", "--nonstream"}
+        common = {"help", "help_all", "config", "url", "model", "api_key_env", "simultaneous_limit",
+                  "default_concurrency", "max_requests", "max_duration_seconds", "request_timeout_seconds",
+                  "max_output_tokens", "checks", "stream", "baseline", "output", "output_format", "verbose",
+                  "quiet", "fail_on", "junit", "summary_md", "html", "skip_preflight", "restart"}
+        advanced = run.add_argument_group("advanced (shown with --help-all)")
+        for action in list(run._actions):
+            if legacy.intersection(action.option_strings):
+                action.help = argparse.SUPPRESS
+            elif action.dest not in common:
+                action.advanced = True
+                for group in run._action_groups:
+                    if action in group._group_actions:
+                        group._group_actions.remove(action)
+                advanced._group_actions.append(action)
     report = commands.add_parser("report", help="Render a saved report without model requests")
     report.add_argument("run_dir", type=Path, metavar="RUN_DIR")
-    report.add_argument("--html", action="store_true", required=True)
+    report.add_argument("--html", action="store_true", help="Write a standalone HTML report")
+    report.add_argument("--junit", type=Path, metavar="PATH")
+    report.add_argument("--summary-md", type=Path, metavar="PATH")
     report.add_argument("--output", type=Path, metavar="PATH")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
     export.add_argument("report", type=Path)
@@ -252,6 +321,7 @@ Exit codes:
     save.add_argument("destination", type=Path)
     save.add_argument("--replace", action="store_true", help="Explicitly replace an existing baseline")
     save.add_argument("--output-format", choices=["text", "json"], default="text")
+    commands.metavar = "{" + ",".join(name for name in commands.choices if name not in hidden_commands) + "}"
     return app
 
 
@@ -288,6 +358,13 @@ def migrated_configuration(values, model=RunConfig):
 
 
 def configuration(args: argparse.Namespace) -> RunConfig:
+    for dest, flag, replacement in (("structured_json", "--structured-output", "--checks json"),
+                                     ("tool_calling", "--tool-calling", "--checks tools"),
+                                     ("metrics", "--metrics", "--checks gpu")):
+        if getattr(args, dest, None):
+            print(f"Deprecated: {flag}; use {replacement}.", file=sys.stderr)
+    if getattr(args, "_legacy_nonstream", False):
+        print("Deprecated: --nonstream; use --no-stream.", file=sys.stderr)
     values, notes = {}, []
     if args.config:
         values = load_configuration(args.config)
@@ -392,7 +469,8 @@ def _discover_model(args: argparse.Namespace, values: dict | None = None, target
         raise ModelSelectionError("Choose --model: " + ", ".join(models))
     if not models:
         raise ModelSelectionError("No model could be discovered. Provide --model with the served model name.")
-    print(f"Using model {models[0]} (only model served)", file=sys.stderr)
+    if not getattr(args, "quiet", False):
+        print(f"Using model {models[0]} (only model served)", file=sys.stderr)
     return models[0]
 
 
@@ -413,7 +491,7 @@ def _stage_name(scenario: str, config=None) -> str | None:
     return "Running checks"
 
 
-async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False) -> RunReport:
+async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False) -> RunReport:
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
@@ -430,6 +508,8 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
+        if quiet:
+            return
         if json_progress:
             _progress_print(json.dumps(event, allow_nan=False))
             return
@@ -510,6 +590,14 @@ def _main(argv: list[str] | None = None) -> int:
         if hasattr(args, "output_format"):
             json_output = args.output_format == "json"
         kind = "baseline.save" if args.command == "baseline" else args.command
+        if arguments and arguments[0] in {"storage", "cleanup", "keep"}:
+            replacement = {"storage": "list"}.get(arguments[0], arguments[0])
+            print(f"Deprecated: giraffe {arguments[0]}; use giraffe runs {replacement}.", file=sys.stderr)
+        if args.command == "init":
+            from giraffe.init_config import write_config
+            write_config(args.output, engine=args.engine, url=args.url, force=args.force)
+            print(f"Configuration: {args.output}")
+            return 0
         if args.command == "sglang-traces":
             from giraffe.sglang_traces import serve
             serve(args.output, args.port)
@@ -644,21 +732,33 @@ def _main(argv: list[str] | None = None) -> int:
             import uvicorn
             from giraffe.web import create_app
 
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            with socket.socket(socket.AF_INET6 if ":" in args.host else socket.AF_INET, socket.SOCK_STREAM) as listener:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
-                    listener.bind(("127.0.0.1", args.port))
+                    listener.bind((args.host, args.port))
                     listener.listen(128)
                 except OSError as error:
                     if error.errno == errno.EADDRINUSE:
                         raise ValueError(f"port {args.port} is in use; choose another with --port") from None
                     raise
+                token = secrets.token_urlsafe(32)
                 app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes,
+                                 token=token, host=args.host, port=args.port, allow_restart_command=args.allow_restart_command,
                                  auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
-                print(f"Giraffe UI: http://127.0.0.1:{args.port} — open in your browser\n"
+                try:
+                    loopback = ipaddress.ip_address(args.host).is_loopback
+                except ValueError:
+                    loopback = args.host.lower() == "localhost"
+                if not loopback:
+                    print("Warning: UI is listening beyond loopback; anyone with the access link can control runs. "
+                          "Use a trusted network.", file=sys.stderr)
+                link_host = "localhost" if args.host in {"0.0.0.0", "::"} else args.host
+                url_host = f"[{link_host}]" if ":" in link_host else link_host
+                access_url = f"http://{url_host}:{args.port}/?token={token}"
+                print(f"Giraffe UI: {access_url} — open in your browser\n"
                       f"Local runs: {args.runs_dir.resolve()}\n"
                       "Review the plan, then choose Launch.", flush=True)
-                server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port,
+                server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port,
                                                        log_level="warning"))
                 try:
                     server.run(sockets=[listener])
@@ -666,12 +766,17 @@ def _main(argv: list[str] | None = None) -> int:
                     print("\nGiraffe UI stopped.")
             return 0
         if args.command == "report":
-            from giraffe.reporting import _atomic_write, _render
-
             report = load_report(args.run_dir)
-            output = args.output or (args.run_dir if args.run_dir.is_dir() else args.run_dir.parent) / "report.html"
-            _atomic_write(output, _render(report))
-            print(f"HTML: {output.resolve()}")
+            if not (args.html or args.junit or args.summary_md):
+                raise ValueError("Choose --html, --junit PATH or --summary-md PATH")
+            if args.output and not args.html:
+                raise ValueError("--output requires --html")
+            if args.html:
+                from giraffe.reporting import _atomic_write, _render
+                output = args.output or (args.run_dir if args.run_dir.is_dir() else args.run_dir.parent) / "report.html"
+                _atomic_write(output, _render(report))
+                print(f"HTML: {output.resolve()}")
+            _ci_outputs(report, args, args.run_dir)
             return 0
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
@@ -737,6 +842,7 @@ def _main(argv: list[str] | None = None) -> int:
             if guard["errors"]:
                 message = guard["errors"][0]["msg"]
                 print(f"giraffe: {message}", file=sys.stderr)
+                _blocked_outputs(config, args, directory, message)
                 if json_output:
                     emit("blocked", 3, message=message, errors=guard["errors"])
                 return 3
@@ -748,6 +854,7 @@ def _main(argv: list[str] | None = None) -> int:
             asyncio.run(ensure_tokenizers(config))
         except TokenizerUnavailable as error:
             print(f"giraffe: {error}", file=sys.stderr)
+            _blocked_outputs(config, args, directory, str(error))
             if json_output:
                 emit("blocked", 3, message=str(error))
             return 3
@@ -768,6 +875,7 @@ def _main(argv: list[str] | None = None) -> int:
             if blocked:
                 target, message = blocked
                 print(f"giraffe: preflight failed for {target}: {message}", file=sys.stderr)
+                _blocked_outputs(config, args, directory, message)
                 if json_output:
                     emit("blocked", 3, target=target, message=message)
                 return 3
@@ -798,10 +906,11 @@ def _main(argv: list[str] | None = None) -> int:
         requests = f"{config.max_requests:,}" if config.max_requests is not None else "Not set"
         simultaneous = f"{config.concurrency:,}" if config.concurrency is not None else "Not set"
         duration = f"{config.max_duration_seconds:,g}s" if config.max_duration_seconds is not None else "Not set"
-        print(f"Giraffe: {len(config.targets)} target(s), Maximum requests: {requests}, "
-              f"Simultaneous limit: {simultaneous}, Maximum duration: {duration}, "
-              f"Request timeout: {config.request_timeout_seconds:g}s, Maximum output tokens: {config.max_output_tokens}. "
-              "Check and saved-request overrides apply. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
+        if not getattr(args, "quiet", False):
+            print(f"Giraffe: {len(config.targets)} target(s), Maximum requests: {requests}, "
+                  f"Simultaneous limit: {simultaneous}, Maximum duration: {duration}, "
+                  f"Request timeout: {config.request_timeout_seconds:g}s, Maximum output tokens: {config.max_output_tokens}. "
+                  "Check and saved-request overrides apply. Ctrl-C saves a partial report.", file=sys.stderr, flush=True)
         timeouts = []
         for check_id in config.checks:
             if check_id == "load":
@@ -810,7 +919,7 @@ def _main(argv: list[str] | None = None) -> int:
                                 for name, settings in settings_sets(config.load_test))
             elif (timeout := config.effective_check(check_id).get("request_timeout_seconds")) is not None:
                 timeouts.append(f"{check_id}={timeout:g}s")
-        if timeouts:
+        if timeouts and not getattr(args, "quiet", False):
             print("Per-check request timeouts: " + ", ".join(timeouts)
                   + ". Saved requests may override these.", file=sys.stderr, flush=True)
         from giraffe.reporting import _retained, compare_baseline, html_failure_warning, save_failure_summary, write_report
@@ -820,7 +929,8 @@ def _main(argv: list[str] | None = None) -> int:
 
         async def run_with_partial_report():
             try:
-                report = await (_run(config, json_progress=True) if json_output else
+                report = await (_run(config, quiet=True) if getattr(args, "quiet", False) else
+                                _run(config, json_progress=True) if json_output else
                                 _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
             except asyncio.CancelledError as error:
                 report = getattr(error, "giraffe_report", None)
@@ -894,7 +1004,7 @@ def _main(argv: list[str] | None = None) -> int:
                         emit("error", 4, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
                     else:
                         print(f"giraffe: {message}", file=sys.stderr)
-                        if getattr(args, "verbose", False):
+                        if getattr(args, "verbose", False) and not getattr(args, "quiet", False):
                             _print_memory(resources)
                     return 4
         export_resources()
@@ -908,7 +1018,7 @@ def _main(argv: list[str] | None = None) -> int:
             except OSError as error:
                 cleanup_result = {"deleted": [], "error": str(error)}
             for identifier in cleanup_result["deleted"]:
-                if not json_output:
+                if not json_output and not getattr(args, "quiet", False):
                     print(f"Automatic cleanup deleted run: {identifier}")
         try:
             save_state("completed", run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
@@ -922,6 +1032,12 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"Warning: {warning}", file=sys.stderr)
         report = _retained(report)
         exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+        _ci_outputs(report, args, directory)
+        policy = getattr(args, "fail_on", "inconclusive")
+        if cancelled is None and ((report.overall == "inconclusive" and policy in {"fail", "never"})
+                                  or (report.overall == "fail" and policy == "never")):
+            exit_code = 0
+            print(f"Note: {report.overall} verdict accepted by --fail-on {policy}.", file=sys.stderr)
         summary = report.observations.get("summary")
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
@@ -930,7 +1046,7 @@ def _main(argv: list[str] | None = None) -> int:
                  **({"summary": summary} if summary else {}),
                  report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
         else:
-            _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False))
+            _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False))
         return exit_code
     except ModelSelectionError as error:
         print(f"giraffe: {error}", file=sys.stderr)
@@ -961,13 +1077,37 @@ def _main(argv: list[str] | None = None) -> int:
         return failure([{"loc": [], "message": str(error), "type": type(error).__name__}])
 
 
+def _blocked_outputs(config: RunConfig, args: argparse.Namespace, directory: Path, reason: str) -> None:
+    """Export CI evidence for a valid configuration blocked before suite traffic."""
+    if not (getattr(args, "junit", None) or getattr(args, "summary_md", None)):
+        return
+    from giraffe.models import CheckResult
+    now = datetime.now(timezone.utc).isoformat()
+    report = RunReport(run_id=directory.name, started_at=now, finished_at=now, overall="blocked",
+                       abort_reason=reason, manifest={"config": config.model_dump(mode="json")},
+                       checks=[CheckResult(id=check, target=target.name, title=CHECK_NAMES[check],
+                                           status="blocked", summary=reason)
+                               for target in config.targets for check in config.checks])
+    _ci_outputs(report, args, None)
+
+
+def _ci_outputs(report: RunReport, args: argparse.Namespace, report_path: Path | None) -> None:
+    from giraffe.ci_output import write_junit, write_summary_md
+    if getattr(args, "junit", None):
+        write_junit(report, args.junit)
+    if getattr(args, "summary_md", None):
+        write_summary_md(report, args.summary_md, report_path)
+
+
 def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
-                  directory: Path, resources: dict, *, verbose: bool = False) -> None:
+                  directory: Path, resources: dict, *, verbose: bool = False, quiet: bool = False) -> None:
     from giraffe.performance import cli_summary
 
     passed = sum(check.status == "pass" for check in report.checks)
     report_path = html_path or json_path
     print(f"{report.overall.upper()}  {passed} checks passed · {len(report.requests)} requests · report: {report_path}")
+    if quiet:
+        return
     for check in report.checks:
         if check.status in {"fail", "inconclusive", "blocked"}:
             print(f"  {check.target} / {check.id}: {check.status} — {' '.join(check.summary.split())}")
