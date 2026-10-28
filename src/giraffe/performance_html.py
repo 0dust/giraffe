@@ -65,6 +65,8 @@ def _structured_value(row):
     truncated = False
 
     def text(value, key=""):
+        if key == "acceptance_ratio" and _number(value):
+            return _fmt(value * 100) + "%"
         nonlocal truncated
         result = ("Unknown" if value is None else ("Yes" if value else "No") if isinstance(value, bool)
                   else _fmt(value) + (" ms" if key.endswith("_ms") else "") if _number(value)
@@ -134,7 +136,10 @@ def _value(row):
         return "—"
     if isinstance(value, (dict, list)):
         return _structured_value(row)
-    return _fmt(value) + (f' <small>{_e(row.get("unit", ""))}</small>' if row.get("unit") else '')
+    unit = row.get("unit", "")
+    if row.get("id", "").startswith("spec_decode_") and unit in {"ratio", "fraction"} and _number(value):
+        value, unit = value * 100, "%"
+    return _fmt(value) + (f' <small>{_e(unit)}</small>' if unit else '')
 
 
 def _availability(row):
@@ -168,6 +173,7 @@ def _table(rows):
     # Adjacent identical definitions share a cell rather than repeating verbose
     # missing-collector guidance for every server metric.
     notes = [(_availability(row) or _e(row.get("source", "")))
+             + (' · ' + _e(row["display_note"]) if row.get("display_note") else '')
              + (' · ESTIMATE' if row.get("state") == "estimated" else '')
              + (' · Partial coverage' if row.get("partial") else '')
              + (' · Server-wide; separate telemetry collection interval' if row.get("scope") == "server-wide" else '')

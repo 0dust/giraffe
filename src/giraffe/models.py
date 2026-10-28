@@ -17,7 +17,8 @@ from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SI
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
                    MAX_STAGE_SECONDS, MAX_SESSIONS,
                    MAX_SESSION_TURNS, MAX_SESSION_TURN_CHARS, MAX_TOOL_CONFIG_BYTES, MAX_TOOL_RESULT_BYTES,
-                   MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES)
+                   MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
+                   MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS)
 
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
@@ -105,7 +106,10 @@ class Deployment(Model):
     launch_command: str | list[str] | None = None
     discovery: Literal["none", "ollama", "vllm", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "none"
     collector_url: str | None = None
-    intended_change: str | None = None
+    intended_change: str | Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=MAX_SANITIZE_STRING_CHARS)]],
+        Field(min_length=1, max_length=MAX_SANITIZE_ITEMS),
+    ] | None = None
 
 
 class Arrival(Model):
