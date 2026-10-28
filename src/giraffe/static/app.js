@@ -746,10 +746,20 @@ function initInterface() {
   toggleRail(document.documentElement.classList.contains('rail-collapsed'));
 }
 
+function expireAccess() {
+  if(!state.accessExpired){
+    connectionError('Giraffe was restarted. Open the new link printed by giraffe ui in your terminal.');
+    state.accessExpired=true;
+    clearPoll();cancelLiveFetch();
+  }
+  return Object.assign(new Error('Access expired.'),{status:401});
+}
 async function api(path, options={}) {
+  if(state.accessExpired)throw expireAccess();
   let response;
   try { response = await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers || {})}}); }
   catch(error) { if(error.name==='AbortError')throw error;throw new Error('The local UI server could not be reached. Check that giraffe ui is still running.'); }
+  if(response.status===401)throw expireAccess();
   let body;
   try { body = await response.json(); } catch(error) { if(error.name==='AbortError')throw error;throw new Error(`The local server returned an unreadable response (${response.status}).`); }
   if (!response.ok) {
@@ -769,7 +779,7 @@ async function api(path, options={}) {
   return body;
 }
 function toast(message) { const el=$('#toast');el.textContent=message;el.hidden=false;setTimeout(()=>{el.hidden=true;},4500); }
-function connectionError(message='') { if(document.body)document.body.dataset.runner=message?'unavailable':'connected';$('#connection-error').textContent=message;$('#connection-error').hidden=!message; }
+function connectionError(message='') { if(state.accessExpired)return;if(document.body)document.body.dataset.runner=message?'unavailable':'connected';$('#connection-error').textContent=message;$('#connection-error').hidden=!message; }
 function setActive(id) {
   if(state.detail?.id===id&&!activeState(state.detail))id=null;
   state.active=id || null;
@@ -793,7 +803,7 @@ function pageVisible() { return document.visibilityState!=='hidden'; }
 function storageVisible() { return pageVisible()&&(location.hash==='#runs'||Boolean($('#storage-dialog')?.open)); }
 function clearPoll() { clearTimeout(state.poll);state.poll=null; }
 function cancelLiveFetch() { state.eventAbort?.abort();state.eventAbort=null; }
-function schedulePoll(callback, version, delay=1800) { clearPoll();if(!pageVisible())return;state.poll=setTimeout(()=>{if(version===state.routeVersion&&pageVisible()) callback(version);},Math.max(300,delay,(state.eventPollAfter || 0)-Date.now())); }
+function schedulePoll(callback, version, delay=1800) { clearPoll();if(state.accessExpired||!pageVisible())return;state.poll=setTimeout(()=>{if(!state.accessExpired&&version===state.routeVersion&&pageVisible()) callback(version);},Math.max(300,delay,(state.eventPollAfter || 0)-Date.now())); }
 async function refreshStorage() {
   if(!storageVisible())return;
   try{state.storage=await api('/api/storage');state.storageUnavailable=false;}
@@ -4164,7 +4174,7 @@ document.addEventListener('click',async(event)=>{
     if(samePage){renderNew();enterRoute();revealPendingSetupEdit();}return;
   }
   if(shellAction==='setup-profile'){chooseSetupProfile(event.target.closest('[data-profile]').dataset.profile);return;}
-  if(shellAction==='reconnect'){location.reload();return;}
+  if(shellAction==='reconnect'){if(!state.accessExpired)location.reload();return;}
   if(shellAction==='theme'){setTheme(document.documentElement.dataset.theme==='light'?'dark':'light');return;}
   if(shellAction==='commands'){openCommands();return;}
   if(shellAction==='shortcuts'){openCommands(true);return;}
@@ -4500,5 +4510,5 @@ document.addEventListener('visibilitychange',()=>{
   else if(location.hash==='#new')schedulePoll(pollNew,version,state.active?300:10000);
   else if(state.active)schedulePoll(pollRunStatus,version,300);
 });
-async function init(){initInterface();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;syncBaselineConfigs(bootstrap.baseline_configs);syncBaselineConfigs(baselines.baseline_configs);connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
+async function init(){initInterface();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;syncBaselineConfigs(bootstrap.baseline_configs);syncBaselineConfigs(baselines.baseline_configs);connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`v${bootstrap.version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
 init();
