@@ -471,6 +471,23 @@ def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
     }
 
 
+def _output_observations(check, scenario, current_work, old_work):
+    observations = []
+    for metric, value_key, sample_key in (
+        ("output_tokens", "reported_output_tokens_p50", "reported_token_samples"),
+        ("output_chars", "output_chars_p50", "valid_completions"),
+    ):
+        current_value, old_value = current_work[value_key], old_work[value_key]
+        observations.append({"metric": metric, "check": check, "scenario": scenario,
+            "current": current_value, "baseline": old_value, "aggregation": "median",
+            "current_samples": current_work[sample_key], "baseline_samples": old_work[sample_key],
+            "descriptive": True, "change_unit": "percent",
+            "observed_delta": current_value - old_value if current_value is not None and old_value is not None else None,
+            "observed_change": (current_value - old_value) * 100 / old_value
+            if current_value is not None and old_value is not None and old_value > 0 else None})
+    return observations
+
+
 def _different_output_work(current: dict[str, Any], old: dict[str, Any], threshold: float) -> bool:
     for key in ("output_chars_p50", "reported_output_tokens_p50"):
         c, b = current[key], old[key]
@@ -487,20 +504,25 @@ def _compare_metric(
         "metric": name, "current_samples": len(current), "baseline_samples": len(old),
         "status": "inconclusive",
     }
+    is_rate = name.endswith("_rate")
+    aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
+    current_value = aggregate(current) if current else None
+    old_value = aggregate(old) if old else None
+    result.update(current=current_value, baseline=old_value,
+                  aggregation="mean" if is_rate else "median",
+                  change_unit="percentage_points" if is_rate else "percent")
+    if current_value is not None and old_value is not None:
+        result["observed_delta"] = current_value - old_value
+        result["observed_change"] = ((current_value - old_value) * 100 if is_rate else
+                                     (current_value - old_value) * 100 / old_value if old_value > 0 else None)
     if min(len(current), len(old)) < minimum:
         result["reason"] = f"Needs at least {minimum} measured samples in each run."
         return result
-    is_rate = name.endswith("_rate")
-    aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
-    current_value, old_value = aggregate(current), aggregate(old)
     higher_is_better = name in {"correctness_rate", "valid_completion_rate", "output_tokens_per_second",
                                "generation_tokens_per_second"}
     direction = -1 if higher_is_better else 1
     # Rates use percentage points, avoiding undefined percentages for a zero baseline error rate.
     scale = 100 if is_rate else (100 / old_value if old_value > 0 else None)
-    result.update(current=current_value, baseline=old_value,
-                  aggregation="mean" if is_rate else "median",
-                  change_unit="percentage_points" if is_rate else "percent")
     if scale is None:
         if current_value == old_value:
             result.update(status="pass", worsening=0, reason="Both measurements are zero.")
@@ -643,7 +665,8 @@ def _compare_load_tests(
     elif not result["points"] or any(row["status"] == "inconclusive" for row in result["points"]):
         result["reason"] = "Incomplete or client-limited tests prevent a load acceptance comparison."
     elif not any(point["status"] == "pass" for point in old_points.values()):
-        result["reason"] = "The baseline established no acceptable tested load."
+        result["reason"] = "Neither a loss nor preservation of passing load can be assessed: the baseline had no passing load level. Measured differences are shown separately."
+        result["reason_code"] = "no_accepted_baseline"
     else:
         result.update(status="pass", reason="Previously acceptable tested loads remain acceptable.")
     return result
@@ -859,6 +882,14 @@ def _concurrent_load_html(metrics):
     return "".join(parts)
 
 
+def _acceptance_status(report: RunReport) -> str:
+    checks = [check for check in report.checks if check.id != "baseline"]
+    interrupted = {(item["target"], item["id"]) for item in
+                   report.observations.get("resources", {}).get("memory_interrupted_checks", [])}
+    return overall_status(checks, report.abort_reason,
+        memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted for check in checks))
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
@@ -879,6 +910,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         "min_samples": minimum, "regression_threshold": threshold,
         "deployment_changes_establish_causality": False,
         "source_outcome": baseline.overall,
+        "acceptance": {label: _acceptance_status(run)
+                       for label, run in (("baseline", baseline), ("current", report))},
         "source_started_at": baseline.started_at, "source_finished_at": baseline.finished_at,
         "method": "Per check/scenario; medians for timing and means for rates; "
                   "400 deterministic bootstrap resamples, 95% sample intervals. "
@@ -918,6 +951,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        observed_outputs = []
         traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
         load_tests = _compare_load_tests(report, baseline, name, target_reasons)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
@@ -937,6 +971,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     continue
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
+                observed_outputs.extend(_output_observations(check, scenario, current_work, old_work))
                 different_work = _different_output_work(current_work, old_work, threshold)
                 current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
                 old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
@@ -946,26 +981,42 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if not values and not old_metrics[metric]:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
+                    warnings = []
+                    initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
+                    def warn(code, message):
+                        warnings.append({"code": code, "message": message})
+                        row["status"] = "inconclusive"
                     if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
-                        row.update(status="inconclusive", reason="Observed input work or live generated histories differ; timing is not like-for-like.")
+                        warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
-                        row.update(status="inconclusive", reason="Actual generated output lengths differ "
-                                   "materially; these performance samples are not like-for-like.")
+                        warn("output_work_changed", "Actual generated output lengths differ materially: "
+                             f"median {old_work['reported_output_tokens_p50']} → {current_work['reported_output_tokens_p50']} tokens "
+                             f"and {old_work['output_chars_p50']} → {current_work['output_chars_p50']} characters. "
+                             "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if metric in TIMING_METRICS:
                         quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
                                    "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
                         row["timing_quality"] = quality
                         if delayed_runs:
-                            row.update(status="inconclusive", reason=" / ".join(delayed_runs) +
-                                       " client scheduling delay overlaps these metric samples; endpoint timing attribution is uncertain.")
+                            for label in delayed_runs:
+                                q = quality[label]
+                                warn("client_delayed", f"{label} client scheduling delay overlaps "
+                                     f"{q['affected_requests']}/{q['total_requests']} requests for this metric "
+                                     f"(maximum overlapping delay {q['max_overlapping_lag_ms']:.0f} ms; threshold {q['threshold_ms']:.0f} ms). "
+                                     "Some waiting time may come from Giraffe, so endpoint timing attribution is uncertain.")
                         if check == "load" and metric in {"latency_ms", "first_output_ms"}:
                             completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
-                                row.update(status="inconclusive", reason="Per-response timing evidence is incomplete; missing clocks remain unknown.")
+                                warn("missing_timing", "Per-response timing evidence is incomplete; missing clocks remain unknown.")
                         if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-                            row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
+                            warn("timing_version", "Client timing measurement boundaries differ; rerun the baseline.")
+                    if warnings:
+                        if initial_uncertainty:
+                            warnings.insert(0, {"code": "sample_uncertainty", "message": initial_uncertainty})
+                        row["reason"] = " ".join(warning["message"] for warning in warnings)
+                    row["warnings"] = warnings
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
                                evidence_ids=[record.id for record in current_records])
@@ -991,10 +1042,12 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         elif traffic is not None and traffic["status"] == "inconclusive":
             status = "inconclusive"
             summary = traffic["reason"]
-        elif load_tests is not None and load_tests["status"] == "inconclusive":
+        elif (load_tests is not None and load_tests["status"] == "inconclusive"
+              and load_tests.get("reason_code") != "no_accepted_baseline"):
             status = "inconclusive"
             summary = load_tests["reason"]
-        elif (not assessed and traffic is None and load_tests is None) or uncertain or missing_measurements:
+        elif (not assessed and (traffic is None or traffic["status"] != "pass")
+              and (load_tests is None or load_tests["status"] != "pass")) or uncertain or missing_measurements:
             status = "inconclusive"
             if not assessed:
                 summary = "No metric has enough comparable samples."
@@ -1012,10 +1065,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         excluded = len(rows) - len(assessed)
         if excluded:
             summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
-        if status == "inconclusive":
-            summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
-                        " using the same workload and settings; rerun longer if variation remains uncertain.")
-        entry = {"target": name, "status": status, "reasons": target_reasons,
+        if status == "inconclusive" and any(min(row["current_samples"], row["baseline_samples"]) < minimum for row in rows):
+            summary += f" Collect at least {minimum} measured samples per metric in both the current and baseline runs."
+        entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,
+                 "observed_outputs": observed_outputs,
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,
@@ -1503,6 +1556,72 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _comparison_outputs(target):
+    if "observed_outputs" in target:
+        return target["observed_outputs"]
+    outputs, seen = [], set()
+    for row in target.get("comparisons", []):
+        key = row.get("check"), row.get("scenario")
+        work = row.get("output_work")
+        if key not in seen and work and work.get("current") and work.get("baseline"):
+            seen.add(key)
+            outputs.extend(_output_observations(*key, work["current"], work["baseline"]))
+    return outputs
+
+
+def _comparison_values_html(target: dict[str, Any]) -> str:
+    labels = {"correctness_rate": "Correct answers", "valid_completion_rate": "Completed valid responses",
+              "error_rate": "Request errors", "latency_ms": "Full response time",
+              "first_output_ms": "First useful output", "max_stream_gap_ms": "Longest pause per response",
+              "output_tokens_per_second": "Output rate, including initial wait",
+              "generation_tokens_per_second": "Generation pace", "output_tokens": "Answer length · tokens",
+              "output_chars": "Answer length · characters"}
+
+    def value(row, amount):
+        if amount is None:
+            return "Not measured"
+        metric = row["metric"]
+        if metric.endswith("_rate"):
+            return f"{amount * 100:.1f}%"
+        suffix = " ms" if metric.endswith("_ms") else " tok/s" if metric.endswith("tokens_per_second") else " tokens" if metric == "output_tokens" else " chars" if metric == "output_chars" else ""
+        return _number(amount) + suffix
+
+    parts = [f'<h3>{_e(target.get("target", ""))}</h3>']
+    for reason in target.get("reasons", []):
+        parts.append(f'<p class="card">Cannot compare: {_e(reason)}</p>')
+    for row in [*target.get("comparisons", []), *_comparison_outputs(target)]:
+        current, old = row.get("current"), row.get("baseline")
+        if current is None or old is None:
+            change = "Not measured"
+        elif row["metric"].endswith("_rate"):
+            change = f"{(current - old) * 100:+.1f} percentage points"
+        elif current == old:
+            change = "No change"
+        elif old == 0:
+            change = ("+" if current > old else "") + value(row, current - old) + " · from zero"
+        else:
+            change = f"{(current - old) * 100 / old:+.1f}%"
+        warnings = [w["message"] for w in row.get("warnings", [])]
+        if not warnings and row.get("status") == "inconclusive":
+            warnings = [row.get("reason", "Insufficient evidence to interpret this change.")]
+        label = "Observed result" if row.get("descriptive") else "Interpretation limited" if warnings else "Regression detected" if row.get("status") == "fail" else "No material regression detected"
+        parts.append(f'<article class="card"><h4>{_e(labels.get(row["metric"], row["metric"]))}</h4>'
+                     f'<p class="muted">{_e(row.get("check"))} · {_e(row.get("scenario"))} · {_e(row.get("aggregation", "median"))}</p>'
+                     '<dl class="comparison-values-export">'
+                     f'<div><dt>Baseline</dt><dd>{value(row, old)}</dd><small>n={_e(row.get("baseline_samples"))}</small></div>'
+                     f'<div><dt>Current</dt><dd>{value(row, current)}</dd><small>n={_e(row.get("current_samples"))}</small></div>'
+                     f'<div><dt>Observed change</dt><dd>{change}</dd></div></dl>'
+                     f'<strong>{label}</strong>')
+        if warnings:
+            parts.append('<ul>' + ''.join(f'<li>{_e(w)}</li>' for w in warnings) + '</ul>')
+        elif row.get("descriptive"):
+            parts.append('<p>Answer length is an observed result; shorter or longer is not automatically better.</p>')
+        else:
+            parts.append(f'<p>{_e(row.get("reason", ""))}</p>')
+        parts.append('</article>')
+    return ''.join(parts)
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -1523,7 +1642,7 @@ def _render(report: RunReport) -> str:
                 else "Giraffe acceptance results")
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '.comparison-values-export{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.comparison-values-export dd{margin:4px 0;font-weight:600;overflow-wrap:anywhere}.comparison-values-export dt{font-size:12px}' + '</style><main>',  f"<h1>{_e(headline)} {_badge(_acceptance_status(report))}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     if headline == "Giraffe acceptance results":
@@ -1669,10 +1788,15 @@ def _render(report: RunReport) -> str:
                      f'<td>{sum(r.score is True for r in scored)} / {len(scored)}</td></tr>')
     parts.append('</table></div></section><section id="baseline"><h2>Baseline comparison</h2>')
     if report.baseline:
-        parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
-                     f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
-                     'Absolute check outcomes appear separately above.</p>')
+        acceptance = report.baseline.get("acceptance", {})
+        parts.append('<h3>What changed?</h3><p>Observed differences do not prove what caused them.</p>'
+                     f'<p>Compared with {_e(report.baseline.get("saved_baseline_name") or report.baseline.get("run_id", "unknown"))}.</p>'
+                     '<h3>Did each run meet its requirements?</h3>'
+                     f'<p>Baseline: {_e(acceptance.get("baseline", "Not recorded separately"))} · '
+                     f'Current: {_e(acceptance.get("current", "Not recorded separately"))}. '
+                     'Pass/fail checks configured requirements; measured changes appear below.</p>')
         for target in report.baseline.get("targets", []):
+            parts.append(_comparison_values_html(target))
             if "traffic_capacity" in target:
                 parts.append(_traffic_baseline_html(target))
             if "load_test" in target:

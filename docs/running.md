@@ -170,6 +170,31 @@ evaluate the current run while comparison reports changes against the reference.
 Incompatible workloads leave metric comparison inconclusive. See
 [deployment and comparison evidence](workloads.md#deployment-metadata).
 
+### Read a before/after comparison
+
+The **Baseline comparison** panel shows all measurements by default: baseline,
+current, and change. Changes are signed as
+current minus baseline; correctness and other rates use percentage points.
+Answer lengths are observations, not better/worse judgments.
+
+**Pass / fail** reports acceptance separately. A failed
+baseline can still provide measured differences. Whether a previously passing
+load level was lost remains a separate assessment in the comparison data.
+
+**Show** filters measurements by **All measurements**, **With warnings**, or
+**Without warnings**. A result without warnings can still be a regression.
+**How comparison is done**, beside the filter, expands the calculation method.
+The sidebar nests answers, response timing, and request completion under the
+comparison; narrow screens use **Jump to section**.
+
+Warnings appear next to affected values. Different output lengths qualify speed
+interpretation; client scheduling delays can prevent attributing timing to the
+endpoint. Multiple warnings remain visible together. Small samples still show
+observed values but cannot establish a confident regression verdict. Missing or
+incompatible evidence remains unknown. The standalone HTML export follows the
+same separation. Historical reports show the evidence they recorded; newly
+computed comparisons include separate acceptance and structured warning fields.
+
 ## Run provenance
 
 Reports and `giraffe export` preserve the launch source alongside the effective

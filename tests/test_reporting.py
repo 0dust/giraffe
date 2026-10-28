@@ -818,3 +818,49 @@ def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evi
     if evidence_count < 25:
         assert 'Request current-0 ' in html
     assert 'Request current-30 ' not in html
+
+
+def test_comparison_preserves_observations_and_all_interpretation_warnings():
+    current, previous = make_report(), make_report('before')
+    current.observations['generator_max_lag_ms'] = 500
+    for record in current.requests:
+        record.output_tokens = 5
+        record.output_chars = 1
+    result = compare_baseline(current, previous)
+    target = result.baseline['targets'][0]
+    latency = next(row for row in target['comparisons'] if row['metric'] == 'latency_ms')
+    assert latency['current'] == latency['baseline'] == 100
+    assert latency['observed_delta'] == 0
+    assert latency['status'] == 'inconclusive'
+    assert {warning['code'] for warning in latency['warnings']} == {'output_work_changed', 'client_delayed'}
+    assert 'output lengths differ' in latency['reason']
+    assert 'client scheduling delay' in latency['reason']
+    outputs = next(row for row in target['observed_outputs'] if row['metric'] == 'output_tokens')
+    assert outputs['baseline'] == 10 and outputs['current'] == 5
+    assert outputs['observed_change'] == -50
+    assert outputs['descriptive'] is True
+    assert result.baseline['acceptance'] == {'baseline': 'pass', 'current': 'pass'}
+    from giraffe.reporting import _render
+    html = _render(result)
+    assert 'What changed?' in html and 'Observed change' in html
+    assert 'output lengths differ' in html and 'client scheduling delay' in html
+
+
+def test_low_samples_keep_values_without_claiming_confidence():
+    result = compare_baseline(make_report(count=2, latency=200), make_report('before', count=2))
+    row = next(row for row in result.baseline['targets'][0]['comparisons'] if row['metric'] == 'latency_ms')
+    assert row['status'] == 'inconclusive'
+    assert row['baseline'] == 100 and row['current'] == 200
+    assert row['observed_change'] == 100
+    assert 'worsening_interval_95' not in row
+
+
+def test_comparison_acceptance_keeps_memory_interruption_and_legacy_output_evidence():
+    from giraffe.reporting import _comparison_outputs
+    current, previous = make_report(), make_report('before')
+    current.observations['resources'] = {'memory_interrupted_checks': [{'target': 'local', 'id': 'correctness'}]}
+    result = compare_baseline(current, previous)
+    assert result.baseline['acceptance']['current'] == 'inconclusive'
+    target = result.baseline['targets'][0]
+    expected = target.pop('observed_outputs')
+    assert _comparison_outputs(target) == expected

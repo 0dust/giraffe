@@ -210,3 +210,32 @@ def test_observed_mixed_share_variation_does_not_change_work_within_each_shape()
 
 
 # Fake inference clients in this module use the matching local tokenizer.
+
+
+def test_failed_baseline_does_not_block_observed_metric_comparison():
+    old = arrival_report()
+    old.manifest['config']['limits']['min_samples'] = 5
+    for point in old.checks[0].metrics['points']:
+        point['status'] = point['groups'][0]['status'] = 'fail'
+    old.checks[0].status = 'fail'
+    old.checks[0].metrics['highest_accepted'] = []
+    current = old.model_copy(deep=True)
+    compared = compare_baseline(current, old)
+    assert compared.baseline['status'] == 'pass'
+    assert compared.overall == 'fail'
+    assert compared.baseline['acceptance'] == {'baseline': 'fail', 'current': 'fail'}
+    target = compared.baseline['targets'][0]
+    assert target['load_test']['reason_code'] == 'no_accepted_baseline'
+    assert target['comparisons']
+    assert all(row['status'] == 'pass' for row in target['comparisons'])
+
+
+def test_failed_baseline_with_too_few_samples_still_has_no_regression_verdict():
+    old = arrival_report()  # min_samples=100, greater than either tested cohort
+    for point in old.checks[0].metrics['points']:
+        point['status'] = point['groups'][0]['status'] = 'fail'
+    old.checks[0].status = 'fail'
+    old.checks[0].metrics['highest_accepted'] = []
+    compared = compare_baseline(old.model_copy(deep=True), old)
+    assert compared.baseline['status'] == 'inconclusive'
+    assert compared.baseline['targets'][0]['comparisons'][0]['current'] is not None
