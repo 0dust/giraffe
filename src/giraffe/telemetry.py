@@ -37,6 +37,21 @@ LEGACY = V1 | {
     "vllm:gpu_cache_usage_perc": ("cache_occupancy", "gauge", "fraction"),
     "vllm:cpu_cache_usage_perc": ("cpu_cache_occupancy", "gauge", "fraction"),
 }
+# Optional V1 counters: vLLM v0.30.0 v1/spec_decode/metrics.py.
+SPEC_DECODE = {
+    "vllm:spec_decode_num_drafts_total": ("spec_decode_drafts", "counter", "drafts"),
+    "vllm:spec_decode_num_draft_tokens_total": ("spec_decode_draft_tokens", "counter", "tokens"),
+    "vllm:spec_decode_num_accepted_tokens_total": ("spec_decode_accepted_tokens", "counter", "tokens"),
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total": ("spec_decode_accepted_tokens_per_pos", "counter", "tokens"),
+}
+V1 = V1 | SPEC_DECODE
+# SGLang v0.5.22 (baa9befa3815), srt/observability/metrics_collector.py:
+# scheduler gauges, NOT cumulative counters. Acceptance length includes the bonus token.
+SGLANG_SPEC_DECODE = {
+    "sglang:spec_accept_length": ("spec_decode_sglang_acceptance_length", "gauge", "tokens/forward"),
+    "sglang:spec_accept_rate": ("spec_decode_sglang_acceptance_ratio", "gauge", "fraction"),
+}
+OPTIONAL_SPEC_DECODE = SPEC_DECODE | SGLANG_SPEC_DECODE
 SGLANG = {
     "sglang:token_usage": ("cache_occupancy", "gauge", "fraction"),
     "sglang:num_running_reqs": ("running", "gauge", "requests"),
@@ -50,8 +65,10 @@ SGLANG = {
     "sglang:time_to_first_token_seconds_count": ("server_ttft_count", "counter", "requests"),
     "sglang:time_to_first_token_seconds_bucket": ("server_ttft_bucket", "counter", "requests"),
 }
+SGLANG = SGLANG | SGLANG_SPEC_DECODE
 # Exact metric contracts from the source used for the live Apple Silicon run.
-SGLANG_REFERENCE = "SGLang 44bc47886 srt/observability/metrics_collector.py"
+SGLANG_REFERENCE = ("SGLang 44bc47886 srt/observability/metrics_collector.py; "
+                    "speculative gauges: v0.5.22 baa9befa3815, same module")
 LLAMACPP = {
     "llamacpp:requests_processing": ("running", "gauge", "requests"),
     "llamacpp:requests_deferred": ("waiting", "gauge", "requests"),
@@ -100,8 +117,11 @@ LINE = re.compile(
     r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*?\})?\s+([-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?)(?:\s+(\d+(?:\.\d+)?))?\s*$"
 )
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+SPEC_LABEL = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\[\\n"]|[^"\\])*)"\s*')
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
 GPU_FAMILIES = {entry[0] for entry in GPU.values()}
+METRIC_FAMILIES = {entry[0] for mapping in (V1, LEGACY, SGLANG, *ENGINE_METRICS.values(), GPU, HOST)
+                   for entry in mapping.values()}
 # NVIDIA DCGM adverse bits: HW slowdown, SW/HW thermal, power brake.
 # Idle/application-clock/sync-boost/display-clock reasons alone are not failures.
 GPU_THROTTLE_REASONS = {8: "hardware slowdown",
@@ -138,7 +158,7 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
         if snap.get("status") not in {"available", "stale_samples", "absent_families"}:
             continue
         samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
-        if snap.get("series_limit_reached"):
+        if _families_truncated(snap, GPU_FAMILIES):
             truncated.add(index)
         if not samples:
             continue
@@ -260,6 +280,8 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
         return metrics, "fail", "GPU telemetry reports a new XID, repeated adverse slowdown or configured temperature violation; " + qualifier
     if any(warning.get("history_unknown") for warning in warnings):
         return metrics, "inconclusive", "Initial XID history is unknown; cannot distinguish a historical XID from a new error; " + qualifier
+    if truncated:
+        return metrics, "inconclusive", "GPU telemetry was truncated; retained devices cannot establish complete coverage; " + qualifier
     if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and observed_count < gpu_count:
         return metrics, "inconclusive", f"GPU telemetry covers {observed_count} devices, fewer than the declared {gpu_count}; " + qualifier
     if any(not row["fresh_in_first_and_last_snapshot"] for row in rows):
@@ -288,6 +310,23 @@ def _metrics_headers(target):
     return headers
 
 
+def _spec_labels(raw_labels):
+    content = (raw_labels or "{}")[1:-1].strip()
+    labels, offset = {}, 0
+    while offset < len(content):
+        match = SPEC_LABEL.match(content, offset)
+        if not match or match[1] in labels:
+            return None
+        labels[match[1]] = match[2]
+        offset = match.end()
+        if offset == len(content):
+            break
+        if content[offset] != ",":
+            return None
+        offset += 1
+    return labels
+
+
 def parse(body, target, config, *, host=False):
     # Identify only published exact-name contracts. User-selected contracts win;
     # unrelated exporters and similarly named metrics cannot invent a runtime.
@@ -295,7 +334,7 @@ def parse(body, target, config, *, host=False):
     if not host and target.metrics_profile == "unknown":
         names = {match[1] for line in body.splitlines() if (match := LINE.fullmatch(line))}
         vllm = "vllm-legacy" if names.intersection(set(LEGACY) - set(V1)) else "vllm-v1"
-        candidates = [name for name, mapping in {vllm: LEGACY, "sglang": SGLANG, **ENGINE_METRICS}.items()
+        candidates = [name for name, mapping in {vllm: LEGACY if vllm == "vllm-legacy" else V1, "sglang": SGLANG, **ENGINE_METRICS}.items()
                       if names.intersection(mapping)]
         if len(candidates) == 1:
             detected = candidates[0]
@@ -311,50 +350,73 @@ def parse(body, target, config, *, host=False):
         else ENGINE_METRICS.get(target.metrics_profile, {})
     )
     mapping = HOST if host else profile | GPU
-    samples, recognized, truncated = [], 0, False
-    for line in body.splitlines():
-        if line.lstrip().startswith("#") or not line.strip():
-            continue
-        match = LINE.fullmatch(line)
-        if not match:
-            continue
-        recognized += 1
-        name, raw_labels, raw_value, raw_time = match.groups()
-        if name not in mapping or not math.isfinite(float(raw_value)):
-            continue
-        if len(samples) >= config.metrics_max_series:
-            truncated = True
-            continue
-        labels = {}
-        for key, value in LABEL.findall(raw_labels or ""):
-            if len(labels) >= MAX_METRICS_LABELS:
-                truncated = True
-                break
-            labels[key] = value[:MAX_METRICS_LABEL_CHARS]
-        family, kind, unit = mapping[name]
-        timestamp = float(raw_time) if raw_time else None
-        age = time.time() - timestamp / 1000 if timestamp is not None else None
-        max_age = (config.effective_check("gpu")["metrics_max_age_seconds"]
-                   if family in {entry[0] for entry in GPU.values()} and "gpu" in config.checks
-                   else config.metrics_max_age_seconds)
-        stale = age is not None and (age > max_age or age < -5)
-        samples.append(
-            {
-                "name": name,
-                "family": family,
-                "kind": kind,
-                "unit": unit,
-                "value": float(raw_value),
-                "labels": sanitize(labels),
-                "sample_timestamp_ms": timestamp,
-                "age_seconds": age,
-                "stale": stale,
-                "freshness": "source timestamp"
-                if timestamp
-                else "scrape only; source freshness unknown",
-                "provenance": "host node_exporter metrics" if host else "runtime-reported metrics",
-            }
-        )
+    samples, recognized, truncated_families, invalid_families = [], 0, set(), set()
+    lines = body.splitlines()
+    passes = (False, True) if mapping.keys() & OPTIONAL_SPEC_DECODE.keys() else (False,)
+    for optional in passes:
+        for line in lines:
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            match = LINE.fullmatch(line)
+            if not match:
+                name_match = re.match(r"\s*([^\s{]+)", line)
+                if name_match and name_match[1] in OPTIONAL_SPEC_DECODE and name_match[1] in mapping:
+                    invalid_families.add(mapping[name_match[1]][0])
+                continue
+            if not optional:
+                recognized += 1
+            name, raw_labels, raw_value, raw_time = match.groups()
+            if (name in OPTIONAL_SPEC_DECODE) != optional:
+                continue
+            if name not in mapping:
+                continue
+            family, kind, unit = mapping[name]
+            if not math.isfinite(float(raw_value)):
+                if name in OPTIONAL_SPEC_DECODE:
+                    invalid_families.add(family)
+                continue
+            if len(samples) >= config.metrics_max_series:
+                truncated_families.add(family)
+                continue
+            if name in OPTIONAL_SPEC_DECODE:
+                parsed_labels = _spec_labels(raw_labels)
+                if parsed_labels is None:
+                    invalid_families.add(family)
+                    continue
+                label_items = parsed_labels.items()
+            else:
+                label_items = LABEL.findall(raw_labels or "")
+            labels = {}
+            for key, value in label_items:
+                if len(labels) >= MAX_METRICS_LABELS:
+                    truncated_families.add(family)
+                    break
+                if len(value) > MAX_METRICS_LABEL_CHARS:
+                    truncated_families.add(family)
+                labels[key] = value[:MAX_METRICS_LABEL_CHARS]
+            timestamp = float(raw_time) if raw_time else None
+            age = time.time() - timestamp / 1000 if timestamp is not None else None
+            max_age = (config.effective_check("gpu")["metrics_max_age_seconds"]
+                       if family in GPU_FAMILIES and "gpu" in config.checks
+                       else config.metrics_max_age_seconds)
+            stale = age is not None and (age > max_age or age < -5)
+            samples.append(
+                {
+                    "name": name,
+                    "family": family,
+                    "kind": kind,
+                    "unit": unit,
+                    "value": float(raw_value),
+                    "labels": sanitize(labels),
+                    "sample_timestamp_ms": timestamp,
+                    "age_seconds": age,
+                    "stale": stale,
+                    "freshness": "source timestamp"
+                    if timestamp
+                    else "scrape only; source freshness unknown",
+                    "provenance": "host node_exporter metrics" if host else "runtime-reported metrics",
+                }
+            )
     families = {s["family"] for s in samples if not s["stale"]}
     state = (
         "stale_samples"
@@ -375,11 +437,13 @@ def parse(body, target, config, *, host=False):
         "status": state,
         "samples": samples,
         "missing_families": sorted(required - families),
-        "series_limit_reached": truncated,
+        "series_limit_reached": bool(truncated_families),
+        "truncated_families": sorted(truncated_families),
+        "invalid_families": sorted(invalid_families),
         "mapping": "node_exporter" if host else target.metrics_profile,
         "profile": "node_exporter" if host else target.metrics_profile,
         "profile_source": "observed exact metric names" if detected else "configured profile",
-        "mapping_reference": "https://prometheus.io/docs/guides/node-exporter/" if host else "vLLM 0.30.0 v1/metrics/loggers.py"
+        "mapping_reference": "https://prometheus.io/docs/guides/node-exporter/" if host else "vLLM 0.30.0 v1/metrics/loggers.py and v1/spec_decode/metrics.py"
         if target.metrics_profile == "vllm-v1"
         else SGLANG_REFERENCE
         if target.metrics_profile == "sglang"
@@ -521,6 +585,7 @@ async def sample_during(run, target):
 
 
 def summarize(data, threshold):
+    _, spec_deltas = _derive_spec_decode(data["snapshots"])
     groups = defaultdict(list)
     phases = defaultdict(set)
     for snap in data["snapshots"]:
@@ -556,6 +621,10 @@ def summarize(data, threshold):
                 if resets
                 else "shared endpoint counter window; attribution unknown",
             )
+        if first["name"] in SPEC_DECODE:
+            identity = (first["family"], tuple(sorted(first["labels"].items())))
+            row.update(delta=spec_deltas.get(identity),
+                       interpretation="Matched fresh adjacent server-wide intervals only; excluded intervals are unknown; attribution unknown.")
         rows.append(row)
     identities = {
         str(sorted(sample["labels"].items()))
@@ -638,9 +707,18 @@ def _derived(value, unit, source, *, reason=None, state=None, samples=0, eligibl
             "details": details}
 
 
+def _families_truncated(snapshot, families):
+    truncated = snapshot.get("truncated_families")
+    if isinstance(truncated, list) and truncated and all(isinstance(f, str) and f in METRIC_FAMILIES for f in truncated):
+        return bool(set(families).intersection(truncated))
+    return bool(snapshot.get("series_limit_reached") or truncated)
+
+
 def _fresh_families(snapshot, families):
     """A failed, truncated, duplicate or stale scope cannot form a counter interval."""
-    if snapshot.get("status") not in {"available", "absent_families"} or snapshot.get("series_limit_reached"):
+    if (snapshot.get("status") not in {"available", "absent_families"}
+            or _families_truncated(snapshot, families)
+            or set(families).intersection(snapshot.get("invalid_families", []))):
         return None
     rows = {family: {} for family in families}
     for sample in snapshot.get("samples", []):
@@ -678,6 +756,139 @@ def _counter_intervals(snapshots, families, *, matching=True):
             continue
         intervals.append((elapsed, deltas))
     return intervals, excluded
+
+
+def _spec_positions(left, right, totals):
+    family = "spec_decode_accepted_tokens_per_pos"
+    intervals, _ = _counter_intervals([left, right], [family])
+    if not intervals or any(not float(sample["value"]).is_integer()
+                            for snap in (left, right) for sample in snap.get("samples", [])
+                            if sample.get("family") == family):
+        return None
+    deltas = intervals[0][1][family]
+    scopes = defaultdict(dict)
+    for labels, value in deltas.items():
+        labels = dict(labels)
+        position = labels.pop("position", "")
+        if not re.fullmatch(r"0|[1-9][0-9]*", position):
+            return None
+        scopes[tuple(sorted(labels.items()))][int(position)] = value
+    if scopes.keys() != totals["spec_decode_drafts"].keys():
+        return None
+    for labels, counts in scopes.items():
+        ordered = sorted(counts)
+        values = [counts[p] for p in ordered]
+        if (ordered != list(range(len(ordered)))
+                or sum(values) != totals["spec_decode_accepted_tokens"][labels]
+                or any(b > a for a, b in zip(values, values[1:]))
+                or values[0] > totals["spec_decode_drafts"][labels]):
+            return None
+    return deltas
+
+
+def _derive_sglang_spec_decode(snapshots):
+    """Latest scheduler values, kept per label set; never pooled or differenced."""
+    latest = snapshots[-1] if snapshots else {}
+    metrics = {}
+    for family, unit, field, definition in (
+        ("spec_decode_sglang_acceptance_length", "tokens/forward", "acceptance_length",
+         "Mean accepted draft tokens plus bonus token per forward"),
+        ("spec_decode_sglang_acceptance_ratio", "fraction", "acceptance_ratio",
+         "Accepted / proposed draft tokens in the scheduler reporting interval"),
+    ):
+        fresh = _fresh_families(latest, [family])
+        values = fresh[family] if fresh else {}
+        if field == "acceptance_ratio" and any(v > 1 for v in values.values()):
+            values = {}
+        series = [{"labels": dict(labels), field: value} for labels, value in sorted(values.items())]
+        value = series[0][field] if len(series) == 1 else series or None
+        row = _derived(value, unit, f"{definition}; latest SGLang-reported gauge, not a run-window total",
+            samples=len(series), eligible=sum(s.get("family") == family for s in latest.get("samples", [])),
+            reason=None if series else "No valid SGLang gauge in the latest scrape; enabled state is unknown.",
+            measurement="scheduler_gauge", activity="unknown", series=series,
+            collected_at=latest.get("collected_at"), elapsed_seconds=latest.get("elapsed_seconds"),
+            aggregation="Each scheduler label series is separate; no pooling, sums or run-window averages.",
+            freshness="Exporter values may describe an earlier scheduler interval; source freshness without timestamps is unknown. A fresh scrape does not establish activity during this run.",
+            attribution="Server-wide values are not linked to selected requests or evidence of speedup.")
+        if value is None:
+            row["action"] = "Enable SGLang metrics and collect a valid scheduler gauge; absent values do not establish disabled speculation."
+        metrics[family] = row
+    return metrics
+
+
+def _derive_spec_decode(snapshots):
+    families = ["spec_decode_drafts", "spec_decode_draft_tokens", "spec_decode_accepted_tokens"]
+    eligible = max(0, len(snapshots) - 1)
+    totals = dict.fromkeys(families, 0.0)
+    raw, positions = defaultdict(float), defaultdict(lambda: [0.0, 0.0])
+    windows, position_windows = [], []
+    for left, right in zip(snapshots, snapshots[1:]):
+        intervals, _ = _counter_intervals([left, right], families)
+        if not intervals:
+            continue
+        if any(not float(sample["value"]).is_integer()
+               for snap in (left, right) for sample in snap.get("samples", [])
+               if sample.get("family") in families):
+            continue
+        _, deltas = intervals[0]
+        if any(deltas[families[2]][labels] > proposed
+               or (deltas[families[0]][labels] == 0 and proposed != 0)
+               for labels, proposed in deltas[families[1]].items()):
+            continue
+        if any(not math.isfinite(totals[family] + sum(counters.values()))
+               for family, counters in deltas.items()):
+            continue
+        windows.append((left["elapsed_seconds"], right["elapsed_seconds"]))
+        for family, counters in deltas.items():
+            for labels, value in counters.items():
+                totals[family] += value
+                raw[(family, labels)] += value
+        positional = _spec_positions(left, right, deltas)
+        if positional is None:
+            continue
+        position_windows.append(windows[-1])
+        for labels, value in positional.items():
+            scope = dict(labels)
+            position = int(scope.pop("position"))
+            positions[position][0] += value
+            positions[position][1] += deltas[families[0]][tuple(sorted(scope.items()))]
+            raw[("spec_decode_accepted_tokens_per_pos", labels)] += value
+
+    def coverage(observed):
+        return {"observed_intervals": len(observed), "excluded_intervals": eligible - len(observed),
+                "duration_seconds": sum(end - start for start, end in observed),
+                "first_elapsed_seconds": observed[0][0] if observed else None,
+                "last_elapsed_seconds": observed[-1][1] if observed else None,
+                "partial_coverage": bool(eligible - len(observed))}
+
+    drafts, proposed, accepted = (totals[family] for family in families)
+    activity = "observed" if drafts else "not_observed" if windows else "unknown"
+    details = coverage(windows) | {
+        "activity": activity,
+        "attribution": "Server-wide counters may include unrelated shared traffic; not request-linked or evidence of speedup.",
+        "activity_scope": "Activity describes valid observed intervals only; zero or missing counters do not establish disabled speculative decoding.",
+    }
+    reason = "No fresh coherent draft/proposed/accepted counter interval; counters may be absent, stale, reset, incomplete or inconsistent."
+    metrics = {}
+    for family, unit in zip(families, ("drafts", "tokens", "tokens")):
+        metrics[family] = _derived(totals[family] if windows else None, unit,
+            "Sum of matching adjacent speculative-decoding counter deltas; server-wide",
+            samples=len(windows), eligible=eligible, reason=None if windows else reason, **details)
+    for key, value, unit, formula in (
+        ("spec_decode_proposal_length", proposed / drafts if drafts else None, "tokens/draft", "Δproposed tokens / Δdrafts"),
+        ("spec_decode_acceptance_ratio", accepted / proposed if proposed else None, "fraction", "Δaccepted tokens / Δproposed tokens"),
+    ):
+        metrics[key] = _derived(value, unit, formula + "; pooled matching server-wide intervals",
+            samples=len(windows), eligible=eligible,
+            reason=None if value is not None else reason if not windows else "No nonzero denominator in valid observed intervals; ratio unavailable.",
+            **details)
+    metrics["spec_decode_accepted_tokens"]["details"].update(
+        accepted_tokens_by_position=[{"position": position, "accepted_tokens": count, "drafts": denominator,
+                                     "acceptance_ratio": count / denominator if denominator else None}
+                                    for position, (count, denominator) in sorted(positions.items())],
+        position_coverage=coverage(position_windows),
+        position_denominator="All drafts on engines exposing this zero-based position; not conditional on the position being proposed.")
+    return metrics, dict(raw)
 
 
 def _mean_duration(snapshots, family):
@@ -757,7 +968,8 @@ def derive_server_metrics(data, *, host_configured=False):
     polling interval. Source freshness without exporter timestamps stays unknown.
     """
     snapshots = data.get("snapshots", [])
-    metrics = {}
+    metrics, _ = _derive_spec_decode(snapshots)
+    metrics.update(_derive_sglang_spec_decode(snapshots))
     for family in ("server_ttft", "server_queue", "server_inference"):
         metrics[family + "_mean_ms"] = _mean_duration(snapshots, family)
         for percentile, row in _histogram_percentiles(snapshots, family).items():
@@ -816,6 +1028,11 @@ def derive_server_metrics(data, *, host_configured=False):
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
+            elif profiles and key.startswith("spec_decode_sglang_"):
+                if "sglang" not in profiles:
+                    row.update(state="not_supported", reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)
+            elif profiles and key.startswith("spec_decode_") and "vllm-v1" not in profiles:
+                row.update(state="not_supported", reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
             elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
                 family = key.rsplit("_", 2)[0]
                 required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")

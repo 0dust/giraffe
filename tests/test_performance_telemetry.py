@@ -199,3 +199,15 @@ def test_runtime_support_is_distinct_from_missing_collection():
     rows = telemetry.derive_server_metrics({"snapshots": [tgi]})
     assert rows["server_ttft_mean_ms"]["state"] == "not_supported"
     assert rows["server_queue_mean_ms"]["state"] == "insufficient_evidence"
+
+
+def test_optional_series_overflow_does_not_erase_existing_serving_counter_intervals():
+    from tests.test_gpu_reliability import combined_snapshot
+
+    first, _ = combined_snapshot(elapsed=0)
+    last, _ = combined_snapshot(elapsed=2)
+    assert first["series_limit_reached"]
+    assert all(f.startswith("spec_decode_") for f in first["truncated_families"])
+    result = telemetry.derive_server_metrics({"snapshots": [first, last]})
+    assert result["server_ttft_mean_ms"]["value"] == 500
+    assert result["server_ttft_mean_ms"]["details"]["excluded_intervals"] == 0
