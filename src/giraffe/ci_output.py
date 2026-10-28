@@ -1,7 +1,6 @@
 """Small CI exports for current and saved reports."""
 from __future__ import annotations
 
-import html
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -114,8 +113,11 @@ def write_junit(report: RunReport, path: Path) -> None:
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
 
-def _md(value: object) -> str:
-    return html.escape(_text(value), quote=False).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
+def _md(value: object, *, table_cell: bool = False) -> str:
+    text = _text(value).replace("\r", " ").replace("\n", " ").replace("`", r"\`")
+    text = re.sub(r"^(\s*)([#>*_~+\-\[!])", r"\1\\\2", text)
+    text = re.sub(r"^(\s*\d{1,9})([.)])(?=\s)", r"\1\\\2", text)
+    return text.replace("|", r"\|") if table_cell else text
 
 
 def _baseline_delta(report: RunReport) -> str:
@@ -146,7 +148,8 @@ def write_summary_md(report: RunReport, path: Path, report_path: Path | None) ->
     lines = [f"## Giraffe: **{_md(report.overall.upper())}**", "", f"Run: {_md(report.run_id)}", "",
              "| Target | Check | Verdict | Reason |", "| --- | --- | --- | --- |"]
     for check, status, reason in _rows(report):
-        lines.append(f"| {_md(check.target)} | {_md(check.id)} | {_md(status)} | {_md(reason)} |")
+        lines.append(f"| {_md(check.target, table_cell=True)} | {_md(check.id, table_cell=True)} | "
+                     f"{_md(status, table_cell=True)} | {_md(reason, table_cell=True)} |")
     if report.abort_reason:
         lines.extend(["", "Reason: " + _md(report.abort_reason)])
     report_line = (f"Report: {_md(report_path)}" if report_path is not None

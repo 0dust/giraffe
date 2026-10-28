@@ -101,7 +101,8 @@ def test_legacy_baseline_failure_and_markdown_escaping(tmp_path):
     summary = tmp_path / "nested" / "summary.md"
     write_summary_md(source, summary, Path("runs/report.json"))
     text = summary.read_text()
-    assert "\\|" in text and "&lt;script&gt;" in text
+    assert "\\|" in text and "<script>" in text
+    assert "&lt;" not in text and "&gt;" not in text
     assert "SECRET" not in text
 
 
@@ -151,3 +152,30 @@ def test_blocked_saved_report_without_results_covers_selected_checks(tmp_path):
     cases = ET.parse(path).findall('.//testcase')
     assert [case.get('name') for case in cases] == ['access', 'json', 'tools', 'gpu']
     assert all(case.find('error').get('message') == source.abort_reason for case in cases)
+
+
+def test_markdown_summary_preserves_comparisons_and_escapes_by_context(tmp_path):
+    source = report()
+    source.run_id = 'run|one'
+    source.checks[0].summary = '# correctness 0.0% < allowed 100.0% > reference & stable | `limit`'
+    source.abort_reason = '- partial < > & | `reason`'
+    path = tmp_path / 'summary.md'
+    write_summary_md(source, path, Path('runs/a|b/report.json'))
+    text = path.read_text()
+    assert r'| local | access | pass | \# correctness 0.0% < allowed 100.0% > reference & stable \| \`limit\` |' in text
+    assert 'Run: run|one' in text
+    assert r'Reason: \- partial < > & | \`reason\`' in text
+    assert 'Report: runs/a|b/report.json' in text
+    assert all(entity not in text for entity in ('&lt;', '&gt;', '&amp;'))
+
+
+@pytest.mark.parametrize('reason,escaped', [
+    ('> quoted', r'\> quoted'), ('* item', r'\* item'),
+    ('1. item', r'1\. item'), ('``code``', r'\`\`code\`\`'),
+])
+def test_markdown_summary_escapes_leading_controls(tmp_path, reason, escaped):
+    source = report()
+    source.checks[0].summary = reason
+    path = tmp_path / 'summary.md'
+    write_summary_md(source, path, None)
+    assert f'| local | access | pass | {escaped} |' in path.read_text()
