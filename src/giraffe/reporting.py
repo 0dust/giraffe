@@ -1800,6 +1800,27 @@ def html_failure_warning(error: OSError) -> str:
     return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
 
 
+def write_comparison_report(report: RunReport, directory: Path, *, max_run_storage: int) -> None:
+    """Replace a saved report atomically without reapplying response retention.
+
+    Baseline snapshots may share the original inode. Atomic replacement preserves
+    those snapshots, and a comparison never discards existing request evidence.
+    """
+    if max_run_storage and _json_size(report) > max_run_storage:
+        raise OSError(errno.ENOSPC, "Comparison exceeds the per-run storage limit")
+    directory = Path(directory)
+    _atomic_write_chunks(directory / "report.json", _report_json_chunks(report))
+    html_path = directory / "report.html"
+    if html_path.exists():
+        try:
+            _atomic_write(html_path, _render(report))
+        except OSError as error:
+            try:
+                html_path.unlink(missing_ok=True)
+            finally:
+                raise ReportWriteError(error, "report.html", json_complete=True) from error
+
+
 def write_report(report: RunReport, directory: Path, *, max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
                  html: bool = False) -> tuple[Path, Path | None]:
     """Save compact JSON; standalone HTML is an explicit optional export."""
