@@ -1523,6 +1523,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     configured_metrics(limits), phase_intervals=(tuple(interval),) if interval else ())
                 stage["timing_quality"] = stage_quality
                 if stage_quality["status"] == "client_delayed":
+                    qualified_ids = set(qualified_violations(stage_records, limits, stage_quality, arrival=True))
+                    stage["violations"] = [rid for rid in stage.get("violations", []) if rid in qualified_ids]
                     stage["accepted"] = False
                     stage["generator_limited"] = True
                     # Missing judgments may still pass; preserve a correctness
@@ -1776,6 +1778,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             baseline_error_rate = (sum(r.status == "failed" or (r.status == "completed" and not r.valid)
                                        for r in baseline_evaluated) / len(baseline_evaluated)
                                    if baseline_evaluated else None)
+            metrics["violations"] = qualified_violations(probes, limits, quality)
+            if ratio_failed and not saturated:
+                ratio_violations = [r.id for r in probes if any(
+                    value is not None and base is not None and base > 0 and value > base * limits.recovery_max_ratio
+                    for value, base in ((r.elapsed_ms, before["p50_ms"]),
+                                        (r.first_output_ms, before["first_output_p50_ms"])))]
+                metrics["violations"] = list(dict.fromkeys(metrics["violations"] + ratio_violations))
             metrics.update({"sustained": sustained_stats, "recovery": after,
                             "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
                             "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
@@ -1790,7 +1799,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             if ((probe_stats["error_rate"] is not None and probe_stats["error_rate"] > limits.max_error_rate)
                     or sustained_error_rate > limits.max_error_rate
                     or (baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate)
-                    or (qualified_violations(probes, limits, quality) or (ratio_failed and not saturated))
+                    or (metrics["violations"] or (ratio_failed and not saturated))
                     or (accuracy is not None and accuracy < limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
                 if baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate:

@@ -1525,7 +1525,11 @@ def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
     if traffic:
         rows.append(dict(traffic, metric="Highest acceptable tested arrival rate (requests/s)",
                          baseline=traffic.get("baseline_highest_acceptable_rate_rps"),
-                         current=traffic.get("current_highest_acceptable_rate_rps")))
+                         current=traffic.get("current_highest_acceptable_rate_rps"),
+                         acceptance_improved=(traffic.get("status") == "pass"
+                             and isinstance(traffic.get("baseline_highest_acceptable_rate_rps"), (int, float))
+                             and isinstance(traffic.get("current_highest_acceptable_rate_rps"), (int, float))
+                             and traffic["current_highest_acceptable_rate_rps"] > traffic["baseline_highest_acceptable_rate_rps"])))
     load = target.get("load_test")
     if load:
         from .load_test import point_label
@@ -1657,7 +1661,29 @@ def _request_prompt_excerpt(record: RequestRecord) -> str:
     return record.fixture_id
 
 
-def _received_answer(record: RequestRecord) -> str:
+def _response_saving_note(record: RequestRecord, report: RunReport) -> str:
+    policy = report.manifest.get("config", {}).get("retention", "failures")
+    if record.output and record.output_chars > len(record.output):
+        return "Response truncated"
+    if record.output or record.tool_calls:
+        return ""
+    if record.status in {"failed", "timeout"} and not record.output_chars:
+        return "No response received" + (f": {record.error}" if record.error else "")
+    if policy == "none" and not record.valid and record.output_chars == 0:
+        return ""
+    if policy == "none":
+        return "Response not saved (retention: none)"
+    omitted = report.manifest.get("storage", {}).get("response_bodies_omitted")
+    if omitted and (record.output_chars or record.valid or record.tool_evaluation):
+        return "Response not saved (storage limit)"
+    if omitted and record.evaluation and (record.evaluation.scorer == "tool" or record.evaluation.tool_expectation):
+        return "Response evidence unavailable (storage limit)"
+    if record.output_chars or record.answer_chars or (policy == "failures" and record.valid):
+        return f"Response not saved (retention: {policy})"
+    return ""
+
+
+def _received_answer(record: RequestRecord, report: RunReport) -> str:
     if record.output:
         return record.output
     if record.tool_calls:
@@ -1669,10 +1695,10 @@ def _received_answer(record: RequestRecord) -> str:
                 arguments = json.dumps(arguments, ensure_ascii=False)
             calls.append(f'{function.get("name", "Unknown tool")}({arguments})')
         return "Tool calls: " + "; ".join(calls)
-    return "No response text recorded"
+    return _response_saving_note(record, report) or ("Empty response" if record.status == "completed" else "No response recorded")
 
 
-def _answer_findings_html(check: CheckResult, records: list[RequestRecord]) -> str:
+def _answer_findings_html(check: CheckResult, records: list[RequestRecord], report: RunReport) -> str:
     matches = [r for r in records if r.target == check.target and check.id in r.check_ids
                and (r.score is False or r.evaluation_error) and r.evaluation][:3]
     parts = []
@@ -1690,7 +1716,9 @@ def _answer_findings_html(check: CheckResult, records: list[RequestRecord]) -> s
             criterion, expected = "Tool expectation", json.dumps(evidence.tool_expectation.model_dump(), ensure_ascii=False)
         else:
             criterion, expected = "Answer check", evidence.scorer
-        received = _received_answer(record)
+        received = _received_answer(record, report)
+        saving_note = _response_saving_note(record, report)
+        received_html = _preview(received) if record.output or record.tool_calls else f'<span class="muted">{_e(received)}</span>'
         excerpt = (f'{criterion}: {expected[:160]}{"…" if len(expected) > 160 else ""} · '
                    f'Received: {received[:160]}{"…" if len(received) > 160 else ""}')
         reason = record.evaluation_error or record.score_message
@@ -1699,13 +1727,22 @@ def _answer_findings_html(check: CheckResult, records: list[RequestRecord]) -> s
                      f' · {_e(excerpt)}</summary><p class="muted">{_e(condition)} · {_e(record.id)}</p>'
                      + (f'<p>{_e(reason)}</p>' if reason else '') +
                      f'<p><strong>{criterion}:</strong> {_preview(expected)}</p>'
-                     f'<p><strong>Received:</strong> {_preview(received)}</p></details>')
+                     f'<p><strong>Received:</strong> {received_html}</p>'
+                     + (f'<p class="muted">{_e(saving_note)}</p>' if saving_note and (record.output or record.tool_calls) else '')
+                     + '</details>')
     return ''.join(parts)
 
 
 def _json_export_html(report: RunReport) -> str:
     return ('<p class="muted"><a href="report.json">JSON export</a> · '
             'report.json — keep it next to this file</p>')
+
+
+def _check_timing_violation_ids(check: CheckResult) -> set[str]:
+    # Current capacity reports store IDs once per stage; older reports aggregate them.
+    sources = [check.metrics.get("violations", []),
+               *(stage.get("violations", []) for stage in check.metrics.get("traffic_stages", []))]
+    return {rid for source in sources if isinstance(source, list) for rid in source if isinstance(rid, str)}
 
 
 def _render(report: RunReport) -> str:
@@ -1715,9 +1752,12 @@ def _render(report: RunReport) -> str:
     report = refresh_performance(report.model_copy())
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
+    timing_failures = {rid for check in report.checks if check.status == "fail"
+                       for rid in _check_timing_violation_ids(check)}
+    evidence.update(timing_failures)
     ordered = sorted(report.requests, key=lambda r: (
         r.id not in evidence,
-        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error)))
+        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error or r.id in timing_failures)))
     detailed = ordered[:max(DEFAULT_HTML_REQUEST_DETAILS, sum(r.id in evidence for r in report.requests))]
     anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
@@ -1749,7 +1789,7 @@ def _render(report: RunReport) -> str:
     findings = [check for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}]
     for check in findings:
         parts.append(f'<article class="card"><strong>{_e(check.title)}</strong> · {_e(check.target)}'
-                     f'<p>{_e(check.summary)}</p>{_answer_findings_html(check, report.requests)}</article>')
+                     f'<p>{_e(check.summary)}</p>{_answer_findings_html(check, report.requests, report)}</article>')
     if not findings:
         parts.append('<p>All selected checks passed.</p>' if report.overall == "pass"
                      else '<p>No check findings were recorded.</p>')
@@ -1952,9 +1992,11 @@ def _render(report: RunReport) -> str:
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_preview(record.output)}</pre>')
         elif record.tool_calls:
-            parts.append(f'<h3>Tool response</h3><pre>{_preview(_received_answer(record))}</pre>')
+            parts.append(f'<h3>Tool response</h3><pre>{_preview(_received_answer(record, report))}</pre>')
         else:
-            parts.append('<p class="muted">No retained response body.</p>')
+            parts.append(f'<p class="muted">{_e(_received_answer(record, report))}</p>')
+        if record.output and (saving_note := _response_saving_note(record, report)):
+            parts.append(f'<p class="muted">{_e(saving_note)}</p>')
         if record.reasoning:
             parts.append(f'<h3>Reasoning response</h3><pre>{_preview(record.reasoning)}</pre>')
         parts.append(f'<details><summary>Local fixture and measured request evidence</summary><pre>'

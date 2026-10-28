@@ -113,7 +113,7 @@ assert.equal((html.match(/<div class="finding-request">/g)||[]).length,1);
 def test_stop_confirmation_expires_and_cannot_carry_to_another_run():
     run_render_checks(r"""
 (async()=>{
- let timer;setTimeout=(fn,ms)=>{if(ms===4000)timer=fn;};api=async()=>{throw Error('must not cancel');};
+ let timer;Date.now=()=>1000;setTimeout=(fn,ms)=>{if(ms===4000)timer=fn;};api=async()=>{throw Error('must not cancel');};
  state.detail={id:'one',state:'running',config:{targets:[]},events:[],progress:{}};renderLive();await confirmStop();assert.match($('[data-action="stop"]').textContent,/Confirm stop/);
  timer();assert.equal($('[data-action="stop"]').textContent,'Stop run');
  await confirmStop();state.detail.id='two';renderLive();await confirmStop();assert.equal(state.stopConfirmation.id,'two');assert.match($('[data-action="stop"]').textContent,/Confirm stop/);

@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261027-results-round2';
+import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-round5';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -775,6 +775,8 @@ function hideSpotTip() {const tip=$('#spot-tip');if(tip)tip.hidden=true;spotTipT
 function refreshSpotTip() {if($('#spot-tip')?.hidden===false){if(spotTipTarget?.isConnected)showSpotTip(spotTipTarget,spotTipPosition.x,spotTipPosition.y);else hideSpotTip();}}
 async function route() {
   const destination=reportRoute();
+  pendingReportReveal=null;
+  if(!destination||!state.reportRouteActive||state.detail?.id!==destination.id)cancelStopConfirmationTimer({reset:true});
   if(destination&&state.reportRouteActive&&state.detail?.id===destination.id){
     syncReportView();
     if(destination.tab){reportView.tab=destination.tab;reportView.explicit=true;}
@@ -927,6 +929,7 @@ function cleanupResultNotice() {
   return `<div class="notice ${skipped.length?'warning':'info'}" role="status">${escape(message)}</div>`;
 }
 function renderRuns() {
+  cancelStopConfirmationTimer({reset:true});
   const focused=document.activeElement,focusId=['run-search','run-filter'].includes(focused?.id)?focused.id:null;
   const selection=focusId==='run-search'?[focused.selectionStart,focused.selectionEnd]:null;
 
@@ -2555,6 +2558,7 @@ function watchPlanViewport() {
   if(dock&&typeof ResizeObserver!=='undefined'){state.planViewportObserver=new ResizeObserver(resize);state.planViewportObserver.observe(dock);}
 }
 function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?.limits})) {
+  cancelStopConfirmationTimer({reset:true});
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
@@ -3130,27 +3134,40 @@ async function loadPerformance({force=false}={}) {
     if(target!==reportView.target||window!==reportView.window){reportView.again=true;return;}
     reportView.performance=value;reportView.error='';
   }catch(error){if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence)reportView.error=error.message;}
-  finally{if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence){reportView.pending=false;if(reportView.again){reportView.again=false;loadPerformance({force:true});}else if(state.reportRouteActive)renderDetail();}}
+  finally{if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence){reportView.pending=false;if(reportView.again){reportView.again=false;loadPerformance({force:true});}else if(state.reportRouteActive){renderDetail();finishPendingReportReveal();}}}
 }
 
 function resultActions(report,{completePass=false,savedBaseline=null}={}) {
   const failed=report.checks.filter(c=>c.id!=='baseline'&&['fail','blocked'].includes(c.status));
   if(savedBaseline&&completePass)return '<button class="button primary" data-action="compare-run">Compare a new run</button>';
   if(completePass)return '<button class="button primary" data-action="baseline-dialog">Save baseline</button>';
-  if(failed.some(c=>findingRequests(c,report).some(isFailingRequest)))return '<button class="button primary" data-action="show-failing">Show failing requests</button>';
+  if(failed.some(c=>checkHasFailingRequests(c,report)))return '<button class="button primary" data-action="show-failing">Show failing requests</button>';
   if(report.checks.some(c=>['inconclusive','blocked'].includes(c.status)))return '<button class="button primary" data-action="show-inconclusive">Show inconclusive checks</button>';
   if(report.baseline)return '<button class="button primary" data-action="show-comparison">Show comparison</button>';
   return '';
 }
-function revealReportSection(section) {
-  if(section==='baseline'){
-    state.tab='baseline';const reference=$('#report-baseline-reference');if(reference){reference.open=true;reference.scrollIntoView?.({block:'start'});$('summary',reference)?.focus({preventScroll:true});}
-  }else $(`#performance-${section}`)?.scrollIntoView?.({block:'start'});
+let pendingReportReveal=null;
+function revealReportSection(section,{defer=true}={}) {
+  if(defer&&reportView.tab==='performance'&&(!selectedPerformance().summary||reportView.pending)){
+    pendingReportReveal={id:state.detail.id,version:state.routeVersion,hash:location.hash,section};return;
+  }
+  const panel=$(`#report-${reportView.tab}`);if(!panel||panel.hidden)return;
+  if(section==='baseline'&&reportView.tab==='results'){
+    state.tab='baseline';const reference=$('#report-baseline-reference',panel);if(reference){reference.open=true;reference.scrollIntoView?.({block:'start'});$('summary',reference)?.focus({preventScroll:true});}
+  }else {
+    const target=$(`#performance-${section}`,panel);if(!target)return;
+    target.scrollIntoView?.({block:'start'});if(section==='baseline'){const heading=$('h2',target)||target;heading.setAttribute('tabindex','-1');heading.focus?.({preventScroll:true});}
+  }
+}
+function finishPendingReportReveal() {
+  const pending=pendingReportReveal;pendingReportReveal=null;
+  const destination=reportRoute();
+  if(pending&&pending.id===state.detail?.id&&pending.version===state.routeVersion&&pending.hash===location.hash&&destination?.section===pending.section&&destination.tab===reportView.tab)revealReportSection(pending.section,{defer:false});
 }
 function showFailingRequests() {
   chooseReportTab('results');
   const report=state.detail.report||summaryReport(state.detail);
-  const check=report.checks.find(c=>c.id!=='baseline'&&['fail','blocked'].includes(c.status)&&findingRequests(c,report).some(isFailingRequest));
+  const check=report.checks.find(c=>c.id!=='baseline'&&['fail','blocked'].includes(c.status)&&checkHasFailingRequests(c,report));
   if(!check)return;
   state.selectedCheck=`${check.target}:${check.id}`;state.failingRequestsOnly=true;
   patchHTML($('#result-content'),renderChecks(report));loadFindingEvidence();
@@ -3158,6 +3175,7 @@ function showFailingRequests() {
 }
 
 function renderDetail() {
+  cancelStopConfirmationTimer();
   state.reportRouteActive=true;
   const d=state.detail;
   syncReportView();
@@ -3212,12 +3230,43 @@ function storageOmission(report) {
 }
 function keyMetric(check,report){if(check.status==='skipped')return report&&unselectedCheck(check,report)?'Not selected':check.summary || 'No result recorded';const m=check.metrics || {};if(check.id==='load')return counted(m.points?.length||0,'load test');if(check.id==='concurrency'&&m.load_types)return `${counted(Object.values(m.load_types).reduce((total,group)=>total+(group.points?.length || 0),0),'test point')} · ${counted(Object.keys(m.load_types).length,'load type')}`;if(check.id==='cancellation'&&m.cancellation_results)return `Server stopped: ${human(m.cancellation_results.server_stopped.status)} · Answer: ${human(m.cancellation_results.answer.status)}`;if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
 let findingEvidence={id:null,records:new Map(),pending:new Set(),errors:new Map()};
-function isFailingRequest(record) {return record.score===false||record.valid===false||Boolean(record.evaluation_error)||['failed','timeout','timed_out','evaluation_error'].includes(record.status);}
-function requestPriority(record) {return record.score===false?-2:isFailingRequest(record)?-1:0;}
+function checkViolationIds(check,report) {
+  const ids=new Set();
+  const visit=value=>{
+    if(!value||typeof value!=='object')return;
+    for(const [key,items] of Object.entries(value)){
+      if(key==='timing_violations'&&(Array.isArray(value.qualified_timing_violations)||value.timing_quality?.status==='client_delayed'||check.metrics?.timing_quality?.status==='client_delayed'))continue;
+      if(['violations','timing_violations','qualified_timing_violations'].includes(key)&&Array.isArray(items)){
+        for(const item of items){const id=typeof item==='string'?item:item?.request_id||item?.id;if(id)ids.add(id);}
+      }else if(typeof items==='object')visit(items);
+    }
+  };
+  visit(check.metrics);
+  const conditions=report.conditions||Object.values(report.observations?.targets||{}).flatMap(target=>target.conditions||[]);
+  for(const condition of conditions)if((!condition.target||condition.target===check.target)&&(condition.check_id===check.id||condition.check_ids?.includes(check.id)))visit(condition);
+  return ids;
+}
+function isFailingRequest(record,violations=null) {return record.score===false||record.valid===false||Boolean(record.evaluation_error)||['failed','timeout','timed_out','evaluation_error'].includes(record.status)||Boolean(violations?.has(record.id));}
+function requestPriority(record,violations=null) {return record.score===false?-2:isFailingRequest(record,violations)?-1:0;}
 function findingRequests(check,report) {
-  const ids=new Set(check.evidence_ids||[]);
-  return report.requests.filter(r=>ids.has(r.id)||(r.target===check.target&&r.check_ids?.includes(check.id)))
-    .sort((a,b)=>requestPriority(a)-requestPriority(b));
+  const violations=checkViolationIds(check,report),ids=new Set([...(check.evidence_ids||[]),...violations]);
+  const records=report.requests.filter(r=>ids.has(r.id));
+  return check.status==='pass'?records:records.sort((a,b)=>requestPriority(a,violations)-requestPriority(b,violations));
+}
+function checkHasFailingRequests(check,report) {
+  const violations=checkViolationIds(check,report);
+  return findingRequests(check,report).some(record=>isFailingRequest(record,violations));
+}
+function timingFailureReason(record,check,report,violations) {
+  if(!violations.has(record.id))return '';
+  if(check.status==='pass')return check.id==='capacity'?'Over limit (stage above accepted rate)':'Over configured limit';
+  const measured=check.id==='capacity'?{...record,first_output_ms:record.arrival_first_output_ms??record.first_output_ms,elapsed_ms:record.arrival_elapsed_ms??record.elapsed_ms}:record;
+  const config=reportConfig(report),limits=report.manifest?.effective_checks?.[check.id]?.limits||{...config.limits,...config.test_options?.[check.id]?.limits};
+  const timings=[['first_token_ms','first_token_ms','TTFT'],['first_output_ms','first_output_ms','first output'],['elapsed_ms','latency_ms','response time'],['max_stream_gap_ms','stream_gap_ms','stream pause']];
+  const reasons=timings.filter(([field,limit])=>(check.id!=='first_output'||field==='first_output_ms')&&(check.id!=='generation'||field!=='first_output_ms')&&Number.isFinite(measured[field])&&Number.isFinite(limits[limit])&&measured[field]>limits[limit])
+    .map(([field,limit,label])=>`${label} ${number(measured[field]/1000,2)} s > ${number(limits[limit]/1000,2)} s`);
+  if(Number.isFinite(record.generation_tokens_per_second)&&Number.isFinite(limits.min_output_tokens_per_second)&&record.generation_tokens_per_second<limits.min_output_tokens_per_second)reasons.push(`generation ${number(record.generation_tokens_per_second,2)} tok/s < ${number(limits.min_output_tokens_per_second,2)} tok/s`);
+  return reasons.length?`Too slow: ${reasons.join(' · ')}`:`Timing limit exceeded: ${shortReason(check.summary).summary}`;
 }
 function inlineAnswerRequests(check,report) {
   if(check.status==='pass'||unselectedCheck(check,report))return [];
@@ -3257,6 +3306,19 @@ function answerExcerpt(value) {
   const text=value===undefined?'Not recorded':typeof value==='string'?value:JSON.stringify(value);
   return text.length>130?`<details class="answer-excerpt"><summary>${escape(text.slice(0,130))}…</summary><pre>${escape(text)}</pre></details>`:escape(text);
 }
+function responseSavingNote(record,report) {
+  const text=record.output||'',calls=record.tool_calls||[],policy=reportConfig(report).retention||'failures';
+  if(text&&record.output_chars>[...text].length)return 'Response truncated';
+  if(text||calls.length)return '';
+  if(['failed','timeout','timed_out'].includes(record.status)&&!(record.output_chars>0))return `No response received${record.error?': '+record.error:''}`;
+  if(policy==='none'&&record.valid===false&&record.output_chars===0)return '';
+  if(policy==='none')return 'Response not saved (retention: none)';
+  const omitted=report?.manifest?.storage?.response_bodies_omitted;
+  if(omitted&&(record.output_chars>0||record.valid||record.tool_evaluation))return 'Response not saved (storage limit)';
+  if(omitted&&(record.evaluation?.scorer==='tool'||record.evaluation?.tool_expectation))return 'Response evidence unavailable (storage limit)';
+  if(record.output_chars>0||record.answer_chars>0||(policy==='failures'&&record.valid))return `Response not saved (retention: ${policy})`;
+  return '';
+}
 function requestAnswerDifference(record) {
   const evaluation=record.evaluation || {},tool=evaluation.tool_expectation;
   const schema=evaluation.schema ?? evaluation.schema_,rubric=evaluation.rubric;
@@ -3264,7 +3326,8 @@ function requestAnswerDifference(record) {
   const hasExpected=tool?.expected_calls!=null||tool?.expected_content!=null||evaluation.expected_provided===true||(evaluation.expected_provided!==false&&evaluation.expected!==undefined);
   const requirement=hasExpected?`<strong>Expected:</strong> ${answerExcerpt(expected)}`:schema?`<strong>Schema:</strong> ${answerExcerpt(schema)}`:rubric?`<strong>Rubric:</strong> ${answerExcerpt(rubric)}`:'<strong>Expected:</strong> No fixed answer configured';
   const received=tool?.expected_calls!=null?{...(record.output?{text:record.output}:{}),tool_calls:record.tool_calls||[]}:record.tool_calls?.length&&!record.output?record.tool_calls:record.output;
-  const body=received==null?`<span>${reportConfig(state.detail?.report).retention==='none'?'Response body not retained':'Open request for response evidence'}</span>`:answerExcerpt(received);
+  const note=responseSavingNote(record,state.detail?.report),hasBody=Boolean(record.output||record.tool_calls?.length);
+  const body=hasBody?answerExcerpt(received)+(note?`<small class="hint">${escape(note)}</small>`:''):`<span class="hint">${escape(note||(record.output===undefined?'Open request for response evidence':record.status==='completed'?'Empty response':'No response recorded'))}</span>`;
   return `<span class="answer-difference"><span>${requirement}${!hasExpected&&(schema||rubric)&&(record.score_message||record.evaluation_error)?`<small>${escape(record.score_message||record.evaluation_error)}</small>`:''}</span><span><strong>Received:</strong> ${body}</span></span>`;
 }
 function renderChecks(report) {
@@ -3290,8 +3353,8 @@ function renderCancellationResults(metrics){
 }
 function renderCheck(check,report) {
   const m=check.metrics || {},config=reportConfig(report),limits={...(config.limits || {}),...(config.test_options?.[check.id]?.limits || {})};
-  const positions=requestPositions(report.requests),evidenceSet=new Set(check.evidence_ids || []),records=report.requests.filter(r=>evidenceSet.has(r.id));
-  const sorted=[...records].filter(r=>!state.failingRequestsOnly||isFailingRequest(r)).sort((a,b)=>requestPriority(a)-requestPriority(b));
+  const positions=requestPositions(report.requests),violations=checkViolationIds(check,report),records=findingRequests(check,report);
+  const sorted=records.filter(r=>!state.failingRequestsOnly||isFailingRequest(r,check.status==='pass'?null:violations));
   const metrics=[];
   if(m.timing_quality){
     const quality=m.timing_quality;
@@ -3345,7 +3408,7 @@ function renderCheck(check,report) {
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
   ${check.id==='capacity'&&m.levels?`<div class="metric-table"><table><thead><tr><th>Load</th><th>Achieved</th><th>Correct</th><th>p95</th></tr></thead><tbody>${Object.entries(m.levels).map(([k,v])=>`<tr><td class="mono">${escape(k)}</td><td>${number(v.achieved_concurrency)}</td><td>${v.correct ?? 0} / ${v.scored ?? 0}</td><td class="mono">${ms(v.p95_ms)}</td></tr>`).join('')}</tbody></table></div>`:''}
   ${check.id==='gpu'&&m.snapshots?renderGpuSnapshots(m.snapshots):''}
-  ${records.length?`<div class="evidence-title"><span>Requests</span><span class="hint">${records.length} recorded · incorrect and failed first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?`<span class="status fail">Incorrect</span>${renderInlineAnswer(r,report,{loading:false})}`:r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
+  ${records.length?`<div class="evidence-title"><span>Requests</span><span class="hint">${state.failingRequestsOnly?`${sorted.length} failing · `:''}${records.length} recorded · incorrect and failed first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${violations.has(r.id)?`<small${check.status==='pass'?' class="hint"':''}>${escape(timingFailureReason(r,check,report,violations))}</small>`:''}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?`<span class="status fail">Incorrect</span>${renderInlineAnswer(r,report,{loading:false})}`:r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
   ${Object.keys(extras).length?`<details class="check-observations"><summary>More measurements</summary><pre>${escape(JSON.stringify(extras,null,2))}</pre></details>`:''}`;
 }
 function renderGpuSnapshots(snapshots){return snapshots.map(snapshot=>`<div class="metric-table"><h3>${escape(human(snapshot.phase))} <span class="hint">${date(snapshot.collected_at)}</span></h3>${snapshot.reason?`<p class="hint" style="margin:12px 0">${escape(snapshot.reason)}</p>`:''}${snapshot.unavailable?.length?`<p class="hint" style="margin:12px 0">Unavailable: ${snapshot.unavailable.map(human).map(escape).join(', ')}</p>`:''}${snapshot.samples?.length?`<table><thead><tr><th>Metric</th><th>Value</th><th>Freshness</th></tr></thead><tbody>${snapshot.samples.map(s=>`<tr><td>${escape(s.name)}<small>${escape(s.labels)}</small></td><td class="mono">${number(s.value,3)}</td><td>${s.stale?'Stale':s.age_seconds==null?'Scrape only':`${number(s.age_seconds,1)}s old`}</td></tr>`).join('')}</tbody></table>`:''}</div>`).join('');}
@@ -3376,7 +3439,7 @@ function comparisonChange(row) {
 }
 function baselineRows(target) {
   const rows=[...(target.comparisons||[])],traffic=target.traffic_capacity,load=target.load_test;
-  if(traffic)rows.push({...traffic,check:'capacity',metric:'accepted_arrival_rate',baseline:traffic.baseline_highest_acceptable_rate_rps,current:traffic.current_highest_acceptable_rate_rps});
+  if(traffic)rows.push({...traffic,check:'capacity',metric:'accepted_arrival_rate',baseline:traffic.baseline_highest_acceptable_rate_rps,current:traffic.current_highest_acceptable_rate_rps,acceptance_improved:traffic.status==='pass'&&Number.isFinite(traffic.baseline_highest_acceptable_rate_rps)&&Number.isFinite(traffic.current_highest_acceptable_rate_rps)&&traffic.current_highest_acceptable_rate_rps>traffic.baseline_highest_acceptable_rate_rps});
   for(const point of load?.points||[])rows.push({...point,check:'load',metric:'load_acceptance',scenario_label:loadPointLabel(point.current||point.baseline||{}),baseline:point.baseline?.status,current:point.current?.status,acceptance_improved:point.status==='pass'&&point.baseline?.status==='fail'&&point.current?.status==='pass'});
   if(load&&!load.points?.length)rows.push({...load,check:'load',metric:'load_acceptance'});
   if(!rows.length)rows.push({metric:'Comparison coverage',status:'inconclusive',reason:(target.reasons||[]).join(' ')||target.summary||'No comparable measurements recorded.'});
@@ -3440,6 +3503,7 @@ function liveStopReasons(detail) {
   return [...reasons];
 }
 function renderLive() {
+  cancelStopConfirmationTimer();
   state.reportRouteActive=true;
   syncReportView();
   state.detail.live_requests=stableLiveRequests(state.detail.live_requests || []);
@@ -3463,7 +3527,7 @@ function renderLive() {
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderDiagnostics(d.report,d)}</section>`,{landing:true});
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
   if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}
-  refreshSpotTip();refreshConditionDialog();loadDetailPlan();
+  refreshSpotTip();refreshConditionDialog();loadDetailPlan();scheduleStopConfirmationReset();
   if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance();
 }
 function renderJudgement(judgement) {
@@ -3564,12 +3628,25 @@ async function openRequest(id) {
 function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
 async function saveBaseline(event){event.preventDefault();const form=event.target,data=new FormData(form),button=$('#save-baseline'),error=$('#baseline-error');button.disabled=true;error.hidden=true;try{await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:state.detail.id,name:String(data.get('baseline_name')).trim(),replace:data.has('replace')})});const result=await api('/api/baselines');state.baselines=result.baselines || [];$('#baseline-dialog').close();renderDetail();toast(`Saved as baseline “${String(data.get('baseline_name')).trim()}”. Use Compare a new run to test against it.`);}catch(e){error.textContent=e.message;error.hidden=false;if(e.status===409)$('#replace-row').hidden=false;}finally{button.disabled=false;}}
+let stopConfirmationTimer=null,stopConfirmationEpoch=0;
+function cancelStopConfirmationTimer({reset=false}={}) {
+  if(stopConfirmationTimer!=null&&typeof clearTimeout==='function')clearTimeout(stopConfirmationTimer);
+  stopConfirmationTimer=null;stopConfirmationEpoch++;
+  if(reset||state.stopConfirmation?.id!==state.detail?.id||!activeState(state.detail))state.stopConfirmation=null;
+}
+function scheduleStopConfirmationReset() {
+  const confirmation=state.stopConfirmation;if(!confirmation||typeof setTimeout!=='function')return;
+  const epoch=stopConfirmationEpoch,version=state.routeVersion,id=state.detail.id,hash=typeof location==='undefined'?'':location.hash;
+  stopConfirmationTimer=setTimeout(()=>{
+    if(epoch!==stopConfirmationEpoch||version!==state.routeVersion||state.detail?.id!==id||state.stopConfirmation!==confirmation||!state.reportRouteActive||!activeState(state.detail)||(typeof location!=='undefined'&&location.hash!==hash))return;
+    stopConfirmationTimer=null;state.stopConfirmation=null;renderDetail();
+  },Math.max(0,confirmation.until-Date.now()));
+}
 async function confirmStop(){
   const id=state.detail?.id;if(!activeState(state.detail)||state.detail.state==='stopping')return;
   const current=state.stopConfirmation,now=Date.now();
-  if(current?.id===id&&now<current.until){if(now-current.armedAt<300)return;state.stopConfirmation=null;await stopRun();return;}
-  const confirmation={id,armedAt:now,until:now+4000};state.stopConfirmation=confirmation;renderDetail();
-  setTimeout(()=>{if(state.stopConfirmation!==confirmation)return;state.stopConfirmation=null;if(state.detail?.id===id&&activeState(state.detail))renderDetail();},4000);
+  if(current?.id===id&&now<current.until){if(now-current.armedAt<300)return;cancelStopConfirmationTimer({reset:true});await stopRun();return;}
+  state.stopConfirmation={id,armedAt:now,until:now+4000};renderDetail();
 }
 
 async function stopRun(){
