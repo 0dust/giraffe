@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-round5';
+import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -3475,12 +3475,20 @@ function baselineIdentity(baseline) {
   const when=baseline.source_started_at || run?.started_at || saved?.saved_at;
   return `<strong>${escape(label)}</strong>${when?`<span>${date(when)}</span>`:''}<details class="baseline-identifier"><summary>Reference ID</summary><code>${escape(baseline.run_id || 'Not recorded')}</code></details>`;
 }
+function renderDeploymentChange(diff) {
+  if(!diff)return '';
+  const changed=(diff.fields||[]).filter(row=>row.change!=='no_observed_change').map(row=>row.field),intended=diff.intended_change;
+  let summary=changed.length?`Deployment change: ${changed.join(', ')}`:'No observed deployment changes.';
+  if(changed.length&&intended&&!diff.confounded)summary+=' (one intended change)';
+  const fields=Array.isArray(intended)?intended:[intended];
+  return `<p class="deployment-change">${escape(summary)}</p>${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
+}
 function renderComparison(report) {
   const baseline=report.baseline;if(!baseline)return '<p class="hint">No baseline selected.</p>';
   return `<header class="comparison-conclusion"><h2>Baseline comparison</h2><div class="baseline-reference">${baselineIdentity(baseline)}</div></header>${(baseline.targets||[]).map(target=>{
     const groups=new Map();for(const row of baselineRows(target)){const key=JSON.stringify([row.check,row.scenario_label||row.scenario]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
     const priority=rows=>Math.min(...rows.map(row=>({'worse':0,'better':1,'no material change':2,'not comparable':3}[comparisonVerdict(row)])));
-    return `<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')}</h3>${target.load_test?.reason?`<p class="hint">${escape(target.load_test.reason)}</p>`:''}${[...groups.values()].sort((a,b)=>priority(a)-priority(b)).map(comparisonCondition).join('')}${target.reasons?.length?`<p class="hint">${target.reasons.map(escape).join(' ')}</p>`:''}${target.traffic_capacity?.stages?.length?`<details><summary>Arrival stage evidence</summary>${renderTrafficComparison(target.traffic_capacity)}</details>`:''}<details class="comparison-support"><summary>Deployment and comparison details</summary><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></details></section>`;
+    return `<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')}</h3>${renderDeploymentChange(target.configuration_diff)}${target.load_test?.reason?`<p class="hint">${escape(target.load_test.reason)}</p>`:''}${[...groups.values()].sort((a,b)=>priority(a)-priority(b)).map(comparisonCondition).join('')}${target.reasons?.length?`<p class="hint">${target.reasons.map(escape).join(' ')}</p>`:''}${target.traffic_capacity?.stages?.length?`<details><summary>Arrival stage evidence</summary>${renderTrafficComparison(target.traffic_capacity)}</details>`:''}<details class="comparison-support"><summary>Deployment and comparison details</summary><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></details></section>`;
   }).join('')}<details class="comparison-support"><summary>Comparison method</summary><p class="hint">${escape(baseline.method||'Method was not recorded.')}</p></details>`;
 }
 

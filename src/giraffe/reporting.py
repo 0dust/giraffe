@@ -1564,10 +1564,37 @@ def _baseline_summary_html(baseline: dict[str, Any]) -> str:
             f'{_e(baseline.get("name") or baseline.get("run_id", "unknown"))}: {_e(summary)}</a></p>')
 
 
+def _deployment_change_html(diff: dict[str, Any]) -> str:
+    if not diff:
+        return ""
+    changed = [row["field"] for row in diff.get("fields", [])
+               if row.get("change") != "no_observed_change"]
+    intended = diff.get("intended_change")
+    summary = ("Deployment change: " + ", ".join(changed) if changed
+               else "No observed deployment changes.")
+    if changed and intended and not diff.get("confounded"):
+        summary += " (one intended change)"
+    parts = [f'<p class="deployment-change">{_e(summary)}</p>']
+    if diff.get("confounded"):
+        parts.append('<p><strong>Confounded: multiple unrelated changes.</strong></p>')
+        if intended:
+            fields = intended if isinstance(intended, list) else [intended]
+            parts.append(f'<p class="muted">Intended change: {_e(", ".join(fields))}</p>')
+    if diff.get("unknown_baseline"):
+        parts.append('<p class="muted">Baseline deployment configuration was not recorded.</p>')
+    if diff.get("interpretation"):
+        parts.append(f'<p class="muted">{_e(diff["interpretation"])}</p>')
+    return "".join(parts)
+
+
 def _baseline_table_html(baseline: dict[str, Any]) -> str:
     conditions: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     notes = []
     for target in baseline.get("targets", []):
+        deployment = _deployment_change_html(target.get("configuration_diff") or {})
+        if deployment:
+            notes.append(f'<div><h3>{_e(target.get("target", "Target"))} · Deployment</h3>'
+                         f'{deployment}</div>')
         rows = _baseline_display_rows(target)
         for row in rows:
             conditions[(target.get("target"), row.get("check"), row.get("scenario"))].append(row)

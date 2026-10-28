@@ -48,7 +48,9 @@ async def test_grouped_change_survives_run_baseline_export_and_rerun(tmp_path):
         saved = load_report(tmp_path)
         assert saved.baseline["targets"][0]["configuration_diff"] == diff
         html = unescape((tmp_path / "report.html").read_text())
-        assert '"confounded":false' in html
+        assert f'Deployment change: {", ".join(FIELDS)} (one intended change)' in html
+        assert 'Confounded: multiple unrelated changes' not in html
+        assert 'data:application/json' not in html and '<script' not in html
         assert all(field in html for field in FIELDS)
         exported = reproduction_export(saved)
         assert exported["deployments"]["local"]["intended_change"] == FIELDS
