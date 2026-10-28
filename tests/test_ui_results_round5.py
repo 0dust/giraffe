@@ -41,6 +41,6 @@ def test_capacity_labels_use_arrival_timing_and_accept_old_aggregate_ids(legacy)
  const metrics=LEGACY?{violations:['slow']}:{traffic_stages:[{violations:['slow']}]};
  const value=report([check('capacity','fail',{evidence_ids:['slow'],metrics})],{overall:'fail',requests:[{id:'slow',target:'local',status:'completed',valid:true,score:true,first_output_ms:500,elapsed_ms:600,arrival_first_output_ms:12300,arrival_elapsed_ms:12400}]});
  value.manifest.effective_checks={capacity:{limits:{first_output_ms:10000,latency_ms:11000}}};detail(value);await listeners.click({target:$('[data-action="show-failing"]')});
- assert.match($('.evidence-table').textContent,/first output 12\.3 s > 10 s/);assert.match($('.evidence-table').textContent,/response time 12\.4 s > 11 s/);
+ assert.match($('.evidence-table').textContent,/first answer 12\.3 s > 10 s/);assert.match($('.evidence-table').textContent,/response time 12\.4 s > 11 s/);
 })()
 """.replace('LEGACY', str(legacy).lower()), dom=True)

@@ -2003,6 +2003,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         if check.status not in {"fail", "inconclusive", "blocked"}:
             continue
         config = _check_config(run.config, check.id)
+        if check.finding_summary is None:
+            check.finding_summary = check.summary
         evidence = set(check.evidence_ids)
         records = [r for r in all_records if r.id in evidence]
         interrupted = (check.id in run.unfinished[target.name] and check.status == "inconclusive"
@@ -2021,13 +2023,20 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                              f"Stopped by you after {len(run.records)} requests. This duration-based workload has no fixed request count.")
             continue
         if interrupted and run.reason == "maximum request budget reached" and check.id not in {"load", "recovery"}:
-            check.summary = "Request budget reached before this check finished. " + budget
+            check.finding_summary = "Request budget reached before this check finished."
+            check.remediation = _budget_remediation(run.config, check.id)
+            check.summary = check.finding_summary + " " + budget
             continue
         if interrupted and run.reason == "maximum run duration reached" and check.id not in {"load", "recovery"}:
-            check.summary = "Run deadline reached before this check finished. " + _deadline_guidance(run.config)
+            check.finding_summary = "Run deadline reached before this check finished."
+            check.remediation = _deadline_remediation(run.config)
+            check.summary = check.finding_summary + " " + _deadline_guidance(run.config)
             continue
         if check.id not in {"load", "concurrency"}:
             check.summary = _verdict_summary(check, config, records, budget)
+        if disconnected:
+            check.finding_summary = disconnected + "."
+            check.remediation = {"action": "review_check", "check": "access", "code": "endpoint_unavailable"}
         if disconnected and check.id == "load":
             count = check.summary.split(": ", 1)[0]
             check.summary = (f"{count}: {disconnected}. "
@@ -2038,12 +2047,32 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     return result + workload_results
 
 
-def _deadline_guidance(config):
+def _deadline_remediation(config):
     from .planning import request_plan
     plan = request_plan(config)
     high = plan.get("budget_high_seconds")
+    action = {"action": "set_limit", "limit": "max_duration"}
     if not plan["unknown_time_components"] and high is not None and math.isfinite(high):
-        return f"Raise --max-duration (max_duration_seconds) to at least {math.ceil(high)} seconds or select fewer checks."
+        action["minimum"] = math.ceil(high)
+    return action
+
+
+def _budget_remediation(config, check_id):
+    if check_id in {"load", "concurrency"}:
+        return {"action": "set_limit", "limit": "max_duration", "clear": "max_requests"}
+    from .planning import request_plan
+    plan = request_plan(config)
+    planned = plan["required_request_limit"] or max(
+        plan["known_total"], (plan["conservative_requests_per_target"]
+                              - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
+    return {"action": "set_limit", "limit": "max_requests",
+            "minimum": max(planned, (config.max_requests or 0) + 1)}
+
+
+def _deadline_guidance(config):
+    minimum = _deadline_remediation(config).get("minimum")
+    if minimum is not None:
+        return f"Raise --max-duration (max_duration_seconds) to at least {minimum} seconds or select fewer checks."
     current = f" (current {config.max_duration_seconds:.3g} s)" if config.max_duration_seconds is not None else ""
     return f"Increase --max-duration{current} or select fewer checks."
 
@@ -2102,6 +2131,23 @@ def _output_budget_guidance(config, records, check_id):
 def _verdict_summary(check, config, records, budget):
 
     summary, metrics, limits = check.summary, check.metrics, config.limits
+    if check.finding_summary is None:
+        check.finding_summary = summary
+    reason = metrics.get("reason_code")
+    if reason == "missing_acceptance_limit":
+        fields = {
+            "first_output": ["first_output_ms"],
+            "generation": ["latency_ms", "stream_gap_ms", "min_output_tokens_per_second"],
+            "arrivals": ["latency_ms", "first_output_ms", "stream_gap_ms", "min_output_tokens_per_second"],
+            "recovery": ["recovery_max_ratio", "first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second"],
+        }.get(check.id, [])
+        check.remediation = {"action": "set_acceptance", "check": check.id, "limits": fields}
+    elif reason == "budget_limited":
+        check.remediation = _budget_remediation(config, check.id)
+    elif reason == "time_limited":
+        check.remediation = _deadline_remediation(config)
+    else:
+        check.remediation = {"action": "review_check", "check": check.id, "code": reason or check.status}
     if check.status == "blocked" and summary.startswith("Internal error in Giraffe ("):
         return summary
     if check.id == "concurrency":
@@ -2235,7 +2281,7 @@ def _verdict_summary(check, config, records, budget):
         remedy = "configure an answer scorer for each unscored request-pack case, then complete its quiet and loaded passes; performance measurements remain available without answer scoring"
     elif metrics.get("request_pack") and check.status == "inconclusive" and (
             not metrics["request_pack"]["coverage_complete"] or not metrics["request_pack"]["all_cases_scored"]):
-        remedy = ("finish quiet and loaded scoring for every request-pack case and inspect any evaluator errors or unfinished answers; "
+        remedy = ("finish quiet and loaded scoring for every request-pack case and inspect any AI judge errors or unfinished answers; "
                   f"global samples does not select the case count. {budget}")
     elif check.id == "capacity" and check.status == "inconclusive":
         stages = metrics.get("traffic_stages", [])
@@ -2269,7 +2315,7 @@ def _verdict_summary(check, config, records, budget):
                   f"collect at least {limits.min_samples} responses with the required timing measurements, then rerun the same workload")
     elif "sample" in text or "score" in text or "scor" in text:
         remedy = (f"collect at least {samples} complete scored answers per tested condition; "
-                  "check the fixture's expected answer and evaluator errors, increase the output budget for truncated answers, then rerun")
+                  "check the fixture's expected answer and AI judge errors, increase the output budget for truncated answers, then rerun")
     else:
         remedy = {
             "access": "verify server availability, target URL, credentials, proxy and TLS trust, then rerun",

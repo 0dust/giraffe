@@ -62,11 +62,11 @@ giraffe run --url http://127.0.0.1:11434/v1 --html
 The model is auto-detected when only one is served; otherwise add `--model MODEL_ID`.
 The CLI and UI select the same four checks by default:
 `access, serving, correctness, first_output`. These check endpoint access, response
-validity, known-answer correctness and p95 time to the first useful output.
+validity, answer correctness and p95 time to the first answer.
 The default first-output limit is **10,000 ms**, a generous laptop sanity bound;
 override it with `--first-output-ms` or YAML `limits.first_output_ms`.
-Default check parallelism is four. Fully scored answers can conclude on accuracy when
-parallelism is inherited; missing server overlap is reported as an observation.
+Default check concurrency is four. Fully scored answers can conclude on accuracy when
+concurrency is inherited; missing server overlap is reported as an observation.
 Set `--default-concurrency` or a per-check concurrency override above one to require concurrent evidence.
 The 10,000 ms sanity bound applies only to `first_output`.
 
@@ -141,7 +141,7 @@ giraffe run --config examples/vllm.yaml \
 
 The new report shows acceptance results and changes against the saved baseline. Keep the workload comparable; incompatible measurements stay inconclusive.
 
-In the UI, open a completed run and choose **Save baseline** (fully passing runs) or **Save as reference baseline** (other completed runs). Name and save it, then choose **Compare a new run with this baseline** at the bottom of the report, or **Compare a new run** when shown at the top. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
+In the UI, open a completed run and choose **Save baseline** (fully passing runs) or **Save as baseline** (other completed runs). Name and save it, then choose **Compare a new run with this baseline** at the bottom of the report, or **Compare a new run** when shown at the top. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
 
 ## Tests
 
@@ -149,21 +149,27 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 
 | Check · CLI ID | What it checks |
 | --- | --- |
-| Network and access · `access` | Connection, authentication and ordinary inference |
-| Serving success · `serving` | Complete, valid, nonempty responses |
-| First useful output · `first_output` | Time to the first useful answer |
-| Generation pace · `generation` | Answer rate, response time and stream pauses |
+| Endpoint access · `access` | Connection, authentication and ordinary inference |
+| Response validity · `serving` | Complete, valid, nonempty responses |
+| Time to first answer · `first_output` | Time to the first useful answer |
+| Generation speed · `generation` | Answer rate, response time and stream pauses |
 | Load test · `load` | Correctness and timing under selected traffic patterns |
-| Long-context behavior · `context` | Recall of known facts across long inputs |
-| Known-answer correctness · `correctness` | Answers against expected values |
-| Structured JSON · `json` | Expected fields, types and values |
-| Limits and cancellation · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
-| Sustained load and recovery · `recovery` | Heavy traffic followed by matched light probes |
-| GPU observations · `gpu` | Available GPU telemetry |
-| Shared prefixes and cache evidence · `prefix` | Reported cache reuse against independent controls |
+| Long-context recall · `context` | Recall of known facts across long inputs |
+| Answer correctness · `correctness` | Answers against expected values |
+| JSON correctness · `json` | Expected fields, types and values |
+| Cancellation & limits · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
+| Recovery after load · `recovery` | Heavy traffic followed by matched light probes |
+| GPU metrics · `gpu` | Available GPU telemetry |
+| Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
-| Repeated-request consistency · `consistency` | Answer agreement across repeated requests |
-| Tool-calling capability · `tools` | Tool-call structure, names and expected arguments |
+| Answer consistency · `consistency` | Answer agreement across repeated requests |
+| Tool calling · `tools` | Tool-call structure, names and expected arguments |
+
+The catalog has 13 verdict checks and two server observations: **GPU metrics** and
+**Prefix cache**. Both remain in the selected checks and baseline configuration.
+Missing GPU telemetry and missing or inactive prefix caching do not change the
+verdict. GPU hardware faults and an exceeded configured temperature limit can
+still fail the run. Prefix cache never fails the run.
 
 When selected, generation uses a **5,000 ms stream-gap limit** if no generation
 limit is supplied; this catches stalls without imposing a token speed. Set

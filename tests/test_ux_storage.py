@@ -8,7 +8,7 @@ def test_history_exposes_disk_totals_run_sizes_and_kept_marker():
 state.storage={runs_bytes:1.25*1024**3,baselines_bytes:40*1024**2,free_bytes:38*1024**3,limits:{max_total_storage:5*1024**3}};
 state.runs=[{id:'retained',state:'completed',overall:'pass',bytes:2.5*1024**2,kept:true,targets:[{model:'test'}]}];
 renderRuns();const html=nodes['#main'].innerHTML;
-assert.match(html,/Saved runs on disk: 1.3 GiB of 5 GiB limit · Baselines 40 MiB · Automatic cleanup: off · Free disk 38 GiB/);
+assert.match(html,/Runs: 1.3 GiB of 5 GiB limit · Baselines 40 MiB · Automatic cleanup: off · Free disk 38 GiB/);
 assert.match(html,/2.5 MiB on disk/);assert.match(html,/class="kept-marker">Kept/);
 assert.match(html,/<button type="button" class="button small" data-action="storage-dialog">Clean up…/);
 assert.doesNotMatch(html,/memory|RAM/);
@@ -29,7 +29,7 @@ const dialog=nodes['#storage-dialog']={innerHTML:'',open:false,showModal(){this.
 nodes['#cleanup-age']={focus(){this.focused=true;}};
 openStorageDialog();assert(dialog.open);assert(nodes['#cleanup-age'].focused);
 assert.match(dialog.innerHTML,/for="cleanup-age"/);assert.match(dialog.innerHTML,/for="cleanup-latest"/);assert.match(dialog.innerHTML,/for="cleanup-total"/);
-assert.match(dialog.innerHTML,/Maximum saved runs on disk \(MiB\)/);
+assert.match(dialog.innerHTML,/Maximum runs on disk \(MiB\)/);
 assert.match(dialog.innerHTML,/id="cleanup-confirm" data-action="cleanup-confirm" disabled/);
 const form=nodes['#cleanup-form']={reportValidity:()=>true,elements:{older_than_days:{value:'7'},keep_latest:{value:'2'},max_total_mib:{value:'50'}}};
 for(const id of ['cleanup-error','cleanup-preview-button','cleanup-confirm','cleanup-preview'])nodes['#'+id]={innerHTML:'',disabled:false,hidden:false};
@@ -136,7 +136,7 @@ def test_summary_only_error_and_storage_omissions_remain_visible():
     run_render_checks(r"""
 let html=detail(null,{state:'error',error:'Report could not be saved (disk full). Request evidence for 3 requests was lost; a summary was saved.',summary:{overall:'pass',request_count:3,checks:[{id:'access',title:'Access check',status:'pass',summary:'Endpoint responded <quickly>'}]}});
 assert.match(html,/<h1>Run could not finish/);assert.match(html,/class="notice error"/);assert.match(html,/disk full/);
-assert.match(html,/Only a summary was saved/);assert.match(html,/Recorded overall: Passed · 3 requests/);assert.match(html,/Endpoint response/);assert.match(html,/Endpoint responded &lt;quickly&gt;/);
+assert.match(html,/Only a summary was saved/);assert.match(html,/Recorded overall: Passed · 3 requests/);assert.match(html,/Endpoint access/);assert.match(html,/Endpoint responded &lt;quickly&gt;/);
 assert.doesNotMatch(html,/Acceptance passed|Save baseline/);assert.match(html,/data-action="keep-run"/);
 html=detail(report([check('access','pass')]),{state:'error',error:'Export failed'});assert.match(html,/<h1>Run could not finish/);assert.doesNotMatch(html,/Acceptance passed|Selected acceptance checks passed/);
 const value=report([check('access','pass')]);value.manifest.storage={limit_bytes:1000,response_bodies_omitted:0};html=detail(value);assert.doesNotMatch(html,/Storage limit on disk/);

@@ -20,7 +20,7 @@ def test_timing_reasons_prefer_applied_manifest_limits_and_keep_legacy_fallback(
     run_render_checks(r"""
 const value=report([check('first_output','fail',{evidence_ids:['slow'],metrics:{violations:['slow']}})],{overall:'fail',requests:[{id:'slow',target:'local',status:'completed',valid:true,score:true,first_output_ms:12300}]});
 value.manifest.config.limits={};value.manifest.effective_checks={first_output:{limits:{first_output_ms:10000}}};
-detail(value);state.selectedCheck='local:first_output';let html=renderChecks(value);assert.match(html,/Too slow: first output 12\.3 s &gt; 10 s/);
+detail(value);state.selectedCheck='local:first_output';let html=renderChecks(value);assert.match(html,/Too slow: first answer 12\.3 s &gt; 10 s/);
 value.manifest.config.limits.first_output_ms=20000;html=renderChecks(value);assert.match(html,/12\.3 s &gt; 10 s/);
 value.manifest.config.limits={};value.checks[0].id='generation';state.selectedCheck='local:generation';value.requests[0].max_stream_gap_ms=6000;value.manifest.effective_checks={generation:{limits:{stream_gap_ms:5000}}};
 assert.match(renderChecks(value),/Too slow: stream pause 6 s &gt; 5 s/);

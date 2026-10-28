@@ -72,7 +72,7 @@ const value=report([check('access','pass')],{baseline:{run_id:'old',targets:[{ta
 const html=renderComparison(value);assert.match(html,new RegExp('>'+expected+'<'));assert(html.includes(DELTA));assert.match(renderBaselineSummary(value),new RegExp('1 '+expected));
 for(const metric of ['throughput','output_tokens_per_second','generation_tokens_per_second']){
  const row={metric,status:after>before?'pass':'fail',baseline:before,current:after,threshold:20,worsening:after>before?-300:75,worsening_interval_95:after>before?[-310,-290]:[70,80]};
- assert.equal(comparisonVerdict(row),expected);assert.equal(comparisonVerdict({...row,status:'inconclusive'}),'not comparable');const table=comparisonTable([row]);assert(table.includes('>'+expected+'<'));assert(table.includes(DELTA));
+ assert.equal(comparisonVerdict(row),expected);assert.equal(comparisonVerdict({...row,status:'inconclusive'}),'not comparable');const table=comparisonConditionTable(comparisonConditionGroups({comparisons:[row]},{}));assert(table.includes('>'+expected+'<'));assert(table.includes(DELTA));
 }
 """.replace('BEFORE', str(before)).replace('AFTER', str(after)).replace('VERDICT', repr(verdict)).replace('DELTA', repr(delta)))
 

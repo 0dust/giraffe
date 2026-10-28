@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from contextvars import copy_context
 from copy import deepcopy
 from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timezone
+from email.utils import formatdate
 from functools import lru_cache
 from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
@@ -38,8 +40,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
 from anyio import CancelScope
 from pydantic import Field, ValidationError, WrapValidator
+
+from giraffe import __version__
 
 from .caps import (
     MAX_BASELINE_NAME_CHARS, MAX_LIVE_CONDITIONS, MAX_LIVE_EVENTS,
@@ -1619,6 +1624,18 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     candidates.append((meta.get("started_at", ""), directory.name))
         return max(candidates, default=("", None))[1]
 
+    def setup_baseline_configs():
+        # Setup drift uses the saved snapshot, even after its source run changes.
+        configs = {}
+        with baseline_lock:
+            for item in saved_baselines():
+                try:
+                    path = _directory(baseline_root, item["id"]) / "report.json"
+                    configs[item["id"]] = safe_config(_report(path).manifest.get("config", {}))
+                except (OSError, ValueError, HTTPException):
+                    continue
+        return configs
+
     @app.get("/api/bootstrap")
     async def bootstrap():
         configuration = _bootstrap_config(defaults)
@@ -1627,6 +1644,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         migrated_defaults, load_notes = migrate_concurrent_load(migrated_defaults)
         _, combined_notes = migrate_load_test(migrated_defaults)
         return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
+                "baseline_configs": await run_in_threadpool(setup_baseline_configs),
                 "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
                 "active_run_id": active.get("id"), "disk_active_id": await run_in_threadpool(disk_active_id), "request_plan": await run_in_threadpool(preview_plan, resolved)}
 
@@ -2100,10 +2118,45 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return summary
 
     static = Path(__file__).with_name("static")
-    app.mount("/static", StaticFiles(directory=static, check_dir=False), name="static")
+
+    def asset_url(name: str, content: bytes | None = None) -> str:
+        digest = hashlib.sha256(content if content is not None else (static / name).read_bytes()).hexdigest()[:16]
+        return f"/static/{name}?v={__version__}-{digest}"
+
+    def app_script() -> bytes:
+        # Version the module dependency too; hash these served bytes for the entry URL.
+        content = (static / "app.js").read_text()
+        dependency = asset_url("form-config.mjs").removeprefix("/static/")
+        return re.sub(r"\./form-config\.mjs(?:\?[^']*)?", f"./{dependency}", content, count=1).encode()
+
+    static_files = StaticFiles(directory=static, check_dir=False)
+
+    def versioned_response(content: bytes, media_type: str, request: Request, files: tuple[str, ...]):
+        headers = {"etag": f'"{hashlib.sha256(content).hexdigest()}"',
+                   "last-modified": formatdate(max((static / name).stat().st_mtime for name in files), usegmt=True)}
+        # ETag takes precedence when clients also send a date validator.
+        conditional = (Headers({"if-none-match": request.headers["if-none-match"]})
+                       if "if-none-match" in request.headers else request.headers)
+        if static_files.is_not_modified(Headers(headers), conditional):
+            return Response(status_code=304, headers=headers)
+        if request.method == "HEAD":
+            headers["content-length"] = str(len(content))
+            content = b""
+        return Response(content, media_type=media_type, headers=headers)
+
+    @app.api_route("/static/app.js", methods=["GET", "HEAD"])
+    def application_script(request: Request):
+        return versioned_response(app_script(), "text/javascript", request, ("app.js", "form-config.mjs"))
+
+    app.mount("/static", static_files, name="static")
 
     @app.get("/")
-    async def index():
-        return FileResponse(static / "index.html")
+    def index(request: Request):
+        content = (static / "index.html").read_text()
+        for name in ("boot.js", "styles.css", "app.js"):
+            url = asset_url(name, app_script() if name == "app.js" else None)
+            content = content.replace(f'"/static/{name}"', f'"{url}"')
+        return versioned_response(content.encode(), "text/html", request,
+                                  ("index.html", "boot.js", "styles.css", "app.js", "form-config.mjs"))
 
     return app

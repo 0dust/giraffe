@@ -16,7 +16,11 @@ STYLE = """
 :root{--bg:#09090a;--surface:#131315;--text:#f5f3ee;--text-2:#b5b2aa;--accent:#f5b544;--line:#333136;--mono:ui-monospace,monospace;color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui}main{max-width:1240px;margin:auto;padding:24px}h1{font-size:28px}h2{font-size:20px}h3{font-size:15px}a{color:var(--accent)}.muted,.html-note{color:var(--text-2)}.card,details,.html-kpi,.html-plot{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px;margin:12px 0}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 var(--mono)}code{overflow-wrap:anywhere}.badge{padding:2px 8px;border-radius:4px;background:#333136}.pass{color:#3dd68c}.fail,.blocked{color:#ff5f67}.inconclusive{color:#f5b544}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}td:nth-child(2),.html-distributions td{font-family:var(--mono)}
 
 .html-section{margin:32px 0;scroll-margin-top:90px}.html-section>header{display:flex;align-items:baseline;justify-content:space-between;gap:18px}.html-section h2{margin:0 0 16px}.html-section header p{font-size:12px;text-align:right}.html-cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.html-kpi{margin:0;min-width:0}.html-kpi h3{font-size:12px;margin:0 0 14px;display:flex;justify-content:space-between;gap:6px}.html-value{font:24px/1.25 var(--mono);overflow-wrap:anywhere}.html-value small,.html-kpi p,.html-note,.html-legend{font:11px/1.5 system-ui;color:var(--text-2)}.html-kpi p{margin:10px 0 0}.html-estimate{font:9px var(--mono);color:var(--accent)}.html-info{position:relative;margin:0;padding:0;border:0;display:inline-block}.html-info summary{font-size:11px;list-style:none}.html-info>span{position:absolute;right:0;z-index:3;width:240px;background:var(--surface);border:1px solid var(--line);padding:10px;font-weight:400}.html-two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.html-throughput{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:18px;align-items:start}.html-capacity{grid-template-columns:repeat(2,minmax(0,1fr))}.html-load{grid-template-columns:repeat(3,minmax(0,1fr))}.html-support{grid-template-columns:1fr 1fr;margin:14px 0}.html-plot{min-width:0;margin:0}.html-plot svg{display:block;width:100%;height:auto}.html-legend{display:flex;flex-wrap:wrap;gap:8px 16px}.html-legend i{display:inline-block;width:14px;border-top:2px solid;margin-right:5px}.html-metrics details{margin:0;padding:0;border:0}.html-scope{padding:12px 0;border-bottom:1px solid var(--line)}
-a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}nav{margin:24px 0}.answer-finding summary{overflow-wrap:anywhere}.baseline-table td{min-width:90px}.baseline-table td:last-child{min-width:220px}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}nav{margin:24px 0}.answer-finding summary{overflow-wrap:anywhere}
+
+.baseline-comparison{width:100%;min-width:0;overflow:visible}.baseline-table{width:100%;min-width:0;table-layout:fixed}.baseline-table .comparison-name-col{width:34%}.baseline-table .comparison-value-col{width:17%}.baseline-table .comparison-delta-col{width:12%}.baseline-table .comparison-verdict-col{width:20%}
+.baseline-table th,.baseline-table td{min-width:0;padding:10px 8px;text-transform:none;white-space:normal;overflow-wrap:anywhere}.baseline-table .comparison-number{text-align:right;white-space:nowrap;font-family:var(--mono);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}.baseline-table .comparison-group th{padding-top:18px;font-size:13px}.baseline-table .comparison-reason{display:block;margin-top:6px;font-weight:400;color:var(--text-2);text-transform:none;white-space:normal}.baseline-table .comparison-samples{display:block;font-size:11px;color:var(--text-2)}
+@media(max-width:599px){.baseline-table,.baseline-table tbody{display:block;width:100%}.baseline-table colgroup{display:none}.baseline-table thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}.baseline-table .comparison-group,.baseline-table .comparison-group th{display:block;width:100%;border:0}.baseline-table .comparison-metric{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"metric metric" "baseline current" "change verdict";gap:8px;margin:8px 0;padding:12px;border:1px solid var(--line);border-radius:6px}.baseline-table .comparison-metric th,.baseline-table .comparison-metric td{display:block;padding:0;border:0}.baseline-table .comparison-metric th{grid-area:metric}.baseline-table [data-label="Baseline"]{grid-area:baseline}.baseline-table [data-label="Current"]{grid-area:current}.baseline-table [data-label="Δ"]{grid-area:change}.baseline-table [data-label="Verdict"]{grid-area:verdict}.baseline-table .comparison-metric .comparison-number{text-align:left}.baseline-table [data-label="Baseline"]::before{content:"Baseline ";color:var(--text-2);font:11px system-ui}.baseline-table [data-label="Current"]::before{content:"→ Current ";color:var(--text-2);font:11px system-ui}.baseline-table [data-label="Δ"]::before{content:"Δ ";color:var(--text-2)}}
 @media(prefers-color-scheme:light){:root{--bg:#fff;--surface:#f7f7f8;--text:#18181b;--text-2:#52525b;--accent:#805500;--line:#d4d4d8;color-scheme:light}.badge{background:#ededf0}.pass{color:#087743}.fail,.blocked{color:#bf202a}.inconclusive{color:#805500}}
 @media print{:root{--bg:#fff;--surface:#fff;--text:#000;--text-2:#333;--accent:#222;--line:#bbb;color-scheme:light}main{max-width:none;padding:0}nav,a[download]{display:none}section{break-inside:auto}h1,h2,h3{break-after:avoid}tr,.html-plot,.html-kpi{break-inside:avoid}.html-cards{grid-template-columns:repeat(3,minmax(0,1fr))}details{border:0;padding:4px 0}details>*:not(summary){display:block!important}details::details-content{content-visibility:visible!important;height:auto!important}a{color:inherit}.pass,.fail,.blocked,.inconclusive{color:#000}.table{overflow:visible}table{font-size:10px}th,td{padding:5px}body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 @media(max-width:800px){main{padding:14px}.html-throughput{grid-template-columns:1fr}.html-two{grid-template-columns:1fr}.html-section>header{display:block}.html-section header p{text-align:left}.html-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -149,6 +153,15 @@ def _availability(row):
     return f'<strong>{_e(state)}</strong>. ' + _e(" ".join(str(row.get(k) or "") for k in ("reason", "action") if row.get(k) not in COMMON_GUIDANCE).strip())
 
 
+# Older performance snapshots keep their original labels; display current names.
+METRIC_LABELS = {"Per-turn latency / first output": "Per-turn latency / time to first answer"}
+
+
+def _metric_label(row):
+    label = row.get("label", "")
+    return METRIC_LABELS.get(label, label)
+
+
 def _card(row):
     info = " · ".join(str(v) for v in (row.get("source"), (row.get("action") if row.get("action") not in COMMON_GUIDANCE else None)) if v)
     note = (f'Median · P95 {_fmt(row["p95"])} {_e(row.get("unit", ""))}'
@@ -158,7 +171,7 @@ def _card(row):
     estimate = ' <span class="html-estimate">ESTIMATE</span>' if row.get("state") == "estimated" else ''
     missing = ('<strong>' + _e(STATES.get(row.get("state"), "Not measured")) + '</strong>. '
                + _e(row.get("reason", "") if row.get("reason") not in COMMON_GUIDANCE else "")) if row.get("value") is None else ''
-    return ('<article class="html-kpi"><h3>' + _e(row.get("label", ""))
+    return ('<article class="html-kpi"><h3>' + _e(_metric_label(row))
             + '<details class="html-info"><summary aria-label="Definition">i</summary><span>' + _e(info)
             + '</span></details></h3><div class="html-value">' + _value(row) + '</div>' + estimate
             + '<p>' + (missing + (' ' + note if row.get("display_note") else '') if missing else note)
@@ -181,7 +194,7 @@ def _table(rows):
     parts = ['<div class="table"><table class="html-metrics"><tr><th>Metric<th>Value<th>Definition / availability']
     remaining = 0
     for index, row in enumerate(rows):
-        parts.append('<tr><th>' + _e(row.get("label", "")) + '<td>' + _value(row))
+        parts.append('<tr><th>' + _e(_metric_label(row)) + '<td>' + _value(row))
         if not remaining:
             count = 1
             while index + count < len(rows) and notes[index + count] == notes[index]:
@@ -196,7 +209,7 @@ def _table(rows):
 def _distributions(rows, convention):
     parts = ['<div class="table"><table class="html-distributions"><tr><th>Metric / unit<th>n<th>Mean<th>Min<th>Median<th>P90<th>P95<th>P99<th>Max']
     for row in rows:
-        parts.append('<tr><th scope="row">' + _e(row['label']) + ' · ' + _e(row.get('unit', '')))
+        parts.append('<tr><th scope="row">' + _e(_metric_label(row)) + ' · ' + _e(row.get('unit', '')))
         if row.get('value') is None:
             parts.append('<td>' + str(row.get('sample_count', 0)) + '<td colspan="7">' + _e(STATES.get(row.get('state'), 'Not measured')))
         else:

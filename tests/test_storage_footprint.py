@@ -66,7 +66,7 @@ def test_cli_html_is_explicit_and_legacy_html_is_regenerated(tmp_path, capsys):
         assert "stale" not in client.get("/api/runs/run/report.html").text
     output = tmp_path / "export.html"
     assert main(["report", str(directory), "--html", "--output", str(output)]) == 0
-    assert "Known-answer correctness" in output.read_text()
+    assert "Answer correctness" in output.read_text()
     assert main(["report", str(directory), "--html"]) == 0
     assert output.read_bytes() == (directory / "report.html").read_bytes()
 

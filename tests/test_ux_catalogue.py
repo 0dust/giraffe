@@ -110,8 +110,8 @@ assert.equal(status.textContent,'Overrides');
 config.checks=[];updateCheckRow(check,config,card);
 assert.equal(status.textContent,'Saved overrides');assert.match(effective.textContent,/At least 9 questions/);
 assert.equal(effective.hidden,undefined); // Info stays available for checks not selected.
-assert.equal(catalogTitle('access'),'Endpoint response');
-assert.equal(catalogTitle('prefix'),'Prompt cache evidence');
+assert.equal(catalogTitle('access'),'Endpoint access');
+assert.equal(catalogTitle('prefix'),'Prefix cache');
 """)
 
 
@@ -129,12 +129,12 @@ for(const check of bootstrap.checks){
 }
 syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,15);
 state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,15);
-state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gpu,prefix');
+state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 // Browse filters must not hide selected checks when returning to the run.
 state.catalogueCategory='server';state.catalogueSearch='gpu';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 state.catalogueCategory='all';
-state.catalogueFilter='all';state.catalogueSearch='concurrent conversations';syncTestControls();assert.equal(cards.filter(x=>!x.hidden)[0].id,'sessions');
+state.catalogueFilter='all';state.catalogueSearch='multi-turn sessions';syncTestControls();assert.equal(cards.filter(x=>!x.hidden)[0].id,'sessions');
 revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,15);
 assert.equal(JSON.stringify(config),original);
 """)
@@ -310,38 +310,17 @@ def test_catalogue_example_is_an_actual_scored_builtin_request():
     }
 
 
-def test_run_limits_are_collapsed_and_keep_controls_without_repeating_workload():
+def test_inline_limits_are_collapsed_and_keep_the_three_budget_controls():
     browser_logic(r"""
 config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
-assert.match(markup,/<details class="shared-settings-editor" id="shared-settings">/);
-assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits<\/h2>/);
-assert.match(markup,/Up to 160 requests · 5m 0s · 4 at once/);assert.match(markup,/class="shared-settings-edit" aria-hidden="true">⌄/);
-assert(markup.lastIndexOf('</details>')<markup.indexOf('id="checks-plan-summary"'));
-assert.match(markup,/class="run-ceilings-values" id="run-ceilings-summary"/);
-assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary"/);
-assert.doesNotMatch(markup,/aria-live=/);
-const expected=['max_requests','max_duration_seconds','concurrency','max_memory_mb','max_requests_enabled','max_duration_seconds_enabled','concurrency_enabled','max_memory_mb_enabled','max_duration_unit'];
-for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
-let depth=0,maximumDepth=0;
-for(const tag of markup.matchAll(/<(\/?)details\b[^>]*>/g)){depth+=tag[1]?-1:1;maximumDepth=Math.max(maximumDepth,depth);}
-assert.equal(depth,0);assert.equal(maximumDepth,1); // One disclosure; request settings and pass criteria live in check panels.
-assert.doesNotMatch(markup,/Set the limits once|run-limit-note/);
-assert.match(markup,/Used by checks unless they override it/);
-assert.match(markup,/Maximum duration takes priority and cancels requests still in progress/);
-for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.match(markup,new RegExp('id="field-'+name+'-hint"></span>')); // Empty enabled-state hint receives Not set when unchecked.
-assert.match(markup,/AI evaluator calls have separate limits/); // Available through the field help.
+assert.match(markup,/<details class="setup-limits-line shared-settings-editor" id="shared-settings">/);
+assert.match(markup,/≤ 160 requests · ≤ 5 m per request · 4 at once · ≤ 5 m total/);
+for(const name of ['max_requests','max_duration_seconds','concurrency']){assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);assert.doesNotMatch(markup,new RegExp('name="'+name+'_enabled"'));assert(markup.includes('for="field-'+name+'"'));}
+assert.doesNotMatch(markup,/name="request_timeout_seconds"|name="stream"|name="max_memory_mb"|Confidence:/);
 assert.equal(JSON.stringify(config),before);
-for(const id of ['run-ceilings-summary','request-defaults-summary','acceptance-summary'])nodes['#'+id]={};
-config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
-assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
-state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
-assert(!catalogue.includes('id="shared-settings"')); // Run limits is a preceding sibling in renderNew.
-assert.match(markup,/name="request_timeout_seconds"[^>]*value="300"/);
-assert.doesNotMatch(markup,/name="samples"|name="max_output_tokens"|name="context_limit"|name="stream"|name="limit_/);
-assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
-assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));
-assert.doesNotMatch(catalogue,/catalogue-view-hint/);
+nodes['#run-ceilings-summary']={};config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
+assert.equal(nodes['#run-ceilings-summary'].textContent,'≤ 80 requests · ≤ 5 m per request · 2 at once · ≤ 12.5 s total');
 """)
 
 

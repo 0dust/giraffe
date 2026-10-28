@@ -248,7 +248,7 @@ def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
         {"name": "first", "url": "http://localhost:1", "model": "a"},
         {"name": "second", "url": "http://localhost:2", "model": "b"},
     ])
-    assert any("share Simultaneous limit" in warning and "overlap" in warning
+    assert any("share Max concurrency" in warning and "overlap" in warning
                for warning in plan(configuration)["warnings"])
 
 

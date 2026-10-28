@@ -1,4 +1,6 @@
-"""Real control paths for Phase C condition evidence and telemetry settings."""
+"""Real control paths for condition evidence and telemetry settings."""
+
+from pathlib import Path
 
 from tests.test_ui_conditions import DIALOG_SETUP
 from tests.test_ux_catalogue import browser_logic
@@ -9,16 +11,18 @@ from tests.test_ux_setup import run_browser_logic
 def test_condition_row_keeps_later_page_number_and_existing_request_evidence():
     run_render_checks(DIALOG_SETUP+r"""
 (async()=>{
- remaining=757;aggregate={...aggregate,planned:757,started:757,running:757};draw();
- openConditionDialog([...conditionViews.keys()][0]);await settle();
- $('#condition-page-number').value='76';listeners.keydown({target:$('#condition-page-number'),key:'Enter',preventDefault(){}});await settle();
- const record={id:'r751',target:'local',scenario:'short',status:'completed',valid:true,score:true,output:'Saved answer',output_chars:12,evaluation:{messages:[{role:'user',content:'Saved input'}],scorer:'contains',expected:'answer',expected_provided:true}};
- state.detail.report=report([check('access','pass')],{requests:[record]});
- await listeners.click({target:$('[data-condition-request="r751"]'),preventDefault(){}});
+ remaining=757;aggregate={...aggregate,planned:757,started:757,running:0,completed:757};
+ const records=Array.from({length:757},(_,index)=>({id:'r'+(index+1),target:'local',condition_id:condition.id,scenario:condition.id,status:'completed',valid:true,score:true}));
+ const record={...records[600],output:'Saved answer',output_chars:12,evaluation:{messages:[{role:'user',content:'Saved input'}],scorer:'contains',expected:'answer',expected_provided:true}};records[600]=record;
+ state.detail.state='completed';state.detail.report=report([check('access','pass')],{requests:records});draw();
+ const settleRequests=async()=>{for(let i=0;i<20;i++)await Promise.resolve();};
+ openConditionDialog([...conditionViews.keys()][0]);await settleRequests();
+ for(let page=2;page<=4;page++){await listeners.click({target:$('#test-dialog [data-evidence-page="'+page+'"]')});await settleRequests();}
+ await listeners.click({target:$('[data-request="r601"]'),preventDefault(){}});
  const dialog=$('#request-dialog');assert(dialog.open);assert($('#test-dialog').open);
- assert.match(dialog.textContent,/Request #0751 of 757 · Short input \/ short output/);assert.doesNotMatch(dialog.textContent,/Request 1 of 1/);
+ assert.match(dialog.textContent,/Request #0601 of 757 · Short input \/ short output/);assert.doesNotMatch(dialog.textContent,/Request 1 of 1/);
  assert.match(dialog.textContent,/What was sent/);assert.match(dialog.textContent,/Saved input|Saved answer/);
- closeRequestEvidence();assert($('#test-dialog').open);assert.equal(conditionDialog.page,76);assert.equal(document.activeElement,$('[data-condition-request="r751"]'));
+ closeRequestEvidence();assert($('#test-dialog').open);assert.equal(conditionDialog.page,4);assert.equal(document.activeElement,$('[data-request="r601"]'));
 })()
 """, dom=True)
 
@@ -32,7 +36,11 @@ state.jsonDraft=state.jsonBase='synced';
 syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=()=>{};
 renderNew();const markup=nodes['#main'].innerHTML;
 assert.match(markup,/name="host_metrics_url" type="url" value="http:\/\/node:9100\/metrics"/);
-assert.match(markup,/Host metrics exporter URL \(optional\)/);assert.match(markup,/server-wide CPU and host RAM/);assert.match(markup,/Inference and runtime metrics credentials are not forwarded/);
+assert.match(markup,/<label for="field-host_metrics_url">Host metrics URL<\/label>/);
+assert.match(markup,/server-wide CPU and host RAM/);
+assert.match(markup,/does not install an exporter/);
+assert.match(markup,/credentials are not forwarded to this URL/);
+assert(markup.indexOf('id="setup-advanced"')<markup.indexOf('name="host_metrics_url"'));
 assert.doesNotMatch(markup,/name="host_metrics_url"[^>]*required/);
 """)
 
@@ -51,13 +59,37 @@ exporter.value='';payload=readForm();assert.equal(payload.config.targets[0].host
 """)
 
 
-def test_chart_pointer_uses_one_floating_tooltip_and_native_svg_hidden_attribute():
+def test_chart_pointer_is_scoped_and_uses_one_tooltip_with_native_svg_hidden():
+    app = (Path(__file__).parents[1] / "src/giraffe/static/app.js").read_text()
+    assert "document.addEventListener('pointermove'" not in app
+    assert "'#main')?.addEventListener?.('pointermove'" in app
     run_render_checks(r"""
 state.detail={id:'pointer',state:'completed'};
 const rows=[{number:1,request_id:'a',values:{response_latency_ms:1000}},{number:2,request_id:'b',values:{response_latency_ms:2500}}];
 $('#main').innerHTML=renderPerformanceLineChart('timing','Timing','Recorded',rows,[{key:'response_latency_ms',label:'Response latency',color:'var(--accent)',scale:.001,unit:'s'}]);
 const svg=$('[data-performance-chart="timing"]'),crosshair=$('.performance-crosshair',svg);assert(crosshair.hasAttribute('hidden'));
-listeners.pointermove({target:svg,clientX:110,clientY:30});assert(!crosshair.hasAttribute('hidden'));
+handlePerformancePointer({target:svg,clientX:110,clientY:30});assert(!crosshair.hasAttribute('hidden'));
 const tooltip=$('#performance-chart-tooltip');assert(!tooltip.hidden);assert.match(tooltip.textContent,/Request #0002 · b/);assert.match(tooltip.textContent,/2.5 s/);
 listeners.pointerout({target:svg,relatedTarget:document.body});assert(tooltip.hidden);
+""", dom=True)
+
+
+def test_request_table_controls_preserve_scroll_and_rows_as_records_append():
+    run_render_checks(r"""
+const records=Array.from({length:205},(_,index)=>({id:'r'+index,target:'local',scenario:'short',status:'completed',valid:true,score:true,
+ elapsed_ms:205-index,evaluation:{messages:[{role:'user',content:'Question '+index}],expected:'answer'},output:'answer'}));
+state.detail={id:'table',state:'completed',report:report([check('access','pass')],{requests:records})};
+$('#main').innerHTML=renderMosaic(records);
+const scroll=$('.request-table-scroll'),row=$('[data-request="r10"]');scroll.scrollTop=147;scroll.scrollLeft=31;row.focus({preventScroll:true});
+listeners.click({target:$('[data-evidence-sort="elapsed_ms"]')});
+assert.equal($('.request-table-scroll'),scroll);assert.equal(scroll.scrollTop,147);assert.equal(scroll.scrollLeft,31);
+assert.equal(evidenceTableState().sort,'elapsed_ms');assert.equal($('.request-evidence-row').dataset.request,'r204');
+assert.equal(document.activeElement,row);assert.equal($('[data-request="r10"]'),row);
+state.detail.report.requests.push({id:'r205',target:'local',scenario:'short',status:'running',elapsed_ms:206});refreshRequestTable();
+assert.equal($('.request-table-scroll'),scroll);assert.equal(scroll.scrollTop,147);assert.equal(document.activeElement,row);
+const filter=$('[data-evidence-filter="status"]');filter.value='pass';listeners.change({target:filter});
+assert.equal(evidenceTableState().status,'pass');assert.equal(evidenceTableState().page,1);
+const next=$('[data-evidence-page="2"]');listeners.click({target:next});
+assert.equal(evidenceTableState().page,2);assert.equal($$('.request-evidence-row').length,5);
+assert.match($('.request-pagination').textContent,/5 of 205 requests/);
 """, dom=True)

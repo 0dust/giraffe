@@ -92,7 +92,7 @@ def test_baseline_groups_condition_rows_discloses_noise_and_links_to_section():
  const row=(metric,status,extra={})=>({check:'generation',scenario:'warm',metric,status,baseline:10,current:10,reason:'No material worsening detected in these samples.',...extra});
  const baseline={run_id:'old',status:'pass',targets:[{target:'local',comparisons:[row('latency_ms','pass'),row('first_output_ms','inconclusive',{reason:'Too few samples.'})],load_test:{status:'pass',reason:'Load qualification improved.',points:[{status:'pass',reason:'Current load passes.',baseline:{type:'combinations',shape:'short_short',pattern:'concurrent',level:2,status:'fail'},current:{type:'combinations',shape:'short_short',pattern:'concurrent',level:2,status:'pass'}}]}}]};
  detail(report([check('access','pass')],{baseline}));assert.match($('.baseline-delta').textContent,/1 better/);
- const html=renderComparison(state.detail.report);assert.match(html,/Unchanged \(1\)/);assert.match(html,/Not comparable \(1\)/);assert.doesNotMatch(html,/No material worsening detected in these samples/);assert.match(html,/Load qualification improved/);assert.match(html,/data-comparison-condition/);
+ const html=renderComparison(state.detail.report);assert.match(html,/no material change/);assert.match(html,/data-label="Verdict">not comparable/);assert.match(html,/Too few samples/);assert.doesNotMatch(html,/No material worsening detected in these samples/);assert.match(html,/Load qualification improved/);assert.match(html,/data-comparison-condition/);
  const link=$('.baseline-delta a');assert.equal(link.getAttribute('href'),'#runs/saved-run/results/baseline');await listeners.click({target:link,preventDefault(){}});await route();assert($('#report-baseline-reference').open);assert.equal(document.activeElement,$('#report-baseline-reference summary'));
 })()
 """, dom=True)
@@ -121,7 +121,7 @@ def test_baseline_94_rows_stay_grouped_and_summary_counts_all_evidence():
 const comparisons=Array.from({length:94},(_,index)=>({check:'generation',scenario:'warm',metric:'metric_'+index,status:index<64?'pass':'inconclusive',baseline:10,current:10,reason:index<64?'No material worsening detected in these samples.':'No eligible samples.'}));
 const value=report([check('access','pass')],{baseline:{run_id:'before-upgrade',targets:[{target:'local',comparisons}]}});
 const hero=detail(value);assert.match(hero,/vs baseline before-upgrade: no regressions \(64 unchanged, 30 not comparable\)/);
-const html=renderComparison(value);assert.equal((html.match(/data-comparison-condition=/g)||[]).length,1);assert.equal((html.match(/<tr><td>/g)||[]).length,94);
-assert.match(html,/<details class="comparison-quiet"><summary>Unchanged \(64\)/);assert.match(html,/<details class="comparison-quiet"><summary>Not comparable \(30\)/);
-assert.equal((html.match(/<th>Reason<\/th>/g)||[]).length,1);assert.doesNotMatch(html,/No material worsening detected in these samples\.|Entry \d/);
+const html=renderComparison(value);assert.equal((html.match(/data-comparison-condition=/g)||[]).length,1);assert.equal((html.match(/class="comparison-metric"/g)||[]).length,94);for(let index=0;index<94;index++)assert(html.includes('Metric '+index));
+assert.equal(comparisonConditionGroups(value.baseline.targets[0],value)[0].rows.length,94);assert.equal((html.match(/data-label="Verdict">not comparable/g)||[]).length,30);assert.match(html,/No eligible samples/);
+assert.match(html,/class="comparison-reason"/);assert.doesNotMatch(html,/No material worsening detected in these samples\.|Entry \d/);
 """)

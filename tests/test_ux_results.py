@@ -131,33 +131,35 @@ const failed=report([check('correctness','fail',{
   summary:'Expected <Paris>; inspect the returned answer.',metrics:{correct:1,scored:3},evidence_ids:['bad']})],{overall:'fail',requests:[{id:'bad',target:'local',status:'completed',score:false,output:'Lyon',evaluation:{expected:'Paris',expected_provided:true}}]});
 let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
-assert.match(html,/Expected &lt;Paris&gt;/);
+assert.match(html,/1 of 3 answers matched the expected answer/);
+assert.match(html,/Expected:<\/strong> Paris/);
+assert.doesNotMatch(html,/Expected &lt;Paris&gt;/);
 assert.match(html,/class="button primary" data-action="show-failing">Show failing requests/);
 assert.doesNotMatch(html,/inspect-finding|Inspect failed answer|Inspect evidence|Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
-assert.match(html,/Save as reference baseline/);
+assert.match(html,/Save as baseline/);
 assert.match(html,/report\.html" download/);
 assert.match(html,/report\.json" download/);
 assert.match(html,/http:\/\/localhost:8000\/v1/);
 const passed=report([check('access','pass')]);
 html=detail(passed);
 assert.match(html,/class="button primary" data-action="baseline-dialog"/);
-assert.match(html,/applies to the endpoint and traffic tested here/);
+assert.match(html,/recorded checks met their configured limits/);
 html=detail({...passed,abort_reason:'maximum request budget reached',overall:'inconclusive'});
 assert.match(html,/Run stopped with partial results/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail(passed,{state:'error',error:'Could not save all artifacts'});
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail({...passed,checks:[...passed.checks,check('gpu','inconclusive',{required:false})]});
-assert.match(html,/<h1>GPU metrics is inconclusive<\/h1>/);
-assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
+assert.match(html,/<h1>1 check passed<\/h1>/);assert.match(html,/Server observations/);
+assert.match(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail({...passed,overall:'fail',baseline:{status:'fail'}});
 assert.match(html,/A material regression was detected/);
 assert.match(html,/class="button primary" data-action="show-comparison">Show comparison/);
 assert.doesNotMatch(html,/data-action="show-failing"/);
 html=detail(report([]));
 assert.match(html,/<h1>No checks ran<\/h1>/);
-assert.doesNotMatch(html,/Selected acceptance checks passed|checks met their configured limits/);
+assert.doesNotMatch(html,/1 check passed|checks met their configured limits/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 """)
 
@@ -174,7 +176,7 @@ let html=detail(value);
 assert(html.indexOf('data-check="local:correctness"')<html.indexOf('data-check="local:access"'));
 assert.match(html,/<details class="checks-not-selected">/);
 const disclosure=html.match(/<details class="checks-not-selected"[^>]*>([\s\S]*?)<\/details>/)[1];
-assert.match(disclosure,/Not selected: JSON correctness/);
+assert.match(disclosure,/JSON correctness/);for(const entry of bootstrap.checks.filter(item=>!value.manifest.config.checks.includes(item.id)))assert(disclosure.includes(escape(entry.title)),entry.title);
 assert.doesNotMatch(html,/data-check="local:json"/);
 assert.match(html,/Server did not expose &lt;tools&gt;/);
 assert.doesNotMatch(disclosure,/data-check="local:access"|data-check="local:correctness"/);
@@ -193,7 +195,7 @@ selectedSkipped.manifest.config.checks.push('tools');
 html=detail(selectedSkipped);
 assert.match(html,/<h1>Some selected checks did not run<\/h1>/);
 assert.match(html,/result-heading inconclusive/);
-assert.doesNotMatch(html,/Acceptance passed|Selected acceptance checks passed/);
+assert.doesNotMatch(html,/Acceptance passed|1 check passed/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 """)
 
@@ -207,7 +209,7 @@ renderLive();let html=nodes['#main'].innerHTML;
 assert.match(html,/<h1>Running<\/h1>/);
 assert.match(html,/9 requests finished · 5s · limit 100/);
 assert.doesNotMatch(html,/Requests started ·|Active requests<\/dt>/);
-assert.match(html,/Scheduled requests can also use budget without reaching the server/);
+assert.doesNotMatch(html,/Scheduled requests can also use budget without reaching the server/);assert.match(fieldDescription('max_requests').help,/without reaching the server/);
 assert.doesNotMatch(html,/Request budget used/);
 state.detail.state='stopping';renderLive();html=nodes['#main'].innerHTML;
 assert.match(html,/data-action="stop"[^>]* disabled/);
@@ -233,13 +235,14 @@ const value=report([check('context','fail')],{baseline});state.detail={report:va
 state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
 let html=renderComparison(value);
 assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
-assert.match(html,/<th>Metric<\/th>/);assert.match(html,/worse/);assert.match(html,/not comparable/);
+assert.match(html,/<th scope="col">Metric<\/th>/);assert.match(html,/worse/);assert.match(html,/not comparable/);
 assert.match(html,/no material change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
 assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>|Entry \d/);
-assert.equal((html.match(/<tbody><tr>/g)||[]).length,3); // Each of the three measurements survives condition grouping.
-assert.equal((html.match(/data-comparison-condition/g)||[]).length,2);
-assert.match(html,/<details class="comparison-quiet"><summary>Unchanged \(1\)/);
-assert.match(html,/<details class="comparison-quiet"><summary>Not comparable \(1\)/);
+assert.equal((html.match(/data-comparison-condition=/g)||[]).length,1); // One condition header, then one row per measurement.
+assert.equal((html.match(/class="comparison-metric"/g)||[]).length,3);
+for(const metric of ['Latency','Time to first answer','Correct answers'])assert(html.includes(metric));
+assert.equal((html.match(/data-comparison-condition/g)||[]).length,1);
+assert.equal((html.match(/data-label="Verdict">not comparable/g)||[]).length,1);assert.match(html,/Sample variation/);
 assert.equal(JSON.stringify(value),original);
 """)
 
@@ -343,9 +346,10 @@ const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive'];
 assert.equal(new Set(statuses.map(status=>statusLabels[status])).size,statuses.length);
 assert.equal(new Set(statuses.map(status=>statusIcons[status])).size,statuses.length);
 for(const status of statuses){assert(statusLabels[status]);assert.match(badge(status),new RegExp(statusLabels[status]));}
-const records=['completed','failed','timeout','cancelled','skipped','completed'].map((status,i)=>({id:'r'+i,status,valid:true,score:i===0?true:null}));
+const records=['completed','failed','timeout','cancelled','skipped','completed'].map((status,i)=>({id:'r'+i,scenario:'correctness',check_ids:['correctness'],status,valid:true,score:i===0?true:null}));
 const html=renderMosaic(records);
-for(const status of statuses){assert(html.includes('request-spot '+status));assert(html.includes(statusLabels[status]));}
+for(const status of ['pass','fail','timeout','cancelled','skipped','unscored']){assert(html.includes('status '+status),status);assert(html.includes(status==='unscored'?'Unscored':statusLabels[status]),status);}
+assert.doesNotMatch(html,/status inconclusive/,'completed unscored requests must be labeled Unscored');
 """)
 
 

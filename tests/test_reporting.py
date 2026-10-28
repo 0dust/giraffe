@@ -34,6 +34,18 @@ def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
 
 
+def test_comparison_setting_reasons_include_structured_values_without_changing_text():
+    current, previous = make_report(), make_report("baseline")
+    current.manifest["config"]["request_timeout_seconds"] = 300
+    previous.manifest["config"]["request_timeout_seconds"] = 15
+    target = compare_baseline(current, previous).baseline["targets"][0]
+    assert "Run setting request_timeout_seconds differs." in target["reasons"]
+    detail = next(item for item in target["reason_details"] if item.get("key") == "request_timeout_seconds")
+    assert detail == {"code": "setting_differs", "key": "request_timeout_seconds",
+                      "baseline": 15, "current": 300,
+                      "text": "Run setting request_timeout_seconds differs."}
+
+
 def dead_endpoint_report():
     from giraffe.models import EvaluationEvidence
 
@@ -551,7 +563,7 @@ def test_serialized_retention_preserves_measurements_scores_and_source(policy, t
     assert bool(saved.requests[1].output) is (policy != "none")
     assert bool(saved.requests[1].reasoning) is (policy != "none")
     assert html_path.exists()
-    assert "Measurements by scenario" in html_path.read_text()
+    assert "Measurements by condition" in html_path.read_text()
     assert "Errors / timeouts" in html_path.read_text()
 
 
@@ -629,7 +641,7 @@ def test_legacy_tool_report_remains_readable(tmp_path):
     json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[0].tool_evaluation is None
-    assert "Request evidence" in html_path.read_text()
+    assert "<h2>Requests</h2>" in html_path.read_text()
 
 
 def test_baseline_roundtrip_works_after_bodies_are_stripped(tmp_path: Path):
@@ -868,7 +880,7 @@ async def test_saved_report_records_and_displays_applied_sanity_limits(tmp_path,
     saved = RunReport.model_validate_json(json_path.read_text())
     html = html_path.read_text()
     for check_id, field, limit, label in (
-        ('first_output', 'first_output_ms', 800 if explicit else 10000, 'p95 first useful output'),
+        ('first_output', 'first_output_ms', 800 if explicit else 10000, 'p95 first answer'),
         ('generation', 'stream_gap_ms', 700 if explicit else 5000, 'Stream pause'),
     ):
         assert saved.manifest['effective_checks'][check_id]['limits'][field] == limit
@@ -888,7 +900,7 @@ def test_old_report_with_null_effective_limit_metadata_keeps_rendering(tmp_path)
     _, html_path = write_report(report, tmp_path, html=True)
     html = html_path.read_text()
     assert 'Timing observed; no acceptance limit configured.' in html
-    assert 'p95 first useful output ≤' not in html
+    assert 'p95 first answer ≤' not in html
 
 
 @pytest.mark.parametrize('limit,label', [(999, '999 ms'), (1000, '1 s'), (1500, '1.5 s'), (10000, '10 s')])
@@ -898,7 +910,7 @@ def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label)
                                 status='pass', summary='Timing met the recorded limit.')]
     report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
     _, html_path = write_report(report, tmp_path, html=True)
-    assert f'p95 first useful output ≤ {label}' in html_path.read_text()
+    assert f'p95 first answer ≤ {label}' in html_path.read_text()
 
 
 
@@ -907,7 +919,8 @@ def test_html_baseline_table_uses_actual_comparison_contract():
 
     report = compare_baseline(make_report(latency=200), make_report("baseline"))
     html = _render(report)
-    assert '<th>Metric</th><th>Baseline</th><th>Current</th><th>Change</th><th>Verdict</th>' in html
+    head = re.search(r'<table class="baseline-table">.*?<thead>(.*?)</thead>', html, re.S).group(1)
+    assert re.findall(r'<th[^>]*>(.*?)</th>', head) == ['Metric', 'Baseline', 'Current', 'Δ', 'Verdict']
     assert '+100.0%' in html
     assert '>Worse</strong>' in html
     assert '>No material change</strong>' in html
@@ -915,6 +928,25 @@ def test_html_baseline_table_uses_actual_comparison_contract():
     assert html.count('>Baseline comparison</h2>') == 1
     assert 'Entry 1' not in html
     assert 'vs baseline baseline:' in html
+
+
+def test_html_baseline_has_condition_headers_and_five_cells_per_metric():
+    from giraffe.reporting import _baseline_table_html
+    from giraffe.performance_html import STYLE
+
+    rows = [dict(check=check, scenario="warm", metric=metric, baseline=10, current=12,
+                 status="inconclusive", reason="Only one sample.")
+            for check, metric in (("access", "latency_ms"), ("generation", "output_tokens_per_second"))]
+    html = _baseline_table_html(dict(targets=[dict(target="local", comparisons=rows)]))
+    assert html.count('class="comparison-group"') == 1
+    assert 'colspan="5" scope="rowgroup"' in html
+    metric_rows = re.findall(r'<tr class="comparison-metric">(.*?)</tr>', html, re.S)
+    assert len(metric_rows) == 2
+    assert all(len(re.findall(r'<(?:td|th)\b', row)) == 5 for row in metric_rows)
+    assert all('class="comparison-reason"' in row for row in metric_rows)
+    assert 'table-layout:fixed' in STYLE and 'font-variant-numeric:tabular-nums' in STYLE
+    assert '.baseline-table .comparison-reason{' in STYLE and 'text-transform:none' in STYLE
+    assert '@media(max-width:599px)' in STYLE
 
 
 def test_html_json_export_is_relative_with_filename_note_and_no_embedded_json():
@@ -1004,7 +1036,8 @@ def test_html_load_baseline_table_names_qualification_and_missing_comparisons(ha
     assert html.count('<section id="baseline">') == 1
     if has_points:
         assert 'short input' in table.lower() and 'concurrency 2' in table
-        assert '<td>Pass</td>' in table and '<td>Fail</td>' in table
+        assert re.search(r'data-label="Baseline"[^>]*>Pass</td>', table)
+        assert re.search(r'data-label="Current"[^>]*>Fail</td>', table)
         assert 'Worse' in table and 'Lost acceptable load.' in table
     else:
         assert 'Not comparable' in table and 'No matched load points.' in table
@@ -1022,15 +1055,16 @@ def test_html_baseline_groups_each_condition_with_changed_rows_first():
                  worsening_interval_95=[-50, -50], threshold=10),
             dict(unchanged, metric="worse", current=200, status="fail", reason="Latency doubled.")]
     html = _baseline_table_html(dict(targets=[dict(target="local", comparisons=rows)]))
-    assert html.index('local · correctness · warm') < html.index('local · correctness · quiet')
-    assert html.index('>Worse (1)</h4>') < html.index('>Better (1)</h4>')
-    assert html.index('>Better (1)</h4>') < html.index('<summary>Unchanged (1)</summary>')
-    assert html.index('<summary>Unchanged (1)</summary>') < html.index('<summary>Not comparable (1)</summary>')
-    assert html.count('<details class="baseline-group">') == 3
-    assert '<details class="baseline-group" open' not in html
+    assert html.index('local · Warm-up') < html.index('local · Quiet')
+    assert html.index('>Worse</strong>') < html.index('>Better</strong>')
+    assert html.index('>Better</strong>') < html.index('>No material change</strong>')
+    assert html.index('>No material change</strong>') < html.index('>Not comparable</strong>')
+    assert html.count('class="comparison-group"') == 2
+    assert html.count('class="comparison-metric"') == 5
+    assert '<details class="baseline-group"' not in html
     assert 'Needs more samples.' in html and 'Latency doubled.' in html
     assert 'No material worsening detected in these samples.' not in html
-    assert html.count('<th>Reason</th>') == 2
+    assert html.count('class="comparison-reason"') == 2
     assert 'Entry ' not in html
 
 
@@ -1046,8 +1080,10 @@ def test_html_baseline_no_regression_summary_includes_uncompared_count_and_focus
     assert 'vs baseline before-upgrade: no regressions (64 unchanged, 30 not comparable)' in html
     assert '<a href="#baseline-heading">vs baseline' in html
     assert '<h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>' in html
-    assert '<summary>Unchanged (64)</summary>' in html
-    assert '<summary>Not comparable (30)</summary>' in html
+    assert html.count('class="comparison-metric"') == 94
+    assert html.count('>No material change</strong>') == 64
+    assert html.count('>Not comparable</strong>') == 30
+    assert html.count('class="comparison-reason"') == 30
 
 
 @pytest.mark.parametrize('status, verdict', [('pass', 'Better'), ('inconclusive', 'Not comparable')])
@@ -1063,7 +1099,8 @@ def test_html_load_improvement_requires_comparable_evidence(status, verdict):
     html = _baseline_table_html(baseline)
     assert f'>{verdict}</strong>' in html
     assert ('Complete matched load evidence.' if status == 'pass' else 'Client-limited evidence.') in html
-    assert '<td>Fail</td>' in html and '<td>Pass</td>' in html
+    assert re.search(r'data-label="Baseline"[^>]*>Fail</td>', html)
+    assert re.search(r'data-label="Current"[^>]*>Pass</td>', html)
     if status == 'pass':
         assert '1 better' in _baseline_summary_html(baseline)
 
