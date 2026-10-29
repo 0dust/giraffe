@@ -1,5 +1,7 @@
 """Accepted tested loads remain comparable when optional metrics are sparse."""
 
+import json
+
 import pytest
 
 from giraffe.load_test import test_points as load_points
@@ -113,6 +115,46 @@ def test_losing_accepted_rate_fails_baseline_without_bootstrap_sample_minimum():
     assert [row["status"] for row in comparison["points"]] == ["pass", "fail"]
     assert next(check for check in compared.checks if check.id == "baseline").evidence_ids == point["request_ids"]
     assert "previously acceptable tested load now fails" in _render(compared)
+
+
+@pytest.mark.parametrize("missing_current", [False, True])
+def test_browser_load_acceptance_preserves_loss_or_missing_evidence_under_filters(missing_current):
+    from tests.test_ux_results import run_render_checks
+
+    old = arrival_report()
+    old.manifest["config"]["limits"]["min_samples"] = 5
+    current = old.model_copy(deep=True)
+    if missing_current:
+        current.checks[0].metrics = {"points": []}
+    else:
+        lose_rate(current)
+    compared = compare_baseline(current, old)
+    target = compared.baseline["targets"][0]
+    assert all(row["status"] == "pass" for row in target["comparisons"])
+    assert target["load_test"]["status"] == ("inconclusive" if missing_current else "fail")
+    run_render_checks(r"""
+const value=VALUE,missing=MISSING;
+state.detail={report:value};
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;state.comparisonCheck='correctness';
+  const html=renderComparison(value);
+  assert.match(html,/id="results-load-acceptance"/);
+  assert.match(html,/Tested load acceptance/);
+  assert.match(html,/Baseline highest accepted \(tested\)/);
+  assert.match(html,/50 requests\/second/);
+  if(missing){
+    assert.match(html,/One run lacks final Load test evidence/);
+    assert.match(html,/Not established/);
+  }else{
+    assert.match(html,/10 requests\/second/);
+    assert.match(html,/previously acceptable tested load now fails its configured criteria/);
+    assert.match(html,/1 previously acceptable tested load\(s\) now fail/);
+    assert.match(html,/Comparison evidence/);
+  }
+}
+assert(resultsSections().some(section=>section[0]==='load-acceptance'));
+""".replace("VALUE", json.dumps(compared.model_dump(mode="json")))
+        .replace("MISSING", json.dumps(missing_current)))
 
 
 @pytest.mark.parametrize("missing_side", ["current", "baseline"])

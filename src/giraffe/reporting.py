@@ -1001,10 +1001,19 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         if delayed_runs:
                             for label in delayed_runs:
                                 q = quality[label]
-                                warn("client_delayed", f"{label} client scheduling delay overlaps "
-                                     f"{q['affected_requests']}/{q['total_requests']} requests for this metric "
-                                     f"(maximum overlapping delay {q['max_overlapping_lag_ms']:.0f} ms; threshold {q['threshold_ms']:.0f} ms). "
-                                     "Some waiting time may come from Giraffe, so endpoint timing attribution is uncertain.")
+                                if q["scope"] == "legacy_run_maximum":
+                                    delay = (f"{label} recorded a run-wide maximum client scheduling delay of "
+                                             f"{q['max_overlapping_lag_ms']:.0f} ms "
+                                             f"(threshold {q['threshold_ms']:.0f} ms). "
+                                             "Request-level overlap was not recorded; the legacy fallback "
+                                             "conservatively qualifies all samples.")
+                                else:
+                                    delay = (f"{label} client scheduling delay overlaps "
+                                             f"{q['affected_requests']}/{q['total_requests']} requests for this metric "
+                                             f"(maximum overlapping delay {q['max_overlapping_lag_ms']:.0f} ms; "
+                                             f"threshold {q['threshold_ms']:.0f} ms).")
+                                warn("client_delayed", delay + " Some waiting time may come from Giraffe, "
+                                     "so endpoint timing attribution is uncertain.")
                         if check == "load" and metric in {"latency_ms", "first_output_ms"}:
                             completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
                                                 for cohort in (current_records, old_records)]
@@ -1054,7 +1063,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             elif missing_measurements:
                 summary = "Some metrics lost measurement coverage or have undefined baseline values."
             elif saturated_runs:
-                summary = "Overlapping client scheduling delay prevents a reliable timing/rate comparison."
+                summary = "Client scheduling delay prevents a reliable timing/rate comparison."
             else:
                 summary = "Sample variation or changed output lengths prevent a clear material-regression decision."
         else:

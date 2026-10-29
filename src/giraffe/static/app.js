@@ -2755,7 +2755,7 @@ function chooseReportTab(tab,{focus=false,anchor=true}={}) {
 function resultsSections() {
   const report=state.detail?.report;if(!report?.baseline)return [];
   const rows=(report.baseline.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)]);
-  return [['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],...comparisonSections.filter(([id])=>rows.some(row=>comparisonCategory(row)===id)).map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
+  return [['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],...(report.baseline.targets?.some(target=>target.load_test)?[['load-acceptance','Tested load acceptance','comparison']]:[]),...comparisonSections.filter(([id])=>rows.some(row=>comparisonCategory(row)===id)).map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 }
 function renderResultsJump() {
   const sections=resultsSections();if(!sections.length)return '';
@@ -3273,7 +3273,7 @@ function comparisonWarningSummary(row) {
       const before=row.output_work?.baseline?.reported_output_tokens_p50,after=row.output_work?.current?.reported_output_tokens_p50;
       notes.push(before!=null&&after!=null?`Answer length changed: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
     }else if(warning.code==='client_delayed'){
-      for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
+      for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(q.scope==='legacy_run_maximum'?`${name} recorded a run-wide Giraffe delay; request-level overlap was not recorded.`:`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
     }else if(warning.code==='sample_uncertainty')notes.push('Sample uncertainty limits this assessment.');
     else if(warning.code==='input_work_changed')notes.push('Input workload differs.');
     else if(warning.code==='missing_timing')notes.push('Some response timings are missing.');
@@ -3299,6 +3299,21 @@ function baselineIdentity(baseline) {
   const when=baseline.source_started_at || run?.started_at || saved?.saved_at;
   return `<strong>${escape(label)}</strong>${when?`<span>${date(when)}</span>`:''}<details class="baseline-identifier"><summary>Reference ID</summary><code>${escape(baseline.run_id || 'Not recorded')}</code></details>`;
 }
+function renderLoadAcceptance(targets) {
+  const tested=targets.filter(target=>target.load_test);
+  if(!tested.length)return '';
+  const label=point=>loadPointLabel({...point,type:point.type||point.workload||'load',shape:point.shape||(loadShapes.includes(point.workload)?point.workload:null)});
+  const status=point=>point?`${badge(point.status||'inconclusive')}${point.not_run?'<small>Not run</small>':point.cut_short?'<small>Cut short</small>':''}${point.dispatched!=null?`<small>${number(point.dispatched)} dispatched</small>`:''}`:'Not tested';
+  return `<section id="results-load-acceptance" class="comparison-section"><h3>Tested load acceptance</h3><p class="hint">Acceptance at tested levels is separate from statistical changes in individual measurements.</p>${tested.map(target=>{
+    const load=target.load_test;
+    const highest=points=>points?.length?points.map(point=>`<strong>${point.value==null?'Not established':number(point.value,2)}${point.pattern==='concurrent'?' concurrent requests':' requests/second'}</strong><small>${escape(label({...point,level:null,rate:null}))}</small>`).join(''):'Not established';
+    return `<section><h4>${escape(target.target||target.name||'Target')} ${badge(load.status||'inconclusive')}</h4>${load.reason?`<p>${escape(load.reason)}</p>`:''}<dl class="metrics-grid"><div class="metric"><dt>Baseline highest accepted (tested)</dt><dd>${highest(load.baseline_highest_accepted)}</dd></div><div class="metric"><dt>Current highest accepted (tested)</dt><dd>${highest(load.current_highest_accepted)}</dd></div></dl>${load.points?.length?`<div class="metric-table" tabindex="0" role="region" aria-label="${escape(target.target||target.name||'Target')} tested load acceptance"><table><thead><tr><th scope="col">Tested load</th><th scope="col">Baseline</th><th scope="col">Current</th><th scope="col">Comparison evidence</th></tr></thead><tbody>${load.points.map(row=>`<tr><th scope="row">${escape(label(row.current||row.baseline||{}))}</th><td>${status(row.baseline)}</td><td>${status(row.current)}</td><td>${badge(row.status||'inconclusive')}<small>${escape(row.reason||'')}</small></td></tr>`).join('')}</tbody></table></div>`:''}</section>`;
+  }).join('')}</section>`;
+}
+function renderComparisonDetails(targets) {
+  if(!targets.length)return '';
+  return `<details class="comparison-support comparison-deployment"><summary>Deployment and comparison details</summary><p class="hint">Changes provide investigation context, not proof of causality. Missing or stale fields do not establish unchanged configuration.</p>${targets.map(target=>`<section><h4>${escape(target.target||target.name||'Target')}</h4><p>${target.configuration_diff?.confounded?'Confounded experiment: other recorded settings changed alongside the intended change.':'Causality unverified.'}</p><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></section>`).join('')}</details>`;
+}
 function renderComparison(report) {
   const b=report.baseline;
   if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><button class="button" data-action="compare-saved">Compare with baseline</button><button class="button" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
@@ -3307,11 +3322,11 @@ function renderComparison(report) {
   const warningCount=allRows.filter(row=>comparisonWarnings(row).length).length,acceptance=b.acceptance||{};
   const acceptanceLabel=value=>value?escape(statusLabels[value]||value):'Not recorded';
   const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='with_warnings'?comparisonWarnings(row).length>0:comparisonWarnings(row).length===0))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
-  return `<header id="results-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="results-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section><div class="comparison-filters">${allRows.length?`<div><label for="comparison-outcome">Show</label><select id="comparison-outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="comparison-check">Check</label><select id="comparison-check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).filter(t=>t.traffic_capacity).map(t=>`<section class="comparison-section"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`).join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
+  return `<header id="results-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="results-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${renderLoadAcceptance(b.targets||[])}<div class="comparison-filters">${allRows.length?`<div><label for="comparison-outcome">Show</label><select id="comparison-outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="comparison-check">Check</label><select id="comparison-check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).filter(t=>t.traffic_capacity).map(t=>`<section class="comparison-section"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`).join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
     const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
     for(const row of rows){const key=JSON.stringify([row.targetName,row.check,row.scenario]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
     return `<section id="results-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
-  }).join('')}`;
+  }).join('')}${renderComparisonDetails(b.targets||[])}`;
 }
 function syncComparisonFilters(){if($('#comparison-outcome'))$('#comparison-outcome').value=state.comparisonFilter;if($('#comparison-check'))$('#comparison-check').value=state.comparisonCheck;}
 function comparisonValue(row,value){if(value==null)return '—';if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':row.metric==='output_tokens'?' tokens':row.metric==='output_chars'?' chars':''}`;}
@@ -3457,24 +3472,29 @@ async function openRequest(id) {
 }
 function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
+// Closing a chooser does not cancel a comparison already being saved.
+const pendingComparisons=new Set();
 async function openComparisonDialog() {
   const id=state.detail?.id,version=state.routeVersion;
   if(!id||state.detail.state!=='completed')return;
+  if(pendingComparisons.has(id)){toast('A comparison is still being saved for this run.');return;}
   try {
     const result=await api('/api/baselines');
-    if(version!==state.routeVersion||state.detail?.id!==id)return;
+    if(version!==state.routeVersion||state.detail?.id!==id||pendingComparisons.has(id))return;
     state.baselines=result.baselines||[];
     const choices=state.baselines.filter(item=>item.run_id!==id);
     const dialog=$('#comparison-dialog');
     dialog.className='baseline-form';
     dialog.innerHTML=`<form id="comparison-form" data-run-id="${escape(id)}"><div class="dialog-head"><h2 id="comparison-title">Compare with saved baseline</h2><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close comparison">✕</button></div><div class="dialog-body"><p>Compare the recorded results. No new requests will be sent to your endpoint.</p>${choices.length?`<label for="saved-baseline-choice">Saved baseline</label><select id="saved-baseline-choice" name="baseline_id" required>${choices.map(item=>`<option value="${escape(item.id)}"${item.id===state.detail.baseline_id?' selected':''}>${escape(item.name)} · ${escape(date(item.saved_at))}</option>`).join('')}</select>`:'<p>No other saved baselines yet. Open a different completed run and choose “Save as reference baseline”, then return here.</p>'}<div id="comparison-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary"${choices.length?'':' disabled'}>Compare saved results</button></div></form>`;
     dialog.showModal();
-  }catch(error){toast(error.message);}
+  }catch(error){if(version===state.routeVersion&&state.detail?.id===id)toast(error.message);}
 }
 async function compareSavedRun(event) {
   event.preventDefault();
   const form=event.target,id=form.dataset.runId,version=state.routeVersion;
+  if(state.detail?.id!==id||pendingComparisons.has(id))return;
   const button=form.querySelector('[type="submit"]'),error=$('#comparison-error');
+  pendingComparisons.add(id);
   button.disabled=true;error.hidden=true;
   try {
     const result=await api(`${runPath(id)}/compare`,{method:'POST',body:JSON.stringify({baseline_id:new FormData(form).get('baseline_id')})});
@@ -3489,7 +3509,7 @@ async function compareSavedRun(event) {
     if(section){section.open=true;section.scrollIntoView?.({block:'start'});$('summary',section)?.focus({preventScroll:true});}
     toast(result.warning||'Comparison saved. No new requests were sent.');
   }catch(failure){if(version===state.routeVersion&&state.detail?.id===id){error.textContent=failure.message;error.hidden=false;}}
-  finally{button.disabled=false;}
+  finally{pendingComparisons.delete(id);button.disabled=false;}
 }
 async function saveBaseline(event){event.preventDefault();const form=event.target,data=new FormData(form),button=$('#save-baseline'),error=$('#baseline-error');button.disabled=true;error.hidden=true;try{await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:state.detail.id,name:String(data.get('baseline_name')).trim(),replace:data.has('replace')})});const result=await api('/api/baselines');state.baselines=result.baselines || [];$('#baseline-dialog').close();renderDetail();toast(`Saved as baseline “${String(data.get('baseline_name')).trim()}”. Open another completed run and choose Compare with baseline, or select it before a new run.`);}catch(e){error.textContent=e.message;error.hidden=false;if(e.status===409)$('#replace-row').hidden=false;}finally{button.disabled=false;}}
 async function stopRun(){

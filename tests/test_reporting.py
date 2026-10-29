@@ -846,6 +846,37 @@ def test_comparison_preserves_observations_and_all_interpretation_warnings():
     assert 'output lengths differ' in html and 'client scheduling delay' in html
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+def test_comparison_timing_warning_distinguishes_legacy_delay_from_request_overlap(scoped):
+    from giraffe.reporting import _render
+
+    current, previous = make_report(), make_report("before")
+    current.observations["generator_max_lag_ms"] = 500
+    if scoped:
+        current.observations["client_timing_health"] = {"schema_version": 1,
+            "windows": [{"start_ms": 0, "end_ms": 100, "lag_ms": 500}]}
+        for index, record in enumerate(current.requests):
+            record.dispatch_ms = index * 1000
+            record.completed_ms = record.dispatch_ms + record.elapsed_ms
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"]
+               if row["metric"] == "latency_ms")
+    warning = next(warning["message"] for warning in row["warnings"]
+                   if warning["code"] == "client_delayed")
+    assert row["current"] == row["baseline"] == 100
+    assert row["status"] == "inconclusive"
+    if scoped:
+        assert "overlaps 1/8 requests" in warning
+        assert "run-wide" not in warning
+    else:
+        assert "run-wide maximum client scheduling delay of 500 ms" in warning
+        assert "Request-level overlap was not recorded" in warning
+        assert "overlaps 8/8" not in warning
+        assert "maximum overlapping delay" not in warning
+        assert "run-wide maximum client scheduling delay" in _render(result)
+        assert "Overlapping client scheduling delay" not in result.baseline["targets"][0]["summary"]
+
+
 def test_low_samples_keep_values_without_claiming_confidence():
     result = compare_baseline(make_report(count=2, latency=200), make_report('before', count=2))
     row = next(row for row in result.baseline['targets'][0]['comparisons'] if row['metric'] == 'latency_ms')
