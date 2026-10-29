@@ -117,7 +117,9 @@ const scenarios=[['mixed_short_long_input_before_output','short request'],['mixe
  ['session_live_turn1','turn 2'],['session_live_turn2','turn 3'],
  ['consistency_c4_short_p2','prompt 3'],['consistency_c4_short_p3','prompt 4'],
  ['tools_lookup_stream_turn0','turn 1'],['tools_lookup_stream_turn1','turn 2']];
-const html=comparisonTable(scenarios.map(([scenario])=>({scenario,metric:'latency_ms'})));
+const html=renderComparison(report([],{baseline:{targets:[{target:'local',comparisons:
+  scenarios.map(([scenario])=>({check:'serving',scenario,metric:'latency_ms',status:'pass',baseline:10,current:10}))}]}}));
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,scenarios.length);
 for(const [scenario,part] of scenarios)assert(html.includes(phaseName(scenario)+' · '+part),scenario);
 assert(renderPhases([{event:'scenario_started',scenario:'session_live_turn1',target:'local'}]).includes('Live sessions · turn 2'));
 const reportValue=report([check('serving','pass',{evidence_ids:['one','two']})],{requests:scenarios.slice(0,2).map(([scenario],i)=>({id:i?'two':'one',scenario,target:'local',status:'completed'}))});
