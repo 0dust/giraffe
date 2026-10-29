@@ -560,10 +560,10 @@ def _remember_discovery(run, target, result):
     return result
 
 
-async def sample_during(run, target):
+async def sample_during(run, target, *, stop_event: asyncio.Event):
     data = run.observations[target.name]["serving_telemetry"]
     last = None
-    while not run.stop.is_set() and time.monotonic() < run.deadline:
+    while not stop_event.is_set() and not run.stop.is_set() and time.monotonic() < run.deadline:
         if len(data["snapshots"]) >= run.config.metrics_max_samples - 1:
             data["sample_limit_reached"] = True
             return
@@ -581,7 +581,7 @@ async def sample_during(run, target):
         last = snap["elapsed_seconds"]
         data["snapshots"].append(snap)
         if (
-            target.deployment.collector_url
+            not stop_event.is_set() and target.deployment.collector_url
             and len(run.observations[target.name]["deployment_history"]) < MAX_DEPLOYMENT_HISTORY
         ):
             from giraffe.deployment import snapshot
@@ -589,6 +589,11 @@ async def sample_during(run, target):
             run.observations[target.name]["deployment_history"].append(
                 await snapshot(target, run.config, run.deadline, run.stop)
             )
+        # A transport cancellation scope can consume Task.cancel() while
+        # finishing a scrape. The target's explicit stop still ends sampling
+        # before another interval wait, without stopping peer targets.
+        if stop_event.is_set():
+            return
         try:
             await asyncio.wait_for(run.stop.wait(), run.config.metrics_interval_seconds)
         except TimeoutError:
