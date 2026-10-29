@@ -2402,11 +2402,17 @@ function renderReviewPassCriteria(config) {
   }).filter(Boolean);
   return rows.length?`<section class="review-criteria review-section"><div class="review-section-heading"><h3>Pass criteria</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit criteria</button></div><div class="plan-rows">${rows.join('')}</div></section>`:'';
 }
+function renderArrivalHistory(plan) {
+  const rows=plan.arrival_history || [];
+  if(!rows.length)return '';
+  return `<details class="request-planning arrival-history"><summary>Previous arrival delivery</summary>${rows.map(row=>`<p>${escape(row.message)}${row.run_id?` <a href="${linkRun(row.run_id)}">Open source run</a>`:''}</p>`).join('')}</details>`;
+}
 function renderRequestPlan(config=null) {
   const element=$('#request-plan');if(!element)return;
   const saved=state.requestPreview,plan=currentRequestPlan();
   if(!config&&$('#run-blueprint')){try{config=readForm(true).config;}catch{}}
   config ||= (plan?saved.config:null) || state.config;
+  const history=$('#setup-history');if(history){history.innerHTML=plan?renderArrivalHistory(plan):'';history.hidden=!history.innerHTML;}
   syncRunBlueprint(config,plan);
   if(config)updateSharedSettingsSummaries(config);
   const durationLine=$('#setup-duration');if(durationLine)durationLine.innerHTML=renderPlanTime(plan);
@@ -2783,6 +2789,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model||'',{required:true,placeholder:'Found when you connect',hiddenLabel:true,hint:''})}</div><p class="hint" id="model-options-label"></p></div></div></div></section>
   <section class="setup-section setup-profiles-section"><h2>What to test</h2><div class="setup-profiles" aria-label="Check profiles">${[['quick','Quick check'],['latency','Latency'],['load','Load'],['correctness','Correctness'],['custom','Custom']].map(([id,label])=>`<button type="button" class="setup-profile" data-action="setup-profile" data-profile="${id}" aria-pressed="${setupProfile(c)===id}">${label}</button>`).join('')}</div><p class="hint" id="setup-selected-checks">${c.checks.map(catalogTitle).map(escape).join(' · ')}</p></section>
   ${renderSharedRunSettings(c)}
+  <div id="setup-history" hidden></div>
   ${selectField('baseline_id','Compare with',baselineOptions(state.prefillBaseline||''),{hint:''})}<div id="baseline-drift">${renderBaselineDrift(state.prefillBaseline||'',c)}</div>
   <details class="setup-advanced" id="setup-advanced" ${setupProfile(c)==='custom'?'open':''}><summary>Advanced</summary><div class="details-content">
   <div class="fields">${field('name','Endpoint name',target.name,{required:true,placeholder:'local',hint:''})}</div>
