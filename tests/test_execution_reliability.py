@@ -176,22 +176,37 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
     assert run.errors == 0 and runner.time.monotonic()-run.start < .2
 
 
-async def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch, local_tokenizer):
+def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch, local_tokenizer):
     from tests.test_concurrent_load import configuration,short_windows,Client as TokenClient
+    from tests.test_review26_phase4_accuracy import run_virtual
+
     class Healthy(TokenClient):
         def __init__(self,*args,max_connections=None): super().__init__()
         async def __aenter__(self): return self
         async def __aexit__(self,*args): pass
+
     monkeypatch.setattr(runner,'LLMClient',Healthy)
     cfg=short_windows(configuration(checks=['load','correctness'],concurrency=64,max_requests=200,test_options={'correctness':{'concurrency':1}},load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[1000]}}),.06)
-    report=await runner.run_suite(cfg)
-    p=next(c for c in report.checks if c.id == 'load').metrics['points'][0]
-    g=p['groups'][0]
-    assert p['scheduled'] == p['dispatched'] == g['completed'] == 60
-    assert g['failed'] == g['error_percent'] == 0
-    assert len(report.requests) == 66 and report.abort_reason is None
-    assert not any('calibration' in record.scenario for record in report.requests)
-    assert all(r.overlap == 1 for r in report.requests if r.scenario == 'correctness_c1')
+
+    async def scenario():
+        # Exercise retention and overlap cleanup without treating a host pause
+        # as measured scheduler lateness. Keep response and arrival clocks aligned.
+        monkeypatch.setattr('tests.test_concurrent_load.time', runner.time)
+        report = await runner.run_suite(cfg)
+        p = next(c for c in report.checks if c.id == 'load').metrics['points'][0]
+        g = p['groups'][0]
+        assert p['scheduled'] == p['dispatched'] == g['completed'] == 60
+        assert g['failed'] == g['error_percent'] == 0
+        assert len(report.requests) == len({record.id for record in report.requests}) == 66
+        assert report.abort_reason is None
+        assert g['client_peak_inflight'] > 1
+        assert max(record.overlap for record in report.requests
+                   if record.scenario.startswith('load_')) > 1
+        assert not any('calibration' in record.scenario for record in report.requests)
+        serial = [record for record in report.requests if record.scenario == 'correctness_c1']
+        assert len(serial) == 6 and all(record.overlap == 1 for record in serial)
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_scorer_failure_preserves_attempt_record_and_clears_inflight(monkeypatch):
