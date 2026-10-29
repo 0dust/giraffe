@@ -83,8 +83,8 @@ assert.match(html,/Preparation complete/);assert.doesNotMatch(html,/reference to
 def test_limits_keep_planned_count_when_cap_allows_the_plan():
     run_render_checks(r'''
 const config={...bootstrap.defaults,max_requests:60,request_timeout_seconds:300,concurrency:4};
-assert.equal(sharedLimitsSummary(config,{planned_total:16,count_kind:'exact'}),'16 requests (≤ 60) · ≤ 5 m per request · 4 at once');
-assert.equal(sharedLimitsSummary(config,{planned_total:16,count_kind:'adaptive'}),'16+ requests (≤ 60) · ≤ 5 m per request · 4 at once');
+assert.equal(sharedLimitsSummary(config,{planned_total:16,count_kind:'exact'}),'16 requests (≤ 60) · 5 m default request timeout · 4 at once');
+assert.equal(sharedLimitsSummary(config,{planned_total:16,count_kind:'adaptive'}),'16+ requests (≤ 60) · 5 m default request timeout · 4 at once');
 ''')
 
 

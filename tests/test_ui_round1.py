@@ -45,10 +45,10 @@ assert.match(html,/condition-reference" open/);assert.doesNotMatch(html,/<summar
 def test_setup_limits_have_plan_and_labelled_empty_means_off():
     run_render_checks(r'''
 state.config={...bootstrap.config,max_requests:null,max_duration_seconds:null,concurrency:null,request_timeout_seconds:300};
-currentRequestPlan=()=>({planned_total:13,known_requests:13,requests_per_target:13,rows:[],checks:[],effective_concurrency:4});
+currentRequestPlan=()=>({planned_total:13,known_requests:13,requests_per_target:13,rows:[],checks:[],required_concurrency:{peak:4}});
 const html=renderSharedRunSettings(state.config);
 assert.doesNotMatch(html,/No (?:request|duration|concurrency) limit|type="checkbox"|checks-plan-summary sr-only/);
-assert.match(html,/13 requests/);assert.match(html,/≤ 5 m per request/);assert.match(html,/Empty = off/);
+assert.match(html,/13 requests/);assert.match(html,/5 m default request timeout/);assert.match(html,/Empty = off/);
 assert.match(html,/<label[^>]*for="field-max_requests"[^>]*>Max requests/);
 ''')
 
@@ -107,7 +107,7 @@ state.prefillBaseline='explicit';chooseSetupProfile('latency');assert.equal(stat
 api=async()=>({config:structuredClone(config)});await startNewRun();assert.equal(state.prefillBaseline,'');
 const endpoint={...config.targets[0],api_key_env:'MY_KEY',metrics_url:'http://private/metrics'};
 state.config={...config,targets:[endpoint]};state.baselineConfigs=new Map([['explicit',{...config,request_timeout_seconds:15,targets:[{name:'old',url:'http://old/v1',model:'old-model'}]}]]);
-readForm=()=>({config:structuredClone(state.config)});matchBaselineSettings();
+readForm=()=>({config:structuredClone(state.config)});api=async(path,options)=>({config:JSON.parse(options.body)});await matchBaselineSettings();
 assert.equal(JSON.stringify(state.config.targets),JSON.stringify([endpoint]));assert.equal(state.config.request_timeout_seconds,15);assert.equal(state.prefillBaseline,'explicit');
 ''')
 

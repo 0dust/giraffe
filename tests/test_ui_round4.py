@@ -58,7 +58,7 @@ renderNew=()=>{$('#main').innerHTML='<form id="new-run-form">'+renderSharedRunSe
 renderNew();await listeners.click({target:$('[data-action="reset-restored-limits"]'),preventDefault(){}});
 for(const key of ['max_requests','max_duration_seconds','concurrency','request_timeout_seconds'])assert.equal(state.config[key],bootstrap.config[key],key);
 assert.equal(state.config.max_output_tokens,1024);assert.equal(state.config.targets[0].model,'m');
-assert.match($('#run-ceilings-summary').textContent,/≤ 5 m per request · 4 at once/);
+assert.match($('#run-ceilings-summary').textContent,/5 m default request timeout · 4 at once/);
 state.config.request_timeout_seconds=15;state.limitSource='restored';renderNew();assert.match($('#main').textContent,/Limits from your last run/);
 })()
 ''',dom=True)

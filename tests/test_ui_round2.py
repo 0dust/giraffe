@@ -22,7 +22,7 @@ def test_limit_summary_shows_cap_and_plan_once_and_one_empty_hint():
     run_render_checks(r'''
 const cfg={...bootstrap.defaults,max_requests:10,request_timeout_seconds:300,concurrency:4};
 currentRequestPlan=()=>({planned_total:19,count_kind:'exact',rows:[]});
-assert.equal(sharedLimitsSummary(cfg),'≤ 10 requests · 19 planned, budget too small · ≤ 5 m per request · 4 at once');
+assert.equal(sharedLimitsSummary(cfg),'≤ 10 requests · 19 planned, budget too small · 5 m default request timeout · 4 at once');
 const html=renderSharedRunSettings(cfg);assert.equal((html.match(/19 planned/g)||[]).length,1);
 assert.equal((html.match(/Empty = off/g)||[]).length,1);assert.doesNotMatch(html,/checks-plan-summary/);
 ''')

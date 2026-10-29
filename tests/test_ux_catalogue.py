@@ -315,12 +315,12 @@ def test_inline_limits_are_collapsed_and_keep_the_three_budget_controls():
 config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
 assert.match(markup,/<details class="setup-limits-line shared-settings-editor" id="shared-settings">/);
-assert.match(markup,/≤ 160 requests · ≤ 5 m per request · 4 at once · ≤ 5 m total/);
+assert.match(markup,/≤ 160 requests · 5 m default request timeout · 4 at once · ≤ 5 m total/);
 for(const name of ['max_requests','max_duration_seconds','concurrency']){assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);assert.doesNotMatch(markup,new RegExp('name="'+name+'_enabled"'));assert(markup.includes('for="field-'+name+'"'));}
 assert.doesNotMatch(markup,/name="request_timeout_seconds"|name="stream"|name="max_memory_mb"|Confidence:/);
 assert.equal(JSON.stringify(config),before);
 nodes['#run-ceilings-summary']={};config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
-assert.equal(nodes['#run-ceilings-summary'].textContent,'≤ 80 requests · ≤ 5 m per request · 2 at once · ≤ 12.5 s total');
+assert.equal(nodes['#run-ceilings-summary'].textContent,'≤ 80 requests · 5 m default request timeout · 2 at once · ≤ 12.5 s total');
 """)
 
 

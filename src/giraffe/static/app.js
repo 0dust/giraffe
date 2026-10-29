@@ -1472,10 +1472,23 @@ async function loadBaselineSettings(id) {
   const node=$('#baseline-drift');if(node&&$('#new-run-form')?.elements.baseline_id?.value===id)node.innerHTML=renderBaselineDrift(id,state.config);
 }
 
-function matchBaselineSettings() {
+async function matchBaselineSettings() {
+  if(state.configBusy||state.submitting)return;
   const form=$('#new-run-form'),id=form?.elements.baseline_id?.value,saved=state.baselineConfigs?.get(id);if(!saved)return;
-  captureFormDraft();const targets=state.config.targets;state.config={...clone(saved),targets,restart_target:null};
-  state.prefillBaseline=id;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();
+  try{assertAppliedConfig();}catch(error){configError(error);return;}
+  captureFormDraft();
+  const route=state.routeVersion,revision=state.configRevision;
+  const current=()=>route===state.routeVersion&&revision===state.configRevision&&$('#new-run-form')?.elements.baseline_id?.value===id;
+  state.configBusy=true;syncSetupStep();
+  try{
+    const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(saved)});
+    if(!current())return;
+    assertAppliedConfig();captureFormDraft();
+    state.config={...result.config,targets:state.config.targets,restart_target:null};
+    state.migrationNotes=result.migration_notes || [];state.dismissedMigrationNotes=[];
+    state.prefillBaseline=id;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();
+  }catch(error){if(current())configError(error);}
+  finally{state.configBusy=false;syncSetupStep();}
 }
 function baselineOptions(selected='') {return `<option value="">No baseline · first or standalone run</option>${state.baselines.map(b=>`<option value="${escape(b.id)}" ${b.id===selected?'selected':''}>${escape(b.name)} · ${statusLabels[b.overall] || b.overall || 'saved'} · ${date(b.saved_at)}</option>`).join('')}`;}
 function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder='Use run setting'}={}) {
@@ -1614,8 +1627,8 @@ function sharedLimitsSummary(config,plan=currentRequestPlan()) {
   const adaptive=plan&&plan.count_kind&&!['exact','estimate'].includes(plan.count_kind);
   const cap=config.max_requests;
   const requests=cap!=null&&known!=null&&known<=cap?`${number(known)}${adaptive?'+':''} requests (≤ ${number(cap)})`:cap!=null?`≤ ${number(cap)} requests${known!=null?` · ${number(known)}${adaptive?'+':''} planned, budget too small`:''}`:known!=null?`${number(known)}${adaptive?'+':''} requests`:'Requests updating…';
-  const atOnce=config.concurrency ?? plan?.effective_concurrency ?? effectiveParallelism(config);
-  return [requests,`≤ ${compactDuration(config.request_timeout_seconds)} per request`,atOnce!=null?`${number(atOnce)} at once`:'',config.max_duration_seconds!=null?`≤ ${compactDuration(config.max_duration_seconds)} total`:''].filter(Boolean).join(' · ');
+  const atOnce=config.concurrency ?? plan?.required_concurrency?.peak;
+  return [requests,`${compactDuration(config.request_timeout_seconds)} default request timeout`,atOnce!=null?`${number(atOnce)} at once`:'Concurrency updating…',config.max_duration_seconds!=null?`≤ ${compactDuration(config.max_duration_seconds)} total`:''].filter(Boolean).join(' · ');
 }
 function updateSharedSettingsSummaries(config) {
   const summary=$('#run-ceilings-summary');if(summary)summary.textContent=sharedLimitsSummary(config);
@@ -2675,16 +2688,17 @@ async function testConnection() {
     const api_key=apiKeyFor(url.value);
     const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
+    const currentForm=$('#new-run-form');if(!currentForm)return;
     if(result.status==='connected'){
       if(!JSON.parse(key).model)state.autoModel=result.model;
-      form.elements.model.value=result.model;form.elements.model.setCustomValidity('');
+      currentForm.elements.model.value=result.model;currentForm.elements.model.setCustomValidity('');
       state.config.targets[0].model=result.model;
       configChanged();updateBounds();
     }
     state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status==='connected'?`Connected · ${result.model}${result.latency_ms==null?' · latency unavailable':` · ${ms(result.latency_ms)}`}`:result.message};
     renderModelDiscovery();scheduleTokenizerSelection({immediate:true});
     if(result.status==='connected')$('#model-options').open=false;
-    if(result.status==='needs_model')(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
+    if(result.status==='needs_model')(result.models?.length>1?$('#connection-model-choice'):currentForm.elements.model)?.focus();
   }catch(error){
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
     state.modelDiscovery={key,route,status:'error',models:[],message:error.message};renderModelDiscovery();
@@ -4171,7 +4185,7 @@ document.addEventListener('click',async(event)=>{
   const runFilter=event.target.closest('[data-run-filter]');if(runFilter){state.filter=runFilter.dataset.runFilter;renderRuns();$(`[data-run-filter="${state.filter}"]`)?.focus();return;}
   const command=event.target.closest('[data-command]');if(command){$('#command-dialog').close();commandList[Number(command.dataset.command)]?.action();return;}
   const shellAction=event.target.closest('[data-action]')?.dataset.action;
-  if(shellAction==='match-baseline'){matchBaselineSettings();return;}
+  if(shellAction==='match-baseline'){await matchBaselineSettings();return;}
   if(['undo-limit-remediation','reset-restored-limits'].includes(shellAction)){
     captureFormDraft();
     if(shellAction==='undo-limit-remediation'&&state.appliedLimits)Object.assign(state.config,state.appliedLimits.before);

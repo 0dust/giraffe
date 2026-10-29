@@ -57,7 +57,7 @@ plan.request_warnings=[{{kind:'incomplete_coverage',fields:['max_requests'],msg:
 plan.estimated_seconds=0;plan.estimated_low_seconds=0;plan.estimated_high_seconds=0;plan.confidence='unknown';
 state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan,config}};
 renderRequestPlan();
-assert.equal(nodes['#run-ceilings-summary'].textContent,'≤ 20 requests · 164 planned, budget too small · ≤ 5 m per request · 8 at once');
+assert.equal(nodes['#run-ceilings-summary'].textContent,'≤ 20 requests · 164 planned, budget too small · 5 m default request timeout · 8 at once');
 assert.match(renderJudgingPreview({{...plan.evaluator,planned_call_upper_bound:12}}),/12/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Flight plan|<h3>Traffic<|<h3>Pass criteria</);
 assert.match(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"/);
 assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning">/);
