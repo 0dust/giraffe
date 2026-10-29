@@ -1,6 +1,7 @@
 from tests.evidence_helpers import workload_records, workload_payloads
 import copy
 import json
+import time
 
 import pytest
 from pydantic import ValidationError
@@ -30,6 +31,22 @@ def config(endpoint, conversations=None, **updates):
         'checks': ['tools'], 'tool_checks': {'conversations': conversations or [fixture()]},
         'max_requests': 16, 'max_duration_seconds': 10, 'request_timeout_seconds': 2,
         'max_output_tokens': 128, 'context_limit': 8192, 'retention': 'all', **updates})
+
+
+@pytest.fixture
+def final_turn_timeout(monkeypatch):
+    from giraffe.runner import _Run
+
+    # Exercise the final conversation timeout without imposing a 50 ms socket
+    # deadline on unrelated successful single-response requests.
+    original_request = _Run.request
+
+    async def final_turn_deadline(self, target, client, spec, *args, **kwargs):
+        if spec.workload.get('selection') == 'conversation' and spec.workload.get('stage') == 'final':
+            spec = spec.model_copy(update={'request_timeout_seconds': .05})
+        return await original_request(self, target, client, spec, *args, **kwargs)
+
+    monkeypatch.setattr(_Run, 'request', final_turn_deadline)
 
 
 async def test_complete_and_stream_preserve_actual_history_and_consume_stub():
@@ -214,18 +231,38 @@ async def test_context_admission_stops_before_sending_oversized_history():
     assert report.overall == 'inconclusive'
 
 
-async def test_timeout_remains_inconclusive_alongside_passing_single_response_fixture():
+async def test_timeout_remains_inconclusive_alongside_passing_single_response_fixture(monkeypatch, final_turn_timeout):
     value = fixture()
     single = {k: value[k] for k in ['fixture_id', 'messages', 'tools']}
-    single.update(fixture_id='single', expected_calls=[{'name': 'get_weather', 'arguments': {'city': 'Warsaw'}}])
+    single.update(fixture_id='single', messages=[{'role': 'user', 'content': 'Single response: check Warsaw weather.'}],
+                  expected_calls=[{'name': 'get_weather', 'arguments': {'city': 'Warsaw'}}])
+    delayed_modes = []
     with FakeEndpoint(mode='conversation_timeout') as endpoint:
-        cfg = config(endpoint, request_timeout_seconds=.05)
+        handler = endpoint._server.RequestHandlerClass
+        original = handler._conversation
+
+        def delayed_single_response(self, payload, mode):
+            if payload['messages'][0]['content'].startswith('Single response:'):
+                delayed_modes.append(payload['stream'])
+                time.sleep(.075)  # Longer than the conversation-only final-turn deadline.
+            return original(self, payload, mode)
+
+        monkeypatch.setattr(handler, '_conversation', delayed_single_response)
+        cfg = config(endpoint)
         cfg.tool_checks.fixtures = [ToolFixture.model_validate(single)]
         report = await run_suite(cfg)
     assert report.overall == 'inconclusive', [r.model_dump(include={
         'scenario', 'status', 'valid', 'score', 'error', 'score_message', 'http_status',
         'elapsed_ms', 'request_timeout_seconds', 'termination_reason', 'termination_limit_seconds',
         'tool_evaluation', 'tool_conversation', 'tool_calls'}) for r in workload_records(report.requests)]
+    assert delayed_modes == [False, True]
+    singles = [r for r in workload_records(report.requests) if r.workload.get('tool_fixture_id') == 'single']
+    assert len(singles) == 2
+    assert all(r.status == 'completed' and r.score is True for r in singles)
+    assert all(r.request_timeout_seconds == cfg.request_timeout_seconds for r in singles)
+    outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
+    assert len(outcomes) == 2
+    assert all(o['reason'] == 'timeout' and o['status'] == 'inconclusive' for o in outcomes)
 
 
 async def test_stop_after_errors_leaves_unstarted_sessions_inconclusive():
@@ -359,19 +396,7 @@ async def test_run_duration_limit_leaves_no_false_conversation_pass():
     assert len(workload_records(report.requests)) <= 2
 
 
-async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence(monkeypatch):
-    from giraffe.runner import _Run
-
-    # Exercise the final conversation timeout without imposing a 50 ms socket
-    # deadline on unrelated successful single-response requests.
-    original_request = _Run.request
-
-    async def final_turn_deadline(self, target, client, spec, *args, **kwargs):
-        if spec.workload.get('selection') == 'conversation' and spec.workload.get('stage') == 'final':
-            spec = spec.model_copy(update={'request_timeout_seconds': .05})
-        return await original_request(self, target, client, spec, *args, **kwargs)
-
-    monkeypatch.setattr(_Run, 'request', final_turn_deadline)
+async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence(final_turn_timeout):
     value = fixture()
     single = ToolFixture.model_validate({k: value[k] for k in ['fixture_id', 'messages', 'tools']} | {
         'fixture_id': 'single', 'expected_calls': [{'name': 'get_weather', 'arguments': {'city': 'Warsaw'}}]})
