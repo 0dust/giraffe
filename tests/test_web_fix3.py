@@ -57,23 +57,32 @@ async def test_helper_error_is_not_cached(tmp_path, monkeypatch, kind, status):
 async def test_saved_helper_does_not_block_live_performance(tmp_path, monkeypatch):
     save_report(tmp_path)
     monkeypatch.setattr(web, '_ISOLATED_REPORT_BYTES', 0)
-    entered, release = threading.Event(), threading.Event()
+    started = threading.Event()
+    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
     def read(self, *args):
         entered.set()
-        assert release.wait(2)
-        return 200, b'{"ok":true}'
+        try:
+            assert release.wait(2)
+            return 200, b'{"ok":true}'
+        finally:
+            exited.set()
     async def held(configuration, *, progress, stop_event):
+        started.set()
         await stop_event.wait()
         return report(configuration)
     monkeypatch.setattr(web._ReportProcess, 'read', read)
     monkeypatch.setattr(web, 'run_suite', held)
     async with browser(tmp_path) as client:
         identifier = await start(client)
+        # Measure helper isolation after startup GC has completed.
+        assert await asyncio.to_thread(started.wait, 2)
         saved = asyncio.create_task(client.get('/api/runs/saved/performance'))
         try:
             assert await asyncio.to_thread(entered.wait, 1)
+            assert not exited.is_set()
             response = await asyncio.wait_for(client.get(f'/api/runs/{identifier}/performance'), .3)
             assert response.status_code == 200
+            assert not exited.is_set()
         finally:
             release.set()
             await saved
