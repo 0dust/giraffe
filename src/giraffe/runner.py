@@ -1065,6 +1065,7 @@ def _target_error(run, target, enabled, exc):
 async def _target(run: _Run, target: Target, fixtures: dict):
     config, enabled = run.config, set(run.config.checks)
     telemetry_task = None
+    telemetry_stop = asyncio.Event()
     from giraffe import deployment, telemetry, workloads
     try:
         reason = run.stop_reason(target.name)
@@ -1091,7 +1092,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             discovery = run.observations[target.name].get("runtime_metrics_discovery", {})
             run.preparation(target.name, "runtime_metrics_discovery", "Runtime telemetry capability", "completed" if available else "unavailable", discovery.get("reason"))
             if available or target.metrics_url or config.metrics or target.host_metrics_url or target.deployment.collector_url:
-                telemetry_task = asyncio.create_task(telemetry.sample_during(run, target))
+                telemetry_task = asyncio.create_task(telemetry.sample_during(
+                    run, target, stop_event=telemetry_stop))
             restart = run.observations[target.name]["restart"]
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
                 response = config.effective_initial()
@@ -1336,6 +1338,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 if row["status"] != "finished":
                     run.finish_condition(target.name, row["condition"]["id"])
             if telemetry_task:
+                telemetry_stop.set()
                 telemetry_task.cancel()
                 await asyncio.gather(telemetry_task, return_exceptions=True)
             data = run.observations[target.name]["serving_telemetry"]
