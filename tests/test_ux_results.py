@@ -109,9 +109,9 @@ def test_saved_comparison_preserves_findings_and_grouped_comparison_results():
   assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
   const compare=heading().querySelector('[data-action="compare-saved"]');
   assert(compare);assert.equal(compare.classList.contains('primary'),false);
-  const baseline={run_id:'reference-run',status:'pass',targets:[{target:'local',status:'pass',comparisons:[{
+  const baseline={run_id:'reference-run',status:'inconclusive',acceptance:{baseline:'pass',current:'fail'},targets:[{target:'local',status:'pass',comparisons:[{
     check:'correctness',metric:'latency_ms',scenario:'question',baseline:100,current:100,
-    baseline_samples:6,current_samples:6,status:'pass',reason:'No material regression'
+    baseline_samples:6,current_samples:6,status:'inconclusive',warnings:[{message:'Client scheduling delay affects attribution'}],reason:'Timing warning'
   }]}]};
   const calls=[];
   api=async(path,options)=>{
@@ -131,9 +131,13 @@ def test_saved_comparison_preserves_findings_and_grouped_comparison_results():
   assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
   assert.equal(heading().querySelector('[data-action="compare-saved"]').textContent,'Change baseline');
   const comparison=document.querySelector('#report-baseline-reference');
-  assert(comparison.open);assert.equal(comparison.querySelectorAll('[data-comparison-condition]').length,1);
+  assert(comparison.open);assert.equal(comparison.querySelectorAll('[data-comparison-group]').length,1);
   assert.match(comparison.textContent,/Before upgrade/);assert.match(comparison.textContent,/100 ms/);
-  assert.match(comparison.textContent,/Unchanged \(1\)/);
+  assert.match(comparison.textContent,/Baseline: Passed/);assert.match(comparison.textContent,/Current: Failed/);
+  assert.match(comparison.textContent,/1 measurements · 1 with warnings/);
+  assert.match(comparison.textContent,/Client scheduling delay affects attribution/);
+  assert.equal(comparison.querySelectorAll('[data-metric]').length,1);
+  assert.doesNotMatch(comparison.querySelector('[data-metric]').textContent,/Regression detected/);
   await listeners.click({target:heading().querySelector('.button.primary'),preventDefault(){}});
   const evidence=document.querySelector('.check-detail .evidence-table');
   assert(evidence);assert.match(evidence.textContent,/Paris/);assert.match(evidence.textContent,/Lyon/);
@@ -416,14 +420,18 @@ const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'lo
 const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
 state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
 let html=renderComparison(value);
+assert.match(html,/measurements/);assert.match(html,/Pass \/ fail/);assert.match(html,/Why this warning/);
 assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
-assert.match(html,/<th>Metric<\/th>/);assert.match(html,/worse/);assert.match(html,/not comparable/);
-assert.match(html,/no material change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
-assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>|Entry \d/);
-assert.equal((html.match(/<tbody><tr>/g)||[]).length,3); // Each of the three measurements survives condition grouping.
-assert.equal((html.match(/data-comparison-condition/g)||[]).length,2);
-assert.match(html,/<details class="comparison-quiet"><summary>Unchanged \(1\)/);
-assert.match(html,/<details class="comparison-quiet"><summary>Not comparable \(1\)/);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
+assert.match(html,/data-comparison-group="context"/);assert.match(html,/Context recall/);
+assert.match(html,/Regression detected/);assert.match(html,/Change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
+assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
+assert.equal((html.match(/data-metric=/g)||[]).length,3); // All measured differences are visible by default.
+state.comparisonFilter='with_warnings';state.comparisonCheck='correctness';html=renderComparison(value);
+assert.match(html,/No measurements match/);
 assert.equal(JSON.stringify(value),original);
 """)
 
@@ -573,6 +581,101 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
             assert '.queued' not in selector and '.reserved' not in selector
     assert animated, 'The parser must inspect real animation rules'
     assert '.is-landing' not in css
+
+
+def test_comparison_changes_are_directional_and_multiple_warnings_are_visible():
+    run_render_checks(r"""
+assert.equal(comparisonChange({metric:'correctness_rate',baseline:.4,current:.5}),'+10 percentage points');
+assert.equal(comparisonChange({metric:'generation_tokens_per_second',baseline:20,current:10}),'-50%');
+assert.equal(comparisonChange({metric:'latency_ms',baseline:0,current:10}),'+10 ms · from zero');
+assert.equal(comparisonChange({metric:'latency_ms',baseline:null,current:10}),'Not measured');
+const rows=[{check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,baseline_samples:5,current_samples:5,status:'inconclusive',warnings:[{message:'Answers are longer'},{message:'Client delayed <8/10>'}]}];
+const html=comparisonTable(rows);
+assert.match(html,/Answers are longer/);assert.match(html,/Client delayed &lt;8\/10&gt;/);
+assert.match(html,/Baseline/);assert.match(html,/Current/);assert.match(html,/Change/);
+assert.doesNotMatch(html,/Regression detected/);
+""")
+
+
+def test_comparison_warning_filter_is_independent_of_regression_status():
+    run_render_checks(r"""
+const row=(metric,status,warnings=[])=>({check:'load',scenario:'same',metric,status,warnings,baseline:10,current:20});
+const value=report([],{baseline:{targets:[{target:'local',comparisons:[
+  row('latency_ms','fail'),row('first_output_ms','pass',[{message:'Partial timing evidence'}]),
+  row('correctness_rate','inconclusive')],observed_outputs:[{...row('output_tokens',null),descriptive:true}]}]}});
+state.detail={report:value};state.comparisonFilter='with_warnings';
+let html=renderComparison(value);
+assert.match(html,/data-metric="first_output_ms"/);assert.match(html,/data-metric="correctness_rate"/);
+assert.doesNotMatch(html,/data-metric="latency_ms"|data-metric="output_tokens"/);
+state.comparisonFilter='without_warnings';html=renderComparison(value);
+assert.match(html,/data-metric="latency_ms"/);assert.match(html,/Regression detected/);
+assert.match(html,/data-metric="output_tokens"/);
+assert.doesNotMatch(html,/data-metric="first_output_ms"|data-metric="correctness_rate"/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-metric=/g)||[]).length,4);
+""")
+
+
+def test_comparison_timing_summary_distinguishes_legacy_and_observed_overlap():
+    run_render_checks(r"""
+const row={metric:'latency_ms',status:'inconclusive',baseline:100,current:100,
+  warnings:[{code:'client_delayed',message:'Timing attribution is uncertain.'}],
+  timing_quality:{Current:{status:'client_delayed',scope:'legacy_run_maximum',affected_requests:8,total_requests:8}}};
+let html=comparisonTable([row]);
+assert.match(html,/run-wide Giraffe delay; request-level overlap was not recorded/);
+assert.doesNotMatch(html,/affected 8\/8/);
+row.timing_quality.Current={status:'client_delayed',scope:'request_intervals',affected_requests:1,total_requests:8};
+html=comparisonTable([row]);
+assert.match(html,/Giraffe delays affected 1\/8 current requests/);
+assert.doesNotMatch(html,/run-wide/);
+""")
+
+
+def test_comparison_preserves_deployment_and_confounding_disclosure_under_filters():
+    run_render_checks(r"""
+const target={target:'GPU <blue>',comparisons:[{check:'serving',scenario:'warm',metric:'latency_ms',status:'pass',baseline:10,current:10}],
+  configuration_diff:{confounded:true,intended_change:'runtime.version',fields:[{field:'runtime.version',baseline:{value:'v1'},current:{value:'v2'}},{field:'hardware.gpu_count',baseline:{value:1},current:{value:2}}],unknown_fields:['serving.scheduler']},
+  identity_changes:{image:{baseline:'image-before',current:'image-after'}},
+  consistency_changes:[{scenario:'same-prompt',baseline_agreement:.8,current_agreement:.9}],
+  telemetry:{baseline:{kind:'before-telemetry'},current:{kind:'after-telemetry'}}};
+const value=report([],{baseline:{targets:[target]}});
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;state.comparisonCheck='correctness';
+  const html=renderComparison(value);
+  assert.match(html,/Deployment and comparison details/);
+  assert.match(html,/GPU &lt;blue&gt;/);assert.doesNotMatch(html,/<blue>/);
+  assert.match(html,/Confounded experiment/);assert.match(html,/not proof of causality/);
+  for(const text of ['runtime.version','hardware.gpu_count','serving.scheduler','image-before','image-after','baseline_agreement','current_agreement','before-telemetry','after-telemetry'])assert(html.includes(text),text);
+}
+target.configuration_diff={unknown_baseline:true,unknown_fields:['runtime.version']};
+assert.match(renderComparison(value),/Causality unverified/);
+""")
+
+
+def test_traffic_only_comparison_preserves_accepted_rate_goodput_and_stage_loss():
+    run_render_checks(r"""
+const value=report([],{baseline:{targets:[{target:'arrival <gpu>',comparisons:[],traffic_capacity:{
+  status:'fail',reason:'Previously accepted arrival rate was lost.',
+  baseline_highest_acceptable_rate_rps:50,current_highest_acceptable_rate_rps:10,
+  delta_rps:-40,change_percent:-80,stages:[{rate_rps:50,status:'fail',
+    baseline:{goodput_rps:49},current:{goodput_rps:8},
+    reason:'This previously acceptable arrival stage now fails its configured criteria.'}]
+}}]}});
+state.detail={report:value};
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;
+  const html=renderComparison(value);
+  assert.match(html,/arrival &lt;gpu&gt;/);
+  assert.match(html,/Tested arrival capacity/);
+  assert.match(html,/Baseline accepted rate<\/dt><dd>50 req\/s/);
+  assert.match(html,/Current accepted rate<\/dt><dd>10 req\/s/);
+  assert.match(html,/-40 req\/s/);assert.match(html,/-80%/);
+  assert.match(html,/Baseline goodput/);assert.match(html,/49 req\/s/);
+  assert.match(html,/Current goodput/);assert.match(html,/8 req\/s/);
+  assert.match(html,/Previously accepted arrival rate was lost\./);
+  assert.match(html,/This previously acceptable arrival stage now fails its configured criteria\./);
+}
+""")
 
 
 def test_check_details_show_recorded_effective_limits_and_default_labels():

@@ -800,8 +800,8 @@ async function route() {
   try {
     if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
     if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();enterRoute();schedulePoll(pollNew,version,3000);return; }
-    if (hash.startsWith('#runs/')) {
-      const id=destination?.id||decodeURIComponent(hash.slice(6).split('/')[0]);updateNav('runs','Run detail');
+    if (destination) {
+      const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
@@ -813,7 +813,7 @@ async function route() {
     renderRuns();enterRoute();schedulePoll(pollRuns,version,3000);
   } catch(error) {
     if(version!==state.routeVersion)return;
-    if(hash.startsWith('#runs/')&&error.status===404){
+    if(destination&&error.status===404){
       updateNav('runs','Run not found');
       $('#main').innerHTML='<div class="page-heading"><h1>Run not found</h1><p>This run is not available in the current run directory.</p></div><a class="button" href="#runs">Back to runs</a>';schedulePoll(pollRunStatus,version,3000);focusRouteHeading();return;
     }
@@ -2779,9 +2779,15 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
+const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
-  const match=hash.match(/^#runs\/([^/]+)(?:\/(performance|results)(?:\/([a-z]+))?)?$/);
-  return match?{id:decodeURIComponent(match[1]),tab:match[2]||null,section:match[3]||null}:null;
+  const match=hash.match(/^#runs\/([^/]+)(?:\/(performance|results)(?:\/([^/]+))?)?$/);
+  if(!match)return null;
+  const tab=match[2]||null,section=match[3]||null;
+  const sections=tab==='performance'?reportSections:reportResultSections;
+  if(section&&!(tab==='results'&&section==='baseline')&&!sections.some(([id])=>id===section))return null;
+  try{return {id:decodeURIComponent(match[1]),tab,section};}catch{return null;}
 }
 function syncReportView() {
   const d=state.detail;if(!d)return;
@@ -2818,10 +2824,36 @@ function chooseReportTab(tab,{focus=false,anchor=true}={}) {
   if(anchor&&typeof location!=='undefined')location.hash=`${linkRun(state.detail.id)}/${tab}`;
   if(focus)$(`#tab-${tab}`)?.focus({preventScroll:true});
 }
+function resultsSections() {
+  const report=state.detail?.report;if(!report?.baseline)return [];
+  const rows=(report.baseline.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)]);
+  return reportResultSections.filter(([id])=>{
+    if(id==='load-acceptance')return report.baseline.targets?.some(target=>target.load_test);
+    if(comparisonSections.some(([section])=>section===id))return rows.some(row=>comparisonCategory(row)===id);
+    return true;
+  });
+}
+function renderResultsJump() {
+  const sections=resultsSections();if(!sections.length)return '';
+  const selected=reportRoute()?.section||'comparison';
+  return `<nav class="results-jump" aria-label="Result sections"><label for="results-section-jump">Jump to section</label><select id="results-section-jump">${sections.map(([id,label,parent])=>`<option value="${id}" ${selected===id?'selected':''}>${parent?'↳ ':''}${escape(label)}</option>`).join('')}</select></nav>`;
+}
+function scrollReportSection(section,tab=reportView.tab){
+  const panel=$(`#report-${tab}`);if(!panel)return;
+  const node=tab==='results'&&section==='comparison'?$('#report-baseline-reference',panel):$(`#${tab==='results'?'results':'performance'}-${section}`,panel);
+  const disclosure=node?.closest('details')||node?.querySelector('details.report-reference')||node?.querySelector('details.run-diagnostics');if(disclosure)disclosure.open=true;
+  node?.scrollIntoView?.({block:'start'});
+}
 function updateReportSections() {
   const rail=$('#report-sections');if(!rail)return;
-  rail.hidden=!state.reportRouteActive||!state.detail;
-  if(!rail.hidden&&rail.getAttribute('data-run-id')!==state.detail.id){rail.setAttribute('data-run-id',state.detail.id);rail.innerHTML=`<h2>This report</h2><nav aria-label="This report">${reportSections.map(([id,label])=>`<a href="${linkRun(state.detail.id)}/performance/${id}" data-report-section="${id}">${escape(label)}</a>`).join('')}</nav>`;}
+  const sections=reportView.tab==='performance'?reportSections.map(([id,label])=>[id,label]):resultsSections();
+  rail.hidden=!state.reportRouteActive||!state.detail||!sections.length;
+  if(rail.hidden){rail.innerHTML='';return;}
+  const link=([id,label])=>`<a href="${linkRun(state.detail.id)}/${reportView.tab}/${id}" data-report-section="${id}" data-report-section-tab="${reportView.tab}">${escape(label)}</a>`;
+  if(!rail.hidden)patchHTML(rail,`<h2>This report</h2><nav aria-label="This report"><ul class="report-section-list">${sections.filter(([, ,parent])=>!parent).map(section=>{
+    const children=sections.filter(([, ,parent])=>parent===section[0]);
+    return `<li>${link(section)}${children.length?`<ul aria-label="${escape(section[1])} sections">${children.map(child=>`<li>${link(child)}</li>`).join('')}</ul>`:''}</li>`;
+  }).join('')}</ul></nav>`);
 }
 function selectedPerformance() {
   const data=reportView.performance,target=data?.targets?.find(item=>item.target===(reportView.target||data.selected_target||data.default_target))||data?.targets?.[0];
@@ -3116,7 +3148,7 @@ function renderPerformance() {
     body+=performanceSection('tokens','Workload & tokens','Token counts and reported cache reuse; rates are shown above.',`<div class="performance-token-charts">${renderPerformanceLineChart('size','Input and answer size by request','All eligible request identities are retained; token usage comes from the endpoint.',rows,tokenSeries,{ylabel:'tokens'})}${renderPerformanceLineChart('cached','Cached prompt tokens by request','Reported cache reuse is a subset of input tokens, not a measured latency saving.',rows,[{key:'cached_prompt_tokens',label:'Cached prompt tokens',color:'var(--pass)',unit:'tokens'}],{ylabel:'cached prompt tokens'})}</div>`+performanceMetricTable(summary.sections?.token_accounting,'Token accounting · selected window')+performanceDistributions(summary,Object.keys(summary.distributions||{}).filter(key=>key.endsWith('_length')),'Token-length distributions'));
     body+=performanceSection('effects','Conversations & workload effects','Workload-specific evidence remains qualified.',performanceMetricTable(summary.sections?.conversations));
     body+=performanceSection('server','Server observations','Server-wide telemetry may include other traffic; runner memory is separate.',performanceMetricTable(summary.sections?.server));
-    body+=performanceSection('baseline','Baseline comparison','Comparability and measurement coverage govern every comparison.',state.detail.report?.baseline?renderComparison(state.detail.report):'<p class="hint">No baseline selected.</p>');
+    body+=performanceSection('baseline','Baseline comparison','Comparability and measurement coverage govern every comparison.',state.detail.report?.baseline?`<div data-comparison-scope="performance">${renderComparison(state.detail.report,{scope:'performance'})}</div>`:'<p class="hint">No baseline selected.</p>');
   }else body=`<section id="performance-overview" class="performance-section"><h2>Performance overview</h2><div class="empty-state"><h3>${reportView.pending?'Loading measurements…':'No performance measurements available'}</h3><p>Request evidence and check verdicts remain available in Test results.</p>${!reportView.pending?'<button class="button small" data-action="refresh-performance">Load measurements</button>':''}</div></section>${reportSections.slice(1).map(([id,label])=>performanceSection(id,label,'','<p class="hint">No measurements available for this selection.</p>')).join('')}`;
   if(typeof setTimeout==='function')setTimeout(observePerformanceCharts,0);
   return `<section id="report-performance" role="tabpanel" aria-labelledby="tab-performance" data-live-key="report-performance" ${reportView.tab==='performance'?'':'hidden'}>${terminal}${data?.coverage?.partial?notice(data.coverage.reason||'Live measurements cover only retained requests.','warning'):''}${reportView.error?notice(reportView.error,'warning'):''}${body}</section>`;
@@ -3153,8 +3185,10 @@ function revealReportSection(section,{defer=true}={}) {
     pendingReportReveal={id:state.detail.id,version:state.routeVersion,hash:location.hash,section};return;
   }
   const panel=$(`#report-${reportView.tab}`);if(!panel||panel.hidden)return;
-  if(section==='baseline'&&reportView.tab==='results'){
+  if(['baseline','comparison'].includes(section)&&reportView.tab==='results'){
     state.tab='baseline';const reference=$('#report-baseline-reference',panel);if(reference){reference.open=true;reference.scrollIntoView?.({block:'start'});$('summary',reference)?.focus({preventScroll:true});}
+  }else if(reportView.tab==='results'){
+    scrollReportSection(section,'results');
   }else {
     const target=$(`#performance-${section}`,panel);if(!target)return;
     target.scrollIntoView?.({block:'start'});if(section==='baseline'){const heading=$('h2',target)||target;heading.setAttribute('tabindex','-1');heading.focus?.({preventScroll:true});}
@@ -3205,12 +3239,14 @@ function renderDetail() {
   const compareButton=d.state==='completed'?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
   patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}${renderBaselineSummary(report)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
   ${d.error?notice(d.error,d.state==='error'?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
-  <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>  <section id="result-content">${renderChecks(report)}</section>
-  <details id="report-baseline-reference" class="report-reference" ${state.tab==='baseline'?'open':''}><summary>Baseline comparison</summary><div id="baseline-content">${renderComparison(report)}</div></details>
-  <details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary>Run configuration</summary>${renderConfig(report)}</details>
-  <details class="report-reference condition-reference"><summary>Test conditions</summary>${renderTests(report.requests,{report})}</details>${renderAllRequests(orderedRequests(report))}${renderDiagnostics(report,d)}</section>
+  <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}
+  <section id="results-checks" class="report-result-section"><section id="result-content">${renderChecks(report)}</section></section>
+  <details id="report-baseline-reference" class="report-reference report-result-section comparison-container" ${report.baseline||state.tab==='baseline'?'open':''}><summary><h2>Baseline comparison</h2></summary><div id="baseline-content" data-comparison-scope="results">${renderComparison(report)}</div></details>
+  <section id="results-configuration" class="report-result-section"><details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary><h2>Run configuration</h2></summary>${renderConfig(report)}</details></section>
+  <details class="report-reference condition-reference"><summary>Test conditions</summary>${renderTests(report.requests,{report})}</details>
+  <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
-  refreshConditionDialog();loadFindingEvidence();
+  syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
   if(reportView.tab==='performance'&&!reportView.performance&&typeof fetch==='function')loadPerformance();
 }
 function renderDiagnostics(report,detail) {
@@ -3436,49 +3472,65 @@ function renderTrafficComparison(capacity){
   return `<div class="traffic-summary"><h3>Tested arrival capacity ${badge(capacity.status)}</h3><p class="hint">${escape(capacity.reason || '')}</p><dl class="metrics-grid"><div class="metric"><dt>Baseline accepted rate</dt><dd>${rate(capacity.baseline_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Current accepted rate</dt><dd>${rate(capacity.current_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Capacity change</dt><dd>${capacity.delta_rps==null?'Unconfirmed':`${capacity.delta_rps>0?'+':''}${number(capacity.delta_rps,2)} req/s`}</dd><small>${capacity.change_percent==null?'Matching, complete stages required':`${capacity.change_percent>0?'+':''}${number(capacity.change_percent,1)}%`}</small></div></dl></div>${capacity.stages?.length?`<div class="metric-table"><table><thead><tr><th>Rate</th><th>Baseline goodput</th><th>Current goodput</th><th>Capacity evidence</th></tr></thead><tbody>${capacity.stages.map(stage=>`<tr><td>${rate(stage.rate_rps)}</td><td>${rate(stage.baseline?.goodput_rps)}</td><td>${rate(stage.current?.goodput_rps)}</td><td>${badge(stage.status)}<small>${escape(stage.reason || '')}</small>${stage.timing_comparable===false?`<small>${escape(stage.timing_comparison_reason || '')}</small>`:''}</td></tr>`).join('')}</tbody></table></div>`:''}`;
 }
 function isProbe(r){return ['client_cancel','client_deadline','deadline_probe'].includes(r.scenario)||/intentional cancellation/i.test(r.error || '');}
-function comparisonVerdict(row) {
-  if(row.status==='fail')return 'worse';
-  if(row.status!=='pass')return 'not comparable';
-  if(row.acceptance_improved)return 'better';
-  if(Number.isFinite(row.threshold)&&row.worsening<0&&row.worsening_interval_95?.[1]!=null&&row.worsening_interval_95[1]<=-row.threshold)return 'better';
-  return 'no material change';
-}
-function comparisonChange(row) {
-  if(typeof row.current!=='number'||typeof row.baseline!=='number')return '—';
-  let delta;
-  if(row.change_unit==='percentage_points')delta=(row.current-row.baseline)*100;
-  else if(row.baseline===0)delta=row.current===0?0:null;
-  else delta=(row.current-row.baseline)/Math.abs(row.baseline)*100;
-  return delta==null?'—':`${delta>0?'+':''}${number(delta,1)}${row.change_unit==='percentage_points'?' pp':'%'}`;
-}
-function baselineRows(target) {
-  const rows=[...(target.comparisons||[])],traffic=target.traffic_capacity,load=target.load_test;
-  if(traffic)rows.push({...traffic,check:'capacity',metric:'accepted_arrival_rate',baseline:traffic.baseline_highest_acceptable_rate_rps,current:traffic.current_highest_acceptable_rate_rps,acceptance_improved:traffic.status==='pass'&&Number.isFinite(traffic.baseline_highest_acceptable_rate_rps)&&Number.isFinite(traffic.current_highest_acceptable_rate_rps)&&traffic.current_highest_acceptable_rate_rps>traffic.baseline_highest_acceptable_rate_rps});
-  for(const point of load?.points||[])rows.push({...point,check:'load',metric:'load_acceptance',scenario_label:loadPointLabel(point.current||point.baseline||{}),baseline:point.baseline?.status,current:point.current?.status,acceptance_improved:point.status==='pass'&&point.baseline?.status==='fail'&&point.current?.status==='pass'});
-  if(load&&!load.points?.length)rows.push({...load,check:'load',metric:'load_acceptance'});
-  if(!rows.length)rows.push({metric:'Comparison coverage',status:'inconclusive',reason:(target.reasons||[]).join(' ')||target.summary||'No comparable measurements recorded.'});
-  return rows;
-}
-const defaultComparisonReason='No material worsening detected in these samples.';
-function comparisonReason(row) {return row.reason===defaultComparisonReason?'':row.reason||'';}
-function comparisonTable(rows,{showScenario=true}={}) {
-  const reasons=rows.some(row=>comparisonReason(row));
-  return `<div class="comparison-table"><table><thead><tr><th>Metric</th><th>Baseline</th><th>Current</th><th>Change</th><th>Verdict</th>${reasons?'<th>Reason</th>':''}</tr></thead><tbody>${rows.map(row=>{
-    const verdict=comparisonVerdict(row),kind=verdict==='worse'?'fail':verdict==='better'?'pass':verdict==='not comparable'?'inconclusive':'dim';
-    return `<tr><td>${escape(human(row.metric))}${showScenario&&(row.scenario_label||row.scenario)?`<small>${escape(row.scenario_label||scenarioLabel(row))}</small>`:''}</td><td class="mono">${comparisonValue(row,row.baseline)}${row.baseline_samples!=null?`<small>n=${number(row.baseline_samples)}</small>`:''}</td><td class="mono">${comparisonValue(row,row.current)}${row.current_samples!=null?`<small>n=${number(row.current_samples)}</small>`:''}</td><td class="mono ${kind}">${comparisonChange(row)}</td><td class="${kind}">${verdict}</td>${reasons?`<td>${escape(comparisonReason(row))}</td>`:''}</tr>`;
-  }).join('')}</tbody></table></div>`;
-}
 function renderBaselineSummary(report) {
   const baseline=report.baseline;if(!baseline)return '';
-  const saved=state.baselines.find(item=>(state.detail?.baseline_id&&item.id===state.detail.baseline_id) || item.run_id===baseline.run_id),counts={};
-  for(const row of (baseline.targets||[]).flatMap(baselineRows)){const verdict=comparisonVerdict(row);counts[verdict]=(counts[verdict]||0)+1;}
-  const summary=counts.worse||counts.better?[counts.worse?`${counts.worse} worse`:'',counts.better?`${counts.better} better`:''].filter(Boolean).join(' · '):`no regressions (${counts['no material change']||0} unchanged, ${counts['not comparable']||0} not comparable)`;
-  return `<p class="baseline-delta"><a href="${linkRun(state.detail.id)}/results/baseline" data-tab="baseline">vs baseline ${escape(saved?.name || baseline.name || baseline.run_id || 'reference')}: ${summary}</a></p>`;
+  const saved=state.baselines.find(item=>(state.detail?.baseline_id&&item.id===state.detail.baseline_id)||item.run_id===baseline.run_id);
+  const rows=(baseline.targets||[]).flatMap(target=>[...(target.comparisons||[]),...comparisonOutputs(target)]);
+  const warnings=rows.filter(row=>comparisonWarnings(row).length).length;
+  return `<p class="baseline-delta"><a href="${linkRun(state.detail.id)}/results/comparison" data-tab="baseline">vs baseline ${escape(saved?.name||baseline.name||baseline.run_id||'reference')}: ${number(rows.length)} measurements · ${number(warnings)} with warnings</a></p>`;
 }
-function comparisonCondition(rows) {
-  const row=rows[0],groups=new Map(['worse','better','no material change','not comparable'].map(verdict=>[verdict,rows.filter(value=>comparisonVerdict(value)===verdict)]));
-  const title=[row.check?catalogTitle(row.check):'Comparison',row.scenario_label|| (row.scenario?scenarioLabel(row):'')].filter(Boolean).join(' · ');
-  return `<section class="comparison-condition" data-comparison-condition="${escape(JSON.stringify([row.check,row.scenario_label||row.scenario]))}"><h4>${escape(title)}</h4>${['worse','better'].map(verdict=>groups.get(verdict).length?comparisonTable(groups.get(verdict),{showScenario:false}):'').join('')}${[['no material change','Unchanged'],['not comparable','Not comparable']].map(([verdict,label])=>groups.get(verdict).length?`<details class="comparison-quiet"><summary>${label} (${groups.get(verdict).length})</summary>${comparisonTable(groups.get(verdict),{showScenario:false})}</details>`:'').join('')}</section>`;
+function comparisonOutputs(target) {
+  if(target.observed_outputs)return target.observed_outputs;
+  const seen=new Set(),rows=[];
+  for(const row of target.comparisons||[]){
+    const key=JSON.stringify([row.check,row.scenario]),work=row.output_work;
+    if(seen.has(key)||!work?.current||!work?.baseline)continue;
+    seen.add(key);
+    for(const [metric,valueKey,countKey] of [['output_tokens','reported_output_tokens_p50','reported_token_samples'],['output_chars','output_chars_p50','valid_completions']])rows.push({metric,check:row.check,scenario:row.scenario,baseline:work.baseline[valueKey],current:work.current[valueKey],baseline_samples:work.baseline[countKey],current_samples:work.current[countKey],descriptive:true,aggregation:'median'});
+  }
+  return rows;
+}
+function comparisonChange(row) {
+  if(row.current==null||row.baseline==null)return 'Not measured';
+  const delta=row.current-row.baseline;
+  if(delta===0)return 'No change';
+  if(row.metric.endsWith('_rate'))return `${delta>0?'+':''}${number(delta*100,1)} percentage points`;
+  if(row.baseline===0)return `${delta>0?'+':''}${comparisonValue(row,delta)} · from zero`;
+  const percent=delta*100/row.baseline;
+  return `${percent>0?'+':''}${number(percent,1)}%`;
+}
+function comparisonMetricLabel(row) {
+  return ({correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
+}
+function comparisonWarnings(row) {
+  return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
+}
+function comparisonCategory(row){return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonWarningSummary(row) {
+  const notes=[];
+  for(const warning of row.warnings||[]){
+    if(warning.code==='output_work_changed'){
+      const before=row.output_work?.baseline?.reported_output_tokens_p50,after=row.output_work?.current?.reported_output_tokens_p50;
+      notes.push(before!=null&&after!=null?`Answer length changed: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
+    }else if(warning.code==='client_delayed'){
+      for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(q.scope==='legacy_run_maximum'?`${name} recorded a run-wide Giraffe delay; request-level overlap was not recorded.`:`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
+    }else if(warning.code==='sample_uncertainty')notes.push('Sample uncertainty limits this assessment.');
+    else if(warning.code==='input_work_changed')notes.push('Input workload differs.');
+    else if(warning.code==='missing_timing')notes.push('Some response timings are missing.');
+    else if(warning.code==='timing_version')notes.push('Timing measurement methods differ.');
+    else notes.push(warning.message);
+  }
+  return [...new Set(notes.length?notes:comparisonWarnings(row))];
+}
+function comparisonTable(rows) {
+  return `<div class="comparison-values">${rows.map(row=>{
+    const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row);
+    const label=row.descriptive?'Observed':warnings.length?'Warning':row.status==='fail'?'Regression detected':'No material regression';
+    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${row.aggregation==='mean'?'Rate':'Median'} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
+  }).join('')}</div>`;
+}
+function comparisonGroup(id,rows) {
+  return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(rows[0]?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(scenarioLabel(rows[0]))}</p>${comparisonTable(rows)}</div>`;
 }
 
 function baselineIdentity(baseline) {
@@ -3496,16 +3548,38 @@ function renderDeploymentChange(diff) {
   const fields=Array.isArray(intended)?intended:[intended];
   return `<p class="deployment-change">${escape(summary)}</p>${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
 }
-function renderComparison(report) {
-  const baseline=report.baseline;if(!baseline)return `<div class="panel empty-state"><h2>No baseline selected</h2><p>Choose a saved baseline to compare this completed run. No new requests will be sent. This run still evaluates its own acceptance limits.</p><button class="button" data-action="compare-saved">Compare with baseline</button><button class="button" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
-  return `<header class="comparison-conclusion"><h2>Baseline comparison</h2><div class="baseline-reference">${baselineIdentity(baseline)}</div></header>${(baseline.targets||[]).map(target=>{
-    const groups=new Map();for(const row of baselineRows(target)){const key=JSON.stringify([row.check,row.scenario_label||row.scenario]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
-    const priority=rows=>Math.min(...rows.map(row=>({'worse':0,'better':1,'no material change':2,'not comparable':3}[comparisonVerdict(row)])));
-    return `<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')}</h3>${renderDeploymentChange(target.configuration_diff)}${target.load_test?.reason?`<p class="hint">${escape(target.load_test.reason)}</p>`:''}${[...groups.values()].sort((a,b)=>priority(a)-priority(b)).map(comparisonCondition).join('')}${target.reasons?.length?`<p class="hint">${target.reasons.map(escape).join(' ')}</p>`:''}${target.traffic_capacity?.stages?.length?`<details><summary>Arrival stage evidence</summary>${renderTrafficComparison(target.traffic_capacity)}</details>`:''}<details class="comparison-support"><summary>Deployment and comparison details</summary><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></details></section>`;
-  }).join('')}<details class="comparison-support"><summary>Comparison method</summary><p class="hint">${escape(baseline.method||'Method was not recorded.')}</p></details>`;
+function renderLoadAcceptance(targets,sectionPrefix='results') {
+  const tested=targets.filter(target=>target.load_test);
+  if(!tested.length)return '';
+  const label=point=>loadPointLabel({...point,type:point.type||point.workload||'load',shape:point.shape||(loadShapes.includes(point.workload)?point.workload:null)});
+  const status=point=>point?`${badge(point.status||'inconclusive')}${point.not_run?'<small>Not run</small>':point.cut_short?'<small>Cut short</small>':''}${point.dispatched!=null?`<small>${number(point.dispatched)} dispatched</small>`:''}`:'Not tested';
+  return `<section id="${sectionPrefix}-load-acceptance" class="comparison-section"><h3>Tested load acceptance</h3><p class="hint">Acceptance at tested levels is separate from statistical changes in individual measurements.</p>${tested.map(target=>{
+    const load=target.load_test;
+    const highest=points=>points?.length?points.map(point=>`<strong>${point.value==null?'Not established':number(point.value,2)}${point.pattern==='concurrent'?' concurrent requests':' requests/second'}</strong><small>${escape(label({...point,level:null,rate:null}))}</small>`).join(''):'Not established';
+    return `<section><h4>${escape(target.target||target.name||'Target')} ${badge(load.status||'inconclusive')}</h4>${load.reason?`<p>${escape(load.reason)}</p>`:''}<dl class="metrics-grid"><div class="metric"><dt>Baseline highest accepted (tested)</dt><dd>${highest(load.baseline_highest_accepted)}</dd></div><div class="metric"><dt>Current highest accepted (tested)</dt><dd>${highest(load.current_highest_accepted)}</dd></div></dl>${load.points?.length?`<div class="metric-table" tabindex="0" role="region" aria-label="${escape(target.target||target.name||'Target')} tested load acceptance"><table><thead><tr><th scope="col">Tested load</th><th scope="col">Baseline</th><th scope="col">Current</th><th scope="col">Comparison evidence</th></tr></thead><tbody>${load.points.map(row=>`<tr><th scope="row">${escape(label(row.current||row.baseline||{}))}</th><td>${status(row.baseline)}</td><td>${status(row.current)}</td><td>${badge(row.status||'inconclusive')}<small>${escape(row.reason||'')}</small></td></tr>`).join('')}</tbody></table></div>`:''}</section>`;
+  }).join('')}</section>`;
 }
-
-function comparisonValue(row,value){if(value==null)return '—';if(typeof value!=='number')return escape(typeof value==='string'?value:JSON.stringify(value));if(row.metric==='accepted_arrival_rate')return `${number(value,2)} req/s`;if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':''}`;}
+function renderComparisonDetails(targets) {
+  if(!targets.length)return '';
+  return `<details class="comparison-support comparison-deployment"><summary>Deployment and comparison details</summary><p class="hint">Changes provide investigation context, not proof of causality. Missing or stale fields do not establish unchanged configuration.</p>${targets.map(target=>`<section><h4>${escape(target.target||target.name||'Target')}</h4><p>${target.configuration_diff?.confounded?'Confounded experiment: other recorded settings changed alongside the intended change.':'Causality unverified.'}</p><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></section>`).join('')}</details>`;
+}
+function renderComparison(report,{scope='results'}={}) {
+  const sectionPrefix=scope==='performance'?'performance-comparison':'results',filterPrefix=scope==='performance'?'performance-comparison':'comparison';
+  const b=report.baseline;
+  if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><p>Choose a saved baseline to compare this completed run. No new requests will be sent. This run still evaluates its own acceptance limits.</p><button class="button" data-action="compare-saved">Compare with baseline</button><button class="button" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
+  const allRows=(b.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)].map(row=>({...row,targetName:t.target||t.name||'Target'}))),checkIds=[...new Set(allRows.map(row=>row.check))].sort();
+  if(!['all','with_warnings','without_warnings'].includes(state.comparisonFilter))state.comparisonFilter='all';
+  const warningCount=allRows.filter(row=>comparisonWarnings(row).length).length,acceptance=b.acceptance||{};
+  const acceptanceLabel=value=>value?escape(statusLabels[value]||value):'Not recorded';
+  const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='with_warnings'?comparisonWarnings(row).length>0:comparisonWarnings(row).length===0))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
+  return `<header id="${sectionPrefix}-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="${sectionPrefix}-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${(b.targets||[]).filter(target=>target.configuration_diff).map(target=>`<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')} · Deployment</h3>${renderDeploymentChange(target.configuration_diff)}</section>`).join('')}${renderLoadAcceptance(b.targets||[],sectionPrefix)}<div class="comparison-filters">${allRows.length?`<div><label for="${filterPrefix}-outcome">Show</label><select id="${filterPrefix}-outcome" data-comparison-filter="outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="${filterPrefix}-check">Check</label><select id="${filterPrefix}-check" data-comparison-filter="check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).filter(t=>t.traffic_capacity).map(t=>`<section class="comparison-section"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`).join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
+    const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
+    for(const row of rows){const key=JSON.stringify([row.targetName,row.check,row.scenario]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+    return `<section id="${sectionPrefix}-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
+  }).join('')}${renderComparisonDetails(b.targets||[])}`;
+}
+function syncComparisonFilters(){for(const control of $$('[data-comparison-filter]'))control.value=control.dataset.comparisonFilter==='outcome'?state.comparisonFilter:state.comparisonCheck;}
+function comparisonValue(row,value){if(value==null)return '—';if(typeof value!=='number')return escape(typeof value==='string'?value:JSON.stringify(value));if(row.metric==='accepted_arrival_rate')return `${number(value,2)} req/s`;if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':row.metric==='output_tokens'?' tokens':row.metric==='output_chars'?' chars':''}`;}
 function renderDeployment(report){
   return `<section class="panel"><div class="section-heading"><h2>Deployment and serving observations</h2></div><p class="hint">Changes provide investigation context, not proof of causality. Source freshness and other replicas remain qualified in the evidence.</p>${Object.entries(report.observations?.targets || {}).map(([name,obs])=>`<h3>${escape(name)}</h3><details><summary>Deployment snapshot and unknown fields</summary><pre>${escape(JSON.stringify(obs.deployment,null,2))}</pre></details><details><summary>Deployment observations during the run</summary><pre>${escape(JSON.stringify(obs.deployment_history || [],null,2))}</pre></details><details><summary>Serving telemetry and phase coverage</summary><pre>${escape(JSON.stringify(obs.serving_telemetry,null,2))}</pre></details>`).join('')}<a class="button" href="${runPath(state.detail.id)}/reproduction.json" download>Export reproduction JSON</a></section>`;
 }
@@ -3894,7 +3968,7 @@ document.addEventListener('click',async(event)=>{
   if(handleConditionClick(event))return;
   if(handlePerformanceClick(event))return;
   const reportTab=event.target.closest('[data-report-tab]');if(reportTab){event.preventDefault();chooseReportTab(reportTab.dataset.reportTab,{focus:reportTab.getAttribute?.('role')==='tab'});return;}
-  const section=event.target.closest('[data-report-section]');if(section){event.preventDefault();if(typeof location!=='undefined')location.hash=section.getAttribute('href');$(`#performance-${section.dataset.reportSection}`)?.scrollIntoView?.({block:'start'});return;}
+  const section=event.target.closest('[data-report-section]');if(section){event.preventDefault();if(typeof location!=='undefined')location.hash=section.getAttribute('href');revealReportSection(section.dataset.reportSection);return;}
 
   const newRun=event.target.closest('a[href="#new"]');if(newRun&&!event.metaKey&&!event.ctrlKey&&!event.shiftKey){event.preventDefault();startNewRun();return;}
   const liveSpot=event.target.closest('[data-live-slot]');if(liveSpot){openLiveRequest(Number(liveSpot.dataset.liveSlot));return;}
@@ -3910,7 +3984,7 @@ document.addEventListener('click',async(event)=>{
   if(shellAction==='mosaic-live'){state.mosaicFollow=true;state.mosaicPage=state.mosaicLivePage;renderDetail();focusMosaicStart();return;}
   const configTab=event.target.closest('[data-config-tab]');if(configTab){switchConfigView(configTab.dataset.configTab);return;}
   const setupStep=event.target.closest('[data-setup-step]');if(setupStep){state.returnToReview=Boolean(setupStep.dataset.reviewEdit);navigateSetup(Number(setupStep.dataset.setupStep));return;}
-  const tab=event.target.closest('[data-tab]');if(tab){event.preventDefault?.();state.tab=tab.dataset.tab;chooseReportTab('results',{anchor:false});revealReportSection(state.tab);location.hash=`${linkRun(state.detail.id)}/results/${state.tab}`;return;}
+  const tab=event.target.closest('[data-tab]');if(tab){event.preventDefault?.();state.tab=tab.dataset.tab;chooseReportTab('results',{anchor:false});revealReportSection(state.tab);location.hash=`${linkRun(state.detail.id)}/results/${state.tab==='baseline'?'comparison':state.tab}`;return;}
   const check=event.target.closest('[data-check]');if(check){
     // Keep the user's place: the list keeps its scroll, the clicked check stays marked, and the page only moves enough to show its details.
     const list=$('.check-list'),listScroll=list?.scrollTop || 0;
@@ -4117,6 +4191,18 @@ document.addEventListener('input',event=>{
   updateBounds();
 });
 document.addEventListener('change',event=>{
+  const comparisonFilter=event.target.dataset?.comparisonFilter;
+  if(['outcome','check'].includes(comparisonFilter)){
+    const container=event.target.closest('[data-comparison-scope]'),report=state.detail?.report;if(!container||!report)return;
+    const scope=container.dataset.comparisonScope;
+    if(comparisonFilter==='outcome')state.comparisonFilter=event.target.value;else state.comparisonCheck=event.target.value;
+    for(const content of $$('[data-comparison-scope]'))content.innerHTML=renderComparison(report,{scope:content.dataset.comparisonScope});
+    syncComparisonFilters();$(`[data-comparison-scope="${scope}"] [data-comparison-filter="${comparisonFilter}"]`)?.focus({preventScroll:true});return;
+  }
+  if(event.target.id==='results-section-jump'){
+    location.hash=`${linkRun(state.detail.id)}/results/${event.target.value}`;
+    scrollReportSection(event.target.value,'results');return;
+  }
   if(handleConditionChange(event))return;
   if(handlePerformanceChange(event))return;
   if(event.target.id==='performance-target'||event.target.id==='performance-window'){

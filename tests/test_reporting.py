@@ -824,12 +824,89 @@ def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evi
     assert 'Request current-30 ' not in html
 
 
+def test_comparison_preserves_observations_and_all_interpretation_warnings():
+    current, previous = make_report(), make_report('before')
+    current.observations['generator_max_lag_ms'] = 500
+    for record in current.requests:
+        record.output_tokens = 5
+        record.output_chars = 1
+    result = compare_baseline(current, previous)
+    target = result.baseline['targets'][0]
+    latency = next(row for row in target['comparisons'] if row['metric'] == 'latency_ms')
+    assert latency['current'] == latency['baseline'] == 100
+    assert latency['observed_delta'] == 0
+    assert latency['status'] == 'inconclusive'
+    assert {warning['code'] for warning in latency['warnings']} == {'output_work_changed', 'client_delayed'}
+    assert 'output lengths differ' in latency['reason']
+    assert 'client scheduling delay' in latency['reason']
+    outputs = next(row for row in target['observed_outputs'] if row['metric'] == 'output_tokens')
+    assert outputs['baseline'] == 10 and outputs['current'] == 5
+    assert outputs['observed_change'] == -50
+    assert outputs['descriptive'] is True
+    assert result.baseline['acceptance'] == {'baseline': 'pass', 'current': 'pass'}
+    from giraffe.reporting import _render
+    html = _render(result)
+    assert 'What changed?' in html and 'Observed change' in html
+    assert 'output lengths differ' in html and 'client scheduling delay' in html
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_comparison_timing_warning_distinguishes_legacy_delay_from_request_overlap(scoped):
+    from giraffe.reporting import _render
+
+    current, previous = make_report(), make_report("before")
+    current.observations["generator_max_lag_ms"] = 500
+    if scoped:
+        current.observations["client_timing_health"] = {"schema_version": 1,
+            "windows": [{"start_ms": 0, "end_ms": 100, "lag_ms": 500}]}
+        for index, record in enumerate(current.requests):
+            record.dispatch_ms = index * 1000
+            record.completed_ms = record.dispatch_ms + record.elapsed_ms
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"]
+               if row["metric"] == "latency_ms")
+    warning = next(warning["message"] for warning in row["warnings"]
+                   if warning["code"] == "client_delayed")
+    assert row["current"] == row["baseline"] == 100
+    assert row["status"] == "inconclusive"
+    if scoped:
+        assert "overlaps 1/8 requests" in warning
+        assert "run-wide" not in warning
+    else:
+        assert "run-wide maximum client scheduling delay of 500 ms" in warning
+        assert "Request-level overlap was not recorded" in warning
+        assert "overlaps 8/8" not in warning
+        assert "maximum overlapping delay" not in warning
+        assert "run-wide maximum client scheduling delay" in _render(result)
+        assert "Overlapping client scheduling delay" not in result.baseline["targets"][0]["summary"]
+
+
+def test_low_samples_keep_values_without_claiming_confidence():
+    result = compare_baseline(make_report(count=2, latency=200), make_report('before', count=2))
+    row = next(row for row in result.baseline['targets'][0]['comparisons'] if row['metric'] == 'latency_ms')
+    assert row['status'] == 'inconclusive'
+    assert row['baseline'] == 100 and row['current'] == 200
+    assert row['observed_change'] == 100
+    assert 'worsening_interval_95' not in row
+
+
+def test_comparison_acceptance_keeps_memory_interruption_and_legacy_output_evidence():
+    from giraffe.reporting import _comparison_outputs
+    current, previous = make_report(), make_report('before')
+    current.observations['resources'] = {'memory_interrupted_checks': [{'target': 'local', 'id': 'correctness'}]}
+    result = compare_baseline(current, previous)
+    assert result.baseline['acceptance']['current'] == 'inconclusive'
+    target = result.baseline['targets'][0]
+    expected = target.pop('observed_outputs')
+    assert _comparison_outputs(target) == expected
+
+
 def test_html_baseline_table_uses_actual_comparison_contract():
     from giraffe.reporting import _render
 
     report = compare_baseline(make_report(latency=200), make_report("baseline"))
     html = _render(report)
-    assert '<th>Metric</th><th>Baseline</th><th>Current</th><th>Change</th><th>Verdict</th>' in html
+    assert '<th>Metric</th><th>Baseline</th><th>Current</th><th>Observed change</th><th>Interpretation</th>' in html
     assert '+100.0%' in html
     assert '>Worse</strong>' in html
     assert '>No material change</strong>' in html
@@ -901,7 +978,7 @@ def test_html_traffic_only_baseline_includes_capacity_delta_and_summary():
     report = compare_baseline(traffic_report(high_failure="latency"), traffic_report("baseline"))
     assert report.baseline["targets"][0]["comparisons"] == []
     html = _render(report)
-    assert 'vs baseline baseline: 1 worse' in html
+    assert 'vs baseline baseline: 0 measurements · 0 with warnings' in html
     table = html[html.index('<table class="baseline-table">'):]
     assert 'Highest acceptable tested arrival rate (requests/s)' in table
     assert '-75.0%' in table
@@ -965,7 +1042,7 @@ def test_html_baseline_no_regression_summary_includes_uncompared_count_and_focus
     ] + [dict(status="inconclusive", metric=f"uncompared-{index}", reason="No samples.")
          for index in range(30)])])
     html = _render(report)
-    assert 'vs baseline before-upgrade: no regressions (64 unchanged, 30 not comparable)' in html
+    assert 'vs baseline before-upgrade: 94 measurements · 30 with warnings' in html
     assert '<a href="#baseline-heading">vs baseline' in html
     assert '<h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>' in html
     assert '<summary>Unchanged (64)</summary>' in html
@@ -986,8 +1063,8 @@ def test_html_load_improvement_requires_comparable_evidence(status, verdict):
     assert f'>{verdict}</strong>' in html
     assert ('Complete matched load evidence.' if status == 'pass' else 'Client-limited evidence.') in html
     assert '<td>Fail</td>' in html and '<td>Pass</td>' in html
-    if status == 'pass':
-        assert '1 better' in _baseline_summary_html(baseline)
+    assert '0 measurements · 0 with warnings' in _baseline_summary_html(baseline)
+    assert 'better' not in _baseline_summary_html(baseline)
 
 
 @pytest.mark.parametrize('scorer, criterion, options', [
@@ -1132,3 +1209,98 @@ def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label)
     report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
     _, html_path = write_report(report, tmp_path, html=True)
     assert f'p95 first useful output ≤ {label}' in html_path.read_text()
+
+
+def test_html_integrates_findings_acceptance_warnings_and_observed_outputs():
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    report.baseline = {
+        "run_id": "before", "saved_baseline_name": "Before <upgrade>", "status": "fail",
+        "acceptance": {"baseline": "pass", "current": "pass"},
+        "targets": [{"target": "local", "comparisons": [{
+            "check": "serving", "scenario": "warm", "metric": "latency_ms",
+            "baseline": 100, "current": 200, "status": "fail",
+            "warnings": [{"message": "Longer <answers>"}, {"message": "Client delay"}],
+        }], "observed_outputs": [{
+            "check": "serving", "scenario": "warm", "metric": "output_tokens",
+            "baseline": 10, "current": 20, "descriptive": True,
+        }]}],
+    }
+    original = report.model_dump_json()
+    html = _render(report)
+    baseline = html.split('<section id="baseline">', 1)[1].split('</section>', 1)[0]
+    assert '<h1>Passed</h1>' in html
+    assert html.index('<section id="findings">') < html.index('<section id="baseline">')
+    assert html.count('>Baseline comparison</h2>') == 1
+    assert 'vs baseline Before &lt;upgrade&gt;: 2 measurements · 1 with warnings' in html
+    assert 'Baseline: pass · Current: pass' in baseline
+    assert 'Interpretation limited' in baseline and 'Observed result' in baseline
+    assert 'Longer &lt;answers&gt; Client delay' in baseline
+    assert '<td>100.0</td><td>200.0</td>' in baseline and '<td>10.0</td><td>20.0</td>' in baseline
+    assert '>Worse</strong>' not in baseline
+    assert report.model_dump_json() == original
+
+
+def test_html_preserves_partial_capacity_and_load_evidence_without_stage_details():
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    report.baseline = {"run_id": "before", "targets": [{
+        "target": "local", "traffic_capacity": {"status": "inconclusive", "delta_rps": 3},
+        "load_test": {"status": "inconclusive", "reason": "No matched load points"},
+    }]}
+    html = _render(report)
+    assert 'Change: +3 requests/s.' in html
+    assert 'No matched load points' in html
+    assert 'Tested load and arrival details' in html
+    assert 'nan' not in html.lower()
+
+
+@pytest.mark.parametrize("metric,before,after,expected_change", [
+    ("output_tokens", 0, 10, "+10.0 tokens · from zero"),
+    ("output_chars", 0, 10, "+10.0 chars · from zero"),
+    ("latency_ms", 0, 10, "+10.0 ms · from zero"),
+    ("generation_tokens_per_second", 0, 10, "+10.0 tok/s · from zero"),
+    ("output_tokens", 0, 0, "+0.0%"),
+    ("output_tokens", None, 10, "—"),
+    ("output_tokens", 0, None, "—"),
+    ("output_tokens", 10, 20, "+100.0%"),
+    ("error_rate", 0, 0.25, "+25.0 pp"),
+    ("error_rate", 0.25, 0, "-25.0 pp"),
+])
+def test_html_export_preserves_observed_changes_from_zero(tmp_path, metric, before, after, expected_change):
+    report = make_report(count=1)
+    descriptive = metric in {"output_tokens", "output_chars"}
+    row = {"check": "serving", "scenario": "warm", "metric": metric,
+           "baseline": before, "current": after, "status": "inconclusive",
+           "descriptive": descriptive,
+           "change_unit": "percentage_points" if metric.endswith("_rate") else "percent"}
+    report.baseline = {"run_id": "before", "targets": [{
+        "target": "local", "observed_outputs" if descriptive else "comparisons": [row],
+    }]}
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    table = re.search(r'<table class="baseline-table">(.*?)</table>', html, re.S).group(1)
+    interpretation = "Observed result" if descriptive else "Not comparable"
+    assert f'>{expected_change}</td>' in table
+    assert f'>{interpretation}</strong>' in table
+    assert '>Better</strong>' not in table and '>Worse</strong>' not in table
+
+
+def test_html_export_zero_baseline_delta_keeps_interpretation_warning(tmp_path):
+    report = make_report(count=1)
+    report.baseline = {"run_id": "before", "targets": [{
+        "target": "local", "comparisons": [{
+            "check": "serving", "scenario": "warm", "metric": "latency_ms",
+            "baseline": 0, "current": 10, "status": "inconclusive",
+            "warnings": [{"message": "Client scheduling delay limits timing attribution."}],
+        }],
+    }]}
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    table = re.search(r'<table class="baseline-table">(.*?)</table>', html, re.S).group(1)
+    assert '>+10.0 ms · from zero</td>' in table
+    assert '>Interpretation limited</strong>' in table
+    assert 'Client scheduling delay limits timing attribution.' in table
+    assert '>Better</strong>' not in table and '>Worse</strong>' not in table

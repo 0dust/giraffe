@@ -479,6 +479,23 @@ def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
     }
 
 
+def _output_observations(check, scenario, current_work, old_work):
+    observations = []
+    for metric, value_key, sample_key in (
+        ("output_tokens", "reported_output_tokens_p50", "reported_token_samples"),
+        ("output_chars", "output_chars_p50", "valid_completions"),
+    ):
+        current_value, old_value = current_work[value_key], old_work[value_key]
+        observations.append({"metric": metric, "check": check, "scenario": scenario,
+            "current": current_value, "baseline": old_value, "aggregation": "median",
+            "current_samples": current_work[sample_key], "baseline_samples": old_work[sample_key],
+            "descriptive": True, "change_unit": "percent",
+            "observed_delta": current_value - old_value if current_value is not None and old_value is not None else None,
+            "observed_change": (current_value - old_value) * 100 / old_value
+            if current_value is not None and old_value is not None and old_value > 0 else None})
+    return observations
+
+
 def _different_output_work(current: dict[str, Any], old: dict[str, Any], threshold: float) -> bool:
     for key in ("output_chars_p50", "reported_output_tokens_p50"):
         c, b = current[key], old[key]
@@ -495,20 +512,25 @@ def _compare_metric(
         "metric": name, "current_samples": len(current), "baseline_samples": len(old),
         "status": "inconclusive",
     }
+    is_rate = name.endswith("_rate")
+    aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
+    current_value = aggregate(current) if current else None
+    old_value = aggregate(old) if old else None
+    result.update(current=current_value, baseline=old_value,
+                  aggregation="mean" if is_rate else "median",
+                  change_unit="percentage_points" if is_rate else "percent")
+    if current_value is not None and old_value is not None:
+        result["observed_delta"] = current_value - old_value
+        result["observed_change"] = ((current_value - old_value) * 100 if is_rate else
+                                     (current_value - old_value) * 100 / old_value if old_value > 0 else None)
     if min(len(current), len(old)) < minimum:
         result["reason"] = f"Needs at least {minimum} measured samples in each run."
         return result
-    is_rate = name.endswith("_rate")
-    aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
-    current_value, old_value = aggregate(current), aggregate(old)
     higher_is_better = name in {"correctness_rate", "valid_completion_rate", "output_tokens_per_second",
                                "generation_tokens_per_second"}
     direction = -1 if higher_is_better else 1
     # Rates use percentage points, avoiding undefined percentages for a zero baseline error rate.
     scale = 100 if is_rate else (100 / old_value if old_value > 0 else None)
-    result.update(current=current_value, baseline=old_value,
-                  aggregation="mean" if is_rate else "median",
-                  change_unit="percentage_points" if is_rate else "percent")
     if scale is None:
         if current_value == old_value:
             result.update(status="pass", worsening=0, reason="Both measurements are zero.")
@@ -651,7 +673,8 @@ def _compare_load_tests(
     elif not result["points"] or any(row["status"] == "inconclusive" for row in result["points"]):
         result["reason"] = "Incomplete or client-limited tests prevent a load acceptance comparison."
     elif not any(point["status"] == "pass" for point in old_points.values()):
-        result["reason"] = "The baseline established no acceptable tested load."
+        result["reason"] = "Neither a loss nor preservation of passing load can be assessed: the baseline had no passing load level. Measured differences are shown separately."
+        result["reason_code"] = "no_accepted_baseline"
     else:
         result.update(status="pass", reason="Previously acceptable tested loads remain acceptable.")
     return result
@@ -867,6 +890,14 @@ def _concurrent_load_html(metrics):
     return "".join(parts)
 
 
+def _acceptance_status(report: RunReport) -> str:
+    checks = [check for check in report.checks if check.id != "baseline"]
+    interrupted = {(item["target"], item["id"]) for item in
+                   report.observations.get("resources", {}).get("memory_interrupted_checks", [])}
+    return overall_status(checks, report.abort_reason,
+        memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted for check in checks))
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
@@ -887,6 +918,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         "min_samples": minimum, "regression_threshold": threshold,
         "deployment_changes_establish_causality": False,
         "source_outcome": baseline.overall,
+        "acceptance": {label: _acceptance_status(run)
+                       for label, run in (("baseline", baseline), ("current", report))},
         "source_started_at": baseline.started_at, "source_finished_at": baseline.finished_at,
         "method": "Per check/scenario; medians for timing and means for rates; "
                   "400 deterministic bootstrap resamples, 95% sample intervals. "
@@ -926,6 +959,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        observed_outputs = []
         traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
         load_tests = _compare_load_tests(report, baseline, name, target_reasons)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
@@ -945,6 +979,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     continue
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
+                observed_outputs.extend(_output_observations(check, scenario, current_work, old_work))
                 different_work = _different_output_work(current_work, old_work, threshold)
                 current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
                 old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
@@ -954,26 +989,51 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if not values and not old_metrics[metric]:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
+                    warnings = []
+                    initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
+                    def warn(code, message):
+                        warnings.append({"code": code, "message": message})
+                        row["status"] = "inconclusive"
                     if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
-                        row.update(status="inconclusive", reason="Observed input work or live generated histories differ; timing is not like-for-like.")
+                        warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
-                        row.update(status="inconclusive", reason="Actual generated output lengths differ "
-                                   "materially; these performance samples are not like-for-like.")
+                        warn("output_work_changed", "Actual generated output lengths differ materially: "
+                             f"median {old_work['reported_output_tokens_p50']} → {current_work['reported_output_tokens_p50']} tokens "
+                             f"and {old_work['output_chars_p50']} → {current_work['output_chars_p50']} characters. "
+                             "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if metric in TIMING_METRICS:
                         quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
                                    "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
                         row["timing_quality"] = quality
                         if delayed_runs:
-                            row.update(status="inconclusive", reason=" / ".join(delayed_runs) +
-                                       " client scheduling delay overlaps these metric samples; endpoint timing attribution is uncertain.")
+                            for label in delayed_runs:
+                                q = quality[label]
+                                if q["scope"] == "legacy_run_maximum":
+                                    delay = (f"{label} recorded a run-wide maximum client scheduling delay of "
+                                             f"{q['max_overlapping_lag_ms']:.0f} ms "
+                                             f"(threshold {q['threshold_ms']:.0f} ms). "
+                                             "Request-level overlap was not recorded; the legacy fallback "
+                                             "conservatively qualifies all samples.")
+                                else:
+                                    delay = (f"{label} client scheduling delay overlaps "
+                                             f"{q['affected_requests']}/{q['total_requests']} requests for this metric "
+                                             f"(maximum overlapping delay {q['max_overlapping_lag_ms']:.0f} ms; "
+                                             f"threshold {q['threshold_ms']:.0f} ms).")
+                                warn("client_delayed", delay + " Some waiting time may come from Giraffe, "
+                                     "so endpoint timing attribution is uncertain.")
                         if check == "load" and metric in {"latency_ms", "first_output_ms"}:
                             completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
-                                row.update(status="inconclusive", reason="Per-response timing evidence is incomplete; missing clocks remain unknown.")
+                                warn("missing_timing", "Per-response timing evidence is incomplete; missing clocks remain unknown.")
                         if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-                            row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
+                            warn("timing_version", "Client timing measurement boundaries differ; rerun the baseline.")
+                    if warnings:
+                        if initial_uncertainty:
+                            warnings.insert(0, {"code": "sample_uncertainty", "message": initial_uncertainty})
+                        row["reason"] = " ".join(warning["message"] for warning in warnings)
+                    row["warnings"] = warnings
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
                                evidence_ids=[record.id for record in current_records])
@@ -999,17 +1059,19 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         elif traffic is not None and traffic["status"] == "inconclusive":
             status = "inconclusive"
             summary = traffic["reason"]
-        elif load_tests is not None and load_tests["status"] == "inconclusive":
+        elif (load_tests is not None and load_tests["status"] == "inconclusive"
+              and load_tests.get("reason_code") != "no_accepted_baseline"):
             status = "inconclusive"
             summary = load_tests["reason"]
-        elif (not assessed and traffic is None and load_tests is None) or uncertain or missing_measurements:
+        elif (not assessed and (traffic is None or traffic["status"] != "pass")
+              and (load_tests is None or load_tests["status"] != "pass")) or uncertain or missing_measurements:
             status = "inconclusive"
             if not assessed:
                 summary = "No metric has enough comparable samples."
             elif missing_measurements:
                 summary = "Some metrics lost measurement coverage or have undefined baseline values."
             elif saturated_runs:
-                summary = "Overlapping client scheduling delay prevents a reliable timing/rate comparison."
+                summary = "Client scheduling delay prevents a reliable timing/rate comparison."
             else:
                 summary = "Sample variation or changed output lengths prevent a clear material-regression decision."
         else:
@@ -1020,10 +1082,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         excluded = len(rows) - len(assessed)
         if excluded:
             summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
-        if status == "inconclusive":
-            summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
-                        " using the same workload and settings; rerun longer if variation remains uncertain.")
-        entry = {"target": name, "status": status, "reasons": target_reasons,
+        if status == "inconclusive" and any(min(row["current_samples"], row["baseline_samples"]) < minimum for row in rows):
+            summary += f" Collect at least {minimum} measured samples per metric in both the current and baseline runs."
+        entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,
+                 "observed_outputs": observed_outputs,
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,
@@ -1473,24 +1535,27 @@ def _session_performance_html(data: dict[str, Any]) -> str:
 def _traffic_baseline_html(target: dict[str, Any]) -> str:
     traffic = target["traffic_capacity"]
     delta = traffic.get("delta_rps")
-    delta_text = (f' Change: {delta:+.4g} requests/s ({traffic["change_percent"]:+.1f}%).'
-                  if delta is not None else " No comparable capacity delta established.")
-    parts = [f'<h3>{_e(target["target"])} — tested arrival capacity</h3>',
-             f'<p>{_badge(traffic["status"])} {_e(traffic["reason"])}<br>'
+    delta_text = " No comparable capacity delta established."
+    if delta is not None:
+        percent = traffic.get("change_percent")
+        delta_text = f" Change: {delta:+.4g} requests/s"
+        delta_text += f" ({percent:+.1f}%)." if percent is not None else "."
+    parts = [f'<h3>{_e(target.get("target", "Target"))} — tested arrival capacity</h3>',
+             f'<p>{_badge(traffic.get("status", "inconclusive"))} {_e(traffic.get("reason", ""))}<br>'
              f'Highest acceptable tested rate: '
              f'{_e(_rps(traffic.get("baseline_highest_acceptable_rate_rps")))} → '
              f'{_e(_rps(traffic.get("current_highest_acceptable_rate_rps")))}.'
              f'{_e(delta_text)}</p>']
-    if traffic["stages"]:
+    if traffic.get("stages"):
         parts.append('<div class="table"><table><tr><th>Offered rate</th><th>Baseline / current</th>'
                      '<th>Cohort goodput, baseline / current</th><th>Finding</th></tr>')
         for stage in traffic["stages"]:
-            before, after = stage["baseline"], stage["current"]
+            before, after = stage.get("baseline") or {}, stage.get("current") or {}
             parts.append(
                 f'<tr><td>{_e(_rps(stage["rate_rps"]))}</td>'
-                f'<td>{_badge(before["status"])} / {_badge(after["status"])}</td>'
+                f'<td>{_badge(before.get("status", "inconclusive"))} / {_badge(after.get("status", "inconclusive"))}</td>'
                 f'<td>{_e(_rps(before.get("goodput_rps")))} / {_e(_rps(after.get("goodput_rps")))}</td>'
-                f'<td>{_badge(stage["status"])} {_e(stage["reason"])} '
+                f'<td>{_badge(stage.get("status", "inconclusive"))} {_e(stage.get("reason", ""))} '
                 f'{_e(stage.get("timing_comparison_reason", ""))}</td></tr>'
             )
         parts.append('</table></div>')
@@ -1501,9 +1566,9 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
     from .load_test import point_label
 
     comparison = target["load_test"]
-    parts = [f'<h3>{_e(target["target"])} — tested load acceptance</h3>',
-             f'<p>{_badge(comparison["status"])} {_e(comparison["reason"])}</p>']
-    if comparison["points"]:
+    parts = [f'<h3>{_e(target.get("target", "Target"))} — tested load acceptance</h3>',
+             f'<p>{_badge(comparison.get("status", "inconclusive"))} {_e(comparison.get("reason", ""))}</p>']
+    if comparison.get("points"):
         parts.append('<div class="table"><table><tr><th>Tested load</th>'
                      '<th>Baseline / current</th><th>Finding</th></tr>')
         for row in comparison["points"]:
@@ -1516,8 +1581,24 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _comparison_outputs(target):
+    if "observed_outputs" in target:
+        return target["observed_outputs"]
+    outputs, seen = [], set()
+    for row in target.get("comparisons", []):
+        key = row.get("check"), row.get("scenario")
+        work = row.get("output_work")
+        if key not in seen and work and work.get("current") and work.get("baseline"):
+            seen.add(key)
+            outputs.extend(_output_observations(*key, work["current"], work["baseline"]))
+    return outputs
+
 
 def _baseline_verdict(row: dict[str, Any]) -> tuple[str, str]:
+    if row.get("descriptive"):
+        return "Observed result", "muted"
+    if row.get("warnings"):
+        return "Interpretation limited", "inconclusive"
     if row.get("status") == "fail":
         return "Worse", "fail"
     if row.get("status") != "pass":
@@ -1533,7 +1614,7 @@ def _baseline_verdict(row: dict[str, Any]) -> tuple[str, str]:
 
 
 def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = list(target.get("comparisons", []))
+    rows = [*target.get("comparisons", []), *_comparison_outputs(target)]
     traffic = target.get("traffic_capacity")
     if traffic:
         rows.append(dict(traffic, metric="Highest acceptable tested arrival rate (requests/s)",
@@ -1565,16 +1646,12 @@ def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _baseline_summary_html(baseline: dict[str, Any]) -> str:
-    counts = Counter(_baseline_verdict(row)[0] for target in baseline.get("targets", [])
-                     for row in _baseline_display_rows(target))
-    if counts["Worse"] or counts["Better"]:
-        summary = ' · '.join(f'{counts[label]} {word}' for label, word in
-                             (("Worse", "worse"), ("Better", "better")) if counts[label])
-    else:
-        summary = (f'no regressions ({counts["No material change"]} unchanged, '
-                   f'{counts["Not comparable"]} not comparable)')
+    rows = [row for target in baseline.get("targets", [])
+            for row in [*target.get("comparisons", []), *_comparison_outputs(target)]]
+    warnings = sum(bool(row.get("warnings")) or row.get("status") == "inconclusive" for row in rows)
+    summary = f"{len(rows)} measurements · {warnings} with warnings"
     return (f'<p class="baseline-summary"><a href="#baseline-heading">vs baseline '
-            f'{_e(baseline.get("name") or baseline.get("run_id", "unknown"))}: {_e(summary)}</a></p>')
+            f'{_e(baseline.get("saved_baseline_name") or baseline.get("name") or baseline.get("run_id", "unknown"))}: {_e(summary)}</a></p>')
 
 
 def _deployment_change_html(diff: dict[str, Any]) -> str:
@@ -1624,11 +1701,11 @@ def _baseline_table_html(baseline: dict[str, Any]) -> str:
                          f'Load acceptance: {_e(load["reason"])}</p>')
 
     def table(rows):
-        reason_column = any(row.get("reason") and row["reason"] !=
-                            "No material worsening detected in these samples."
+        reason_column = any(row.get("warnings") or (row.get("reason") and row["reason"] !=
+                            "No material worsening detected in these samples.")
                             for row in rows)
         parts = ['<div class="table"><table class="baseline-table"><thead><tr>'
-                 '<th>Metric</th><th>Baseline</th><th>Current</th><th>Change</th><th>Verdict</th>'
+                 '<th>Metric</th><th>Baseline</th><th>Current</th><th>Observed change</th><th>Interpretation</th>'
                  + ('<th>Reason</th>' if reason_column else '') + '</tr></thead><tbody>']
         for row in rows:
             label = str(row.get("metric", "Metric")).replace("_", " ")
@@ -1651,6 +1728,13 @@ def _baseline_table_html(baseline: dict[str, Any]) -> str:
                     change = f"{(after - before) * 100 / before:+.1f}%"
                 elif after == before:
                     change = "+0.0%"
+                else:
+                    metric = row.get("metric", "")
+                    suffix = (" ms" if metric.endswith("_ms") else
+                              " tok/s" if metric.endswith("tokens_per_second") else
+                              " tokens" if metric == "output_tokens" else
+                              " chars" if metric == "output_chars" else "")
+                    change = f"{after - before:+,.1f}{suffix} · from zero"
             verdict, tone = _baseline_verdict(row)
             parts.append(f'<tr><th scope="row">{_e(label)}</th>'
                          f'<td>{value(before)}</td><td>{value(after)}</td>'
@@ -1660,6 +1744,9 @@ def _baseline_table_html(baseline: dict[str, Any]) -> str:
                 reason = row.get("reason", "")
                 if reason == "No material worsening detected in these samples.":
                     reason = ""
+                warnings = [warning["message"] for warning in row.get("warnings", [])]
+                if warnings:
+                    reason = " ".join(warnings)
                 parts.append(f'<td class="muted">{_e(reason)}</td>')
             parts.append('</tr>')
         parts.append('</tbody></table></div>')
@@ -1668,13 +1755,14 @@ def _baseline_table_html(baseline: dict[str, Any]) -> str:
     parts = notes
     # Conditions with changed acceptance appear before conditions without changes.
     ordered = sorted(conditions.items(), key=lambda item: min(
-        {"Worse": 0, "Better": 1, "No material change": 2, "Not comparable": 3}[
+        {"Worse": 0, "Better": 1, "Interpretation limited": 2, "No material change": 3, "Not comparable": 4, "Observed result": 5}[
             _baseline_verdict(row)[0]] for row in item[1]))
     for condition, entries in ordered:
         label = ' · '.join(str(value).replace('_', ' ') for value in condition if value)
         parts.append(f'<div class="baseline-condition"><h3>{_e(label or "Run comparison")}</h3>')
         for verdict, title in (("Worse", "Worse"), ("Better", "Better"),
-                               ("No material change", "Unchanged"), ("Not comparable", "Not comparable")):
+                               ("Interpretation limited", "Warnings"), ("No material change", "Unchanged"),
+                               ("Not comparable", "Not comparable"), ("Observed result", "Observed outputs")):
             rows = [row for row in entries if _baseline_verdict(row)[0] == verdict]
             if not rows:
                 continue
@@ -1805,7 +1893,7 @@ def _render(report: RunReport) -> str:
                     if (summary := connection_summary(
                         [r for r in report.requests if r.target == target["name"]], target.get("url", target["name"])))}
     verdict = {"pass": "Passed", "fail": "Failed", "inconclusive": "Inconclusive",
-               "partial": "Partial results"}.get(report.overall, report.overall.capitalize())
+               "partial": "Partial results"}.get(_acceptance_status(report), _acceptance_status(report).capitalize())
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
              f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
@@ -1930,10 +2018,25 @@ def _render(report: RunReport) -> str:
         parts.append(f'<p class="muted">Not included in this run: {_e(", ".join(absent))}.</p>')
     parts.append('</section><section id="baseline"><h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>')
     if report.baseline:
-        parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
-                     f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
-                     'Absolute check outcomes appear separately above.</p>')
+        acceptance = report.baseline.get("acceptance", {})
+        parts.append('<h3>What changed?</h3><p>Observed differences do not prove what caused them.</p>'
+                     f'<p>Compared with {_e(report.baseline.get("saved_baseline_name") or report.baseline.get("run_id", "unknown"))}.</p>'
+                     '<h3>Did each run meet its requirements?</h3>'
+                     f'<p>Baseline: {_e(acceptance.get("baseline", "Not recorded separately"))} · '
+                     f'Current: {_e(acceptance.get("current", "Not recorded separately"))}. '
+                     'Pass/fail checks configured requirements; measured changes appear below.</p>')
         parts.append(_baseline_table_html(report.baseline))
+        for target in report.baseline.get("targets", []):
+            if target.get("traffic_capacity") or target.get("load_test"):
+                parts.append(f'<details><summary>{_e(target.get("target", "Target"))} · '
+                             'Tested load and arrival details</summary>')
+                if target.get("traffic_capacity"):
+                    parts.append(_traffic_baseline_html(target))
+                if target.get("load_test"):
+                    parts.append(_load_baseline_html(target))
+                parts.append('</details>')
+        parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
+                     f'<pre>{_json(report.baseline)}</pre></details>')
     else:
         parts.append('<p>No baseline supplied. This run reports absolute checks only.</p>')
     parts.append('</section></div><div id="html-performance" aria-label="Performance">')
