@@ -30,8 +30,18 @@ async def test_monitor_stop_preserves_preexisting_cancellation_count(monkeypatch
     await asyncio.create_task(run())
 
 
-async def test_new_timeout_preserves_preexisting_cancellation_count(monkeypatch, client):
+@pytest.mark.parametrize("preparation_delay", [0, .08])
+async def test_new_timeout_preserves_preexisting_cancellation_count(monkeypatch, client, preparation_delay):
+    from giraffe import deployment
+
     monkeypatch.setattr(client, "delay", 10)
+    original_prepare = deployment.preparation_residency
+
+    async def prepare(*args, **kwargs):
+        await asyncio.sleep(preparation_delay)
+        return await original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(deployment, "preparation_residency", prepare)
 
     async def run():
         task = asyncio.current_task()
@@ -42,15 +52,53 @@ async def test_new_timeout_preserves_preexisting_cancellation_count(monkeypatch,
             pass
         try:
             with pytest.raises(TimeoutError) as timeout:
-                async with asyncio.timeout(.05):
-                    await runner.run_suite(config())
-            assert timeout.value.__cause__.giraffe_report.abort_reason == "run cancelled"
+                async with asyncio.timeout(None) as deadline:
+                    def progress(event):
+                        if event["event"] == "request_started" and deadline.when() is None:
+                            deadline.reschedule(asyncio.get_running_loop().time() + .05)
+                    await runner.run_suite(config(), progress=progress)
+            assert deadline.expired()
+            report = timeout.value.__cause__.giraffe_report
+            assert report.abort_reason == "run cancelled"
+            assert report.requests and all(r.status == "cancelled" and r.completed_ms is not None
+                                           for r in report.requests)
+            assert client.active == 0 and client.closed == ["service"]
             assert task.cancelling() == 1
         finally:
             while task.cancelling():
                 task.uncancel()
 
-    await asyncio.create_task(run())
+    await asyncio.wait_for(asyncio.create_task(run()), 2)
+
+
+async def test_preparation_timeout_preserves_cancellation_without_inventing_a_report(monkeypatch, client):
+    from giraffe import deployment
+
+    async def run():
+        task = asyncio.current_task()
+        task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        try:
+            with pytest.raises(TimeoutError) as timeout:
+                async with asyncio.timeout(None) as deadline:
+                    async def prepare(*args, **kwargs):
+                        deadline.reschedule(asyncio.get_running_loop().time())
+                        await asyncio.Event().wait()
+                    monkeypatch.setattr(deployment, "preparation_residency", prepare)
+                    await runner.run_suite(config())
+            assert deadline.expired()
+            assert isinstance(timeout.value.__cause__, asyncio.CancelledError)
+            assert not hasattr(timeout.value.__cause__, "giraffe_report")
+            assert task.cancelling() == 1
+            assert not client.scenarios and client.active == 0 and not client.closed
+        finally:
+            while task.cancelling():
+                task.uncancel()
+
+    await asyncio.wait_for(asyncio.create_task(run()), 2)
 
 
 @pytest.mark.parametrize("event_name", ["request_completed", "run_stopping"])
