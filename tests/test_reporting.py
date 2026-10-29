@@ -1310,3 +1310,52 @@ def test_html_preserves_partial_capacity_and_load_evidence_without_stage_details
     assert 'No matched load points' in html
     assert 'Tested load and arrival details' in html
     assert 'nan' not in html.lower()
+
+
+@pytest.mark.parametrize("metric,before,after,expected_change", [
+    ("output_tokens", 0, 10, "+10.0 tokens · from zero"),
+    ("output_chars", 0, 10, "+10.0 chars · from zero"),
+    ("latency_ms", 0, 10, "+10.0 ms · from zero"),
+    ("generation_tokens_per_second", 0, 10, "+10.0 tok/s · from zero"),
+    ("output_tokens", 0, 0, "+0.0%"),
+    ("output_tokens", None, 10, "—"),
+    ("output_tokens", 0, None, "—"),
+    ("output_tokens", 10, 20, "+100.0%"),
+    ("error_rate", 0, 0.25, "+25.0 pp"),
+    ("error_rate", 0.25, 0, "-25.0 pp"),
+])
+def test_html_export_preserves_observed_changes_from_zero(tmp_path, metric, before, after, expected_change):
+    report = make_report(count=1)
+    descriptive = metric in {"output_tokens", "output_chars"}
+    row = {"check": "serving", "scenario": "warm", "metric": metric,
+           "baseline": before, "current": after, "status": "inconclusive",
+           "descriptive": descriptive,
+           "change_unit": "percentage_points" if metric.endswith("_rate") else "percent"}
+    report.baseline = {"run_id": "before", "targets": [{
+        "target": "local", "observed_outputs" if descriptive else "comparisons": [row],
+    }]}
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    table = re.search(r'<table class="baseline-table">(.*?)</table>', html, re.S).group(1)
+    interpretation = "Observed result" if descriptive else "Not comparable"
+    assert f'>{expected_change}</td>' in table
+    assert f'>{interpretation}</strong>' in table
+    assert '>Better</strong>' not in table and '>Worse</strong>' not in table
+
+
+def test_html_export_zero_baseline_delta_keeps_interpretation_warning(tmp_path):
+    report = make_report(count=1)
+    report.baseline = {"run_id": "before", "targets": [{
+        "target": "local", "comparisons": [{
+            "check": "serving", "scenario": "warm", "metric": "latency_ms",
+            "baseline": 0, "current": 10, "status": "inconclusive",
+            "warnings": [{"message": "Client scheduling delay limits timing attribution."}],
+        }],
+    }]}
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    table = re.search(r'<table class="baseline-table">(.*?)</table>', html, re.S).group(1)
+    assert '>+10.0 ms · from zero</td>' in table
+    assert '>Interpretation limited</strong>' in table
+    assert 'Client scheduling delay limits timing attribution.' in table
+    assert '>Better</strong>' not in table and '>Worse</strong>' not in table

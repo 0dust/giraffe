@@ -2007,6 +2007,13 @@ def _baseline_table_html(baseline: dict[str, Any]) -> str:
                     change = f"{(after - before) * 100 / before:+.1f}%"
                 elif after == before:
                     change = "+0.0%"
+                else:
+                    metric = row.get("metric", "")
+                    suffix = (" ms" if metric.endswith("_ms") else
+                              " tok/s" if metric.endswith("tokens_per_second") else
+                              " tokens" if metric == "output_tokens" else
+                              " chars" if metric == "output_chars" else "")
+                    change = f"{after - before:+,.1f}{suffix} · from zero"
             verdict, tone = _baseline_verdict(row)
             parts.append(f'<tr><th scope="row">{_e(label)}</th>'
                          f'<td>{value(before)}</td><td>{value(after)}</td>'
