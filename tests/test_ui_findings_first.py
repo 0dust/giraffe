@@ -42,7 +42,7 @@ def test_report_rail_retargets_links_after_run_navigation():
   for(const link of $('#report-sections').querySelectorAll('a'))assert(link.getAttribute('href').startsWith('#runs/'+id+'/performance/'));
  }
  location.hash='#runs/B/results';await route();
- assert.equal($('#report-sections').hidden,false);
+ assert.equal($('#report-sections').hidden,true);assert.equal($('#report-sections').querySelectorAll('a').length,0);
  for(const link of $('#report-sections').querySelectorAll('a'))assert(link.getAttribute('href').startsWith('#runs/B/'));
 })()
 """, dom=True)
@@ -69,9 +69,9 @@ const baseline={run_id:'old',status:'fail',targets:[{target:'local',comparisons:
  {metric:'latency_ms',baseline:100,current:90,status:'pass',worsening:-10,threshold:20,reason:'Within threshold'},
  {metric:'latency_ms',status:'inconclusive',reason:'Too few samples'}]}]};
 state.baselines=[{id:'chosen',run_id:'old',name:'Before deploy'}];let html=detail(report([check('access','pass')],{baseline,overall:'fail'}));
-assert.match(html,/vs baseline Before deploy: 1 worse · 1 better/);
-html=renderComparison(state.detail.report);for(const heading of ['Metric','Baseline','Current','Change','Verdict'])assert(html.includes('<th>'+heading+'</th>'));
-assert.match(html,/\+30%/);assert.match(html,/-30%/);assert.match(html,/no material change/);assert.match(html,/not comparable/);assert.doesNotMatch(html,/Entry \d/);
+assert.match(html,/vs baseline Before deploy: 4 measurements · 1 with warnings/);
+html=renderComparison(state.detail.report);assert.equal((html.match(/data-metric=/g)||[]).length,4);for(const heading of ['Baseline','Current','Change'])assert(html.includes('<dt>'+heading+'</dt>'));
+assert.match(html,/\+30%/);assert.match(html,/-30%/);assert.match(html,/Regression detected/);assert.match(html,/No material regression/);assert.match(html,/Too few samples/);assert.match(html,/Why this warning/);assert.doesNotMatch(html,/Entry \d/);
 """)
 
 
@@ -133,7 +133,9 @@ def test_routes_rail_clicks_and_palette_follow_current_run_and_focus_heading():
  };
  location.hash='#runs/A/results';await route();assertCurrent('A');
  location.hash='#runs/B/results';await route();assertCurrent('B');
- await listeners.click({target:$('#report-sections a'),preventDefault(){}});await route();assertCurrent('B');assert.equal(reportView.tab,'performance');
+ await listeners.click({target:$('#tab-performance'),preventDefault(){}});await route();
+ assert.equal($('#report-sections').hidden,false);assert.equal($('#report-sections').querySelectorAll('a').length,9);
+ await listeners.click({target:$('#report-sections a'),preventDefault(){}});await route();assert.equal(state.detail.id,'B');assert.equal(reportView.tab,'performance');
  const dialog=document.createElement('dialog');dialog.setAttribute('id','command-dialog');document.body.insertBefore(dialog,null);
  dialog.showModal=function(){this.open=true;$('#command-search').focus=()=>{};};
  state.runs=[{id:'A',targets:[{model:'same-model'}]},{id:'B',targets:[{model:'same-model'}]}];openCommands();
@@ -170,7 +172,7 @@ const point={type:'combinations',shape:'short_short',pattern:'concurrent',level:
 const value=report([check('load','fail')],{baseline:{run_id:'old',status:'fail',targets:[{target:'local',traffic_capacity:{status:'fail',baseline_highest_acceptable_rate_rps:5,current_highest_acceptable_rate_rps:4,reason:'Lost accepted rate.'},load_test:{points:[{baseline:point,current:{...point,status:'fail'},status:'fail',reason:'Lost acceptable load.'}]}}]}});
 state.detail={id:'current',report:value};const html=renderComparison(value);
 assert.match(html,/5 req\/s/);assert.match(html,/4 req\/s/);assert.doesNotMatch(html,/500%|400%/);
-assert.match(html,/2 concurrent requests/);assert.match(html,/Short input/);
+assert.match(html,/maintained concurrency 2/);assert.match(html,/Short input/);
 """)
 
 

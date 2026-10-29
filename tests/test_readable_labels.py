@@ -163,7 +163,8 @@ assert.equal(requestIdentity(second,records),'Request 2 of 2');
 assert(renderMosaic(records).includes('aria-label="Canonical test &lt;name&gt;. Request 2 of 2'));
 assert(renderBeeswarm(records.map(r=>({...r,elapsed_ms:1}))).includes('aria-label="Canonical test &lt;name&gt;. Request 2 of 2'));
 assert(renderPhases([{event:'scenario_started',scenario:condition.id,target:'local'}]).includes('Canonical test &lt;name&gt;'));
-assert(comparisonTable([{scenario:condition.id,target:'local',metric:'latency_ms'}]).includes('Canonical test &lt;name&gt;'));
+assert(renderComparison({...saved,baseline:{targets:[{target:'local',comparisons:[
+  {check:'serving',scenario:condition.id,target:'local',metric:'latency_ms',status:'pass',baseline:10,current:10}]}]}}).includes('Canonical test &lt;name&gt;'));
 nodes['#request-dialog']={innerHTML:'',showModal(){}};openRequest('second');assert(nodes['#request-dialog'].innerHTML.includes('Canonical test &lt;name&gt;'));
 """)
 

@@ -1573,6 +1573,107 @@ main > #report-results { padding-top:20px; }
 .tokenizer-options > button { display:block; width:100%; padding:10px; text-align:left; border:0; background:transparent; color:var(--text); cursor:pointer; }
 .tokenizer-options > button:hover,.tokenizer-options > button:focus { background:var(--surface); }
 
+/* Comparisons use compact, anchored sections like the performance report. */
+[id^="results-"] { scroll-margin-top: 145px; }
+.comparison-conclusion { padding: 16px 20px; flex-direction: column; gap: 12px; }
+.comparison-conclusion > div:first-child { display: block; }
+.comparison-conclusion > div:first-child p { margin: 4px 0 0; }
+.comparison-conclusion .baseline-reference { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 0; border: 0; min-width: 0; }
+.comparison-conclusion .baseline-reference > strong { font-size: 13px; }
+.comparison-conclusion h2 { font-size: 18px; }
+.comparison-conclusion .baseline-reference .button { margin: 0 0 0 auto; }
+.comparison-acceptance { padding: 12px 18px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); }
+.comparison-acceptance h3 { font-size: 14px; margin-bottom: 8px; }
+.comparison-acceptance > div { display: flex; gap: 24px; flex-wrap: wrap; }
+.comparison-acceptance .hint { margin-top: 4px; }
+.comparison-section > h3 { font-size: 18px; margin: 12px 0 6px; }
+.load-acceptance, .load-acceptance-target { min-width: 0; }
+.load-acceptance-target > h4 { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 6px; }
+.load-acceptance-target > .hint, .load-acceptance-highest { overflow-wrap: anywhere; }
+.load-acceptance-highest { margin-top: 12px; font-size: 12px; }
+.load-acceptance-highest h5 { margin-bottom: 4px; font-size: 12px; }
+.load-acceptance-table { min-width: 0; }
+.load-acceptance-table table { min-width: 680px; }
+.load-acceptance-table th, .load-acceptance-table td { white-space: normal; overflow-wrap: break-word; vertical-align: top; }
+.load-acceptance-table th:nth-child(2), .load-acceptance-table th:nth-child(3), .load-acceptance-table td:nth-child(2), .load-acceptance-table td:nth-child(3) { min-width: 150px; white-space: nowrap; overflow-wrap: normal; }
+.load-acceptance-table td small { display: block; white-space: normal; overflow-wrap: normal; margin-top: 4px; color: var(--text-3); font-size: 11px; }
+.load-acceptance-table td:nth-child(4) { min-width: 145px; }
+.load-comparison-exclusions { margin-top: 16px; font-size: 12px; overflow-wrap: anywhere; }
+.load-comparison-exclusions h5 { font-size: 12px; margin-bottom: 8px; }
+.load-comparison-exclusions ul { padding-left: 20px; }
+.load-comparison-exclusions li { margin-bottom: 8px; }
+.load-comparison-exclusions li span { display: block; color: var(--text-3); }
+.load-acceptance-table tbody th { text-transform: none; letter-spacing: normal; font-size: 13px; }
+.load-acceptance-table th:first-child { width: 24%; }
+.load-acceptance-table th:last-child { width: 32%; }
+.comparison-group-heading { max-width: none; padding: 10px 16px; margin: 0; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: 12px; }
+.comparison-values { display: grid; }
+.comparison-measurement { display: grid; grid-template-columns: minmax(150px,1fr) minmax(0,2fr); gap: 8px 20px; padding: 14px 16px; min-width: 0; border-bottom: 1px solid var(--line); }
+.comparison-measurement:last-child { border-bottom: 0; }
+.comparison-measurement-heading h4 { font-size: 14px; margin: 0 0 4px; }
+.comparison-measurement-heading small { font-size: 11px; color: var(--text-3); }
+.comparison-value-grid { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 10px; margin: 0; }
+.comparison-value-grid dt { color: var(--text-2); font-size: 11px; margin-bottom: 3px; }
+.comparison-value-grid dd { margin: 0; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.comparison-value-grid small { font-size: 10px; color: var(--text-3); }
+.comparison-brief-warning { grid-column: 1/-1; padding: 6px 10px; border-left: 2px solid #b88832; background: color-mix(in srgb,#b88832 6%,transparent); color: var(--text-2); font-size: 12px; line-height: 1.5; }
+.comparison-brief-warning p { margin: 0; }
+.comparison-brief-warning .comparison-support { padding: 3px 0 0; }
+.comparison-brief-warning ul { margin: 6px 0 0; padding-left: 18px; }
+.comparison-brief-warning li+li { margin-top: 6px; }
+.comparison-statistics { grid-column: 1/-1; font-size: 11px; color: var(--text-3); }
+.comparison-statistics summary { cursor: pointer; }
+.comparison-statistics p { margin: 6px 0 0; }
+@media(max-width:600px) {
+  .comparison-measurement { grid-template-columns: minmax(0,1fr); gap: 8px; padding: 12px; }
+  .comparison-value-grid { gap: 8px; }
+  .comparison-value-grid dd { font-size: 14px; }
+  .comparison-filters > div { min-width: 0; flex: 1; }
+}
+
+.results-jump { display:none; }
+@media(max-width:700px) {
+  .results-jump { display:flex; align-items:center; gap:10px; margin:12px 0; }
+  .results-jump label { margin:0; white-space:nowrap; font-size:11px; }
+  .results-jump select { min-width:0; width:100%; font-size:12px; }
+}
+.rail-collapsed .results-jump { display:flex; align-items:center; gap:10px; margin:12px 0; }
+
+/* Top-level results have a boundary; comparison headings stay inside it. */
+.report-result-section { scroll-margin-top:145px; margin:28px 0; border:1px solid var(--line-strong); border-radius:var(--r-lg); padding:20px; background:var(--surface); min-width:0; }
+.report-result-section > :first-child { margin-top:0; }
+.report-result-section > :last-child { margin-bottom:0; }
+.report-result-section > .report-reference { margin:0; }
+.report-result-section > summary, .report-result-section > .report-reference > summary { padding:0; color:var(--text); cursor:pointer; }
+.report-result-section > summary h2, .report-result-section > .report-reference > summary h2 { display:inline; font-size:20px; }
+.comparison-container[open] > summary, .report-result-section > .report-reference[open] > summary { padding-bottom:16px; margin-bottom:16px; border-bottom:1px solid var(--line-strong); }
+.comparison-container #baseline-content { border-left:2px solid var(--accent-line); padding-left:16px; }
+.comparison-container .comparison-conclusion { border:0; border-radius:0; padding:0 0 16px; background:transparent; }
+.comparison-container .comparison-section > h3 { font-size:15px; }
+.report-section-list, .report-section-list ul { list-style:none; margin:0; padding:0; }
+.report-section-list > li > a { font-weight:600; }
+.report-section-list ul { margin:2px 0 12px 5px; padding-left:12px; border-left:1px solid var(--line-strong); }
+.report-section-list ul a { font-weight:400; font-size:10.5px; }
+@media(max-width:700px) {
+  .report-result-section { padding:14px; margin:20px 0; }
+  .comparison-container #baseline-content { padding-left:10px; }
+  .report-result-section > summary h2, .report-result-section > .report-reference > summary h2 { font-size:18px; }
+}
+.report-result-section > summary::before, .report-result-section > .report-reference > summary::before { content:'›'; display:inline-block; width:18px; margin-right:6px; font-size:22px; color:var(--text-2); text-align:center; }
+.comparison-container[open] > summary::before, .report-result-section > .report-reference[open] > summary::before { transform:rotate(90deg); }
+
+.comparison-filters > .comparison-method { margin-left:0; padding:0; }
+.comparison-method > summary { font-size:12px; }
+.comparison-method[open] { flex-basis:100%; }
+.comparison-method[open] > summary { width:fit-content; margin-left:0; }
+.comparison-method > p { margin:12px 0 0; padding:12px; border:1px solid var(--line); border-radius:var(--r); font-size:12px; color:var(--text-2); max-width:none; }
+@media(max-width:600px) {
+  .comparison-filters { gap:8px; }
+  .comparison-filters > .comparison-method { flex:1; min-width:0; }
+  .comparison-method > summary { font-size:11px; }
+  .comparison-filters > .comparison-method[open] { flex-basis:100%; }
+}
+
 /* Findings lead; request and process details stay close and expandable. */
 .report-measurement[hidden] { display:none; }
 .result-heading { padding:20px 24px; }
