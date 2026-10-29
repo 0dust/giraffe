@@ -94,6 +94,109 @@ def test_post_run_baseline_picker_filters_self_and_ignores_stale_navigation():
 """, dom=True)
 
 
+def test_saved_comparison_stays_pending_across_close_and_reopen():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  const messages=[];toast=message=>messages.push(message);
+  globalThis.FormData=class{constructor(form){this.form=form;}get(){return this.form.baselineChoice;}};
+  detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail),pending=[];
+  let writes=0,persisted=initial;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'a',name:'Reference A'},{id:'b',name:'Reference B'}]};
+    if(options?.method==='POST'){
+      writes++;persisted={...initial,baseline_id:JSON.parse(options.body).baseline_id};return {};
+    }
+    const snapshot=structuredClone(persisted);
+    return new Promise(resolve=>pending.push(()=>resolve(snapshot)));
+  };
+  await openComparisonDialog();
+  const form=dialog.querySelector('form');form.baselineChoice='a';
+  const first=compareSavedRun({preventDefault(){},target:form});
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(pending.length,1);
+  await listeners.click({target:form.querySelector('[data-action="close-dialog"]'),preventDefault(){}});
+  assert.equal(dialog.open,false);
+  await openComparisonDialog();
+  assert.equal(dialog.open,false);
+  assert.match(messages.at(-1),/still being saved/);
+  form.baselineChoice='b';
+  await compareSavedRun({preventDefault(){},target:form});
+  assert.equal(writes,1);assert.equal(pending.length,1);
+  pending[0]();await first;
+  assert.equal(state.detail.baseline_id,'a');
+  await openComparisonDialog();
+  const next=dialog.querySelector('form');next.baselineChoice='b';
+  const second=compareSavedRun({preventDefault(){},target:next});
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(writes,2);pending[1]();await second;
+  assert.equal(state.detail.baseline_id,'b');assert.equal(persisted.baseline_id,'b');
+  assert.equal(dialog.open,false);
+})();
+""", dom=True)
+
+
+@pytest.mark.parametrize("phase", ["post", "detail"])
+@pytest.mark.parametrize("navigate", [False, True])
+def test_saved_comparison_failure_releases_pending_and_respects_navigation(phase, navigate):
+    run_render_checks(r"""
+(async()=>{
+  const phase=PHASE,navigate=NAVIGATE;
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  toast=()=>{};detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail);let reject;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+    if(options?.method==='POST'&&phase==='detail')return {};
+    return new Promise((_,fail)=>{reject=fail;});
+  };
+  await openComparisonDialog();
+  const form=dialog.querySelector('form'),error=dialog.querySelector('#comparison-error');
+  const saving=compareSavedRun({preventDefault(){},target:form});
+  await Promise.resolve();await Promise.resolve();
+  if(navigate){state.routeVersion++;state.detail={...initial,id:'another-run'};}
+  reject(Error('Could not '+phase));await saving;
+  assert.equal(error.hidden,navigate);
+  assert.equal(state.detail.id,navigate?'another-run':'saved-run');
+  assert.equal(form.querySelector('[type="submit"]').disabled,false);
+  dialog.close();state.routeVersion++;state.detail=initial;
+  api=async()=>({baselines:[{id:'reference',name:'Reference'}]});
+  await openComparisonDialog();assert.equal(dialog.open,true);
+})();
+""".replace("PHASE", json.dumps(phase)).replace("NAVIGATE", json.dumps(navigate)), dom=True)
+
+
+@pytest.mark.parametrize("phase", ["post", "detail"])
+def test_saved_comparison_ignores_success_after_navigation(phase):
+    run_render_checks(r"""
+(async()=>{
+  const phase=PHASE;
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  toast=()=>{};detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail);let resolve,detailReads=0;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+    if(options?.method==='POST'&&phase==='detail')return {};
+    if(!options)detailReads++;
+    return new Promise(done=>{resolve=done;});
+  };
+  await openComparisonDialog();
+  const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+  await Promise.resolve();await Promise.resolve();
+  state.routeVersion++;state.detail={...initial,id:'another-run'};
+  resolve({...initial,baseline_id:'reference'});await saving;
+  assert.equal(state.detail.id,'another-run');
+  assert.equal(detailReads,phase==='post'?0:1);
+  dialog.close();state.routeVersion++;state.detail=initial;
+  api=async()=>({baselines:[{id:'reference',name:'Reference'}]});
+  await openComparisonDialog();assert.equal(dialog.open,true);
+})();
+""".replace("PHASE", json.dumps(phase)), dom=True)
+
+
 def test_live_view_retains_stop_reasons_during_stopping_and_judging():
     run_render_checks(r"""
 const config={targets:[{name:'local',model:'m'}],max_requests:50,concurrency:4,max_duration_seconds:120,request_timeout_seconds:30,max_output_tokens:128};
