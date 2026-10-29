@@ -622,6 +622,72 @@ def test_not_delivered_metric_qualification_depends_on_side(side, latency, expec
         assert not any(r['status'] == 'fail' for r in target['comparisons'])
 
 
+@pytest.mark.parametrize('side', ['baseline', 'current', 'both'])
+@pytest.mark.parametrize('latency', [10, 100])
+@pytest.mark.parametrize('delivery', ['qualified', 'unqualified', 'legacy_missing'])
+def test_scoring_failure_preserves_independent_delivery_qualification(side, latency, delivery):
+    from giraffe.load_test import assess_point
+    from giraffe.models import RunConfig
+    from giraffe.runner import _Run
+
+    old, current = concurrent_report(), concurrent_report()
+    for label, report in [('baseline', old), ('current', current)]:
+        config = RunConfig.model_validate(report.manifest['config'])
+        run = _Run(config, None, None)
+        point = report.checks[0].metrics['points'][1]
+        affected = side in {label, 'both'}
+        duration = latency if label == 'current' else 10
+        point.update(sending_start_ms=0, sending_end_ms=3 * duration)
+        records = [record for record in report.requests if record.id in point['request_ids']]
+        for index, record in enumerate(records):
+            start = index // 4 * duration
+            record.timing_start_ms = record.dispatch_ms = start
+            record.completed_ms = start + duration
+            record.elapsed_ms = duration
+            record.first_output_ms, record.stream_end_ms = 2, duration
+            record.score = not affected
+            if affected and delivery != 'qualified':
+                # Four client requests overlap, but their answer streams do not.
+                record.first_output_ms = index % 4 * duration / 4
+                record.stream_end_ms = record.first_output_ms + duration / 8
+        assess_point(run, config.targets[0], config.load_test, point, records)
+        assert point['client_mean_inflight'] == 4
+        assert point['load_qualified'] is (not affected or delivery == 'qualified')
+        assert point['reason_code'] == ('correctness' if affected else 'criteria_met')
+        if affected and delivery == 'legacy_missing':
+            del point['load_qualified']
+
+    target = compare_baseline(current, old).baseline['targets'][0]
+    timing = next(row for row in target['comparisons']
+                  if row['metric'] == 'latency_ms' and row['load_point']['level'] == 4)
+    unqualified = delivery == 'unqualified'
+    expected = 'fail' if latency == 100 else 'pass'
+    if unqualified and (side != 'current' or expected == 'pass'):
+        expected = 'inconclusive'
+    assert timing['status'] == expected
+    warnings = [warning for warning in timing['warnings'] if warning['code'] == 'load_not_delivered']
+    labels = {'Current', 'Baseline'} if side == 'both' else {side.title()}
+    assert {warning['message'].split()[0] for warning in warnings} == (labels if unqualified else set())
+    for warning in warnings:
+        assert 'streamed output evidenced peak overlap of 1 against 4' in warning['message']
+    acceptance = target['load_test']['points'][1]
+    assert acceptance['acceptance_change'] == {
+        'baseline': 'gained', 'current': 'lost', 'both': 'unchanged_not_accepted'}[side]
+    assert 'correctness' in acceptance['reason']
+
+
+def test_arrival_false_concurrency_flag_does_not_qualify_delivered_timing():
+    old, current = arrival_report(count=100), arrival_report(count=100)
+    for report in (old, current):
+        for point in report.checks[0].metrics['points']:
+            # assess_point's concurrency flag has no meaning for arrival rates.
+            assert point['pattern'] == 'constant' and point['level'] is None
+            point['load_qualified'] = False
+    rows = compare_baseline(current, old).baseline['targets'][0]['comparisons']
+    assert rows and all(row['status'] == 'pass' for row in rows)
+    assert not any(warning['code'] == 'load_not_delivered' for row in rows for warning in row['warnings'])
+
+
 @pytest.mark.parametrize('renderer', ['export', 'browser'])
 def test_preserved_metric_failure_displays_verdict_and_delivery_warning(renderer):
     from giraffe.reporting import _comparison_values_html

@@ -597,7 +597,11 @@ def _load_work_comparison(current, old):
 
 
 def _load_not_delivered(point):
-    return bool(point and point.get("reason_code") == "load_not_delivered")
+    # A higher-priority failure can own reason_code despite missing concurrency.
+    # The flag applies only to concurrent points; older reports may omit it.
+    return bool(point and (point.get("reason_code") == "load_not_delivered"
+                          or (point.get("pattern") == "concurrent"
+                              and point.get("load_qualified") is False)))
 
 
 def _server_limited_load(point):
@@ -751,12 +755,12 @@ def _compare_load_tests(
             elif before == "fail" and after == "fail":
                 row.update(acceptance_change="unchanged_not_accepted", reason="Still not accepted; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
             elif before == "pass" and after == "fail":
-                reason = ("No longer accepted: " + server_reason(point) + "." if _server_limited_load(point)
+                reason = ("No longer accepted: " + server_reason(point) + "." if point.get("status") != "fail" and _server_limited_load(point)
                           else "This previously acceptable tested load now fails; current: " + explanation(point, row["current"]) + ".")
                 row.update(acceptance_change="lost", status="fail", reason=reason)
             elif before == "fail" and after == "pass":
                 reason = ("Newly accepted: baseline " + server_reason(previous) + "."
-                          if _server_limited_load(previous) else "Newly accepted; baseline: " + explanation(previous, row["baseline"]) + ".")
+                          if previous.get("status") != "fail" and _server_limited_load(previous) else "Newly accepted; baseline: " + explanation(previous, row["baseline"]) + ".")
                 row.update(acceptance_change="gained", status="pass", reason=reason)
             elif after == "pass":
                 row.update(acceptance_change="accepted_baseline_not_established", reason="Accepted now; not established in baseline; baseline: " + explanation(previous, row["baseline"]) + ".")
