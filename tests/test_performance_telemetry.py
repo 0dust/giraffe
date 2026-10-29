@@ -192,6 +192,67 @@ async def test_runner_collects_configured_runtime_and_host_independently_of_gpu_
     assert all(row["host"]["status"] == "available" for row in rows)
 
 
+@pytest.mark.parametrize("cancel_during", ["scrape", "collector"])
+async def test_finished_target_stops_sampler_after_consumed_cancellation_without_stopping_peer(
+        monkeypatch, cancel_during):
+    from giraffe import deployment
+    from giraffe.runner import _Run
+
+    first = Target(name="first", url="http://first/v1", model="test",
+                   deployment={"collector_url": "http://first/collector"})
+    peer = Target(name="peer", url="http://peer/v1", model="test")
+    config = RunConfig(targets=[first, peer], metrics_interval_seconds=60)
+    run = _Run(config, None, None)
+    entered, release_peer, peer_sampled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    consumed = []
+
+    async def consume_cancellation():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            consumed.append(True)
+
+    async def scrape(run, target, phase):
+        if target is first and cancel_during == "scrape":
+            await consume_cancellation()
+        elif target is peer:
+            await release_peer.wait()
+            peer_sampled.set()
+        return {"elapsed_seconds": 1, "phase": phase, "samples": []}
+
+    async def collect(target, *_):
+        assert target is first and cancel_during == "collector"
+        await consume_cancellation()
+        return {"status": "observed"}
+
+    monkeypatch.setattr(telemetry, "scrape", scrape)
+    monkeypatch.setattr(deployment, "snapshot", collect)
+    stops = [asyncio.Event(), asyncio.Event()]
+    tasks = [asyncio.create_task(telemetry.sample_during(run, target, stop_event=stop))
+             for target, stop in zip((first, peer), stops)]
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        stops[0].set()
+        tasks[0].cancel()
+        # Completion cannot wait for the 60-second collection interval.
+        done, _ = await asyncio.wait({tasks[0]}, timeout=1)
+        assert tasks[0] in done
+        assert tasks[0].result() is None and consumed == [True]
+        assert not run.stop.is_set() and not stops[1].is_set()
+        release_peer.set()
+        await asyncio.wait_for(peer_sampled.wait(), 2)
+        assert not tasks[1].done()
+        assert len(run.observations[peer.name]["serving_telemetry"]["snapshots"]) == 1
+        assert len(run.observations[first.name]["serving_telemetry"]["snapshots"]) == 1
+        assert len(run.observations[first.name]["deployment_history"]) == (cancel_during == "collector")
+    finally:
+        for stop, task in zip(stops, tasks):
+            stop.set()
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def test_runtime_support_is_distinct_from_missing_collection():
     missing = telemetry.derive_server_metrics({"snapshots": []})
     assert missing["server_ttft_mean_ms"]["state"] == "not_collected"
