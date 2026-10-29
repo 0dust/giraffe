@@ -172,7 +172,7 @@ const point={type:'combinations',shape:'short_short',pattern:'concurrent',level:
 const value=report([check('load','fail')],{baseline:{run_id:'old',status:'fail',targets:[{target:'local',traffic_capacity:{status:'fail',baseline_highest_acceptable_rate_rps:5,current_highest_acceptable_rate_rps:4,reason:'Lost accepted rate.'},load_test:{points:[{baseline:point,current:{...point,status:'fail'},status:'fail',reason:'Lost acceptable load.'}]}}]}});
 state.detail={id:'current',report:value};const html=renderComparison(value);
 assert.match(html,/5 req\/s/);assert.match(html,/4 req\/s/);assert.doesNotMatch(html,/500%|400%/);
-assert.match(html,/2 concurrent requests/);assert.match(html,/Short input/);
+assert.match(html,/maintained concurrency 2/);assert.match(html,/Short input/);
 """)
 
 

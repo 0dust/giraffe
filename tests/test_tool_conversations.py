@@ -222,7 +222,10 @@ async def test_timeout_remains_inconclusive_alongside_passing_single_response_fi
         cfg = config(endpoint, request_timeout_seconds=.05)
         cfg.tool_checks.fixtures = [ToolFixture.model_validate(single)]
         report = await run_suite(cfg)
-    assert report.overall == 'inconclusive'
+    assert report.overall == 'inconclusive', [r.model_dump(include={
+        'scenario', 'status', 'valid', 'score', 'error', 'score_message', 'http_status',
+        'elapsed_ms', 'request_timeout_seconds', 'termination_reason', 'termination_limit_seconds',
+        'tool_evaluation', 'tool_conversation', 'tool_calls'}) for r in workload_records(report.requests)]
 
 
 async def test_stop_after_errors_leaves_unstarted_sessions_inconclusive():
@@ -378,7 +381,10 @@ async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence(
         report = await run_suite(cfg)
     singles = [r for r in workload_records(report.requests) if r.workload.get('tool_fixture_id') == 'single']
     assert len(singles) == 2
-    assert all(r.score is True and r.status == 'completed' for r in singles)
+    assert all(r.score is True and r.status == 'completed' for r in singles), [r.model_dump(include={
+        'scenario', 'status', 'valid', 'score', 'error', 'score_message', 'http_status',
+        'elapsed_ms', 'request_timeout_seconds', 'termination_reason', 'termination_limit_seconds',
+        'tool_evaluation', 'tool_calls'}) for r in singles]
     assert all(r.request_timeout_seconds == cfg.request_timeout_seconds for r in singles)
     final_turns = [r for r in workload_records(report.requests) if r.workload.get('stage') == 'final']
     assert len(final_turns) == 2
