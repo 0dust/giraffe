@@ -122,20 +122,67 @@ async def test_enclosing_timeout_raises_and_preserves_partial_report_for_existin
 
 
 
-async def test_competing_external_cancel_is_not_converted_to_timeout(monkeypatch, client):
+@pytest.mark.parametrize("phase", ["preparation", "traffic"])
+@pytest.mark.parametrize("preparation_delay", [0, .08])
+@pytest.mark.parametrize("external_cancel", [False, True])
+async def test_competing_external_cancel_is_not_converted_to_timeout(
+    monkeypatch, client, phase, preparation_delay, external_cancel,
+):
+    from giraffe import deployment
+
     monkeypatch.setattr(client, "delay", 10)
+    original_prepare = deployment.preparation_residency
+    observed = {}
+
     async def run():
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + .05
-        async with asyncio.timeout_at(deadline):
-            # Deliver an external request alongside the timeout's own request.
-            loop.call_at(deadline, asyncio.current_task().cancel)
-            await runner.run_suite(config())
+        loop, current = asyncio.get_running_loop(), asyncio.current_task()
+        async with asyncio.timeout(None) as deadline:
+            observed["timeout"] = deadline
+
+            def arm():
+                if deadline.when() is None:
+                    observed["armed_at"] = loop.time()
+                    when = observed["armed_at"] + .05
+                    deadline.reschedule(when)
+                    if external_cancel:
+                        observed["external_handle"] = loop.call_at(when, current.cancel)
+
+            async def prepare(*args, **kwargs):
+                await asyncio.sleep(preparation_delay)
+                if phase == "preparation":
+                    arm()
+                    await asyncio.Event().wait()
+                return await original_prepare(*args, **kwargs)
+
+            def progress(event):
+                if phase == "traffic" and event["event"] == "request_started":
+                    arm()
+
+            monkeypatch.setattr(deployment, "preparation_residency", prepare)
+            await runner.run_suite(config(), progress=progress)
+
     task = asyncio.create_task(run())
-    with pytest.raises(asyncio.CancelledError) as cancellation:
-        await task
-    assert task.cancelling() == 1
-    assert cancellation.value.giraffe_report.requests
+    try:
+        expected = asyncio.CancelledError if external_cancel else TimeoutError
+        with pytest.raises(expected) as stopped:
+            await asyncio.wait_for(task, 2)
+    finally:
+        if handle := observed.get("external_handle"):
+            handle.cancel()
+    assert observed["timeout"].expired()
+    assert observed["timeout"].when() - observed["armed_at"] == pytest.approx(.05)
+    assert task.cancelling() == int(external_cancel)
+    cancellation = stopped.value if external_cancel else stopped.value.__cause__
+    assert isinstance(cancellation, asyncio.CancelledError)
+    if phase == "traffic":
+        partial = cancellation.giraffe_report
+        assert partial.abort_reason == "run cancelled"
+        assert partial.requests and all(r.status == "cancelled" and r.completed_ms is not None
+                                        and r.score is None for r in partial.requests)
+        assert client.active == 0 and client.closed == ["service"]
+    else:
+        assert not hasattr(cancellation, "giraffe_report")
+        assert not client.scenarios and client.active == 0 and not client.closed
 
 
 @pytest.mark.parametrize("cancel", [False, True])
