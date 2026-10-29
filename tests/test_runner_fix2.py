@@ -8,8 +8,23 @@ from tests.test_runner import client as client, config
 from tests.test_runner_stats_revision import VariableClient, spec
 
 
-async def test_monitor_stop_preserves_preexisting_cancellation_count(monkeypatch, client):
+def _monitor_stop_report(monkeypatch, client, *, target_start_delay):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
     monkeypatch.setattr(client, "delay", 10)
+    original_target, original_monitor = runner._target, runner._Run.monitor
+    monitor_cancellations = []
+
+    async def target(run, target, fixtures):
+        await asyncio.sleep(target_start_delay)
+        await original_target(run, target, fixtures)
+
+    async def monitor(run, tasks):
+        await original_monitor(run, tasks)
+        monitor_cancellations.extend(task.cancelling() for task in tasks)
+
+    monkeypatch.setattr(runner, "_target", target)
+    monkeypatch.setattr(runner._Run, "monitor", monitor)
 
     async def run():
         task = asyncio.current_task()
@@ -22,12 +37,29 @@ async def test_monitor_stop_preserves_preexisting_cancellation_count(monkeypatch
         try:
             report = await runner.run_suite(config(max_duration_seconds=.2))
             assert report.abort_reason == "maximum run duration reached"
-            assert report.requests and all(r.status == "cancelled" for r in report.requests)
+            assert report.observations["inference_duration_seconds"] == pytest.approx(.2)
+            assert monitor_cancellations == [1]
             assert task.cancelling() == 1
+            return report
         finally:
             task.uncancel()
 
-    await asyncio.create_task(run())
+    # Keep the native monitor and task cancellation, while CPU stalls during
+    # setup cannot consume a test's entire 200 ms inference window.
+    return run_virtual(monkeypatch, asyncio.wait_for(run(), 2))
+
+
+def test_monitor_stop_preserves_preexisting_cancellation_count(monkeypatch, client):
+    report = _monitor_stop_report(monkeypatch, client, target_start_delay=0)
+    assert report.requests and all(r.status == "cancelled" and r.completed_ms is not None
+                                   for r in report.requests)
+    assert client.active == 0 and client.closed == ["service"]
+
+
+def test_monitor_expiry_before_traffic_preserves_empty_report_and_older_cancellation(monkeypatch, client):
+    report = _monitor_stop_report(monkeypatch, client, target_start_delay=.3)
+    assert report.requests == []
+    assert not client.scenarios and client.active == 0 and not client.closed
 
 
 @pytest.mark.parametrize("preparation_delay", [0, .08])
