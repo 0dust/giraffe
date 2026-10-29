@@ -2025,6 +2025,7 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
     assert state.stop_reason() is None
 
 
+@pytest.mark.parametrize("preparation_delay", [0, .06])
 @pytest.mark.parametrize("scoring_delay", [0, .28])
 @pytest.mark.parametrize("phase,settings", [
     ("initial", {}), ("warm", {}), ("context", {"checks": ["context"]}),
@@ -2034,9 +2035,29 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
         "patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True}, "rates": [100]},
         "schedule": {"duration_seconds": 1, "finish_seconds": 1}}}),
 ])
-async def test_run_deadline_bounds_each_target_traffic_phase(client, monkeypatch, phase, settings, scoring_delay):
+async def test_run_deadline_bounds_each_target_traffic_phase(
+    client, monkeypatch, phase, settings, scoring_delay, preparation_delay,
+):
     original = client.execute
-    entered, cancelled = [], []
+    entered, cancelled, observed = [], [], {}
+    original_init, original_emit = runner._Run.__init__, runner._Run.emit
+
+    def prepare_phase(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        observed["run"] = self
+        # Phase cancellation needs a live phase, independently of preparation speed.
+        # Global deadline expiry before traffic is covered separately below.
+        self.deadline = float("inf")
+        time.sleep(preparation_delay)
+
+    def arm_phase_deadline(self, event, target="", scenario="", **extra):
+        if event == "request_started" and scenario.startswith(phase) and "armed_at" not in observed:
+            observed["armed_at"] = time.monotonic()
+            self.deadline = observed["armed_at"] + self.config.max_duration_seconds
+        return original_emit(self, event, target, scenario, **extra)
+
+    monkeypatch.setattr(runner._Run, "__init__", prepare_phase)
+    monkeypatch.setattr(runner._Run, "emit", arm_phase_deadline)
 
     async def slow_phase(self, spec, **kwargs):
         if spec.scenario.startswith(phase):
@@ -2057,15 +2078,40 @@ async def test_run_deadline_bounds_each_target_traffic_phase(client, monkeypatch
 
     monkeypatch.setattr(runner, "_checks", delayed_scoring)
     monkeypatch.setattr(client, "execute", slow_phase)
-    report = await runner.run_suite(config(max_duration_seconds=.045, **settings))
+    report = await asyncio.wait_for(runner.run_suite(config(max_duration_seconds=.045, **settings)), 2)
     assert entered, [r.scenario for r in report.requests]
     assert sorted(cancelled) == sorted(entered)
-    # The run deadline bounds traffic, independently of later scoring/report work.
-    assert report.observations["inference_duration_seconds"] < .25
+    state = observed["run"]
+    assert state.deadline - observed["armed_at"] == pytest.approx(.045)
+    # Keep the phase's original bound, excluding preparation and later scoring.
+    inference_finished_at = state.start + report.observations["inference_duration_seconds"]
+    assert inference_finished_at - observed["armed_at"] < .25
+    assert not any(state.active.values()) and client.active == 0
+    assert all(task.done() for task in state.target_tasks.values())
+    assert client.closed == ["service"]
     assert report.abort_reason == "maximum run duration reached"
     interrupted = [r for r in report.requests if r.scenario in entered]
     assert interrupted and all(r.status == "cancelled" and r.score is None for r in interrupted)
     assert report.overall != "pass"
+
+
+async def test_run_deadline_expiring_during_preparation_starts_no_traffic(client, monkeypatch):
+    original = runner.builtin_fixtures
+    prepared = False
+
+    def slow_preparation(*args, **kwargs):
+        nonlocal prepared
+        if not prepared:
+            prepared = True
+            time.sleep(.06)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "builtin_fixtures", slow_preparation)
+    report = await runner.run_suite(config(checks=["context"], max_duration_seconds=.045))
+    assert prepared and not report.requests and not client.scenarios
+    assert report.abort_reason == "maximum run duration reached"
+    assert report.limits_reached == ["max_duration_seconds"]
+    assert report.overall != "pass" and client.active == 0
 
 
 async def test_slot_wait_is_bounded_by_run_deadline_without_monitor(client):
