@@ -2,6 +2,7 @@ from tests.evidence_helpers import workload_records, workload_payloads
 import copy
 import json
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -30,6 +31,23 @@ def config(endpoint, conversations=None, **updates):
         'checks': ['tools'], 'tool_checks': {'conversations': conversations or [fixture()]},
         'max_requests': 16, 'max_duration_seconds': 10, 'request_timeout_seconds': 2,
         'max_output_tokens': 128, 'context_limit': 8192, 'retention': 'all', **updates})
+
+
+def timeout_tool_followups(monkeypatch):
+    """Inject a transport timeout only after a real tool call has been answered."""
+    original = httpx.AsyncHTTPTransport.handle_async_request
+    timed_out = []
+
+    async def handle(transport, request):
+        if request.method == 'POST' and request.url.path.endswith('/chat/completions'):
+            payload = json.loads(request.content)
+            if any(message.get('role') == 'tool' for message in payload['messages']):
+                timed_out.append(payload)
+                raise httpx.ReadTimeout('controlled tool-result timeout', request=request)
+        return await original(transport, request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', handle)
+    return timed_out
 
 
 async def test_complete_and_stream_preserve_actual_history_and_consume_stub():
@@ -92,11 +110,25 @@ async def test_budget_exhaustion_never_promotes_first_stage_to_conversation_pass
 
 
 @pytest.mark.parametrize('mode', ['conversation_truncated', 'conversation_timeout'])
-async def test_incomplete_followup_is_not_a_wrong_answer_or_pass(mode):
-    with FakeEndpoint(mode=mode) as endpoint:
-        report = await run_suite(config(endpoint, request_timeout_seconds=.05))
+async def test_incomplete_followup_is_not_a_wrong_answer_or_pass(mode, monkeypatch):
+    if mode == 'conversation_timeout':
+        timed_out = timeout_tool_followups(monkeypatch)
+        endpoint_mode, reason = 'conversation_success', 'timeout'
+    else:
+        endpoint_mode, reason = mode, 'truncated'
+    with FakeEndpoint(mode=endpoint_mode) as endpoint:
+        report = await run_suite(config(endpoint))
     assert report.overall == 'inconclusive'
-    assert all(item['status'] == 'inconclusive' for item in next(check for check in report.checks if check.id == 'tools').metrics['conversations'])
+    outcomes = next(check for check in report.checks if check.id == 'tools').metrics['conversations']
+    assert len(outcomes) == 2
+    assert all(item['status'] == 'inconclusive' and item['reason'] == reason for item in outcomes)
+    records = workload_records(report.requests)
+    assert len(records) == 4
+    assert all(record.status == 'completed' and record.score is True for record in records[::2])
+    if mode == 'conversation_timeout':
+        assert [payload['stream'] for payload in timed_out] == [False, True]
+        assert all(record.status == 'timeout' and record.termination_reason == 'read_timeout'
+                   for record in records[1::2])
 
 
 async def test_early_eof_keeps_complete_and_stream_coverage_distinct():
@@ -214,21 +246,66 @@ async def test_context_admission_stops_before_sending_oversized_history():
     assert report.overall == 'inconclusive'
 
 
-async def test_timeout_remains_inconclusive_alongside_passing_single_response_fixture():
+async def test_timeout_remains_inconclusive_alongside_passing_single_response_fixture(monkeypatch):
+    timed_out = timeout_tool_followups(monkeypatch)
     value = fixture()
     single = {k: value[k] for k in ['fixture_id', 'messages', 'tools']}
     single.update(fixture_id='single', expected_calls=[{'name': 'get_weather', 'arguments': {'city': 'Warsaw'}}])
-    with FakeEndpoint(mode='conversation_timeout') as endpoint:
-        cfg = config(endpoint, request_timeout_seconds=.05)
+    with FakeEndpoint(mode='conversation_success') as endpoint:
+        cfg = config(endpoint)
         cfg.tool_checks.fixtures = [ToolFixture.model_validate(single)]
         report = await run_suite(cfg)
+    singles = [r for r in workload_records(report.requests) if r.workload.get('tool_fixture_id') == 'single']
+    assert len(singles) == 2
+    assert all(r.status == 'completed' and r.score is True for r in singles)
+    assert [payload['stream'] for payload in timed_out] == [False, True]
+    final_turns = [r for r in workload_records(report.requests) if r.workload.get('stage') == 'final']
+    assert len(final_turns) == 2
+    assert all(r.status == 'timeout' and r.termination_reason == 'read_timeout' for r in final_turns)
+    outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
+    assert len(outcomes) == 2
+    assert all(o['reason'] == 'timeout' and o['status'] == 'inconclusive' for o in outcomes)
     assert report.overall == 'inconclusive'
 
 
-async def test_stop_after_errors_leaves_unstarted_sessions_inconclusive():
-    with FakeEndpoint(mode='conversation_timeout') as endpoint:
-        report = await run_suite(config(endpoint, request_timeout_seconds=.05, stop_after_errors=1))
-    assert len(workload_records(report.requests)) == 2
+@pytest.mark.parametrize('invalid_fixture', ['single', 'conversation'])
+async def test_conversation_timeout_does_not_mask_independent_fixture_failure(monkeypatch, invalid_fixture):
+    timed_out = timeout_tool_followups(monkeypatch)
+    value = fixture()
+    single = {k: value[k] for k in ['fixture_id', 'messages', 'tools']}
+    single.update(fixture_id='single', expected_calls=[{'name': 'get_weather', 'arguments': {
+        'city': 'Paris' if invalid_fixture == 'single' else 'Warsaw'}}])
+    conversations = [value]
+    if invalid_fixture == 'conversation':
+        invalid = fixture(fixture_id='wrong-city')
+        invalid['steps'][0]['expected_calls'][0]['arguments']['city'] = 'Paris'
+        conversations.append(invalid)
+    with FakeEndpoint(mode='conversation_success') as endpoint:
+        cfg = config(endpoint, conversations)
+        cfg.tool_checks.fixtures = [ToolFixture.model_validate(single)]
+        report = await run_suite(cfg)
+    singles = [r for r in workload_records(report.requests) if r.workload.get('tool_fixture_id') == 'single']
+    assert len(singles) == 2
+    assert all(r.status == 'completed' and r.score is (invalid_fixture != 'single') for r in singles)
+    assert [payload['stream'] for payload in timed_out] == [False, True]
+    outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
+    assert [(o['status'], o['reason']) for o in outcomes[:2]] == [('inconclusive', 'timeout')] * 2
+    if invalid_fixture == 'conversation':
+        assert [(o['status'], o['reason']) for o in outcomes[2:]] == [('fail', 'unexpected_call')] * 2
+    else:
+        assert len(outcomes) == 2
+    assert report.overall == 'fail'
+
+
+async def test_stop_after_errors_leaves_unstarted_sessions_inconclusive(monkeypatch):
+    timed_out = timeout_tool_followups(monkeypatch)
+    with FakeEndpoint(mode='conversation_success') as endpoint:
+        report = await run_suite(config(endpoint, stop_after_errors=1))
+    records = workload_records(report.requests)
+    assert len(records) == 2
+    assert records[0].status == 'completed' and records[0].score is True
+    assert records[1].status == 'timeout' and records[1].termination_reason == 'read_timeout'
+    assert [payload['stream'] for payload in timed_out] == [False]
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert [o['reason'] for o in outcomes] == ['timeout', 'budget_exhausted']
     assert report.overall == 'inconclusive'

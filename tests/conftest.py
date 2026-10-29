@@ -5,11 +5,13 @@ import json
 import os
 import sys
 import threading
+import time
 import weakref
 from contextlib import nullcontext
 
 import pytest
 import pytest_asyncio
+from anyio._backends._asyncio import WorkerThread
 
 
 @pytest.fixture(autouse=True)
@@ -20,6 +22,8 @@ def giraffe_resource_guard():
     client = getattr(runner, "LLMClient", None)
     create_task = asyncio.BaseEventLoop.create_task
     start_thread = threading.Thread.start
+    stop_worker = WorkerThread.stop
+    idle_at_stop = weakref.WeakSet()
 
     def tracked_task(loop, coroutine, *args, **kwargs):
         task = create_task(loop, coroutine, *args, **kwargs)
@@ -41,26 +45,51 @@ def giraffe_resource_guard():
             threads.add(thread)
         return start_thread(thread, *args, **kwargs)
 
+    def tracked_worker_stop(thread, *args, **kwargs):
+        if not thread.stopping:
+            # stop() removes idle membership. Capture it first: stopping alone
+            # also describes abandoned calls that are still executing. A drained
+            # queue covers expired idle workers already popped by AnyIO's pruner.
+            with thread.queue.mutex:
+                drained = thread.queue.unfinished_tasks == 0
+            if thread in thread.idle_workers or drained:
+                idle_at_stop.add(thread)
+        return stop_worker(thread, *args, **kwargs)
+
     # This context outlives function-scoped monkeypatch fixtures and pytest's
     # loop runner. Ordinary executor threads are joined by that runner first.
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(asyncio.BaseEventLoop, "create_task", tracked_task)
         patch.setattr(threading.Thread, "start", tracked_thread)
+        patch.setattr(WorkerThread, "stop", tracked_worker_stop)
         yield tasks, errors
         # The application-owned measurement loop stays idle between runs. Only
         # this persistent thread is exempt; per-run heartbeat/evidence/RAM
         # threads must be closed and joined before their owning test ends.
         persistent_threads = {"giraffe-run"}
-        alive = sorted(thread.name for thread in threads
-                       if thread.is_alive() and thread.name not in persistent_threads)
-        if alive:
-            errors.append("Giraffe threads left running: " + ", ".join(alive))
+        alive = {thread for thread in threads
+                 if thread.is_alive() and thread.name not in persistent_threads}
+        shutting_down = {thread for thread in alive
+                         if isinstance(thread, WorkerThread) and thread.stopping
+                         and thread.loop.is_closed() and thread in idle_at_stop}
+        # Record all other leaks at the boundary, even if they happen to finish
+        # during another worker's shutdown. Client state is checked here too.
+        leaked_threads = alive - shutting_down
         if runner is not None and runner.LLMClient is not client:
             leaked = runner.LLMClient
             runner.LLMClient = client
             errors.append("Unrestored runner.LLMClient: " +
                           f"{getattr(leaked, '__module__', type(leaked).__module__)}."
                           f"{getattr(leaked, '__qualname__', type(leaked).__qualname__)}")
+        # AnyIO queues a sentinel but does not join workers before closing its
+        # loop. Allow only idle workers to finish, with one shared wait budget.
+        deadline = time.monotonic() + 1
+        for thread in shutting_down:
+            thread.join(max(0, deadline - time.monotonic()))
+        leaked_threads.update(thread for thread in shutting_down if thread.is_alive())
+        if leaked_threads:
+            errors.append("Giraffe threads left running: " + ", ".join(sorted(
+                thread.name for thread in leaked_threads)))
         if errors:
             pytest.fail("\n".join(errors), pytrace=False)
 

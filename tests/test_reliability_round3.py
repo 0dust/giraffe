@@ -18,6 +18,7 @@ from tests.test_runner import FakeClient, check, config
 from tests.test_scoring_reliability import fixture
 from tests.test_workload_reliability import MemoryEndpoint
 from tests.test_workloads import config as workload_config
+from tests.measurement_clock import MeasurementClock
 
 
 @pytest.mark.parametrize('status,valid,maximum,expected', [
@@ -141,16 +142,10 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
 ):
     snapshots = json.loads((Path(__file__).parent / 'fixtures/run-limits-phase3-defaults.json').read_text())['cases']
     values = dict(snapshots[f'examples/{example}.yaml']['source'])
-    # Preserve concurrency, sample counts and all acceptance limits. Scale only
-    # time: local fault window/deadline/hang = .05/.3/.6; vllm = .3/1.2/.6.
-    values.update(checks=['access', 'serving', 'first_output', 'recovery'],
-                  request_timeout_seconds=values['request_timeout_seconds'] / 100,
-                  sustained_seconds=values['sustained_seconds'] / 100,
-                  max_duration_seconds=5)
-    if mode == 'healthy':
-        # Give the healthy control enough time to establish sustained occupancy
-        # despite scheduler jitter; retain the short fault-injection windows.
-        values['sustained_seconds'] = max(.3, values['sustained_seconds'])
+    # Keep the example's real budgets and limits. The fixture controls elapsed
+    # measurement time and fault completion instead of racing subsecond sleeps.
+    values.update(checks=['access', 'serving', 'first_output', 'recovery'])
+    clock = MeasurementClock(monkeypatch)
     values['targets'][0]['url'] = 'http://memory.test/v1'
     configured = RunConfig.model_validate(values)
     fixtures = builtin_fixtures(configured)
@@ -162,10 +157,14 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
                      for specs in [heavy['long_input'], heavy['long_output']] for spec in specs}
     original = httpx.AsyncClient
     heavy_open, heavy_started, hangs, interrupted = 0, 0, 0, 0
-    phase_end = None
+    phase_start = None
+    first_pair = asyncio.Event()
+    fault_pair = asyncio.Event()
+    healthy_pair = asyncio.Barrier(configured.concurrency)
+    fault_time_advanced = False
 
     async def handle(request):
-        nonlocal heavy_open, heavy_started, hangs, interrupted, phase_end
+        nonlocal heavy_open, heavy_started, hangs, interrupted, phase_start, fault_time_advanced
         if request.method == 'GET':
             return httpx.Response(404)
         payload = json.loads(request.content)
@@ -174,28 +173,43 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
             return httpx.Response(400, json={'error': {'param': field}})
         prompt = tuple(m['content'] for m in payload['messages'])
         is_heavy = prompt in heavy_prompts
-        timer = None
         if is_heavy:
             heavy_open += 1
             heavy_started += 1
-            if phase_end is None:
-                phase_end = asyncio.get_running_loop().time() + configured.sustained_seconds
+            sequence = heavy_started
+            if phase_start is None:
+                phase_start = clock.now
+            if sequence == 2:
+                first_pair.set()
+            if sequence == 3:
+                fault_pair.set()
         try:
-            if mode != 'healthy' and is_heavy and heavy_open >= 2:
-                hangs += 1
-                if mode == 'phase_cancel':
-                    # Exercise the real client's cancellation path, without
-                    # inventing a cancelled record or discarding the request.
-                    timer = asyncio.get_running_loop().call_at(phase_end + .005,
-                                                               asyncio.current_task().cancel)
-                try:
-                    await asyncio.sleep(.6)
-                except asyncio.CancelledError:
-                    interrupted += 1
-                    raise
-                # sim2.py closes the connection without headers after its hang.
-                raise httpx.RemoteProtocolError('peer closed without response headers')
-            await asyncio.sleep(.003)
+            if mode != 'healthy' and is_heavy:
+                if sequence == 1:
+                    # One successful response releases a worker to dispatch the
+                    # third request while the second remains outstanding.
+                    await first_pair.wait()
+                else:
+                    hangs += 1
+                    await fault_pair.wait()
+                    if not fault_time_advanced:
+                        fault_time_advanced = True
+                        elapsed = (configured.sustained_seconds + .5 if mode == 'phase_cancel'
+                                   else configured.request_timeout_seconds if example == 'local' else 60)
+                        clock.advance(max(0, phase_start + elapsed - clock.now))
+                    if mode == 'phase_cancel':
+                        # Cancel the real executing task after the phase boundary;
+                        # the client and runner must retain its terminal evidence.
+                        asyncio.current_task().cancel()
+                        try:
+                            await asyncio.sleep(0)
+                        except asyncio.CancelledError:
+                            interrupted += 1
+                            raise
+                    if example == 'local':
+                        raise httpx.ReadTimeout('controlled heavy response timeout', request=request)
+                    raise httpx.RemoteProtocolError('peer closed without response headers', request=request)
+            await asyncio.sleep(0)
             answer = answers[prompt]
             split = max(1, len(answer) // (2 if is_heavy else 8))
             events = [dict(choices=[dict(delta={'content': answer[start:start + split]})])
@@ -204,16 +218,20 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
                                usage={'prompt_tokens': 32, 'completion_tokens': len(answer.split())}))
             class EventStream(httpx.AsyncByteStream):
                 async def __aiter__(self):
-                    for event in events:
-                        await asyncio.sleep(.001)
+                    for index, event in enumerate(events):
+                        if mode == 'healthy' and is_heavy and index == len(events) - 1:
+                            # Finish three complete concurrent pairs, then close
+                            # the virtual window before either terminal event.
+                            if await healthy_pair.wait() == 0 and heavy_started >= 6:
+                                clock.advance(max(0, phase_start + configured.sustained_seconds - clock.now))
+                            await healthy_pair.wait()
+                        await asyncio.sleep(0)
                         yield ('data: ' + json.dumps(event) + '\n\n').encode()
                     yield b'data: [DONE]\n\n'
 
             return httpx.Response(200, stream=EventStream(),
                                   headers={'content-type': 'text/event-stream'})
         finally:
-            if timer is not None:
-                timer.cancel()
             if is_heavy:
                 heavy_open -= 1
 
@@ -228,7 +246,7 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
     if mode == 'healthy':
         assert outcome.status == report.overall == 'pass', (
             outcome.model_dump(), report.abort_reason, completion)
-        assert len(sustained) >= 5 and all(r.status == 'completed' and r.valid for r in sustained)
+        assert len(sustained) == 6 and all(r.status == 'completed' and r.valid for r in sustained)
         assert outcome.metrics['sustained']['error_rate'] == 0
         return
     assert outcome.status == report.overall == ('inconclusive' if mode == 'phase_cancel' else 'fail'), (
@@ -244,8 +262,9 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
         assert interrupted == 2
         assert sum(r.status == 'cancelled' for r in sustained) == 2
     elif example == 'local':
-        assert interrupted == 2
+        assert interrupted == 0
         assert sum(r.status == 'timeout' for r in sustained) == 2
+        assert all('ReadTimeout' in r.error for r in sustained if r.status == 'timeout')
     else:
         assert interrupted == 0
         assert sum(r.status == 'failed' for r in sustained) == 2
