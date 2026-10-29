@@ -158,10 +158,20 @@ async def test_mixed_http_workload_scores_short_long_input_and_long_output(monke
 
 async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows():
     with FakeEndpoint(first_token_delay=.002,chunk_delay=0,service_slots=1) as endpoint:
-        cfg=traffic_config(endpoint)
+        # Keep start/end telemetry; periodic scrapes must not inject client-side
+        # scheduling stalls into this comparison of server service rates.
+        cfg=traffic_config(endpoint,metrics_max_samples=2)
         baseline=await run_suite(cfg)
+        baseline_payloads=list(endpoint.requests)
         endpoint.first_token_delay=.05
         candidate=await run_suite(cfg)
+        candidate_payloads=endpoint.requests[len(baseline_payloads):]
+        assert endpoint.metrics_reads == 4
+        assert endpoint.peak_active >= 3
+    for report,payloads in ((baseline,baseline_payloads),(candidate,candidate_payloads)):
+        assert_http_arrival_accounting(report,payloads,[6,30],other_requests=1)
+        assert all(point['dispatched'] == point['scheduled'] and point['late_arrivals'] == 0
+                   for point in capacity(report).metrics['points'])
     old,current=capacity(baseline).metrics,capacity(candidate).metrics
     assert old['highest_accepted'][0]['value'] == 50 and current['highest_accepted'][0]['value'] == 10
     low,high=current['points']
