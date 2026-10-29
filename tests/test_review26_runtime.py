@@ -51,13 +51,18 @@ async def test_tools_never_silently_disappear_when_suite_output_cap_matches_cont
     assert all(record.scenario.startswith("tools_") for record in report.requests)
 
 
-async def test_recovery_allowance_records_request_limit_before_total_exhaustion(monkeypatch):
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    configured = config(checks=["recovery", "tools"], max_requests=40, sustained_seconds=.05)
-    report = await runner.run_suite(configured)
-    assert len(report.requests) < 40
-    assert report.observations["targets"]["one"]["sustained_batches"] > 0
-    assert "max_requests" in report.limits_reached
+def test_recovery_allowance_records_request_limit_before_total_exhaustion(monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr(runner, "LLMClient", FakeClient)
+        configured = config(checks=["recovery", "tools"], max_requests=40, sustained_seconds=.05)
+        report = await runner.run_suite(configured)
+        assert len(report.requests) < 40
+        assert report.observations["targets"]["one"]["sustained_batches"] > 0
+        assert "max_requests" in report.limits_reached
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("samples,exhausted", [(6, False), (8, True)])
