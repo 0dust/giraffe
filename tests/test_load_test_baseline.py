@@ -336,9 +336,67 @@ def test_load_request_mix_warns_only_above_ten_percentage_points(share, changed)
                 record.fixture_id = 'a' if index < split else 'b'
     target = compare_baseline(current, old).baseline['targets'][0]
     assert not target['reasons'] and target['load_test']['status'] == 'pass'
-    timing = next(r for r in target['comparisons'] if r['metric'] == 'latency_ms')
-    assert ('request_mix_changed' in [w['code'] for w in timing['warnings']]) == changed
-    assert timing['status'] == ('inconclusive' if changed else 'pass')
+    for row in target['comparisons']:
+        assert ('request_mix_changed' in [w['code'] for w in row['warnings']]) == changed
+        assert row['status'] == ('inconclusive' if changed else 'pass')
+
+
+@pytest.mark.parametrize('metric', ['correctness_rate', 'error_rate', 'valid_completion_rate'])
+def test_seeded_case_mix_qualifies_aggregate_rates_without_losing_observations(metric):
+    old, current = concurrent_report(5), concurrent_report(200)
+    choices = [random.Random(6637 + index).choices([True, False], weights=[10, 90])[0]
+               for index in range(200)]
+    for run in (old, current):
+        for point in run.checks[0].metrics['points']:
+            records = [record for record in run.requests if record.id in point['request_ids']]
+            for record, easy in zip(records, choices):
+                record.fixture_id = 'easy' if easy else 'hard'
+                if metric == 'correctness_rate':
+                    record.score = easy
+                elif not easy:
+                    record.status = 'failed' if metric == 'error_rate' else 'cancelled'
+                    record.valid = False
+                    record.score = None
+    before = old.model_dump_json(), current.model_dump_json()
+
+    target = compare_baseline(current, old).baseline['targets'][0]
+
+    # Both fixtures behave identically in both runs; only their shares changed.
+    assert target['status'] != 'fail'
+    rows = [row for row in target['comparisons'] if row['metric'] == metric]
+    assert len(rows) == 2
+    for row in rows:
+        expected = (0.865, 0.2) if metric == 'error_rate' else (0.135, 0.8)
+        assert (row['current'], row['baseline']) == pytest.approx(expected)
+        assert (row['current_samples'], row['baseline_samples']) == (200, 5)
+        assert row['worsening'] == pytest.approx(66.5)
+        assert row['worsening_interval_95'] == pytest.approx([25.5, 90])
+        assert row['status'] == 'inconclusive'
+        assert [warning['code'] for warning in row['warnings']] == ['request_mix_changed']
+        assert len(row['evidence_ids']) == 200
+    assert (old.model_dump_json(), current.model_dump_json()) == before
+
+
+def test_rate_regression_in_matching_cohort_survives_mix_warning_elsewhere():
+    old, current = concurrent_report(10), concurrent_report(10)
+    for run, share in [(old, 5), (current, 8)]:
+        point = run.checks[0].metrics['points'][1]
+        for index, record in enumerate(r for r in run.requests if r.id in point['request_ids']):
+            record.fixture_id = 'easy' if index < share else 'hard'
+            record.score = index < share
+    for record in current.requests:
+        if record.load_point['level'] == 1:
+            record.score = False
+
+    target = compare_baseline(current, old).baseline['targets'][0]
+
+    rows = {row['load_point']['level']: row for row in target['comparisons']
+            if row['metric'] == 'correctness_rate'}
+    assert target['status'] == 'fail'
+    assert rows[1]['status'] == 'fail' and rows[1]['warnings'] == []
+    assert (rows[1]['current'], rows[1]['baseline']) == (0, 1)
+    assert rows[4]['status'] == 'inconclusive'
+    assert [warning['code'] for warning in rows[4]['warnings']] == ['request_mix_changed']
 
 
 @pytest.mark.parametrize('count,changed', [(36, False), (37, True)])

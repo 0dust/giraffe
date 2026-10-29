@@ -841,7 +841,8 @@ def _baseline_rows(report, target, window, records, put):
     point_ids = {point.get("point_id") for point in load_points}
     capacity = [r for r in entry.get("load_test", {}).get("points", [])
                 if (r.get("current") or {}).get("id") in point_ids
-                and r.get("acceptance_change") in {"gained", "lost", "unchanged_accepted", "unchanged_not_accepted"}]
+                and (r.get("acceptance_change") in {"gained", "lost", "unchanged_accepted", "unchanged_not_accepted"}
+                     or ("acceptance_change" not in r and r.get("status") in {"pass", "fail"}))]
     capacity += traffic
     put("baseline_capacity", capacity or None, "Accepted capacity change", "tested load", "Existing qualified tested-load baseline; not inferred saturation",
         samples=len(capacity), state="measured" if capacity else ("no_baseline" if baseline is None else "insufficient_evidence"))

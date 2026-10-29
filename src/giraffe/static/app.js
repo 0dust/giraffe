@@ -3304,7 +3304,7 @@ function comparisonWarningSummary(row) {
       const before=row.output_work?.baseline?.reported_output_tokens_p50,after=row.output_work?.current?.reported_output_tokens_p50;
       notes.push(before!=null&&after!=null?`Answer length changed: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
     }else if(warning.code==='client_delayed'){
-      for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
+      for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(q.scope==='legacy_run_maximum'?`${name} recorded a run-wide Giraffe delay; request-level overlap was not recorded.`:`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
     }else if(warning.code==='sample_uncertainty')notes.push('Sample uncertainty limits this assessment.');
     else if(warning.code==='input_work_changed')notes.push('Input workload differs.');
     else if(warning.code==='missing_timing')notes.push('Some response timings are missing.');
@@ -3332,6 +3332,10 @@ function baselineIdentity(baseline) {
   const when=baseline.source_started_at || run?.started_at || saved?.saved_at;
   return `<strong>${escape(label)}</strong>${when?`<span>${date(when)}</span>`:''}<details class="baseline-identifier"><summary>Reference ID</summary><code>${escape(baseline.run_id || 'Not recorded')}</code></details>`;
 }
+function renderComparisonDetails(targets) {
+  if(!targets.length)return '';
+  return `<details class="comparison-support comparison-deployment"><summary>Deployment and comparison details</summary><p class="hint">Changes provide investigation context, not proof of causality. Missing or stale fields do not establish unchanged configuration.</p>${targets.map(target=>`<section><h4>${escape(target.target||target.name||'Target')}</h4><p>${target.configuration_diff?.confounded?'Confounded experiment: other recorded settings changed alongside the intended change.':'Causality unverified.'}</p><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></section>`).join('')}</details>`;
+}
 function renderComparison(report) {
   const b=report.baseline;
   if(!b)return `<div class="panel empty-state"><h2>No baseline selected</h2><button class="button" data-action="compare-saved">Compare with baseline</button><button class="button" data-action="baseline-dialog">Save this run as a baseline</button></div>`;
@@ -3344,7 +3348,7 @@ function renderComparison(report) {
     const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
     for(const row of rows){const key=JSON.stringify([row.targetName,row.check,comparisonCohort(row)]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
     return `<section id="results-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
-  }).join('')}`;
+  }).join('')}${renderComparisonDetails(b.targets||[])}`;
 }
 function syncComparisonFilters(){if($('#comparison-outcome'))$('#comparison-outcome').value=state.comparisonFilter;if($('#comparison-check'))$('#comparison-check').value=state.comparisonCheck;}
 function comparisonValue(row,value){if(value==null)return '—';if(row.metric.endsWith('_rate'))return `${number(value*100,1)}%`;if(row.metric.endsWith('_ms'))return ms(value);return `${number(value,2)}${row.metric.endsWith('tokens_per_second')?' tok/s':row.metric==='output_tokens'?' tokens':row.metric==='output_chars'?' chars':''}`;}
@@ -3490,24 +3494,29 @@ async function openRequest(id) {
 }
 function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
+// Closing a chooser does not cancel a comparison already being saved.
+const pendingComparisons=new Set();
 async function openComparisonDialog() {
   const id=state.detail?.id,version=state.routeVersion;
   if(!id||state.detail.state!=='completed')return;
+  if(pendingComparisons.has(id)){toast('A comparison is still being saved for this run.');return;}
   try {
     const result=await api('/api/baselines');
-    if(version!==state.routeVersion||state.detail?.id!==id)return;
+    if(version!==state.routeVersion||state.detail?.id!==id||pendingComparisons.has(id))return;
     state.baselines=result.baselines||[];
     const choices=state.baselines.filter(item=>item.run_id!==id);
     const dialog=$('#comparison-dialog');
     dialog.className='baseline-form';
     dialog.innerHTML=`<form id="comparison-form" data-run-id="${escape(id)}"><div class="dialog-head"><h2 id="comparison-title">Compare with saved baseline</h2><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close comparison">✕</button></div><div class="dialog-body"><p>Compare the recorded results. No new requests will be sent to your endpoint.</p>${choices.length?`<label for="saved-baseline-choice">Saved baseline</label><select id="saved-baseline-choice" name="baseline_id" required>${choices.map(item=>`<option value="${escape(item.id)}"${item.id===state.detail.baseline_id?' selected':''}>${escape(item.name)} · ${escape(date(item.saved_at))}</option>`).join('')}</select>`:'<p>No other saved baselines yet. Open a different completed run and choose “Save as reference baseline”, then return here.</p>'}<div id="comparison-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary"${choices.length?'':' disabled'}>Compare saved results</button></div></form>`;
     dialog.showModal();
-  }catch(error){toast(error.message);}
+  }catch(error){if(version===state.routeVersion&&state.detail?.id===id)toast(error.message);}
 }
 async function compareSavedRun(event) {
   event.preventDefault();
   const form=event.target,id=form.dataset.runId,version=state.routeVersion;
+  if(state.detail?.id!==id||pendingComparisons.has(id))return;
   const button=form.querySelector('[type="submit"]'),error=$('#comparison-error');
+  pendingComparisons.add(id);
   button.disabled=true;error.hidden=true;
   try {
     const result=await api(`${runPath(id)}/compare`,{method:'POST',body:JSON.stringify({baseline_id:new FormData(form).get('baseline_id')})});
@@ -3522,7 +3531,7 @@ async function compareSavedRun(event) {
     if(section){section.open=true;section.scrollIntoView?.({block:'start'});$('summary',section)?.focus({preventScroll:true});}
     toast(result.warning||'Comparison saved. No new requests were sent.');
   }catch(failure){if(version===state.routeVersion&&state.detail?.id===id){error.textContent=failure.message;error.hidden=false;}}
-  finally{button.disabled=false;}
+  finally{pendingComparisons.delete(id);button.disabled=false;}
 }
 async function saveBaseline(event){event.preventDefault();const form=event.target,data=new FormData(form),button=$('#save-baseline'),error=$('#baseline-error');button.disabled=true;error.hidden=true;try{await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:state.detail.id,name:String(data.get('baseline_name')).trim(),replace:data.has('replace')})});const result=await api('/api/baselines');state.baselines=result.baselines || [];$('#baseline-dialog').close();renderDetail();toast(`Saved as baseline “${String(data.get('baseline_name')).trim()}”. Open another completed run and choose Compare with baseline, or select it before a new run.`);}catch(e){error.textContent=e.message;error.hidden=false;if(e.status===409)$('#replace-row').hidden=false;}finally{button.disabled=false;}}
 async function stopRun(){
