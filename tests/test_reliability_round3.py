@@ -15,6 +15,7 @@ from giraffe.models import Arrival, Limits, RunConfig
 from tests.test_fixtures import record
 from tests.test_gpu_reliability import snapshot
 from tests.test_runner import FakeClient, check, config
+from tests.test_review26_phase4_accuracy import run_virtual
 from tests.test_scoring_reliability import fixture
 from tests.test_workload_reliability import MemoryEndpoint
 from tests.test_workloads import config as workload_config
@@ -25,7 +26,8 @@ from tests.measurement_clock import MeasurementClock
     ('timeout', False, 0, 'fail'), ('failed', False, 0, 'fail'),
     ('timeout', False, 1, 'inconclusive'), ('completed', True, 0, 'inconclusive'),
 ])
-async def test_sustained_errors_and_successful_sample_minimum(monkeypatch, status, valid, maximum, expected):
+def test_sustained_errors_and_successful_sample_minimum(monkeypatch, status, valid, maximum, expected):
+    """Evaluate errors and sample minimums after two mocked requests drain."""
     class Client(FakeClient):
         async def execute(self, spec, **kwargs):
             result = await super().execute(spec, **kwargs)
@@ -34,10 +36,16 @@ async def test_sustained_errors_and_successful_sample_minimum(monkeypatch, statu
             return result
 
     monkeypatch.setattr(runner, 'LLMClient', Client)
-    report = await runner.run_suite(config(checks=['serving', 'first_output', 'recovery'], samples=5,
+    # Both workers start inside the 1 ms window; their 4 ms responses finish
+    # after it. Host scheduling must not decide whether this evidence exists.
+    report = run_virtual(monkeypatch, runner.run_suite(config(checks=['serving', 'first_output', 'recovery'], samples=5,
         sustained_seconds=.001, limits=Limits(min_samples=5, first_output_ms=1000,
-                                            latency_ms=1000, max_error_rate=maximum)))
+                                            latency_ms=1000, max_error_rate=maximum))))
     outcome = check(report, 'recovery')
+    sustained = [row for row in report.requests if row.scenario == 'sustained']
+    assert len(sustained) == outcome.metrics['sustained']['attempted'] == 2
+    assert all((row.status, row.valid) == (status, valid) for row in sustained)
+    assert outcome.metrics['sustained']['completed'] == (2 if valid else 0)
     assert outcome.status == expected, (outcome.summary, outcome.metrics)
     assert outcome.metrics['sustained']['completed'] < 5
     assert outcome.metrics['sustained_error_rate'] == (0 if valid else 1)
