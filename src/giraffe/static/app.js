@@ -3303,7 +3303,12 @@ function checkViolationIds(check,report) {
   const visit=value=>{
     if(!value||typeof value!=='object')return;
     for(const [key,items] of Object.entries(value)){
-      if(key==='timing_violations'&&(Array.isArray(value.qualified_timing_violations)||value.timing_quality?.status==='client_delayed'||check.metrics?.timing_quality?.status==='client_delayed'))continue;
+      if(key==='timing_violations'){
+        // Load groups partition qualified IDs from unattributed IDs before reporting.
+        const qualifiedLoad=check.id==='load'&&Array.isArray(value.unattributed_timing_violations);
+        const clientDelayed=value.timing_quality?.status==='client_delayed'||check.metrics?.timing_quality?.status==='client_delayed';
+        if(Array.isArray(value.qualified_timing_violations)||(!qualifiedLoad&&clientDelayed))continue;
+      }
       if(['violations','timing_violations','qualified_timing_violations'].includes(key)&&Array.isArray(items)){
         for(const item of items){const id=typeof item==='string'?item:item?.request_id||item?.id;if(id)ids.add(id);}
       }else if(typeof items==='object')visit(items);

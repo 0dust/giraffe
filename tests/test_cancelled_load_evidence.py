@@ -68,8 +68,9 @@ async def test_arrival_cancelled_record_keeps_stage_metadata_without_double_coun
     target = config.targets[0]
     spec = RequestSpec(fixture_id="arrival", scenario="arrival", check_ids=["load"], messages=[])
 
-    async def execute(value):
-        return await run.request(target, client, value, slot_reserved=True, budget_reserved=True)
+    async def execute(value, finalize_record):
+        return await run.request(target, client, value, slot_reserved=True, budget_reserved=True,
+                                 finalize_record=finalize_record)
 
     task = asyncio.create_task(traffic.run_stage(
         traffic=TrafficConfig(rates=[20], duration_seconds=.2, max_in_flight=1),
@@ -107,11 +108,13 @@ async def test_arrival_cancelled_record_keeps_stage_metadata_without_double_coun
 async def test_arrival_other_cancellation_callbacks_still_count_once(returns_record):
     spec = RequestSpec(fixture_id="cancelled", scenario="arrival", check_ids=["capacity"], messages=[])
 
-    async def execute(value):
+    async def execute(value, finalize_record):
         if not returns_record:
             raise asyncio.CancelledError
-        return RequestRecord(id="returned", target="local", fixture_id=value.fixture_id,
+        record = RequestRecord(id="returned", target="local", fixture_id=value.fixture_id,
             scenario=value.scenario, check_ids=value.check_ids, started_at="now", status="cancelled")
+        finalize_record(record)
+        return record
 
     result = await traffic.run_stage(
         traffic=TrafficConfig(rates=[10], duration_seconds=.01, max_in_flight=1), rate_rps=10,

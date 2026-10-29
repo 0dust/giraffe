@@ -10,6 +10,7 @@ import sys
 
 import httpx
 import pytest
+import yaml
 
 from giraffe.cli import _print_result, _run, configuration, main, parser
 from giraffe.models import CheckResult, RunConfig, RunReport
@@ -73,6 +74,103 @@ def test_config_model_is_never_discovered(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"targets": [{"name": "test", "url": "http://server", "model": "chosen"}]}))
     assert configuration(parser().parse_args(["run", "--config", str(path)])).targets[0].model == "chosen"
+
+
+LEGACY_CHECKS = ["access", "serving", "first_output", "generation", "load",
+                 "context", "correctness", "cancellation", "recovery"]
+
+
+@pytest.mark.parametrize("format", ["json", "yaml"])
+@pytest.mark.parametrize("concurrency", [None, 4])
+def test_saved_legacy_config_preserves_omitted_check_selection(tmp_path, format, concurrency):
+    values = {"targets": [{"name": "test", "url": "http://server", "model": "chosen"}]}
+    if concurrency is not None:
+        values["concurrency"] = concurrency
+    path = tmp_path / f"config.{format}"
+    path.write_text(json.dumps(values) if format == "json" else yaml.safe_dump(values))
+
+    config = configuration(parser().parse_args(["run", "--config", str(path)]))
+
+    assert config.checks == LEGACY_CHECKS
+    assert config.config_version == 2
+    path.write_text(config.model_dump_json())
+    assert configuration(parser().parse_args(["run", "--config", str(path)])).checks == LEGACY_CHECKS
+
+
+@pytest.mark.parametrize("field,value,check", [
+    ("structured_json", True, "json"), ("metrics", True, "gpu"),
+    ("prefix", {}, "prefix"), ("sessions", {}, "sessions"),
+    ("consistency", {}, "consistency"), ("tool_calling", True, "tools"),
+    ("tool_checks", {}, "tools"), ("arrivals", {}, "load"),
+])
+def test_saved_legacy_config_preserves_implicit_optional_checks(tmp_path, field, value, check):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"targets": [{"name": "test", "url": "http://server", "model": "chosen"}],
+                                    field: value}))
+
+    config = configuration(parser().parse_args(["run", "--config", str(path)]))
+
+    assert config.checks == list(dict.fromkeys([*LEGACY_CHECKS, check]))
+    if field == "arrivals":
+        assert config.load_test.legacy_source == "arrivals"
+        assert config.load_test.schedule.duration_seconds == 8
+
+
+@pytest.mark.parametrize("disabled", [False, "false", 0])
+def test_saved_legacy_config_does_not_select_disabled_optional_checks(tmp_path, disabled):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"targets": [{"name": "test", "url": "http://server", "model": "chosen"}],
+        "structured_json": disabled, "metrics": disabled, "tool_calling": disabled,
+        "prefix": None, "sessions": None, "consistency": None, "tool_checks": None, "arrivals": None}))
+    assert configuration(parser().parse_args(["run", "--config", str(path)])).checks == LEGACY_CHECKS
+
+
+@pytest.mark.parametrize("field", ["buckets", "concurrent_workloads"])
+def test_saved_legacy_implicit_load_block_keeps_its_workloads(tmp_path, field):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"targets": [{"name": "test", "url": "http://server", "model": "chosen"}],
+                                    field: {}, "sessions": {}, "tool_calling": True}))
+    config = configuration(parser().parse_args(["run", "--config", str(path)]))
+    assert config.checks == [*LEGACY_CHECKS, "sessions", "tools"]
+    assert config.load_test.legacy_source == "concurrency"
+    assert config.load_test.workloads.stress.enabled
+    assert len(config.load_test.workloads.combinations.selected) == 9
+
+
+@pytest.mark.parametrize("format", ["json", "yaml"])
+@pytest.mark.parametrize("null_fields", [
+    {"buckets": None}, {"concurrent_workloads": None},
+    {"buckets": None, "concurrent_workloads": None},
+])
+def test_saved_legacy_null_load_blocks_are_absent(tmp_path, format, null_fields):
+    values = {"targets": [{"name": "test", "url": "http://server", "model": "chosen"}]}
+    serialize = json.dumps if format == "json" else yaml.safe_dump
+    baseline = tmp_path / f"baseline.{format}"
+    baseline.write_text(serialize(values))
+    saved = tmp_path / f"with-null.{format}"
+    saved.write_text(serialize({**values, **null_fields}))
+
+    expected = configuration(parser().parse_args(["run", "--config", str(baseline)]))
+    actual = configuration(parser().parse_args(["run", "--config", str(saved)]))
+
+    assert actual.checks == LEGACY_CHECKS
+    assert actual.model_dump() == expected.model_dump()
+    assert actual._migration_notes == expected._migration_notes
+
+
+@pytest.mark.parametrize("version,selection", [(None, ["serving"]), (2, None)])
+def test_saved_check_selection_remains_explicit_or_uses_v2_defaults(tmp_path, version, selection):
+    values = {"targets": [{"name": "test", "url": "http://server", "model": "chosen"}]}
+    if version is not None:
+        values["config_version"] = version
+    if selection is not None:
+        values.update(checks=selection, structured_json=True, metrics=True, sessions={})
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values))
+
+    config = configuration(parser().parse_args(["run", "--config", str(path)]))
+
+    assert config.checks == (selection or ["access", "serving", "correctness", "first_output"])
 
 
 @pytest.mark.parametrize("flags,format", [
