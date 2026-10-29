@@ -42,15 +42,16 @@ def affected_requests(report, target, row):
 
 
 def assert_handoff_outcome(returncode, envelope, replay, original, *, compare):
-    """Only observed client delay may make this otherwise healthy replay inconclusive."""
+    """Qualify correctness separately from this replay's timing observations."""
     for report in (original, replay):
         assert report["abort_reason"] is None
+        assert set(report["manifest"]["config"]["checks"]) == {"correctness"}
         selected = [c for c in report["checks"] if c["required"] and c["id"] != "baseline"]
-        assert selected and all(c["status"] == "pass" for c in selected)
+        assert {c["id"] for c in selected} == {"correctness"}
+        assert all(c["status"] == "pass" for c in selected)
         assert all(r["status"] == "completed" and r["valid"] and not r["error"]
                    and not r["evaluation_error"] for r in report["requests"])
         assert all(r["score"] is True for r in workload_records(report["requests"]))
-    expected = "pass"
     if compare:
         baseline = replay["baseline"]
         assert baseline["run_id"] == original["run_id"]
@@ -58,7 +59,6 @@ def assert_handoff_outcome(returncode, envelope, replay, original, *, compare):
         for target in baseline["targets"]:
             assert not target["reasons"]
             assert target["comparisons"]
-            delayed = False
             for row in target["comparisons"]:
                 if "worsening" not in row:
                     assert row["status"] == "inconclusive"
@@ -78,16 +78,18 @@ def assert_handoff_outcome(returncode, envelope, replay, original, *, compare):
                 else:
                     assert row["metric"] in {"valid_completion_rate", "error_rate", "correctness_rate"}
                 assert row["status"] == ("inconclusive" if affected else "pass"), row
-                delayed |= affected
-            assert target["status"] == ("inconclusive" if delayed else "pass")
-            if delayed:
-                expected = "inconclusive"
-        assert baseline["status"] == expected
-        assert [c["status"] for c in replay["checks"] if c["id"] == "baseline"] == [expected]
+            # Qualified correctness covers this selected check. Uncertain
+            # timing remains visible without vetoing its measured verdict.
+            correctness = [row for row in target["comparisons"]
+                           if row["check"] == "correctness" and row["metric"] == "correctness_rate"]
+            assert correctness and all("worsening" in row and row["status"] == "pass" for row in correctness)
+            assert target["status"] == "pass"
+        assert baseline["status"] == "pass"
+        assert [c["status"] for c in replay["checks"] if c["id"] == "baseline"] == ["pass"]
     else:
         assert replay["baseline"] is None
-    assert replay["overall"] == envelope["outcome"] == expected
-    assert returncode == envelope["exit_code"] == {"pass": 0, "inconclusive": 2}[expected]
+    assert replay["overall"] == envelope["outcome"] == "pass"
+    assert returncode == envelope["exit_code"] == 0
 
 
 @pytest.mark.parametrize("compare,pause", [(False, False), (True, False), (True, True)])
@@ -190,13 +192,18 @@ async def test_copied_command_replays_ui_configuration_and_baseline(
             if compare:
                 assert replay["baseline"]["run_id"] == original["report"]["run_id"]
                 if pause:
-                    assert replay["baseline"]["status"] == "inconclusive"
-                    assert result.returncode == 2
+                    health = source_report["observations"]["client_timing_health"]
+                    windows = health["windows"] + ([health["overflow_window"]] if health["overflow_window"] else [])
+                    assert any(window["lag_ms"] > 100 for window in windows)
+                    assert any(row["status"] == "inconclusive"
+                               and row.get("timing_quality", {}).get("Baseline", {}).get("affected_request_ids")
+                               for target in replay["baseline"]["targets"] for row in target["comparisons"])
+                    assert replay["baseline"]["status"] == "pass"
+                    assert result.returncode == 0
                 # The oracle must reject broken exits, real failures, and lost baseline evidence.
                 with pytest.raises(AssertionError):
-                    wrong_exit = 0 if result.returncode == 2 else 2
-                    assert_handoff_outcome(wrong_exit, envelope, replay, source_report, compare=True)
-                for defect in ("failed_rate", "unexplained_inconclusive", "different_baseline", "lost_delay"):
+                    assert_handoff_outcome(2, envelope, replay, source_report, compare=True)
+                for defect in ("failed_rate", "unexplained_inconclusive", "different_baseline", "lost_delay", "lost_correctness"):
                     broken = deepcopy(replay)
                     rows = broken["baseline"]["targets"][0]["comparisons"]
                     if defect in {"failed_rate", "unexplained_inconclusive"}:
@@ -205,6 +212,8 @@ async def test_copied_command_replays_ui_configuration_and_baseline(
                         )
                     elif defect == "different_baseline":
                         broken["baseline"]["run_id"] = "not-the-exported-baseline"
+                    elif defect == "lost_correctness":
+                        rows[:] = [row for row in rows if row["metric"] != "correctness_rate"]
                     else:
                         if not pause:
                             continue

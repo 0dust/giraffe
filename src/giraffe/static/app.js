@@ -25,9 +25,9 @@ function updateAPIKeySummary() {
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not needed for most local servers';
   $('.row-action',summary).textContent=key||ref?'Change':'Add';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
-const statusLabels = {pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',cancelled:'Cancelled',interrupted:'Interrupted'};
-const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',cancelled:'⊘',interrupted:'!'};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const statusLabels = {pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
+const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
 const icon = (name) => ({plus:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>',arrow:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>',repeat:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15 6A6 6 0 1 0 16 12M15 2v5h-5"/></svg>',stop:'<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10"/></svg>'}[name] || '');
 const badge = (status, label, run=state.detail) => {const shown=displayStatus(status,run);return `<span class="status ${escape(shown)}" data-state="${escape(shown)}"><span class="status-icon" aria-hidden="true">${statusIcons[shown] || '·'}</span>${escape(shown===status&&label || statusLabels[shown] || shown)}</span>`;};
@@ -682,9 +682,9 @@ function initReticulate() {
 async function api(path, options={}) {
   let response;
   try { response = await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers || {})}}); }
-  catch { throw new Error('The local UI server could not be reached. Check that giraffe ui is still running.'); }
+  catch(error) { if(error.name==='AbortError')throw error;throw new Error('The local UI server could not be reached. Check that giraffe ui is still running.'); }
   let body;
-  try { body = await response.json(); } catch { throw new Error(`The local server returned an unreadable response (${response.status}).`); }
+  try { body = await response.json(); } catch(error) { if(error.name==='AbortError')throw error;throw new Error(`The local server returned an unreadable response (${response.status}).`); }
   if (!response.ok) {
     if(response.status===404 && (path.startsWith('/api/config/')||path==='/api/datasets/preview'||path==='/api/runs/try-example')){
       const error=new Error('The running Giraffe server does not support this configuration operation. Restart giraffe ui from the updated installation, then refresh this page and try again.');
@@ -722,12 +722,45 @@ function updateTitle() {
   const label=run?.label||run?.targets?.map(target=>target.model).filter(Boolean).join(', ')||run?.config?.targets?.map(target=>target.model).filter(Boolean).join(', ')||state.pageLabel||'Run';
   document.title=state.active?`● In progress · ${label} · Giraffe`:`${state.pageLabel||'Giraffe'}${state.pageLabel?' · Giraffe':''}`;
 }
+function pageVisible() { return document.visibilityState!=='hidden'; }
+function storageVisible() { return pageVisible()&&(location.hash==='#runs'||Boolean($('#storage-dialog')?.open)); }
 function clearPoll() { clearTimeout(state.poll);state.poll=null; }
-function schedulePoll(callback, version, delay=1800) { clearPoll();state.poll=setTimeout(()=>{if(version===state.routeVersion) callback(version);},delay); }
+function cancelLiveFetch() { state.eventAbort?.abort();state.eventAbort=null; }
+function schedulePoll(callback, version, delay=1800) { clearPoll();if(!pageVisible())return;state.poll=setTimeout(()=>{if(version===state.routeVersion&&pageVisible()) callback(version);},Math.max(300,delay,(state.eventPollAfter || 0)-Date.now())); }
+async function refreshStorage() {
+  if(!storageVisible())return;
+  try{state.storage=await api('/api/storage');state.storageUnavailable=false;}
+  catch{state.storage=null;state.storageUnavailable=true;}
+}
 async function refreshRuns() {
-  const [runs,storage]=await Promise.allSettled([api('/api/runs'),api('/api/storage')]);state.storage=storage.status==='fulfilled'?storage.value:null;state.storageUnavailable=storage.status==='rejected';
+  const [runs]=await Promise.allSettled([api('/api/runs'),refreshStorage()]);
   if(runs.status==='rejected')throw runs.reason;
-  const data=runs.value;state.runs=data.runs || [];setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
+  const data=runs.value;state.runs=data.runs || [];state.diskActive=data.disk_active_id || null;setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
+}
+async function runEvents(id, after=0) {
+  const controller=typeof AbortController==='function'?new AbortController():null;
+  state.eventAbort=controller;
+  state.eventPollAfter=Date.now()+300;
+  try{const delta=await api(`${runPath(id)}/events?after=${Number.isFinite(after)?after:0}`,controller?{signal:controller.signal}:{});state.eventPollAfter=Date.now()+(delta.reset||delta.idle?1800:300);return delta;}
+  finally{if(state.eventAbort===controller)state.eventAbort=null;}
+}
+function mergeRunEvents(detail, delta) {
+  const events=delta.events || [],keys=['state','progress','live_request_count','live_request_summary','live_preparations','phases','error','abort_reason'];
+  for(const event of events)for(const key of keys)if(Object.hasOwn(event,key))detail[key]=event[key];
+  for(const key of keys)if(Object.hasOwn(delta,key))detail[key]=delta[key];
+  detail.seq=delta.seq;
+  detail.events=[...(detail.events || []),...events].slice(-100);
+  const records=new Map((detail.live_requests || []).map(record=>[record.slot,record]));
+  for(const record of delta.records || [])records.set(record.slot,{...records.get(record.slot),...record});
+  const through=detail.live_request_summary?.through_slot;
+  detail.live_requests=[...records.values()].filter(record=>through==null||record.slot>through).sort((a,b)=>a.slot-b.slot).slice(-4096);
+  const key=row=>JSON.stringify([row.target || '',row.condition?.id || row.condition_id || row.id || '']);
+  const conditions=new Map((detail.live_conditions || []).map(row=>[key(row),row]));
+  const checks=new Map((detail.live_checks || detail.report?.checks || []).map(row=>[key(row),row]));
+  for(const row of delta.checks || []){const rows=row.condition || row.condition_id?conditions:checks;rows.set(key(row),{...rows.get(key(row)),...row});}
+  detail.live_conditions=[...conditions.values()];detail.live_checks=[...checks.values()];
+  if(detail.report)detail.report.checks=detail.live_checks;
+  return detail;
 }
 function relativeTime(value) {
   const then=Date.parse(value);if(!Number.isFinite(then))return '';
@@ -778,10 +811,12 @@ async function route() {
   pendingReportReveal=null;
   if(!destination||!state.reportRouteActive||state.detail?.id!==destination.id)cancelStopConfirmationTimer({reset:true});
   if(destination&&state.reportRouteActive&&state.detail?.id===destination.id){
+    const openedPerformance=destination.tab==='performance'&&reportView.tab!=='performance';
     syncReportView();
     if(destination.tab){reportView.tab=destination.tab;reportView.explicit=true;}
     else {reportView.tab='results';reportView.explicit=false;}
     renderDetail();
+    if(openedPerformance&&typeof fetch==='function')loadPerformance({force:true});
     if(destination.section)revealReportSection(destination.section);
     return;
   }
@@ -796,17 +831,18 @@ async function route() {
   for(const id of ['baseline-dialog','comparison-dialog','storage-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
   if ($('#new-run-form')) captureFormDraft();
   window.scrollTo?.({top:0,left:0,behavior:'instant'});
-  clearPoll();const version=++state.routeVersion;const hash=location.hash;
+  clearPoll();cancelLiveFetch();const version=++state.routeVersion;const hash=location.hash;
   try {
     if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
-    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();enterRoute();schedulePoll(pollNew,version,3000);return; }
+    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();enterRoute();schedulePoll(pollNew,version,state.active?3000:10000);return; }
     if (destination) {
       const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
       state.detail=detail;state.failingRequestsOnly=false;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';reportView.id=null;renderDetail();enterRoute();if(destination?.section)revealReportSection(destination.section);
-      if(activeState(detail))schedulePoll(pollDetail,version);else schedulePoll(pollRunStatus,version,3000);return;
+      if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance({force:true});
+      if(activeState(detail))schedulePoll(pollDetail,version,300);else if(state.active)schedulePoll(pollRunStatus,version,3000);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
     await refreshRuns();if(version!==state.routeVersion)return;
@@ -822,25 +858,48 @@ async function route() {
   }
 }
 async function pollRuns(version) {
-  try { const previous=JSON.stringify([state.runs,state.storage,state.storageUnavailable]),active=state.active;await refreshRuns();if(version!==state.routeVersion)return;connectionError();if(previous!==JSON.stringify([state.runs,state.storage,state.storageUnavailable])||active!==state.active)renderRuns(); }
-  catch(error) { if(version===state.routeVersion)connectionError(error.message+' Your saved runs have not changed.'); }
+  try {
+    const previous=JSON.stringify([state.runs,state.storage,state.storageUnavailable]),active=state.active;
+    if(state.active)await Promise.all([pollRunStatus(version,{schedule:false}),refreshStorage()]);else await refreshRuns();if(version!==state.routeVersion)return;
+    if(!active)connectionError();if(previous!==JSON.stringify([state.runs,state.storage,state.storageUnavailable])||active!==state.active)renderRuns();
+  }catch(error){if(version===state.routeVersion)connectionError(error.message+' Your saved runs have not changed.');}
   if(version===state.routeVersion)schedulePoll(pollRuns,version,3000);
 }
-async function pollRunStatus(version) {
-  try{await refreshRuns();if(version===state.routeVersion)connectionError();}
-  catch(error){if(version===state.routeVersion)connectionError(error.message);}
-  if(version===state.routeVersion)schedulePoll(pollRunStatus,version,3000);
+async function pollRunStatus(version,{schedule=true}={}) {
+  const id=state.active;if(!id)return;let delay=300;
+  try{
+    if(state.statusRun?.id!==id)state.statusRun={id,state:'running',seq:0};
+    const delta=await runEvents(id,state.statusRun.seq);
+    if(version!==state.routeVersion||state.active!==id)return;
+    if(delta.reset||delta.idle)delay=1800;
+    if(delta.reset)state.statusRun=await api(runPath(id));else mergeRunEvents(state.statusRun,delta);
+    if(version!==state.routeVersion||state.active!==id)return;
+    const saved=state.runs.find(run=>run.id===id);if(saved)saved.state=state.statusRun.state;
+    if(!activeState(state.statusRun)){setActive(null);await refreshRuns();}
+    connectionError();renderRailRuns();
+  }catch(error){if(error.name==='AbortError')return;delay=3000;if(version===state.routeVersion)connectionError(error.message);}
+  if(schedule&&version===state.routeVersion&&state.active)schedulePoll(pollRunStatus,version,delay);
 }
 async function pollNew(version) {
-  try { await refreshRuns();if(version!==state.routeVersion)return;connectionError();const button=$('#start-run');if(button&&!state.submitting)button.disabled=!canStartRun();const activeNotice=$('#new-active-notice');if(activeNotice){activeNotice.hidden=!state.active;$('a',activeNotice).href=state.active?linkRun(state.active):'#runs';} }
-  catch(error) {if(version===state.routeVersion)connectionError(error.message);}
-  if(version===state.routeVersion)schedulePoll(pollNew,version,3000);
+  if(!pageVisible())return;
+  try{if(state.active)await pollRunStatus(version,{schedule:false});else await refreshRuns();}
+  catch(error){if(error.name==='AbortError')return;if(version===state.routeVersion)connectionError(error.message);}
+  if(version!==state.routeVersion)return;
+  const button=$('#start-run');if(button&&!state.submitting)button.disabled=!canStartRun();const activeNotice=$('#new-active-notice');if(activeNotice){activeNotice.hidden=!(state.active||state.diskActive);activeNotice.innerHTML=newActiveNotice();}
+  schedulePoll(pollNew,version,state.active?3000:10000);
 }
 let detailEpoch=0,detailSequence=0,lastDetailSequence=0;
 async function pollDetail(version) {
   const id=state.detail.id,epoch=detailEpoch,sequence=++detailSequence;
   try {
-    const detail=await api(runPath(id));if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    if(!activeState(state.detail)&&activeState({state:delta.state}))return;
+    const wasStopping=state.detail.state==='stopping';
+    let detail=delta.reset?await api(runPath(id)):mergeRunEvents(state.detail,delta);
+    if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    const completed=!activeState(detail);
+    if(completed&&!delta.reset){detail=await api(runPath(id));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;}
+    if(wasStopping&&activeState(detail))detail.state='stopping';
     if(['running','queued'].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
       schedulePoll(pollDetail,version,500);return;
     }
@@ -850,14 +909,16 @@ async function pollDetail(version) {
     if(state.liveError?.id===id&&sequence>state.liveError.sequence)state.liveError=null;
     const focused=document.activeElement,slot=focused?.dataset?.liveSlot,action=focused?.dataset?.action,autoFocused=slot!==undefined&&slot===state.mosaicAutoFocus,summaryFocus=focused?.tagName==='SUMMARY'&&Boolean(focused.closest?.('.all-requests'));
     connectionError();state.detail=detail;renderDetail();
+    if(completed&&typeof fetch==='function')loadPerformance({force:true});
     if(slot!==undefined){const scope=$('.all-requests'),spot=scope?scope.querySelector(`[data-live-slot="${slot}"]`):$(`[data-live-slot="${slot}"]`);if(spot)spot.focus({preventScroll:true});else if(autoFocused&&activeState(detail)&&state.mosaicFollow!==false)focusMosaicStart();}
     else if(summaryFocus){const disclosure=$('.all-requests');disclosure?.querySelector('summary')?.focus({preventScroll:true});}
     else if(action==='stop')$('[data-action="stop"]')?.focus({preventScroll:true});
-    if(activeState(detail))schedulePoll(pollDetail,version);else {if(state.active===id)setActive(null);await refreshRuns();if(version===state.routeVersion)schedulePoll(pollRunStatus,version,3000);}
-  } catch(error) {if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
+    if(activeState(detail))schedulePoll(pollDetail,version,delta.reset||delta.idle?1800:300);else {if(state.active===id)setActive(null);await refreshRuns();if(version===state.routeVersion&&state.active)schedulePoll(pollRunStatus,version,3000);}
+  } catch(error) {if(error.name==='AbortError'||version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
 function runOutcome(run) {
+  if(run.state==='cancelled'||run.state==='completed'&&(run.abort_reason||run.report?.abort_reason||run.summary?.abort_reason))return 'stopped';
   return activeState(run)||['error','failed','cancelled','interrupted'].includes(run.state)?run.state:run.overall || run.state;
 }
 function filteredRuns() {
@@ -938,8 +999,8 @@ function renderRuns() {
     return;
   }
   const runs=filteredRuns();
-  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','cancelled','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
-  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Search runs" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
+  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','stopped','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
+  <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Search runs" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="stopped">Stopped</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
   ${runs.length?`<div class="history-table"><table aria-label="Saved endpoint runs"><thead><tr><th>Model</th><th>Outcome</th><th>Started</th><th><span class="sr-only">Open run</span></th></tr></thead><tbody>${runs.map(r=>{
     const targets=r.targets || [],model=targets.map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model';
     const names=targets.map(t=>t.name).filter(name=>name&&name!=='local').join(', ');
@@ -2564,7 +2625,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
   if(sessionAPIKey && !apiKeyFor(target.url))clearAPIKey();
   $('#main').innerHTML=`${renderHeroCoat()}<div class="page-heading setup-page-heading"><div><h1 id="setup-title">Test your endpoint</h1><p class="setup-lede" id="setup-lede"></p></div><button type="button" class="text-button setup-import" data-action="import-config">Load saved setup</button></div>
-  <div class="notice" id="new-active-notice" ${state.active?'':'hidden'}><strong>A run is already active.</strong> <a href="${state.active?linkRun(state.active):'#runs'}">Inspect or stop it</a> before starting another.</div>
+  <div class="notice" id="new-active-notice" ${state.active||state.diskActive?'':'hidden'}>${newActiveNotice()}</div>
   <form id="new-run-form" novalidate>
   <ol class="setup-stepper" aria-label="Run setup">${['Connect','Checks','Launch'].map((label,index)=>`<li><button type="button" class="setup-step" data-setup-step="${index+1}" aria-label="Step ${index+1}: ${label}" aria-controls="setup-panel-${index+1}"><span class="setup-step-index" aria-hidden="true">${index+1}</span><strong>${label}</strong></button></li>`).join('')}</ol>
 <div class="notice config-draft-notice" id="config-draft-notice" hidden><div><strong>Unapplied JSON changes.</strong> Apply or discard them before editing the form, running, exporting, or copying the CLI command.</div><div class="actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><button class="text-button" type="button" data-action="discard-config">Discard changes</button></div></div><div id="config-error" class="error-message config-action-error" role="alert" hidden></div><div class="panel cli-fallback" id="cli-fallback" hidden><label for="cli-command">Copy command</label><textarea id="cli-command" readonly spellcheck="false"></textarea></div><div id="setup-context" class="setup-context" hidden></div><div class="new-run-layout"><div id="config-panel-form" role="tabpanel" aria-labelledby="config-tab-form">
@@ -2697,6 +2758,7 @@ function reportConfig(report){return report?.manifest?.config || state.detail?.c
 function reportSummary(report){const summary=report.observations?.summary;return typeof summary==='string'?summary.trim():'';}
 function mainFinding(report) {
   if(userStopped(report))return 'Stopped by you';
+  if(report.abort_reason==='run cancelled')return 'Stopped';
   const summary=reportSummary(report);if(/could not connect|no checks could run/i.test(summary))return shortReason(summary).summary;
   const checks=report.checks.filter(c=>c.id!=='baseline'),failed=checks.find(c=>c.status==='fail');
   if(!checks.length)return 'No checks ran';
@@ -2821,6 +2883,7 @@ function chooseReportTab(tab,{focus=false,anchor=true}={}) {
   if(!['performance','results'].includes(tab)||!state.detail)return;
   syncReportView();reportView.tab=tab;reportView.explicit=true;
   renderDetail();
+  if(tab==='performance'&&typeof fetch==='function')loadPerformance({force:true});
   if(anchor&&typeof location!=='undefined')location.hash=`${linkRun(state.detail.id)}/${tab}`;
   if(focus)$(`#tab-${tab}`)?.focus({preventScroll:true});
 }
@@ -3126,7 +3189,7 @@ function renderPerformance() {
   const {data,target,window,summary}=selectedPerformance(),scope=JSON.stringify([state.detail?.id,target?.target,window?.id]);
   if(performancePlotScope!==scope){performancePlotScope=scope;performancePlotViews.clear();}
   performanceCharts.clear();
-  const terminal=!activeState(state.detail)?`<div class="notice report-terminal-notice">${escape(statusLabels[state.detail.state]||human(state.detail.state))}. ${state.detail.report?.abort_reason?'Partial evidence: '+escape(state.detail.report.abort_reason):'Review measurement coverage and check verdicts before interpreting these results.'} <a href="${linkRun(state.detail.id)}/results" data-report-tab="results">View test results</a></div>`:'';
+  const terminal=!activeState(state.detail)?`<div class="notice report-terminal-notice">${escape(statusLabels[runOutcome(state.detail)==='stopped'?'stopped':state.detail.state]||human(state.detail.state))}. ${state.detail.report?.abort_reason?'Partial evidence: '+escape(state.detail.report.abort_reason):'Review measurement coverage and check verdicts before interpreting these results.'} <a href="${linkRun(state.detail.id)}/results" data-report-tab="results">View test results</a></div>`:'';
   let body='';
   if(summary){
     const metrics=summary.metrics||{},rows=(summary.request_row_indices||[]).map(index=>target.request_series?.[index]).filter(Boolean),timingKeys=Object.keys(summary.distributions||{}).filter(key=>!key.endsWith('_length'));
@@ -3157,7 +3220,7 @@ function renderPerformance() {
 async function loadPerformance({force=false}={}) {
   if(!state.detail)return;
   if(reportView.pending){if(force)reportView.again=true;return;}
-  const now=Date.now();if(!force&&(!activeState(state.detail)&&reportView.performance||now-reportView.lastFetch<1800))return;
+  const now=Date.now();if(!force&&(reportView.performance||reportView.lastFetch))return;
   const id=state.detail.id,version=state.routeVersion,sequence=++reportView.sequence,target=reportView.target,window=reportView.window;
   reportView.pending=true;reportView.lastFetch=now;
   const params=Object.entries({target,window}).filter(([,value])=>value!=null).map(([key,value])=>`${key}=${encodeURIComponent(value)}`).join('&');
@@ -3220,7 +3283,7 @@ function renderDetail() {
     cancelLandings();hideSpotTip();renderRailRuns();
     if(state.liveRendered===d.id){const dialog=$('#request-dialog');if(dialog?.open){dialog.close();dialog.innerHTML='';}state.liveRendered=null;}
   }
-  if(activeState(d)&&state.active!==d.id)setActive(d.id);else if(state.active===d.id&&!activeState(d))setActive(null);else updateTitle();
+  if(activeState(d)&&d.stoppable!==false&&state.active!==d.id)setActive(d.id);else if(state.active===d.id&&!activeState(d))setActive(null);else updateTitle();
   if(activeState(d)){renderLive();return;}
   const report=d.report;
   if(!report){
@@ -3247,7 +3310,6 @@ function renderDetail() {
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
   syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
-  if(reportView.tab==='performance'&&!reportView.performance&&typeof fetch==='function')loadPerformance();
 }
 function renderDiagnostics(report,detail) {
   return `<details class="run-diagnostics"><summary>Run diagnostics</summary><p>Internal run ID: <code>${escape(report?.run_id || 'Not recorded')}</code></p>${renderResources(report,detail)}</details>`;
@@ -3256,11 +3318,16 @@ function memorySize(value,resources={}) {
   if(typeof value!=='number')return ['unavailable','not measured on this platform'].includes(resources.memory_measurement)||resources.measurement_available===false?'not measured on this platform':'not recorded';
   return value>=1024**3?`${number(value/1024**3,2)} GiB`:`${number(value/1024**2,1)} MiB`;
 }
+function newActiveNotice() {
+  if(state.active)return `<strong>A run is already active.</strong> <a href="${linkRun(state.active)}">Inspect or stop it</a> before starting another.`;
+  if(state.diskActive)return `<strong>Running from the CLI.</strong> <a href="${linkRun(state.diskActive)}">View the run</a>. You can start a web run.`;
+  return '';
+}
 function renderResources(report,detail={}) {
   const resources=report?.observations?.resources || {},saved=detail.resources || {},peaks=resources.sampled_peak_rss_bytes || {},growth=resources.sampled_peak_growth_bytes || {},exportPeak=saved.sampled_peak_rss_bytes?.export;
   const limit=resources.memory_limit_bytes,active=resources.guardrail_active,unavailable=['unavailable','not measured on this platform'].includes(resources.memory_measurement)||resources.measurement_available===false;
   const guard=resources.memory_limit_reached?(resources.memory_limit_stopped_run?'Memory limit exceeded; unfinished work stopped with partial results. Completed checks keep their results.':'Memory limit exceeded; completed checks keep their results. No work was stopped.') :limit===0?'Memory guardrail disabled (0 = off).':active===true?`Maximum memory (RAM growth during this run): ${memorySize(limit)}. Guardrail active.`:active===false&&unavailable?'Memory guardrail inactive: RAM growth was not measured on this platform.':active===false?'Memory guardrail inactive: RAM at run start was not recorded.':'Memory guardrail status not recorded.';
-  return `<section class="panel resource-summary" aria-labelledby="memory-title"><h2 id="memory-title">Peak memory (RAM)</h2><p class="hint">Sampled process RSS and RAM growth since this run started, separate from saved runs on disk. Only growth triggers the guardrail.</p><dl class="metrics-grid">${metric('At run start',memorySize(resources.rss_at_start_bytes,resources))}${metric('Traffic',memorySize(peaks.traffic,resources),'Process RSS')}${metric('Scoring / aggregation',memorySize(peaks.scoring,resources),'Process RSS')}${metric('Traffic RAM growth',memorySize(growth.traffic,resources))}${metric('Scoring / aggregation RAM growth',memorySize(growth.scoring,resources))}${metric('Export',memorySize(exportPeak,saved),'Process RSS')}${metric('Process lifetime peak',memorySize(resources.process_peak_rss_bytes,resources),'Includes earlier runs in the web server; never used for the memory guardrail.')}</dl><p class="${resources.memory_limit_reached?'notice warning':'hint'}">${escape(guard)}</p><p class="hint">${escape(resources.sampling || 'Sampled about once per second; short spikes between samples can be missed.')}</p></section>`;
+  return `<section class="panel resource-summary" aria-labelledby="memory-title"><h2 id="memory-title">Peak memory (RAM)</h2><p class="hint">Sampled process RSS and RAM growth since this run started, separate from saved runs on disk. Only growth triggers the guardrail. The report helper uses a separate process; its memory is not included in these values or the guardrail.</p><dl class="metrics-grid">${metric('At run start',memorySize(resources.rss_at_start_bytes,resources))}${metric('Traffic',memorySize(peaks.traffic,resources),'Process RSS')}${metric('Scoring / aggregation',memorySize(peaks.scoring,resources),'Process RSS')}${metric('Traffic RAM growth',memorySize(growth.traffic,resources))}${metric('Scoring / aggregation RAM growth',memorySize(growth.scoring,resources))}${metric('Export',memorySize(exportPeak,saved),'Process RSS')}${metric('Process lifetime peak',memorySize(resources.process_peak_rss_bytes,resources),'Includes earlier runs in the web server; never used for the memory guardrail.')}</dl><p class="${resources.memory_limit_reached?'notice warning':'hint'}">${escape(guard)}</p><p class="hint">${escape(resources.sampling || 'Sampled about once per second; short spikes between samples can be missed.')}</p></section>`;
 }
 function storageOmission(report) {
   const storage=report.manifest?.storage;if(!storage||!storage.response_bodies_omitted&&!storage.limit_exceeded)return '';
@@ -3633,10 +3700,10 @@ function renderLive() {
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const planned=plannedRequests(d),confirmation=state.stopConfirmation?.id===d.id&&Date.now()<state.stopConfirmation.until;
   const stopReasons=liveStopReasons(d),liveError=state.liveError?.id===d.id?state.liveError.message:'';
-  const title=judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Running';
+  const title=d.stoppable===false?'Running from the CLI':judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Running';
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
-  patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}`}</p></div><button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button></div>
+  patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
   ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
   ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
 </section>
@@ -3645,7 +3712,6 @@ function renderLive() {
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
   if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}
   refreshSpotTip();refreshConditionDialog();loadDetailPlan();scheduleStopConfirmationReset();
-  if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance();
 }
 function renderJudgement(judgement) {
   if(!judgement)return '';
@@ -3799,14 +3865,14 @@ function scheduleStopConfirmationReset() {
   },Math.max(0,confirmation.until-Date.now()));
 }
 async function confirmStop(){
-  const id=state.detail?.id;if(!activeState(state.detail)||state.detail.state==='stopping')return;
+  const id=state.detail?.id;if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping')return;
   const current=state.stopConfirmation,now=Date.now();
   if(current?.id===id&&now<current.until){if(now-current.armedAt<300)return;cancelStopConfirmationTimer({reset:true});await stopRun();return;}
   state.stopConfirmation={id,armedAt:now,until:now+4000};renderDetail();
 }
 
 async function stopRun(){
-  if(!activeState(state.detail)||state.detail.state==='stopping'||state.stopPending?.id===state.detail.id)return;
+  if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping'||state.stopPending?.id===state.detail.id)return;
   const button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion,epoch=++detailEpoch;
   state.liveError=null;state.stopPending={id};button.disabled=true;button.textContent='Stopping…';
   try{
@@ -4333,5 +4399,13 @@ document.addEventListener('pointermove',event=>{
 },{passive:true});
 window.addEventListener('hashchange',()=>{if(state.bootstrap)return route();});
 window.addEventListener('pagehide',saveDraft);
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
+document.addEventListener('visibilitychange',()=>{
+  clearPoll();cancelLiveFetch();if(!pageVisible())return;
+  const version=state.routeVersion;
+  if(location.hash==='#runs')schedulePoll(pollRuns,version,300);
+  else if(state.reportRouteActive&&activeState(state.detail))schedulePoll(pollDetail,version,300);
+  else if(location.hash==='#new')schedulePoll(pollNew,version,state.active?300:10000);
+  else if(state.active)schedulePoll(pollRunStatus,version,300);
+});
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" onclick="location.reload()">Reconnect</button>`;}}
 init();

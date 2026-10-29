@@ -64,3 +64,23 @@ def test_unfinished_request_lower_bound_is_qualified_separately(unfinished, stat
     result = assess(1, delayed, unfinished=unfinished)
     assert result.status == status
     assert result.metrics.get("violations", []) == (["unfinished"] if status == "fail" else [])
+
+
+def test_first_output_qualification_uses_full_precision_at_the_limit():
+    config = RunConfig(targets=[dict(name="t", url="http://local", model="m")],
+                       checks=["first_output"], limits=Limits(first_output_ms=500.9561))
+    run = runner._Run(config, None, None)
+    run.timing_health = TimingHealth(0)
+    run.records = [record(str(i), check_ids=["first_output"], timing_start_ms=i * 30_000,
+        completed_ms=i * 30_000 + 21_000, elapsed_ms=21_000,
+        first_output_ms=10_000.123 if i == 19 else 500 if i == 18 else 1,
+        last_output_ms=20_001, stream_end_ms=21_000) for i in range(20)]
+    run.timing_health.windows = [dict(start_ms=540_001, end_ms=540_200, lag_ms=150)]
+
+    result = next(c for c in runner._checks(run, config.targets[0]) if c.id == "first_output")
+
+    # Replacing the affected 500 ms answer with zero leaves a p95 of
+    # 500.95615 ms. Rounding it to three decimals would hide the failure.
+    assert result.status == "fail"
+    assert result.metrics["first_output_p95_ms"] == pytest.approx(975.00615)
+    assert result.metrics["violations"] == ["19"]

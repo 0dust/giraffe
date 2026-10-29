@@ -13,12 +13,11 @@ from decimal import Decimal
 import math
 import random
 import time
-from statistics import median
+from giraffe.stats import median, percentile
 
 from giraffe.concurrent_load import (
     OutputProgress,
     _distribution,
-    _percentile,
     aggregate,
     calibrate,
     context_window,
@@ -44,7 +43,9 @@ from giraffe.overlap import (
     scheduling_delay_windows,
 )
 from giraffe.timing import configured_metrics, qualified_violations, run_quality
-from giraffe.traffic import ScheduleObservation, arrival_schedule, run_stage
+from giraffe.traffic import (
+    AUTHORITATIVE_TERMINATION_REASONS, ScheduleObservation, arrival_schedule, run_stage,
+)
 
 LOAD_TITLES = {
     "combinations": "Input → output combinations",
@@ -53,9 +54,6 @@ LOAD_TITLES = {
     "interference": "Long input during an active short stream",
 }
 SCHEDULER_LAG_MS = 100  # Same delivery-evidence policy as traffic.py, not an acceptance criterion.
-AUTHORITATIVE_TERMINATION_REASONS = {
-    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "run_duration_limit",
-}
 
 
 def settings_sets(settings):
@@ -702,6 +700,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     changed = asyncio.Event()
     rng = random.Random(settings.patterns.poisson.seed)
     reason = None
+    failure = None
     cutoff = None
     triggered = 0
     scenario = point["id"] + ("." + phase if phase else "")
@@ -716,6 +715,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
 
     def ended():
         nonlocal reason, cutoff
+        if failure is not None:
+            return True
         if time.monotonic() >= end:
             return True
         if not run.allowed(target.name):
@@ -744,7 +745,13 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             ):
                 return None
             spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
-            record = await run.request(target, client, spec, event=progress, slot_reserved=True)
+            try:
+                record = await run.request(target, client, spec, event=progress, slot_reserved=True)
+            except asyncio.CancelledError as exc:
+                record = getattr(exc, "giraffe_record", None)
+                if record is not None:
+                    records.append(record)
+                raise
             if record is not None:
                 records.append(record)
             return record
@@ -765,7 +772,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             finally:
                 active.pop(index, None)
                 changed.set()
-            if record is None or asyncio.current_task().cancelling():
+            if record is None:
                 break
             await asyncio.sleep(0)
 
@@ -797,6 +804,17 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     ]
     if phase == "probe":
         tasks.append(asyncio.create_task(probe()))
+
+    def worker_finished(task):
+        nonlocal failure
+        if not task.cancelled():
+            error = task.exception()
+            if failure is None and error is not None:
+                failure = error
+        changed.set()
+
+    for task in tasks:
+        task.add_done_callback(worker_finished)
     cancelled = None
     sending_end = None
     try:
@@ -809,19 +827,27 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                 )
             except TimeoutError:
                 pass
+        if failure is not None:
+            raise failure
         sending_end = min(end, cutoff if cutoff is not None else time.monotonic())
         intent.begin_drain(sending_end)
         finish_end = run.deadline
         while any(not t.done() for t in tasks) and time.monotonic() < finish_end:
+            if failure is not None:
+                raise failure
             stop = run.stop_reason(target.name)
             if stop and stop != "maximum request budget reached":
                 reason = stop
                 break
-            await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())))
+            await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())),
+                               return_when=asyncio.FIRST_EXCEPTION)
     except asyncio.CancelledError as exc:
         sending_end = min(end, time.monotonic())
         reason = run.stop_reason(target.name) or "execution cancelled"
         cancelled = exc
+    except Exception as exc:
+        if failure is None:
+            failure = exc
     finally:
         if sending_end is None:
             sending_end = min(end, time.monotonic())
@@ -836,15 +862,30 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             except asyncio.CancelledError as exc:
                 cancelled = exc
                 reason = run.stop_reason(target.name) or "execution cancelled"
+        # gather can already be complete before task callbacks get another
+        # loop turn, notably when the final offers exhaust the request budget.
+        for outcome in cleanup.result():
+            if failure is None and isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                failure = outcome
         intent.finish(time.monotonic())
+    if failure is not None:
+        reason = "internal load worker error"
+        point.update(not_run=False, execution_error=(
+            f"Internal error in Giraffe ({type(failure).__name__}); see the Giraffe log."))
+        # request() retains terminal evidence before rethrowing an internal
+        # failure; include those records even though send() did not return.
+        records = [record for record in run.records if record.target == target.name
+                   and record.scenario == scenario]
     now = time.monotonic()
+    if any(r.status == "cancelled" for r in records) and reason in {
+        None, "time limit reached", "maximum run duration reached"
+    }:
+        reason = "overall run deadline reached"
     for record in records:
         if record.status == "cancelled":
             if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
                 record.error = reason or "overall run deadline reached"
             record.load_point["cancellation_reason"] = record.error
-    if any(r.status == "cancelled" for r in records) and reason is None:
-        reason = "overall run deadline reached"
     window = {
         "phase": phase,
         "sending_start_ms": (begin - run.start) * 1000,
@@ -872,6 +913,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             cut_short=any(w["cut_short"] for w in windows),
             window_reason=reason,
         )
+    if failure is not None:
+        raise failure
     if cancelled:
         raise cancelled
     return records, window
@@ -891,8 +934,15 @@ async def arrival_window(run, target, client, settings, point, calibration):
         scheduler_lag_tolerance_ms=SCHEDULER_LAG_MS,
     )
 
-    async def send(spec):
-        return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True)
+    async def send(spec, finalize_record):
+        return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
+                                 finalize_record=finalize_record)
+
+    def offer_spec(index):
+        offer = offers[index]
+        spec = build_spec(run, settings, point, offer["shape"], calibration)
+        spec.load_point.update(origin=offer["origin"], burst_index=offer["burst_index"])
+        return spec
 
     def stop():
         why = run.stop_reason(target.name)
@@ -912,7 +962,7 @@ async def arrival_window(run, target, client, settings, point, calibration):
         deadline=run.deadline,
         limits=settings.pass_criteria.timing_limits(),
         schedule_override=[(o["offset_seconds"], o["shape"]) for o in offers],
-        spec_factory=lambda i: build_spec(run, settings, point, offers[i]["shape"], calibration),
+        spec_factory=offer_spec,
         check_id="load",
         scenario=point["id"],
         run_start=run.start,
@@ -928,16 +978,6 @@ async def arrival_window(run, target, client, settings, point, calibration):
         offer["outcome"] = outcome
         offer["scheduler_lag_ms"] = evidence.offer_lags_ms[index]
     for index, record in evidence.records:
-        if record.status == "cancelled":
-            if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
-                record.error = (
-                    "overall run deadline reached"
-                    if evidence.drain_expired
-                    else "; ".join(evidence.reasons) or "run stopped"
-                )
-            record.load_point["cancellation_reason"] = record.error
-        record.load_point["origin"] = offers[index]["origin"]
-        record.load_point["burst_index"] = offers[index]["burst_index"]
         offers[index]["request_id"] = record.id
         offers[index]["dispatch_delay_ms"] = record.dispatch_lag_ms
     point.update(
@@ -1154,10 +1194,10 @@ def measurements(run, target, settings, point, records, shape):
         if scored
         else None,
         required=criteria.min_valid_responses,
-        first_answer_p50_ms=_percentile([v for v in first if v is not None], 0.5),
-        first_answer_p95_ms=_percentile([v for v in first if v is not None], 0.95),
-        completion_p50_ms=_percentile([v for v in durations if v is not None], 0.5),
-        completion_p95_ms=_percentile([v for v in durations if v is not None], 0.95),
+        first_answer_p50_ms=percentile([v for v in first if v is not None], 0.5),
+        first_answer_p95_ms=percentile([v for v in first if v is not None], 0.95),
+        completion_p50_ms=percentile([v for v in durations if v is not None], 0.5),
+        completion_p95_ms=percentile([v for v in durations if v is not None], 0.95),
         longest_stream_pause_ms=max(
             (r.max_stream_gap_ms for r in valid if r.max_stream_gap_ms is not None), default=None
         ),
@@ -1245,6 +1285,8 @@ def score_group(settings, point, group, records):
 
     if point.get("blocked"):
         return result("blocked", "context_exceeded", point["blocked"])
+    if point.get("execution_error"):
+        return result("blocked", "internal_error", point["execution_error"])
     if point.get("calibration_failure"):
         return result("fail", "calibration_failed", point["calibration_failure"])
     if group["error_percent"] is not None and group["error_percent"] > c.max_error_percent:
@@ -1506,7 +1548,7 @@ def assess_point(run, target, settings, point, records):
             "spread_ms": max(r.dispatch_ms for r in rows) - min(r.dispatch_ms for r in rows)
             if rows and all(r.dispatch_ms is not None for r in rows)
             else None,
-            "completion_p50_ms": _percentile(
+            "completion_p50_ms": percentile(
                 [r.arrival_elapsed_ms for r in rows if r.arrival_elapsed_ms is not None], 0.5
             ),
         }
@@ -1515,7 +1557,7 @@ def assess_point(run, target, settings, point, records):
     point["response_by_origin"] = {
         origin: {
             "dispatched": len(rows),
-            "completion_p50_ms": _percentile(
+            "completion_p50_ms": percentile(
                 [r.arrival_elapsed_ms for r in rows if r.arrival_elapsed_ms is not None], 0.5
             ),
             "failed": sum(r.status in {"failed", "timeout"} for r in rows),
@@ -1702,6 +1744,9 @@ def _result_summary(run, target, points, status, settings):
               and window_cause(point.get("preparation_reason")) == "time_limited"
               else point.get("reason_code") for point in deciding]
     code = Counter(causes).most_common(1)[0][0] if causes else None
+    if code == "internal_error":
+        error = next(point["execution_error"] for point in deciding if point.get("execution_error"))
+        return f"{len(deciding)} of {len(points)} load conditions blocked: {error}"
     descriptions = {
         "budget_limited": ("request budget reached", None),
         "time_limited": ("run deadline reached", "Increase --max-duration (max_duration_seconds) to cover all selected sending windows and request timeouts, or select fewer rates."),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import ssl
@@ -17,6 +18,9 @@ from .caps import (
     MAX_METRICS_LABEL_CHARS,
 )
 from giraffe.deployment import sanitize
+
+logger = logging.getLogger(__name__)
+
 
 # Exact names and units, not substring guesses. Profiles are explicit runtime contracts.
 # vLLM V1: vllm/v1/metrics/loggers.py; legacy: engine/metrics.py.
@@ -473,6 +477,12 @@ def _metrics_client(config, target, timeout):
     )
 
 
+def _parse_body(body, target, config, *, host=False):
+    # Decoding and Prometheus parsing share the executor, away from the loop
+    # that timestamps inference reads.
+    return parse(body.decode("utf-8"), target, config, host=host)
+
+
 async def _scrape_runtime(run, target, phase, *, force=False):
     # A single same-origin conventional route is safe to discover. Never scan
     # ports, follow redirects, or forward inference credentials to an exporter.
@@ -522,8 +532,9 @@ async def _scrape_runtime(run, target, phase, *, force=False):
                             })
                             return _remember_discovery(run, target, result)
                         body.extend(chunk)
-        result.update(parse(body.decode("utf-8"), target, run.config))
+        result.update(await asyncio.to_thread(_parse_body, body, target, run.config))
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
+        logger.debug("Statistics collection failed", exc_info=True)
         result.update(
             status="connection_failure",
             reason=f"Statistics unavailable ({type(exc).__name__}); instrumentation state unknown.",
@@ -549,10 +560,10 @@ def _remember_discovery(run, target, result):
     return result
 
 
-async def sample_during(run, target):
+async def sample_during(run, target, *, stop_event: asyncio.Event):
     data = run.observations[target.name]["serving_telemetry"]
     last = None
-    while not run.stop.is_set() and time.monotonic() < run.deadline:
+    while not stop_event.is_set() and not run.stop.is_set() and time.monotonic() < run.deadline:
         if len(data["snapshots"]) >= run.config.metrics_max_samples - 1:
             data["sample_limit_reached"] = True
             return
@@ -570,7 +581,7 @@ async def sample_during(run, target):
         last = snap["elapsed_seconds"]
         data["snapshots"].append(snap)
         if (
-            target.deployment.collector_url
+            not stop_event.is_set() and target.deployment.collector_url
             and len(run.observations[target.name]["deployment_history"]) < MAX_DEPLOYMENT_HISTORY
         ):
             from giraffe.deployment import snapshot
@@ -578,6 +589,11 @@ async def sample_during(run, target):
             run.observations[target.name]["deployment_history"].append(
                 await snapshot(target, run.config, run.deadline, run.stop)
             )
+        # A transport cancellation scope can consume Task.cancel() while
+        # finishing a scrape. The target's explicit stop still ends sampling
+        # before another interval wait, without stopping peer targets.
+        if stop_event.is_set():
+            return
         try:
             await asyncio.wait_for(run.stop.wait(), run.config.metrics_interval_seconds)
         except TimeoutError:
@@ -678,11 +694,12 @@ async def _scrape_host(run, target, phase):
                         if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
                             return result | {"status": "response_limit", "reason": "Host statistics response exceeds 1 MiB."}
                         body.extend(chunk)
-        result.update(parse(body.decode("utf-8"), target, run.config, host=True))
+        result.update(await asyncio.to_thread(_parse_body, body, target, run.config, host=True))
         hosts = {s["labels"].get("nodename") for s in result["samples"]
                  if s["family"] == "host_identity" and not s["stale"]}
         result["reported_host_identities"] = sorted(h for h in hosts if h)
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
+        logger.debug("Statistics collection failed", exc_info=True)
         result.update(status="connection_failure", reason=f"Host statistics unavailable ({type(exc).__name__}).")
     result["scrape_duration_seconds"] = time.monotonic() - run.start - result["elapsed_seconds"]
     return result

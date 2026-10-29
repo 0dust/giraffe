@@ -3,24 +3,115 @@
 from __future__ import annotations
 
 from collections import Counter
+import contextvars
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import socket
 import stat
+import tempfile
+import threading
 import time
 from typing import Any
+
+from . import models
 
 
 DEFAULT_LIMITS = {"max_total_storage": 5 * 1024 ** 3, "min_free_disk": 1024 ** 3,
                   "max_run_storage": 256 * 1024 ** 2}
 # HTML remains recognized for legacy runs and explicit CLI exports.
-_FILES = {"report.json", "report.html", ".web.json", ".keep", "summary.json"}
+_FILES = {"report.json", "report.html", ".web.json", ".keep", "summary.json", "evidence.jsonl", "giraffe.log"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+logger = logging.getLogger(__name__)
+_metadata_lock = threading.RLock()
+# Readers that must merge several metadata fields can share the publication
+# transaction with report writers and the heartbeat timer.
+metadata_lock = _metadata_lock
+HEARTBEAT_SECONDS = 5.0
+HEARTBEAT_STALE_SECONDS = 30.0
+LEGACY_HEARTBEAT_STALE_SECONDS = 120.0
+HEARTBEAT_CLOSE_SECONDS = 5.0
+
+
+def fsync_directory(directory: Path | str) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_metadata(directory: Path, values: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".web.json.",
+                                         suffix=".tmp", dir=directory, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(values, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(directory / ".web.json")
+        fsync_directory(directory)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_metadata(directory: Path | str, values: dict) -> None:
+    """The single publisher for web metadata, shared with report and timer writers."""
+    with _metadata_lock:
+        _write_metadata(Path(directory), values)
+
+
+def update_metadata(directory: Path | str, changes: dict) -> dict:
+    with _metadata_lock:
+        directory = Path(directory)
+        values = _read(directory / ".web.json") | changes
+        _write_metadata(directory, values)
+        return values
+
+
+class Heartbeat:
+    """Keep ownership fresh even while the request or server event loop is busy."""
+
+    def __init__(self, directory: Path | str, *, interval: float = HEARTBEAT_SECONDS):
+        self.directory = Path(directory)
+        self.interval = min(max(interval, 0.01), HEARTBEAT_SECONDS)
+        self._stop = threading.Event()
+        context = contextvars.copy_context()
+        self._thread = threading.Thread(target=context.run, args=(self._run,),
+                                        name="giraffe-heartbeat", daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                with _metadata_lock:
+                    values = _read(self.directory / ".web.json")
+                    if values.get("state") not in {"running", "stopping"}:
+                        return
+                    values["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+                    _write_metadata(self.directory, values)
+            except Exception:
+                logger.exception("Could not save heartbeat for %s", self.directory.name)
+            self._stop.wait(self.interval)
+
+    def close(self):
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=HEARTBEAT_CLOSE_SECONDS)
+            if self._thread.is_alive():
+                logger.warning("Heartbeat did not stop within %gs for %s",
+                               HEARTBEAT_CLOSE_SECONDS, self.directory.name)
 
 
 def parse_size(value: str | int) -> int:
@@ -92,7 +183,7 @@ def is_giraffe_run(directory: Path, meta: dict | None = None, report: dict | Non
     report = _fields(directory / "report.json") if report is None else report
     return (all(isinstance(report.get(key), str) and report[key]
                 for key in ("run_id", "started_at", "suite_version", "finished_at"))
-            and isinstance(report.get("schema_version"), str) and report["schema_version"] in {"2", "3"}
+            and models.is_supported_schema(report.get("schema_version"))
             and isinstance(report.get("overall"), str)
             and report["overall"] in {"pass", "fail", "blocked", "inconclusive", "skipped"}
             and isinstance(report.get("manifest"), dict))
@@ -216,27 +307,30 @@ def run_alive(directory: Path | str, meta: dict | None = None, *, active_id: str
     if directory.name == active_id:
         return True
     meta = _read(directory / ".web.json") if meta is None else meta
-    pid = meta.get("owner_pid")
-    if (meta.get("owner_host") == socket.gethostname() and isinstance(pid, int)
-            and not isinstance(pid, bool) and pid > 0 and pid != os.getpid()):
-        # A fresh marker cannot keep a known-dead local writer alive after restart.
-        try:
-            os.kill(pid, 0)
-        except PermissionError:
-            return True
-        except ProcessLookupError:
-            return False
-        except (OSError, OverflowError):
-            pass  # An unprobeable owner falls back to the freshness grace below.
-        else:
-            return True
-    # Only active_id proves a current-process row still has an active job.
-    # Other hosts and legacy metadata retain their existing freshness grace.
     try:
         modified = (directory / ".web.json").stat().st_mtime
     except (FileNotFoundError, NotADirectoryError):
         modified = 0
-    return max(modified, _timestamp(meta.get("heartbeat_at"), 0)) >= time.time() - 120
+    # A heartbeat is authoritative when present; legacy rows use marker mtime.
+    heartbeat = _timestamp(meta.get("heartbeat_at"), modified)
+    grace = (HEARTBEAT_STALE_SECONDS if meta.get("heartbeat_at")
+             else LEGACY_HEARTBEAT_STALE_SECONDS)
+    if heartbeat >= time.time() - grace:
+        return True
+    if meta.get("owner_host") != socket.gethostname():
+        return False
+    pid = meta.get("owner_pid")
+    # An inactive row owned by this process (including PID 1 in a container)
+    # cannot be rescued by probing our own PID.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, OverflowError):
+        return False
+    return True
 
 
 def _run(directory: Path, active_id: str | None, sources: set[str], unknown_source: bool) -> dict | None:

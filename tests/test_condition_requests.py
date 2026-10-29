@@ -154,10 +154,13 @@ async def test_saved_paging_api_bounded_validation_and_target_identity(tmp_path)
 
 
 async def test_live_api_uses_full_condition_index(tmp_path, monkeypatch):
+    import threading
+    ready = threading.Event()
     async def waiting(config, *, progress, stop_event):
         for slot in range(32):
             progress({"event": "request_started", "request_slot": slot, "target": "local",
                       "scenario": "bucket_c32_short_short", "condition_summary": lifecycle(planned=32, started=32, running=32, completed=0, status="running")})
+        ready.set()
         await stop_event.wait()
         return saved_report([])
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
@@ -168,7 +171,7 @@ async def test_live_api_uses_full_condition_index(tmp_path, monkeypatch):
             response = await client.post("/api/runs", json={"config": {"targets": [{"name": "local", "url": "http://localhost/v1", "model": "test"}], "checks": ["serving"]}})
             assert response.status_code == 202, response.text
             identifier = response.json()["id"]
-            await asyncio.sleep(0)
+            assert await asyncio.to_thread(ready.wait, 2)
             result = await client.get(f"/api/runs/{identifier}/conditions/bucket_c32_short_short/requests?page=4")
             assert result.status_code == 200, result.text
             assert [row["number"] for row in result.json()["rows"]] == [31, 32]

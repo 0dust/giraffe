@@ -358,6 +358,9 @@ async def test_complete_logprob_pass_needs_depth_and_serial_scope(monkeypatch, l
     class TokenEndpoint(MemoryEndpoint):
         async def handle(self, request):
             response = await super().handle(request)
+            # Warm-up requests may stream; only complete responses carry JSON logprobs.
+            if response.headers.get("content-type") != "application/json":
+                return response
             data = response.json()
             choice = data['choices'][0]
             output = choice['message']['content']

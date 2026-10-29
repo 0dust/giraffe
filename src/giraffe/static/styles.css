@@ -265,7 +265,7 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 :is(.status, .status-spot, .legend-dot, .outcome-segment, .history-row, .summary-item, .check-item, .verdict-word, .result-heading).blocked { --s: var(--blocked); }
 :is(.status, .status-spot, .legend-dot, .outcome-segment, .history-row, .summary-item, .check-item, .verdict-word, .result-heading).interrupted { --s: var(--blocked); }
 :is(.status, .status-spot, .legend-dot, .outcome-segment, .history-row, .summary-item, .check-item, .verdict-word, .result-heading).inconclusive { --s: var(--unknown); }
-:is(.status, .status-spot, .legend-dot, .outcome-segment, .history-row, .summary-item, .check-item, .verdict-word, .result-heading):is(.skipped, .cancelled) { --s: var(--skip); }
+:is(.status, .status-spot, .legend-dot, .outcome-segment, .history-row, .summary-item, .check-item, .verdict-word, .result-heading):is(.skipped, .cancelled, .stopped) { --s: var(--skip); }
 :is(.status, .status-spot, .legend-dot, .outcome-segment, .history-row, .summary-item, .check-item):is(.running, .queued, .stopping, .active) { --s: var(--live); }
 @media (prefers-reduced-motion: no-preference) {
   .status.running .status-icon, .status.stopping .status-icon { animation: pulse 1.6s var(--ease) infinite; }
@@ -276,7 +276,7 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 }
 
 .rail-recent .status-spot { display: grid; place-items: center; width: 15px; height: 15px; transform: none; background: transparent; color: var(--s, var(--skip)); border: 1px solid currentColor; font: 700 12px var(--mono); }
-.status.cancelled .status-icon { background: transparent; color: var(--s); border: 1px solid currentColor; }
+.status.cancelled .status-icon, .status.stopped .status-icon { background: transparent; color: var(--s); border: 1px solid currentColor; }
 
 /* Spot tooltip */
 .spot-tip { position: fixed; left: 0; top: 0; z-index: 70; display: flex; align-items: flex-start; gap: 10px; max-width: 320px; padding: 9px 12px; border-radius: var(--r); background: color-mix(in oklab, var(--surface-3) 94%, transparent); border: 1px solid var(--line-strong); box-shadow: var(--shadow-lg); backdrop-filter: blur(12px); pointer-events: none; font-size: 12px; line-height: 1.45; }

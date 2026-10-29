@@ -16,7 +16,7 @@ The per-run limit measures the compact, deduplicated JSON, including its storage
 
 `--retention all`, `failures`, and `none` control whether response text is kept: all responses, only failure evidence, or no responses. Request metadata (timings, status, scores) is always saved. Retention does not cap disk usage; storage limits do.
 
-Use `giraffe storage --runs-dir runs` or the Runs page to inspect saved runs on disk, saved baselines, available disk space, and limits. `giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10 --max-total 2GiB` previews cleanup; add `--yes` to delete the preview's eligible runs. The criteria combine with OR: old runs, runs beyond the newest count, and oldest eligible runs needed to meet the size target. The newest count includes protected runs. A cleanup maximum must be positive; `--max-total 0` is rejected. To remove all unprotected runs, explicitly use `--older-than 0` and confirm with `--yes`. Protected runs are never deleted. Use `giraffe keep RUN_DIR` to protect a run, or `--off` to remove that marker. The active run, live running or stopping runs, saved baseline source runs, and directories containing files Giraffe did not write are also protected. Filenames alone never prove ownership: cleanup requires a `.web.json` whose `id` matches the directory name, or a bounded Giraffe report header with nonempty `run_id`, `started_at`, `finished_at` and `suite_version`, schema `2` or `3`, a Giraffe `overall` verdict and an object-valued `manifest`. Four generic string fields alone are insufficient proof. Other report-like directories (including pytest coverage reports) appear as protected with reason **not a Giraffe run**. The same proof is rechecked immediately before manual or automatic deletion. Empty or temporary-only baseline directories left by failed saves do not protect other runs; malformed actual baseline files still trigger conservative protection. Legacy `tmpXXXXXXXX` files from Giraffe's old atomic writer are recognized. Baselines are never cleaned. The UI requires a preview followed by a separate delete confirmation. Apply builds one fresh plan and revalidates each confirmed directory and its protections before deletion; it never adds unconfirmed IDs. Both the UI and CLI report the actual deleted count and bytes freed on disk, followed by each skipped ID and its reason. The Runs page keeps this result visible after the dialog closes and history refreshes, including when no runs were deleted. Storage reads prefer web metadata or cached report identity/time fields, rather than repeatedly decoding retained bodies. Storage, cleanup, keep and pre-start filesystem work use the web threadpool. A storage lookup failure leaves run history usable with an unavailable-storage notice.
+Use `giraffe storage --runs-dir runs` or the Runs page to inspect saved runs on disk, saved baselines, available disk space, and limits. `giraffe cleanup --runs-dir runs --older-than 30 --keep-latest 10 --max-total 2GiB` previews cleanup; add `--yes` to delete the preview's eligible runs. The criteria combine with OR: old runs, runs beyond the newest count, and oldest eligible runs needed to meet the size target. The newest count includes protected runs. A cleanup maximum must be positive; `--max-total 0` is rejected. To remove all unprotected runs, explicitly use `--older-than 0` and confirm with `--yes`. Protected runs are never deleted. Use `giraffe keep RUN_DIR` to protect a run, or `--off` to remove that marker. The active run, live running or stopping runs, saved baseline source runs, and directories containing files Giraffe did not write are also protected. Filenames alone never prove ownership: cleanup requires a `.web.json` whose `id` matches the directory name, or a bounded Giraffe report header with nonempty `run_id`, `started_at`, `finished_at` and `suite_version`, a supported schema (`2`, `3` or `4`), a Giraffe `overall` verdict and an object-valued `manifest`. Four generic string fields alone are insufficient proof. Other report-like directories (including pytest coverage reports) appear as protected with reason **not a Giraffe run**. The same proof is rechecked immediately before manual or automatic deletion. Empty or temporary-only baseline directories left by failed saves do not protect other runs; malformed actual baseline files still trigger conservative protection. Legacy `tmpXXXXXXXX` files from Giraffe's old atomic writer are recognized. Baselines are never cleaned. The UI requires a preview followed by a separate delete confirmation. Apply builds one fresh plan and revalidates each confirmed directory and its protections before deletion; it never adds unconfirmed IDs. Both the UI and CLI report the actual deleted count and bytes freed on disk, followed by each skipped ID and its reason. The Runs page keeps this result visible after the dialog closes and history refreshes, including when no runs were deleted. Storage reads prefer web metadata or cached report identity/time fields, rather than repeatedly decoding retained bodies. Storage, cleanup, keep and pre-start filesystem work use the web threadpool. A storage lookup failure leaves run history usable with an unavailable-storage notice.
 
 Limits are checked before starting, without reserving space. Concurrent writers can consume free disk while a run executes. If JSON export fails, Giraffe marks the run as an error and tries to save a small `summary.json` with the measured overall result, per-check summaries, and request count. Check summaries are capped at 2,048 characters and visibly marked when truncated; titles are capped at 256 characters. The error message states whether that summary was saved and how many requests lost their evidence. If a CLI run explicitly requests `--html` and JSON is complete but HTML saving fails, Giraffe keeps `report.json`, marks the run completed and displays an HTML-save warning; it does not claim request evidence was lost. A failure to save final status metadata also stays a warning when the complete report exists.
 
@@ -65,33 +65,40 @@ Use `giraffe report RUN_DIR --html [--output PATH]` for a standalone HTML file, 
 `report.json` for full retained evidence; keep them together when sharing files.
 
 All newly serialized report, baseline, summary and web-state JSON is compact.
-Eligible immutable schema-3 baseline sources can be hard-linked as-is. Older
-sources are reserialized when saving a managed baseline so newly written format-2
-evidence always carries the schema-3 signal. Fields are not omitted merely because
-they have default values. Native and portable saved report JSON omit the derived
-`performance` field; model loading and JSON downloads regenerate it from retained
-measurements. Native saved reports also use the versioned input representation:
-they have `schema_version: "3"`, `report_format: 2` and an `inputs` table mapping SHA-256 references to exact
-message arrays. Nonempty `evaluation.messages` moves to that table; each request
-has `input_ref` instead. Empty messages stay empty. Table entries follow retention,
-so this cannot restore tool-conversation inputs stripped by `none` or `failures`.
-The format fields are dedicated top-level/request fields, outside measurements.
-Readers verify each table entry's SHA-256 before rehydrating and reject mismatches
-rather than substituting altered input evidence. Schema 2 and schema 3 remain
-measurement-compatible in the new comparator; the bump signals a changed stored
-representation.
+Eligible immutable schema-4 baseline sources can be hard-linked as-is. Older
+sources are migrated and reserialized when saving a managed baseline. Fields are
+not omitted merely because they have default values. Native saved reports use
+`schema_version: "4"`, `report_format: 2` and an `inputs` table mapping SHA-256
+references to exact message arrays. Nonempty `evaluation.messages` moves to that
+table; each request has `input_ref` instead. Empty messages stay empty. Table
+entries follow retention, so this cannot restore tool-conversation inputs stripped
+by `none` or `failures`. Readers verify each table entry's SHA-256 before
+rehydrating and reject mismatches rather than substituting altered input evidence.
 
-Deduplicated reports require a **schema-3 / report-format-2 reader**. Older pinned
-checkouts may not understand this representation. Inspect
-`schema_version`/`report_format` rather than relying on the package version alone.
-Current Giraffe reads both representations. For portable exchange, `giraffe baseline save
-RUN_DIR file.json` always streams expanded schema-2 JSON with input messages in
-each request and no table/reference fields. Older pinned schema-2 Giraffe readers
-can read that file. CLI baseline exports retain their previous `0644` mode and
-have an independent inode; they intentionally trade storage sharing for portability.
+Schema 4 persists `conditions` and the default target/window `performance`
+selection. The raw `request_series` is omitted from this snapshot because the
+requests already retain its measurements. Loading and downloads use the stored
+default metrics; explicit target/window selections are recomputed with the current
+measurement code. Missing derived blocks are recomputed and marked with
+`observations.derived_recomputed: true`. Schema-2 and schema-3 embedded Phase-A
+performance blocks were display caches rather than authoritative snapshots; their
+migration discards that cache and records its recomputation. Saved checks, overall
+verdicts and recorded conditions remain intact. Persisted evidence tolerates
+unknown fields, while user configuration validation remains strict.
+
+Native schema-4 reports require a reader that supports the current schema and
+report-format-2 input table. Older pinned checkouts may not understand this
+representation. Inspect `schema_version`/`report_format` rather than relying on the
+package version alone. Current Giraffe migrates schema 2 and schema 3, accepting
+historical integer schema values as well as strings. For portable exchange,
+`giraffe baseline save RUN_DIR file.json` streams expanded schema-4 JSON with input
+messages in each request and no table/reference fields. Portable exports retain
+the stored derived snapshots and omit duplicate request series. CLI baseline
+exports retain their previous `0644` mode and have an independent inode; they
+intentionally trade storage sharing for portability.
 
 `RunReport` validation, CLI loading and web loading accept both legacy reports and
-this format, restoring independent message arrays for each request. API results,
+the current format, restoring independent message arrays for each request. API results,
 including the JSON download, keep the expanded model representation with exact
 inputs. Direct disk JSON readers must understand `report_format`/`inputs`/`input_ref`.
 The validation suite does: its streaming decoder reads table entries individually

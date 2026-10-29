@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
+from functools import cached_property
 import math
 import re
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args, get_origin
 
 from pydantic_core import PydanticCustomError
 from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
 
 
+from . import __version__
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
                    MAX_STAGE_SECONDS, MAX_SESSIONS,
@@ -77,6 +79,44 @@ SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class PersistedModel(Model):
+    """Saved evidence tolerates fields introduced by other Giraffe versions."""
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+
+
+CURRENT_SCHEMA = "4"
+SUPPORTED_SCHEMAS = frozenset({"2", "3", CURRENT_SCHEMA})
+
+
+def is_supported_schema(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (str, int)) and str(value) in SUPPORTED_SCHEMAS
+
+
+def _migrate_report_v2(value: dict) -> dict:
+    return {**value, "schema_version": "3"}
+
+
+def _migrate_report_v3(value: dict) -> dict:
+    # Pre-v4 Phase-A performance blocks were display caches, not authoritative
+    # snapshots. Rebuild them from requests; only v4 pins derived performance.
+    value = {**value, "schema_version": CURRENT_SCHEMA}
+    value.pop("performance", None)
+    return value
+
+
+REPORT_MIGRATIONS = {"2": _migrate_report_v2, "3": _migrate_report_v3}
+
+
+def migrate_report(value: dict) -> dict:
+    version = value.get("schema_version", CURRENT_SCHEMA)
+    if not is_supported_schema(version):
+        raise ValueError(f"Unsupported report schema version: {version}")
+    value = {**value, "schema_version": str(version)}
+    while value["schema_version"] in REPORT_MIGRATIONS:
+        value = REPORT_MIGRATIONS[value["schema_version"]](value)
+    return value
 
 
 class CleanupCriteria(Model):
@@ -1138,7 +1178,7 @@ class LogprobConsistency(Model):
         return self
 
 
-class LogprobAlternative(Model):
+class LogprobAlternative(PersistedModel):
     token: str
     bytes: list[int] | None
     token_id: int | None = None
@@ -1150,7 +1190,7 @@ class LogprobToken(LogprobAlternative):
     top_logprobs: list[LogprobAlternative]
 
 
-class LogprobEvidence(Model):
+class LogprobEvidence(PersistedModel):
     status: Literal["available", "missing", "invalid", "incomplete", "rejected"]
     reason: str
     requested_top_logprobs: int
@@ -1734,11 +1774,13 @@ class ToolChecks(ToolContractModel):
 
 
 class ToolCheckOutcome(ToolContractModel):
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
     status: Literal["pass", "fail", "inconclusive", "not_checked"]
     message: str
 
 
 class ToolEvaluation(ToolContractModel):
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
     choice: ToolCheckOutcome | None = None
     arguments: ToolCheckOutcome | None = None
     task: ToolCheckOutcome | None = None
@@ -1865,7 +1907,7 @@ class JudgingConfig(Model):
         return self
 
 
-class JudgeVote(Model):
+class JudgeVote(PersistedModel):
     judge: str
     url: str
     model: str
@@ -1876,7 +1918,7 @@ class JudgeVote(Model):
     observed_model: str | None = None
 
 
-class RequestJudgement(Model):
+class RequestJudgement(PersistedModel):
     status: Literal["pass", "fail", "inconclusive"]
     votes: list[JudgeVote] = Field(default_factory=list)
 
@@ -2364,9 +2406,34 @@ class RequestSpec(Model):
         return self
 
 
-class EvaluationEvidence(Model):
+def _persisted_model_input(model, value):
+    """Ignore future fields in contracts shared by saved evidence and strict config."""
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for name, field in model.model_fields.items():
+        key = field.alias if field.alias in value else name
+        if key not in value:
+            continue
+        item = value[key]
+        annotation = field.annotation
+        choices = get_args(annotation) if get_origin(annotation) is not list else (annotation,)
+        for choice in choices or (annotation,):
+            if isinstance(choice, type) and issubclass(choice, BaseModel):
+                item = _persisted_model_input(choice, item)
+                break
+            if get_origin(choice) is list and isinstance(item, list):
+                child = get_args(choice)[0]
+                if isinstance(child, type) and issubclass(child, BaseModel):
+                    item = [_persisted_model_input(child, row) for row in item]
+                break
+        result[key] = item
+    return result
+
+
+class EvaluationEvidence(PersistedModel):
     """The actual input and answer check used for one request; never credentials."""
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, populate_by_name=True, serialize_by_alias=True)
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False, populate_by_name=True, serialize_by_alias=True)
     messages: list[dict[str, Any]]
     scorer: str
     expected: Any = None
@@ -2375,12 +2442,17 @@ class EvaluationEvidence(Model):
     tool_expectation: ToolExpectation | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
+    @field_validator("tool_expectation", mode="before")
+    @classmethod
+    def tolerate_saved_tool_fields(cls, value):
+        return _persisted_model_input(ToolExpectation, value)
+
 
 # Coarse bursts cannot establish a reliable answer-token generation rate.
 MAX_TOKENS_PER_READ = 16
 
 
-class RequestRecord(Model):
+class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
@@ -2598,7 +2670,7 @@ class RequestRecord(Model):
         return later * 1000 / (self.last_output_ms - self.first_output_ms)
 
 
-class CheckResult(Model):
+class CheckResult(PersistedModel):
     id: str
     target: str
     title: str
@@ -2609,9 +2681,18 @@ class CheckResult(Model):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
-class RunReport(Model):
-    schema_version: str = "3"
-    suite_version: str = "0.1.0"
+class RunReport(PersistedModel):
+    @cached_property
+    def _stored_derived(self) -> bool:
+        # Operational cache provenance is excluded from report equality and JSON.
+        return False
+
+    @cached_property
+    def _source_schema(self) -> str | int | None:
+        return CURRENT_SCHEMA
+
+    schema_version: str = CURRENT_SCHEMA
+    suite_version: str = __version__
     run_id: str
     started_at: str
     finished_at: str
@@ -2627,13 +2708,37 @@ class RunReport(Model):
     abort_reason: str | None = None
     limits_reached: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def remember_source_schema(cls, value, handler):
+        report = handler(value)
+        if isinstance(value, dict):
+            report._source_schema = value.get("schema_version")
+        return report
+
     @model_validator(mode="after")
     def aggregate_performance(self, info: ValidationInfo):
+        self._stored_derived = "performance" in self.model_fields_set
         if not (info.context or {}).get("metadata_only"):
-            from .performance import refresh_performance
+            from .performance import build_performance
+            from .conditions import aggregate_conditions
 
-            refresh_performance(self)
+            missing = {"performance", "conditions"} - self.model_fields_set
+            if "performance" in missing or self._stored_derived:
+                self.performance = build_performance(self)
+            if "conditions" in missing:
+                self.conditions = aggregate_conditions(self)
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_saved_report(cls, value):
+        if not isinstance(value, dict) or "schema_version" not in value:
+            return value
+        value = migrate_report(value)
+        if not {"performance", "conditions"} <= value.keys():
+            value["observations"] = {**value.get("observations", {}), "derived_recomputed": True}
+        return value
 
     @model_validator(mode="before")
     @classmethod

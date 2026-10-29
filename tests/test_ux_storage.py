@@ -24,6 +24,7 @@ for(const [bytes,expected] of [[0,'0 B'],[1,'1 B'],[1023,'1,023 B'],[1024,'1 KiB
 def test_cleanup_requires_preview_and_explicit_confirmation_with_same_ids_and_criteria():
     run_render_checks(r"""
 (async()=>{
+globalThis.location={hash:'#runs'};
 const dialog=nodes['#storage-dialog']={innerHTML:'',open:false,showModal(){this.open=true;},close(){this.open=false;}};
 nodes['#cleanup-age']={focus(){this.focused=true;}};
 openStorageDialog();assert(dialog.open);assert(nodes['#cleanup-age'].focused);

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import codecs
 import json
 import hashlib
+from contextlib import aclosing
 from http.cookiejar import CookieJar
 import os
 import re
@@ -24,6 +26,9 @@ from .caps import (
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget, LogprobCollector
 from giraffe.transport import HTTPClientPool, _finish_cleanup
+
+logger = logging.getLogger(__name__)
+
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -88,14 +93,15 @@ def _headers(target: Target) -> dict[str, str]:
 
 async def _limited_body(response: httpx.Response, *, on_read=None, on_body=None) -> bytes:
     body = bytearray()
-    async for chunk in response.aiter_bytes():
-        if chunk and on_body is not None:
-            on_body(len(chunk))
-        if on_read is not None:
-            on_read(time.perf_counter())
-        if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
-            raise _ProtocolError("response exceeded the 4 MiB safety limit")
-        body.extend(chunk)
+    async with aclosing(response.aiter_bytes()) as chunks:
+        async for chunk in chunks:
+            if chunk and on_body is not None:
+                on_body(len(chunk))
+            if on_read is not None:
+                on_read(time.perf_counter())
+            if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                raise _ProtocolError("response exceeded the 4 MiB safety limit")
+            body.extend(chunk)
     return bytes(body)
 
 
@@ -108,36 +114,38 @@ async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterato
     consumed = 0
 
     async def chunks_with_eof() -> AsyncIterator[tuple[bytes, bool]]:
-        async for chunk in response.aiter_bytes():
-            if chunk and on_read is not None:
-                on_read(len(chunk))
-            yield chunk, False
+        async with aclosing(response.aiter_bytes()) as chunks:
+            async for chunk in chunks:
+                if chunk and on_read is not None:
+                    on_read(len(chunk))
+                yield chunk, False
         yield b"", True
 
-    async for chunk, final in chunks_with_eof():
-        observed_at = time.perf_counter()
-        consumed += len(chunk)
-        if consumed > _MAX_RESPONSE_BYTES:
-            raise _ProtocolError("response exceeded the 4 MiB safety limit")
-        buffer += decoder.decode(chunk, final=final)
-        while (match := re.search(r"[\r\n]", buffer)) is not None:
-            end = match.start()
-            # A CR at the end might be the first half of a fragmented CRLF.
-            if buffer[end] == "\r" and end == len(buffer) - 1 and not final:
-                break
-            width = 2 if buffer[end:end + 2] == "\r\n" else 1
-            line, buffer = buffer[:end], buffer[end + width:]
-            if not line:
-                if data:
-                    yield event_type, "\n".join(data), observed_at
-                data, event_type = [], "message"
-            elif not line.startswith(":"):
-                field, _, value = line.partition(":")
-                value = value[1:] if value.startswith(" ") else value
-                if field == "data":
-                    data.append(value)
-                elif field == "event":
-                    event_type = value
+    async with aclosing(chunks_with_eof()) as chunks:
+        async for chunk, final in chunks:
+            observed_at = time.perf_counter()
+            consumed += len(chunk)
+            if consumed > _MAX_RESPONSE_BYTES:
+                raise _ProtocolError("response exceeded the 4 MiB safety limit")
+            buffer += decoder.decode(chunk, final=final)
+            while (match := re.search(r"[\r\n]", buffer)) is not None:
+                end = match.start()
+                # A CR at the end might be the first half of a fragmented CRLF.
+                if buffer[end] == "\r" and end == len(buffer) - 1 and not final:
+                    break
+                width = 2 if buffer[end:end + 2] == "\r\n" else 1
+                line, buffer = buffer[:end], buffer[end + width:]
+                if not line:
+                    if data:
+                        yield event_type, "\n".join(data), observed_at
+                    data, event_type = [], "message"
+                elif not line.startswith(":"):
+                    field, _, value = line.partition(":")
+                    value = value[1:] if value.startswith(" ") else value
+                    if field == "data":
+                        data.append(value)
+                    elif field == "event":
+                        event_type = value
     if buffer or data:
         raise _ProtocolError("unterminated SSE event at end of response")
 
@@ -316,6 +324,7 @@ class LLMClient:
                 try:
                     client = await setup
                 except Exception:
+                    logger.exception("Request client cleanup failed")
                     return
                 await client.aclose()
 
@@ -341,7 +350,7 @@ class LLMClient:
         # [DONE] completes the measured response. Consume only the transport tail
         # in the background so HTTPX can return the connection to its pool.
         try:
-            async with asyncio.timeout(_STREAM_DRAIN_SECONDS):
+            async with asyncio.timeout(_STREAM_DRAIN_SECONDS), aclosing(events):
                 async for _ in events:
                     pass
         except (TimeoutError, httpx.HTTPError, OSError, _ProtocolError, UnicodeDecodeError):
@@ -787,7 +796,11 @@ class LLMClient:
                         self._stream_drains.add(task)
                         task.add_done_callback(self._stream_drains.discard)
                     else:
-                        await response.aclose()
+                        try:
+                            if events is not None:
+                                await events.aclose()
+                        finally:
+                            await response.aclose()
         except _IntentionalCancellation:
             record.status, record.error = "cancelled", "intentional cancellation after generation chunks"
             record.termination_reason = "generation_chunk_limit"
@@ -815,6 +828,7 @@ class LLMClient:
         except UnicodeDecodeError:
             record.error = "response contains invalid UTF-8"
         except (httpx.HTTPError, OSError, ValueError) as exc:
+            logger.debug("Endpoint request failed", exc_info=True)
             record.error = f"request failed ({type(exc).__name__})"
         finally:
             if logprob_collector is not None and record.logprob_evidence is None:

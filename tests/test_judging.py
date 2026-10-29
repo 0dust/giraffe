@@ -357,3 +357,23 @@ async def test_only_unjudgeable_answers_make_no_judge_calls(monkeypatch):
     assert not clients and summary["judge_calls_total"] == 0
     assert summary["inconclusive_requests"] == 1
     assert item.score is None and item.score_message == "truncated before a complete answer"
+
+
+async def test_repeated_vote_failures_log_one_traceback_and_a_count(monkeypatch, caplog):
+    from giraffe import judging
+    class Broken:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError('judge unavailable')
+    monkeypatch.setattr(judging, 'LLMClient', Broken)
+    values = [record(index) for index in range(20)]
+    result = await judge_records(configuration(), values, [fixture()])
+    logs = [row for row in caplog.records if row.name == judging.__name__]
+    assert result['judge_calls_errors'] == 20
+    assert sum(row.exc_info is not None for row in logs) == 1
+    assert any('19 additional' in row.getMessage() for row in logs)

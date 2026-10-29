@@ -270,7 +270,7 @@ Per test point, in this order. **Cut short / not run / insufficient evidence can
 
 **Aggregation.** Load-type status = aggregate of its points (fail > blocked > inconclusive > pass). Check status = aggregate of load types. A passing check summary counts its test points and load types, with the number of budget-limited windows when present: "All 14 test points passed across 4 load types (2 ran budget-limited windows)." Other summaries name only points with the deciding status, up to three with their reasons, then "and N more". Point reasons do not repeat their status; a supported shortened pass says "Budget-limited window: ran 1.85 s of 3 s". The best result is "highest observed among tested settings", never a capacity limit; it is shown with the result measurements.
 
-**Remedies** (via `remedy_conditions` / `_verdict_summary`, by reason code):
+**Remedies** (rendered from each point’s recorded reason code):
 
 | Reason | Guidance |
 |---|---|
@@ -283,7 +283,7 @@ Per test point, in this order. **Cut short / not run / insufficient evidence can
 | client delay | Existing remedy text. |
 | missing slowdown limit | Existing remedy text. |
 
-Old `remedy_conditions` keys (`fairness`, `mixed`, `buckets`, `token_stress`) are removed. `_budget_guidance` must not suggest "raise max_requests above X" from known counts for duration points.
+The former fairness, mixed, bucket and token-stress remedy keys are retired; guidance belongs to the corresponding Load test point. Request-budget guidance must use the duration workload and observed request rate rather than a fixed request count for duration points.
 
 
 ## 6. Structured errors and UI

@@ -7,7 +7,7 @@ def test_storage_failure_preserves_runs_and_poll_retries_storage_independently()
     run_render_checks(r"""
 (async()=>{
 setActive=value=>state.active=value;renderRailRuns=()=>{};schedulePoll=()=>{};connectionError=()=>{};
-nodes['#run-count']={};
+nodes['#run-count']={};globalThis.location={hash:'#runs'};
 const saved=[{id:'available',state:'completed',overall:'pass',targets:[{model:'available-model'}]}];
 let failStorage=true,failRuns=false;
 api=async path=>{if(path==='/api/runs'){if(failRuns)throw Error('Runs unavailable');return {runs:saved};}if(failStorage)throw Error('Storage unavailable');return {runs_bytes:10,baselines_bytes:0,free_bytes:100,limits:{}};};

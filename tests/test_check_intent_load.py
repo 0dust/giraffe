@@ -399,19 +399,25 @@ async def test_duration_elapsed_needs_time_weighted_occupancy(endpoint, monkeypa
     assert check(report, "recovery").status == "inconclusive"
 
 
-async def test_unscored_sustained_completions_block_a_recovery_pass(endpoint, monkeypatch):
-    original = endpoint.execute
+def test_unscored_sustained_completions_block_a_recovery_pass(endpoint, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
 
-    async def truncated(self, spec, **kw):
-        result = await original(self, spec, **kw)
-        if spec.scenario == "sustained":
-            result.output, result.finish_reason = str(spec.expected)[:2], "length"
-        return result
+    async def scenario():
+        monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
+        original = endpoint.execute
 
-    monkeypatch.setattr(endpoint, "execute", truncated)
-    report = await runner.run_suite(config(checks=["recovery"], limits=Limits(latency_ms=5000, min_samples=2)))
-    result = check(report, "recovery")
-    assert result.metrics["unscored_completions"] > 0 and result.status == "inconclusive"
+        async def truncated(self, spec, **kw):
+            result = await original(self, spec, **kw)
+            if spec.scenario == "sustained":
+                result.output, result.finish_reason = str(spec.expected)[:2], "length"
+            return result
+
+        monkeypatch.setattr(endpoint, "execute", truncated)
+        report = await runner.run_suite(config(checks=["recovery"], limits=Limits(latency_ms=5000, min_samples=2)))
+        result = check(report, "recovery")
+        assert result.metrics["unscored_completions"] > 0 and result.status == "inconclusive"
+
+    run_virtual(monkeypatch, scenario())
 
 
 # Match fake endpoint token usage while exercising the real local-sizing path.

@@ -363,7 +363,8 @@ def test_lost_timing_or_correctness_measurements_prevent_a_passing_comparison():
         record.score = None
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "inconclusive"
-    assert "measurement coverage" in baseline_check(result).summary
+    assert "correctness" in baseline_check(result).summary
+    assert "at least 5 measured samples" in baseline_check(result).summary
 
 
 def test_noise_is_inconclusive_when_it_crosses_material_threshold():
@@ -371,7 +372,9 @@ def test_noise_is_inconclusive_when_it_crosses_material_threshold():
     for record, timing in zip(current.requests, [80, 90, 100, 110, 140, 180, 250, 400]):
         record.elapsed_ms = timing
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
     latency = next(row for row in result.baseline["targets"][0]["comparisons"]
                    if row["metric"] == "latency_ms")
     assert latency["status"] == "inconclusive"
@@ -383,7 +386,9 @@ def test_shorter_generations_do_not_establish_performance_stability():
         record.output_chars = 1
         record.output_tokens = 5
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
     latency = next(row for row in result.baseline["targets"][0]["comparisons"]
                    if row["metric"] == "latency_ms")
     assert latency["status"] == "inconclusive"
@@ -398,7 +403,8 @@ def test_different_fixture_proportions_are_not_a_timing_regression():
             record.elapsed_ms = 1000 if record.fixture_id == "slow" else 100
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "inconclusive"
-    assert "proportions" in baseline_check(result).summary
+    assert "correctness" in baseline_check(result).summary
+    assert any("proportions" in row["reason"] for row in result.baseline["targets"][0]["comparisons"])
 
 
 def test_absolute_failure_stays_failed_even_when_baseline_comparison_passes():
@@ -430,8 +436,10 @@ def test_generator_saturation_cannot_create_timing_regressions(saturated_run):
     noisy = current if saturated_run == "current" else previous
     noisy.observations["generator_max_lag_ms"] = 500
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
-    assert result.overall == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
+    assert result.overall == "pass"
     rows = result.baseline["targets"][0]["comparisons"]
     timing = {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second",
               "generation_tokens_per_second"}
@@ -517,7 +525,9 @@ def test_missing_scenario_does_not_hide_regression_in_another_comparable_scenari
     previous.requests.append(missing)
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "fail"
-    assert result.baseline["targets"][0]["reasons"]
+    # AM9 records an unmatched scenario locally; other scenarios still compare.
+    assert not result.baseline["targets"][0]["reasons"]
+    assert any(row["metric"] == "request_shapes" for row in result.baseline["targets"][0]["comparisons"])
 
 
 @pytest.mark.parametrize("policy", ["all", "failures", "none"])
@@ -822,6 +832,73 @@ def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evi
     if evidence_count < 25:
         assert 'Request current-0 ' in html
     assert 'Request current-30 ' not in html
+
+
+def test_old_baseline_none_effective_defaults_match_same_explicit_config():
+    from copy import deepcopy
+    from giraffe.reporting import _settings_reasons
+    current = make_report()
+    current.manifest['config'].update(checks=['first_output', 'generation'])
+    config = RunConfig.model_validate(current.manifest['config'])
+    current.manifest['effective_checks'] = {name: config.effective_check(name) for name in config.checks}
+    previous = deepcopy(current)
+    previous.run_id = 'main-baseline'
+    # Old main saved a full config and None for the two formerly absent sanity defaults.
+    previous.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = None
+    previous.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = None
+    current.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = 10000
+    current.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = 5000
+    assert _settings_reasons(current, previous) == []
+    current.manifest['config']['test_options'] = {'generation': {'limits': {'stream_gap_ms': 2000}}}
+    assert _settings_reasons(current, previous)
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_saved_report_records_and_displays_applied_sanity_limits(tmp_path, monkeypatch, explicit):
+    from giraffe import runner
+    from tests.test_runner import FakeClient
+
+    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
+    values = {'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}],
+              'checks': ['first_output', 'generation']}
+    if explicit:
+        values['limits'] = {'first_output_ms': 800, 'stream_gap_ms': 700}
+    report = await runner.run_suite(RunConfig.model_validate(values))
+    json_path, html_path = write_report(report, tmp_path, html=True)
+    saved = RunReport.model_validate_json(json_path.read_text())
+    html = html_path.read_text()
+    for check_id, field, limit, label in (
+        ('first_output', 'first_output_ms', 800 if explicit else 10000, 'p95 first useful output'),
+        ('generation', 'stream_gap_ms', 700 if explicit else 5000, 'Stream pause'),
+    ):
+        assert saved.manifest['effective_checks'][check_id]['limits'][field] == limit
+        assert (field in saved.manifest['default_check_limits'][check_id]) == (not explicit)
+        duration = f'{limit / 1000:g} s' if limit >= 1000 else f'{limit} ms'
+        assert f'{label} ≤ {duration}' + ('' if explicit else ' (default)') in html
+    if not explicit:
+        assert 'default_concurrency' not in saved.manifest['config']
+
+
+def test_old_report_with_null_effective_limit_metadata_keeps_rendering(tmp_path):
+    report = make_report()
+    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
+                                status='inconclusive', summary='Timing observed; no acceptance limit configured.')]
+    report.manifest['effective_checks'] = {'first_output': {'limits': None}}
+    report.manifest['default_check_limits'] = None
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    assert 'Timing observed; no acceptance limit configured.' in html
+    assert 'p95 first useful output ≤' not in html
+
+
+@pytest.mark.parametrize('limit,label', [(999, '999 ms'), (1000, '1 s'), (1500, '1.5 s'), (10000, '10 s')])
+def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label):
+    report = make_report()
+    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
+                                status='pass', summary='Timing met the recorded limit.')]
+    report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
+    _, html_path = write_report(report, tmp_path, html=True)
+    assert f'p95 first useful output ≤ {label}' in html_path.read_text()
 
 
 def test_comparison_preserves_observations_and_all_interpretation_warnings():
@@ -1199,71 +1276,12 @@ def test_html_preserves_backend_reason_sentences_without_rewriting(reason):
     assert f"<p>{escape(reason)}</p>" in html
     assert "Stopped by you Stopped by you" not in html
     assert "--First-output-ms" not in html
-def test_old_baseline_none_effective_defaults_match_same_explicit_config():
-    from copy import deepcopy
-    from giraffe.reporting import _settings_reasons
-    current = make_report()
-    current.manifest['config'].update(checks=['first_output', 'generation'])
-    config = RunConfig.model_validate(current.manifest['config'])
-    current.manifest['effective_checks'] = {name: config.effective_check(name) for name in config.checks}
-    previous = deepcopy(current)
-    previous.run_id = 'main-baseline'
-    # Old main saved a full config and None for the two formerly absent sanity defaults.
-    previous.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = None
-    previous.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = None
-    current.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = 10000
-    current.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = 5000
-    assert _settings_reasons(current, previous) == []
-    current.manifest['config']['test_options'] = {'generation': {'limits': {'stream_gap_ms': 2000}}}
-    assert _settings_reasons(current, previous)
 
 
-@pytest.mark.parametrize('explicit', [False, True])
-async def test_saved_report_records_and_displays_applied_sanity_limits(tmp_path, monkeypatch, explicit):
-    from giraffe import runner
-    from tests.test_runner import FakeClient
-
-    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
-    values = {'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}],
-              'checks': ['first_output', 'generation']}
-    if explicit:
-        values['limits'] = {'first_output_ms': 800, 'stream_gap_ms': 700}
-    report = await runner.run_suite(RunConfig.model_validate(values))
-    json_path, html_path = write_report(report, tmp_path, html=True)
-    saved = RunReport.model_validate_json(json_path.read_text())
-    html = html_path.read_text()
-    for check_id, field, limit, label in (
-        ('first_output', 'first_output_ms', 800 if explicit else 10000, 'p95 first useful output'),
-        ('generation', 'stream_gap_ms', 700 if explicit else 5000, 'Stream pause'),
-    ):
-        assert saved.manifest['effective_checks'][check_id]['limits'][field] == limit
-        assert (field in saved.manifest['default_check_limits'][check_id]) == (not explicit)
-        duration = f'{limit / 1000:g} s' if limit >= 1000 else f'{limit} ms'
-        assert f'{label} ≤ {duration}' + ('' if explicit else ' (default)') in html
-    if not explicit:
-        assert 'default_concurrency' not in saved.manifest['config']
 
 
-def test_old_report_with_null_effective_limit_metadata_keeps_rendering(tmp_path):
-    report = make_report()
-    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
-                                status='inconclusive', summary='Timing observed; no acceptance limit configured.')]
-    report.manifest['effective_checks'] = {'first_output': {'limits': None}}
-    report.manifest['default_check_limits'] = None
-    _, html_path = write_report(report, tmp_path, html=True)
-    html = html_path.read_text()
-    assert 'Timing observed; no acceptance limit configured.' in html
-    assert 'p95 first useful output ≤' not in html
 
 
-@pytest.mark.parametrize('limit,label', [(999, '999 ms'), (1000, '1 s'), (1500, '1.5 s'), (10000, '10 s')])
-def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label):
-    report = make_report()
-    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
-                                status='pass', summary='Timing met the recorded limit.')]
-    report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
-    _, html_path = write_report(report, tmp_path, html=True)
-    assert f'p95 first useful output ≤ {label}' in html_path.read_text()
 
 
 def test_html_integrates_findings_acceptance_warnings_and_observed_outputs():

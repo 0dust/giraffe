@@ -193,8 +193,14 @@ def test_incomplete_or_changed_load_cannot_claim_lost_accepted_rate(change):
     else:
         current.manifest["config"]["load_test"]["patterns"]["rates"] = [10, 100]
     compared = compare_baseline(current, old)
+    # A qualified lower-rate point cannot establish preservation of the
+    # previously accepted higher rate. Ordinary metric coverage stays separate.
     assert compared.baseline["status"] == "inconclusive"
     assert compared.baseline["targets"][0]["load_test"]["status"] == "inconclusive"
+    if change != "configuration":
+        assert compared.baseline["targets"][0]["load_test"]["points"][0]["status"] == "pass"
+        assert compared.baseline["targets"][0]["load_test"]["points"][1]["status"] == "inconclusive"
+        assert "Preservation of previously accepted load is unverified" in compared.baseline["targets"][0]["summary"]
     assert not next(check for check in compared.checks if check.id == "baseline").evidence_ids
 
 
@@ -224,8 +230,11 @@ def test_same_config_with_changed_or_missing_actual_request_work_cannot_establis
     else:
         setattr(record, change, getattr(record, change) + 1)
     compared = compare_baseline(current, old)
+    # Unchanged lower-rate acceptance cannot verify the previously accepted
+    # higher rate when its actual request work is missing or different.
     assert compared.baseline["status"] == "inconclusive"
     rows = compared.baseline["targets"][0]["load_test"]["points"]
+    assert rows[0]["status"] == "pass"
     affected = next(row for row in rows if row["current"]["id"] == point["id"])
     assert affected["status"] == "inconclusive"
     assert affected["reason"] == {"missing_metadata": "Dispatched request metadata is incomplete.",
@@ -575,6 +584,7 @@ def test_gained_level_cannot_hide_lost_or_unverified_baseline_acceptance(outcome
     current_point['status'] = current_point['groups'][0]['status'] = outcome
     target = compare_baseline(current, old).baseline['targets'][0]
     comparison = target['load_test']
+    # A gain at another level cannot establish preservation of accepted load.
     assert comparison['status'] == target['status'] == status
     assert comparison['summary_counts']['gained'] == comparison['summary_counts'][change] == 1
     assert '1 tested load(s) newly accepted' in target['summary']

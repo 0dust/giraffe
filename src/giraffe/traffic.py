@@ -10,13 +10,19 @@ import asyncio
 import math
 import random
 import time
-from statistics import mean, median
+from statistics import mean
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from .stats import median, percentile
 from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, TrafficConfig
 from .timing import qualify, qualified_violations
+
+
+AUTHORITATIVE_TERMINATION_REASONS = {
+    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "run_duration_limit",
+}
 
 
 class ScheduleObservation:
@@ -101,15 +107,6 @@ def arrival_schedule(traffic: TrafficConfig, rate_rps: float, stage_index: int =
     return schedule, overflow
 
 
-def _percentile(values: list[float], fraction: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * fraction
-    lower, upper = math.floor(position), math.ceil(position)
-    return round(ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower), 3)
-
-
 def _timing(record: RequestRecord, limits: Limits) -> tuple[bool, bool]:
     """Return (violated, missing); arrival-relative latency includes dispatch lag."""
     measured = (
@@ -158,7 +155,7 @@ def _record_stats(records: list[RequestRecord], limits: Limits) -> dict:
     ):
         values = [value for r in completed if (value := getattr(r, attribute)) is not None]
         for label, fraction in (("p50", .5), ("p95", .95)):
-            result[f"{name}_{label}_ms"] = _percentile(values, fraction)
+            result[f"{name}_{label}_ms"] = percentile(values, fraction)
     return result
 
 
@@ -198,7 +195,7 @@ async def run_stage(
     rate_rps: float,
     stage_index: int,
     fixtures: dict[str, list[RequestSpec]],
-    execute: Callable[[RequestSpec], Awaitable[RequestRecord | None]],
+    execute: Callable[[RequestSpec, Callable[[RequestRecord], None]], Awaitable[RequestRecord | None]],
     reserve_offer: Callable[[], bool],
     try_acquire: Callable[[], bool],
     release: Callable[[], None],
@@ -225,7 +222,9 @@ async def run_stage(
 
     ``traffic.max_in_flight`` must already be resolved against the global bound.
     ``execute`` uses the reserved slot without waiting for another semaphore and
-    must return after cancellation, as the existing HTTP client does.
+    calls its second argument to annotate the terminal record before persisting
+    or returning it. It must finish promptly after cancellation, returning that record or
+    attaching it as ``giraffe_record`` to the propagated CancelledError.
     ``on_drop`` reports reserved offers that never dispatch, including tasks
     cancelled before starting; unreserved schedule entries are not drops.
     """
@@ -302,6 +301,27 @@ async def run_stage(
             if on_drop:
                 on_drop()
 
+    def annotate(kind: str, offset: float, lag_ms: float, record: RequestRecord):
+        record.traffic_stage = stage_index
+        record.traffic_rate_rps = rate_rps
+        record.traffic_class = kind
+        record.scheduled_offset_ms = offset * 1000
+        if run_start is not None and record.scheduled_ms is not None:
+            clock_start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
+            if clock_start is not None:
+                lag_ms = max(lag_ms, clock_start-record.scheduled_ms)
+        record.dispatch_lag_ms = lag_ms
+        record.arrival_first_output_ms = (lag_ms + record.first_output_ms
+                                           if record.first_output_ms is not None else None)
+        record.arrival_elapsed_ms = lag_ms + record.elapsed_ms
+        if record.status == "cancelled" and record.load_point is not None:
+            if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
+                record.error = (
+                    "overall run deadline reached" if drain_expired
+                    else "; ".join(reasons) or "run stopped"
+                )
+            record.load_point["cancellation_reason"] = record.error
+
     async def dispatch(index: int, kind: str, offset: float):
         nonlocal execution_errors
         dispatched = time.monotonic()
@@ -317,25 +337,16 @@ async def run_stage(
             })
             if run_start is not None:
                 spec.workload = {**spec.workload, "scheduled_ms": (started_at - run_start + offset) * 1000}
-            record = await execute(spec)
+            record = await execute(spec, lambda record: annotate(kind, offset, lag_ms, record))
             if record is None:
                 drop(index, "not_offered")
                 return
-            record.traffic_stage = stage_index
-            record.traffic_rate_rps = rate_rps
-            record.traffic_class = kind
-            record.scheduled_offset_ms = offset * 1000
-            if run_start is not None and record.scheduled_ms is not None:
-                clock_start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
-                if clock_start is not None:
-                    lag_ms = max(lag_ms, clock_start-record.scheduled_ms)
-            record.dispatch_lag_ms = lag_ms
-            record.arrival_first_output_ms = (lag_ms + record.first_output_ms
-                                               if record.first_output_ms is not None else None)
-            record.arrival_elapsed_ms = lag_ms + record.elapsed_ms
             records.append((index, record))
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             outcomes[index] = "cancelled"
+            record = getattr(exc, "giraffe_record", None)
+            if record is not None:
+                records.append((index, record))
         except Exception:
             # Backend normally records exceptions. Keep a truthful failure if a
             # callback unexpectedly escapes without leaking transport text.
@@ -461,7 +472,9 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     not_offered = counts["not_offered"] + counts["dispatching"]
     stats = _record_stats([record for _, record in records], limits)
     stats["failed"] += evidence.execution_errors
-    stats["cancelled"] += counts["cancelled"]
+    recorded_indices = {index for index, _ in records}
+    stats["cancelled"] += sum(outcome == "cancelled" and index not in recorded_indices
+                              for index, outcome in enumerate(outcomes))
     error_rate = (stats["failed"] + stats["timed_out"]) / started if started else None
     generator_limited = bool(counts["dropped_local"] or counts["dropped_late"] or evidence.overflow)
     fully_offered = not (not_offered or generator_limited or evidence.interrupted)
@@ -571,6 +584,8 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         window_records = [record for index, record in records if index in indices]
         window_counts = Counter(outcomes[index] for index in indices)
         window_stats = _record_stats(window_records, limits)
+        window_stats["cancelled"] += sum(outcomes[index] == "cancelled" and index not in recorded_indices
+                                          for index in indices)
         # Qualified request IDs belong to the stage; window counts remain raw.
         window_stats.pop("violations", None)
         window_started = window_counts["started"] + window_counts["cancelled"]
@@ -602,7 +617,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     short_poisson = evidence.arrival == "poisson" and len(latencies) < 80
     if short_poisson and latencies:
         values = sorted(value for _, value in latencies)
-        low, high = (values[int(q * (len(values) - 1))] for q in (.1, .9))
+        low, high = (percentile(values, q) for q in (.1, .9))
         stability_unverified = high > max(1.25 * low, low + .01 * evidence.duration_seconds)
     if len(latencies) >= 6:
         sampled = latencies[::max(1, math.ceil(len(latencies) / 64))]

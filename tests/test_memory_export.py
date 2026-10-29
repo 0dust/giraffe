@@ -49,8 +49,11 @@ def report_fixture(policy):
 
 def reference_size(report):
     """Independent full-materialization format-2 oracle, used only in small tests."""
-    value = report.model_dump(mode="json", exclude={"performance"})
-    value.update(schema_version="3", report_format=2, inputs={})
+    value = report.model_dump(mode="json")
+    value["performance"] = {**value["performance"], "targets": [
+        {key: field for key, field in target.items() if key != "request_series"}
+        for target in value["performance"].get("targets", [])]}
+    value.update(schema_version="4", report_format=2, inputs={})
     for row in value["requests"]:
         if row["evaluation"] and row["evaluation"]["messages"]:
             messages = row["evaluation"].pop("messages")
@@ -63,7 +66,7 @@ def reference_size(report):
 
 def reference_limited(report, limit, legacy):
     report = legacy._old_retained(report)
-    report.schema_version = "3"
+    report.schema_version = "4"
     storage = {"limit_bytes": limit, "response_bodies_omitted": 0,
                "reason": "Per-run JSON storage limit on disk.", "limit_exceeded": False}
     report.manifest["storage"] = storage
@@ -100,12 +103,14 @@ def test_streamed_export_matches_reference_and_does_not_mutate_input(tmp_path, l
     assert [row.id for row in saved.requests if row.output] == [row.id for row in expected.requests if row.output]
     assert [row.evaluation for row in saved.requests] == [row.evaluation for row in expected.requests]
     assert saved.manifest["storage"]["limit_exceeded"] == expected.manifest["storage"]["limit_exceeded"]
-    assert saved == expected
+    assert saved.model_dump() == expected.model_dump()
     if policy == "all" and 0 < len([row for row in saved.requests if row.output]) < len(saved.requests):
         assert saved.requests[0].output  # Failure evidence survives before either passing response.
     assert report.model_dump_json() == before
-    assert "performance" not in raw  # Derived summaries belong in API/export, never on disk.
-    assert saved.performance  # Loading still derives the summary.
+    # AM5 persists default summaries; the raw request series remains unduplicated.
+    assert raw["performance"]
+    assert all("request_series" not in target for target in raw["performance"]["targets"])
+    assert saved.performance
     assert _json_size(saved) == json_path.stat().st_size == reference_size(expected)
 
 
@@ -134,7 +139,7 @@ def test_streamed_export_never_serializes_all_requests_together(tmp_path, monkey
     original = RunReport.model_dump_json
 
     def metadata_only(self, *args, **kwargs):
-        assert kwargs.get("exclude") == {"requests", "performance"}
+        assert kwargs.get("exclude") == {"requests"}
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(RunReport, "model_dump_json", metadata_only)
@@ -148,12 +153,11 @@ def test_empty_requests_streams_valid_identical_json(tmp_path, legacy_export):
     expected = json.loads(legacy_export._old_storage_limited(legacy_export._old_retained(report), 0))
     json_path, _ = write_report(report, tmp_path, max_run_storage=0)
     loaded = RunReport.model_validate_json(json_path.read_text())
-    # Legacy snapshots may contain stale derived fields after requests change.
-    # Both old and new storage must load to the same freshly derived state.
-    assert loaded == RunReport.model_validate(expected)
+    # New writes aggregate final evidence, then loading uses that stored snapshot.
+    assert loaded.requests == RunReport.model_validate(expected).requests
     assert loaded.conditions == []
     assert loaded.performance["available_targets"] == []
-    assert "performance" not in json.loads(json_path.read_text())
+    assert json.loads(json_path.read_text())["performance"] == loaded.performance
 
 
 def test_comparison_preserves_memory_stop_inconclusive_with_blocked_checks():

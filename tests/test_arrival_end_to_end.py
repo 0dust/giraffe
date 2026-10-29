@@ -1,12 +1,15 @@
 """Arrival pressure and upgrade decisions through real loopback HTTP sockets."""
 
 import asyncio
+import json
+from types import SimpleNamespace
 import time
+import uuid
 
 import pytest
 
 
-from giraffe.models import Limits, TrafficConfig, required_concurrency
+from giraffe.models import Limits, RequestRecord, TrafficConfig, required_concurrency
 from giraffe.reporting import compare_baseline
 from giraffe.runner import run_suite
 from tests.fake_endpoint import FakeEndpoint
@@ -248,8 +251,23 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
     assert alpha["max_tokens"] == 4 and alpha["temperature"] == .1
 
 
-async def test_reference_judging_runs_after_http_traffic_without_extending_measurements():
-    import json
+def reference_judging_config(endpoint, judge, **overrides):
+    values = dict(
+        checks=["capacity", "correctness"], stream=False,
+        request_source="request_pack", request_pack={"version": 1, "cases": [
+            {"fixture_id": "refund", "messages": [{"role": "user", "content": "What is the refund window?"}],
+             "scorer": "judge", "expected": "Within 30 days.", "rubric": "The number of days must agree."},
+        ]},
+        judging={"judges": [{"name": "reviewer", "url": judge.url, "model": "judge-model"}],
+                 "concurrency": 1, "max_duration_seconds": 3},
+        traffic=TrafficConfig(rates=[30], duration_seconds=.1, max_in_flight=32),
+        limits=Limits(latency_ms=1000, min_samples=2),
+    )
+    return traffic_config(endpoint, **(values | overrides))
+
+
+async def test_reference_judging_waits_for_all_http_answers_and_preserves_payloads():
+    """A finite control plus three loaded calls exercise real transport and ordering."""
 
     with FakeEndpoint(first_token_delay=.005, chunk_delay=0) as endpoint, FakeEndpoint(
         first_token_delay=.09, chunk_delay=0,
@@ -265,26 +283,82 @@ async def test_reference_judging_runs_after_http_traffic_without_extending_measu
                                else "The refund duration differs."})
 
         judge._answer = evaluate
-        config = traffic_config(
-            endpoint, checks=["capacity", "correctness"], stream=False,
-            max_duration_seconds=.3,
-            request_source="request_pack", request_pack={"version": 1, "cases": [
-                {"fixture_id": "refund", "messages": [{"role": "user", "content": "What is the refund window?"}],
-                 "scorer": "judge", "expected": "Within 30 days.", "rubric": "The number of days must agree."},
-            ]},
-            judging={"judges": [{"name": "reviewer", "url": judge.url, "model": "judge-model"}],
-                     "concurrency": 1, "max_duration_seconds": 3},
-            traffic=TrafficConfig(rates=[30], duration_seconds=.1, max_in_flight=32),
-            limits=Limits(latency_ms=1000, min_samples=2),
-        )
+        config = reference_judging_config(
+            endpoint, judge, checks=["correctness"], default_concurrency=3)
         report = await run_suite(config)
         assert len(endpoint.requests) == len(judge.requests) == len(report.requests) == 4
+        assert len({record.id for record in report.requests}) == 4
+        assert sum(record.scenario == "pack_control" for record in report.requests) == 1
+        assert sum(record.scenario == "pack_loaded" for record in report.requests) == 3
         assert min(judge.request_started_at) >= max(endpoint.request_finished_at)
         assert all(payload["model"] == "judge-model" for payload in judge.requests)
         assert all(data["messages"] == [{"role": "user", "content": "What is the refund window?"}]
                    and data["reference_answer"] == "Within 30 days."
                    and data["rubric"] == "The number of days must agree." for data in seen_inputs)
 
+    evaluation = report.observations["judging"]
+    assert evaluation["judge_calls_completed"] == evaluation["judge_calls_total"] == 4
+    assert evaluation["passed_requests"] == 1 and evaluation["failed_requests"] == 3
+    correctness = next(check for check in report.checks if check.id == "correctness")
+    assert correctness.metrics["request_pack"]["control_status"] == "pass"
+    assert correctness.status == "fail"
+    assert report.abort_reason is None and report.observations["request_budget_used"] == 4
+    assert all(record.valid and record.judgement for record in report.requests)
+
+
+def test_reference_judging_has_separate_budget_and_does_not_extend_arrival_measurements(monkeypatch):
+    """The real scheduler and judge phase share a deterministic clock, not a budget."""
+    from giraffe import judging, runner
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    inference_finished, judge_started = [], []
+
+    class TimedClient:
+        def __init__(self, target, config, *, max_connections=None):
+            self.target = target
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def execute(self, spec, **kwargs):
+            began = runner.time.monotonic()
+            if self.target.name == "reviewer":
+                assert len(inference_finished) == 4
+                judge_started.append(began)
+                await asyncio.sleep(.09)
+                data = json.loads(spec.messages[-1]["content"])
+                output = json.dumps({"verdict": "thirty" in data["generated_answer"],
+                                     "reason": "Compared the reference duration."})
+            else:
+                await asyncio.sleep(.005)
+                output = "Within thirty days." if spec.scenario == "pack_control" else "Within 60 days."
+                inference_finished.append(runner.time.monotonic())
+            elapsed = (runner.time.monotonic() - began) * 1000
+            return RequestRecord(
+                id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
+                scenario=spec.scenario, check_ids=spec.check_ids, started_at="now",
+                status="completed", valid=True, output=output, http_status=200,
+                elapsed_ms=elapsed, first_output_ms=elapsed, last_output_ms=elapsed,
+                finish_reason="stop", stream=False,
+            )
+
+    monkeypatch.setattr(runner, "LLMClient", TimedClient)
+    monkeypatch.setattr(judging, "LLMClient", TimedClient)
+    config = reference_judging_config(
+        SimpleNamespace(url="http://endpoint.invalid/v1"),
+        SimpleNamespace(url="http://judge.invalid/v1"), max_duration_seconds=.3)
+
+    async def scenario():
+        report = await runner.run_suite(config)
+        assert len(report.requests) == len({record.id for record in report.requests}) == 4
+        assert min(judge_started) >= max(inference_finished)
+        assert runner.time.monotonic() > config.max_duration_seconds
+        return report
+
+    report = run_virtual(monkeypatch, scenario())
     result = capacity(report)
     stage = result.metrics["points"][0]
     evaluation = report.observations["judging"]

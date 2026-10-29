@@ -213,9 +213,9 @@ def expanded_report_chunks(path: Path):
         report_format = metadata.pop("report_format", None)
         if has_inputs != (report_format == 2) or report_format not in (None, 2):
             raise ValueError("Unsupported saved report format")
-        # Old embedded summaries are ignored: exports always derive the current
-        # default selection from retained measurement evidence.
-        metadata.pop("performance", None)
+        # Schema-4 default summaries remain authoritative across code upgrades.
+        # RunReport migrates v2/v3 display caches, fills missing legacy blocks
+        # and supplies the raw request series.
         header = RunReport.model_validate({**metadata, "requests": measurements})
         yield header.model_dump_json(exclude={"requests"})[:-1] + ',"requests":['
         handle.seek(0)

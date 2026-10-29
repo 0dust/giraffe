@@ -3,22 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import logging
 import os
+import queue
 import re
 import shutil
+import selectors
+import struct
+import subprocess
+import sys
 import socket
 import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
-from contextlib import asynccontextmanager, closing
+from concurrent.futures import Future, InvalidStateError
+from contextvars import copy_context
+from copy import deepcopy
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Annotated, Literal
+from time import perf_counter
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -52,8 +64,359 @@ from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
 from giraffe.resources import PhaseSampler, SAMPLING
 from giraffe.runner import run_suite
+from giraffe.runner import record_sink
+from giraffe.diagnostics import configure_logging, run_logging
+from giraffe.evidence import EvidenceWriter, recover_evidence
 from giraffe.storage import (DEFAULT_LIMITS, apply_cleanup, automatic_cleanup, check_start, cleanup_plan,
-                             is_giraffe_run, run_alive, run_size, set_kept, storage_summary)
+                             is_giraffe_run, run_alive, run_size, set_kept, storage_summary,
+                             Heartbeat, write_metadata, metadata_lock as storage_metadata_lock)
+
+
+logger = logging.getLogger(__name__)
+_EVENT_WAIT_SECONDS = 10.0
+_RECOVERY_SECONDS = 5.0
+_FINALIZE_SECONDS = 12.0
+_PARTIAL_REPORT_SECONDS = 30.0
+_DELTA_WINDOW = 16384
+_REPORT_CACHE_BYTES = 256 * 1024 * 1024
+_ISOLATED_REPORT_BYTES = 256 * 1024
+_IN_REPORT_PROCESS = False
+
+
+@contextmanager
+def _measurement_gc():
+    """Keep the pre-run heap out of GC scans and attribute remaining pauses."""
+    thresholds = gc.get_threshold()
+    already_frozen = bool(gc.get_freeze_count())
+    gc.collect()
+    if not already_frozen:
+        gc.freeze()
+    pauses = {"gc_pause_count": 0, "gc_pause_total_ms": 0.0, "gc_pause_max_ms": 0.0}
+    began = None
+    def collected(phase, info):
+        nonlocal began
+        if phase == "start":
+            began = perf_counter()
+        elif began is not None:
+            elapsed = (perf_counter() - began) * 1000
+            pauses["gc_pause_count"] += 1
+            pauses["gc_pause_total_ms"] += elapsed
+            pauses["gc_pause_max_ms"] = max(pauses["gc_pause_max_ms"], elapsed)
+            began = None
+    gc.set_threshold(thresholds[0], thresholds[1], max(thresholds[2], 1_000_000))
+    gc.callbacks.append(collected)
+    try:
+        yield pauses
+    finally:
+        gc.callbacks.remove(collected)
+        gc.set_threshold(*thresholds)
+        if not already_frozen:
+            gc.unfreeze()
+
+
+def _helper_response_cost(value):
+    # Transient 404/500 responses must not survive until the file changes.
+    return len(value[1]) if value[0] == 200 else _REPORT_CACHE_BYTES + 1
+
+
+class _ReportCache:
+    def __init__(self):
+        self.entries = OrderedDict()
+        self.bytes = 0
+        self.lock = threading.RLock()
+        self.inflight = {}
+        self.generation = 0
+
+    def get(self, key, cost, factory):
+        with self.lock:
+            if key in self.entries:
+                self.entries.move_to_end(key)
+                return self.entries[key][1]
+            generation = self.generation
+            flight_key = (generation, key)
+            pending = self.inflight.get(flight_key)
+            owner = pending is None
+            if owner:
+                pending = self.inflight[flight_key] = Future()
+        if not owner:
+            return pending.result()
+        try:
+            value = factory()
+            size = cost(value) if callable(cost) else cost
+            with self.lock:
+                if generation == self.generation and size <= _REPORT_CACHE_BYTES:
+                    while self.entries and self.bytes + size > _REPORT_CACHE_BYTES:
+                        _, (removed, _) = self.entries.popitem(last=False)
+                        self.bytes -= removed
+                    self.entries[key] = (size, value)
+                    self.bytes += size
+            pending.set_result(value)
+            return value
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        finally:
+            with self.lock:
+                self.inflight.pop(flight_key, None)
+
+    def clear(self):
+        with self.lock:
+            self.entries.clear()
+            self.bytes = 0
+            self.generation += 1
+
+
+_report_cache = _ReportCache()
+
+
+def _file_revision(path):
+    stat = path.stat()
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns
+
+
+def _json_response(value):
+    return Response(json.dumps(value, ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":")).encode(), media_type="application/json")
+
+
+def _cached_json_response(key, factory):
+    content = _report_cache.get(key, len, lambda: _json_response(factory()).body)
+    return Response(content, media_type="application/json")
+
+
+def _close_report_process(process):
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+    finally:
+        process.stdin.close()
+        process.stdout.close()
+
+
+class _ReportProcess:
+    """Isolate large cold parses/JSON encoding from the measurement thread's GIL."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.process = None
+        self.release = None
+
+    def close(self):
+        self.process = None
+        if self.release is not None:
+            self.release()
+            self.release = None
+
+    def read(self, root, identifier, kind, target=None, window=None):
+        with self.lock:
+            if self.process is None or self.process.poll() is not None:
+                self.close()
+                self.process = subprocess.Popen([sys.executable, "-c",
+                    "import os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
+                    "os.dup2(2,1); sys.stdout=sys.stderr; "
+                    "from giraffe.web import _report_process_main; _report_process_main(protocol)"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.release = weakref.finalize(self, _close_report_process, self.process)
+            process = self.process
+            try:
+                process.stdin.write((json.dumps([str(root), identifier, kind, target, window,
+                                                 _REPORT_CACHE_BYTES]) + "\n").encode())
+                process.stdin.flush()
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    size = (root / identifier / "report.json").stat().st_size
+                    deadline = time.monotonic() + 30 + size / (10 * 1024**2)
+                    def read_exact(size):
+                        chunks = []
+                        while size:
+                            if not selector.select(max(0, deadline - time.monotonic())):
+                                raise HTTPException(504, "Report too large to open in the UI within "
+                                                    "its time limit; use giraffe report.")
+                            chunk = os.read(process.stdout.fileno(), min(size, 64 * 1024))
+                            if not chunk:
+                                raise RuntimeError("Report reader stopped")
+                            chunks.append(chunk)
+                            size -= len(chunk)
+                        return b"".join(chunks)
+                    status, length = struct.unpack("!II", read_exact(8))
+                    return status, read_exact(length)
+            except BaseException:
+                self.close()
+                raise
+
+
+def _report_process_main(protocol):
+    global _IN_REPORT_PROCESS, _REPORT_CACHE_BYTES
+    import httpx
+    _IN_REPORT_PROCESS = True
+    apps = OrderedDict()
+    async def read(root, identifier, kind, target, window):
+        if root not in apps:
+            apps[root] = create_app(Path(root))
+            if len(apps) > 2:
+                apps.popitem(last=False)
+        path = f"/api/runs/{identifier}" + ("/performance" if kind == "performance" else "")
+        params = {key: value for key, value in (("target", target), ("window", window)) if value is not None}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=apps[root]),
+                                     base_url="http://localhost") as client:
+            response = await client.get(path, params=params)
+            return response.status_code, response.content
+    with asyncio.Runner() as runner:
+        for line in sys.stdin.buffer:
+            root, identifier, kind, target, window, budget = json.loads(line)
+            _REPORT_CACHE_BYTES = budget
+            if not budget:
+                _report_cache.clear()
+                apps.clear()
+            status, body = runner.run(read(root, identifier, kind, target, window))
+            protocol.write(struct.pack("!II", status, len(body)))
+            protocol.write(body)
+            protocol.flush()
+
+
+class _RunLoop:
+    """Application-owned measurement loop, reused across sequential runs."""
+    def __init__(self):
+        self.jobs = queue.Queue(maxsize=1)
+        self.closing = threading.Event()
+        self.lock = threading.Lock()
+        self.thread = None
+        self.current = None
+
+    def busy(self):
+        with self.lock:
+            if self.thread is not None and not self.thread.is_alive():
+                return False
+            return self.current is not None or not self.jobs.empty()
+
+    def submit(self, worker):
+        with self.lock:
+            if self.closing.is_set():
+                raise RuntimeError("The run loop is shutting down")
+            if self.thread is not None and not self.thread.is_alive():
+                logger.error("Measurement thread died; restarting it")
+                if self.current is not None and not self.current.future.done():
+                    self.current.future.set_exception(RuntimeError("Measurement thread died"))
+                self.current = None
+                self.thread = None
+                while not self.jobs.empty():
+                    abandoned = self.jobs.get_nowait()
+                    if not abandoned.future.done():
+                        abandoned.future.set_exception(RuntimeError("Measurement thread died"))
+                    self.jobs.task_done()
+            if self.current is not None or not self.jobs.empty():
+                raise RuntimeError("Previous run still stopping")
+            self.jobs.put_nowait(worker)
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, name="giraffe-run", daemon=True)
+                self.thread.start()
+            worker.thread = self.thread
+
+    def close(self):
+        with self.lock:
+            self.closing.set()
+            current = self.current
+            thread = self.thread
+        if current is not None:
+            current.request_stop(cancel=True)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
+    def _run(self):
+        with asyncio.Runner() as runner:
+            while True:
+                try:
+                    worker = self.jobs.get(timeout=.1)
+                except queue.Empty:
+                    if self.closing.is_set():
+                        return
+                    continue
+                with self.lock:
+                    self.current = worker
+                    closing = self.closing.is_set()
+                try:
+                    if closing:
+                        worker.future.cancel()
+                    else:
+                        worker._run(runner)
+                finally:
+                    with self.lock:
+                        self.current = None
+                    self.jobs.task_done()
+                    if worker.owns_loop:
+                        self.closing.set()
+
+
+class _RunThread:
+    """One measured job; only thread-safe signals cross the loop boundary."""
+    def __init__(self, operation, *, owner=None):
+        self.future = Future()
+        self.loop = None
+        self.task = None
+        self.stop = None
+        self.stopping = threading.Event()
+        self.cancelling = threading.Event()
+        self.cancel_delivered = False
+        self.operation = operation
+        self.thread = None
+        self.context = None
+        self.owns_loop = owner is None
+        self.owner = owner if owner is not None else _RunLoop()
+
+    def start(self):
+        self.context = copy_context()
+        self.owner.submit(self)
+
+    def request_stop(self, *, cancel=False):
+        self.stopping.set()
+        if cancel:
+            self.cancelling.set()
+        loop = self.loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._signal)
+            except RuntimeError:
+                pass  # The loop finished between checking and signalling.
+
+    def _signal(self):
+        self.stop.set()
+        if self.cancelling.is_set() and not self.cancel_delivered:
+            self.cancel_delivered = True
+            self.task.cancel()
+
+    def _run(self, runner):
+        async def run():
+            self.stop = asyncio.Event()
+            self.loop = asyncio.get_running_loop()
+            self.task = asyncio.create_task(self.operation(self.stop))
+            if self.stopping.is_set():
+                self.loop.call_soon(self._signal)
+            return await self.task
+        if not self.future.set_running_or_notify_cancel():
+            return
+        try:
+            result = runner.run(run(), context=self.context)
+        except BaseException as error:
+            try:
+                self.future.set_exception(error)
+            except InvalidStateError:
+                logger.exception("Run future already completed while delivering its failure")
+        else:
+            try:
+                self.future.set_result(result)
+            except InvalidStateError:
+                logger.exception("Run future already completed while delivering its result")
+
+
+def _completion_future(future):
+    wrapped = asyncio.wrap_future(future)
+    # A shielded waiter may time out or be cancelled before the worker fails.
+    wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    return wrapped
 
 
 def _config_input(value, handler):
@@ -131,7 +494,10 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
         while len(preparations) > 64:
             preparations.popitem(last=False)
     if not event["event"].startswith("condition_"):
-        job["progress"] = event
+        if not event["event"].startswith("check_") and event["event"] != "run_finished":
+            if "partial_report_deadline" in job:
+                event.update(phase="saving_partial_report", message="Saving partial report…")
+            job["progress"] = event
         job["events"].append(event)
         del job["events"][:-MAX_LIVE_EVENTS]
     index = job.get("condition_requests")
@@ -280,9 +646,11 @@ def _now() -> str:
 
 
 def _write(path: Path, value: dict) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
-    temporary.replace(path)
+    if path.name == ".web.json":
+        write_metadata(path.parent, value)
+    else:
+        from .reporting import _atomic_write_chunks
+        _atomic_write_chunks(path, (json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n",))
 
 
 def _read(path: Path) -> dict:
@@ -347,12 +715,20 @@ def _report(path: Path) -> RunReport:
     if path.is_symlink():
         raise HTTPException(404, "Report unavailable")
     try:
-        return RunReport.model_validate_json(path.read_text())
+        return _parsed_report(str(path), *_file_revision(path))
     except (OSError, ValueError) as exc:
         message = "Report unavailable or unreadable"
         if "SHA-256 mismatch" in str(exc):
             message += ": saved input SHA-256 mismatch"
         raise HTTPException(404, message) from exc
+
+
+def _parsed_report(path: str, modified: int, size: int, inode: int, changed: int) -> RunReport:
+    return _report_cache.get(("parsed", path, modified, size, inode, changed), max(size * 16, 1024),
+        lambda: RunReport.model_validate_json(Path(path).read_text()))
+
+
+_parsed_report.cache_clear = _report_cache.clear
 
 
 class _WorkerCompletion(asyncio.Future):
@@ -446,6 +822,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                min_free_disk: int = DEFAULT_LIMITS["min_free_disk"],
                max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
                auto_cleanup: dict | None = None) -> FastAPI:
+    configure_logging()
     limits = {"max_total_storage": max_total_storage, "min_free_disk": min_free_disk,
               "max_run_storage": max_run_storage}
     if any(type(value) is not int or value < 0 for value in limits.values()):
@@ -456,13 +833,48 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     if baseline_root.is_symlink():
         raise ValueError("Baseline directory cannot be a symlink")
     active: dict = {}
+    run_loop = _RunLoop()
+    report_process = _ReportProcess()
+    # Completed feeds remain briefly addressable for the final long poll. Full
+    # detail on disk is the reset source after a restart or feed eviction.
+    feeds: OrderedDict[str, dict] = OrderedDict()
     start_lock = asyncio.Lock()
+    recovery_pause = threading.Event()
     download_lock = asyncio.Lock()
     connection_pending = False
     unsaved_metadata: dict[str, dict] = {}
-    metadata_lock = threading.RLock()
+    metadata_lock = storage_metadata_lock
     last_auto_cleanup: dict = {}
     observation_cache: dict = {}
+
+    def live_snapshot() -> dict:
+        if not active:
+            return {}
+        result = dict(active)
+        for key in ("requests", "conditions", "condition_plans", "live_preparations", "meta"):
+            result[key] = active[key].copy()
+        for key in ("events", "phases"):
+            result[key] = list(active[key])
+        return result
+
+    def publish(job: dict, event: dict, max_requests: int | None) -> None:
+        # Called exclusively on the server loop, including worker progress.
+        if job is not active or job.get("terminal"):
+            return
+        _track_live_progress(job, event, max_requests)
+        job["seq"] += 1
+        event = {key: value for key, value in event.items() if key != "performance"}
+        event["seq"] = job["seq"]
+        job["deltas"].append(event)
+        del job["deltas"][:-_DELTA_WINDOW]
+        if isinstance(event.get("check"), dict):
+            check = event["check"]
+            job["checks"][(check.get("target", event.get("target")), check.get("id"))] = check
+        job["changed"].set()
+
+    def api_report(path: str, modified: int, size: int, inode: int, changed: int) -> dict:
+        return _report_cache.get(("api", path, modified, size, inode, changed), max(size * 8, 1024),
+                                lambda: _api_report(_report(Path(path))))
 
     def preview_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | None = None,
                      validate: bool = False) -> dict:
@@ -500,13 +912,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     def save_metadata(directory: Path, meta: dict) -> None:
         with metadata_lock:
+            meta = dict(meta)
             try:
                 saved = _read(directory / ".web.json")
             except (OSError, ValueError):
                 saved = {}
             cached = unsaved_metadata.get(directory.name, {})
+            if (saved.get("state") in {"completed", "error", "interrupted"}
+                    and meta.get("state") in {"running", "stopping"}):
+                return  # A delayed stop/status write cannot resurrect a finished job.
             if "latency_summary" in saved:
                 meta["latency_summary"] = saved["latency_summary"]
+            if saved.get("heartbeat_at"):
+                meta["heartbeat_at"] = saved["heartbeat_at"]
             resources = merge_resources(meta.get("resources", {}), saved.get("resources", {}))
             resources = merge_resources(resources, cached.get("resources", {}))
             if resources:
@@ -534,51 +952,135 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except OSError:
                 pass  # Resource-only failures never cache a possibly stale lifecycle state.
 
-    def recover_interrupted() -> None:
+    def recover_interrupted(active_id=None) -> bool:
+        if active_id is not None or run_loop.busy() or disk_active_id() is not None:
+            return True
+        pending = False
         try:
             directories = list(root.iterdir())
         except (FileNotFoundError, NotADirectoryError):
-            return
+            return False
         for directory in directories:
+            if recovery_pause.is_set():
+                return True
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
             meta = metadata(directory)
-            if (meta.get("state") not in {"running", "stopping"} or run_alive(directory, meta)
-                    or not is_giraffe_run(directory, meta)):
+            interrupted = meta.get("state") == "interrupted" and (directory / "evidence.jsonl").is_file()
+            if (meta.get("state") not in {"running", "stopping"} and not interrupted
+                    or not is_giraffe_run(directory, meta) or directory.name == active_id):
+                continue
+            if not interrupted and run_alive(directory, meta):
+                pending = True
+                continue
+            if meta.get("recovery_retry_at", 0) > time.time():
+                pending = True
                 continue
             try:
                 saved = _report(directory / "report.json")
             except HTTPException:
+                if (directory / "summary.json").is_file():
+                    continue  # A final verdict summary owns this run's outcome.
                 meta.update(state="interrupted", finished_at=_now(),
                             error="The writer stopped before a complete report was saved.")
+                try:
+                    recovered = recover_evidence(directory, meta, pause=recovery_pause)
+                    if recovery_pause.is_set():
+                        return True
+                    if recovered is not None:
+                        write_report(recovered, directory, max_run_storage=max_run_storage)
+                        meta.update(run_id=recovered.run_id, error=recovered.abort_reason)
+                except Exception as error:
+                    attempts = meta.get("recovery_attempts", 0) + 1
+                    terminal = attempts >= 5
+                    pending = pending or not terminal
+                    error_id = uuid.uuid4().hex[:8]
+                    with run_logging(directory):
+                        if attempts == 1:
+                            logger.exception("Could not recover evidence [error %s]", error_id)
+                        else:
+                            logger.warning("Evidence recovery attempt %s failed (%s) [error %s]",
+                                           attempts, type(error).__name__, error_id)
+                    reason = ("disk full" if getattr(error, "errno", None) == 28 else type(error).__name__)
+                    meta.update(error_id=error_id, recovery_attempts=attempts,
+                        recovery_retry_at=time.time() + _RECOVERY_SECONDS * 2 ** (attempts - 1),
+                        error=f"Recovery failed: {reason} (attempt {attempts}/5). [error {error_id}]")
+                    if terminal:
+                        meta["state"] = "error"
             else:
-                meta.update(state="completed", finished_at=saved.finished_at, run_id=saved.run_id)
+                state = "interrupted" if saved.observations.get("interrupted") else "completed"
+                meta.update(state=state, finished_at=saved.finished_at, run_id=saved.run_id)
                 meta.pop("error", None)
             try:
                 save_metadata(directory, meta)
             except OSError:
+                pending = True
                 unsaved_metadata[directory.name] = meta
+        return pending
+
+    async def retry_recovery(pending):
+        while pending:
+            await asyncio.sleep(_RECOVERY_SECONDS)
+            if not active and not run_loop.busy() and not start_lock.locked():
+                recovery_pause.clear()
+                pending = await run_in_threadpool(recover_interrupted)
+
+    def saving_partial(job):
+        # One deadline covers shutdown and execute cancellation; retries must
+        # neither shorten report construction nor restart the waiting window.
+        if "partial_report_deadline" not in job:
+            count = max(job.get("live_request_count", 0), job.get("progress", {}).get("completed", 0))
+            job["partial_report_deadline"] = time.monotonic() + _PARTIAL_REPORT_SECONDS + min(90, count / 1000)
+        job["state"] = job["meta"]["state"] = "stopping"
+        # Preserve run counters without replaying a stale request/condition event.
+        job["progress"] = {key: value for key, value in job["progress"].items()
+                           if key in {"completed", "attempted", "elapsed_seconds"}}
+        job["progress"].update(event="saving_partial_report", phase="saving_partial_report",
+                               message="Saving partial report…", state="stopping")
+        publish(job, job["progress"], None)
+        job["meta"]["progress"] = job["progress"]
+        return max(0, job["partial_report_deadline"] - time.monotonic())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await run_in_threadpool(recover_interrupted)
-        yield
-        if active:
-            active["stop"].set()
-            task = active["task"]
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=_SHUTDOWN_SECONDS)
-            except TimeoutError:
-                task.cancel()
+        pending = await run_in_threadpool(recover_interrupted)
+        recovery = asyncio.create_task(retry_recovery(pending))
+        try:
+            yield
+        finally:
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
+            if active:
+                job = active
+                job["worker"].request_stop()
+                task = job["task"]
                 try:
-                    await asyncio.wait_for(task, timeout=2)
+                    await asyncio.wait_for(asyncio.shield(_completion_future(job["future"])), timeout=_SHUTDOWN_SECONDS)
                 except (TimeoutError, asyncio.CancelledError):
-                    pass
+                    saving_partial(job)
+                    await run_in_threadpool(save_metadata, job["directory"], job["meta"])
+                    job["worker"].request_stop(cancel=True)
+                except Exception:
+                    logger.exception("Run worker failed during server shutdown for %s", job["id"])
+                finally:
+                    remaining = (max(0, job["partial_report_deadline"] - time.monotonic())
+                                 if "partial_report_deadline" in job else _SHUTDOWN_SECONDS)
+                    done, _ = await asyncio.wait({task}, timeout=remaining)
+                    if not done:
+                        saving_partial(job)
+                        task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=_FINALIZE_SECONDS + 1)
+                    except (asyncio.CancelledError, TimeoutError):
+                        pass
+                    except Exception:
+                        logger.exception("Run finalization failed during shutdown for %s", job["id"])
+            await run_in_threadpool(run_loop.close)
+            await run_in_threadpool(report_process.close)
 
     app = FastAPI(title="Giraffe", docs_url=None, redoc_url=None, lifespan=lifespan)
 
-    @app.middleware("http")
-    async def local_mutations(request: Request, call_next):
+    def local_mutation_error(request):
         # Validate before request.url uses Host, for reads as well as mutations.
         hosts = request.headers.getlist("host")
         if len(hosts) != 1 or not _is_local_authority(hosts[0]):
@@ -597,13 +1099,48 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if request.headers.get("sec-fetch-site") == "cross-site" or not same_origin:
                 return JSONResponse({"detail": "Use the local Giraffe page to make changes"},
                                     status_code=403)
-        response = await call_next(request)
-        path = request.url.path
-        # Mutable frontend assets must revalidate across upgrades, including 304 responses.
-        if path == "/" or (path.startswith("/static/")
-                           and Path(path).suffix in {".html", ".css", ".js", ".mjs"}):
-            response.headers["Cache-Control"] = "no-cache"
-        return response
+        return None
+
+    class LocalRequests:
+        # A plain ASGI boundary avoids per-poll task groups/stream wrappers,
+        # whose debug stack capture competes with measured traffic for the GIL.
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return await self.app(scope, receive, send)
+            request = Request(scope)
+            error = local_mutation_error(request)
+            if error is not None:
+                return await error(scope, receive, send)
+            path = scope["path"]
+            revalidate = path == "/" or (path.startswith("/static/") and
+                Path(path).suffix in {".html", ".css", ".js", ".mjs"})
+            started = False
+            async def response_send(message):
+                nonlocal started
+                if message["type"] == "http.response.start":
+                    started = True
+                    if revalidate:
+                        headers = [(key, value) for key, value in message["headers"]
+                                   if key.lower() != b"cache-control"]
+                        message = {**message, "headers": [*headers, (b"cache-control", b"no-cache")]}
+                await send(message)
+            try:
+                await self.app(scope, receive, response_send)
+            except Exception as error:
+                error_id = uuid.uuid4().hex[:8]
+                exc_info = (type(error), error, error.__traceback__)
+                await run_in_threadpool(logger.error, "Web request failed [error %s]", error_id,
+                                        exc_info=exc_info)
+                if started:
+                    raise
+                response = JSONResponse({"detail": f"Request could not finish ({type(error).__name__}). [error {error_id}]",
+                                         "error_id": error_id}, status_code=500)
+                await response(scope, receive, send)
+
+    app.add_middleware(LocalRequests)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
@@ -611,20 +1148,33 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return JSONResponse({"detail": _configuration_errors(error.errors(), error.body)}, status_code=422)
 
     @lru_cache(maxsize=256)
-    def listing_report(path: str, modified: int, size: int) -> dict | None:
+    def listing_report(path: str, modified: int, size: int, inode: int, changed: int) -> dict | None:
         try:
-            saved = _report(Path(path))
-        except HTTPException:
+            from .report_stream import _Reader
+            result, count = {}, 0
+            with Path(path).open(encoding="utf-8") as stream:
+                reader = _Reader(stream)
+                for key in reader.members():
+                    if key == "requests":
+                        count = sum(1 for _ in reader.requests())
+                    else:
+                        value = reader.value()
+                        if key in {"run_id", "overall", "started_at", "finished_at", "abort_reason"}:
+                            result[key] = value
+                        elif key == "checks":
+                            result[key] = [{"status": check["status"]} for check in value]
+                        elif key == "manifest":
+                            result[key] = {"config": {"targets": _targets(value.get("config", {}))}}
+                        elif key == "baseline":
+                            result[key] = {"saved_baseline_id": value["saved_baseline_id"]} if (
+                                value and "saved_baseline_id" in value) else None
+                if reader.peek() or not result.get("run_id") or "overall" not in result:
+                    raise ValueError("Invalid report summary")
+            return {**result, "request_count": count}
+        except (OSError, ValueError, KeyError, TypeError):
             return None
-        return {"run_id": saved.run_id, "overall": saved.overall,
-                "started_at": saved.started_at, "finished_at": saved.finished_at,
-                "baseline": {"saved_baseline_id": saved.baseline["saved_baseline_id"]}
-                if saved.baseline and "saved_baseline_id" in saved.baseline else None,
-                "request_count": len(saved.requests),
-                "checks": [{"status": check.status} for check in saved.checks],
-                "manifest": {"config": {"targets": _targets(saved.manifest.get("config", {}))}}}
 
-    def run_detail(identifier: str, *, listing: bool = False) -> dict:
+    def run_detail(identifier: str, *, listing: bool = False, snapshot: dict | None = None) -> dict:
         directory = _directory(root, identifier)
         meta = metadata(directory)
         report_path = directory / "report.json"
@@ -643,15 +1193,15 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if report_path.is_file() and summary is None:
             try:
                 if listing:
-                    stat = report_path.stat()
-                    persisted = listing_report(str(report_path), stat.st_mtime_ns, stat.st_size)
+                    persisted = listing_report(str(report_path), *_file_revision(report_path))
                     if persisted is None:
                         raise HTTPException(404, "Saved report is unreadable")
                 else:
-                    persisted = _api_report(_report(report_path))
+                    persisted = dict(api_report(str(report_path), *_file_revision(report_path)))
             except (HTTPException, FileNotFoundError, NotADirectoryError):
                 meta = {**meta, "state": "error", "error": "Saved report is unreadable."}
-        live = active if active.get("id") == identifier else {}
+        snapshot = snapshot or {}
+        live = snapshot if snapshot.get("id") == identifier else {}
         state = live.get("state", meta.get("state", "completed"))
         condition_rows = list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", [])
         if not listing:
@@ -660,14 +1210,21 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 reason=(persisted or {}).get("abort_reason") or meta.get("error"))
             if persisted is not None:
                 persisted["conditions"] = condition_rows
+        if summary and meta.get("error_id") and meta.get("error") and meta["error_id"] not in meta["error"]:
+            meta = {**meta, "error": meta["error"] + f' [error {meta["error_id"]}]'}
         return {"id": identifier, "state": state,
-                "error": meta.get("error"), "progress": live.get("progress", meta.get("progress", {})),
+                "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
+                "error": meta.get("error"), "error_id": meta.get("error_id"),
+                "seq": live.get("seq", meta.get("seq", 0)),
+                "progress": live.get("progress", meta.get("progress", {})),
                 "events": live.get("events", meta.get("events", [])),
                 "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
                 "live_requests": list(live.get("requests", {}).values()),
                 "live_request_summary": live.get("live_request_summary", meta.get("live_request_summary", {})),
                 "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
                 "live_conditions": condition_rows,
+                "live_checks": list(live.get("checks", {}).values()),
+                "stoppable": bool(live) and state in {"running", "stopping"},
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
@@ -680,18 +1237,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     # Two selections per run, four runs total. Cache derived values only, never
     # expanded retained request evidence. File identity invalidates saved values.
     performance_cache = OrderedDict()
+    performance_lock = threading.Lock()
+    baseline_lock = threading.Lock()
 
-    def selected_performance(identifier, target=None, window=None):
+    def selected_performance(identifier, target=None, window=None, snapshot=None):
         from .performance import build_performance
 
         directory = _directory(root, identifier)
-        live = active if active.get("id") == identifier and active.get("state") in {"running", "stopping"} else None
+        live = snapshot if snapshot and snapshot.get("id") == identifier and snapshot.get("state") in {"running", "stopping"} else None
         path = directory / "report.json"
         if live is None:
             if path.is_symlink() or not path.is_file():
                 raise HTTPException(404, "Report is not available")
-            stat = path.stat()
-            revision = (stat.st_mtime_ns, stat.st_size)
+            revision = _file_revision(path)
         else:
             revision = "live"
         cached = performance_cache.get(identifier)
@@ -749,7 +1307,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return value
 
     @lru_cache(maxsize=8)
-    def saved_condition_requests(path: str, modified: int, size: int) -> ConditionRequestIndex:
+    def saved_condition_requests(path: str, modified: int, size: int, inode: int, changed: int) -> ConditionRequestIndex:
         return ConditionRequestIndex.from_report(_report(Path(path)))
 
     def run_summary(detail: dict) -> dict:
@@ -757,7 +1315,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         counts = dict.fromkeys(("pass", "fail", "inconclusive", "skipped", "blocked"), 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
-        return {key: detail[key] for key in ("id", "state", "error", "progress", "baseline_id",
+        return {key: detail[key] for key in ("id", "state", "error", "abort_reason", "progress", "baseline_id",
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
@@ -781,25 +1339,75 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return sorted(rows, key=lambda item: item.get("saved_at", ""), reverse=True)
 
     async def execute(job: dict, config: RunConfig, baseline: RunReport | None) -> None:
-        meta = job["meta"]
-        finished = False
+        nonlocal active
+        try:
+            with run_logging(job["directory"]):
+                try:
+                    await execute_logged(job, config, baseline)
+                except Exception as error:
+                    error_id = uuid.uuid4().hex[:8]
+                    logger.exception("Run finalization failed [error %s]", error_id)
+                    job["meta"].update(state="error", finished_at=_now(), error_id=error_id,
+                        error=f"Run finalization failed ({type(error).__name__}). [error {error_id}]")
+        finally:
+            # No await may separate terminal publication from releasing the run.
+            # A second cancellation cannot strand the next POST behind a 409.
+            if job["meta"].get("state") in {"running", "stopping"}:
+                job["meta"] = {**job["meta"], "state": "interrupted", "finished_at": _now()}
+            job["state"] = job["meta"]["state"]
+            try:
+                if job is active:
+                    try:
+                        publish(job, {"event": "run_finished", "state": job["state"],
+                                      "abort_reason": job["meta"].get("abort_reason"),
+                                      "error": job["meta"].get("error"), "error_id": job["meta"].get("error_id")}, config.max_requests)
+                    except Exception:
+                        logger.exception("Could not publish final status for %s", job["id"])
+                job["terminal"] = True
+                for identifier, feed in list(feeds.items()):
+                    if identifier != job["id"] and feed.get("terminal"):
+                        del feeds[identifier]
+                feeds[job["id"]] = {key: job[key] for key in (
+                    "id", "state", "meta", "seq", "deltas", "changed", "terminal", "checks",
+                    "progress", "phases", "live_preparations", "live_request_count", "live_request_summary")}
+            except Exception:
+                logger.exception("Could not retain terminal feed for %s", job["id"])
+            finally:
+                if active is job:
+                    active = {}
+                if job["worker"].thread is None and not job["future"].done():
+                    job["future"].set_result(None)
+
+    async def execute_logged(job: dict, config: RunConfig, baseline: RunReport | None) -> None:
+        meta = dict(job["meta"])
         cancelled = None
+        writer = None
+        heartbeat = None
+        writer_close_attempted = False
+        stop_wait_attempted = False
+        condition_rows = []
+        export_error_id = None
+        server_loop = asyncio.get_running_loop()
 
         def progress(event: dict) -> None:
-            if finished:
-                return
-            _track_live_progress(job, event, config.max_requests)
+            # Completed request payloads are newly dumped, owned dictionaries.
+            # Lifecycle dictionaries still share nested counters with the runner.
+            event = dict(event)
+            for key in ("condition", "condition_summary", "preparation"):
+                if key in event:
+                    event[key] = deepcopy(event[key])
+            writer.progress(event)
+            try:
+                server_loop.call_soon_threadsafe(publish, job, event, config.max_requests)
+            except RuntimeError:
+                logger.debug("Server loop closed before progress delivery for %s", job["id"])
 
-        try:
-            report = await run_suite(config, progress=progress, stop_event=job["stop"])
+        def export(report):
             report.manifest["invocation"] = {"source": "web_api", "argv": None}
             report.manifest["open_files"] = job["open_files"]
             if baseline is not None:
                 report = compare_baseline(report, baseline)
-            # Persist the same condition cohort shown while live, including
-            # work a stop/budget never reached. These are report observations,
-            # not executor counters or invented request records.
-            merged = _merged_condition_rows(list(job["conditions"].values()), report.conditions,
+            merged = _merged_condition_rows(condition_rows, report.conditions,
                 terminal=True, reason=report.abort_reason)
             targets = report.observations.setdefault("targets", {})
             for target in config.targets:
@@ -807,85 +1415,217 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     {**row, "status": row["lifecycle_status"]}
                     for row in merged if row.get("target") == target.name]
             report.conditions = aggregate_conditions(report)
-            meta["run_id"] = report.run_id
             sampler = PhaseSampler("export")
             try:
-                with sampler, metadata_lock:
-                    write_report(report, job["directory"], max_run_storage=max_run_storage)
+                with sampler:
+                    write_report(report, job["directory"], max_run_storage=max_run_storage,
+                                 preserve_evidence=writer is not None and not writer.stopped)
             except OSError as error:
+                logger.exception("Report export failed [error %s]", export_error_id)
                 if getattr(error, "json_complete", False):
-                    meta.update(state="completed", finished_at=_now(), error=html_failure_warning(error))
+                    result = dict(state="completed", finished_at=_now(), error=html_failure_warning(error))
                 else:
                     message = save_failure_summary(report, job["directory"], error)
-                    meta.update(state="error", finished_at=_now(), error=message)
+                    result = dict(state="error", finished_at=_now(), error=message)
+                result["error_id"] = export_error_id
+                result["error"] += f" [error {export_error_id}]"
             else:
-                meta.update(state="completed", finished_at=_now())
-            finally:
-                meta["resources"] = {"sampled_peak_rss_bytes": dict(sampler.peaks),
-                                     "memory_measurement": "unavailable" if sampler.peaks.get("export") is None else "sampled process RSS",
-                                     "sampling": SAMPLING}
+                result = dict(state="completed", finished_at=_now())
+            result.update(run_id=report.run_id, abort_reason=report.abort_reason, resources={
+                "sampled_peak_rss_bytes": dict(sampler.peaks),
+                "memory_measurement": "unavailable" if sampler.peaks.get("export") is None else "sampled process RSS",
+                "sampling": SAMPLING})
+            return result
+
+        try:
+            writer = await run_in_threadpool(EvidenceWriter, job["directory"],
+                manifest={"config": safe_config(config.model_dump(mode="json"))},
+                started_at=meta["started_at"])
+            heartbeat = await run_in_threadpool(lambda: Heartbeat(job["directory"]).start())
+
+            async def measured(stop):
+                nonlocal writer_close_attempted
+                token = record_sink.set(writer.record_finished)
+                report = None
+                cancellation = None
+                try:
+                    with _measurement_gc() as pauses:
+                        try:
+                            report = await run_suite(config, progress=progress, stop_event=stop)
+                        except asyncio.CancelledError as error:
+                            report = getattr(error, "giraffe_report", None)
+                            if report is None:
+                                raise
+                            cancellation = error
+                    report.observations.setdefault("client_timing_health", {}).update(pauses)
+                    for check in report.checks:
+                        progress({"event": "check_finished", "target": check.target,
+                                  "check": check.model_dump(mode="json")})
+                    # Pass the exception as data: asyncio may replace a task's
+                    # CancelledError when it crosses a Future/loop boundary.
+                finally:
+                    record_sink.reset(token)
+                    # The producer owns the journal through terminal request
+                    # handling and report construction. Server timeout must not
+                    # close it while this engine can still append records.
+                    writer_close_attempted = True
+                    try:
+                        _, close_cancel = await _finish_shielded(asyncio.create_task(asyncio.to_thread(writer.close)))
+                        cancellation = cancellation or close_cancel
+                    except Exception:
+                        error_id = uuid.uuid4().hex[:8]
+                        logger.exception("Evidence writer failed; exporting final report [error %s]", error_id)
+                        if report is not None:
+                            report.warnings.append(f"Live evidence journal failed [error {error_id}]; final report assembled from completed run state.")
+                return report, cancellation
+
+            async def finish_report(report):
+                nonlocal condition_rows, export_error_id
+                report.observations["evidence_dropped_count"] = writer.dropped_count
+                if writer.dropped_count:
+                    report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
+                condition_rows = list(job["conditions"].values())
+                export_error_id = uuid.uuid4().hex[:8]
+                meta.update(await run_in_threadpool(export, report))
+
+            worker = job["worker"]
+            worker.operation = measured
+            worker.start()
+            waiting = _completion_future(worker.future)
+            try:
+                report, engine_cancel = await asyncio.shield(waiting)
+            except asyncio.CancelledError as error:
+                cancelled = error
+                stop_wait_attempted = True
+                worker.request_stop(cancel=True)
+                remaining = saving_partial(job)
+                meta.update(state="stopping", progress=job["progress"])
+                await run_in_threadpool(save_metadata, job["directory"], meta)
+                # Validators may synchronously build a large partial report.
+                done, _ = await asyncio.wait({waiting}, timeout=remaining)
+                if not done:
+                    raise
+                report, engine_cancel = waiting.result()
+            cancelled = engine_cancel or cancelled
+            if cancelled is not None and not report.abort_reason:
+                report.abort_reason = "run cancelled"
+            # Export has one owner even if shutdown cancels execute during disk
+            # I/O. Finish that export before finalizing metadata and re-raising.
+            _, export_cancel = await _finish_shielded(asyncio.create_task(finish_report(report)))
+            cancelled = cancelled or export_cancel
         except asyncio.CancelledError as error:
             cancelled = error
-            meta.update(state="interrupted", finished_at=_now(),
-                        error="The local server stopped before a report was saved.")
-        except Exception as error:
-            # The exception message may include endpoint content, headers, or credentials.
-            meta.update(state="error", finished_at=_now(),
-                        error=f"Run could not finish ({type(error).__name__}). Review the configuration and retry.")
-        finally:
-            finished = True
-            meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
-                        live_preparations=list(job.get("live_preparations", {}).values()),
-                        conditions=list(job["conditions"].values()),
-                        live_request_summary=job["live_request_summary"],
-                        live_request_count=job["live_request_count"])
-            status_warning_added = False
-
-            def persist_final():
-                nonlocal status_warning_added
-                warning = "Run status could not be saved to disk."
-                with metadata_lock:
-                    payload = dict(meta)
-                    if status_warning_added:
-                        error = (payload.get("error") or "").removesuffix(warning).strip()
-                        if error:
-                            payload["error"] = error
-                        else:
-                            payload.pop("error", None)
+            if not stop_wait_attempted:
+                job["worker"].request_stop(cancel=True)
+                if job["worker"].thread is not None:
                     try:
-                        save_metadata(job["directory"], payload)
-                    except OSError:
-                        if warning not in (meta.get("error") or ""):
-                            meta["error"] = ((meta.get("error") or "") + " " + warning).strip()
-                            status_warning_added = True
-                        unsaved_metadata[job["id"]] = meta
-                    else:
-                        meta.clear()
-                        meta.update(payload)
-                        status_warning_added = False
-                        unsaved_metadata.pop(job["id"], None)
+                        waiting = _completion_future(job["future"])
+                        await asyncio.wait({waiting}, timeout=2)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Run failed while stopping %s", job["id"])
+            meta.update(state="interrupted", finished_at=_now(),
+                        error="The local server stopped before a report was saved. Recorded evidence will be recovered on the next start.")
+        except Exception as error:
+            error_id = uuid.uuid4().hex[:8]
+            logger.exception("Run could not finish [error %s]", error_id)
+            meta.update(state="error", finished_at=_now(), error_id=error_id,
+                        error=f"Run could not finish ({type(error).__name__}). Review the configuration and retry. [error {error_id}]")
+        finally:
+            async def finalize():
+                nonlocal cancelled
+                if (writer is not None and not writer_close_attempted
+                        and (job["worker"].thread is None or job["future"].done())):
+                    try:
+                        await run_in_threadpool(writer.close)
+                    except Exception:
+                        logger.exception("Could not close evidence writer for %s", job["id"])
+                if writer is not None:
+                    meta["evidence_dropped_count"] = writer.dropped_count
+                meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
+                            live_preparations=list(job.get("live_preparations", {}).values()),
+                            conditions=list(job["conditions"].values()),
+                            live_request_summary=job["live_request_summary"],
+                            live_request_count=job["live_request_count"])
+                status_warning_added = False
+
+                def persist_final():
+                    nonlocal status_warning_added
+                    warning = "Run status could not be saved to disk."
+                    with metadata_lock:
+                        payload = dict(meta)
+                        if status_warning_added:
+                            error = (payload.get("error") or "").removesuffix(warning).strip()
+                            if error:
+                                payload["error"] = error
+                            else:
+                                payload.pop("error", None)
+                        try:
+                            save_metadata(job["directory"], payload)
+                        except OSError:
+                            logger.exception("Could not save final status for %s", job["id"])
+                            if warning not in (meta.get("error") or ""):
+                                meta["error"] = ((meta.get("error") or "") + " " + warning).strip()
+                                status_warning_added = True
+                            unsaved_metadata[job["id"]] = dict(meta)
+                        else:
+                            meta.clear()
+                            meta.update(payload)
+                            status_warning_added = False
+                            unsaved_metadata.pop(job["id"], None)
+
+                try:
+                    await run_in_threadpool(persist_final)
+                    if policy and cancelled is None:
+                        try:
+                            task = asyncio.create_task(run_in_threadpool(
+                                automatic_cleanup, root, policy, active_id=job["id"]))
+                            result, cleanup_cancelled = await _finish_shielded(task)
+                            cancelled = cleanup_cancelled or cancelled
+                        except Exception as error:
+                            logger.exception("Automatic cleanup failed for %s", job["id"])
+                            result = {"deleted": [], "error": f"Automatic cleanup failed ({type(error).__name__})."}
+                        meta.update(auto_cleanup=result, auto_cleanup_policy=policy)
+                        last_auto_cleanup.clear()
+                        last_auto_cleanup.update(result)
+                finally:
+                    try:
+                        # Persist the completion cursor before waking the final poll.
+                        meta["seq"] = job["seq"] + 1
+                        await run_in_threadpool(persist_final)
+                    finally:
+                        if heartbeat is not None:
+                            await run_in_threadpool(heartbeat.close)
+
+            async def bounded_finalize():
+                cleanup = asyncio.create_task(finalize())
+                done, _ = await asyncio.wait({cleanup}, timeout=_FINALIZE_SECONDS)
+                if not done:
+                    cleanup.cancel()
+                    cleanup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+                    logger.error("Run finalization exceeded its time limit for %s", job["id"])
+                else:
+                    cleanup.result()
 
             try:
-                # Publish the result before cleanup can block or be cancelled.
-                persist_final()
-                if policy and cancelled is None:
-                    try:
-                        task = asyncio.create_task(run_in_threadpool(
-                            automatic_cleanup, root, policy, active_id=job["id"]))
-                        result, cleanup_cancelled = await _finish_shielded(task)
-                        cancelled = cleanup_cancelled or cancelled
-                    except Exception as error:
-                        result = {"deleted": [], "error": f"Automatic cleanup failed ({type(error).__name__})."}
-                    meta.update(auto_cleanup=result, auto_cleanup_policy=policy)
-                    last_auto_cleanup.clear()
-                    last_auto_cleanup.update(result)
+                _, final_cancel = await _finish_shielded(asyncio.create_task(bounded_finalize()))
+                cancelled = cancelled or final_cancel
             finally:
-                try:
-                    persist_final()
-                finally:
-                    active.clear()
-            if cancelled is not None:
-                raise cancelled
+                job["meta"] = dict(meta)
+                job["state"] = meta["state"]
+        if cancelled is not None:
+            raise cancelled
+
+    def disk_active_id():
+        candidates = []
+        for directory in root.iterdir() if root.exists() else ():
+            if (directory.is_dir() and not directory.is_symlink() and not directory.name.startswith(".")
+                    and directory.name != active.get("id")):
+                meta = metadata(directory)
+                if meta.get("state") in {"running", "stopping"} and run_alive(directory, meta):
+                    candidates.append((meta.get("started_at", ""), directory.name))
+        return max(candidates, default=("", None))[1]
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -896,7 +1636,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         _, combined_notes = migrate_load_test(migrated_defaults)
         return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
                 "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
-                "active_run_id": active.get("id"), "request_plan": preview_plan(resolved)}
+                "active_run_id": active.get("id"), "disk_active_id": await run_in_threadpool(disk_active_id), "request_plan": await run_in_threadpool(preview_plan, resolved)}
 
     @app.get("/api/capabilities")
     async def describe_capabilities():
@@ -914,10 +1654,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if active:
                 raise HTTPException(409, "A run is active. Wait for it to finish or stop it "
                                     "before preparing another tokenizer.")
-            try:
-                return await preview_tokenizer(body.model, body.token_id)
-            except TokenizerUnavailable as error:
-                raise HTTPException(422, str(error)) from None
+        try:
+            return await preview_tokenizer(body.model, body.token_id)
+        except TokenizerUnavailable as error:
+            raise HTTPException(422, str(error)) from None
 
     @app.post("/api/targets/test-connection")
     async def target_connection(body: ConnectionTest):
@@ -936,25 +1676,25 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
 
     @app.post("/api/config/draft")
-    async def validate_draft(config: ConfigDraftInput):
+    def validate_draft(config: ConfigDraftInput):
         """Normalize a draft for editing or export without requiring run readiness."""
         return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": preview_plan(config)}
 
     @app.post("/api/config/plan")
     @app.post("/api/config/validate")
-    async def validate_config(config: RunConfigInput):
+    def validate_config(config: RunConfigInput):
         """Normalize edits using the same contract as a run without sending traffic."""
         return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": preview_plan(config, validate=True)}
 
     @app.post("/api/config/preview")
-    async def preview_config(config: ConfigDraftInput):
+    def preview_config(config: ConfigDraftInput):
         """Describe effective requests and coverage without target calls or file imports."""
         preview = pack_preview(config)
         return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_pack_preview": preview,
                 "request_plan": preview_plan(config, pack_details=preview, validate=True)}
 
     @app.post("/api/datasets/preview")
-    async def preview_dataset_import(body: DatasetPreview):
+    def preview_dataset_import(body: DatasetPreview):
         from giraffe.dataset_import import preview_dataset
 
         return preview_dataset(**body.model_dump())
@@ -1016,16 +1756,20 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.get("/api/runs")
     async def list_runs():
+        snapshot = live_snapshot()
+        return await run_in_threadpool(list_runs_saved, snapshot)
+
+    def list_runs_saved(snapshot):
         rows = []
         for directory in (root.iterdir() if root.exists() else ()):
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
             try:
-                rows.append(run_summary(run_detail(directory.name, listing=True)))
+                rows.append(run_summary(run_detail(directory.name, listing=True, snapshot=snapshot)))
             except HTTPException:
                 continue
         return {"runs": sorted(rows, key=lambda item: item.get("started_at") or "", reverse=True),
-                "active_run_id": active.get("id")}
+                "active_run_id": snapshot.get("id"), "disk_active_id": disk_active_id()}
 
     def prepare_run(body: StartRun) -> tuple[RunConfig, RunReport | None]:
         """Resolve the same execution intent for Start and Copy CLI."""
@@ -1054,7 +1798,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return config, baseline
 
     @app.post("/api/config/cli")
-    async def copy_cli(body: StartRun):
+    def copy_cli(body: StartRun):
         from giraffe.handoff import cli_command
 
         config, baseline = prepare_run(body)
@@ -1063,13 +1807,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.post("/api/runs", status_code=202)
     async def start_run(body: StartRun):
+        nonlocal active
         async with start_lock:
+            # Recovery cooperatively stops at the next journal line; admission
+            # never waits for parsing. The idle retry clears this pause.
+            recovery_pause.set()
             if active:
                 raise HTTPException(409, "A run is already active; stop it or wait for its report")
+            if run_loop.busy():
+                raise HTTPException(409, "Previous run still stopping; wait for it to finish")
             if connection_pending:
                 raise HTTPException(409, "A connection test is running. Wait for its result "
                                     "before starting a run.")
-            config, baseline = prepare_run(body)
+            config, baseline = await run_in_threadpool(prepare_run, body)
             _validated_plan(config)
             guard = open_file_guard(config, raise_limit=True, web=True)
             if guard["errors"]:
@@ -1088,34 +1838,140 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 }]) from None
             identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
             directory = _directory(root, identifier)
-            directory.mkdir(parents=True)
-            meta = {"id": identifier, "state": "running", "started_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+            await run_in_threadpool(directory.mkdir, parents=True)
+            meta = {"id": identifier, "state": "running", "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                     "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
-            save_metadata(directory, meta)
+            await run_in_threadpool(save_metadata, directory, meta)
             waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
             condition_index = ConditionRequestIndex()
             for summary in waiting:
                 condition_index.summary(summary)
-            active.update(id=identifier, state="running", directory=directory, meta=meta,
+            active = dict(id=identifier, state="running", directory=directory, meta=meta,
                           open_files=guard,
                           progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
                           conditions={(row["target"], row["condition_id"]): row for row in waiting},
                           condition_requests=condition_index,
                           condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],
                           live_request_summary={"evicted": 0, "through_slot": None, "statuses": {}},
-                          live_request_count=0, evicted_running=set(), stop=asyncio.Event())
+                          live_request_count=0, evicted_running=set(), checks={}, seq=0, deltas=[], changed=asyncio.Event())
+            active["worker"] = _RunThread(None, owner=run_loop)
+            active["future"] = active["worker"].future
+            feeds[identifier] = active
+            while len(feeds) > 4:
+                feeds.popitem(last=False)
             active["task"] = asyncio.create_task(execute(active, config, baseline))
             return {"id": identifier, "state": "running", "migration_notes": config._migration_notes,
                     "live_conditions": waiting}
 
-
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
-        return run_detail(identifier)
+        snapshot = live_snapshot()
+        def read():
+            directory = _directory(root, identifier)
+            path = directory / "report.json"
+            meta = metadata(directory)
+            if (snapshot.get("id") != identifier and path.is_file() and not path.is_symlink()
+                    and meta.get("state") not in {"running", "queued", "stopping"}):
+                def revision(name):
+                    try:
+                        return _file_revision(directory / name)
+                    except FileNotFoundError:
+                        return None
+                key = ("detail-wire", str(path), _file_revision(path),
+                       revision(".web.json"), revision("summary.json"), revision(".keep"))
+                if path.stat().st_size >= _ISOLATED_REPORT_BYTES and not _IN_REPORT_PROCESS:
+                    status, body = _report_cache.get(key, _helper_response_cost,
+                        lambda: report_process.read(root, identifier, "detail"))
+                    return Response(body, status_code=status, media_type="application/json")
+                return _cached_json_response(key, lambda: run_detail(identifier, snapshot=snapshot))
+            return _json_response(run_detail(identifier, snapshot=snapshot))
+        return await run_in_threadpool(read)
+
+    @app.get("/api/runs/{identifier}/events")
+    async def run_events(identifier: str, after: int = Query(0, ge=0)):
+        _directory(root, identifier)
+        deadline = asyncio.get_running_loop().time() + _EVENT_WAIT_SECONDS
+        while True:
+            feed = feeds.get(identifier)
+            if feed is None:
+                detail = await run_in_threadpool(run_detail, identifier)
+                if detail["state"] in {"running", "queued", "stopping"}:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        detail = await run_in_threadpool(run_detail, identifier)
+                    if detail["state"] in {"running", "queued", "stopping"}:
+                        return {"seq": detail["seq"], "reset": False, "idle": True,
+                                "events": [], "records": [], "checks": [], "state": detail["state"]}
+                return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
+                        "state": detail["state"], "error": detail.get("error")}
+            seq = feed["seq"]
+            oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
+            reset = after < oldest - 1 or after > seq
+            remaining = deadline - asyncio.get_running_loop().time()
+            if reset or seq > after or feed.get("terminal") or remaining <= 0:
+                break
+            # Clearing and checking occur without yielding, so a signal cannot
+            # be lost between observing the cursor and registering this wait.
+            feed["changed"].clear()
+            try:
+                await asyncio.wait_for(feed["changed"].wait(), remaining)
+            except TimeoutError:
+                pass
+        events = [] if reset else [row for row in feed["deltas"] if row["seq"] > after]
+        records, checks = OrderedDict(), OrderedDict()
+        for event in events:
+            if isinstance(event.get("check"), dict):
+                check = event["check"]
+                checks[("check", check.get("target", event.get("target")), check.get("id"))] = check
+            elif event.get("event", "").startswith("check_") and event.get("check_id"):
+                check = {key: value for key, value in event.items() if key in {"target", "status", "title", "summary", "metrics", "required"}}
+                check["id"] = event["check_id"]
+                checks[("check", check.get("target"), check["id"])] = check
+            slot = event.get("request_slot")
+            if slot is not None:
+                record = feed.get("requests", {}).get(slot)
+                if record is None and event.get("request"):
+                    record = {**event["request"], "slot": slot}
+                if record is not None:
+                    records[slot] = record
+            summary = event.get("condition_summary")
+            if summary and summary.get("condition"):
+                key = (summary["target"], summary["condition"]["id"])
+                checks[key] = feed.get("conditions", {}).get(key, summary)
+            elif event.get("event", "").startswith("condition_") and event.get("condition"):
+                key = (event.get("target"), event["condition"]["id"])
+                checks[key] = feed.get("conditions", {}).get(key, event)
+        return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
+                "checks": list(checks.values()), "state": feed["state"],
+                "progress": feed["progress"], "live_request_count": feed["live_request_count"],
+                "live_request_summary": feed["live_request_summary"],
+                "live_preparations": list(feed["live_preparations"].values()),
+                "phases": feed["phases"], "abort_reason": feed["meta"].get("abort_reason"),
+                "error": feed["meta"].get("error"),
+                "error_id": feed["meta"].get("error_id")}
 
     @app.get("/api/runs/{identifier}/performance")
     async def performance_selection(identifier: str, target: str | None = None, window: str | None = None):
-        return selected_performance(identifier, target, window)
+        snapshot = live_snapshot()
+        def select():
+            if snapshot.get("id") != identifier or snapshot.get("state") not in {"running", "stopping"}:
+                path = _directory(root, identifier) / "report.json"
+                try:
+                    revision = _file_revision(path)
+                except FileNotFoundError:
+                    raise HTTPException(404, "Report is not available") from None
+                key = ("performance-wire", str(path), revision, target, window)
+                if path.stat().st_size >= _ISOLATED_REPORT_BYTES and not _IN_REPORT_PROCESS:
+                    status, body = _report_cache.get(key, _helper_response_cost,
+                        lambda: report_process.read(root, identifier, "performance", target, window))
+                    return Response(body, status_code=status, media_type="application/json")
+                with performance_lock:
+                    return _cached_json_response(key,
+                        lambda: selected_performance(identifier, target, window, snapshot))
+            with performance_lock:
+                return _json_response(selected_performance(identifier, target, window, snapshot))
+        return await run_in_threadpool(select)
 
     @app.post("/api/runs/{identifier}/compare")
     async def compare_saved_run(identifier: str, body: CompareRun):
@@ -1148,7 +2004,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     "status": report.baseline["status"], "warning": warning}
 
     @app.get("/api/runs/{identifier}/requests/{request_id}")
-    async def request_evidence(identifier: str, request_id: str):
+    def request_evidence(identifier: str, request_id: str):
         directory = _directory(root, identifier)
         path = directory / "report.json"
         if path.is_symlink() or not path.is_file():
@@ -1172,15 +2028,22 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if active.get("id") == identifier:
             index = active.setdefault("condition_requests", ConditionRequestIndex())
         else:
-            path = directory / "report.json"
-            if path.is_symlink() or not path.is_file():
-                raise HTTPException(404, "Report is not available")
-            stat = path.stat()
-            index = saved_condition_requests(str(path), stat.st_mtime_ns, stat.st_size)
-            meta = metadata(directory)
-            for summary in _merged_condition_rows(meta.get("conditions", []), list(index.summaries.values()),
-                    terminal=True, reason=meta.get("error") or (meta.get("progress") or {}).get("reason")):
-                index.summary({**summary, "status": summary["lifecycle_status"]})
+            return await run_in_threadpool(saved_condition_page, directory, condition_id, target,
+                                           status, page, page_size)
+        return condition_page(index, condition_id, target, status, page, page_size)
+
+    def saved_condition_page(directory, condition_id, target, status, page, page_size):
+        path = directory / "report.json"
+        if path.is_symlink() or not path.is_file():
+            raise HTTPException(404, "Report is not available")
+        index = saved_condition_requests(str(path), *_file_revision(path))
+        meta = metadata(directory)
+        for summary in _merged_condition_rows(meta.get("conditions", []), list(index.summaries.values()),
+                terminal=True, reason=meta.get("error") or (meta.get("progress") or {}).get("reason")):
+            index.summary({**summary, "status": summary["lifecycle_status"]})
+        return condition_page(index, condition_id, target, status, page, page_size)
+
+    def condition_page(index, condition_id, target, status, page, page_size):
         try:
             return index.page(condition_id, target=target, status=status, page=page, page_size=page_size)
         except KeyError:
@@ -1189,7 +2052,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             raise HTTPException(422, str(error)) from None
 
     @app.get("/api/runs/{identifier}/config.json")
-    async def download_config(identifier: str):
+    def download_config(identifier: str):
         saved = _report(_directory(root, identifier) / "report.json")
         config = saved.manifest.get("config")
         if not isinstance(config, dict):
@@ -1200,20 +2063,22 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.post("/api/runs/{identifier}/cancel")
     async def cancel_run(identifier: str):
-        detail = run_detail(identifier)
         if active.get("id") == identifier:
-            active["state"] = "stopping"
-            active["meta"]["state"] = "stopping"
-            active["stop"].set()
+            job = active
+            job["state"] = "stopping"
+            job["meta"]["state"] = "stopping"
+            job["worker"].request_stop()
+            publish(job, {"event": "run_stopping", "state": "stopping"}, None)
             try:
-                save_metadata(active["directory"], active["meta"])
+                await run_in_threadpool(save_metadata, job["directory"], dict(job["meta"]))
             except OSError:
                 pass  # Stopping traffic must not depend on available disk space.
             return {"id": identifier, "state": "stopping"}
+        detail = await run_in_threadpool(run_detail, identifier)
         return {"id": identifier, "state": detail["state"]}
 
     @app.get("/api/runs/{identifier}/report.{extension}")
-    async def download_report(identifier: str, extension: str):
+    def download_report(identifier: str, extension: str):
         if extension not in {"json", "html"}:
             raise HTTPException(404, "Unknown report format")
         directory = _directory(root, identifier)
@@ -1223,19 +2088,27 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return _ReportDownload(path, extension, identifier, download_lock, record_download_resources)
 
     @app.get("/api/runs/{identifier}/reproduction.json")
-    async def export_reproduction(identifier: str):
+    def export_reproduction(identifier: str):
         return reproduction_export(_report(_directory(root, identifier) / "report.json"))
 
     @app.get("/api/baselines")
-    async def list_baselines():
+    def list_baselines():
         return {"baselines": saved_baselines()}
 
     @app.post("/api/baselines", status_code=201)
     async def save_baseline(body: SaveBaseline):
+        snapshot = live_snapshot()
+        return await run_in_threadpool(save_baseline_saved, body, snapshot)
+
+    def save_baseline_saved(body: SaveBaseline, snapshot: dict):
+        with baseline_lock:
+            return save_baseline_locked(body, snapshot)
+
+    def save_baseline_locked(body: SaveBaseline, snapshot: dict):
         name = body.name.strip()
         if not name:
             raise HTTPException(422, "Choose a baseline name")
-        detail = run_detail(body.run_id)
+        detail = run_detail(body.run_id, snapshot=snapshot)
         if detail["state"] != "completed" or detail["report"] is None:
             raise HTTPException(409, "Wait for the run report before saving a baseline")
         existing = next((item for item in saved_baselines() if item["name"] == name), None)

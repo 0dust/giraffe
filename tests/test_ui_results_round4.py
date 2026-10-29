@@ -68,6 +68,68 @@ def test_async_performance_baseline_reveal_runs_once_for_current_route_only(leav
 """.replace('LEAVE', str(leave).lower()), dom=True)
 
 
+@pytest.mark.parametrize('entry', ['deep_link', 'hash_change', 'tab_click'])
+def test_performance_navigation_fetches_once_but_explicit_refresh_can_queue(entry):
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+ fetch=()=>{};clearPoll=schedulePoll=updateNav=()=>{};
+ const paths=[],responses=[],tasks=[],originalLoad=loadPerformance;
+ loadPerformance=(...args)=>{const task=originalLoad(...args);tasks.push(task);return task;};
+ api=path=>path.includes('/performance')?new Promise(resolve=>{paths.push(path);responses.push(resolve);}):Promise.resolve({id:'B',state:'completed',report:report([check('access','pass')])});
+ if(ENTRY==='deep_link'){
+   location.hash='#runs/B/performance/baseline';await route();
+ }else{
+   location.hash='#runs/B/results';await route();
+   if(ENTRY==='hash_change'){location.hash='#runs/B/performance';await route();}
+   else{await listeners.click({target:$('#tab-performance'),preventDefault(){}});await route();}
+ }
+ assert.equal(paths.length,1);
+ responses[0](performanceFixture());await Promise.all(tasks.slice());
+ assert.equal(paths.length,1,'navigation must not queue a duplicate performance request');
+ assert.equal(reportView.pending,false);assert(!reportView.again);
+ renderDetail();await route();assert.equal(paths.length,1,'rendering and the settled route do not refetch');
+ const refresh=loadPerformance({force:true});assert.equal(paths.length,2);
+ await loadPerformance({force:true});assert.equal(paths.length,2,'explicit refresh stays serial while pending');
+ responses[1](performanceFixture());await refresh;
+ assert.equal(paths.length,3,'explicit refresh queued while pending is retained');
+ responses[2](performanceFixture());await Promise.all(tasks.slice());
+ assert.equal(reportView.pending,false);assert.equal(reportView.again,false);
+})()
+""".replace('ENTRY', repr(entry)), dom=True)
+
+
+@pytest.mark.parametrize('pending', [False, True])
+def test_saved_comparison_invalidates_selected_performance_without_duplicate_fetch(pending):
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+ fetch=()=>{};clearPoll=schedulePoll=updateNav=toast=()=>{};
+ const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+ globalThis.FormData=class{get(){return 'reference';}};
+ const value=report([check('access','pass')]),responses=[],tasks=[],originalLoad=loadPerformance;
+ loadPerformance=(...args)=>{const task=originalLoad(...args);tasks.push(task);return task;};
+ api=(path,options)=>{
+   if(path.includes('/performance'))return new Promise(resolve=>responses.push(resolve));
+   if(path==='/api/baselines')return Promise.resolve({baselines:[{id:'reference',run_id:'old',name:'Reference'}]});
+   if(options?.method==='POST')return Promise.resolve({});
+   return Promise.resolve({id:'saved-run',state:'completed',report:{...value,baseline:{run_id:'old',targets:[]}}});
+ };
+ detail(value);chooseReportTab('performance');assert.equal(responses.length,1);
+ if(!PENDING){responses[0](performanceFixture());await Promise.all(tasks.slice());}
+ await openComparisonDialog();await compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+ assert.equal(reportView.tab,'results');assert.equal(responses.length,1,'saving comparison does not fetch hidden performance');
+ if(PENDING){responses[0](performanceFixture());await Promise.all(tasks.slice());}
+ assert.equal(reportView.performance,null,'a pre-comparison summary cannot restore invalidated data');
+ assert.equal(reportView.pending,false);
+ await listeners.click({target:$('#tab-performance'),preventDefault(){}});await route();
+ assert.equal(responses.length,2,'reopening Performance requests one fresh comparison summary');
+ const latest=performanceFixture();latest.targets[0].summaries.full.metrics.throughput.value=88;
+ responses[1](latest);await Promise.all(tasks.slice());
+ assert.equal(responses.length,2);assert.equal(reportView.pending,false);
+ assert.equal(selectedPerformance().summary.metrics.throughput.value,88);
+})()
+""".replace('PENDING', str(pending).lower()), dom=True)
+
+
 def test_same_run_tab_hash_change_preserves_armed_stop_confirmation():
     run_render_checks(r"""
 (async()=>{
