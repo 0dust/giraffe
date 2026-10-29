@@ -6,7 +6,7 @@ import pytest
 from giraffe.models import RunConfig
 from giraffe.reporting import write_report
 from giraffe.web import create_app
-from tests.test_web import config, report
+from tests.test_web import config, report, saved_comparison_fixture
 
 
 @pytest.fixture
@@ -43,6 +43,43 @@ async def test_missing_origin_needs_authentication_for_mutations(tmp_path):
             response = await client.post("/api/config/validate", json=config(), headers={
                 "X-Giraffe-Token": "launch-token", **headers})
             assert response.status_code == 403
+
+
+@pytest.mark.parametrize("credential", ["header", "cookie"])
+async def test_saved_comparison_requires_auth_and_same_origin_before_writing(tmp_path, credential):
+    saved_comparison_fixture(tmp_path, "before")
+    saved_comparison_fixture(tmp_path, "after", latency=200)
+    report_path = tmp_path / "after" / "report.json"
+    original = report_path.read_bytes()
+    app = create_app(tmp_path, token="launch-token")
+    token = {"X-Giraffe-Token": "launch-token"}
+    async with app.router.lifespan_context(app), client_for(app) as client:
+        saved = await client.post("/api/baselines", json={"run_id": "before", "name": "Before"},
+                                  headers=token)
+        assert saved.status_code == 201
+        baseline_id = saved.json()["id"]
+        for headers, status in (
+            ({}, 401),
+            ({"X-Giraffe-Token": "wrong"}, 401),
+            ({**token, "Origin": "http://attacker.example"}, 403),
+            ({**token, "Origin": "https://localhost:8787"}, 403),
+            ({**token, "Sec-Fetch-Site": "cross-site"}, 403),
+        ):
+            response = await client.post("/api/runs/after/compare",
+                                         json={"baseline_id": baseline_id}, headers=headers)
+            assert response.status_code == status, response.text
+            assert report_path.read_bytes() == original
+        if credential == "cookie":
+            assert (await client.get("/?token=launch-token")).status_code == 303
+            token = {}
+        response = await client.post("/api/runs/after/compare", json={"baseline_id": baseline_id},
+                                     headers={**token, "Origin": "http://localhost:8787"})
+        assert response.status_code == 200, response.text
+        listed = (await client.get("/api/runs", headers=token)).json()["runs"]
+        assert next(row for row in listed if row["id"] == "after")["baseline_id"] == baseline_id
+        exported = (await client.get("/api/runs/after/report.json", headers=token)).json()
+        assert exported["baseline"]["run_id"] == "before"
+        assert exported["baseline"]["saved_baseline_id"] == baseline_id
 
 
 async def test_token_link_sets_http_only_cookie_and_plain_download_works(tmp_path):

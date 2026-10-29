@@ -60,6 +60,190 @@ function detail(value,extra={}) {
     assert result.returncode == 0, result.stderr
 
 
+def test_post_run_baseline_picker_filters_self_and_ignores_stale_navigation():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  toast=message=>{throw Error(message);};
+  detail(report([check('serving','pass')]));
+  assert(document.querySelector('[data-action="compare-saved"]'));
+  let calls=[];
+  api=async path=>{calls.push(path);return {baselines:[
+    {id:'self',run_id:'saved-run',name:'Own snapshot'},
+    {id:'reference',run_id:'other-run',name:'Before <upgrade>',saved_at:'2026-10-15T09:00:00Z'}
+  ]};};
+  await openComparisonDialog();
+  assert(dialog.open);
+  assert.deepEqual(calls,['/api/baselines']);
+  const options=dialog.querySelectorAll('option');
+  assert.equal(options.length,1);assert.equal(options[0].getAttribute('value'),'reference');
+  assert.match(dialog.textContent,/Before <upgrade>/);
+  assert.equal(dialog.querySelector('upgrade'),null);
+  dialog.close();
+  api=async()=>({baselines:[{id:'self',run_id:'saved-run',name:'Own snapshot'}]});
+  await openComparisonDialog();
+  assert(dialog.querySelector('[type="submit"]').hasAttribute('disabled'));
+  assert.match(dialog.textContent,/No other saved baselines/);
+  dialog.close();
+  let resolve;
+  api=()=>new Promise(done=>{resolve=done;});
+  const opening=openComparisonDialog();state.routeVersion++;
+  resolve({baselines:[]});await opening;
+  assert.equal(dialog.open,false);
+})();
+""", dom=True)
+
+
+def test_saved_comparison_preserves_findings_and_grouped_comparison_results():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  const messages=[];toast=message=>messages.push(message);
+  const failed=report([check('correctness','fail',{metrics:{correct:0,scored:1},evidence_ids:['bad']})],{
+    overall:'fail',requests:[{id:'bad',target:'local',scenario:'question',status:'completed',valid:true,
+      score:false,output:'Lyon',evaluation:{expected:'Paris',expected_provided:true}}]
+  });
+  detail(failed);
+  const heading=()=>document.querySelector('.page-heading');
+  assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
+  const compare=heading().querySelector('[data-action="compare-saved"]');
+  assert(compare);assert.equal(compare.classList.contains('primary'),false);
+  const baseline={run_id:'reference-run',status:'pass',targets:[{target:'local',status:'pass',comparisons:[{
+    check:'correctness',metric:'latency_ms',scenario:'question',baseline:100,current:100,
+    baseline_samples:6,current_samples:6,status:'pass',reason:'No material regression'
+  }]}]};
+  const calls=[];
+  api=async(path,options)=>{
+    calls.push([path,options?.method||'GET']);
+    if(path==='/api/baselines')return {baselines:[{id:'reference',run_id:'reference-run',name:'Before upgrade'}]};
+    if(path==='/api/runs/saved-run/compare'){
+      assert.equal(options.method,'POST');assert.deepEqual(JSON.parse(options.body),{baseline_id:'reference'});return {};
+    }
+    assert.equal(path,'/api/runs/saved-run');
+    return {id:'saved-run',state:'completed',baseline_id:'reference',report:{...failed,baseline}};
+  };
+  await listeners.click({target:compare,preventDefault(){}});
+  assert(dialog.open);
+  await compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+  assert.deepEqual(calls,[['/api/baselines','GET'],['/api/runs/saved-run/compare','POST'],['/api/runs/saved-run','GET']]);
+  assert.equal(dialog.open,false);assert.equal(state.detail.baseline_id,'reference');
+  assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
+  assert.equal(heading().querySelector('[data-action="compare-saved"]').textContent,'Change baseline');
+  const comparison=document.querySelector('#report-baseline-reference');
+  assert(comparison.open);assert.equal(comparison.querySelectorAll('[data-comparison-condition]').length,1);
+  assert.match(comparison.textContent,/Before upgrade/);assert.match(comparison.textContent,/100 ms/);
+  assert.match(comparison.textContent,/Unchanged \(1\)/);
+  await listeners.click({target:heading().querySelector('.button.primary'),preventDefault(){}});
+  const evidence=document.querySelector('.check-detail .evidence-table');
+  assert(evidence);assert.match(evidence.textContent,/Paris/);assert.match(evidence.textContent,/Lyon/);
+  assert.match(messages.at(-1),/No new requests were sent/);
+})();
+""", dom=True)
+
+def test_saved_comparison_stays_pending_across_close_and_reopen():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  const messages=[];toast=message=>messages.push(message);
+  globalThis.FormData=class{constructor(form){this.form=form;}get(){return this.form.baselineChoice;}};
+  detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail),pending=[];
+  let writes=0,persisted=initial;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'a',name:'Reference A'},{id:'b',name:'Reference B'}]};
+    if(options?.method==='POST'){
+      writes++;persisted={...initial,baseline_id:JSON.parse(options.body).baseline_id};return {};
+    }
+    const snapshot=structuredClone(persisted);
+    return new Promise(resolve=>pending.push(()=>resolve(snapshot)));
+  };
+  await openComparisonDialog();
+  const form=dialog.querySelector('form');form.baselineChoice='a';
+  const first=compareSavedRun({preventDefault(){},target:form});
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(pending.length,1);
+  await listeners.click({target:form.querySelector('[data-action="close-dialog"]'),preventDefault(){}});
+  assert.equal(dialog.open,false);
+  await openComparisonDialog();
+  assert.equal(dialog.open,false);
+  assert.match(messages.at(-1),/still being saved/);
+  form.baselineChoice='b';
+  await compareSavedRun({preventDefault(){},target:form});
+  assert.equal(writes,1);assert.equal(pending.length,1);
+  pending[0]();await first;
+  assert.equal(state.detail.baseline_id,'a');
+  await openComparisonDialog();
+  const next=dialog.querySelector('form');next.baselineChoice='b';
+  const second=compareSavedRun({preventDefault(){},target:next});
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(writes,2);pending[1]();await second;
+  assert.equal(state.detail.baseline_id,'b');assert.equal(persisted.baseline_id,'b');
+  assert.equal(dialog.open,false);
+})();
+""", dom=True)
+
+
+@pytest.mark.parametrize("phase", ["post", "detail"])
+@pytest.mark.parametrize("navigate", [False, True])
+def test_saved_comparison_failure_releases_pending_and_respects_navigation(phase, navigate):
+    run_render_checks(r"""
+(async()=>{
+  const phase=PHASE,navigate=NAVIGATE;
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  toast=()=>{};detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail);let reject;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+    if(options?.method==='POST'&&phase==='detail')return {};
+    return new Promise((_,fail)=>{reject=fail;});
+  };
+  await openComparisonDialog();
+  const form=dialog.querySelector('form'),error=dialog.querySelector('#comparison-error');
+  const saving=compareSavedRun({preventDefault(){},target:form});
+  await Promise.resolve();await Promise.resolve();
+  if(navigate){state.routeVersion++;state.detail={...initial,id:'another-run'};}
+  reject(Error('Could not '+phase));await saving;
+  assert.equal(error.hidden,navigate);
+  assert.equal(state.detail.id,navigate?'another-run':'saved-run');
+  assert.equal(form.querySelector('[type="submit"]').disabled,false);
+  dialog.close();state.routeVersion++;state.detail=initial;
+  api=async()=>({baselines:[{id:'reference',name:'Reference'}]});
+  await openComparisonDialog();assert.equal(dialog.open,true);
+})();
+""".replace("PHASE", json.dumps(phase)).replace("NAVIGATE", json.dumps(navigate)), dom=True)
+
+
+@pytest.mark.parametrize("phase", ["post", "detail"])
+def test_saved_comparison_ignores_success_after_navigation(phase):
+    run_render_checks(r"""
+(async()=>{
+  const phase=PHASE;
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  toast=()=>{};detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail);let resolve,detailReads=0;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+    if(options?.method==='POST'&&phase==='detail')return {};
+    if(!options)detailReads++;
+    return new Promise(done=>{resolve=done;});
+  };
+  await openComparisonDialog();
+  const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+  await Promise.resolve();await Promise.resolve();
+  state.routeVersion++;state.detail={...initial,id:'another-run'};
+  resolve({...initial,baseline_id:'reference'});await saving;
+  assert.equal(state.detail.id,'another-run');
+  assert.equal(detailReads,phase==='post'?0:1);
+  dialog.close();state.routeVersion++;state.detail=initial;
+  api=async()=>({baselines:[{id:'reference',name:'Reference'}]});
+  await openComparisonDialog();assert.equal(dialog.open,true);
+})();
+""".replace("PHASE", json.dumps(phase)), dom=True)
+
+
 def test_live_view_retains_stop_reasons_during_stopping_and_judging():
     run_render_checks(r"""
 const config={targets:[{name:'local',model:'m'}],max_requests:50,concurrency:4,max_duration_seconds:120,request_timeout_seconds:30,max_output_tokens:128};
@@ -415,3 +599,30 @@ markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
 delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
 markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
 """)
+
+
+@pytest.mark.parametrize("check_id", ["first_output", "generation"])
+def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_id):
+    run_render_checks(r"""
+(async()=>{
+ const id=CHECK_ID,first=id==='first_output';
+ const limitField=first?'first_output_ms':'stream_gap_ms',observedField=first?'first_output_ms':'max_stream_gap_ms';
+ const limit=first?10000:5000,slow=first?12300:6000;
+ const records=[['slow',slow],['good',200],['client',20000]].map(([id,time])=>({id,target:'local',status:'completed',valid:true,score:true,output:'Correct',[observedField]:time}));
+ const failed=check(id,'fail',{evidence_ids:['slow','good','client'],metrics:{violations:['slow'],unattributed_timing_violations:['client']}});
+ const value=report([failed],{overall:'fail',requests:records});
+ value.manifest.config.limits={[limitField]:60000};
+ value.manifest.effective_checks={[id]:{limits:{[limitField]:limit}}};
+ value.manifest.default_check_limits={[id]:[limitField]};
+ const original=JSON.stringify(value);
+ detail(value);const action=$('[data-action="show-failing"]');assert(action);await listeners.click({target:action});
+ const panel=$('.check-detail'),table=panel.querySelector('.evidence-table');
+ assert(panel.textContent.includes(`Limit: ≤ ${limit/1000} s (default)`));
+ assert(!panel.textContent.includes('60 s'));
+ assert(table.querySelector('[data-request="slow"]'));
+ assert.equal(table.querySelector('[data-request="good"]'),null);
+ assert.equal(table.querySelector('[data-request="client"]'),null);
+ assert(table.textContent.includes(first?'Too slow: first output 12.3 s > 10 s':'Too slow: stream pause 6 s > 5 s'));
+ assert.equal(JSON.stringify(value),original);
+})()
+""".replace('CHECK_ID', json.dumps(check_id)), dom=True)
