@@ -42,7 +42,7 @@ class Harness:
         self.available += 1
         assert self.available <= self.slots
 
-    async def execute(self, spec):
+    async def execute(self, spec, finalize_record):
         start = time.monotonic()
         self.starts.append(start)
         self.on_start()
@@ -60,7 +60,9 @@ class Harness:
             answer_chunks=2, output_tokens=2, max_stream_gap_ms=1,
         )
         self.records.append(record)
-        return self.transform(record)
+        record = self.transform(record)
+        finalize_record(record)
+        return record
 
     async def run(self, settings=None, limits=None, deadline=None, **pack):
         settings = settings or profile()
@@ -202,9 +204,9 @@ async def test_monitor_cancellation_during_stop_cleanup_keeps_partial_stage():
     execute = harness.execute
     cleanup_started = asyncio.Event()
 
-    async def slow_cleanup(spec):
+    async def slow_cleanup(spec, finalize_record):
         try:
-            return await execute(spec)
+            return await execute(spec, finalize_record)
         finally:
             cleanup_started.set()
             await asyncio.sleep(.02)
@@ -302,7 +304,7 @@ async def test_poisson_schedule_overflow_is_bounded_and_never_dispatched(monkeyp
 async def test_callback_that_does_not_start_request_releases_reserved_slot():
     harness = Harness()
 
-    async def no_request(_):
+    async def no_request(_, finalize_record):
         return None
 
     harness.execute = no_request
@@ -315,7 +317,7 @@ async def test_callback_that_does_not_start_request_releases_reserved_slot():
 async def test_escaped_callback_failure_is_not_reported_as_success():
     harness = Harness()
 
-    async def broken_callback(_):
+    async def broken_callback(_, finalize_record):
         raise RuntimeError("private transport details")
 
     harness.execute = broken_callback

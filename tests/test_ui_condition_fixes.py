@@ -54,7 +54,8 @@ def test_dialog_title_and_focused_strip_share_readable_shape():
  state.detail.live_requests=state.detail.live_requests.slice(0,2).map(record=>({...record,scenario:id,condition_id:id}));draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
  assert.equal($('#test-title').textContent,'Short input / short output');assert.match($('#test-dialog').textContent,/Load test · 4 at once/);
  assert.match($('.condition-strip-row').textContent,/Short input \/ short output · 4 at once/);
- assert.equal($$('#test-dialog .request-evidence-row').length,2);assert($$('#test-dialog .request-evidence-row td[data-label="Condition"]').every(cell=>cell.textContent==='Short input / short output'));
+ assert.equal($$('#test-dialog .request-evidence-row').length,200);assert($$('#test-dialog .request-evidence-row td[data-label="Condition"]').every(cell=>cell.textContent==='Short input / short output'));
+ assert.equal(conditionDialog.localEvidence,false);assert.match($('#test-dialog').textContent,/Page 1 of 5/);
  assert.equal($('.condition-plan-identity'),null);assert.equal([...conditionViews.values()][0].condition.id,id);assert.match(calls.at(-1),/conditions\/load_primary_combinations_short_short_concurrent_c4\/requests/);
  assert.doesNotMatch($('#test-title').textContent,/Combinations short short concurrent|load_primary/);
 })()

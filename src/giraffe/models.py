@@ -705,6 +705,17 @@ def migrate_run_limits(value):
     if not is_legacy_config(value):
         return value, []
     value, notes = deepcopy(value), []
+    if "checks" not in value:
+        legacy_load = any(value.get(field) is not None for field in ("concurrent_workloads", "buckets"))
+        checks = ["concurrency" if check == "load" and legacy_load else check
+                  for check in _LEGACY_DEFAULT_CHECKS]
+        checks.extend([*(["json"] if value.get("structured_json") else []),
+                       *(["gpu"] if value.get("metrics") else [])])
+        checks.extend(check for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
+                                                ("sessions", "sessions"), ("consistency", "consistency"),
+                                                ("tool_calling", "tools"), ("tool_checks", "tools"))
+                      if value.get(field) is not None and (field != "tool_calling" or value[field]))
+        value["checks"] = list(dict.fromkeys(checks))
     descriptions = {
         "max_requests": ("300 requests", "a request limit", "Maximum requests"),
         "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
@@ -757,11 +768,7 @@ def migrate_run_limits(value):
                 own = own.model_dump(exclude_unset=True) if isinstance(own, BaseModel) else own
                 if own.get("max_in_flight") is None:
                     value[field] = {**own, "max_in_flight": parallelism}
-    checks = list(value.get("checks", _LEGACY_DEFAULT_CHECKS))
-    if "checks" not in value:
-        checks.extend(check for field, check in (("arrivals", "arrivals"), ("sessions", "sessions"),
-                                                ("consistency", "consistency"))
-                      if value.get(field) is not None)
+    checks = value["checks"]
     parallelism = value.get("concurrency") or 4
     if value.get("custom_fixtures") and "correctness" in checks:
         value["legacy_custom_fixture_max_output_tokens"] = value.get("max_output_tokens", 128)
@@ -2316,7 +2323,7 @@ class RunConfig(Model):
 # rebuild schemas or invoke Pydantic's environment-dependent plugin discovery.
 _MIGRATION_INPUT_ADAPTERS = {
     name: TypeAdapter(RunConfig.model_fields[name].rebuild_annotation())
-    for name in ("config_version", "checks")
+    for name in ("config_version", "checks", "structured_json", "metrics", "tool_calling")
 }
 
 

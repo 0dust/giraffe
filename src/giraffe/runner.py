@@ -565,7 +565,12 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None, request_parameters=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+        """Complete a request and persist its terminal evidence once.
+
+        ``finalize_record`` synchronously adds scheduler-owned measurements before
+        the evidence snapshot, including cancellation and postprocessing failures.
+        """
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
@@ -732,6 +737,7 @@ class _Run:
                            and record.status == "cancelled") or (
                 timeout_override is not None and record.status == "timeout")
             record.intentional = intentional
+            propagating_error = False
             try:
                 try:
                     record = score_response(spec, record)
@@ -805,11 +811,22 @@ class _Run:
                 if failure is not None:
                     raise failure
                 return record
+            except BaseException:
+                propagating_error = True
+                raise
             finally:
                 try:
-                    self.record_finished(record)
+                    if finalize_record is not None:
+                        finalize_record(record)
                 except Exception:
-                    logger.exception("Could not persist terminal request %s", record.id)
+                    if not propagating_error:
+                        raise
+                    logger.exception("Could not finalize terminal request %s", record.id)
+                finally:
+                    try:
+                        self.record_finished(record)
+                    except Exception:
+                        logger.exception("Could not persist terminal request %s", record.id)
 
     async def group(self, target, client, specs, scenario, count=None, concurrency=1, checks=()):
         count = count if count is not None else self.config.samples
@@ -1566,13 +1583,21 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 "min_output_tokens_per_second": None}) if check_id == "first_output" else limits.model_copy(update={"first_output_ms": None})
             qualified = qualified_violations(records, assessed_limits, quality, unfinished=True)
             if check_id == "first_output" and limits.first_output_ms is not None:
+                # Completed answers are a p95 cohort; unfinished requests can
+                # independently establish a lower-bound timing failure.
+                unfinished_ids = {r.id for r in records if not r.valid
+                                  and "first_output_ms" in exceeded_unfinished(r, limits)}
                 p95 = metrics["first_output_p95_ms"]
                 if p95 is not None and p95 <= limits.first_output_ms:
-                    # Completed answers are judged as a p95 cohort; an unfinished
-                    # request can still establish a lower-bound timing failure.
-                    unfinished_ids = {r.id for r in records if not r.valid
-                                      and "first_output_ms" in exceeded_unfinished(r, limits)}
                     violations = [identifier for identifier in violations if identifier in unfinished_ids]
+                # Keep the sample count and raw observations intact. A zero
+                # latency for every affected answer gives the cohort's most
+                # favorable possible p95, so only a failure of that bound can
+                # be attributed to the endpoint.
+                affected = set(quality["affected_metrics"].get("first_output_ms", []))
+                best_case_p95 = percentile([0 if r.id in affected else r.first_output_ms
+                    for r in records if r.valid and r.status == "completed" and r.first_output_ms is not None], .95)
+                if best_case_p95 is None or best_case_p95 <= limits.first_output_ms:
                     qualified = [identifier for identifier in qualified if identifier in unfinished_ids]
             gap_samples = sum(r.valid and r.status == "completed" and r.measured_stream_gap for r in records)
             metrics["measured_gap_samples"] = gap_samples

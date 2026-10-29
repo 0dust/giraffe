@@ -1,5 +1,4 @@
 """Round-one UX regressions, executed in the socket-free browser VM."""
-from pathlib import Path
 from tests.test_ux_results import run_render_checks
 from tests.test_ui_request_evidence import run_script
 
@@ -189,14 +188,15 @@ assert.match(text,/First answer9 ms/);assert.match(text,/TTFT3 ms/);assert.doesN
 ''',dom=True)
 
 
-def test_live_condition_table_uses_retained_evidence_and_counts_the_capped_window():
+def test_live_condition_table_keeps_api_rows_and_hydrates_retained_evidence():
     run_render_checks(r'''
 const records=Array.from({length:205},(_,i)=>({id:`r${i}`,scenario:'correctness',condition_id:'correctness',status:'completed',valid:true,score:true,elapsed_ms:205-i,question:`Question ${i}`}));
 state.detail={id:'run',state:'running',live_requests:records};
 renderTests(records,{live:true,conditions:[{condition:{id:'correctness',check:'correctness'},started:500,completed:500}]});
-const key=[...conditionViews.keys()][0];conditionDialog={key,page:1,size:200,filter:'all',table:createRequestTableState(),payload:{page:1,pages:10,total:500,rows:[{request_id:'evicted',number:1,status:'passed'}]}};
-renderConditionDialog();assert.match($('#test-dialog').textContent,/205 of 500 requests available/);
-assert.doesNotMatch($('#test-dialog').innerHTML,/data-request="evicted"/);
+const key=[...conditionViews.keys()][0];conditionDialog={key,page:1,size:200,filter:'all',table:createRequestTableState(),payload:{page:1,pages:3,total:500,rows:[{request_id:'evicted',number:1,status:'passed'},{request_id:'r204',number:2,status:'passed'}]}};
+renderConditionDialog();assert.equal(conditionDialog.localEvidence,false);
+assert.match($('#test-dialog').textContent,/Page 1 of 3/);
+assert.match($('#test-dialog').innerHTML,/data-request="evicted"/);
 updateConditionEvidence({closest:()=>$('#test-dialog')},'sort','elapsed_ms');
 assert.equal($('#test-dialog .request-evidence-row').dataset.request,'r204');
 updateConditionEvidence({closest:()=>$('#test-dialog')},'search','Question 204');

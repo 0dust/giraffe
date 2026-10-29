@@ -133,7 +133,7 @@ let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
 assert.match(html,/1 of 3 answers matched the expected answer/);
 assert.match(html,/Expected:<\/strong> Paris/);
-assert.doesNotMatch(html,/Expected &lt;Paris&gt;/);
+assert.match(html,/Expected &lt;Paris&gt;/,'the recorded failure explanation remains visible');
 assert.match(html,/class="button primary" data-action="show-failing">Show failing requests/);
 assert.doesNotMatch(html,/inspect-finding|Inspect failed answer|Inspect evidence|Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);

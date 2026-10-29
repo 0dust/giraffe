@@ -43,7 +43,9 @@ from giraffe.overlap import (
     scheduling_delay_windows,
 )
 from giraffe.timing import configured_metrics, qualified_violations, run_quality
-from giraffe.traffic import ScheduleObservation, arrival_schedule, run_stage
+from giraffe.traffic import (
+    AUTHORITATIVE_TERMINATION_REASONS, ScheduleObservation, arrival_schedule, run_stage,
+)
 
 LOAD_TITLES = {
     "combinations": "Input → output combinations",
@@ -52,9 +54,6 @@ LOAD_TITLES = {
     "interference": "Long input during an active short stream",
 }
 SCHEDULER_LAG_MS = 100  # Same delivery-evidence policy as traffic.py, not an acceptance criterion.
-AUTHORITATIVE_TERMINATION_REASONS = {
-    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "run_duration_limit",
-}
 
 
 def settings_sets(settings):
@@ -898,8 +897,15 @@ async def arrival_window(run, target, client, settings, point, calibration):
         scheduler_lag_tolerance_ms=SCHEDULER_LAG_MS,
     )
 
-    async def send(spec):
-        return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True)
+    async def send(spec, finalize_record):
+        return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
+                                 finalize_record=finalize_record)
+
+    def offer_spec(index):
+        offer = offers[index]
+        spec = build_spec(run, settings, point, offer["shape"], calibration)
+        spec.load_point.update(origin=offer["origin"], burst_index=offer["burst_index"])
+        return spec
 
     def stop():
         why = run.stop_reason(target.name)
@@ -919,7 +925,7 @@ async def arrival_window(run, target, client, settings, point, calibration):
         deadline=run.deadline,
         limits=settings.pass_criteria.timing_limits(),
         schedule_override=[(o["offset_seconds"], o["shape"]) for o in offers],
-        spec_factory=lambda i: build_spec(run, settings, point, offers[i]["shape"], calibration),
+        spec_factory=offer_spec,
         check_id="load",
         scenario=point["id"],
         run_start=run.start,
@@ -935,16 +941,6 @@ async def arrival_window(run, target, client, settings, point, calibration):
         offer["outcome"] = outcome
         offer["scheduler_lag_ms"] = evidence.offer_lags_ms[index]
     for index, record in evidence.records:
-        if record.status == "cancelled":
-            if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
-                record.error = (
-                    "overall run deadline reached"
-                    if evidence.drain_expired
-                    else "; ".join(evidence.reasons) or "run stopped"
-                )
-            record.load_point["cancellation_reason"] = record.error
-        record.load_point["origin"] = offers[index]["origin"]
-        record.load_point["burst_index"] = offers[index]["burst_index"]
         offers[index]["request_id"] = record.id
         offers[index]["dispatch_delay_ms"] = record.dispatch_lag_ms
     point.update(

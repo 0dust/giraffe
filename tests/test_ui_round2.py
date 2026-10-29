@@ -85,7 +85,8 @@ def test_structured_remediation_renders_ui_controls_and_keeps_reason_concrete():
 const c=check('load','inconclusive',{summary:'Need --max-duration 60 and --max-requests off.',finding_summary:'The request budget ended the load window.',remediation:{action:'set_limit',limit:'max_duration',clear:'max_requests'}});
 const html=detail(report([c]));assert.match(html,/Set Max duration and turn off Max requests in Limits/);assert.match(html,/>Open Limits</);assert.doesNotMatch(html,/--max-|Need --/);
 const correctness=check('correctness','fail',{metrics:{correct:0,scored:5},summary:'scoring failed the configured correctness limit; rerun the same fixtures'});
-assert.equal(measuredCheckReason(correctness,report([correctness])),'0 of 5 answers matched the expected answer.');
+assert.equal(measuredCheckReason(correctness,report([correctness])),correctness.summary);
+assert.match(renderScoredCheckEvidence(correctness),/0 of 5 answers matched the expected answer/);
 assert.equal(renderGuidance(report([correctness]),state.detail),'');
 ''')
 

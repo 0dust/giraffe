@@ -68,7 +68,8 @@ def test_aggregate_progress_remains_authoritative_over_retained_request_counts()
  openConditionDialog([...conditionViews.keys()][0]);await settle();
  const dialog=$('#test-dialog');assert(dialog.open);assert.match(dialog.textContent,/Running/);
  for(const label of ['Planned','Started','Running','Completed','Failed / timed out','Not started'])assert(dialog.textContent.includes(label));
- assert.equal($$('.request-evidence-row',dialog).length,1);assert.match(dialog.textContent,/1 of 1,000 requests available/);assert.equal($('.request-evidence-row',dialog).dataset.request,'partial');
+ assert.equal($$('.request-evidence-row',dialog).length,200);assert.match(dialog.textContent,/200 of 1,000 requests/);assert.equal($('.request-evidence-row',dialog).dataset.request,'r1');
+ assert.equal(conditionDialog.localEvidence,false);assert.match(dialog.textContent,/Page 1 of 5/);
  assert.match(dialog.textContent,/1,000/);assert.match(calls.at(-1),/status=all&page=4&page_size=50/);
  assert.match(dialog.textContent,/Back to conditions/);
 })()
