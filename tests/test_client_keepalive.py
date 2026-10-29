@@ -325,3 +325,145 @@ async def test_all_lanes_share_cookie_state_and_request_settings(monkeypatch):
     assert all(request.headers['authorization'] == 'Bearer test-key' and
                request.headers['x-custom'] == 'test-header' for request in requests)
     assert requests[-1].headers['cookie'] == 'session=shared'
+
+
+@pytest.mark.parametrize('double_cancel', [False, True])
+async def test_cancelled_header_wait_cannot_strand_the_next_request(monkeypatch, double_cancel):
+    import httpx
+    from httpcore._async.http11 import AsyncHTTP11Connection
+    from giraffe.transport import HTTPClientPool
+    from tests.fake_endpoint import FakeEndpoint
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = AsyncHTTP11Connection._response_closed
+
+    async def paused_close(connection):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        await original(connection)
+
+    monkeypatch.setattr(AsyncHTTP11Connection, '_response_closed', paused_close)
+    pool = HTTPClientPool(lambda: httpx.AsyncClient(timeout=None, trust_env=False,
+        limits=httpx.Limits(max_connections=1, max_keepalive_connections=1)), 1)
+    pending = None
+    try:
+        with FakeEndpoint(first_token_delay=10) as server:
+            url = server.url + '/chat/completions'
+            first = {'model': 'fake', 'messages': [{'role': 'user', 'content': 'first'}],
+                     'max_tokens': 8, 'stream': False}
+            second = {**first, 'messages': [{'role': 'user', 'content': 'independent'}]}
+            pending = asyncio.create_task(pool.send(pool.build_request('POST', url, json=first), stream=True))
+            async with asyncio.timeout(1):
+                while not server.requests:
+                    await asyncio.sleep(0)
+                pending.cancel()
+                await entered.wait()
+                if double_cancel:
+                    pending.cancel()
+                else:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+                assert pending.cancelling() == (2 if double_cancel else 1)
+            release.set()
+            server.first_token_delay = 0
+            async with asyncio.timeout(1):
+                response = await pool.send(pool.build_request('POST', url, json=second), stream=True)
+                assert response.status_code == 200
+                await response.aread()
+            assert server.requests == [first, second]  # No replay of the cancelled request.
+            assert pool._slots._value == 1 and len(pool._idle) == len(pool._clients) == 1
+    finally:
+        release.set()
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await pool.aclose()
+
+
+@pytest.mark.parametrize('close_error', [False, True])
+async def test_cancelled_send_keeps_slot_until_retired_lane_is_closed(close_error):
+    import httpx
+    from giraffe.transport import HTTPClientPool
+
+    started, closing, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    clients, transports = [], []
+
+    class Transport(httpx.AsyncBaseTransport):
+        close_calls = 0
+        resource_closed = False
+
+        async def handle_async_request(self, request):
+            if request.url.path == '/blocked':
+                started.set()
+                await asyncio.Event().wait()
+            return httpx.Response(200, text='ok')
+
+        async def aclose(self):
+            if self.resource_closed:
+                return
+            self.close_calls += 1
+            closing.set()
+            await finish.wait()
+            if close_error and self.close_calls == 1:
+                raise httpx.CloseError('controlled transport close failure')
+            self.resource_closed = True
+
+    def factory():
+        transport = Transport()
+        client = httpx.AsyncClient(transport=transport)
+        transports.append(transport)
+        clients.append(client)
+        return client
+
+    pool = HTTPClientPool(factory, 1)
+    pending = asyncio.create_task(pool.send(pool.build_request('GET', 'http://local/blocked')))
+    waiting = None
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        pending.cancel()
+        await asyncio.wait_for(closing.wait(), 1)
+        waiting = asyncio.create_task(pool.send(pool.build_request('GET', 'http://local/next')))
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done() and not waiting.done()
+        assert pool._slots._value == 0 and len(clients) == 1
+        finish.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(pending, 1)
+        assert isinstance(cancelled.value.__cause__, httpx.CloseError) is close_error
+        assert pending.cancelling() == 2
+        if close_error:
+            with pytest.raises(RuntimeError, match='client is closed'):
+                await asyncio.wait_for(waiting, 1)
+            assert pool._clients == clients and not pool._idle
+            assert pool._slots._value == 1 and clients[0].is_closed
+            assert not transports[0].resource_closed
+            for _ in range(2):
+                with pytest.raises(httpx.CloseError, match='transport close failure'):
+                    await pool.aclose()
+            assert transports[0].close_calls == 1 and not transports[0].resource_closed
+        else:
+            response = await asyncio.wait_for(waiting, 1)
+            assert response.status_code == 200
+            assert clients[0].is_closed and transports[0].resource_closed
+            assert pool._slots._value == 1 and len(pool._clients) == 1
+    finally:
+        finish.set()
+        for task in (pending, waiting):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (pending, waiting) if task is not None),
+                             return_exceptions=True)
+        try:
+            await pool.aclose()
+        except httpx.CloseError:
+            if not close_error:
+                raise
+        finally:
+            # The fixture owns this mock resource; production never bypasses HTTPX.
+            for transport in transports:
+                await transport.aclose()
+    assert all(client.is_closed for client in clients)
+    assert all(transport.resource_closed for transport in transports)

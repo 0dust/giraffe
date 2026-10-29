@@ -66,6 +66,7 @@ class HTTPClientPool:
         self._slots = asyncio.Semaphore(max_connections)
         self._closing: set[asyncio.Task] = set()
         self._close_task: asyncio.Task | None = None
+        self._retirement_error: BaseException | None = None
         self._closed = False
 
     def build_request(self, *args, **kwargs) -> httpx.Request:
@@ -85,10 +86,31 @@ class HTTPClientPool:
                 client = self._factory()
                 self._clients.append(client)
             response = await client.send(request, stream=stream)
-        except BaseException:
-            if client is not None:
-                self._idle.append(client)
-            self._slots.release()
+        except BaseException as error:
+            try:
+                if client is not None:
+                    if isinstance(error, asyncio.CancelledError):
+                        # Interrupted HTTPcore cleanup can strand its connection.
+                        # Retire this lane without replaying the cancelled request.
+                        closing = asyncio.create_task(client.aclose())
+                        self._closing.add(closing)
+                        closing.add_done_callback(self._closing.discard)
+                        try:
+                            await _finish_cleanup(closing)
+                        except Exception as cleanup_error:
+                            raise error from cleanup_error
+                        finally:
+                            failure = asyncio.CancelledError() if closing.cancelled() else closing.exception()
+                            if failure is None:
+                                self._clients.remove(client)
+                            else:
+                                self._closed = True
+                                if self._retirement_error is None:
+                                    self._retirement_error = failure
+                    else:
+                        self._idle.append(client)
+            finally:
+                self._slots.release()
             raise
 
         def release() -> None:
@@ -117,6 +139,9 @@ class HTTPClientPool:
         for outcome in outcomes:
             if isinstance(outcome, BaseException):
                 raise outcome
+        if self._retirement_error is not None:
+            # HTTPX may already report closed after failed transport cleanup.
+            raise self._retirement_error
 
     async def aclose(self) -> None:
         if self._close_task is None:

@@ -111,22 +111,70 @@ def test_named_tool_selection_has_a_tool_call_label():
     assert condition_for("tools_lookup_named_complete")["label"] == "Lookup tool calls · named tool · non-streaming"
 
 
-def test_per_scenario_rows_keep_partner_turn_and_prompt_distinctions():
-    run_render_checks(r"""
-const scenarios=[['mixed_short_long_input_before_output','short request'],['mixed_heavy_long_input_before_output','heavy partner'],
- ['session_live_turn1','turn 2'],['session_live_turn2','turn 3'],
- ['consistency_c4_short_p2','prompt 3'],['consistency_c4_short_p3','prompt 4'],
- ['tools_lookup_stream_turn0','turn 1'],['tools_lookup_stream_turn1','turn 2']];
-const html=renderComparison(report([],{baseline:{targets:[{target:'local',comparisons:
-  scenarios.map(([scenario])=>({check:'serving',scenario,metric:'latency_ms',status:'pass',baseline:10,current:10}))}]}}));
-assert.equal((html.match(/data-comparison-group=/g)||[]).length,scenarios.length);
-for(const [scenario,part] of scenarios)assert(html.includes(phaseName(scenario)+' · '+part),scenario);
+@pytest.mark.parametrize("recorded_conditions", [False, True])
+def test_per_scenario_rows_keep_partner_turn_and_prompt_distinctions(recorded_conditions):
+    scenarios = [
+        ("mixed_short_long_input_before_output", "Long input interference · before output · short request", ""),
+        ("mixed_heavy_long_input_before_output", "Long input interference · before output · heavy partner", ""),
+        ("session_live_turn1", "Live sessions · turn 2", ""),
+        ("session_live_turn2", "Live sessions · turn 3", ""),
+        ("consistency_c4_short_p2", "Short input consistency · prompt 3", "4 at once"),
+        ("consistency_c4_short_p3", "Short input consistency · prompt 4", "4 at once"),
+        ("consistency_c8_short_p2", "Short input consistency · prompt 3", "8 at once"),
+        ("tools_lookup_stream_turn0", "Lookup conversation · streaming · turn 1", ""),
+        ("tools_lookup_stream_turn1", "Lookup conversation · streaming · turn 2", ""),
+    ]
+    conditions = []
+    if recorded_conditions:
+        for scenario, _, _ in scenarios:
+            condition = condition_for(scenario)
+            if condition["id"] == "consistency_c4_short":
+                condition["label"] = "Saved short consistency · 4 at once"
+            conditions.append({"target": "local", "condition": condition})
+        scenarios = [(scenario, label.replace("Short input consistency", "Saved short consistency")
+                      if scenario.startswith("consistency_c4_") else label, context)
+                     for scenario, label, context in scenarios]
+    run_render_checks("const scenarios=" + json.dumps(scenarios) + ";const conditions="
+                      + json.dumps(conditions) + ";" + r"""
+const value=report([],{conditions,baseline:{targets:[{target:'local',comparisons:
+  scenarios.map(([scenario])=>({check:'serving',scenario,metric:'latency_ms',status:'pass',baseline:10,current:10}))}]}});
+$('#main').innerHTML=renderComparison(value);
+const groups=$$('.comparison-check-group');
+assert.equal(groups.length,scenarios.length);
+for(let index=0;index<scenarios.length;index++){
+ const [scenario,label,context]=scenarios[index],group=groups[index];
+ assert(group.querySelector('.comparison-group-heading').textContent.endsWith(' · '+label),scenario+': '+group.textContent);
+ if(context){
+  const evidence=group.querySelector('.comparison-cohort-context');
+  assert(evidence&&!evidence.hidden,scenario+': '+group.textContent);
+  assert.equal(evidence.textContent,context);
+  assert.equal(group.textContent.split(context).length-1,1);
+ }
+}
 assert(renderPhases([{event:'scenario_started',scenario:'session_live_turn1',target:'local'}]).includes('Live sessions · turn 2'));
 const reportValue=report([check('serving','pass',{evidence_ids:['one','two']})],{requests:scenarios.slice(0,2).map(([scenario],i)=>({id:i?'two':'one',scenario,target:'local',status:'completed'}))});
 detail(reportValue);state.selectedCheck='local:serving';renderDetail();
 assert(nodes['#main'].innerHTML.includes('interference · before output · short request'));
 assert(nodes['#main'].innerHTML.includes('interference · before output · heavy partner'));
-""")
+""", dom=True)
+
+
+def test_comparison_fallback_condition_metadata_stays_with_its_target():
+    run_render_checks(r"""
+const row={check:'consistency',scenario:'consistency_c4_short_p2',metric:'latency_ms',status:'pass',baseline:10,current:10};
+const value=report([],{observations:{targets:{
+ remote:{conditions:[{condition:{id:'consistency_c4_short',label:'Remote prompt',parameters:{concurrency:8}}}]},
+ local:{conditions:[{condition:{id:'consistency_c4_short',label:'Local <prompt>',parameters:{concurrency:4}}}]}
+}},baseline:{targets:[{target:'local',comparisons:[row]},{target:'remote',comparisons:[row]}]}});
+const html=renderComparison(value);$('#main').innerHTML=html;
+const groups=$$('.comparison-check-group');assert.equal(groups.length,2);
+assert(groups[0].querySelector('.comparison-group-heading').textContent.endsWith('Local <prompt> · prompt 3'),groups[0].textContent);
+assert.equal(groups[0].querySelector('.comparison-cohort-context').textContent,'4 at once');
+assert.equal(groups[0].querySelector('prompt'),null);
+assert(html.includes('Local &lt;prompt&gt;'));
+assert(groups[1].querySelector('.comparison-group-heading').textContent.endsWith('Remote prompt · prompt 3'));
+assert.equal(groups[1].querySelector('.comparison-cohort-context').textContent,'8 at once');
+""", dom=True)
 
 
 @pytest.mark.parametrize("messages,expected", [
