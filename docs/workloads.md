@@ -76,7 +76,7 @@ duration**) also default to **Not set**. The request budget covers all selected
 tests and targets, independently of concurrency. Increasing simultaneous load
 does not increase that budget. AI evaluator calls use separate limits.
 Use `--simultaneous-limit` and `--default-concurrency` to set the two CLI controls
-independently. The compatibility flag `--concurrency N` sets both to `N`.
+independently.
 
 ## Load test
 
@@ -192,7 +192,31 @@ saved manifests can retain them as `config_migration_notes`. Normalized exports 
 the current schema. Old reports still render, but comparisons across incompatible
 formats are inconclusive.
 
+## Your own questions
+
+[`examples/request-pack.json`](../examples/request-pack.json) is a complete run
+configuration with embedded cases, expected answers and deterministic scorers.
+Edit its target URL and model, then run it with
+`giraffe run --config examples/request-pack.json --html`. Its `request_pack`
+object can also be extracted as a standalone dataset for `--request-pack`.
+
+Judge scoring requires an explicit evaluator endpoint in `judging.judges` and a
+`judge` case with an expected answer and rubric. Evaluator calls have separate
+budgets and send the case and generated answer to that endpoint; validation
+reports this before a judged run.
+
 ## Standard checks and load evidence
+
+The CLI and UI default checks are `access, serving, correctness, first_output`.
+The first-output check defaults to a p95 limit of 10,000 ms, a generous sanity
+bound for laptops. Override it with `--first-output-ms` or YAML
+`limits.first_output_ms`. Generation defaults to a 5,000 ms stream-gap limit when
+no explicit generation timing or speed limit is configured. Override it with
+`--stream-gap-ms` or YAML `limits.stream_gap_ms`; a configured latency, stream-gap
+or minimum token-speed limit takes precedence over this fallback.
+An explicit global or per-check `stream_gap_ms: null` disables the generation
+stream-gap sanity default. The first-output sanity bound applies only to the
+`first_output` check; other checks keep their configured timing limits.
 
 First-output and generation checks use ordinary serial requests; loaded timing
 belongs to the corresponding load check. Serving excludes sustained recovery traffic.
@@ -239,9 +263,10 @@ apply to recovery probes. Sustained outcomes stay outside serving/first-output c
 sustained answers still enter the correctness allowance. Post-load probes use the
 same fixture as the pre-load baseline. `recovery_max_ratio` limits median latency
 and first-output ratios. Set it even when absolute timing limits are configured
-(the examples use `2`): a large slowdown can remain inside an absolute limit. An
+to catch a large slowdown that remains inside an absolute limit. An
 absolute-only pass states both measured probe/baseline ratios and that no ratio
-limit was configured. Without a timing limit or ratio, recovery is inconclusive.
+limit was configured. With no timing limit or ratio, recovery concludes from
+correctness and error rate, and reports timing as an observation.
 
 Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
 interrupt an active generation stream after that many nonempty content or reasoning

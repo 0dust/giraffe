@@ -121,7 +121,7 @@ def test_derived_defaults_do_not_replace_explicit_invalid_profile_values(invalid
 
 
 def test_numeric_global_values_use_their_validated_integer_values_for_defaults():
-    config = RunConfig(targets=[TARGET], concurrency='2', max_output_tokens='32')
+    config = RunConfig(targets=[TARGET], checks=['load'], concurrency='2', max_output_tokens='32')
     assert config.load_test.patterns.concurrent.levels == [1]
     assert config.load_test.profile.long.output_tokens == 512
     assert config.concurrency == 2 and config.max_output_tokens == 32

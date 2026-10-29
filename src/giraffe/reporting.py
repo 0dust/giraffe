@@ -83,6 +83,8 @@ def _comparison_config(value: dict) -> dict:
     config, _ = migrate_concurrent_load(config)
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
+        for field in ("first_output_ms", "stream_gap_ms"):
+            config["limits"].setdefault(field, None)
     default = config.setdefault("default_concurrency", 4)
     ceiling = config.get("concurrency")
     if isinstance(ceiling, int):
@@ -141,6 +143,12 @@ def _comparison_manifest(manifest: dict) -> dict:
                     **settings} if isinstance(settings, dict) else settings
             for check, settings in value["effective_checks"].items()
         }
+    for check, field in (("first_output", "first_output_ms"), ("generation", "stream_gap_ms")):
+        settings = value.get("effective_checks", {}).get(check)
+        if isinstance(settings, dict) and isinstance(settings.get("limits"), dict):
+            supplied = (config.get("test_options", {}).get(check) or {}).get("limits") or {}
+            threshold = supplied[field] if field in supplied else (config.get("limits") or {}).get(field)
+            value["effective_checks"][check] = {**settings, "limits": {**settings["limits"], field: threshold}}
     if "capacity" in resolved.checks:
         value.setdefault("effective_traffic", resolved.effective_traffic().model_dump(mode="json"))
     return value
@@ -1339,6 +1347,11 @@ def _number(value: float | None) -> str:
     return "—" if value is None or not math.isfinite(value) else f"{value:,.1f}"
 
 
+def _duration_ms(value: float) -> str:
+    amount, unit = (value / 1000, "s") if value >= 1000 else (value, "ms")
+    return f"{_number(amount).rstrip('0').rstrip('.')} {unit}"
+
+
 def _badge(status: str) -> str:
     return f'<span class="badge {_e(status)}">{_e(status)}</span>'
 
@@ -1614,6 +1627,14 @@ def _render(report: RunReport) -> str:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
+        applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
+        default_limits = (report.manifest.get("default_check_limits") or {}).get(check.id) or []
+        timing = {"first_output": [("first_output_ms", "p95 first useful output")],
+                  "generation": [("latency_ms", "Response time"), ("stream_gap_ms", "Stream pause")]}
+        limit_text = "; ".join(f"{label} ≤ {_duration_ms(applied[field])}" + (" (default)" if field in default_limits else "")
+                               for field, label in timing.get(check.id, []) if applied.get(field) is not None)
+        if limit_text:
+            metrics = f'<p>{_e(limit_text)}</p>' + metrics
         parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(check.title)}</strong>'
                      f'<br>{"Required" if check.required else "Optional"}</td>'
                      f'<td>{_badge(check.status)}</td><td>{_e(check.summary)}'

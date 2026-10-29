@@ -395,3 +395,29 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
             assert '.queued' not in selector and '.reserved' not in selector
     assert animated, 'The parser must inspect real animation rules'
     assert '.is-landing' not in css
+
+
+def test_check_details_show_recorded_effective_limits_and_default_labels():
+    run_render_checks(r"""
+const first=check('first_output','pass'),generation=check('generation','pass');
+const value=report([first,generation]);
+value.manifest.effective_checks={first_output:{limits:{first_output_ms:10000}},generation:{limits:{stream_gap_ms:5000}}};
+value.manifest.default_check_limits={first_output:['first_output_ms'],generation:['stream_gap_ms']};
+const original=JSON.stringify(value);
+let markup=renderCheck(first,value);
+assert.match(markup,/Limit: ≤ 10 s \(default\)/);
+assert.doesNotMatch(markup,/No acceptance limit set/);
+markup=renderCheck(generation,value);
+assert.match(markup,/Limit: ≤ 5 s \(default\)/);
+assert.doesNotMatch(markup,/No stream-pause limit set/);
+assert.equal(JSON.stringify(value),original);
+value.manifest.config.limits.first_output_ms=123;
+value.manifest.effective_checks.first_output.limits.first_output_ms=800;
+value.manifest.default_check_limits.first_output=[];
+markup=renderCheck(first,value);
+assert.match(markup,/Limit: ≤ 800 ms/);assert.doesNotMatch(markup,/\(default\)|123 ms/);
+value.manifest.effective_checks.first_output.limits.first_output_ms=null;
+markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
+delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
+markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
+""")

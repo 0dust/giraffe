@@ -63,7 +63,7 @@ async def test_discovery_errors_are_bounded_and_do_not_echo_remote_body(monkeypa
 async def test_discovery_missing_auth_does_not_connect(monkeypatch):
     monkeypatch.delenv("GIRAFFE_MISSING_KEY", raising=False)
     monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient", lambda **kw: pytest.fail("Connected"))
-    with pytest.raises(HTTPException, match="authentication environment variable"):
+    with pytest.raises(HTTPException, match="API key environment variable GIRAFFE_MISSING_KEY is not set"):
         await discover_models(ModelDiscovery(url="http://server", api_key_env="GIRAFFE_MISSING_KEY"))
 
 

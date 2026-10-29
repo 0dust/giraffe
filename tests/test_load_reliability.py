@@ -96,15 +96,15 @@ async def test_recovery_ratio_compares_same_fixture_before_and_after_load(endpoi
     assert result.metrics[f"{slow_metric}_ratio"] == 4
 
 
-async def test_recovery_without_timing_acceptance_limit_is_inconclusive(endpoint):
+async def test_recovery_without_timing_acceptance_limit_passes_correct_answers(endpoint):
     # Amortize worker startup/refill delays so occupancy is not the inconclusive reason.
-    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.25))
+    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.25, limits=Limits(first_output_ms=None, min_samples=2)))
     result = check(report, "recovery")
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["correct"] == 2
-    assert result.status == "inconclusive"
-    assert result.summary.startswith("Recovery observed; no acceptance limit configured.")
-    assert "To conclude, set limits.recovery_max_ratio" in result.summary
+    assert result.status == "pass"
+    assert "no ratio limit configured" in result.summary
+    assert result.metrics["latency_ratio"] is not None
 
 
 async def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):

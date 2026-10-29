@@ -53,15 +53,22 @@ python -m pip install "giraffe-llm==0.1.0a1"
 
 ### 2. Start your run
 
-This example uses Ollama with `llama3.2:3b` already installed. Replace the URL and model for your server.
+This example uses Ollama with a model already installed. Replace the URL for your server.
 
 ```sh
-giraffe run --url http://127.0.0.1:11434/v1 \
-  --model llama3.2:3b --checks access,serving,correctness \
-  --concurrency 1 --html
+giraffe run --url http://127.0.0.1:11434/v1 --html
 ```
 
-This is a basic sequential check of endpoint access, response validity and known-answer correctness. It does not test concurrent serving or load capacity.
+The model is auto-detected when only one is served; otherwise add `--model MODEL_ID`.
+The CLI and UI select the same four checks by default:
+`access, serving, correctness, first_output`. These check endpoint access, response
+validity, known-answer correctness and p95 time to the first useful output.
+The default first-output limit is **10,000 ms**, a generous laptop sanity bound;
+override it with `--first-output-ms` or YAML `limits.first_output_ms`.
+Default check parallelism is four. Fully scored answers can conclude on accuracy when
+parallelism is inherited; missing server overlap is reported as an observation.
+Set `--default-concurrency` or a per-check concurrency override above one to require concurrent evidence.
+The 10,000 ms sanity bound applies only to `first_output`.
 
 **Outputs:** results in the terminal, plus JSON and HTML reports in `runs/<timestamp>/`. The command exits when finished. Open `report.html` to inspect each check and its requests.
 
@@ -85,13 +92,13 @@ Open **[localhost:8765](http://127.0.0.1:8765)**, enter your endpoint and model,
 
 Connect through the engine’s **OpenAI-compatible chat API**. Discovery, metrics and server-side evidence vary by engine.
 
-Download a YAML configuration from the links below into a local `examples/` directory. Each file defines the endpoint, model, checks, load settings and acceptance limits for a run.
+Download a YAML configuration from the links below into a local `examples/` directory. Engine files define an endpoint, model and metrics profile, and inherit the shared default checks and limits. Dedicated workload examples show additional tests.
 
 | Engine | YAML configuration |
 | --- | --- |
 | Ollama | [`local.yaml`](https://github.com/0dust/giraffe/blob/main/examples/local.yaml) |
 | vLLM / vLLM-Metal | [`vllm.yaml`](https://github.com/0dust/giraffe/blob/main/examples/vllm.yaml) |
-| SGLang | Use your endpoint URL and model ID in the [CLI command above](#2-start-your-run) |
+| SGLang | [`sglang.yaml`](https://github.com/0dust/giraffe/blob/main/examples/sglang.yaml) |
 | llama.cpp server | [`llamacpp.yaml`](https://github.com/0dust/giraffe/blob/main/examples/llamacpp.yaml) |
 | TensorRT-LLM | [`tensorrt-llm.yaml`](https://github.com/0dust/giraffe/blob/main/examples/tensorrt-llm.yaml) |
 | LMDeploy | [`lmdeploy.yaml`](https://github.com/0dust/giraffe/blob/main/examples/lmdeploy.yaml) |
@@ -138,7 +145,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 
 ## Tests
 
-15 built-in checks. Select the ones that matter to your endpoint.
+15 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
 
 | Check · CLI ID | What it checks |
 | --- | --- |
@@ -157,6 +164,16 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
 | Repeated-request consistency · `consistency` | Answer agreement across repeated requests |
 | Tool-calling capability · `tools` | Tool-call structure, names and expected arguments |
+
+When selected, generation uses a **5,000 ms stream-gap limit** if no generation
+limit is supplied; this catches stalls without imposing a token speed. Set
+`--stream-gap-ms` or YAML `limits.stream_gap_ms` to override it; an explicit YAML
+`stream_gap_ms: null` disables this fallback. Recovery can pass
+on correctness and error rate without a timing limit; timing remains an observation.
+
+Use `--json` (an alias of `--output-format json`) for machine-readable CLI output.
+Use `--structured-output` to add the structured-JSON check, and `--verbose` to show
+diagnostic stages and RAM measurements. JSON reports retain those measurements.
 
 Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Missing delivery or measurement evidence stays inconclusive. Inspect the request evidence before attributing a failure to your inference server.
 

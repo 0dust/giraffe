@@ -71,7 +71,7 @@ def test_unknown_after_covered_windows_is_risk_without_a_lower_budget_action():
 
 @pytest.mark.parametrize("budget", [300, 600, 1200, 2400, 5000])
 def test_default_suite_cut_detection_uses_known_highs_and_unknown_lower_bounds(budget):
-    plan = request_plan(config(max_duration_seconds=budget, checks=list(RunConfig(targets=[TARGET]).checks)))
+    plan = request_plan(config(max_duration_seconds=budget, checks=["access", "serving", "first_output", "generation", "load", "context", "correctness", "cancellation", "recovery"]))
     assert plan["errors"] == []
     for notice in plan["time_warnings"]:
         for action in notice.get("actions", []):
