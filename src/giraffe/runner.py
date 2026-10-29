@@ -1460,13 +1460,21 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 "min_output_tokens_per_second": None}) if check_id == "first_output" else limits.model_copy(update={"first_output_ms": None})
             qualified = qualified_violations(records, assessed_limits, quality, unfinished=True)
             if check_id == "first_output" and limits.first_output_ms is not None:
+                # Completed answers are a p95 cohort; unfinished requests can
+                # independently establish a lower-bound timing failure.
+                unfinished_ids = {r.id for r in records if not r.valid
+                                  and "first_output_ms" in exceeded_unfinished(r, limits)}
                 p95 = metrics["first_output_p95_ms"]
                 if p95 is not None and p95 <= limits.first_output_ms:
-                    # Completed answers are judged as a p95 cohort; an unfinished
-                    # request can still establish a lower-bound timing failure.
-                    unfinished_ids = {r.id for r in records if not r.valid
-                                      and "first_output_ms" in exceeded_unfinished(r, limits)}
                     violations = [identifier for identifier in violations if identifier in unfinished_ids]
+                # Keep the sample count and raw observations intact. A zero
+                # latency for every affected answer gives the cohort's most
+                # favorable possible p95, so only a failure of that bound can
+                # be attributed to the endpoint.
+                affected = set(quality["affected_metrics"].get("first_output_ms", []))
+                best_case_p95 = _percentile([0 if r.id in affected else r.first_output_ms
+                    for r in records if r.valid and r.status == "completed" and r.first_output_ms is not None], .95)
+                if best_case_p95 is None or best_case_p95 <= limits.first_output_ms:
                     qualified = [identifier for identifier in qualified if identifier in unfinished_ids]
             gap_samples = sum(r.valid and r.status == "completed" and r.measured_stream_gap for r in records)
             metrics["measured_gap_samples"] = gap_samples
