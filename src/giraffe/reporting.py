@@ -1893,7 +1893,7 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
                     for field, label in (("valid", "valid"), ("dispatched", "dispatched"), ("required", "required")):
                         if point.get(field) is not None:
                             evidence.append(f'{point[field]} {label}')
-                    for field, label in (("server_evidenced_concurrency", "server-evidenced concurrency"), ("client_mean_inflight", "mean client in flight")):
+                    for field, label in (("server_evidenced_concurrency", "server-evidenced concurrency"), ("client_mean_inflight", "mean client requests at once")):
                         if point.get(field) is not None:
                             evidence.append(f'{label} {point[field]:g}')
                 parts.append(f'<td>{_e(point_status(point).capitalize())}'
