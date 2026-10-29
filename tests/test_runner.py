@@ -554,9 +554,8 @@ async def test_shared_request_concurrency_budget_and_replica_separation(client):
 
 async def test_global_duration_closes_active_client_and_preserves_attempt(client):
     client.delay = 1
-    start = time.monotonic()
     report = await runner.run_suite(config(max_duration_seconds=.035))
-    assert time.monotonic()-start < .2
+    assert report.observations["inference_duration_seconds"] < .2
     assert "duration" in report.abort_reason
     assert len(report.requests) == 1
     assert report.requests[0].status in {"timeout", "cancelled"}
@@ -1784,9 +1783,8 @@ async def test_disconnected_sustained_endpoint_aborts_and_keeps_partial_evidence
     events = []
     settings = config(checks=["recovery", "sessions"], sustained_seconds=1, max_requests=500,
                       stop_after_errors=500, unresponsive_after_failures=3, unresponsive_for_seconds=.03)
-    started = time.monotonic()
     report = await runner.run_suite(settings, progress=events.append)
-    assert time.monotonic() - started < .3
+    assert report.observations["inference_duration_seconds"] < .3
     assert report.abort_reason.startswith("Endpoint service unresponsive:")
     assert any(r.valid for r in report.requests)
     assert any(r.status == "failed" for r in report.requests)
@@ -1856,11 +1854,10 @@ async def test_endpoint_outage_through_transport_stops_and_saves_records(monkeyp
 
     mock_inference_transport(monkeypatch, handler)
     events = []
-    started = time.monotonic()
     report = await runner.run_suite(config(checks=["serving", "sessions"], samples=50,
         max_requests=500, stop_after_errors=500, stream=False, request_timeout_seconds=.015,
         unresponsive_after_failures=3, unresponsive_for_seconds=.025), progress=events.append)
-    assert time.monotonic() - started < .5
+    assert report.observations["inference_duration_seconds"] < .5
     assert active == 0
     assert report.abort_reason.startswith("Endpoint service unresponsive:")
     assert report.overall != "pass" and check(report, "sessions").status != "pass"
@@ -1933,12 +1930,11 @@ async def test_silence_policy_cancels_capacity_drain_even_after_offer_budget_is_
             active -= 1
 
     mock_inference_transport(monkeypatch, handler)
-    started = time.monotonic()
     report = await runner.run_suite(load_config(max_requests=8, rate=500, finish=1,
         request_source="request_pack", request_pack={"version": 1, "cases": [{"fixture_id": "one",
             "messages": [{"role": "user", "content": "42"}], "scorer": "exact", "expected": "42"}]},
         unresponsive_after_failures=2, unresponsive_for_seconds=.025))
-    assert time.monotonic() - started < .5
+    assert report.observations["inference_duration_seconds"] < .5
     assert active == 0 and report.abort_reason.startswith("Endpoint service unresponsive:")
     assert any(r.status == "cancelled" for r in report.requests)
     assert all(r.score is None for r in report.requests)
@@ -1994,6 +1990,7 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
     assert state.stop_reason() is None
 
 
+@pytest.mark.parametrize("scoring_delay", [0, .28])
 @pytest.mark.parametrize("phase,settings", [
     ("initial", {}), ("warm", {}), ("context", {"checks": ["context"]}),
     ("session_", {"checks": ["sessions"], "context_limit": 4096}),
@@ -2002,21 +1999,34 @@ async def test_endpoint_health_is_per_target_and_starts_at_first_attempt():
         "patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True}, "rates": [100]},
         "schedule": {"duration_seconds": 1, "finish_seconds": 1}}}),
 ])
-async def test_run_deadline_bounds_each_target_traffic_phase(client, monkeypatch, phase, settings):
+async def test_run_deadline_bounds_each_target_traffic_phase(client, monkeypatch, phase, settings, scoring_delay):
     original = client.execute
-    entered = []
+    entered, cancelled = [], []
 
     async def slow_phase(self, spec, **kwargs):
         if spec.scenario.startswith(phase):
             entered.append(spec.scenario)
-            await asyncio.sleep(1)
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                cancelled.append(spec.scenario)
+                raise
         return await original(self, spec, **kwargs)
 
+    original_checks = runner._checks
+
+    def delayed_scoring(state, target):
+        assert not any(state.active.values())
+        time.sleep(scoring_delay)
+        return original_checks(state, target)
+
+    monkeypatch.setattr(runner, "_checks", delayed_scoring)
     monkeypatch.setattr(client, "execute", slow_phase)
-    started = time.monotonic()
     report = await runner.run_suite(config(max_duration_seconds=.045, **settings))
     assert entered, [r.scenario for r in report.requests]
-    assert time.monotonic() - started < .25
+    assert sorted(cancelled) == sorted(entered)
+    # The run deadline bounds traffic, independently of later scoring/report work.
+    assert report.observations["inference_duration_seconds"] < .25
     assert report.abort_reason == "maximum run duration reached"
     interrupted = [r for r in report.requests if r.scenario in entered]
     assert interrupted and all(r.status == "cancelled" and r.score is None for r in interrupted)
@@ -2074,9 +2084,8 @@ async def test_run_deadline_terminates_restart_hook():
 
     target = Target(name="service", model="test", url="http://localhost",
         restart_command=[sys.executable, "-c", "import time; time.sleep(2)"])
-    started = time.monotonic()
     report = await runner.run_suite(config(targets=[target], restart_target="service", max_duration_seconds=.03))
-    assert time.monotonic() - started < .3
+    assert report.observations["inference_duration_seconds"] < .3
     assert report.abort_reason == "maximum run duration reached"
     assert not report.requests
 
@@ -2103,10 +2112,9 @@ async def test_repeated_sse_headers_without_body_abort_hung_engine(monkeypatch):
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
 
     mock_inference_transport(monkeypatch, handler)
-    started = time.monotonic()
     report = await runner.run_suite(config(samples=50, max_requests=100, stop_after_errors=100,
         request_timeout_seconds=.015, unresponsive_after_failures=3, unresponsive_for_seconds=.025))
-    assert time.monotonic() - started < .5
+    assert report.observations["inference_duration_seconds"] < .5
     assert report.abort_reason and "unresponsive" in report.abort_reason
     assert len(report.requests) >= 3
     assert all(r.http_status == 200 and r.status == "timeout" and r.score is None for r in report.requests)
