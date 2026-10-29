@@ -27,11 +27,11 @@ async def main():
     subprocess.run([str(command), "--help"], check=True, timeout=30)
     static = resources.files("giraffe").joinpath("static")
     with tempfile.TemporaryDirectory() as directory:
-        app = create_app(Path(directory) / "runs")
+        app = create_app(Path(directory) / "runs", token="package-smoke-token")
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://localhost"
         ) as client:
-            response = await client.get("/")
+            response = await client.get("/?token=package-smoke-token", follow_redirects=True)
             response.raise_for_status()
             if "<!doctype html>" not in response.text.lower():
                 raise RuntimeError("Installed UI did not serve its HTML page")

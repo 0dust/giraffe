@@ -25,7 +25,7 @@ jobs:
         with:
           version: '0.13.5'
           python-version: '3.12'
-      - run: uv sync --frozen --extra dev
+      - run: uv sync --frozen --extra dev --extra hf-tokenizer
       - run: uv run --no-sync ruff check .
 
   test:
@@ -47,9 +47,35 @@ jobs:
         with:
           version: '0.13.5'
           python-version: '3.12'
-      - run: uv sync --frozen --extra dev --extra sglang-tracing
+      - run: uv sync --frozen --extra dev --extra hf-tokenizer --extra sglang-tracing
       - name: Run tests, including Node browser behavior checks
         run: uv run --no-sync python -m pytest -q -ra --tb=short --junitxml="$RUNNER_TEMP/pytest.xml"
+      - name: Summarize failures and skipped coverage
+        if: always()
+        run: python3 .github/scripts/pytest_summary.py "$RUNNER_TEMP/pytest.xml" >> "$GITHUB_STEP_SUMMARY"
+
+  test-python311:
+    name: Product tests (Python 3.11, Node 22)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          python-version: '3.11'
+      - run: uv sync --frozen --extra dev --extra hf-tokenizer --extra sglang-tracing
+      - name: Run product tests
+        run: uv run --no-sync python -m pytest tests -q -ra --tb=short --ignore-glob=tests/test_validation_*.py --junitxml="$RUNNER_TEMP/pytest.xml"
       - name: Summarize failures and skipped coverage
         if: always()
         run: python3 .github/scripts/pytest_summary.py "$RUNNER_TEMP/pytest.xml" >> "$GITHUB_STEP_SUMMARY"

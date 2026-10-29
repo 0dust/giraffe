@@ -205,7 +205,8 @@ def test_run_help_has_all_flags_examples_and_exit_codes(capsys):
         main(["run", "--help"])
     assert stopped.value.code == 0
     output = capsys.readouterr().out
-    assert "--structured-output" in output and "--json" in output and "--verbose" in output
+    assert "--structured-output" not in output and "--json" in output and "--verbose" in output
+    assert "--no-stream" in output and "--help-all" in output
     assert "(default: 300)" not in output
     help_text = " ".join(output.split())  # Argparse wraps the longer field labels.
     assert help_text.count("(default: Not set)") == 3

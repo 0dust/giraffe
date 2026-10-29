@@ -21,7 +21,7 @@ def config(**values):
 async def test_real_validated_snapshot_copy_cli_accepts_resource_block(tmp_path, limits):
     limits["hard"] = 70
     cfg = config()
-    async with browser(tmp_path) as client:
+    async with browser(tmp_path, allow_restart_command=True) as client:
         validated = await client.post("/api/config/validate", json=cfg.model_dump(mode="json"))
         assert validated.status_code == 200, validated.text
         normalized = validated.json()
@@ -147,7 +147,7 @@ async def test_web_summary_and_lifecycle_metadata_share_one_lock(tmp_path, monke
     monkeypatch.setattr(web, "write_report", write_report)
     monkeypatch.setattr(storage, "_write_metadata", write_metadata)
     monkeypatch.setattr(web, "run_suite", successful_runner)
-    async with browser(tmp_path) as client:
+    async with browser(tmp_path, allow_restart_command=True) as client:
         response = await client.post("/api/runs", json={"config": config().model_dump(mode="json")})
         assert response.status_code == 202, response.text
         identifier = response.json()["id"]

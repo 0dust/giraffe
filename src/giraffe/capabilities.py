@@ -149,7 +149,7 @@ def configuration_limits(schema: dict) -> dict:
     return limits
 
 
-def capabilities(config: RunConfig | None = None) -> dict:
+def capabilities(config: RunConfig | None = None, *, restart_allowed: bool = False) -> dict:
     """Describe real model fields; semantic constraints are checked by validate."""
     configured = config or RunConfig(targets=[{
         "name": "local", "url": "http://localhost:11434/v1", "model": "placeholder",
@@ -161,6 +161,7 @@ def capabilities(config: RunConfig | None = None) -> dict:
     schema = RunConfig.model_json_schema()
     limits = configuration_limits(schema)
     return {
+        "restart_allowed": restart_allowed,
         "builtin_question_example": {"question": example.messages[0]["content"], "expected": example.expected},
         "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION, "version": __version__,
         "validation_note": "The schema describes configuration. Validate checks semantic constraints; neither command contacts endpoints or verifies runtime availability.",

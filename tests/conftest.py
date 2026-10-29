@@ -1,8 +1,12 @@
 """Shared tokenizer fixture, watchdog and test lifecycle isolation guards."""
 import asyncio
 import faulthandler
+from importlib.machinery import PathFinder
+from importlib.util import module_from_spec
 import json
+import inspect
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -12,6 +16,14 @@ from contextlib import nullcontext
 import pytest
 import pytest_asyncio
 from anyio._backends._asyncio import WorkerThread
+
+
+# A separately installed ``scripts`` package can shadow the repository's
+# namespace directory, even when the checkout is first on sys.path. Storage
+# tests deliberately exercise these repository measurement helpers.
+_scripts_spec = PathFinder.find_spec("scripts", [str(Path(__file__).resolve().parents[1])])
+if _scripts_spec is not None:
+    sys.modules["scripts"] = module_from_spec(_scripts_spec)
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +197,49 @@ def local_tokenizer(monkeypatch, tmp_path):
         return Worker()
 
     monkeypatch.setattr(sizing, "_start_worker", start_worker)
+
+
+@pytest.fixture
+def web_auto_auth():
+    """Security tests override this to exercise anonymous test clients."""
+    return True
+
+
+@pytest.fixture(autouse=True)
+def giraffe_web_client_auth(monkeypatch, web_auto_auth):
+    """Give ASGI clients real per-app credentials; production auth stays enabled."""
+    if not web_auto_auth:
+        return
+    import httpx
+    from starlette.testclient import TestClient
+
+    test_client_init = TestClient.__init__
+    test_client_signature = inspect.signature(test_client_init)
+
+    def authenticated_test_client(client, *args, **kwargs):
+        # TestClient may use a different HTTP backend or a transport without
+        # .app. Authenticate from its public constructor argument instead.
+        bound = test_client_signature.bind(client, *args, **kwargs)
+        app = bound.arguments["app"]
+        token = getattr(getattr(app, "state", None), "giraffe_token", None)
+        if token:
+            headers = httpx.Headers(bound.arguments.get("headers"))
+            headers.setdefault("X-Giraffe-Token", token)
+            bound.arguments["headers"] = dict(headers)
+        return test_client_init(*bound.args, **bound.kwargs)
+
+    def authenticated_init(original):
+        def initialize(client, *args, **kwargs):
+            app = getattr(kwargs.get("transport"), "app", None)
+            token = getattr(getattr(app, "state", None), "giraffe_token", None)
+            if token:
+                headers = httpx.Headers(kwargs.get("headers"))
+                headers.setdefault("X-Giraffe-Token", token)
+                kwargs["headers"] = headers
+            original(client, *args, **kwargs)
+        return initialize
+
+    monkeypatch.setattr(httpx.Client, "__init__", authenticated_init(httpx.Client.__init__))
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", authenticated_init(httpx.AsyncClient.__init__))
+
+    monkeypatch.setattr(TestClient, "__init__", authenticated_test_client)

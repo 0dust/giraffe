@@ -499,7 +499,7 @@ async def test_copy_cli_and_start_reject_the_same_invalid_restart_intent(
     values["targets"][0]["restart_command"] = hook
     values["restart_target"] = config_restart
     body = {"config": values, "mode": mode, "restart_target": restart_target}
-    async with browser(tmp_path) as client:
+    async with browser(tmp_path, allow_restart_command=True) as client:
         copy = await client.post("/api/config/cli", json=body)
         start = await client.post("/api/runs", json=body)
         assert copy.status_code == start.status_code == 422
@@ -863,7 +863,7 @@ async def test_disabled_correctness_does_not_load_custom_fixture_file(tmp_path, 
 async def test_normal_run_never_runs_restart_config(tmp_path, fake_runner):
     values = config(restart_target="local")
     values["targets"][0]["restart_command"] = ["echo", "restart"]
-    async with browser(tmp_path, defaults=values) as client:
+    async with browser(tmp_path, defaults=values, allow_restart_command=True) as client:
         assert (await client.get("/api/bootstrap")).json()["config"]["restart_target"] is None
         response = await client.post("/api/runs", json={"config": values})
         assert response.status_code == 422
@@ -874,7 +874,7 @@ async def test_normal_run_never_runs_restart_config(tmp_path, fake_runner):
 
 
 async def test_cold_start_requires_matching_target_with_hook(tmp_path, fake_runner):
-    async with browser(tmp_path) as client:
+    async with browser(tmp_path, allow_restart_command=True) as client:
         response = await client.post("/api/runs", json={"config": config(), "mode": "cold-start",
                                                        "restart_target": "local"})
         assert response.status_code == 422

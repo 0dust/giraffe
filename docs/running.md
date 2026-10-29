@@ -22,12 +22,13 @@ useful answer. The default p95 first-output limit is 10,000 ms; override it with
 Results appear in the terminal and in `runs/<timestamp>/report.json` and
 `report.html`. The command exits when done.
 
-For a saved configuration, edit an example's endpoint, model and limits first:
+Generate a saved configuration, then review its endpoint, model and limits:
 
 ```sh
-giraffe validate --config examples/local.yaml
-giraffe preview --config examples/local.yaml
-giraffe run --config examples/local.yaml --html
+giraffe init --engine ollama --url http://127.0.0.1:11434/v1
+giraffe validate --config giraffe.yaml
+giraffe preview --config giraffe.yaml
+giraffe run --config giraffe.yaml --html
 ```
 
 Validate and preview send no test traffic. Preview shows effective settings,
@@ -40,7 +41,7 @@ and Load test pattern levels can use fewer requests. See
 [workload limits](workloads.md#configure-and-run).
 
 `--json` is an alias of `--output-format json` for machine-readable CLI output.
-`--structured-output` instead adds the structured-JSON check. Normal text output
+`--checks json` selects the structured-JSON check. Normal text output
 shows a final verdict, selected check results and one list of unselected checks.
 Use `--verbose` to include diagnostic stages and RAM measurements; JSON reports
 retain the measurements regardless of verbosity.
@@ -51,13 +52,16 @@ retain the measurements regardless of verbosity.
 giraffe ui
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Follow
+Open the token link printed by `giraffe ui`. Follow
 **Connect → Checks → Launch**, review the plan, then choose **Launch**. The UI uses
 the same runner and scoring as the CLI. It starts on loopback and does not begin
 inference automatically. Keep the terminal open; **Ctrl+C** stops the UI server.
 
 | Flag | Purpose |
 | --- | --- |
+| `--host HOST` | Bind address; default `127.0.0.1`. Non-loopback binding prints a warning. |
+| `--no-browser` | Print the access link; no browser is opened automatically. |
+| `--allow-restart-command` | Permit cold-start execution. Configurations may retain unused restart commands without it. |
 | `--port PORT` | Choose a different port; default `8765`. |
 | `--runs-dir PATH` | Report/history directory; default `runs` relative to the working directory. |
 | `--config FILE` | Prefill from YAML/JSON, including the selected checks. |
@@ -217,3 +221,111 @@ Runs from the local browser UI or HTTP API are identified as `web_api`, and dire
 Python calls as `python_api`, with no invented command. Older reports have unknown
 launch provenance. Replaying a report records the new invocation; it does not claim
 to have used the original command. Server launch metadata remains separate.
+
+## CI output and exit policy
+
+```sh
+giraffe run --config giraffe.yaml --quiet --fail-on inconclusive \
+  --junit results/junit.xml --summary-md results/summary.md --output runs/ci
+giraffe report runs/ci --junit results/junit.xml --summary-md results/summary.md
+```
+
+JUnit has one testcase per selected check and target, with failed assertions,
+errors for blocked checks and skipped reasons for unfinished evidence. Each
+target's suite properties contain its model, credential-redacted endpoint and
+run ID; testcase output contains the display title. Markdown includes the
+verdict, check table, baseline delta and report path. Blocked/preflight exits also
+write the requested CI files, including the blocking reason. HTML export remains
+optional.
+
+The default `--fail-on inconclusive` preserves exit codes 0/1/2 for
+pass/fail/inconclusive. `--fail-on fail` accepts an inconclusive **run verdict**
+with exit 0. `--fail-on never` accepts both failed and inconclusive run verdicts,
+including baseline regressions, with exit 0. Each accepted verdict prints a
+stderr note. Model selection errors remain 2; blocked/preflight failures remain
+3; usage, configuration, export and Giraffe errors remain errors. Cancellation retains exit 130. The verdict saved in
+reports and CI exports is unchanged by the exit policy.
+
+`--quiet` prints only the final verdict block (or final JSON object) on stdout.
+It suppresses progress on stderr; warnings and deprecation notices remain.
+
+## Common and advanced CLI options
+
+`giraffe run --help` shows common options. `giraffe run --help-all` also shows the
+advanced group. Every existing flag remains accepted; no setting moved to
+config-only. These options moved from ordinary help into the advanced group:
+
+- `--manifest`, `--no-simultaneous-limit`, `--no-max-requests`, `--no-max-duration`,
+  `--max-memory`, `--context-limit`, `--samples`, `--sustained-seconds`,
+  `--stop-after-errors`, `--unresponsive-after-failures`, `--unresponsive-for`.
+- `--deployment-file`, `--metrics-url`, `--host-metrics-url`,
+  `--metrics-api-key-env`, `--metrics-profile`, `--overlap-models`, `--fixtures`,
+  `--request-pack`, `--retention`, `--ca-bundle`, `--proxy`.
+- `--first-output-ms`, `--latency-ms`, `--stream-gap-ms`,
+  `--min-output-tokens-per-second`, `--max-error-rate`, `--min-correctness`,
+  `--regression-percent`, `--save-config`.
+- `--max-total-storage`, `--min-free-disk`, `--max-run-storage`,
+  `--auto-cleanup-keep-latest`, `--auto-cleanup-older-than`,
+  `--auto-cleanup-max-total`, `--runs-dir`.
+
+`--max-concurrency` and `--simultaneous-limit` are aliases for the suite request
+ceiling. `--default-concurrency` sets per-check parallelism. The hidden legacy
+`--concurrency` still sets both and prints a migration note. Hidden
+`--structured-output`, `--tool-calling` and `--metrics` still opt into JSON, tool
+and GPU checks; use `--checks json,tools,gpu` for explicit selection.
+`--nonstream` remains an alias with a deprecation notice; use `--no-stream`.
+`--json` remains an alias for `--output-format json`.
+
+Manage reports with `giraffe runs list`, `giraffe runs cleanup` and
+`giraffe runs keep RUN_DIR`. The old `storage`, `cleanup` and `keep` commands
+remain hidden aliases and print a deprecation notice. Cleanup is still a preview
+until `--yes` is supplied.
+
+## Local UI access and containers
+
+Each UI launch generates a new access token. Opening `/?token=...` exchanges it
+for an HttpOnly, SameSite=Strict cookie named `giraffe_token_<port>` and redirects
+to `/`. Distinct names let two UI instances on different ports stay signed in.
+All `/api/` routes,
+including bootstrap, event polling and downloads, require that cookie or an
+`X-Giraffe-Token` header. A plain report download link works after opening the
+access link. For curl, send `-H 'X-Giraffe-Token: YOUR_TOKEN'`. Static assets are
+public; opening `/` without authentication shows instructions to open the access
+link. Keep that link private. Cold-start execution and requests setting a restart
+target require `giraffe ui --allow-restart-command`. Unused restart commands may
+remain in configurations for ordinary runs, editing, preview and copied CLI
+commands. Ordinary CLI runs retain their existing explicit cold-start flow.
+
+Cookies are scoped to the host, not the port: other local HTTP servers on the
+same host receive these cookies when you visit them. Port-specific names prevent
+overwriting another UI instance's cookie; they do not isolate local servers from
+each other. On a shared machine, avoid visiting untrusted servers on the same
+host while signed in, or use a separate browser session or header-only API
+access. See [cookie origin rules](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Same-origin_policy).
+
+The UI sends a Content-Security-Policy restricting scripts and connections to its
+own origin. Web configurations retain environment-variable credential references;
+there is no environment-variable name allowlist.
+
+The container runs as a non-root user. Build and expose the UI with:
+
+```sh
+docker build -t giraffe .
+docker run --rm -p 127.0.0.1:8765:8765 giraffe ui --host 0.0.0.0
+```
+
+Wildcard binds (`0.0.0.0` or `::`) print a token link using `localhost`. The Docker
+example publishes the port only on the host's loopback interface. To expose it
+beyond localhost, deliberately change the published address and open the token
+link using your host's address; use a trusted network. Non-loopback binding
+prints a warning. Anonymous visits to `/` show access instructions; API requests
+and report data still require authentication. Mount a writable directory at
+`/work` to persist runs across containers.
+
+## Optional Hugging Face tokenizer
+
+The core install uses built-in tiktoken sizing when automatic model-tokenizer
+resolution is unavailable. It includes FastAPI and Uvicorn for the UI, without
+transformers or torch. Install `giraffe-llm[hf-tokenizer]` to use a model's own
+tokenizer. Explicitly configuring an HF tokenizer without the extra fails with
+an install hint; automatic resolution silently falls back to built-in sizing.
