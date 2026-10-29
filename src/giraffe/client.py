@@ -76,7 +76,7 @@ def _headers(target: Target) -> dict[str, str]:
     elif target.api_key_env:
         value = os.environ.get(target.api_key_env)
         if not value:
-            raise ValueError(f"Missing API key environment variable: {target.api_key_env}")
+            raise ValueError(f"API key environment variable {target.api_key_env} is not set")
         headers["Authorization"] = f"Bearer {value}"
     for header, name in target.headers_env.items():
         value = os.environ.get(name)
@@ -684,6 +684,22 @@ class LLMClient:
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
+                        if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
+                            # Keep only the classification, never arbitrary server error text.
+                            body = error_body.decode("utf-8", errors="replace").lower()
+                            try:
+                                payload = json.loads(body)
+                            except (ValueError, UnicodeError):
+                                payload = None
+                            detail = payload.get("error", payload.get("detail", payload.get("message"))) if isinstance(payload, dict) else None
+                            message = (detail.get("message", "") if isinstance(detail, dict) else
+                                       detail if isinstance(detail, str) else body if payload is None else "")
+                            message = message if isinstance(message, str) else ""
+                            code = detail.get("code") if isinstance(detail, dict) else None
+                            missing = any(term in message for term in ("not found", "does not exist"))
+                            record.workload["model_not_served"] = ((isinstance(code, str) and code in {"model_not_found", "unknown_model"})
+                                or "unknown model" in message or "model does not exist" in message or "model not found" in message
+                                or (self.target.model.lower() in message and missing))
                         if probing and response.status_code in {400, 422}:
                             rejected_field = _rejected_evidence_field(error_body)
                             if rejected_field:

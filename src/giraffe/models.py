@@ -17,7 +17,8 @@ from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SI
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
                    MAX_STAGE_SECONDS, MAX_SESSIONS,
                    MAX_SESSION_TURNS, MAX_SESSION_TURN_CHARS, MAX_TOOL_CONFIG_BYTES, MAX_TOOL_RESULT_BYTES,
-                   MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES)
+                   MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
+                   MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS)
 
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
@@ -36,8 +37,10 @@ CHECK_NAMES = {
     "gpu": "GPU observations",
 }
 CORE_CHECKS = tuple("concurrency" if name == "fairness" else name for name in CHECK_NAMES)
-DEFAULT_CHECKS = tuple("concurrency" if name == "fairness" else name
-                       for name in CORE_CHECKS if name not in {"json", "gpu"})
+DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
+# Saved pre-v2 files with no selection retain their historical workload.
+_LEGACY_DEFAULT_CHECKS = ("access", "serving", "first_output", "generation", "load",
+                          "context", "correctness", "cancellation", "recovery")
 CHECK_NAMES.update({
     "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
     "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
@@ -68,7 +71,6 @@ for _old_check in ("concurrency", "capacity", "arrivals"):
     CATALOGUE_NAMES.pop(_old_check, None)
 CHECK_NAMES["load"] = CATALOGUE_NAMES["load"] = INTERNAL_CHECK_NAMES["load"] = "Load test"
 CORE_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in CORE_CHECKS))
-DEFAULT_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in DEFAULT_CHECKS))
 
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
@@ -105,7 +107,10 @@ class Deployment(Model):
     launch_command: str | list[str] | None = None
     discovery: Literal["none", "ollama", "vllm", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "none"
     collector_url: str | None = None
-    intended_change: str | None = None
+    intended_change: str | Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=MAX_SANITIZE_STRING_CHARS)]],
+        Field(min_length=1, max_length=MAX_SANITIZE_ITEMS),
+    ] | None = None
 
 
 class Arrival(Model):
@@ -595,7 +600,7 @@ def migrate_load_test(value):
     if converted:
         value["load_test"].setdefault("migrated_tests", []).extend(converted)
         notes.append("Multiple saved checks remain separate sequential tests in load_test.migrated_tests; their rates, durations and burst schedules are not blended.")
-    value["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks)) if old_checks else list(DEFAULT_CHECKS)
+    value["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks)) if old_checks else list(_LEGACY_DEFAULT_CHECKS)
     value.pop("concurrent_load", None)
     value.pop("traffic", None)
     value.pop("arrivals", None)
@@ -684,6 +689,17 @@ def migrate_run_limits(value):
     if not is_legacy_config(value):
         return value, []
     value, notes = deepcopy(value), []
+    if "checks" not in value:
+        legacy_load = any(value.get(field) is not None for field in ("concurrent_workloads", "buckets"))
+        checks = ["concurrency" if check == "load" and legacy_load else check
+                  for check in _LEGACY_DEFAULT_CHECKS]
+        checks.extend([*(["json"] if value.get("structured_json") else []),
+                       *(["gpu"] if value.get("metrics") else [])])
+        checks.extend(check for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
+                                                ("sessions", "sessions"), ("consistency", "consistency"),
+                                                ("tool_calling", "tools"), ("tool_checks", "tools"))
+                      if value.get(field) is not None and (field != "tool_calling" or value[field]))
+        value["checks"] = list(dict.fromkeys(checks))
     descriptions = {
         "max_requests": ("300 requests", "a request limit", "Maximum requests"),
         "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
@@ -695,7 +711,7 @@ def migrate_run_limits(value):
             notes.append(f"Earlier Giraffe versions stopped after {old} by default; this configuration did not set {label}, so none applies now. Enable {control} to keep that bound.")
     if value.get("concurrency") is not None:
         value.setdefault("default_concurrency", value["concurrency"])
-        checks = value.get("checks", DEFAULT_CHECKS)
+        checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)
         users = []
         for check in ("correctness", "json", "recovery", "arrivals", "capacity"):
             if check not in checks:
@@ -715,11 +731,9 @@ def migrate_run_limits(value):
         kept = (f"{', '.join(users)} retain legacy {value['default_concurrency']}-request parallelism"
                 if users else "no selected check inherits that parallelism")
         notes.append(f"concurrency: {value['concurrency']} now limits simultaneous requests; default_concurrency={value['default_concurrency']}; {kept}.")
-    else:
-        value.setdefault("default_concurrency", 4)
     if value.get("concurrency") is not None and value.get("overlap_models"):
         parallelism = value["concurrency"]
-        checks = value.get("checks", DEFAULT_CHECKS)
+        checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)
         if "correctness" in checks and value.get("request_source") == "request_pack":
             targets = len(value.get("targets") or []) or 1
             effective = max(1, parallelism // targets)
@@ -738,11 +752,7 @@ def migrate_run_limits(value):
                 own = own.model_dump(exclude_unset=True) if isinstance(own, BaseModel) else own
                 if own.get("max_in_flight") is None:
                     value[field] = {**own, "max_in_flight": parallelism}
-    checks = list(value.get("checks", DEFAULT_CHECKS))
-    if "checks" not in value:
-        checks.extend(check for field, check in (("arrivals", "arrivals"), ("sessions", "sessions"),
-                                                ("consistency", "consistency"))
-                      if value.get(field) is not None)
+    checks = value["checks"]
     parallelism = value.get("concurrency") or 4
     if value.get("custom_fixtures") and "correctness" in checks:
         value["legacy_custom_fixture_max_output_tokens"] = value.get("max_output_tokens", 128)
@@ -899,7 +909,7 @@ def migrate_concurrent_load(value):
     elif legacy:
         # The final catalogue's Load test defaults must not replace an old
         # implicit workload block before its actual scenarios are converted.
-        value["checks"] = list(dict.fromkeys("concurrency" if c == "load" else c for c in DEFAULT_CHECKS))
+        value["checks"] = list(dict.fromkeys("concurrency" if c == "load" else c for c in _LEGACY_DEFAULT_CHECKS))
     for name in ("concurrency", *legacy_checks):
         removed = options.pop(name, None)
         if removed:
@@ -1909,6 +1919,7 @@ class RunConfig(Model):
     prefix: Prefix | None = None
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
     load_test: LoadTest = Field(default_factory=LoadTest)
+    _preparation_residency: dict = PrivateAttr(default_factory=dict)
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
@@ -2067,6 +2078,11 @@ class RunConfig(Model):
             ):
                 raise ValueError("judge scoring requires at least one judge with a name, URL and model")
 
+    def parallelism_requested(self, check_id: str) -> bool:
+        options = self.test_options.get(check_id)
+        return ("default_concurrency" in self.model_fields_set
+                or bool(options and options.concurrency is not None))
+
     def effective_check(self, check_id: str) -> dict[str, Any]:
         """Resolve sparse overrides once; suite request settings are defaults."""
         if check_id not in INTERNAL_CHECK_NAMES:
@@ -2089,6 +2105,12 @@ class RunConfig(Model):
         limits = self.limits.model_dump()
         if options.limits:
             limits.update(options.limits.model_dump(exclude_unset=True))
+        supplied = self.limits.model_fields_set | (options.limits.model_fields_set if options.limits else set())
+        if check_id == "first_output" and "first_output_ms" not in supplied:
+            limits["first_output_ms"] = 10000
+        if check_id == "generation" and "stream_gap_ms" not in supplied and not any(
+                limits[key] is not None for key in ("latency_ms", "stream_gap_ms", "min_output_tokens_per_second")):
+            limits["stream_gap_ms"] = 5000
         resolved["limits"] = limits
         if check_id in {"serving", "first_output"}:
             response = self.effective_response()
@@ -2098,6 +2120,12 @@ class RunConfig(Model):
                 "request_timeout_seconds": resolved["request_timeout_seconds"],
             }
         return resolved
+
+    def default_limit_fields(self, check_id: str) -> list[str]:
+        options = self.test_options.get(check_id)
+        supplied = self.limits.model_fields_set | (options.limits.model_fields_set if options and options.limits else set())
+        return [name for name, value in self.effective_check(check_id).get("limits", {}).items()
+                if value is not None and name not in supplied]
 
     def effective_response(self) -> dict[str, Any]:
         """Endpoint response owns shared initial/warm requests.
@@ -2229,6 +2257,21 @@ class RunConfig(Model):
                     schedule.__pydantic_fields_set__ = own.model_fields_set.copy()
                     self.concurrent_load = self.concurrent_load.model_copy(update={"schedule": schedule})
 
+    @model_serializer(mode="wrap")
+    def serialize_parallelism_intent(self, handler):
+        result = handler(self)
+        if "default_concurrency" not in self.model_fields_set:
+            result.pop("default_concurrency", None)
+        return result
+
+    @field_serializer("limits")
+    def serialize_sanity_opt_outs(self, value, info):
+        result = value.model_dump(mode=info.mode)
+        for field in ("first_output_ms", "stream_gap_ms"):
+            if field not in value.model_fields_set:
+                result.pop(field, None)
+        return result
+
     @field_serializer("load_test")
     def serialize_load_test(self, value, info):
         result = value.model_dump(mode=info.mode)
@@ -2261,7 +2304,7 @@ class RunConfig(Model):
 # rebuild schemas or invoke Pydantic's environment-dependent plugin discovery.
 _MIGRATION_INPUT_ADAPTERS = {
     name: TypeAdapter(RunConfig.model_fields[name].rebuild_annotation())
-    for name in ("config_version", "checks")
+    for name in ("config_version", "checks", "structured_json", "metrics", "tool_calling")
 }
 
 

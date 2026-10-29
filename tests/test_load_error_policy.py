@@ -173,7 +173,7 @@ def test_prefix_scenario_keeps_per_request_cache_observations(cached, source):
     ]
 
 
-def test_disconnected_summary_prefix_is_kept_for_concurrent_load():
+def test_disconnected_cause_is_kept_in_concise_load_summary():
     settings = config()
     state = runner._Run(settings, None, None)
     state.records = [
@@ -191,7 +191,7 @@ def test_disconnected_summary_prefix_is_kept_for_concurrent_load():
     check = next(
         check for check in runner._checks(state, settings.targets[0]) if check.id == "load"
     )
-    assert check.summary.startswith(
-        "Could not connect to http://localhost:1234 (ConnectError); no checks could run."
-    )
+    assert "Could not connect to http://localhost:1234 (ConnectError); no checks could run." in check.summary
+    assert "load conditions unfinished:" in check.summary
+    assert len(check.summary.split(". ")) == 2
     assert "Start the server" in check.summary

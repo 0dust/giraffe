@@ -48,11 +48,11 @@ for(let i=1;i<expected.length;i++)assert(legend.indexOf(expected[i-1])<legend.in
 """, dom=True)
 
 
-def test_live_mission_control_uses_condition_copy():
+def test_live_running_view_uses_condition_copy():
     run_render_checks(r"""
 state.detail={id:'live-copy',state:'running',config:{targets:[{name:'local',model:'test',url:'http://localhost/v1'}],checks:[],limits:{}},live_requests:[],live_conditions:[],events:[]};
 renderLive();const html=nodes['#main'].innerHTML;
-assert.match(html,/>Mission control<\/h1>/);
+assert.match(html,/>Running<\/h1>/);
 assert.match(html,/One spot per test\. Select a spot for its requests and results\./);
 assert.doesNotMatch(html,/Requests appear as they start/);
 """)

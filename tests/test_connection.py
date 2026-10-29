@@ -121,7 +121,7 @@ async def test_missing_credentials_send_no_traffic(monkeypatch, model):
     httpx.Response(200, text="private response"),
     httpx.Response(200, content=b"x" * (4 * 1024 * 1024 + 1)),
     httpx.Response(302, headers={"Location": "https://elsewhere.invalid"}),
-    httpx.Response(404, text="private model error"),
+    httpx.Response(404, text="private endpoint error"),
 ])
 async def test_http_status_alone_does_not_prove_usable_inference(monkeypatch, response):
     requests, _ = endpoint(monkeypatch, lambda request: response)

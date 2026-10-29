@@ -230,9 +230,10 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   }}
 }}
 // Explicit goal changes use the form's latest draft rather than a stale applied config.
+state.bootstrap.config={{...structuredClone(state.bootstrap.config),checks:bootstrap.defaults.checks}};
 form.elements.model.value='latest-model';await listeners.click({{target:{{closest:q=>q==='[data-action]'?{{dataset:{{action:'quick-checks'}}}}:null}}}});
 assert.equal(state.config.targets[0].model,'latest-model');
-assert.equal(state.config.checks.join(','),'access,correctness');
+assert.equal(state.config.checks.join(','),bootstrap.defaults.checks.join(','));
 assert.equal(JSON.stringify(state.config.request_pack),savedPack);
 assert.equal(state.config.max_requests,config.max_requests);
 // Reruns and imported advanced selections infer Custom without rewriting them.
@@ -1112,8 +1113,8 @@ markup=renderJudgement({status:'inconclusive',votes:[votes[0],{judge:'second',st
 state.detail={report:{requests:[{id:'r',fixture_id:'refund',judgement:{status:'inconclusive',votes},score:null}],manifest:{config:{retention:'all'}}}};
 openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI evaluation/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
 state.detail={id:'run',state:'running',config:{targets:[{name:'target',model:'m'}],judging:config.judging,max_requests:50},progress:{event:'judging_progress',attempted:20,completed:20,judge_calls_total:40,judge_calls_completed:7,elapsed_seconds:10},events:[]};
-renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
-state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Mission control</h1>'));assert(nodes['#main'].innerHTML.includes('One spot per test. Select a spot for its requests and results.'));
+renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Evaluation calls/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
+state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Running</h1>'));assert(nodes['#main'].innerHTML.includes('One spot per test. Select a spot for its requests and results.'));
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))

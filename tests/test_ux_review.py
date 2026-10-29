@@ -155,7 +155,7 @@ def test_review_explains_measurement_only_timing_with_explicit_null_overrides():
     config = configuration(checks=["first_output", "generation"],
                            limits={"first_output_ms": 400, "latency_ms": 2000},
                            test_options={"first_output": {"limits": {"first_output_ms": None}},
-                                         "generation": {"limits": {"latency_ms": None}}})
+                                         "generation": {"limits": {"latency_ms": None, "stream_gap_ms": None}}})
     browser_logic(r"""
 const original=JSON.stringify(config);let markup=renderReviewPassCriteria(config);
 assert.equal((markup.match(/Measurement only — no timing target; result is inconclusive/g)||[]).length,2);
@@ -209,3 +209,14 @@ nodes['#shared-settings']={open:false};nodes['#new-run-form']={elements:{max_req
 await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'edit-run-limits'}}:null}});
 assert(captured);assert.equal(step,2);assert(updated);assert(nodes['#shared-settings'].open);assert(focused);
 """)
+
+
+def test_review_keeps_generation_gap_default_when_only_latency_is_cleared():
+    config = configuration(checks=['generation'], limits={'latency_ms': 2000},
+                           test_options={'generation': {'limits': {'latency_ms': None}}})
+    assert config.effective_check('generation')['limits']['stream_gap_ms'] == 5000
+    browser_logic(r"""
+const markup=renderReviewPassCriteria(config);
+assert.doesNotMatch(markup,/Measurement only|Completion limit 2,000/);
+assert.match(markup,/Stream pause 5000 ms/);
+""", config)

@@ -18,6 +18,16 @@ from statistics import fmean
 
 PERFORMANCE_SCHEMA = 1
 PERCENTILES = "Linear interpolation between closest ranks: position = (n - 1) × p."
+SPEC_DECODE_ROWS = (
+    ("spec_decode_drafts", "Speculative decoding drafts", "drafts"),
+    ("spec_decode_draft_tokens", "Proposed speculative tokens", "tokens"),
+    ("spec_decode_accepted_tokens", "Accepted speculative tokens", "tokens"),
+    ("spec_decode_proposal_length", "Proposed tokens per speculative draft", "tokens/draft"),
+    ("spec_decode_acceptance_ratio", "Speculative decoding acceptance rate", "fraction"),
+    ("spec_decode_sglang_acceptance_length", "SGLang reported acceptance length", "tokens/forward"),
+    ("spec_decode_sglang_acceptance_ratio", "SGLang reported acceptance rate", "fraction"),
+)
+
 KPI_IDS = ("request_throughput", "output_throughput", "response_latency", "first_useful_output",
            "tpot", "generation_pace", "client_ttft", "itl", "first_reasoning", "server_ttft")
 
@@ -509,7 +519,9 @@ def _window_summary(report, target, window, records, series, observation):
         "token_accounting": ("input_tokens", "answer_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cached_share", "reasoning_tokens", "missing_usage"),
         "throughput_capacity": ("input_throughput", "completion_throughput", "total_throughput", "output_rate", "output_per_in_flight", "total_per_in_flight", "goodput", "knee", "highest_acceptable_rate"),
         "conversations": ("turn_latency", "turn_generation", "conversation_completion", "user_fairness", "workload_occupancy", "decode_interference", "response_interference", "recovery_ratios", "cancel_followup"),
-        "server": ("gpu_utilization", "gpu_memory", "gpu_temperature", "gpu_errors", "throttling", "server_running", "server_waiting", "kv_cache", "prefix_cache", "prefix_hit_rate", "preemptions", "server_retractions_per_second", "server_queue", "server_inference", "server_prompt_tokens_per_second", "server_tokens", "host_cpu", "host_ram", "websocket_rtt"),
+        "server": ("gpu_utilization", "gpu_memory", "gpu_temperature", "gpu_errors", "throttling", "server_running", "server_waiting", "kv_cache", "prefix_cache", "prefix_hit_rate", "preemptions", "server_retractions_per_second", "server_queue", "server_inference", "server_prompt_tokens_per_second", "server_tokens", "host_cpu", "host_ram", "websocket_rtt")
+                  + tuple(key for key, _, _ in SPEC_DECODE_ROWS)
+                  + (("spec_decode_accepted_by_position",) if "spec_decode_accepted_by_position" in metrics else ()),
         "baseline": ("baseline_throughput", "baseline_timing", "baseline_generation", "baseline_quality", "baseline_capacity"),
     }
     return {"metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
@@ -689,12 +701,31 @@ def _bind_existing(report, target, window, records, observation, put):
     put("cancel_followup", followup, "Post-cancellation follow-up delay", "ms", "Existing matched cancellation follow-up evidence", samples=1 if followup else 0, state="measured" if followup else "not_applicable")
 
 
+def _spec_decode_coverage(details):
+    observed = details.get("observed_intervals", 0)
+    excluded = details.get("excluded_intervals", 0)
+    note = f"{observed} / {observed + excluded} telemetry intervals"
+    first, last = details.get("first_elapsed_seconds"), details.get("last_elapsed_seconds")
+    duration = details.get("duration_seconds")
+    if _number(first) and _number(last):
+        note += f" · {first:g}–{last:g} s elapsed"
+    if _number(duration):
+        note += f" · {duration:g} s covered"
+    if details.get("partial_coverage"):
+        note += " · Partial coverage; totals include valid intervals only"
+    return note + " · Server-wide; attribution to the selected request window is not established."
+
+
 def _server_rows(report, target, window, observation, put, metrics):
     from .telemetry import derive_server_metrics
 
     telemetry = observation.get("serving_telemetry", {})
     target_config = next((t for t in report.manifest.get("config", {}).get("targets", []) if t.get("name") == target), {})
     derived = telemetry.get("derived") or derive_server_metrics(telemetry, host_configured=bool(target_config.get("host_metrics_url")))
+    if any(key not in derived for key, _, _ in SPEC_DECODE_ROWS):
+        fresh = derive_server_metrics(telemetry)
+        derived = {**derived, **{key: fresh[key] for key, _, _ in SPEC_DECODE_ROWS
+                                if key not in derived and key in fresh}}
     mapping = (
         ("server_ttft", "server_ttft_mean_ms", "Server TTFT", "ms"),
         ("gpu_utilization", "utilization", "GPU utilization", "%"),
@@ -711,12 +742,12 @@ def _server_rows(report, target, window, observation, put, metrics):
         ("server_tokens", "server_generated_tokens_per_second", "Server token throughput", "tok/s"),
         ("host_cpu", "host_cpu_percent", "Server CPU utilization", "%"),
         ("host_ram", "host_ram_used_bytes", "Server host RAM", "bytes"),
-    )
+    ) + tuple((key, key, label, unit) for key, label, unit in SPEC_DECODE_ROWS)
     # Scrapes have a separate collection window. Never relabel them as linked
     # request/stage samples. Preserve raw bounds/coverage in each row.
     for key, derived_key, label, unit in mapping:
         row = derived.get(derived_key, {})
-        if row.get("value") is None and key not in {"host_cpu", "host_ram"} and not telemetry.get("snapshots"):
+        if row.get("value") is None and key not in {"host_cpu", "host_ram"} and not key.startswith("spec_decode_") and not telemetry.get("snapshots"):
             row = {**row, "state": "not_collected", "reason": "This saved run has no runtime telemetry collection evidence.",
                    "action": "New runs discover same-origin /metrics automatically; an exporter at another route requires targets[].metrics_url."}
         put(key, row.get("value"), label, row.get("unit", unit), row.get("source", "Server telemetry"),
@@ -728,6 +759,18 @@ def _server_rows(report, target, window, observation, put, metrics):
         metrics[key]["eligible_count"] = row.get("eligible_count", 0)
         metrics[key]["counts"] = {"sample": row.get("sample_count", 0), "eligible": row.get("eligible_count", 0),
                                   "missing": max(0, row.get("eligible_count", 0)-row.get("sample_count", 0))}
+        if key.startswith("spec_decode_"):
+            metrics[key]["partial"] = bool(row.get("details", {}).get("partial_coverage"))
+            details = row.get("details", {})
+            if key.startswith("spec_decode_sglang_"):
+                metrics[key]["sample_unit"] = "label series in latest scrape"
+                metrics[key]["display_note"] = " · ".join(str(v) for v in (
+                    "Latest exporter sample", details.get("collected_at"),
+                    details.get("aggregation"), details.get("freshness"),
+                    "Server-wide; attribution to the selected request window is not established.") if v)
+            else:
+                metrics[key]["sample_unit"] = "telemetry intervals"
+                metrics[key]["display_note"] = _spec_decode_coverage(details)
         if key in {"server_ttft", "server_queue", "server_inference"}:
             family = {"server_ttft": "server_ttft", "server_queue": "server_queue", "server_inference": "server_inference"}[key]
             metrics[key]["statistic"] = "counter-delta mean; not a request median"
@@ -739,6 +782,18 @@ def _server_rows(report, target, window, observation, put, metrics):
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"), reason=row.get("reason"), action=row.get("action"),
             scope="server-wide", collection_window="telemetry sample interval", details=row.get("details", {}))
         metrics[key]["action"] = row.get("action")
+    accepted = derived.get("spec_decode_accepted_tokens", {})
+    positions = accepted.get("details", {}).get("accepted_tokens_by_position", [])
+    if positions:
+        coverage = accepted["details"].get("position_coverage", {})
+        put("spec_decode_accepted_by_position", positions, "Accepted speculative tokens by position", "",
+            "Optional vLLM position counters; zero-based positions. Acceptance rate uses all drafts on the engines exposing each position, not only drafts proposing that position.",
+            samples=coverage.get("observed_intervals", 0),
+            eligible=coverage.get("observed_intervals", 0) + coverage.get("excluded_intervals", 0),
+            scope="server-wide", collection_window="telemetry sample interval",
+            partial=bool(coverage.get("partial_coverage")), sample_unit="telemetry intervals",
+            display_note=_spec_decode_coverage(coverage),
+            details={**coverage, "selected_window_attribution": "not established"})
     put("websocket_rtt", None, "WebSocket round-trip time", "ms", "Inference transport: HTTP/SSE", state="not_applicable",
         reason="HTTP/SSE requests have no WebSocket round trip.", action="An actual WebSocket transport and request/response timing would be required.")
 

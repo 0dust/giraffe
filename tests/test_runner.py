@@ -144,7 +144,7 @@ def load_group(report, target="service", index=0):
 
 
 async def test_overlap_verdict_explains_plain_reason_and_rerun_settings(client):
-    report = await runner.run_suite(config(checks=["correctness"], stream=False))
+    report = await runner.run_suite(config(checks=["correctness"], stream=False, default_concurrency=2))
     check = next(c for c in report.checks if c.id == "correctness")
     assert check.status == "inconclusive"
     assert "streaming was disabled" in check.summary
@@ -168,7 +168,7 @@ async def test_serialized_server_overlap_remedy_preserves_sequential_scope(clien
                 for field in ("elapsed_ms", "first_output_ms", "last_output_ms", "stream_end_ms")})
 
     monkeypatch.setattr(client, "execute", serialized)
-    report = await runner.run_suite(config(checks=[check_id], structured_json=True, concurrency=concurrency))
+    report = await runner.run_suite(config(checks=[check_id], structured_json=True, concurrency=concurrency, default_concurrency=concurrency))
     check = next(c for c in report.checks if c.id == check_id)
     assert check.status == ("pass" if concurrency == 1 else "inconclusive")
     assert all(r.score is True for r in report.requests)
@@ -280,7 +280,9 @@ async def test_dead_endpoint_keeps_verdicts_and_reports_connection_cause(client,
     assert report.overall == "fail"
     expected = "Could not connect to http://localhost:1234 (ConnectError); no checks could run"
     assert report.observations["summary"] == expected
-    assert expected in next(c for c in report.checks if c.id == "load").summary
+    load_summary = next(c for c in report.checks if c.id == "load").summary
+    assert expected in load_summary
+    assert len(load_summary.split(". ")) <= 2
     assert next(c for c in report.checks if c.id == "access").status == "blocked"
 
 
@@ -317,11 +319,11 @@ async def test_wrong_answer_summary_has_expected_and_received(client):
 
 
 async def test_all_unfinished_default_verdicts_offer_a_remedy(client):
-    report = await runner.run_suite(config(checks=RunConfig.model_fields["checks"].get_default(call_default_factory=True),
+    report = await runner.run_suite(config(checks=[*RunConfig.model_fields["checks"].get_default(call_default_factory=True), "load"],
         max_requests=32, concurrency=4, max_duration_seconds=.01))
     unfinished = [check for check in report.checks if check.status in {"fail", "inconclusive"}]
     assert any(check.id == "load" for check in unfinished)
-    assert all("To conclude," in check.summary for check in unfinished), [(check.id, check.summary) for check in unfinished]
+    assert all("To conclude," in check.summary or "--max-duration" in check.summary for check in unfinished), [(check.id, check.summary) for check in unfinished]
 
 
 
@@ -564,6 +566,10 @@ async def test_user_stop_stops_submissions_and_saves_partial(client):
     assert report.abort_reason == "cancelled by user"
     assert len(report.requests) == 1 and report.requests[0].status == "cancelled"
     assert client.active == 0 and client.closed == ["service"]
+    summary = check(report, "serving").summary
+    assert summary.startswith("Stopped by you after 1 of ")
+    assert summary.endswith(" planned requests.")
+    assert "--max-requests" not in summary and "--max-duration" not in summary
 
 
 async def test_missing_optional_telemetry_does_not_block_api():
@@ -625,7 +631,7 @@ async def test_observational_timing_and_separate_initial_samples(client):
     assert result.status == "pass"
     assert result.metrics["initial"]["first_output_p95_ms"] == 500
     assert result.metrics["first_output_p95_ms"] == 2
-    unbounded = await runner.run_suite(config(checks=["first_output"]))
+    unbounded = await runner.run_suite(config(checks=["first_output"], limits=Limits(first_output_ms=None, min_samples=2)))
     assert check(unbounded, "first_output").status == "inconclusive"
 
 
@@ -2318,7 +2324,7 @@ async def test_final_load_client_delay_qualifies_timing_but_preserves_known_answ
 
 
 @pytest.mark.parametrize("request_budget", [6, None])
-async def test_measure_only_load_explains_limits_unscored_answers_and_budget_separately(request_budget):
+async def test_measure_only_load_keeps_detail_out_of_concise_stop_summary(request_budget):
     cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
     for case in cases:
         case.update(scorer="none", expected=None)
@@ -2334,6 +2340,7 @@ async def test_measure_only_load_explains_limits_unscored_answers_and_budget_sep
     else:
         assert "--max-requests" not in result.summary
     assert "max_first_answer_ms" in result.summary and "max_completion_ms" in result.summary
-    assert "unscored" in result.summary.lower()
-    assert "throughput and latency" in result.summary.lower()
-    assert "collect the required valid, scored responses" not in result.summary
+    assert "unscored" in result.summary
+    assert len(result.summary.split(". ")) <= 2
+    assert load_group(value)["unscored"] > 0
+    assert result.metrics["points"][0]["reason_code"] in {"budget_limited", "missing_case_coverage"}

@@ -76,7 +76,7 @@ duration**) also default to **Not set**. The request budget covers all selected
 tests and targets, independently of concurrency. Increasing simultaneous load
 does not increase that budget. AI evaluator calls use separate limits.
 Use `--simultaneous-limit` and `--default-concurrency` to set the two CLI controls
-independently. The compatibility flag `--concurrency N` sets both to `N`.
+independently.
 
 ## Load test
 
@@ -192,7 +192,31 @@ saved manifests can retain them as `config_migration_notes`. Normalized exports 
 the current schema. Old reports still render, but comparisons across incompatible
 formats are inconclusive.
 
+## Your own questions
+
+[`examples/request-pack.json`](../examples/request-pack.json) is a complete run
+configuration with embedded cases, expected answers and deterministic scorers.
+Edit its target URL and model, then run it with
+`giraffe run --config examples/request-pack.json --html`. Its `request_pack`
+object can also be extracted as a standalone dataset for `--request-pack`.
+
+Judge scoring requires an explicit evaluator endpoint in `judging.judges` and a
+`judge` case with an expected answer and rubric. Evaluator calls have separate
+budgets and send the case and generated answer to that endpoint; validation
+reports this before a judged run.
+
 ## Standard checks and load evidence
+
+The CLI and UI default checks are `access, serving, correctness, first_output`.
+The first-output check defaults to a p95 limit of 10,000 ms, a generous sanity
+bound for laptops. Override it with `--first-output-ms` or YAML
+`limits.first_output_ms`. Generation defaults to a 5,000 ms stream-gap limit when
+no explicit generation timing or speed limit is configured. Override it with
+`--stream-gap-ms` or YAML `limits.stream_gap_ms`; a configured latency, stream-gap
+or minimum token-speed limit takes precedence over this fallback.
+An explicit global or per-check `stream_gap_ms: null` disables the generation
+stream-gap sanity default. The first-output sanity bound applies only to the
+`first_output` check; other checks keep their configured timing limits.
 
 First-output and generation checks use ordinary serial requests; loaded timing
 belongs to the corresponding load check. Serving excludes sustained recovery traffic.
@@ -239,9 +263,10 @@ apply to recovery probes. Sustained outcomes stay outside serving/first-output c
 sustained answers still enter the correctness allowance. Post-load probes use the
 same fixture as the pre-load baseline. `recovery_max_ratio` limits median latency
 and first-output ratios. Set it even when absolute timing limits are configured
-(the examples use `2`): a large slowdown can remain inside an absolute limit. An
+to catch a large slowdown that remains inside an absolute limit. An
 absolute-only pass states both measured probe/baseline ratios and that no ratio
-limit was configured. Without a timing limit or ratio, recovery is inconclusive.
+limit was configured. With no timing limit or ratio, recovery concludes from
+correctness and error rate, and reports timing as an observation.
 
 Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
 interrupt an active generation stream after that many nonempty content or reasoning
@@ -545,9 +570,39 @@ failed baseline does not approve it. Baselines are never silently replaced; `--r
 is explicit. Legacy snapshots are readable, with missing deployment fields unknown.
 Workload incompatibility can block metric comparison while the deployment diff
 still shows added, removed and changed fields. Runtime/image/backend changes alone
-do not invalidate an otherwise comparable workload. `intended_change` names a
-field (for example `serving.scheduler`); other observed changes flag the declared
-one-setting experiment as confounded. Differences are context, not causality.
+do not invalidate an otherwise comparable workload. Set
+`targets[].deployment.intended_change` to one exact field path (for example
+`serving.scheduler`), or a list of paths when one intended change is recorded in
+several fields:
+
+```yaml
+targets:
+  - name: local
+    url: http://localhost:8000/v1
+    model: example
+    deployment:
+      intended_change:
+        - extension.requested_speculative_config
+        - serving.launch_arguments
+checks: [serving]
+max_requests: 32
+```
+
+The declaration belongs in the target configuration, not the imported metadata
+file. Existing string declarations remain valid. A list must contain 1–256
+nonempty strings, each at most 8,192 characters. Paths match complete deployment
+diff field names exactly; they do not expand wildcards, prefixes or nested keys.
+Other observed additions, removals or changes still mark the experiment as
+confounded. For example, changed `extension.arm`, `extension.note` or
+`extension.status` fields remain confounders unless explicitly declared.
+
+Declarations apply to whole recorded fields: `serving.launch_arguments` includes
+all recorded launch arguments, so additional flag changes within that field are
+not distinguished. Inspect the complete diff before grouping fields. The report
+retains all differences, unknown fields and continuity qualifications; grouping
+is the user's declaration of intent, not verification that only one setting
+changed. Differences are context, not causality, and a non-confounded comparison
+does not establish a performance effect.
 
 ## Serving statistics
 
@@ -566,7 +621,8 @@ An explicit `targets[].metrics_profile` overrides detection. Profiles map exact
 metric names and units:
 
 - `vllm-v1`: vLLM 0.30.0 V1 metric names for KV-cache fraction, running/waiting
-  requests, preemption count, prefix hits/queries and server TTFT sum/count.
+  requests, preemption count, prefix hits/queries, server TTFT sum/count and optional
+  speculative-decoding draft, proposed-token, accepted-token and per-position counters.
 - `vllm-legacy`: an explicit older-name contract adding GPU/CPU cache fractions;
   qualify the recorded runtime/version before interpreting it as supported.
 - `sglang`, `llamacpp`, `lmdeploy` and `tgi`: runtime-specific Prometheus metric
@@ -576,6 +632,41 @@ metric names and units:
   or KV-cache counter coverage at `/metrics`.
 - `unknown`: attempts automatic contract detection; ambiguous or unrecognized
   metric names leave serving counters unmapped.
+
+For vLLM speculative decoding, **Server observations** in the live UI and exported
+HTML report draft count, proposed/accepted token counts, average proposed tokens
+per draft, and token acceptance rate (accepted / proposed). The same evidence is
+available in JSON. These are changes over compatible adjacent telemetry scrapes,
+not lifetime counter values. Optional per-position acceptance uses **all drafts**
+on engines exposing that zero-based position as its denominator; it is not the
+probability of acceptance conditional on reaching that position.
+
+All three aggregate counters must have matching engine/model labels and valid
+intervals. Resets, changing labels, stale or missing samples, failed scrapes and
+truncated scrapes exclude affected intervals. Reports show the covered interval
+count, elapsed bounds, duration and partial-coverage warning; totals cover only
+valid intervals. Per-position evidence has its own coverage and may be absent
+while aggregate counts are available. Missing counters do not mean speculative
+decoding is disabled, and zero drafts make proposal length and acceptance rate
+unavailable. The counters are server-wide and may include other traffic or time
+outside the selected request window. They demonstrate observed activity, not a
+speedup or proof that every benchmark request used speculative decoding. These
+optional counters do not change acceptance-check outcomes or require GPUs.
+
+For SGLang, **Server observations** also shows the latest reported speculative
+acceptance length and acceptance rate from `sglang:spec_accept_length` and
+`sglang:spec_accept_rate` (the optional gauge contract in [SGLang v0.5.22](https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/observability/metrics_collector.py)).
+Enable the server's `--enable-metrics` and use the `sglang` metrics profile, or
+allow exact-name metrics discovery. No additional Giraffe check is required.
+Acceptance length includes the bonus token per forward; acceptance rate is the
+scheduler's reported accepted/proposed draft ratio. These gauges are **not**
+cumulative counters, run-window acceptance rates, or draft/accepted-token totals.
+Different scheduler label series remain separate. JSON, live UI and HTML use the
+same values. Failed, missing, stale, duplicate, invalid or truncated latest
+observations stay unavailable; older values are not carried forward. Exporter
+values can describe an earlier scheduler interval even when a scrape succeeds.
+Zero or absent gauges do not prove speculation is disabled, and a positive gauge
+does not establish activity during this run, request attribution or speedup.
 
 Published DCGM memory, utilization, temperature, throttle and device-error families
 remain available alongside serving series. GPU checks identify each device by
@@ -609,6 +700,13 @@ time, phase, units and labels. Bounds are explicit: `metrics_interval_seconds`,
 `metrics_timeout_seconds`, `metrics_max_samples`, `metrics_max_series`; every scrape
 also has a 1 MiB response limit and the global run deadline. Collection stops on
 cancellation. Sample/cardinality limits and collection gaps remain visible.
+Existing serving and GPU samples take priority over optional speculative-decoding
+counters within the same `metrics_max_series` bound, regardless of exporter order.
+Reports identify which metric families lost samples or labels. Loss in optional
+counters does not invalidate complete GPU or serving evidence; incomplete GPU
+evidence cannot support a passing GPU check, even without a declared device count.
+Observed GPU failures still fail. Older reports with an unscoped truncation flag
+are treated conservatively as incomplete evidence.
 
 Unavailable states distinguish not enabled, no endpoint, transport/timeout,
 authentication denied, endpoint absent, empty success, unsupported format, absent
@@ -807,3 +905,15 @@ fixtures share the 64 KiB tool configuration limit. When conversations are set a
 diagnostics apply only to single-response fixtures without explicit choice rules.
 
 The message linkage follows the [OpenAI function-calling conversation contract](https://developers.openai.com/api/docs/guides/function-calling).
+
+
+### Model residency around preparation
+
+With `deployment.discovery: ollama`, Giraffe reads `/api/ps` before its CLI
+connection probe or run preparation, then again after preparation. The deployment
+snapshot and HTML report label both observations with their source, time and target
+scope. A missing model is `not_resident`; unsupported, disabled, failed or malformed
+discovery is `unknown`. These observations do not prove a cold start or explain a
+slow first response. A separately requested UI connection test may already have
+loaded the model before the run starts. A deliberate restart may also change state
+between observations. This is one endpoint’s inventory, not proof about every replica.

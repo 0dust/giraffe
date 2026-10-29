@@ -199,7 +199,7 @@ assert.match(markup,/data-live-slot="500"[^>]*tabindex="0"/);
 assert.match(markup,/481–501 \/ 501/);assert.doesNotMatch(markup,/Unused|Budget slot|Request budget/);
 nodes['#main']={};state.detail={id:'live',state:'running',config,live_requests:records,progress:{attempted:501,completed:500},events:[],live_conditions:[],live_request_summary:{evicted:500,statuses:{completed:500}}};
 renderTests=renderAllRequests=renderLiveLoadResults=renderPhases=()=>'';renderLive();
-assert.match(nodes['#main'].innerHTML,/No request limit set/);assert.match(nodes['#main'].innerHTML,/500 earlier requests outside the live window/);
+assert.match(nodes['#main'].innerHTML,/500 requests finished · 0s · limit not set/);assert.match(nodes['#main'].innerHTML,/500 earlier requests outside the live window/);
 assert.doesNotMatch(nodes['#main'].innerHTML,/budget-track|NaN|Infinity|undefined/);
 """)
 
