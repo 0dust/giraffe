@@ -25,7 +25,7 @@ def admissions(**changes):
 
 
 def test_cancellation_catalog_has_one_runtime_independent_check():
-    assert CHECK_NAMES["cancellation"] == "Limits and cancellation"
+    assert CHECK_NAMES["cancellation"] == "Cancellation & limits"
     assert not any("sglang" in key or "ollama" in key or "vllm" in key for key in CHECK_NAMES)
 
 

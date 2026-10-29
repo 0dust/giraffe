@@ -14,7 +14,7 @@ TARGET = {"name": "local", "url": "http://localhost/v1", "model": "test"}
 
 def test_limit_names_match_bounds_and_edit_destinations():
     browser_logic(r"""
-const labels={max_requests:'Maximum requests',max_duration_seconds:'Maximum duration',concurrency:'Simultaneous limit'};
+const labels={max_requests:'Max requests',max_duration_seconds:'Max duration',concurrency:'Max concurrency'};
 const markup=renderPlanBounds(config)+renderSharedRunSettings(config);
 for(const [path,label] of Object.entries(labels)){
   assert(markup.includes('<dt>'+label+'</dt>'));
@@ -34,8 +34,8 @@ def test_budget_copy_uses_catalogue_names_and_grouped_numbers_without_changing_r
     plan = request_plan(configured)
     assert plan["planned_total"] == 100007  # 100k arrivals + connection + answers; local sizing sends no requests.
     assert [(row["id"], row["title"]) for row in plan["rows"]] == [
-        ("initial", "Connection check"), ("access", "Network and access"),
-        ("correctness", "Known-answer correctness"),
+        ("initial", "Endpoint access"), ("access", "Endpoint access"),
+        ("correctness", "Answer correctness"),
         ("load_combinations", "Input → output combinations"), ("load_calibration", "Local prompt preparation")]
     notice = next(item for item in plan["request_warnings"] if item["kind"] == "incomplete_coverage")
     assert notice["actions"][0] == {"label": "Use 100,007 total requests", "field": "max_requests", "value": 100007}

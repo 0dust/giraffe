@@ -1736,14 +1736,38 @@ def _minimum_request_budget(run):
     return required * len(run.config.targets), None
 
 
-def _result_summary(run, target, points, status, settings):
-    if status == "pass":
-        return f"{len(points)} of {len(points)} load conditions passed."
+def _result_reason(points, status):
     deciding = [point for point in points if point["status"] == status]
     causes = ["time_limited" if point.get("reason_code") == "input_not_calibrated"
               and window_cause(point.get("preparation_reason")) == "time_limited"
               else point.get("reason_code") for point in deciding]
-    code = Counter(causes).most_common(1)[0][0] if causes else None
+    return Counter(causes).most_common(1)[0][0] if causes else None
+
+
+def _result_remediation(run, points, status):
+    if status == "pass" or run.reason == "cancelled by user":
+        return None
+    code = _result_reason(points, status)
+    if code == "budget_limited":
+        minimum, unknown = _minimum_request_budget(run)
+        if minimum is not None:
+            return {"action": "set_limit", "limit": "max_requests", "minimum": minimum}
+        if unknown == "duration_based":
+            return {"action": "set_limit", "limit": "max_duration", "clear": "max_requests"}
+    if code == "time_limited":
+        from .runner import _deadline_remediation
+        return _deadline_remediation(run.config)
+    if code == "measure_only":
+        return {"action": "set_acceptance", "check": "load",
+                "limits": ["max_first_answer_ms", "max_completion_ms"]}
+    return {"action": "review_check", "check": "load", "code": code or "incomplete"}
+
+
+def _result_summary(run, target, points, status, settings, *, include_remedy=True):
+    if status == "pass":
+        return f"{len(points)} of {len(points)} load conditions passed."
+    deciding = [point for point in points if point["status"] == status]
+    code = _result_reason(points, status)
     if code == "internal_error":
         error = next(point["execution_error"] for point in deciding if point.get("execution_error"))
         return f"{len(deciding)} of {len(points)} load conditions blocked: {error}"
@@ -1806,7 +1830,7 @@ def _result_summary(run, target, points, status, settings):
         remedy = (remedy.rstrip(".") + "; " if remedy else "") + " and ".join(additions) + "."
     label = "unfinished" if status == "inconclusive" else status
     summary = f"{len(deciding)} of {len(points)} load conditions {label}: {cause}."
-    return summary + (" " + remedy if remedy else "")
+    return summary + (" " + remedy if include_remedy and remedy else "")
 
 
 def result(run, target):
@@ -1877,6 +1901,8 @@ def result(run, target):
         status=status,
         required=True,
         summary=summary,
+        finding_summary=_result_summary(run, target, observation["points"], status, settings, include_remedy=False),
+        remediation=_result_remediation(run, observation["points"], status),
         metrics=observation,
         evidence_ids=[r.id for r in run.records if r.target == target.name and r.load_point],
     )

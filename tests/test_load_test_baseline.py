@@ -1,6 +1,7 @@
 """Accepted tested loads remain comparable when optional metrics are sparse."""
 
 import json
+import re
 import random
 
 import pytest
@@ -758,7 +759,7 @@ def test_preserved_metric_failure_displays_verdict_and_delivery_warning(renderer
     else:
         run_render_checks('const row=' + json.dumps(row) + ";" + r'''
 const html=comparisonTable([row]);
-assert.match(html,/Regression detected/);
+assert.match(html,/worse/);
 assert(html.includes(row.warnings[0].message));
 ''')
 
@@ -907,6 +908,7 @@ def test_html_load_acceptance_uses_qualified_outcomes_not_raw_point_status(limit
     assert row[limited_side]['status'] == 'inconclusive'
     assert row[limited_side + '_acceptance'] == 'fail'
     html = _baseline_table_html({'targets': [{'target': 'local', 'load_test': {'points': [row]}}]})
-    assert f'<td>{before}</td><td>{after}</td>' in html
+    assert re.search(r'data-label="Baseline"[^>]*>' + before + r'</td>', html)
+    assert re.search(r'data-label="Current"[^>]*>' + after + r'</td>', html)
     assert f'>{verdict}</strong>' in html
     assert 'streamed output evidenced peak overlap of 1 against 4' in html

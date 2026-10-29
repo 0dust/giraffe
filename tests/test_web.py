@@ -358,7 +358,7 @@ async def test_frontend_assets_require_revalidation_without_losing_validators(tm
         assert head.headers.get("cache-control") == "no-cache"
 
 
-async def test_frontend_entrypoints_and_module_dependency_share_an_upgrade_version(tmp_path):
+async def test_frontend_entrypoints_and_module_dependency_have_versioned_content_hashes(tmp_path):
     async with browser(tmp_path) as client:
         index = await client.get("/")
         app_match = re.search(r'<script type="module" src="([^"]+)"', index.text)
@@ -373,7 +373,10 @@ async def test_frontend_entrypoints_and_module_dependency_share_an_upgrade_versi
         assert form.status_code == 200
         versions = [parse_qs(urlsplit(str(asset.url)).query).get("v", [None])[0]
                     for asset in (app, style, form)]
-        assert all(versions) and len(set(versions)) == 1, versions
+        import hashlib
+        from giraffe import __version__
+        assert versions == [f"{__version__}-{hashlib.sha256(asset.content).hexdigest()[:16]}"
+                            for asset in (app, style, form)]
         for asset in (app, style, form):
             assert asset.headers.get("cache-control") == "no-cache"
 

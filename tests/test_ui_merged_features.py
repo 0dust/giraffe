@@ -26,7 +26,10 @@ if(confounded){
  assert.match(summary.textContent,/\(one intended change\)/);
  assert.doesNotMatch(section.querySelector('.deployment-change').textContent,/Confounded/);
 }
-assert.match(section.textContent,/not evidence of causality/);
+const caveat=section.querySelectorAll('p').find(node=>/not evidence of causality/.test(node.textContent));
+assert(caveat,'Deployment interpretation needs a visible causality caveat');
+assert(!caveat.closest('details.comparison-support'));
+for(let node=caveat;node&&node!==section.parentNode;node=node.parentNode)assert(!node.hidden);
 ''', dom=True)
 
 

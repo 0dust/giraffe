@@ -24,55 +24,31 @@ from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SI
 
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
+# Public display names have one source; compatibility imports share this object.
 CHECK_NAMES = {
-    "access": "Network and access",
-    "serving": "Serving success",
-    "first_output": "First useful output",
-    "generation": "Generation pace",
-    "capacity": "Arrival traffic capacity",
-    "fairness": "Mixed long/short fairness",
-    "context": "Long-context behavior",
-    "correctness": "Known-answer correctness",
-    "json": "Structured JSON",
-    "cancellation": "Limits and cancellation",
-    "recovery": "Sustained load and recovery",
-    "gpu": "GPU observations",
+    "access": "Endpoint access",
+    "serving": "Response validity",
+    "first_output": "Time to first answer",
+    "generation": "Generation speed",
+    "load": "Load test",
+    "context": "Long-context recall",
+    "correctness": "Answer correctness",
+    "json": "JSON correctness",
+    "cancellation": "Cancellation & limits",
+    "recovery": "Recovery after load",
+    "gpu": "GPU metrics",
+    "prefix": "Prefix cache",
+    "sessions": "Multi-turn sessions",
+    "consistency": "Answer consistency",
+    "tools": "Tool calling",
 }
-CORE_CHECKS = tuple("concurrency" if name == "fairness" else name for name in CHECK_NAMES)
+CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
+CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
+               "correctness", "json", "cancellation", "recovery", "gpu")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
 # Saved pre-v2 files with no selection retain their historical workload.
 _LEGACY_DEFAULT_CHECKS = ("access", "serving", "first_output", "generation", "load",
                           "context", "correctness", "cancellation", "recovery")
-CHECK_NAMES.update({
-    "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
-    "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
-    "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
-    "tools": "Tool-calling capability",
-})
-# Legacy titles remain readable for saved reports; execution uses public check ids.
-INTERNAL_CHECK_NAMES = {**CHECK_NAMES, "token_stress": "Token stress cases",
-                        "concurrency": "Concurrent load"}
-CHECK_NAMES = {("concurrency" if key == "fairness" else key):
-               ("Concurrent load" if key == "fairness" else title)
-               for key, title in CHECK_NAMES.items() if key not in {"buckets", "mixed"}}
-# Current check-list names for actionable diagnostics. Saved report and request
-# breakdown titles above stay stable for comparisons with earlier runs.
-CATALOGUE_NAMES = {
-    "access": "Endpoint response", "serving": "Invalid responses",
-    "correctness": "Answer correctness", "json": "JSON correctness",
-    "context": "Context recall", "tools": "Tool-call correctness",
-    "first_output": "First answer", "generation": "Generation",
-    "capacity": "Capacity under load", "concurrency": "Concurrent load",
-    "arrivals": "Arrival traffic", "recovery": "Recovery after load",
-    "sessions": "Concurrent conversations", "consistency": "Answer consistency",
-    "cancellation": "Cancellation & timeouts", "prefix": "Prompt cache evidence",
-    "gpu": "GPU metrics",
-}
-for _old_check in ("concurrency", "capacity", "arrivals"):
-    CHECK_NAMES.pop(_old_check, None)
-    CATALOGUE_NAMES.pop(_old_check, None)
-CHECK_NAMES["load"] = CATALOGUE_NAMES["load"] = INTERNAL_CHECK_NAMES["load"] = "Load test"
-CORE_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in CORE_CHECKS))
 
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
@@ -2127,7 +2103,9 @@ class RunConfig(Model):
 
     def effective_check(self, check_id: str) -> dict[str, Any]:
         """Resolve sparse overrides once; suite request settings are defaults."""
-        if check_id not in INTERNAL_CHECK_NAMES:
+        # Legacy saved metadata still resolves by id; the public display catalog
+        # contains only selectable checks.
+        if check_id not in CHECK_OPTION_FIELDS and check_id != "load":
             raise ValueError(f"unsupported check: {check_id}")
         if check_id == "load":
             return self.load_test.model_dump(mode="json")
@@ -2677,8 +2655,35 @@ class CheckResult(PersistedModel):
     status: Status
     required: bool = True
     summary: str
+    # UI findings and actions are separate from CLI guidance retained in summary.
+    finding_summary: str | None = None
+    remediation: dict[str, Any] | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     evidence_ids: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def serialize_finding_metadata(self, handler):
+        value = handler(self)
+        for name in ("finding_summary", "remediation"):
+            if getattr(self, name) is None:
+                value.pop(name, None)
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def observation_defaults(cls, value: Any) -> Any:
+        # Generated observations omit required; archived reports explicitly save it.
+        # Keep assessment-only changes out of the workload generator's identity.
+        if isinstance(value, dict) and value.get("id") == "prefix" and "required" not in value:
+            value = {**value, "required": False}
+            if value.get("status") == "fail":
+                value["status"] = "inconclusive"
+            summary = value.get("summary", "")
+            if summary.startswith("no prefix reuse observed on a majority of repeats;"):
+                value["summary"] = "Prefix caching not active;" + summary.split(";", 1)[1]
+            elif summary.startswith("Prefix is estimated below 512 tokens;"):
+                value["summary"] = "Prefix caching not active; " + summary
+        return value
 
 
 class RunReport(PersistedModel):

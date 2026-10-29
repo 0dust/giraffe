@@ -767,7 +767,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                                and (item["high_seconds"] is None or item["high_seconds"] > 0)]
             for item in risk_components:
                 if item["kind"] == "setup":
-                    reasons.append(f"The first connection check for {item['target']} may wait up to {item['high_seconds']:,g} s "
+                    reasons.append(f"{CHECK_NAMES['access']} for {item['target']} may wait up to {item['high_seconds']:,g} s "
                                    "if the server is slow to respond; this allowance shares the time limit and is excluded from the estimated duration.")
                 elif item["high_seconds"] is not None:
                     reasons.append(f"{item['target']} · {_warning_title(item)} has no comparable timing measurements; "
@@ -835,7 +835,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 unfinished_label = (f"{unfinished:,g}" if math.isfinite(unfinished)
                     else f"{Decimal(str(rate)) * Decimal(str(traffic.expected_response_seconds)):,g}")
                 message = (f"Capacity risk estimate: ≈ {rate:,g} requests/second × {traffic.expected_response_seconds:,g} seconds "
-                    f"= {unfinished_label} unfinished requests needed; in-flight limit {traffic.max_in_flight:,} "
+                    f"= {unfinished_label} unfinished requests needed; Max concurrency {traffic.max_in_flight:,} "
                     "→ the rest are dropped locally. This uses your expected response time, not measured capacity.")
                 capacity_warnings.append({"kind": "capacity_risk_estimate", "estimate": True,
                     "fields": ["traffic.rates", "traffic.expected_response_seconds", "traffic.max_in_flight"],
@@ -846,7 +846,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     "msg": message,
                     "actions": [{"label": "Edit sending rate", "field": "traffic.rates"},
                                 {"label": "Edit expected response time", "field": "traffic.expected_response_seconds"},
-                                {"label": "Edit in-flight limit", "field": "traffic.max_in_flight"}]})
+                                {"label": "Edit Max concurrency", "field": "traffic.max_in_flight"}]})
     warnings.extend(notice["msg"] for notice in capacity_warnings)
     if "arrivals" in selected and config.arrivals.mode == "burst":
         arrivals = config.effective_arrivals()
@@ -867,14 +867,14 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "values": {"arrivals.burst_size": arrivals.burst_size,
                            "arrivals.max_in_flight": arrivals.max_in_flight,
                            "arrivals.max_pending": arrivals.max_pending, "dropped": dropped},
-                "msg": f"Burst size {arrivals.burst_size:,} exceeds {in_flight} in-flight + {arrivals.max_pending:,} pending = {capacity}; {dropped:,} excess requests will be dropped locally."}
+                "msg": f"Burst size {arrivals.burst_size:,} exceeds {in_flight} at once + {arrivals.max_pending:,} pending = {capacity}; {dropped:,} excess requests will be dropped locally."}
             if contention:
                 pool, occupied = contention
                 warning["fields"].append("concurrency")
                 warning["values"].update({"concurrency": config.concurrency, "shared_pool": pool,
                     "other_endpoint_slots": occupied, "available_in_flight": in_flight})
                 warning["msg"] = (f"Arrivals share {pool} slots across {target_count} endpoints. Other endpoints can occupy {occupied:,}; "
-                    f"in that case {in_flight} in-flight + {arrivals.max_pending:,} pending = {capacity}, "
+                    f"in that case {in_flight} at once + {arrivals.max_pending:,} pending = {capacity}, "
                     f"so up to {dropped:,} of the {arrivals.burst_size:,} burst requests may be dropped locally.")
             concurrency_warnings.append(warning)
     warnings.extend(notice["msg"] for notice in concurrency_warnings)
@@ -891,7 +891,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     initial = bool(selected & {"access", "serving", "first_output", "generation"})
     if initial:
         add("initial", 1, "One generated request checks the connection. Time to first text uses this same request.",
-            title="Connection check")
+            title=CHECK_NAMES["access"])
     if config.restart_target:
         add("restart_readiness", None,
             f"GET readiness polls for {config.restart_target}, then one inference probe outside the request budget.",
@@ -899,10 +899,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     warm_count = config.effective_response()["samples"] if selected & {"serving", "first_output"} else 0
     if warm_count:
         add("warm", warm_count, "Repeated connection requests reused to compare response timing and mixed-length requests.",
-            title="Repeated connection checks")
+            title=CHECK_NAMES["serving"])
     for check in ("access", "serving", "first_output"):
         if check in selected:
-            add(check, 0, "Reuses connection checks and the other selected tests; adds no requests.")
+            add(check, 0, "Reuses requests from the other selected checks; adds no requests.")
 
     if "generation" in selected:
         count = config.effective_check("generation")["samples"]
@@ -1004,7 +1004,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     if "arrivals" in selected:
         add("arrivals", config.arrivals.requests,
-            f"{config.arrivals.requests} scheduled offers; the pending queue and run limits can leave some undispatched.")
+            f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
     if "prefix" in selected:
         settings = config.prefix
         context_limit = config.effective_check("prefix")["context_limit"]
@@ -1133,7 +1133,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if config.request_source == "request_pack" and not pack_selected:
         warnings.append("Your dataset is inactive: select Answer correctness or Capacity under load to use it.")
     if config.overlap_models and target_count > 1:
-        warnings.append("Models run at the same time and share Simultaneous limit. Their actual overlap depends on when request slots become free.")
+        warnings.append("Models run at the same time and share Max concurrency. Their actual overlap depends on when request slots become free.")
     known = sum(row.get("known_scheduled_requests", row["requests_per_target"] or 0
                         if row["kind"] == "exact" else 0) for row in rows)
     unknown = any(row["requests_per_target"] is None for row in rows)

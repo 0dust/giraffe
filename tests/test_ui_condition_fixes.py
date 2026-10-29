@@ -1,19 +1,19 @@
-"""Condition details retain readable context and exclude setup work."""
+"""Condition details retain readable context and every recorded condition."""
 
 from tests.test_ui_conditions import DIALOG_SETUP
 from tests.test_ux_results import run_render_checks
 
 
-def test_setup_and_calibration_are_not_conditions_but_request_evidence_is_untouched():
+def test_setup_and_calibration_conditions_remain_visible_with_request_evidence():
     run_render_checks(r"""
 state.detail={id:'setup',state:'running'};
 const rows=['load_calibration_v45_short_short_answer','load_calibration_long_long_output','stress_calibration_large','warm','recovery_prime','context_calibration','setup_connection','load_primary_combinations_short_short_concurrent_c4'].map(id=>({target:'local',condition:{id,label:id,check:'load'},planned:4,started:4,completed:4,status:'finished'}));
-const records=[{id:'setup-request',scenario:'warm',status:'completed'}];
+const records=[{id:'setup-request',target:'local',scenario:'warm',status:'completed'}];
 const html=renderTests(records,{live:true,conditions:rows});
-assert.equal(conditionViews.size,1);assert.match(html,/1 test condition/);assert.doesNotMatch(html,/Calibrating|calibration|Warm-up|setup_connection/);
+assert.equal(conditionViews.size,8);assert.equal((html.match(/class="condition-strip-row"/g)||[]).length,8);for(const row of rows)assert([...conditionViews.values()].some(view=>view.condition.id===row.condition.id));
 assert.equal(records.length,1);assert.equal(records[0].scenario,'warm');
-const fallback=renderTests([{id:'warm',scenario:'warm'},{id:'short',scenario:'short',status:'completed'}],{live:true});assert.equal(conditionViews.size,1);assert.match(fallback,/Short requests/);
-renderTests([],{live:true,conditions:[{condition:{id:'opaque-setup',label:'Preparation',load_type:'calibration'}},{condition:{id:'opaque-warmup',phase:'warmup'}},{condition:{id:'short',label:'Short requests',check:'serving'}}]});assert.equal(conditionViews.size,1);
+const fallback=renderTests([{id:'warm',scenario:'warm'},{id:'short',scenario:'short',status:'completed'}],{live:true});assert.equal(conditionViews.size,2);assert.match(fallback,/Short requests/);assert.match(fallback,/Warm-up/);
+renderTests([],{live:true,conditions:[{condition:{id:'opaque-setup',label:'Preparation',load_type:'calibration'}},{condition:{id:'opaque-warmup',phase:'warmup'}},{condition:{id:'short',label:'Short requests',check:'serving'}}]});assert.equal(conditionViews.size,3);
 """)
 
 
@@ -33,28 +33,30 @@ const view=[...conditionViews.values()][0];assert.equal(view.name,'Long input / 
 """)
 
 
-def test_page_enter_shares_validation_with_go_and_does_not_open_a_fake_cell():
+def test_shared_condition_rows_support_keyboard_detail_without_page_jump_controls():
     run_render_checks(DIALOG_SETUP+r"""
 (async()=>{
- openConditionDialog([...conditionViews.keys()][0]);await settle();
- let prevented=0;const key=()=>handleConditionKeydown({target:$('#condition-page-number'),key:'Enter',preventDefault(){prevented++;}});
- $('#condition-page-number').value='76';key();await settle();assert.equal(conditionDialog.page,76);assert.match($('#test-dialog').textContent,/751–760 of 1,000 requests/);
- for(const invalid of ['', 'no', '0', '101', '2.5']){$('#condition-page-number').value=invalid;key();assert.equal(conditionDialog.page,76);assert.match($('#condition-page-error').textContent,/Enter a page from 1 to 100/);}
- assert.equal(prevented,6);assert($('#test-dialog').open);
+ openConditionDialog([...conditionViews.keys()][0]);await settle();await pageTo(5);
+ assert.equal($('#condition-page-number'),null);assert.equal($('#condition-page-size'),null);
+ const rows=$$('.request-evidence-row'),opened=[];let prevented=0;rows[0].focus({preventScroll:true});
+ handleRequestTableKeydown({target:rows[0],key:'ArrowDown',preventDefault(){prevented++;}},id=>opened.push(id));assert.equal(document.activeElement,rows[1]);
+ handleRequestTableKeydown({target:rows[1],key:'Enter',preventDefault(){prevented++;}},id=>opened.push(id));assert.deepEqual(opened,['r802']);
+ assert.equal(prevented,2);assert.equal(conditionDialog.page,5);assert($('#test-dialog').open);assert.equal($('.request-spot'),null);
 })()
 """, dom=True)
 
 
-def test_dialog_title_tooltip_and_focused_strip_share_readable_shape():
+def test_dialog_title_and_focused_strip_share_readable_shape():
     run_render_checks(DIALOG_SETUP+r"""
 (async()=>{
  const id='load_primary_combinations_short_short_concurrent_c4';
  aggregate={...aggregate,condition:{id,label:'Combinations short short concurrent c4',check:'load',level:4},condition_id:id,check_id:'load',name:'Combinations short short concurrent c4',concurrency_description:'4 concurrent'};
- draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
+ state.detail.live_requests=state.detail.live_requests.slice(0,2).map(record=>({...record,scenario:id,condition_id:id}));draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
  assert.equal($('#test-title').textContent,'Short input / short output');assert.match($('#test-dialog').textContent,/Load test · 4 at once/);
- assert.match($('#condition-selection').textContent,/Short input \/ short output · 4 at once/);
- assert.match($('.condition-spot').getAttribute('aria-label'),/Short input \/ short output · 4 at once/);
- assert.match($('.condition-plan-identity').textContent,/load_primary_combinations_short_short_concurrent_c4/);
+ assert.match($('.condition-strip-row').textContent,/Short input \/ short output · 4 at once/);
+ assert.equal($$('#test-dialog .request-evidence-row').length,200);assert($$('#test-dialog .request-evidence-row td[data-label="Condition"]').every(cell=>cell.textContent==='Short input / short output'));
+ assert.equal(conditionDialog.localEvidence,false);assert.match($('#test-dialog').textContent,/Page 1 of 5/);
+ assert.equal($('.condition-plan-identity'),null);assert.equal([...conditionViews.values()][0].condition.id,id);assert.match(calls.at(-1),/conditions\/load_primary_combinations_short_short_concurrent_c4\/requests/);
  assert.doesNotMatch($('#test-title').textContent,/Combinations short short concurrent|load_primary/);
 })()
 """, dom=True)
@@ -63,11 +65,11 @@ def test_dialog_title_tooltip_and_focused_strip_share_readable_shape():
 def test_request_context_keeps_whole_condition_number_on_later_filtered_page():
     run_render_checks(DIALOG_SETUP+r"""
 (async()=>{
- remaining=757;aggregate={...aggregate,planned:757,started:757,running:757};draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
- $('#condition-page-number').value='76';click('go');await settle();
- const context=conditionRequestContext('r751');assert.equal(context.number,751);assert.equal(context.total,757);assert.equal(context.condition_id,condition.id);assert.equal(context.target,'local');assert.match(context.label,/Short input \/ short output/);
+ remaining=757;state.detail.live_requests=state.detail.live_requests.slice(0,757);aggregate={...aggregate,planned:757,started:757,running:757};draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
+ await pageTo(4);
+ const context=conditionRequestContext('r701');assert.equal(context.number,701);assert.equal(context.total,757);assert.equal(context.condition_id,condition.id);assert.equal(context.target,'local');assert.match(context.label,/Short input \/ short output/);
  conditionDialog.filter='running';conditionDialog.payload={...conditionDialog.payload,total:7,totals:{running:7,passed:750}};
- assert.equal(conditionRequestContext('r751').total,757);assert.equal(conditionRequestContext('absent'),null);
+ assert.equal(conditionRequestContext('r701').total,757);assert.equal(conditionRequestContext('absent'),null);
 })()
 """, dom=True)
 
@@ -80,3 +82,18 @@ assert.match(conditionDialogCounts([...conditionViews.values()][0]),/Unknown —
 renderTests([],{live:true,conditions:[{condition:{id:'custom',label:'Custom requests',check:'serving'},planned:null,planned_kind:'unknown',started:4}]});
 assert.match(conditionDialogCounts([...conditionViews.values()][0]),/Unknown — plan not recorded/);assert.doesNotMatch(conditionDialogCounts([...conditionViews.values()][0]),/duration-based/);
 """)
+
+
+def test_local_condition_context_uses_dispatch_order_after_table_sort():
+    run_render_checks(r"""
+(async()=>{
+ const condition={id:'correctness',check:'correctness',label:'Answer correctness'},aggregate={target:'local',condition,planned:2,planned_kind:'exact',started:2,completed:2,aggregate_status:'passed'};
+ const late={id:'late',target:'local',condition_id:'correctness',scenario:'correctness',dispatch_ms:20,elapsed_ms:5,status:'completed',valid:true,score:true},early={...late,id:'early',dispatch_ms:10,elapsed_ms:90};
+ detail(report([check('correctness','pass')],{requests:[late,early],conditions:[aggregate]}));
+ api=async()=>({aggregate,rows:[],page:1,pages:1,page_size:50,total:2,totals:{passed:2}});
+ openConditionDialog([...conditionViews.keys()][0]);for(let i=0;i<12;i++)await Promise.resolve();
+ conditionDialog.table.sort='elapsed_ms';conditionDialog.table.direction='desc';renderConditionDialog();
+ assert.equal(conditionRequestContext('early').number,1);assert.equal(conditionRequestContext('late').number,2);assert.equal(conditionRequestContext('late').total,2);
+ assert.equal(state.detail.report.requests[0].id,'late','inspection must not mutate saved evidence');
+})()
+""",dom=True)

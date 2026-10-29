@@ -365,7 +365,7 @@ def test_warning_titles_use_catalogue_names_without_changing_breakdown():
         assert all("limits.stop_control" not in action["label"] and "recovery_baseline" not in action["label"]
                    for action in warning.get("actions", []))
     actions = {action["label"] for warning in warnings for action in warning.get("actions", [])}
-    assert "Edit Cancellation & timeouts" in actions
+    assert "Edit Cancellation & limits" in actions
     assert "Edit Recovery after load" in actions
 
 

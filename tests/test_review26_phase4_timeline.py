@@ -105,7 +105,7 @@ async def test_cancellation_observations_cover_real_controls_and_probes(monkeypa
     saved = await runner.run_suite(configured)
     plan = request_plan(configured, observations=observations(saved))
     assert {item["title"] for item in plan["time_components"]} == {
-        "Stop-sequence control", "Cancellation & timeouts", "Cancellation health probes"}
+        "Stop-sequence control", "Cancellation & limits", "Cancellation health probes"}
     unknown, = plan["unknown_time_components"]
     assert unknown["id"] == "cancellation_intentional"
     assert unknown["requests"] == 2

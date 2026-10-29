@@ -109,7 +109,7 @@ def test_extended_check_pass_criteria_change_verdict_and_remain_isolated(check):
         "test_options": {check: {"limits": {"latency_ms": 5}}}})
     run.config = overridden
     after = outcome()
-    assert after.status == "fail"
+    assert after.status == ("inconclusive" if check == "prefix" else "fail")
     assert after.metrics["timing_violations"]
     assert overridden.limits.latency_ms == 50
     run.config = config

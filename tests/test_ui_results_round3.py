@@ -74,8 +74,8 @@ assert(html.includes(`Baseline accepted rate</dt><dd>${before} req/s`));assert(h
 assert(html.includes(after>before?'Passed':'Failed'));
 for(const metric of ['throughput','output_tokens_per_second','generation_tokens_per_second']){
  const row={metric,status:after>before?'pass':'fail',baseline:before,current:after,threshold:20,worsening:after>before?-300:75,worsening_interval_95:after>before?[-310,-290]:[70,80]};
- const table=comparisonTable([row]);assert(table.includes(expected==='better'?'No material regression':'Regression detected'));assert(table.includes(DELTA));
- const uncertain=comparisonTable([{...row,status:'inconclusive',reason:'Insufficient samples'}]);assert(uncertain.includes('Insufficient samples'));assert(!uncertain.includes('Regression detected'));
+ const table=comparisonTable([row]);assert(table.includes('data-label="Verdict">'+expected+'</td>'));assert(table.includes(DELTA));
+ const uncertain=comparisonTable([{...row,status:'inconclusive',reason:'Insufficient samples'}]);assert(uncertain.includes('Insufficient samples'));assert(uncertain.includes('data-label="Verdict">not comparable</td>'));
 }
 """.replace('BEFORE', str(before)).replace('AFTER', str(after)).replace('VERDICT', repr(verdict)).replace('DELTA', repr(delta)))
 
