@@ -476,10 +476,30 @@ async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence(
         report = await run_suite(cfg)
     singles = [r for r in workload_records(report.requests) if r.workload.get('tool_fixture_id') == 'single']
     assert len(singles) == 2
-    assert all(r.score is True and r.status == 'completed' for r in singles), [r.model_dump(include={
-        'scenario', 'status', 'valid', 'score', 'error', 'score_message', 'http_status',
-        'elapsed_ms', 'request_timeout_seconds', 'termination_reason', 'termination_limit_seconds',
-        'tool_evaluation', 'tool_calls'}) for r in singles]
+    if not all(r.score is True and r.status == 'completed' for r in singles):
+        # Captured stdout preserves full JSON; pytest abbreviates nested assertion reprs.
+        with endpoint._lock:
+            arrivals = [{
+                'stream': payload.get('stream'),
+                'roles': [message['role'] for message in payload['messages']],
+                'started_monotonic': started,
+            } for payload, started in zip(endpoint.requests, endpoint.request_started_at, strict=True)]
+            finished = list(endpoint.request_finished_at)
+        print(json.dumps({
+            'inference_duration_seconds': report.observations['inference_duration_seconds'],
+            'configured_request_timeout_seconds': cfg.request_timeout_seconds,
+            'abort_reason': report.abort_reason, 'limits_reached': report.limits_reached,
+            'generator_max_lag_ms': report.observations.get('generator_max_lag_ms'),
+            'client_timing_health': report.observations.get('client_timing_health'),
+            'requests': [r.model_dump(mode='json', include={
+                'scenario', 'status', 'valid', 'score', 'error', 'score_message', 'http_status',
+                'started_at', 'dispatch_ms', 'completed_ms', 'timing_start_ms', 'elapsed_ms',
+                'client_preparation_ms', 'client_wait_ms', 'workload',
+                'request_timeout_seconds', 'termination_reason', 'termination_limit_seconds',
+                'tool_evaluation', 'tool_calls'}) for r in report.requests],
+            'endpoint_arrivals': arrivals, 'endpoint_finished_monotonic': finished,
+        }, indent=2))
+    assert all(r.score is True and r.status == 'completed' for r in singles)
     assert all(r.request_timeout_seconds == cfg.request_timeout_seconds for r in singles)
     final_turns = [r for r in workload_records(report.requests) if r.workload.get('stage') == 'final']
     assert len(final_turns) == 2
