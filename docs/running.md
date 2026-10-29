@@ -140,10 +140,22 @@ giraffe inspect runs/before/report.json
 
 In the UI, open a completed run. Fully passing runs offer **Save baseline**; other
 completed runs offer **Save as reference baseline**. Give it a name and choose
-**Save baseline**. Then choose **Compare a new run with this baseline** at the
-bottom of the report, or **Compare a new run** when shown at the top. Both open a
-new run using that reference and the saved setup. Review the settings before
-choosing **Launch**.
+**Save baseline**.
+
+To compare a run that already finished, open that run and choose **Compare with
+baseline**. Select the saved reference and choose **Compare saved results**.
+Giraffe uses the recorded measurements without contacting the endpoint. The
+comparison stays with the report after reload and appears in JSON/HTML exports.
+Use **Change baseline** to compare the same measurements against another saved
+reference. Saved baselines and request evidence remain unchanged; incompatible
+workloads or insufficient evidence still produce inconclusive results.
+
+The local API provides the same operation: `POST /api/runs/{run_id}/compare`
+with `{"baseline_id": "<saved-baseline-id>"}`. List references with
+`GET /api/baselines`. Only completed reports can be compared.
+
+You can also choose **Compare a new run with this baseline** to open a new run
+using that reference and the saved setup. Review settings before **Launch**.
 
 From the CLI, save a completed run with `giraffe baseline save`, then pass the
 saved file to `giraffe run --baseline`:
