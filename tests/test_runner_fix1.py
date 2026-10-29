@@ -99,19 +99,43 @@ def test_first_output_verdict_uses_unrounded_p95():
     assert set(result.metrics["violations"]) == {"0", "1"}
 
 
-async def test_enclosing_timeout_raises_and_preserves_partial_report_for_existing_writer(tmp_path, monkeypatch, client):
+@pytest.mark.parametrize("preparation_delay", [0, .3])
+async def test_enclosing_timeout_raises_and_preserves_partial_report_for_existing_writer(
+        tmp_path, monkeypatch, client, preparation_delay):
+    from giraffe import deployment
+
     monkeypatch.setattr(client, "delay", 10)
-    events = []
-    initial = asyncio.current_task().cancelling()
-    with pytest.raises(TimeoutError) as timeout:
-        async with asyncio.timeout(.2):
-            await runner.run_suite(config(), progress=events.append)
-    assert asyncio.current_task().cancelling() == initial
-    cancellation = timeout.value.__cause__
-    assert isinstance(cancellation, asyncio.CancelledError)
-    partial = cancellation.giraffe_report
-    assert partial.requests and all(record.status == "cancelled" for record in partial.requests)
+    original_prepare = deployment.preparation_residency
+    events, observed = [], {}
+
+    async def prepare(*args, **kwargs):
+        await asyncio.sleep(preparation_delay)
+        return await original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(deployment, "preparation_residency", prepare)
+
+    async def run():
+        initial = asyncio.current_task().cancelling()
+        with pytest.raises(TimeoutError) as timeout:
+            async with asyncio.timeout(None) as deadline:
+                def progress(event):
+                    events.append(event)
+                    if event["event"] == "request_started" and deadline.when() is None:
+                        observed["armed_at"] = asyncio.get_running_loop().time()
+                        deadline.reschedule(observed["armed_at"] + .2)
+                await runner.run_suite(config(), progress=progress)
+        assert deadline.expired()
+        assert deadline.when() - observed["armed_at"] == pytest.approx(.2)
+        assert asyncio.current_task().cancelling() == initial
+        cancellation = timeout.value.__cause__
+        assert isinstance(cancellation, asyncio.CancelledError)
+        return cancellation.giraffe_report
+
+    partial = await asyncio.wait_for(asyncio.create_task(run()), 2)
+    assert partial.requests and all(record.status == "cancelled" and record.completed_ms is not None
+                                    for record in partial.requests)
     assert partial.abort_reason == "run cancelled"
+    assert client.active == 0 and client.closed == ["service"]
     assert events[-1]["event"] == "run_finished"
     # The existing report writer/loader works on the partial report carried by
     # the cancellation; timeout conversion must not throw that evidence away.
@@ -119,7 +143,6 @@ async def test_enclosing_timeout_raises_and_preserves_partial_report_for_existin
     saved = RunReport.model_validate_json(path.read_text())
     assert saved.run_id == partial.run_id and saved.abort_reason == partial.abort_reason
     assert [record.status for record in saved.requests] == ["cancelled"]
-
 
 
 @pytest.mark.parametrize("phase", ["preparation", "traffic"])
