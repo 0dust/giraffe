@@ -230,9 +230,10 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   }}
 }}
 // Explicit goal changes use the form's latest draft rather than a stale applied config.
+state.bootstrap.config={{...structuredClone(state.bootstrap.config),checks:bootstrap.defaults.checks}};
 form.elements.model.value='latest-model';await listeners.click({{target:{{closest:q=>q==='[data-action]'?{{dataset:{{action:'quick-checks'}}}}:null}}}});
 assert.equal(state.config.targets[0].model,'latest-model');
-assert.equal(state.config.checks.join(','),'access,correctness');
+assert.equal(state.config.checks.join(','),bootstrap.defaults.checks.join(','));
 assert.equal(JSON.stringify(state.config.request_pack),savedPack);
 assert.equal(state.config.max_requests,config.max_requests);
 // Reruns and imported advanced selections infer Custom without rewriting them.

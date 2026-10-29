@@ -1675,6 +1675,95 @@ async def execute(run, target, client):
     return observation
 
 
+def _minimum_request_budget(run):
+    from .planning import request_plan
+    selected = test_points(run.config.load_test)
+    if any(point["pattern"] in {"concurrent", "interference"} for point in selected):
+        return None, "duration_based"
+    plan = request_plan(run.config.model_copy(update={"max_requests": None}))
+    fixed = [row for row in plan["rows"] if not row["id"].startswith("load_")]
+    if any(row["requests_per_target"] is None for row in fixed):
+        return None, "unknown_request_count"
+    settings = dict(settings_sets(run.config.load_test))
+    required = sum(row["requests_per_target"] for row in fixed)
+    for point in selected:
+        offers, overflow = planned_arrivals(settings[point["source"]], point)
+        if overflow:
+            return None, "schedule_overflow"
+        required += len(offers)
+    return required * len(run.config.targets), None
+
+
+def _result_summary(run, target, points, status, settings):
+    if status == "pass":
+        return f"{len(points)} of {len(points)} load conditions passed."
+    deciding = [point for point in points if point["status"] == status]
+    causes = ["time_limited" if point.get("reason_code") == "input_not_calibrated"
+              and window_cause(point.get("preparation_reason")) == "time_limited"
+              else point.get("reason_code") for point in deciding]
+    code = Counter(causes).most_common(1)[0][0] if causes else None
+    descriptions = {
+        "budget_limited": ("request budget reached", None),
+        "time_limited": ("run deadline reached", "Increase --max-duration (max_duration_seconds) to cover all selected sending windows and request timeouts, or select fewer rates."),
+        "client_delay": ("client scheduling delay", "Reduce the offered load or run the client on a less busy machine."),
+        "incomplete_delivery": ("scheduled requests were not delivered", "Reduce the offered rates or raise --simultaneous-limit to deliver the selected traffic."),
+        "cancelled": ("requests were cancelled", "Complete the selected sending windows and allow requests to finish."),
+        "input_not_calibrated": ("input preparation unavailable", "Configure an available tokenizer in targets[].tokenizer."),
+        "insufficient_responses": ("too few valid responses", "Lengthen load_test.schedule.duration_seconds to collect load_test.pass_criteria.min_valid_responses per result group."),
+        "missing_judgments": ("answer judgments missing", "Configure answer scorers and collect the required scored responses."),
+        "missing_case_coverage": ("saved questions lack scored responses", "Lengthen load_test.schedule.duration_seconds to exercise every selected saved question."),
+        "missing_timing": ("required timing measurements missing", "Enable streaming and use an endpoint that reports the required timing and token usage."),
+        "cached_input": ("long input was mostly cached", "Use uncached long inputs to exercise the selected workload."),
+        "insufficient_coverage": ("required token coverage not exercised", "Use saved questions and output budgets that reach the selected load_test.profile token targets."),
+        "input_not_verified": ("input token coverage not verified", "Use questions in the selected input size classes and an endpoint that reports input token usage."),
+        "load_not_delivered": ("requested concurrency not exercised", "Lengthen load_test.schedule.duration_seconds or lower the selected concurrency levels."),
+        "measure_only": ("no latency acceptance limit configured", "Set load_test.pass_criteria.max_first_answer_ms or load_test.pass_criteria.max_completion_ms in --config to establish accepted capacity."),
+        "comparison": ("comparison workload not sufficiently exercised", "Complete both comparison windows with verified input sizes and overlapping short streams."),
+        "context_exceeded": ("request exceeds the endpoint context window", "Reduce load_test.profile input or output token targets to fit the endpoint context window."),
+        "calibration_failed": ("input preparation failed", "Correct the input preparation failure recorded in the affected conditions."),
+        "error_rate": ("endpoint error allowance exceeded", "Correct the endpoint errors recorded in the affected conditions."),
+        "output_cap": ("endpoint exceeded the requested output cap", "Configure the endpoint to respect the requested output cap."),
+        "correctness": ("answer correctness below the requirement", "Correct the answers or scoring configuration recorded in the affected conditions."),
+        "timing": ("response timing limit exceeded", "Reduce the offered load or adjust load_test.pass_criteria to the required service target."),
+    }
+    if (run.reason == "cancelled by user" and status == "inconclusive"
+            and code in {"run_stopped", "cancelled", "unfinished", "budget_limited", "time_limited"}):
+        cause, remedy = "stopped by you", None
+    else:
+        cause, remedy = descriptions.get(code, (
+            "run stopped before sufficient evidence was collected",
+            "Resolve the stop cause recorded in the affected conditions and rerun the selected workload.",
+        ))
+    if code == "budget_limited" and run.reason != "cancelled by user":
+        minimum, unknown = _minimum_request_budget(run)
+        if unknown == "schedule_overflow":
+            remedy = ("Reduce load_test.patterns.rates or load_test.schedule.duration_seconds "
+                      "to fit the client arrival-schedule limit before rerunning.")
+        elif minimum is not None:
+            remedy = f"Raise --max-requests (max_requests) to at least {minimum} or select fewer rates."
+        else:
+            explanation = ("Duration-based workloads send as many requests as the server can answer"
+                           if unknown == "duration_based" else "The selected workloads have no fixed request count")
+            remedy = (explanation + ", so bound this run with --max-duration (max_duration_seconds) and "
+                      "--no-max-requests (max_requests: null), or select fewer rates.")
+    elif code == "time_limited" and run.reason != "cancelled by user":
+        from .runner import _deadline_guidance
+        remedy = _deadline_guidance(run.config)
+    measure_only = any(own.pass_criteria.max_first_answer_ms is None and own.pass_criteria.max_completion_ms is None
+                       for own in settings.values())
+    unscored = any(group.get("unscored", 0) for p in points for group in p.get("groups", []))
+    if status == "inconclusive" and run.reason != "cancelled by user" and (measure_only or unscored):
+        additions = []
+        if measure_only:
+            additions.append("set load_test.pass_criteria.max_first_answer_ms or load_test.pass_criteria.max_completion_ms in --config")
+        if unscored:
+            additions.append("configure scorers for unscored answers")
+        remedy = (remedy.rstrip(".") + "; " if remedy else "") + " and ".join(additions) + "."
+    label = "unfinished" if status == "inconclusive" else status
+    summary = f"{len(deciding)} of {len(points)} load conditions {label}: {cause}."
+    return summary + (" " + remedy if remedy else "")
+
+
 def result(run, target):
     observation = run.observations[target.name].get("load_test")
     if observation is None:
@@ -1733,19 +1822,9 @@ def result(run, target):
             row["value"] = max(row["value"], value)
     observation["highest_accepted"] = list(accepted.values())
     status = aggregate([p["status"] for p in observation["points"]])
-    summary = (
-        f"{len(observation['points'])} sequential load tests: "
-        + "; ".join(
-            f"{k}: {v}" for k, v in Counter(p["status"] for p in observation["points"]).items()
-        )
-        + "."
-    )
-    if status != "pass":
-        deciding = [p for p in observation["points"] if p["status"] == status]
-        summary += " " + "; ".join(f"{point_label(p)}: {p['reason']}" for p in deciding[:3])
-        if len(deciding) > 3:
-            summary += f"; and {len(deciding) - 3} more"
-        summary += "."
+    summary = _result_summary(run, target, observation["points"], status, settings)
+    deciding = [p for p in observation["points"] if p["status"] == status]
+    observation["reason_code"] = Counter(p.get("reason_code") for p in deciding).most_common(1)[0][0] if deciding else None
     return CheckResult(
         id="load",
         title="Load test",

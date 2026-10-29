@@ -34,7 +34,7 @@ def reports(check="sessions", *, arrivals=None):
     old.manifest["config"] = deepcopy(current.manifest["config"])
     old_config = old.manifest["config"]
     old_config.pop("config_version")
-    old_config.pop("default_concurrency")
+    old_config.pop("default_concurrency", None)
     old_config.update(concurrency=4, max_requests=300, max_duration_seconds=300)
     settings = {field: (getattr(config, field).model_dump(mode="json")
                         if hasattr(getattr(config, field), "model_dump") else getattr(config, field))

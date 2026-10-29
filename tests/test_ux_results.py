@@ -389,3 +389,56 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
             assert '.queued' not in selector and '.reserved' not in selector
     assert animated, 'The parser must inspect real animation rules'
     assert '.is-landing' not in css
+
+
+def test_check_details_show_recorded_effective_limits_and_default_labels():
+    run_render_checks(r"""
+const first=check('first_output','pass'),generation=check('generation','pass');
+const value=report([first,generation]);
+value.manifest.effective_checks={first_output:{limits:{first_output_ms:10000}},generation:{limits:{stream_gap_ms:5000}}};
+value.manifest.default_check_limits={first_output:['first_output_ms'],generation:['stream_gap_ms']};
+const original=JSON.stringify(value);
+let markup=renderCheck(first,value);
+assert.match(markup,/Limit: ≤ 10 s \(default\)/);
+assert.doesNotMatch(markup,/No acceptance limit set/);
+markup=renderCheck(generation,value);
+assert.match(markup,/Limit: ≤ 5 s \(default\)/);
+assert.doesNotMatch(markup,/No stream-pause limit set/);
+assert.equal(JSON.stringify(value),original);
+value.manifest.config.limits.first_output_ms=123;
+value.manifest.effective_checks.first_output.limits.first_output_ms=800;
+value.manifest.default_check_limits.first_output=[];
+markup=renderCheck(first,value);
+assert.match(markup,/Limit: ≤ 800 ms/);assert.doesNotMatch(markup,/\(default\)|123 ms/);
+value.manifest.effective_checks.first_output.limits.first_output_ms=null;
+markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
+delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
+markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
+""")
+
+
+@pytest.mark.parametrize("check_id", ["first_output", "generation"])
+def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_id):
+    run_render_checks(r"""
+(async()=>{
+ const id=CHECK_ID,first=id==='first_output';
+ const limitField=first?'first_output_ms':'stream_gap_ms',observedField=first?'first_output_ms':'max_stream_gap_ms';
+ const limit=first?10000:5000,slow=first?12300:6000;
+ const records=[['slow',slow],['good',200],['client',20000]].map(([id,time])=>({id,target:'local',status:'completed',valid:true,score:true,output:'Correct',[observedField]:time}));
+ const failed=check(id,'fail',{evidence_ids:['slow','good','client'],metrics:{violations:['slow'],unattributed_timing_violations:['client']}});
+ const value=report([failed],{overall:'fail',requests:records});
+ value.manifest.config.limits={[limitField]:60000};
+ value.manifest.effective_checks={[id]:{limits:{[limitField]:limit}}};
+ value.manifest.default_check_limits={[id]:[limitField]};
+ const original=JSON.stringify(value);
+ detail(value);const action=$('[data-action="show-failing"]');assert(action);await listeners.click({target:action});
+ const panel=$('.check-detail'),table=panel.querySelector('.evidence-table');
+ assert(panel.textContent.includes(`Limit: ≤ ${limit/1000} s (default)`));
+ assert(!panel.textContent.includes('60 s'));
+ assert(table.querySelector('[data-request="slow"]'));
+ assert.equal(table.querySelector('[data-request="good"]'),null);
+ assert.equal(table.querySelector('[data-request="client"]'),null);
+ assert(table.textContent.includes(first?'Too slow: first output 12.3 s > 10 s':'Too slow: stream pause 6 s > 5 s'));
+ assert.equal(JSON.stringify(value),original);
+})()
+""".replace('CHECK_ID', json.dumps(check_id)), dom=True)

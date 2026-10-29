@@ -189,12 +189,12 @@ def test_manifest_rerun_recomputes_legacy_notes(tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize('arrivals', [{}, {'requests': 2}])
 def test_unrunnable_legacy_default_keeps_automatic_check_selection(arrivals):
-    from giraffe.models import DEFAULT_CHECKS
     values = {'targets': [TARGET], 'concurrent_workloads': {'scenarios': ['streaming_fairness']},
         'structured_json': True, 'arrivals': arrivals}
     config = load_saved(values)
     # The unrunnable old stream comparison cannot hide independent arrivals.
-    assert config.checks == [*[check for check in DEFAULT_CHECKS if check != 'load'], 'json', 'load']
+    assert config.checks == ['access', 'serving', 'first_output', 'generation', 'context',
+                             'correctness', 'cancellation', 'recovery', 'json', 'load']
     assert config.load_test.workloads.combinations.selected == ['short_short']
     assert config.load_test.patterns.constant.enabled
     assert any('streaming_fairness ran at 2 concurrent requests; interference left off' in note for note in config._migration_notes)

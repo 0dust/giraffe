@@ -7,7 +7,6 @@ checks:
 - tools
 stream: true
 max_requests: 8
-max_duration_seconds: 120
 request_timeout_seconds: 30
 max_output_tokens: 128
 retention: failures

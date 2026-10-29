@@ -424,9 +424,7 @@ def _bootstrap_config(defaults: dict | None) -> dict:
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1",
                                  "model": "placeholder"}]).model_dump(mode="json")
     config["targets"][0]["model"] = ""
-    if defaults is None:
-        config["checks"] = ["access", "correctness"]
-    else:
+    if defaults is not None:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
         defaults, _ = migrate_run_limits(defaults)
         defaults, _ = migrate_concurrent_load(defaults)

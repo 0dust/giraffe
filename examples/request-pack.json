@@ -1,34 +1,75 @@
 {
-  "version": 1,
-  "cases": [
+  "config_version": 2,
+  "targets": [
     {
-      "fixture_id": "refund-window",
-      "weight": 3,
-      "messages": [
-        {"role": "system", "content": "Answer using only the policy supplied. Return the requested value without explanation."},
-        {"role": "user", "content": "Policy: returns are accepted within 30 days of delivery. How many days is the return window? Reply with the number only."}
-      ],
-      "scorer": "exact",
-      "expected": "30",
-      "max_tokens": 16,
-      "options": {"temperature": 0}
-    },
-    {
-      "fixture_id": "order-extraction",
-      "weight": 1,
-      "messages": [
-        {"role": "user", "content": "Extract this order as JSON with only order_id and status. Order ID: A-104. Status: shipped. Return JSON only."}
-      ],
-      "scorer": "json",
-      "schema": {
-        "type": "object",
-        "properties": {"order_id": {"type": "string"}, "status": {"type": "string"}},
-        "required": ["order_id", "status"],
-        "additionalProperties": false
-      },
-      "expected": {"order_id": "A-104", "status": "shipped"},
-      "max_tokens": 64,
-      "options": {"temperature": 0}
+      "name": "local",
+      "url": "http://127.0.0.1:11434/v1",
+      "model": "qwen2.5:7b-instruct"
     }
-  ]
+  ],
+  "checks": [
+    "correctness"
+  ],
+  "max_output_tokens": 128,
+  "request_source": "request_pack",
+  "request_pack": {
+    "version": 1,
+    "cases": [
+      {
+        "fixture_id": "refund-window",
+        "weight": 3,
+        "messages": [
+          {
+            "role": "system",
+            "content": "Answer using only the policy supplied. Return the requested value without explanation."
+          },
+          {
+            "role": "user",
+            "content": "Policy: returns are accepted within 30 days of delivery. How many days is the return window? Reply with the number only."
+          }
+        ],
+        "scorer": "exact",
+        "expected": "30",
+        "max_tokens": 16,
+        "options": {
+          "temperature": 0
+        }
+      },
+      {
+        "fixture_id": "order-extraction",
+        "weight": 1,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Extract this order as JSON with only order_id and status. Order ID: A-104. Status: shipped. Return JSON only."
+          }
+        ],
+        "scorer": "json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "order_id": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "order_id",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        "expected": {
+          "order_id": "A-104",
+          "status": "shipped"
+        },
+        "max_tokens": 64,
+        "options": {
+          "temperature": 0
+        }
+      }
+    ]
+  }
 }

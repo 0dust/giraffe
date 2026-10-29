@@ -1511,7 +1511,7 @@ function runLimitHint(name,config) {
   if(name==='load_patterns_concurrent_levels')return 'Used by maintained-concurrency traffic and the long-input / short-answer test.';
   if(name==='traffic_max_in_flight')return `Own in-flight bound; inherited default ${effectiveParallelism(config)}. When slots are busy, arrivals are dropped locally. ${explanation}`;
 }
-function effectiveParallelism(config) {return Math.min(config.default_concurrency,config.concurrency==null?Infinity:Math.max(1,Math.floor(config.concurrency/(config.overlap_models?config.targets.length:1))));}
+function effectiveParallelism(config) {return Math.min(config.default_concurrency ?? state.bootstrap.config_schema.properties.default_concurrency.default,config.concurrency==null?Infinity:Math.max(1,Math.floor(config.concurrency/(config.overlap_models?config.targets.length:1))));}
 function updateRunLimitHints(config) {
   for(const name of ['load_patterns_concurrent_levels']){const hint=$(`#field-${name}-hint`);if(hint)hint.textContent=runLimitHint(name,config);}
 }
@@ -3358,7 +3358,11 @@ function renderCancellationResults(metrics){
   }).join('');
 }
 function renderCheck(check,report) {
-  const m=check.metrics || {},config=reportConfig(report),limits={...(config.limits || {}),...(config.test_options?.[check.id]?.limits || {})};
+  const m=check.metrics || {},config=reportConfig(report),recordedLimits=report.manifest?.effective_checks?.[check.id]?.limits;
+  const limits=recordedLimits || {...(config.limits || {}),...(config.test_options?.[check.id]?.limits || {})};
+  const defaultLimits=report.manifest?.default_check_limits?.[check.id] || [];
+  const limitDuration=value=>value>=1000?`${number(value/1000,1)} s`:ms(value);
+  const timingLimit=(name,missing)=>limits[name]?`Limit: ${recordedLimits?'≤ ':''}${recordedLimits?limitDuration(limits[name]):ms(limits[name])}${recordedLimits&&defaultLimits.includes(name)?' (default)':''}`:missing;
   const positions=requestPositions(report.requests),violations=checkViolationIds(check,report),records=findingRequests(check,report);
   const sorted=records.filter(r=>!state.failingRequestsOnly||isFailingRequest(r,check.status==='pass'?null:violations));
   const metrics=[];
@@ -3385,11 +3389,11 @@ function renderCheck(check,report) {
     else metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));
   }else{
     metrics.push(metric('Requests completed',`${m.completed ?? 0} / ${m.attempted ?? 0}`,`${m.failed ?? 0} failed · ${m.timed_out ?? 0} timed out`));
-    if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),limits.first_output_ms?`Limit: ${ms(limits.first_output_ms)}`:'No acceptance limit set'));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}
+    if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),timingLimit('first_output_ms','No acceptance limit set')));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}
     else if(check.id==='capacity'&&m.traffic_stages){metrics.push(metric(m.request_pack?.control_status==='fail'?'Highest acceptable tested loaded rate · quiet failed':'Highest acceptable tested arrival rate',m.highest_acceptable_rate_rps==null?'Unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s`,m.request_pack?.control_status==='fail'?'Loaded result only; quiet checks failed. Maximum capacity unknown.':'Highest tested acceptable rate; maximum capacity unknown'));metrics.push(metric('Rate stages',number(m.traffic_stages.length),'Each stage is offered independently, then drained'));}
     else if(check.id==='capacity'){metrics.push(metric('Highest accepted load',m.highest_tested_acceptable_concurrency==null?'Unconfirmed':number(m.highest_tested_acceptable_concurrency),'Highest tested; maximum capacity unknown'));metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));}
     else if(check.id==='fairness'){metrics.push(metric('Mixed / short-only latency',m.latency_ratio==null?'Unmeasured':`${number(m.latency_ratio,2)}×`,limits.fairness_max_ratio?`Limit: ${limits.fairness_max_ratio}×`:'No slowdown limit set'));metrics.push(metric('Observed overlap',`${m.overlaps ?? 0} / ${m.pairs ?? 0}`,'Pairs with concurrent prefill'));}
-    else {metrics.push(metric('Response time · p95',ms(m.p95_ms),limits.latency_ms?`Limit: ${ms(limits.latency_ms)}`:'No response-time limit set'));metrics.push(metric('Longest stream pause',ms(m.max_stream_gap_ms),limits.stream_gap_ms?`Limit: ${ms(limits.stream_gap_ms)}`:'No stream-pause limit set'));}
+    else {metrics.push(metric('Response time · p95',ms(m.p95_ms),timingLimit('latency_ms','No response-time limit set')));metrics.push(metric('Longest stream pause',ms(m.max_stream_gap_ms),timingLimit('stream_gap_ms','No stream-pause limit set')));}
   }
   if(check.id==='cancellation' && typeof m.backend_cancellation==='object'){
     const backend=m.backend_cancellation;
@@ -3893,7 +3897,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='catalogue-category'){state.catalogueCategory=event.target.closest('[data-category]').dataset.category;syncTestControls();return;}
   if(action==='catalogue-filter'){state.catalogueFilter=event.target.closest('[data-catalogue-filter]').dataset.catalogueFilter;syncTestControls();return;}
   if(action==='reset-profile'){try{assertAppliedConfig();const key=event.target.closest('[data-profile]').dataset.profile;captureFormDraft();state.config[key]=null;configChanged();renderNew('custom');$(`[data-profile="${key}"]`)?.focus();}catch(error){configError(error);}return;}
-  if(action==='quick-checks'){try{assertAppliedConfig();captureFormDraft();state.config.checks=['access','correctness'];state.config.structured_json=false;state.config.metrics=false;state.config.tool_calling=false;state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;configChanged();renderNew('custom');$('[data-catalogue-filter="selected"]')?.focus();}catch(error){configError(error);}return;}
+  if(action==='quick-checks'){try{assertAppliedConfig();captureFormDraft();state.config.checks=clone(state.bootstrap.config.checks);state.config.structured_json=false;state.config.metrics=false;state.config.tool_calling=false;state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;configChanged();renderNew('custom');$('[data-catalogue-filter="selected"]')?.focus();}catch(error){configError(error);}return;}
   if(action==='tokenizer-options'){showTokenizerOptions($('#tokenizer-options').hidden);return;}
   if(action==='select-tokenizer'){const input=$('#field-tokenizer');input.value=event.target.closest('[data-token-id]').dataset.tokenId;showTokenizerOptions(false);input.focus();scheduleTokenizerSelection({immediate:true});configChanged();updateBounds();return;}
   if(action==='retry-tokenizer'){scheduleTokenizerSelection({immediate:true,force:true});return;}

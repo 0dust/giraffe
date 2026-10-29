@@ -46,7 +46,7 @@ From the checkout, with Docker available:
 docker build -t giraffe .
 docker run --rm -v "$PWD:/work" giraffe run \
   --url http://host.docker.internal:11434/v1 --model llama3.2:3b \
-  --checks access,serving,correctness --concurrency 1 --html \
+  --checks access,serving,correctness --simultaneous-limit 1 --default-concurrency 1 --html \
   --output runs/container
 ```
 
