@@ -3883,12 +3883,12 @@ function comparisonTable(rows) {
 }
 function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}
 function comparisonGroup(id,rows,report) {
-  const row=rows[0],conditionId=row.condition_id||row.scenario;
-  const summary=(report.conditions||[]).find(item=>(!item.target||item.target===row.targetName)&&(item.condition_id||item.condition?.id)===conditionId);
-  const label=row.load_point?comparisonLoadLabel(row.load_point):summary
-    ?conditionDisplayName(summary.condition||{id:conditionId,label:summary.name},summary)
-    :scenarioLabel(row,report,conditionDisplayName(conditionInfo(row,report),{}));
-  return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(row?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(label)}</p>${comparisonTable(rows)}</div>`;
+  const row=rows[0],info=conditionInfo({...row,target:row.targetName},report),conditionId=row.condition_id||info.id;
+  const summary=(report.conditions||[]).find(item=>(!item.target||item.target===row.targetName)&&[conditionId,row.scenario].includes(item.condition_id||item.condition?.id));
+  const condition=summary?.condition||info;
+  const label=row.load_point?comparisonLoadLabel(row.load_point):scenarioLabel(row,report,conditionDisplayName(condition,summary||{}));
+  const context=row.load_point?'':conditionDescription(condition,summary||{});
+  return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(row?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(label)}</p>${context&&!label.includes(context)?`<p class="comparison-cohort-context hint">${escape(context)}</p>`:''}${comparisonTable(rows)}</div>`;
 }
 
 function baselineIdentity(baseline) {
