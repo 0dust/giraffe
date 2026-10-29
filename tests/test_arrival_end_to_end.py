@@ -1,6 +1,7 @@
 """Arrival pressure and upgrade decisions through real loopback HTTP sockets."""
 
 import asyncio
+import time
 
 import pytest
 
@@ -41,6 +42,63 @@ def traffic_records(report):
     return [r for r in report.requests if (r.load_point or {}).get('type') not in {None,'calibration'}]
 
 
+def arrival_host_pause(monkeypatch, enabled, rate):
+    from giraffe.client import LLMClient
+
+    execute = LLMClient.execute
+    evidence = {"paused": False}
+
+    async def execute_with_host_pause(self, spec, **kwargs):
+        if enabled and not evidence["paused"] and (spec.load_point or {}).get("rate") == rate:
+            evidence["paused"] = True
+            asyncio.get_running_loop().call_later(.015, time.sleep, .12)
+        return await execute(self, spec, **kwargs)
+
+    monkeypatch.setattr(LLMClient, "execute", execute_with_host_pause)
+    return evidence
+
+
+def assert_http_arrival_accounting(report, payloads, planned_counts, *, other_requests):
+    """Only evidenced scheduler-backlog drops may reduce the fixed HTTP offer total."""
+    assert report.abort_reason is None
+    points = capacity(report).metrics["points"]
+    assert [point["scheduled"] for point in points] == planned_counts
+    records = traffic_records(report)
+    by_id = {record.id: record for record in records}
+    assert len(by_id) == len(records)
+    dispatched_ids = []
+    for point, planned in zip(points, planned_counts):
+        assert len(point["offers"]) == planned
+        assert point["window_reason"] is None and not point["cut_short"]
+        assert point["local_drops"] == 0
+        discard_through_ms, started, late = -1, [], 0
+        for offer in point["offers"]:
+            offset_ms = offer["offset_seconds"] * 1000
+            lag_ms = offer["scheduler_lag_ms"]
+            assert lag_ms is not None and lag_ms >= 0
+            # A >100 ms stall discards its already-due backlog, never a catch-up burst.
+            if lag_ms > 100:
+                discard_through_ms = max(discard_through_ms, offset_ms + lag_ms)
+            dropped = offset_ms <= discard_through_ms
+            assert offer["outcome"] == ("dropped_late" if dropped else "started")
+            if dropped:
+                assert "request_id" not in offer
+                late += 1
+            else:
+                assert offer["request_id"] in by_id
+                record = by_id[offer["request_id"]]
+                assert record.load_point["point_id"] == point["id"]
+                assert record.scheduled_ms == pytest.approx(point["sending_start_ms"] + offset_ms)
+                started.append(record.id)
+        assert point["dispatched"] == len(started)
+        assert point["late_arrivals"] == point["not_sent"] == late
+        assert len(started) + late == planned
+        dispatched_ids.extend(started)
+    assert len(set(dispatched_ids)) == len(dispatched_ids)
+    assert set(dispatched_ids) == set(by_id)
+    assert len(report.requests) == len(payloads) == len(dispatched_ids) + other_requests
+
+
 def test_fake_endpoint_long_output_uses_final_token_prompt_and_preserves_faults():
     from giraffe.concurrent_load import prompt
     text = prompt(32, 'long_output')
@@ -75,17 +133,23 @@ async def test_arrivals_reach_http_server_before_prior_requests_complete():
     assert all(r.score for r in traffic_records(report))
 
 
-async def test_mixed_http_workload_scores_short_long_input_and_long_output():
+@pytest.mark.parametrize("pause", [False, True])
+async def test_mixed_http_workload_scores_short_long_input_and_long_output(monkeypatch, pause):
+    pause_evidence = arrival_host_pause(monkeypatch, pause, 30)
     with FakeEndpoint(first_token_delay=.001,chunk_delay=0) as endpoint:
         cfg=traffic_config(endpoint,traffic=TrafficConfig(rates=[30],duration_seconds=1,seed=42,max_in_flight=32,long_input_chars=512,long_output_words=16),limits=Limits(latency_ms=1000,min_samples=2))
         report=await run_suite(cfg)
     rows=traffic_records(report)
     p=capacity(report).metrics['points'][0]
     assert {r.load_point['shape'] for r in rows} == {'short_short','long_short','short_long'}
-    assert len(rows) == p['scheduled'] == p['dispatched'] == 30
+    assert pause_evidence["paused"] == pause
+    if pause:
+        assert p["late_arrivals"] > 0
+    assert_http_arrival_accounting(report, endpoint.requests, [30], other_requests=len(report.requests) - len(rows))
+    assert len(rows) == p['dispatched']
     assert all(r.score is True for r in rows)
     assert max(r.input_chars for r in rows) >= 512 and max(r.output_tokens for r in rows) >= 16
-    assert sum(g['correct_work_meeting_limits'] for g in p['groups']) == 30
+    assert sum(g['correct_work_meeting_limits'] for g in p['groups']) == len(rows)
     assert {g['shape'] for g in p['groups']} == {'short_short','long_short','short_long'}
 
 
@@ -123,7 +187,9 @@ async def test_stop_during_http_arrivals_preserves_partial_accounting():
     assert len(traffic_records(report))==p['dispatched']<=3
 
 
-async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure():
+@pytest.mark.parametrize("pause", [False, True])
+async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure(monkeypatch, pause):
+    pause_evidence = arrival_host_pause(monkeypatch, pause, 40)
     # The actual HTTP handler varies only the answer of one request while another
     # is active. No runner scenario metadata is sent to the service.
     with FakeEndpoint(first_token_delay=.07, chunk_delay=0) as endpoint:
@@ -163,7 +229,16 @@ async def test_request_pack_quiet_passes_but_loaded_wrong_answer_is_case_failure
     assert all(record.valid for record in report.requests)
     probes = [r for r in report.requests if r.scenario == "performance_evidence_probe"]
     assert len(probes) == 1
-    assert len(report.requests) == len(payloads) == 20 + len(probes)
+    assert pause_evidence["paused"] == pause
+    if pause:
+        assert high["late_arrivals"] > 0
+    assert_http_arrival_accounting(report, payloads, [2, 16], other_requests=2 + len(probes))
+    with pytest.raises(AssertionError):
+        assert_http_arrival_accounting(report, payloads[:-1], [2, 16], other_requests=2 + len(probes))
+    missing_record = report.model_copy(deep=True)
+    missing_record.requests.pop()
+    with pytest.raises(AssertionError):
+        assert_http_arrival_accounting(missing_record, payloads, [2, 16], other_requests=2 + len(probes))
     assert next(check for check in report.checks if check.id == "correctness").status == "fail"
     pack_payloads = [p for p in payloads if "PACK_" in p["messages"][0]["content"]]
     for first in pack_payloads[:2]:
