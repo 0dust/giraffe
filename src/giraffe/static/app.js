@@ -3288,7 +3288,10 @@ function checkViolationIds(check,report) {
   for(const condition of conditions)if((!condition.target||condition.target===check.target)&&(condition.check_id===check.id||condition.check_ids?.includes(check.id)))visit(condition);
   return ids;
 }
-function isFailingRequest(record,violations=null) {return record.score===false||record.valid===false||Boolean(record.evaluation_error)||['failed','timeout','timed_out','evaluation_error'].includes(record.status)||Boolean(violations?.has(record.id));}
+function isFailingRequest(record,violations=null) {
+  if(record.evaluation_error||record.status==='evaluation_error'||violations?.has(record.id))return true;
+  return !record.intentional&&!isProbe(record)&&(record.score===false||record.valid===false||['failed','timeout','timed_out'].includes(record.status));
+}
 function requestPriority(record,violations=null) {return record.score===false?-2:isFailingRequest(record,violations)?-1:0;}
 function findingRequests(check,report) {
   const violations=checkViolationIds(check,report),ids=new Set([...(check.evidence_ids||[]),...violations]);
