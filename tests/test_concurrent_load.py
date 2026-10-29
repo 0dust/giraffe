@@ -565,15 +565,21 @@ async def test_real_stream_client_progress_and_cached_usage_without_sockets(monk
         return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=Stream(payload))
     monkeypatch.setattr(LLMClient, '_create_client', lambda self: httpx.AsyncClient(transport=httpx.MockTransport(handle)))
     c = short_windows(configuration(request_options={'temperature': .7}, load={'combinations': {'enabled': False},
-        'interference': {'enabled': True, 'trigger': 'after_chunks', 'trigger_chunks': 2}, 'schedule': {'levels': [2]}}))
+        'interference': {'enabled': True, 'trigger': 'after_five_chunks'}, 'schedule': {'levels': [2]}}))
     report = await run_suite(c)
     check = next(x for x in report.checks if x.id == 'load')
     data = point(check)
-    assert data['interference']['baseline']['matched_count'] > 0
-    assert data['interference']['probe']['matched_count'] > 0
+    shorts = [r for r in report.requests if (r.load_point or {}).get('role') == 'short_stream']
+    probes = [r for r in report.requests if (r.load_point or {}).get('role') == 'probe']
+    assert {r.load_point['phase'] for r in shorts} == {'baseline', 'probe'}
+    # Live five-chunk callbacks must execute a probe; timing overlap is qualified separately.
+    assert probes, 'Live chunk progress did not execute a probe.'
+    assert all(r.load_point['phase'] == 'probe' for r in probes)
+    assert data['interference']['triggered'] == len(probes)
+    assert all(r.status == 'completed' and r.valid for r in report.requests)
     assert all(p['temperature'] == .7 for p in payloads)
     assert all(r.cached_prompt_tokens == 0 for r in report.requests)
-    assert all(r.answer_chunks >= 2 for r in report.requests)
+    assert all(r.answer_chunks == 6 for r in report.requests)
 
 
 async def test_nonstream_load_is_client_only_and_wrong_count_allowance_is_exact():
