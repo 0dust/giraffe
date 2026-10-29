@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 import httpx
 import pytest
@@ -95,6 +96,78 @@ def test_newer_success_supersedes_failure(tmp_path):
     save(tmp_path, score=True)
     row = plan(tmp_path)["correctness_history"][0]
     assert row["status"] == "observed" and row["failed"] == 0 and row["failed_request_ids"] == []
+
+
+@pytest.mark.parametrize("builtin", [False, True])
+@pytest.mark.parametrize("old_proxy,new_proxy", [
+    (None, "http://proxy-a.local:8080"),
+    ("http://proxy-a.local:8080", None),
+    ("http://proxy-a.local:8080", "http://proxy-b.local:8080"),
+])
+async def test_proxy_changes_isolate_persisted_failures_and_newer_successes(
+    tmp_path, builtin, old_proxy, new_proxy,
+):
+    from giraffe.web import create_app
+
+    original = config(builtin=builtin)
+    original.proxy = old_proxy
+    changed = original.model_copy(update={"proxy": new_proxy})
+    previous = save(tmp_path, original, folder="failure", age=1)
+    fixture_id = previous.requests[0].fixture_id
+
+    def history(result):
+        return next(row for row in result["correctness_history"]
+                    if row.get("fixture_id") == fixture_id)
+
+    assert history(plan(tmp_path, original))["status"] == "warning"
+    assert history(plan(tmp_path, changed))["status"] == "unknown"
+    save(tmp_path, changed, folder="success", score=True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),
+                                 base_url="http://localhost") as client:
+        for cfg, expected_status, expected_run in (
+            (original, "warning", "failure"), (changed, "observed", "success"),
+        ):
+            response = await client.post("/api/config/preview", json=cfg.model_dump(mode="json"))
+            assert response.status_code == 200
+            for result in (plan(tmp_path, cfg), response.json()["request_plan"]):
+                row = history(result)
+                assert row["status"] == expected_status
+                assert row["run_id"] == expected_run
+                assert row["failed_request_ids"] == (
+                    ["failed-answer"] if expected_status == "warning" else []
+                )
+
+
+@pytest.mark.parametrize("builtin,legacy_key", [
+    (False, "62cdd52032c73ae4d757fac28d13df673cdb051524dddba986a5f8905880d49e"),
+    (True, "ac6acdf0d14f4b49794ab4ceec5be4472267cf5e20b6b5bb99427aba7295263e"),
+])
+def test_proxy_unqualified_version_two_history_is_unknown(tmp_path, builtin, legacy_key):
+    cfg = config(builtin=builtin)
+    save(tmp_path, cfg)
+    metadata_path = tmp_path / "previous" / ".web.json"
+    metadata = json.loads(metadata_path.read_text())
+    # Keys written by 5c5374c before configured proxy became part of the context.
+    metadata["latency_summary"]["targets"][0]["correctness_history"][0]["fixture_key"] = legacy_key
+    metadata_path.write_text(json.dumps(metadata))
+    assert all(row["status"] == "unknown" for row in plan(tmp_path, cfg)["correctness_history"])
+
+
+def test_proxy_identity_is_only_a_digest_in_compact_history(tmp_path, monkeypatch):
+    from giraffe.correctness_history import fixture_keys
+
+    cfg = config()
+    cfg.proxy = "http://private-proxy.internal:8080"
+    expected = fixture_keys(cfg)
+    monkeypatch.setenv("HTTPS_PROXY", "http://secret-user:secret-password@other-proxy.internal:8080")
+    assert fixture_keys(cfg) == expected
+    save(tmp_path, cfg)
+    metadata = (tmp_path / "previous" / ".web.json").read_text()
+    for private in (cfg.proxy, "private-proxy", "secret-user", "secret-password", "other-proxy"):
+        assert private not in metadata
+    saved = json.loads(metadata)["latency_summary"]["targets"][0]["correctness_history"][0]
+    assert saved["fixture_key"] == expected["pack:question"]["key"]
+    assert len(saved["fixture_key"]) == 64
 
 
 def test_correctness_history_keeps_latency_measurements_contract(tmp_path):

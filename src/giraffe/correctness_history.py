@@ -25,7 +25,8 @@ def fixture_keys(config):
         load.pop("pass_criteria", None)
         for migrated in load.get("migrated_tests", []):
             migrated["settings"].pop("pass_criteria", None)
-    context = fixture_hash({"version": 2, "fixtures": FIXTURE_VERSION, "checks": config.checks, "load": load,
+    context = fixture_hash({"version": 3, "fixtures": FIXTURE_VERSION, "checks": config.checks, "load": load,
+        "proxy": config.proxy,
         "judging": judging_identity(config), "stream": config.stream, "options": config.request_options,
         "concurrency": config.concurrency, "default_concurrency": config.default_concurrency,
         "correctness_concurrency": config.effective_check("correctness")["concurrency"],
