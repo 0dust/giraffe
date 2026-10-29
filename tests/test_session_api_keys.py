@@ -1,5 +1,6 @@
 """Pasted keys authenticate requests without entering persisted configuration."""
 
+import threading
 import asyncio
 import json
 import os
@@ -176,12 +177,12 @@ async def test_try_example_keeps_key_only_for_selected_target(tmp_path, monkeypa
 
 
 async def test_active_run_key_is_not_overwritten_by_another_request(tmp_path, monkeypatch, local_tokenizer):
-    started, release = asyncio.Event(), asyncio.Event()
+    started, release = threading.Event(), threading.Event()
     observed = []
 
     async def runner(configuration, **kwargs):
         started.set()
-        await release.wait()
+        assert await asyncio.to_thread(release.wait, 3)
         observed.append(_headers(configuration.targets[0]))
         return report(configuration)
 
@@ -189,7 +190,7 @@ async def test_active_run_key_is_not_overwritten_by_another_request(tmp_path, mo
     values = config()
     async with browser(tmp_path) as ui:
         r = await ui.post("/api/runs", json={"config": values, "api_keys": [credential(values)]})
-        await asyncio.wait_for(started.wait(), 2)
+        assert await asyncio.to_thread(started.wait, 2)
         second = await ui.post("/api/runs", json={"config": values,
                                "api_keys": [credential(values, "different-key")]})
         assert second.status_code == 409

@@ -1,3 +1,4 @@
+import threading
 import asyncio
 import json
 
@@ -36,7 +37,37 @@ async def test_import_api_cli_parity_without_endpoint_calls(tmp_path, monkeypatc
     assert json.loads(capsys.readouterr().out) == response.json()
 
 
-async def test_try_example_is_single_http_request_and_saved_report(tmp_path):
+@pytest.mark.parametrize("suppress_sampler_cancel", [False, True])
+async def test_try_example_is_single_http_request_and_saved_report(tmp_path, monkeypatch,
+                                                                 suppress_sampler_cancel):
+    if suppress_sampler_cancel:
+        from giraffe import telemetry
+        from giraffe.client import LLMClient
+
+        sampled = asyncio.Event()
+        cancelled = threading.Event()
+        scrape = telemetry.scrape
+        close = LLMClient.__aexit__
+
+        async def scrape_until_cancelled(run, target, phase, **kwargs):
+            result = await scrape(run, target, phase, **kwargs)
+            if phase not in {"start", "end"}:
+                sampled.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # A transport's internal cancellation scope can swallow a
+                    # simultaneous native Task.cancel() when connecting.
+                    cancelled.set()
+            return result
+
+        async def close_after_sample(client, *args):
+            await close(client, *args)
+            await sampled.wait()
+
+        monkeypatch.setattr(telemetry, "scrape", scrape_until_cancelled)
+        monkeypatch.setattr(LLMClient, "__aexit__", close_after_sample)
+
     with FakeEndpoint(mode="wrong") as endpoint:
         values = judged_config()
         values["stream"] = False
@@ -91,10 +122,15 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path):
         assert "output" not in saved["requests"][0]
         assert evidence.json()["output"] == "INCORRECT"
         assert evidence.json()["id"] == saved["requests"][0]["id"]
+        assert saved["abort_reason"] == "maximum request budget reached"
+        snapshots = saved["observations"]["targets"]["local"]["serving_telemetry"]["snapshots"]
+        assert snapshots[-1]["phase"] == "end"
+        if suppress_sampler_cancel:
+            assert cancelled.is_set()
 
 
 async def test_try_example_uses_existing_busy_and_cancel_lifecycle(tmp_path, monkeypatch):
-    started = asyncio.Event()
+    started = threading.Event()
 
     async def waiting(config, *, progress, stop_event):
         started.set()
@@ -106,7 +142,7 @@ async def test_try_example_uses_existing_busy_and_cancel_lifecycle(tmp_path, mon
     async with browser(tmp_path) as client:
         response = await client.post("/api/runs/try-example", json=body)
         assert response.status_code == 202
-        await started.wait()
+        assert await asyncio.to_thread(started.wait, 3)
         assert (await client.post("/api/runs/try-example", json=body)).status_code == 409
         identifier = response.json()["id"]
         assert (await client.post(f"/api/runs/{identifier}/cancel", json={})).status_code == 200

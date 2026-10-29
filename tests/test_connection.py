@@ -121,7 +121,7 @@ async def test_missing_credentials_send_no_traffic(monkeypatch, model):
     httpx.Response(200, text="private response"),
     httpx.Response(200, content=b"x" * (4 * 1024 * 1024 + 1)),
     httpx.Response(302, headers={"Location": "https://elsewhere.invalid"}),
-    httpx.Response(404, text="private model error"),
+    httpx.Response(404, text="private endpoint error"),
 ])
 async def test_http_status_alone_does_not_prove_usable_inference(monkeypatch, response):
     requests, _ = endpoint(monkeypatch, lambda request: response)
@@ -170,12 +170,21 @@ async def test_network_errors_are_sanitized(monkeypatch, model):
 
 
 async def test_connection_deadline_does_not_retry(monkeypatch):
-    timeout = asyncio.timeout
-    monkeypatch.setattr("giraffe.preflight.asyncio.timeout", lambda seconds: timeout(.01))
+    real_timeout = asyncio.timeout
+    deadlines = []
+
+    def timeout(seconds):
+        assert seconds == 15
+        deadline = real_timeout(None)
+        deadlines.append(deadline)
+        return deadline
+
+    monkeypatch.setattr("giraffe.preflight.asyncio.timeout", timeout)
 
     async def slow(request):
-        await asyncio.sleep(.1)
-        return httpx.Response(200, json=answer())
+        # Expire after transport entry, independent of client setup or CI speed.
+        deadlines[-1].reschedule(asyncio.get_running_loop().time())
+        await asyncio.Future()
 
     requests, _ = endpoint(monkeypatch, slow)
     with pytest.raises(HTTPException, match="timed out after 15 seconds"):

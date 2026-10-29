@@ -39,13 +39,13 @@ function browser(config=defaults,hash='#new'){
     window:{addEventListener:(kind,fn)=>windowListeners[kind]=fn},
     fetch:async(path)=>{
       paths.push(path);
-      const body=path==='/api/bootstrap'?{config:structuredClone(config),suite_version:'0.3.0'}:
+      const body=path==='/api/bootstrap'?{config:structuredClone(config),version:'9.8.7'}:
         path==='/api/baselines'?{baselines:[]}:path==='/api/runs'?{runs:[]}:
         {id:decodeURIComponent(path.slice('/api/runs/'.length)),state:'completed',report:{run_id:'suite-run',overall:'inconclusive',checks:[],requests:[],manifest:{config}}};
       return {ok:true,json:async()=>body};
     }};
   vm.createContext(context);
-  vm.runInContext(source+`\ninitReticulate=()=>{};renderNew=()=>{nodes['#main'].innerHTML='New run: '+state.config.targets[0].url;};`,context);
+  vm.runInContext(source+`\ninitInterface=()=>{};renderNew=()=>{nodes['#main'].innerHTML='New run: '+state.config.targets[0].url;};`,context);
   return {...context,run:script=>vm.runInContext(script,context)};
 }
 """.replace("FORM_PATH", json.dumps((STATIC / "form-config.mjs").as_uri())).replace(
@@ -55,37 +55,36 @@ function browser(config=defaults,hash='#new'){
     assert result.returncode == 0, result.stderr
 
 
-def test_archived_run_keeps_polling_active_status_without_replacing_the_report():
+def test_archived_run_only_watches_known_active_run_without_replacing_report():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
 await page.run(`
 (async()=>{
-  let callback;
-  schedulePoll=fn=>{callback=fn;};
-  location.hash='#runs/archived';await route();
-  assert.equal(callback,pollRunStatus);
-  assert.match(document.title,/Run detail/);
-  const markup=nodes['#main'].innerHTML;
-  api=async()=>({runs:[{id:'live',state:'running',label:'Another run'}],active_run_id:'live'});
-  await callback(state.routeVersion);assert.match(document.title,/In progress · Another run/);
-  assert.equal(nodes['#main'].innerHTML,markup);
-  api=async()=>({runs:[]});await callback(state.routeVersion);
-  assert.equal(document.title,'Run detail · Giraffe');
+  let callback;schedulePoll=fn=>{callback=fn;};
+  state.runs=[{id:'live',state:'running',label:'Another run'}];setActive('live');
+  location.hash='#runs/archived';await route();assert.equal(callback,pollRunStatus);
+  const markup=nodes['#main'].innerHTML,paths=[];
+  api=async path=>{paths.push(path);return path.includes('/events?')?{seq:2,state:'completed',events:[],records:[],checks:[]}:{runs:[]};};
+  await callback(state.routeVersion);
+  assert.equal(paths[0],'/api/runs/live/events?after=0');assert.equal(paths[1],'/api/runs');
+  assert.equal(nodes['#main'].innerHTML,markup);assert.equal(document.title,'Run detail · Giraffe');
+  callback=null;await pollRunStatus(state.routeVersion);assert.equal(callback,null);
 })()
 `);
 """)
 
 
-def test_live_detail_keeps_1800ms_polling_and_archived_status_uses_3000ms():
+def test_live_detail_starts_delta_poll_after_minimum_delay_and_idle_archive_has_no_timer():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
 await page.run(`
 (async()=>{
-  const delays=[];schedulePoll=(fn,version,delay=1800)=>delays.push([fn,delay]);
-  api=async()=>({id:'live',state:'running',config:state.config,progress:{},events:[]});
-  location.hash='#runs/live';await route();assert.equal(delays.at(-1)[0],pollDetail);assert.equal(delays.at(-1)[1],1800);
+  const delays=[];schedulePoll=(fn,version,delay)=>delays.push([fn,delay]);
+  api=async()=>({id:'live',state:'running',seq:0,config:state.config,progress:{},events:[]});
+  location.hash='#runs/live';await route();assert.equal(delays.at(-1)[0],pollDetail);assert.equal(delays.at(-1)[1],300);
+  setActive(null);delays.length=0;
   api=async()=>({id:'old',state:'completed',config:state.config,report:null});
-  location.hash='#runs/old';await route();assert.equal(delays.at(-1)[0],pollRunStatus);assert.equal(delays.at(-1)[1],3000);
+  location.hash='#runs/old';await route();assert.equal(delays.length,0);
 })()
 `);
 """)
@@ -113,101 +112,66 @@ listeners.keydown({...event('model'),isComposing:true});assert.equal(connected,2
 """)
 
 
-def test_live_mosaic_paging_pauses_follow_and_returning_to_live_resumes_it():
+def test_request_table_sorts_filters_and_pages_at_200_rows():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
-await page.run(`
-(async()=>{
-state.detail={id:'live',state:'running',config:state.config,
- live_requests:Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}))};
-state.detail.config.max_requests=600;renderDetail();assert.equal(state.mosaicPage,1);
-let focused=0;
-nodes['.request-mosaic [tabindex="0"]']={focus(options){assert.equal(options.preventScroll,true);focused++;}};
-const click=action=>listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action}}:null}});
-await click('mosaic-next');assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,false);
-renderDetail();assert.equal(state.mosaicPage,2);
-await click('mosaic-live');assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);
-await click('mosaic-prev');assert.equal(state.mosaicPage,0);assert.equal(state.mosaicFollow,false);
-await click('mosaic-next');assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);
-assert.equal(focused,4);
-state.mosaicFollow=false;location.hash='#runs/another';await route();
-assert.equal(state.mosaicFollow,true);assert.equal(state.mosaicPage,0);
-})()
+page.run(`
+state.detail={id:'table',state:'running',config:state.config};
+const records=Array.from({length:405},(_,slot)=>({id:'r'+slot,slot,status:'completed',valid:true,score:slot%2===0,
+ elapsed_ms:405-slot,condition_id:slot%2===0?'even':'odd',evaluation:{messages:[{role:'user',content:'Question '+slot}],expected:'Expected '+slot},output:'Answer '+slot}));
+const table=evidenceTableState();
+let view=requestTablePage(records,table);assert.equal(view.rows.length,200);assert.equal(view.pages,3);
+updateRequestTableState(table,'page',3);view=requestTablePage(records,table);assert.equal(view.rows.length,5);assert.equal(view.rows[0].id,'r400');
+updateRequestTableState(table,'sort','elapsed_ms');view=requestTablePage(records,table);
+assert.equal(table.page,1);assert.equal(view.rows[0].id,'r404');
+updateRequestTableState(table,'sort','elapsed_ms');assert.equal(requestTablePage(records,table).rows[0].id,'r0');
+updateRequestTableState(table,'condition','even');view=requestTablePage(records,table);assert.equal(view.matched,203);assert(view.rows.every(row=>row.condition==='even'));
+updateRequestTableState(table,'status','pass');assert.equal(requestTablePage(records,table).matched,203);
+updateRequestTableState(table,'search','Question 404');assert.equal(requestTablePage(records,table).rows[0].id,'r404');
+const html=renderRequestTable(records,table,{total:500});
+assert.match(html,/Expected: Expected 404/);assert.match(html,/Received: Answer 404/);
+assert.match(html,/405 of 500 requests available/);assert.match(html,/aria-sort="descending"/);
+assert.doesNotMatch(html,/reticulate|request-mosaic|idle-budget|request-spot/);
 `);
 """)
 
 
-def test_live_mosaic_controls_keep_following_after_programmatic_focus():
+def test_request_table_rows_keep_focus_for_arrow_keys_and_open_on_enter():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
-await page.run(`
-(async()=>{
-const spots={};
-for(const slot of [240,480,481,720]){
- const spot={dataset:{liveSlot:String(slot)},closest:()=>spot,getAttribute:()=>null,getBoundingClientRect:()=>({left:0,top:0,width:10}),
-  focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;listeners.focusin({target:this});}};
- spots[slot]=spot;
- Object.defineProperty(nodes,'[data-live-slot="'+slot+'"]',{get:()=>Math.floor(slot/240)===state.mosaicPage?spot:null});
-}
-Object.defineProperty(nodes,'.request-mosaic [tabindex="0"]',{get:()=>spots[state.mosaicPage*240]});
-const click=action=>listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action}}:null}});
-for(const action of ['mosaic-live','mosaic-next','mosaic-prev']){
- document.activeElement=null;state.mosaicFollow=false;state.mosaicPage=action==='mosaic-prev'?2:0;
- state.detail={id:'live',state:'running',config:{...state.config,max_requests:960},
-  live_requests:Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}))};
- renderDetail();await click(action);
- assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);assert.equal(document.activeElement,spots[240]);
- let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:480,status:'running'}]};
- api=async()=>next;refreshRuns=async()=>{};
- await pollDetail(state.routeVersion);
- assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
- assert.equal(document.activeElement,spots[480]);assert.equal(state.mosaicAutoFocus,'480');
- // The transferred focus must also follow the next page boundary.
- next={...next,live_requests:[...next.live_requests,{slot:720,status:'running'}]};
- await pollDetail(state.routeVersion);
- assert.equal(state.mosaicPage,3);assert.equal(state.mosaicFollow,true);assert.equal(document.activeElement,spots[720]);
- // A user focus change clears the exemption, even if they return to that spot.
- state.mosaicPage=2;state.mosaicFollow=true;state.mosaicAutoFocus='480';
- spots[481].focus({preventScroll:true});spots[480].focus({preventScroll:true});
- await pollDetail(state.routeVersion);
- assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,false);assert.equal(document.activeElement,spots[480]);
-}
-})()
+page.run(`
+let selected=null,opened=null,prevented=0;
+const body={querySelectorAll:()=>rows};
+const rows=[0,1,2].map(index=>({dataset:{request:'r'+index},closest:q=>q==='tbody'?body:rows[index],
+ focus(options){assert.equal(options.preventScroll,true);selected=index;},scrollIntoView(options){assert.equal(options.block,'nearest');}}));
+const key=(index,key)=>handleRequestTableKeydown({key,target:rows[index],preventDefault(){prevented++;}},id=>opened=id);
+assert.equal(key(0,'ArrowDown'),true);assert.equal(selected,1);
+key(1,'End');assert.equal(selected,2);key(2,'ArrowDown');assert.equal(selected,2);
+key(2,'Home');assert.equal(selected,0);key(0,'ArrowUp');assert.equal(selected,0);
+key(1,'Enter');assert.equal(opened,'r1');assert.equal(prevented,6);
+rows[1].dataset.liveSlot='17';let live=null;
+handleRequestTableKeydown({key:'Enter',target:rows[1],preventDefault(){}},()=>assert.fail('Should open live evidence'),slot=>live=slot);
+assert.equal(live,17);
 `);
 """)
 
 
-def test_live_mosaic_poll_preserves_keyboard_inspection_and_page_at_run_end():
+def test_live_delta_keeps_request_table_page_sort_and_focused_request():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
 await page.run(`
 (async()=>{
-state.detail={id:'live',state:'running',config:{...state.config,max_requests:600},
- live_requests:Array.from({length:240},(_,slot)=>({slot,status:slot===239?'running':'completed'}))};
-renderDetail();assert.equal(state.mosaicPage,0);
-let restored=0;
-const spot={dataset:{liveSlot:'239'},closest:q=>q==='.request-mosaic'?{}:null,focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;restored++;}};
-document.activeElement=spot;nodes['[data-live-slot="239"]']=spot;
-let next={...state.detail,live_requests:[...state.detail.live_requests,{slot:240,status:'running'}]};
-api=async()=>next;refreshRuns=async()=>{};
+state.detail={id:'live',seq:0,state:'running',config:{...state.config,max_requests:600},
+ live_requests:Array.from({length:240},(_,slot)=>({id:'r'+slot,slot,status:'completed',elapsed_ms:slot}))};
+renderDetail();const table=evidenceTableState();updateRequestTableState(table,'sort','elapsed_ms');updateRequestTableState(table,'page',2);renderDetail();
+let restored=0;const row={dataset:{liveSlot:'239'},focus(options){assert.equal(options.preventScroll,true);document.activeElement=this;restored++;}};
+document.activeElement=row;nodes['[data-live-slot="239"]']=row;
+const paths=[];api=async path=>{paths.push(path);return {seq:1,state:'running',records:[{id:'r240',slot:240,status:'running',elapsed_ms:240}],events:[],checks:[]};};
 await pollDetail(state.routeVersion);
-assert.equal(state.mosaicFollow,false);assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,1);
-assert.equal(document.activeElement,spot);assert.equal(restored,1);assert.match(nodes['#main'].innerHTML,/data-live-slot="239"/);
-next={...next,live_requests:[...next.live_requests,{slot:490,status:'running'}]};
-await pollDetail(state.routeVersion);assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,2);
-// Explicitly returning to live overrides inspection of an earlier spot.
-nodes['.request-mosaic [tabindex="0"]']={focus(options){assert.equal(options.preventScroll,true);document.activeElement={dataset:{liveSlot:'480'}};}};
-await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'mosaic-live'}}:null}});
-assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
-// With no spot focused, polls follow the frontier across a page boundary.
-document.activeElement=null;state.mosaicPage=0;
-await pollDetail(state.routeVersion);assert.equal(state.mosaicPage,2);assert.equal(state.mosaicFollow,true);
-// Ending a run keeps the shown page even when following was enabled.
-state.mosaicPage=0;
-next={id:'live',state:'completed',report:{run_id:'live',overall:'inconclusive',checks:[],
- requests:Array.from({length:600},(_,i)=>({id:'request-'+i,status:'completed'})),manifest:{config:state.config}}};
-await pollDetail(state.routeVersion);assert.equal(state.mosaicPage,0);
-assert.doesNotMatch(nodes['#main'].innerHTML,/mosaic-live|Following live/);
+assert.equal(paths[0],'/api/runs/live/events?after=0');assert.equal(state.detail.live_requests.length,241);
+assert.equal(evidenceTableState(),table);assert.equal(table.page,2);assert.equal(table.sort,'elapsed_ms');assert.equal(table.direction,'asc');
+assert.equal(document.activeElement,row);assert.equal(restored,1);
+assert.match(nodes['#main'].innerHTML,/request-evidence-row/);assert.doesNotMatch(nodes['#main'].innerHTML,/request-mosaic|reticulate|mosaic-live/);
 })()
 `);
 """)
@@ -270,7 +234,7 @@ page.run(`var originalFetch=fetch,finishBootstrap;fetch=path=>path==='/api/boots
 const initializing=page.run('init()');
 page.location.hash='#runs/latest';await page.windowListeners.hashchange();
 assert(!page.paths.includes('/api/runs/latest'));
-page.run(`finishBootstrap({ok:true,json:async()=>({config:${JSON.stringify(defaults)},suite_version:'0.3.0'})});`);
+page.run(`finishBootstrap({ok:true,json:async()=>({config:${JSON.stringify(defaults)},version:'9.8.7'})});`);
 await initializing;assert(page.paths.includes('/api/runs/latest'));
 assert.match(page.nodes['#main'].innerHTML,/suite-run/);
 """)
@@ -293,8 +257,11 @@ assert.match(page.nodes['#main'].innerHTML,/Disk unavailable/);
 def test_suite_label_and_validation_errors_are_readable_at_api_boundary():
     run_browser_script(r"""
 const page=browser();await page.run('init()');
-assert.equal(page.nodes['#suite-version'].textContent,'suite 0.3.0');
-assert.match(fs.readFileSync(INDEX_PATH,'utf8'),/id="suite-version">suite/);
+assert.equal(page.nodes['#suite-version'].textContent,'v9.8.7');
+const index=fs.readFileSync(INDEX_PATH,'utf8');
+assert.match(index,/<script src="\/static\/boot.js"><\/script>/);
+assert.doesNotMatch(index,/<script(?![^>]*src=)[^>]*>/);
+assert.doesNotMatch(fs.readFileSync(APP_PATH,'utf8'),/onclick=/);
 await page.run(`
 (async()=>{
 const message='target url must be an http(s) endpoint';
@@ -306,7 +273,7 @@ fetch=async()=>({ok:false,status:422,json:async()=>({detail:[{loc:['body','targe
 await assert.rejects(api('/api/config/validate'),error=>error.message==='targets.0.url: '+message+'\\nmax_requests: Input should be greater than 0');
 })()
 `);
-""".replace("INDEX_PATH", json.dumps(str(STATIC / "index.html"))))
+""".replace("INDEX_PATH", json.dumps(str(STATIC / "index.html"))).replace("APP_PATH", json.dumps(str(STATIC / "app.js"))))
 
 
 def test_run_summary_heads_connection_failures_without_capacity_wording():
@@ -332,8 +299,8 @@ assert.equal(JSON.stringify(report),before);
 for(const observations of [undefined,{}, {summary:''}, {summary:'  '}, {summary:null}]){
   report.observations=observations;renderDetail();
   const fallback=nodes['#main'].innerHTML.split('<div class="report-toolbar')[0];
-  assert.match(fallback,/<h1>Capacity under load is inconclusive<\\/h1>/);
-  assert.match(fallback,/Highest tested acceptable arrival rate: not established/);
+  assert.match(fallback,/<h1>Capacity is inconclusive<\\/h1>/);
+  assert.match(nodes['#main'].innerHTML,/Highest tested acceptable arrival rate: not established/);
 }
 `);
 """)

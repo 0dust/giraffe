@@ -85,10 +85,6 @@ def _overlap(a, b, delay_windows):
     return next(_unstalled((start, end), delay_windows), None) is not None
 
 
-def windows_overlap(a, b, delay_windows=()):
-    return a.target == b.target and _overlap(output_window(a), output_window(b), _delays(delay_windows))
-
-
 def evidenced_overlap(record, others, delay_windows=(), *, limit=None):
     """1 + same-target responses with >= 1 ms unstalled intersection; optionally capped."""
     window = output_window(record)

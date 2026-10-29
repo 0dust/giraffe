@@ -166,7 +166,7 @@ def test_cli_marks_running_during_export_and_forwards_per_run_limit(tmp_path, mo
 
     async def run(config, **kwargs):
         meta = json.loads((directory / ".web.json").read_text())
-        assert set(meta) == {"id", "state", "started_at", "owner_pid", "owner_host"} and meta["state"] == "running"
+        assert set(meta) == {"id", "state", "started_at", "owner_pid", "owner_host", "heartbeat_at"} and meta["state"] == "running"
         assert meta["owner_pid"] > 0
         return RunReport(run_id="done", started_at="now", finished_at="now", overall="pass", manifest={})
 

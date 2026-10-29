@@ -1,4 +1,5 @@
 """Established built-in encoding, short-name resolution, and honest provenance."""
+import threading
 import asyncio
 import time
 from types import SimpleNamespace
@@ -231,10 +232,11 @@ async def test_tokenizer_preview_cannot_overlap_active_run(tmp_path, monkeypatch
         assert response.status_code == 409 and not calls
 
 
-async def test_run_start_waits_for_tokenizer_preview(tmp_path, monkeypatch):
-    from tests.test_web import browser, config, report
+async def test_run_start_proceeds_while_tokenizer_preview_downloads(tmp_path, monkeypatch):
+    from tests.test_web import browser, config, finished, report
 
-    entered, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    entered, release = asyncio.Event(), asyncio.Event()
+    started = threading.Event()
 
     async def preview(*args):
         entered.set()
@@ -249,12 +251,13 @@ async def test_run_start_waits_for_tokenizer_preview(tmp_path, monkeypatch):
     monkeypatch.setattr("giraffe.web.run_suite", running)
     async with browser(tmp_path) as client:
         preview_task = asyncio.create_task(client.post("/api/targets/tokenizer", json={"token_id": "builtin"}))
-        await entered.wait()
-        run_task = asyncio.create_task(client.post("/api/runs", json={"config": config(checks=["access"])}))
+        await asyncio.wait_for(entered.wait(), 2)
         try:
-            await asyncio.sleep(.02)
-            assert not run_task.done() and not started.is_set()
+            response = await asyncio.wait_for(client.post("/api/runs", json={"config": config(checks=["access"])}), 2)
+            assert response.status_code == 202
+            assert await asyncio.to_thread(started.wait, 2)
+            assert not preview_task.done()
+            assert (await finished(client, response.json()["id"]))["state"] == "completed"
         finally:
             release.set()
-            responses = await asyncio.gather(preview_task, run_task)
-        assert [response.status_code for response in responses] == [200, 202]
+            assert (await preview_task).status_code == 200

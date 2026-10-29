@@ -51,20 +51,28 @@ async def test_tools_never_silently_disappear_when_suite_output_cap_matches_cont
     assert all(record.scenario.startswith("tools_") for record in report.requests)
 
 
-async def test_recovery_allowance_records_request_limit_before_total_exhaustion(monkeypatch):
+def test_recovery_allowance_records_request_limit_before_total_exhaustion(monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr(runner, "LLMClient", FakeClient)
+        configured = config(checks=["recovery", "tools"], max_requests=40, sustained_seconds=.05)
+        report = await runner.run_suite(configured)
+        assert len(report.requests) < 40
+        assert report.observations["targets"]["one"]["sustained_batches"] > 0
+        assert "max_requests" in report.limits_reached
+
+    run_virtual(monkeypatch, scenario())
+
+
+@pytest.mark.parametrize("samples,exhausted", [(6, False), (8, True)])
+async def test_final_request_marks_exhaustion_even_without_another_admission_check(monkeypatch, samples, exhausted):
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    configured = config(checks=["recovery", "tools"], max_requests=40, sustained_seconds=.05)
+    configured = config(max_requests=6, samples=samples)
     report = await runner.run_suite(configured)
-    assert len(report.requests) < 40
-    assert report.observations["targets"]["one"]["sustained_batches"] > 0
-    assert "max_requests" in report.limits_reached
-
-
-async def test_final_request_marks_exhaustion_even_without_another_admission_check(monkeypatch):
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    report = await runner.run_suite(config(max_requests=6))
     assert len(report.requests) == 6
-    assert "max_requests" in report.limits_reached
+    assert ("max_requests" in report.limits_reached) == exhausted
+    assert (report.abort_reason == "maximum request budget reached") == exhausted
 
 
 async def test_legacy_custom_fixture_caps_survive_v2_export_and_v2_keeps_own_caps(tmp_path, monkeypatch):

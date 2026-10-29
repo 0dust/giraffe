@@ -233,7 +233,11 @@ def test_incomplete_or_generator_limited_stages_cannot_establish_delta(reason):
         stage[{"local": "dropped_local", "late": "dropped_late", "not_offered": "not_offered"}[reason]] = 1
     current.checks[0].metrics["highest_acceptable_rate_rps"] = 1
     result = compare_baseline(current, traffic_report("baseline"))
-    assert result.baseline["status"] == "inconclusive"
+    # AM9: the unchanged qualified low-rate stage covers this selected check.
+    # The incomplete high-rate stage stays inconclusive and supplies no delta.
+    assert result.baseline["status"] == "pass"
+    assert comparison(result)["status"] == "inconclusive"
+    assert comparison(result)["stages"][0]["status"] == "pass"
     assert comparison(result)["delta_rps"] is None
     assert comparison(result)["stages"][1]["status"] == "inconclusive"
 

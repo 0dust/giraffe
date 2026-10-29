@@ -22,7 +22,7 @@ Transfer `wheelhouse/` and `tokenizer-cache/` to the offline machine. In an
 activated Python environment there:
 
 ```sh
-python -m pip install --no-index --find-links wheelhouse giraffe-check
+python -m pip install --no-index --find-links wheelhouse giraffe-llm
 export TIKTOKEN_CACHE_DIR="$PWD/tokenizer-cache"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -46,7 +46,7 @@ From the checkout, with Docker available:
 docker build -t giraffe .
 docker run --rm -v "$PWD:/work" giraffe run \
   --url http://host.docker.internal:11434/v1 --model llama3.2:3b \
-  --checks access,serving,correctness --concurrency 1 --html \
+  --checks access,serving,correctness --simultaneous-limit 1 --default-concurrency 1 --html \
   --output runs/container
 ```
 

@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import math
-import re
 import uuid
 from collections import Counter
-from statistics import median
+from giraffe.stats import distribution, median, percentile
 
 from giraffe.fixtures import reasoning_budget
 from giraffe.models import RequestSpec, load_shape_label
@@ -153,13 +152,6 @@ def point_shapes(settings, point):
     return ["short_short", "long_short"] if point["type"] == "interference" else [point["shape"]]
 
 
-def _conditions(point):
-    if point["type"] == "interference":
-        return [f"load_interference_{name}_c{point['level']}" for name in ("control", "probe")]
-    return [point["id"]]
-
-
-
 def interference_measurements(records, level, duration, latencies=(), never_triggered=0):
     short = [r for r in records if r.load_point["role"] == "short_stream" and r.valid and r.status == "completed"]
     probes = [r for r in records if r.load_point["role"] == "probe"]
@@ -178,8 +170,8 @@ def interference_measurements(records, level, duration, latencies=(), never_trig
     for name, parity in (("control", 0), ("probe", 1)):
         matched = matched_groups[parity]
         groups[name] = {"matched_count": len(matched), "request_ids": [r.id for r in matched],
-            "decode_median_ms": _median([r.last_output_ms - r.first_output_ms for r in matched]),
-            "response_median_ms": _median([r.elapsed_ms for r in matched]),
+            "decode_median_ms": median([r.last_output_ms - r.first_output_ms for r in matched]),
+            "response_median_ms": median([r.elapsed_ms for r in matched]),
             "longest_stream_pause_ms": max((r.max_stream_gap_ms for r in matched if r.max_stream_gap_ms is not None), default=None)}
     def ratio(field):
         a, b = groups["control"][field], groups["probe"][field]
@@ -194,16 +186,9 @@ def interference_measurements(records, level, duration, latencies=(), never_trig
                              "configured_seconds": duration / 4} for i in range(4)]}
 
 
-def _median(values):
-    return median(values) if values else None
-
-
-def _percentile(values, percent):
-    return sorted(values)[max(0, math.ceil(len(values) * percent) - 1)] if values else None
-
-
 def _distribution(values):
-    return {"median": _median(values), "min": min(values, default=None), "max": max(values, default=None)}
+    summary = distribution(values)
+    return {key: summary[key] for key in ("median", "min", "max")}
 
 
 def inflight(records, start, end):
@@ -258,8 +243,8 @@ def measurements(run, target, settings, point, records):
         client_peak_inflight=peak, server_evidenced_concurrency=evidenced,
         load_qualified=point["level"] == 1 or run.config.stream and evidenced >= point["level"] and average >= .9 * point["level"],
         concurrency_reason=None if run.config.stream or point["level"] == 1 else "client-delivered only; server overlap not evidenced",
-        first_output_p50_ms=_median(first), first_output_p95_ms=_percentile(first, .95),
-        response_p50_ms=_median(response), response_p95_ms=_percentile(response, .95),
+        first_output_p50_ms=median(first), first_output_p95_ms=percentile(first, .95),
+        response_p50_ms=median(response), response_p95_ms=percentile(response, .95),
         longest_stream_pause_ms=max((r.max_stream_gap_ms for r in records if r.max_stream_gap_ms is not None), default=None),
         steady_state_seconds=steady, requests_per_second=len(steady_records) / steady if steady > 0 else None,
         output_tokens_per_second=sum(output) / steady if steady > 0 and output and all(n is not None for n in output) else None,
@@ -292,80 +277,6 @@ def measurements(run, target, settings, point, records):
     return point
 
 
-def score_point(settings, point, records):
-    """Failure evidence precedes every coverage and window downgrade."""
-    criteria = settings.pass_criteria
-    def result(status, code, reason):
-        point.update(status=status, reason_code=code, reason=reason)
-        return point
-    if point.get("blocked"):
-        return result("blocked", "context_exceeded", point["blocked"])
-    if point.get("calibration_failure"):
-        return result("fail", "calibration_failed", point["calibration_failure"])
-    if point["error_percent"] > criteria.max_error_percent:
-        context = any(r.http_status == 400 and re.search(r"context|maximum.*length|too many tokens", r.error or "", re.I) for r in records)
-        return result("fail", "context_exceeded" if context else "error_rate", "context window exceeded" if context else f"Error rate {point['error_percent']:g}% exceeds {criteria.max_error_percent:g}%")
-    if any(r.completion_tokens is not None and r.requested_output_tokens is not None and r.completion_tokens > r.requested_output_tokens for r in records):
-        return result("fail", "output_cap", "Endpoint generated more tokens than the requested output cap")
-    wrong = point["scored"] - point["correct"]
-    if (point["scored"] >= criteria.min_valid_responses and point["correct_percent"] < criteria.min_correct_percent
-            or wrong > math.floor(criteria.min_valid_responses * (100 - criteria.min_correct_percent) / 100)):
-        return result("fail", "correctness", f"{wrong} incorrect label {'answer' if wrong == 1 else 'answers'}; minimum correct {criteria.min_correct_percent:g}%")
-    delayed = False
-    for field, record_field, limit in (("first_output_p95_ms", "first_output_ms", criteria.first_output_p95_ms),
-                                        ("response_p95_ms", "latency_ms", criteria.response_p95_ms)):
-        value = point[field]
-        if limit is not None and value is not None and value > limit:
-            affected = point["timing_quality"]["affected_metrics"].get(record_field, [])
-            lag = point["timing_quality"].get("max_overlapping_lag_ms", 0)
-            unexplained = [r for r in records if r.valid and r.status == "completed"
-                           and (getattr(r, "elapsed_ms" if record_field == "latency_ms" else record_field) or 0) > limit
-                           and (r.id not in affected or lag < ((getattr(r, "elapsed_ms" if record_field == "latency_ms" else record_field) or 0) - limit) / 2)]
-            if unexplained:
-                label = "First answer p95" if field == "first_output_p95_ms" else "Response p95"
-                return result("fail", "timing", f"{label} {value:g} exceeds {limit:g} ms")
-            delayed = True
-    interference = point.get("interference")
-    if interference and min(interference["control"]["matched_count"], interference["probe"]["matched_count"]) >= criteria.min_valid_responses:
-        if settings.interference.max_slowdown is not None and interference["slowdown"] is not None and interference["slowdown"] > settings.interference.max_slowdown:
-            return result("fail", "slowdown", f"Decode slowdown {interference['slowdown']:.3g} exceeds {settings.interference.max_slowdown:g}")
-    if delayed:
-        return result("inconclusive", "client_delay", "Client scheduling delay explains the timing violation")
-    if point.get("not_run") and point.get("input_not_calibrated"):
-        return result("inconclusive", "input_not_calibrated", "input length not calibrated")
-    if point.get("not_run"):
-        return result("inconclusive", window_cause(point.get("window_reason")), point.get("window_reason") or "not run: shared run stopped")
-    if point.get("cut_short") and not (point["valid"] >= criteria.min_valid_responses and point["load_qualified"]
-            and point["delivered_window_seconds"] >= max(.25 * point["configured_window_seconds"], 3 * (point["response_p50_ms"] or 0) / 1000)):
-        return result("inconclusive", window_cause(point.get("window_reason")), f"Ran {point['delivered_window_seconds']:.3g} s of {point['configured_window_seconds']:g} s: {point.get('window_reason') or 'run limit'}")
-    if point["valid"] < criteria.min_valid_responses:
-        return result("inconclusive", "insufficient_responses", f"{point['valid']} valid {'response' if point['valid'] == 1 else 'responses'}; {criteria.min_valid_responses} required")
-    if not point["load_qualified"] and not (interference and point.get("short_stream_load_qualified")):
-        return result("inconclusive", "load_not_delivered", point.get("concurrency_reason") or "Requested load not delivered or server overlap not evidenced")
-    for shape, lengths in point["token_lengths"].items():
-        if shape.startswith("long_") and lengths["cached_prompt_tokens"]["median"] is not None and lengths["input_tokens"]["median"] is not None and lengths["cached_prompt_tokens"]["median"] > lengths["input_tokens"]["median"] * .5:
-            return result("inconclusive", "cached_input", "More than half the long input was cached")
-    if point.get("input_not_calibrated"):
-        return result("inconclusive", "input_not_calibrated", "input length not calibrated")
-    if point["type"] == "stress" and point["workload"] == "input" and any(
-            lengths["input_tokens"]["median"] is None or abs(lengths["input_tokens"]["median"] - lengths["input_target"]) > lengths["input_target"] * settings.input_token_tolerance for lengths in point["token_lengths"].values()):
-        return result("inconclusive", "input_not_verified", "Large input length not verified; endpoint token counts are required")
-    if point.get("coverage", {}).get("covered_valid_responses", criteria.min_valid_responses) < criteria.min_valid_responses:
-        return result("inconclusive", "insufficient_coverage", "Too few responses reached the minimum output length")
-    if interference:
-        if interference["buffered_stream"]:
-            return result("inconclusive", "buffered_stream", "stream is buffered; interruption cannot be measured")
-        if min(interference["control"]["matched_count"], interference["probe"]["matched_count"]) < criteria.min_valid_responses or interference["slowdown"] is None:
-            return result("inconclusive", "insufficient_matches", "Insufficient matched short streams for both probe groups")
-        if settings.interference.max_slowdown is None:
-            return result("inconclusive", "missing_slowdown_limit", "Slowdown measured only; no maximum slowdown configured")
-    if point.get("cut_short"):
-        code = window_cause(point.get("window_reason"))
-        label = {"budget_limited": "Budget-limited", "time_limited": "Time-limited", "run_stopped": "Stopped"}[code]
-        return result("pass", code, f"{label} window: ran {point['delivered_window_seconds']:.3g} s of {point['configured_window_seconds']:g} s")
-    return result("pass", "criteria_met", "Observed evidence met the configured criteria")
-
-
 def later_reservation(config):
     from giraffe.planning import request_plan
     later = [c for c in config.checks if c in {"sessions", "consistency", "tools"}]
@@ -374,22 +285,6 @@ def later_reservation(config):
     if "sessions" in later and config.sessions:
         probes += sum(r["id"] == "sessions" and r["requests_per_target"] is None for r in plan["rows"])
     return plan["known_per_target"] + probes
-
-
-async def execute(run, target, client):
-    # Compatibility import only: all execution is unified.
-    from giraffe.load_test import execute as unified
-    return await unified(run, target, client)
-
-
-def result(run, target):
-    from giraffe.load_test import result as unified
-    return unified(run, target)
-
-
-def remedy_conditions(check, config, records):
-    codes = {p.get("reason_code") for g in check.metrics.get("load_types", {}).values() for p in g["points"]}
-    return "correctness" in codes, bool(codes & {"timing", "slowdown"})
 
 
 def remedies(metrics, config):

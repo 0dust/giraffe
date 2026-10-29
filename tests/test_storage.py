@@ -231,8 +231,8 @@ def test_disabled_start_limits_do_not_inspect_storage(tmp_path, monkeypatch):
 @pytest.mark.parametrize("kind,alive", [("active", True), ("legacy", False), ("foreign", False),
                                        ("self", False), ("dead", False), ("local", True),
                                        ("denied", True), ("heartbeat", True), ("recent", True),
-                                       ("recent-self", True), ("recent-dead", False),
-                                       ("heartbeat-dead", False), ("active-dead", True),
+                                       ("recent-self", True), ("recent-dead", True),
+                                       ("heartbeat-dead", True), ("active-dead", True),
                                        ("recent-foreign", True), ("recent-legacy", True),
                                        ("recent-overflow", True), ("overflow", False),
                                        ("recent-unknown-error", True), ("unknown-error", False)])

@@ -7,10 +7,13 @@ import time
 
 import httpx
 import pytest
+from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
 from giraffe import telemetry
 from giraffe.deployment import deployment_diff, safe_launch, load_metadata
-from giraffe.models import RunConfig, Target
+from giraffe.caps import MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS
+from giraffe.models import Deployment, RunConfig, Target
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from giraffe.runner import _Run, run_suite
 from tests.fake_endpoint import FakeEndpoint
@@ -539,3 +542,70 @@ async def test_runtime_telemetry_is_collected_when_gpu_check_is_deselected():
         assert endpoint.metrics_reads >= 2
     assert not report.manifest["config"]["metrics"]
     assert next(check for check in report.checks if check.id == "gpu").status == "skipped"
+
+
+@pytest.mark.parametrize("intended,confounded", [
+    (["extension.requested_speculative_config", "serving.launch_arguments"], False),
+    (["extension.requested_speculative_config"], True),
+    (["extension", "serving.*"], True),
+    ("extension.requested_speculative_config", True),
+    (None, False),
+    ("", False),
+])
+def test_intended_change_matches_exact_fields_without_hiding_other_changes(intended, confounded):
+    fields = ("extension.requested_speculative_config", "serving.launch_arguments")
+    baseline = {"fields": {field: {"configured": {"value": "off"}} for field in fields},
+                "continuity": "stable", "unknown_fields": ["hardware.layout"]}
+    current = {"fields": {field: {"configured": {"value": "on"}} for field in fields},
+               "intended_change": intended, "continuity": "unverified"}
+    diff = deployment_diff(current, baseline)
+    assert diff["confounded"] is confounded
+    assert diff["intended_change"] == intended
+    assert [(row["field"], row["change"]) for row in diff["fields"]] == [
+        (field, "changed") for field in fields
+    ]
+    assert not diff["unknown_baseline"]
+    assert diff["unknown_fields"] == ["hardware.layout"]
+    assert diff["continuity"] == {"baseline": "stable", "current": "unverified"}
+    assert "not evidence of causality" in diff["interpretation"]
+
+    current["fields"]["extension.arm"] = {"configured": {"value": "on"}}
+    with_bookkeeping = deployment_diff(current, baseline)
+    assert with_bookkeeping["confounded"] is bool(intended)
+    assert with_bookkeeping["fields"][0]["field"] == "extension.arm"
+    assert with_bookkeeping["fields"][0]["change"] == "added"
+
+
+def test_intended_change_keeps_legacy_single_field_and_unknown_baseline_behavior():
+    current = {"intended_change": "runtime.image", "fields": {
+        "runtime.image": {"configured": {"value": "new"}},
+    }}
+    diff = deployment_diff(current, {})
+    assert not diff["confounded"]
+    assert diff["unknown_baseline"]
+    assert diff["fields"][0]["change"] == "added"
+    current["intended_change"] = ["runtime.image"]
+    assert deployment_diff(current, {})["confounded"] is False
+
+
+@pytest.mark.parametrize("intended", [
+    None, "", "runtime.image", ["extension.requested_speculative_config", "serving.launch_arguments"],
+    ["extension.custom field.with.dots", "extension.custom field.with.dots"],
+])
+def test_intended_change_public_schema_and_round_trip(intended):
+    payload = {"intended_change": intended}
+    Draft202012Validator(Deployment.model_json_schema()).validate(payload)
+    deployment = Deployment.model_validate(payload)
+    assert Deployment.model_validate_json(deployment.model_dump_json()).intended_change == intended
+
+
+@pytest.mark.parametrize("intended", [
+    [], [""], [1], [["runtime.image"]],
+    ["runtime.image"] * (MAX_SANITIZE_ITEMS + 1),
+    ["x" * (MAX_SANITIZE_STRING_CHARS + 1)],
+])
+def test_intended_change_rejects_invalid_or_truncated_new_lists(intended):
+    payload = {"intended_change": intended}
+    assert not Draft202012Validator(Deployment.model_json_schema()).is_valid(payload)
+    with pytest.raises(ValidationError):
+        Deployment.model_validate(payload)

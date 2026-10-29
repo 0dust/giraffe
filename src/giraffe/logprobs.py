@@ -24,16 +24,35 @@ class _CollectionLimit(Exception):
 class LogprobBudget:
     def __init__(self):
         self.used_bytes = 0
+        self.pending_bytes = 0
         self.exhausted = False
 
     def collect(self, raw, output, top_k):
+        if self.exhausted:
+            return self.limit(top_k)
+        return self.retain(collect_logprobs(raw, output, top_k))
+
+    def reserve(self, size):
+        if not self.exhausted and self.used_bytes + self.pending_bytes + size <= MAX_RUN_BYTES:
+            self.pending_bytes += size
+            return True
+        self.exhausted = True
+        return False
+
+    def release(self, size):
+        self.pending_bytes -= size
+
+    def retain(self, evidence):
         if not self.exhausted:
-            evidence = collect_logprobs(raw, output, top_k)
             size = len(evidence.model_dump_json().encode())
-            if self.used_bytes + size <= MAX_RUN_BYTES:
+            if self.used_bytes + self.pending_bytes + size <= MAX_RUN_BYTES:
                 self.used_bytes += size
                 return evidence
             self.exhausted = True
+        return self.limit(evidence.requested_top_logprobs)
+
+    @staticmethod
+    def limit(top_k):
         return LogprobEvidence(status='incomplete', requested_top_logprobs=top_k,
             reason='Run logprob evidence exceeded the 16 MiB collection limit.')
 
@@ -46,23 +65,22 @@ def identity(token):
     return ('text', token.token)
 
 
-def collect_logprobs(raw, output, top_k):
-    def outcome(status, reason, tokens=()):
-        return LogprobEvidence(status=status, reason=reason, requested_top_logprobs=top_k, tokens=list(tokens))
+class LogprobCollector:
+    """Bound token evidence as chunks arrive; align UTF-8 only after assembly."""
 
-    if raw is None or isinstance(raw, dict) and raw.get('content') is None:
-        return outcome('missing', 'No content token logprobs returned.')
-    if not isinstance(raw, dict) or not isinstance(raw.get('content'), list):
-        return outcome('invalid', 'Malformed content logprob collection.')
-    content = raw['content']
-    if not content:
-        return outcome('missing', 'Empty content token logprobs.')
-    if len(content) > MAX_TOKENS:
-        return outcome('incomplete', 'Token evidence exceeds the 4096-token collection limit.')
-    entries = text_bytes = 0
+    def __init__(self, top_k, budget=None):
+        self.top_k = top_k
+        self.budget = budget
+        self.reserved_bytes = 0
+        self.tokens = []
+        self.entries = self.text_bytes = 0
+        self.error = None
 
-    def alternative(value):
-        nonlocal entries, text_bytes
+    def outcome(self, status, reason, tokens=()):
+        return LogprobEvidence(status=status, reason=reason,
+                              requested_top_logprobs=self.top_k, tokens=list(tokens))
+
+    def alternative(self, value):
         if not isinstance(value, dict) or not isinstance(value.get('token'), str):
             raise ValueError('Invalid token identity.')
         token_bytes = value.get('bytes')
@@ -75,41 +93,91 @@ def collect_logprobs(raw, output, top_k):
         probability = value.get('logprob')
         if type(probability) not in {int, float} or not math.isfinite(probability) or probability > 0:
             raise ValueError('Logprobs must be finite, non-positive numbers.')
-        text_bytes += len(value['token'].encode()) + len(token_bytes or [])
-        entries += 1
-        if text_bytes > MAX_TEXT_BYTES or entries > MAX_ENTRIES:
+        self.text_bytes += len(value['token'].encode()) + len(token_bytes or [])
+        self.entries += 1
+        if self.text_bytes > MAX_TEXT_BYTES or self.entries > MAX_ENTRIES:
             raise _CollectionLimit
         return LogprobAlternative(token=value['token'], bytes=token_bytes, token_id=token_id, logprob=probability)
 
-    tokens = []
-    try:
-        for position, value in enumerate(content):
-            chosen = alternative(value)
-            top = value.get('top_logprobs', [] if top_k == 0 else None)
-            if not isinstance(top, list) or len(top) > top_k:
-                raise ValueError('Invalid top-logprob list or count.')
-            alternatives = [alternative(item) for item in top]
-            if len({identity(item) for item in alternatives}) != len(alternatives):
-                raise ValueError('Duplicate alternative token identity.')
-            for item in alternatives:
-                if identity(item) == identity(chosen) and item.logprob != chosen.logprob:
+    def release(self):
+        if self.budget is not None:
+            self.budget.release(self.reserved_bytes)
+            self.reserved_bytes = 0
+
+    def discard(self):
+        self.tokens.clear()
+        self.release()
+
+    def add(self, raw):
+        if self.budget is not None and self.budget.exhausted:
+            self.error = self.budget.limit(self.top_k)
+            self.discard()
+            return
+        if self.error is not None or raw is None or isinstance(raw, dict) and raw.get('content') is None:
+            return
+        if not isinstance(raw, dict) or not isinstance(raw.get('content'), list):
+            self.error = self.outcome('invalid', 'Malformed content logprob collection.')
+            self.discard()
+            return
+        try:
+            if len(self.tokens) + len(raw['content']) > MAX_TOKENS:
+                raise _CollectionLimit
+            for value in raw['content']:
+                chosen = self.alternative(value)
+                top = value.get('top_logprobs', [] if self.top_k == 0 else None)
+                if not isinstance(top, list) or len(top) > self.top_k:
+                    raise ValueError('Invalid top-logprob list or count.')
+                alternatives = [self.alternative(item) for item in top]
+                if len({identity(item) for item in alternatives}) != len(alternatives):
+                    raise ValueError('Duplicate alternative token identity.')
+                if any(identity(item) == identity(chosen) and item.logprob != chosen.logprob for item in alternatives):
                     raise ValueError('Chosen and alternative token logprobs conflict.')
-            tokens.append(LogprobToken(**chosen.model_dump(), position=position, top_logprobs=alternatives))
-        if all(token.bytes is not None for token in tokens):
-            reconstructed = bytes(b for token in tokens for b in token.bytes).decode('utf-8')
-        else:
-            reconstructed = ''.join(token.token for token in tokens)
-        if reconstructed != output:
-            raise ValueError('Token evidence does not reconstruct the assistant content.')
-    except _CollectionLimit:
-        return outcome('incomplete', 'Token evidence exceeds its bounded collection budget.')
-    except (ValueError, OverflowError, UnicodeError, RecursionError):
-        return outcome('invalid', 'Invalid token identities, probabilities, alternatives, or content alignment.')
-    partial = any(token.logprob == SENTINEL or (top_k and not token.top_logprobs) or
-                  any(item.logprob == SENTINEL for item in token.top_logprobs) for token in tokens)
-    return outcome('incomplete' if partial else 'available',
-                   'Sentinel or absent alternative probabilities are unknown.' if partial else
-                   'Content token logprobs collected; returned alternatives are not the full distribution.', tokens)
+                token = LogprobToken(**chosen.model_dump(), position=len(self.tokens), top_logprobs=alternatives)
+                if self.budget is not None:
+                    size = len(token.model_dump_json().encode()) + 1
+                    if not self.budget.reserve(size):
+                        self.error = self.budget.limit(self.top_k)
+                        self.discard()
+                        return
+                    self.reserved_bytes += size
+                self.tokens.append(token)
+        except _CollectionLimit:
+            self.error = self.outcome('incomplete', 'Token evidence exceeds its bounded collection budget.')
+        except (ValueError, OverflowError, UnicodeError, RecursionError):
+            self.error = self.outcome('invalid', 'Invalid token identities, probabilities, or alternatives.')
+        if self.error is not None:
+            self.discard()
+
+    def finish(self, output):
+        # The caller retains the completed evidence synchronously after release.
+        self.release()
+        if self.budget is not None and self.budget.exhausted:
+            self.tokens.clear()
+            return self.budget.limit(self.top_k)
+        if self.error is not None:
+            return self.error
+        if not self.tokens:
+            return self.outcome('missing', 'No content token logprobs returned.')
+        try:
+            if all(token.bytes is not None for token in self.tokens):
+                reconstructed = bytes(b for token in self.tokens for b in token.bytes).decode('utf-8')
+            else:
+                reconstructed = ''.join(token.token for token in self.tokens)
+            if reconstructed != output:
+                raise ValueError('Token evidence does not reconstruct the assistant content.')
+        except (ValueError, UnicodeError):
+            return self.outcome('invalid', 'Token evidence does not reconstruct the assistant content.')
+        partial = any(token.logprob == SENTINEL or (self.top_k and not token.top_logprobs) or
+                      any(item.logprob == SENTINEL for item in token.top_logprobs) for token in self.tokens)
+        return self.outcome('incomplete' if partial else 'available',
+                            'Sentinel or absent alternative probabilities are unknown.' if partial else
+                            'Content token logprobs collected; returned alternatives are not the full distribution.', self.tokens)
+
+
+def collect_logprobs(raw, output, top_k):
+    collector = LogprobCollector(top_k)
+    collector.add(raw)
+    return collector.finish(output)
 
 
 def compare_samples(records, *, cross=False, prefix_cache=None):

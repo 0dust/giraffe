@@ -8,7 +8,7 @@ import pytest
 
 from giraffe.cli import load_report, main
 from giraffe.reporting import _atomic_write, _retained, _storage_limited, compare_baseline, save_baseline_report, write_report
-from giraffe.storage import automatic_cleanup, cleanup_plan, run_size, set_kept, storage_summary
+from giraffe.storage import automatic_cleanup, cleanup_plan, set_kept, storage_summary
 from giraffe.web import _report, create_app
 from scripts.measure_storage import measure, previous_artifacts, synthetic_report
 from validation_suite.baseline import iter_report_requests
@@ -48,7 +48,9 @@ def test_footprint_round_trip_preserves_models_api_and_failure_evidence(tmp_path
             evidence = client.get(f"/api/runs/saved/requests/{record.id}")
             assert evidence.status_code == 200
             assert evidence.json() == record.model_dump(mode="json")
-        assert client.get("/api/runs/saved/report.json").content == client.get("/api/runs/legacy/report.json").content
+        # AM5 may append a hydrated raw series after stored metadata; JSON key
+        # order differs from fully embedded legacy snapshots, values do not.
+        assert client.get("/api/runs/saved/report.json").json() == client.get("/api/runs/legacy/report.json").json()
         html = client.get("/api/runs/saved/report.html")
         assert html.status_code == 200 and "attachment" in html.headers["content-disposition"]
         assert html.content == client.get("/api/runs/legacy/report.html").content
@@ -64,7 +66,7 @@ def test_cli_html_is_explicit_and_legacy_html_is_regenerated(tmp_path, capsys):
         assert "stale" not in client.get("/api/runs/run/report.html").text
     output = tmp_path / "export.html"
     assert main(["report", str(directory), "--html", "--output", str(output)]) == 0
-    assert "Known-answer correctness" in output.read_text()
+    assert "Answer correctness" in output.read_text()
     assert main(["report", str(directory), "--html"]) == 0
     assert output.read_bytes() == (directory / "report.html").read_bytes()
 
@@ -79,14 +81,10 @@ def test_baseline_survives_atomic_source_rewrite_and_deletion(tmp_path, monkeypa
     save_baseline_report(source / "report.json", baseline)
     expected = load_report(baseline)
     summary = storage_summary(tmp_path, limits={})
-    if not fallback:
-        assert baseline.stat().st_ino == (source / "report.json").stat().st_ino
-        assert summary["baselines_bytes"] == 0
-        assert summary["baselines_shared_bytes"] == baseline.stat().st_size
-        assert run_size(tmp_path) == summary["runs_bytes"]
-    else:
-        assert summary["baselines_bytes"] == baseline.stat().st_size
-        assert summary["baselines_shared_bytes"] == 0
+    assert baseline.stat().st_ino != (source / "report.json").stat().st_ino
+    assert baseline.stat().st_mode & 0o777 == 0o600
+    assert summary["baselines_bytes"] == baseline.stat().st_size
+    assert summary["baselines_shared_bytes"] == 0
     assert cleanup_plan(tmp_path, keep_latest=0)["protected"][0]["protected_reason"] == "source run of a saved baseline"
     replacement = synthetic_report(5, 200, "none")
     write_report(replacement, source)
@@ -242,15 +240,52 @@ def test_baseline_import_keeps_retention_and_default_fields(tmp_path):
     assert raw["requests"][0]["response_events"] == []
 
 
-def test_synthetic_thousand_performance_is_derived_not_persisted(tmp_path):
+def test_synthetic_thousand_default_performance_is_persisted_without_series(tmp_path):
     from tests.performance_fixture import synthetic_report_1000
-    from giraffe.reporting import _report_json_chunks
+    from giraffe.reporting import _json_size, _report_json_chunks
 
     report = synthetic_report_1000()
-    path, _ = write_report(report, tmp_path / 'synthetic')
+    path, _ = write_report(report, tmp_path / "synthetic")
     raw = json.loads(path.read_text())
-    assert 'performance' not in raw
-    baseline = _retained(report).model_copy(update={'performance': {}})
-    baseline_size = len(''.join(_report_json_chunks(baseline)).encode('utf-8'))
-    assert path.stat().st_size <= baseline_size * 1.1
-    assert load_report(path).performance['targets'][0]['summaries']
+    performance = raw["performance"]
+
+    def has_request_series(value):
+        if isinstance(value, dict):
+            return "request_series" in value or any(has_request_series(item) for item in value.values())
+        return isinstance(value, list) and any(has_request_series(item) for item in value)
+
+    # Snapshot size follows the current metric contract, including additive
+    # speculative-decoding rows. Bound duplication structurally: one default
+    # target/window summary and no second copy of the 1,000 raw request rows.
+    assert not has_request_series(performance)
+    assert len(performance["targets"]) == 1
+    target = performance["targets"][0]
+    assert list(target["summaries"]) == [target["default_window"]]
+    assert len(raw["requests"]) == 1000
+    saved = load_report(path)
+    baseline = saved.model_copy(update={"performance": {}})
+    baseline_json = "".join(_report_json_chunks(baseline))
+    baseline_size = len(baseline_json.encode("utf-8"))
+    empty_performance = json.loads(baseline_json)["performance"]
+    # Speculative-decoding rows bring the measured ratio to about 1.1113;
+    # 1.12 allows under one percentage point of margin for snapshot metadata.
+    assert path.stat().st_size <= 1.12 * baseline_size
+
+    def encoded_size(value):
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    # Every extra byte is the single persisted performance snapshot, with the
+    # same metadata, conditions and request evidence on either side.
+    assert path.stat().st_size - baseline_size == encoded_size(performance) - encoded_size(empty_performance)
+    assert _json_size(saved) == path.stat().st_size
+
+    # Snapshot bytes count toward the existing per-run cap. This fixture has no
+    # response bodies to trim, so a cap below its metadata size must be reported
+    # as exceeded while all request evidence remains available.
+    limited_path, _ = write_report(report, tmp_path / "limited", max_run_storage=baseline_size)
+    limited = load_report(limited_path)
+    assert limited.manifest["storage"]["limit_bytes"] == baseline_size
+    assert limited.manifest["storage"]["limit_exceeded"] is True
+    assert len(limited.requests) == 1000
+    assert limited_path.stat().st_size > baseline_size
+    assert _json_size(limited) == limited_path.stat().st_size

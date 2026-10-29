@@ -51,21 +51,22 @@ def recording_client(seed, *, milliseconds=2, sigma=0):
 
 async def observed_range(config, *, seed, milliseconds=1, sigma=0):
     """Run -> measured summary -> plan -> independent next run, as in the review."""
-    runner.LLMClient = recording_client(seed, milliseconds=milliseconds, sigma=sigma)
-    training = config.model_copy(deep=True)
-    if "correctness" in training.checks:
-        training.test_options["correctness"].samples = 192
-    previous = await runner.run_suite(training)
-    summary = latency_summary(previous)
-    observations = {target["name"]: target["measurements"] for target in summary["targets"]}
-    plan = request_plan(config, observations=observations)
-    runner.LLMClient = recording_client(seed + 10000, milliseconds=milliseconds, sigma=sigma)
-    current = await runner.run_suite(config)
-    actual = current.observations["inference_duration_seconds"]
-    low, high = plan["estimated_low_seconds"], plan["estimated_high_seconds"]
-    return {"seed": seed, "confidence": plan["confidence"], "low": low, "high": high,
-            "actual": actual, "hit": low is not None and low <= actual <= high,
-            "unknowns": len(plan["unknown_time_components"])}, summary, plan, current
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(runner, "LLMClient", recording_client(seed, milliseconds=milliseconds, sigma=sigma))
+        training = config.model_copy(deep=True)
+        if "correctness" in training.checks:
+            training.test_options["correctness"].samples = 192
+        previous = await runner.run_suite(training)
+        summary = latency_summary(previous)
+        observations = {target["name"]: target["measurements"] for target in summary["targets"]}
+        plan = request_plan(config, observations=observations)
+        patch.setattr(runner, "LLMClient", recording_client(seed + 10000, milliseconds=milliseconds, sigma=sigma))
+        current = await runner.run_suite(config)
+        actual = current.observations["inference_duration_seconds"]
+        low, high = plan["estimated_low_seconds"], plan["estimated_high_seconds"]
+        return {"seed": seed, "confidence": plan["confidence"], "low": low, "high": high,
+                "actual": actual, "hit": low is not None and low <= actual <= high,
+                "unknowns": len(plan["unknown_time_components"])}, summary, plan, current
 
 
 CASES = {
@@ -199,3 +200,83 @@ def test_local_batch_overhead_cannot_claim_medium(monkeypatch):
         assert "99%" in " ".join(plan["confidence_details"]["insufficient_observations"])
 
     run_virtual(monkeypatch, scenario())
+
+
+def test_refill_timing_coverage_does_not_hide_dispatch_gaps_behind_a_slow_request():
+    from giraffe.models import RequestRecord, RunReport
+
+    starts = [0, 0, 25, 50, 75, 100]
+    durations = [100, 20, 20, 20, 20, 20]
+    saved = RunReport(run_id="refill-gaps", overall="inconclusive", started_at="now", finished_at="now",
+        manifest={"config": {"targets": [TARGET], "concurrency": 2}},
+        requests=[RequestRecord(id=str(index), target=TARGET["name"], fixture_id="sample",
+            scenario="correctness_c2", check_ids=["correctness"], started_at="now",
+            status="completed", valid=True, stream=True, dispatch_ms=start,
+            completed_ms=start + duration, elapsed_ms=duration)
+            for index, (start, duration) in enumerate(zip(starts, durations))])
+    measurement, = latency_summary(saved)["targets"][0]["measurements"]
+    # A continuously replenished pool would finish in 100 ms. The measured
+    # 120 ms includes dispatch gaps, even though old batch maxima sum to 140 ms.
+    assert measurement["batch_timing_coverage"] == pytest.approx(100 / 120, abs=1e-6)
+
+
+@pytest.mark.parametrize("count", [2049, 2200])
+def test_large_deterministic_refill_pool_keeps_the_final_partial_wave(monkeypatch, count):
+    configured = RunConfig(targets=[TARGET], checks=["correctness"],
+        test_options={"correctness": {"samples": count, "concurrency": 512}})
+
+    async def scenario():
+        result, _, plan, _ = await observed_range(configured, seed=7, milliseconds=1000)
+        assert result["actual"] == pytest.approx(5)
+        # Exact deterministic equality permits only virtual-clock roundoff.
+        assert result["low"] == pytest.approx(5)
+        assert result["high"] == pytest.approx(5)
+        component, = plan["time_components"]
+        assert component["expected_seconds"] == pytest.approx(5)
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_large_variable_refill_pool_bounds_include_the_final_drain(monkeypatch):
+    configured = RunConfig(targets=[TARGET], checks=["correctness"],
+        test_options={"correctness": {"samples": 2049, "concurrency": 512}})
+
+    async def scenario():
+        result, _, plan, _ = await observed_range(configured, seed=7, milliseconds=1000, sigma=.001)
+        assert result["hit"], result
+        component, = plan["time_components"]
+        assert component["upper_bound"] is True
+        assert result["high"] >= 4.9
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_logprob_round_barriers_are_kept_in_timing_coverage():
+    from giraffe.models import RequestRecord, RunReport
+
+    starts = [0, 0, 20, 100, 100, 120]
+    durations = [100, 20, 20, 100, 20, 20]
+    saved = RunReport(run_id="rounds", overall="inconclusive", started_at="now", finished_at="now",
+        manifest={"config": {"targets": [TARGET], "concurrency": 2}},
+        requests=[RequestRecord(id=str(index), target=TARGET["name"], fixture_id="sample",
+            scenario="consistency_c2_short", check_ids=["consistency"], started_at="now",
+            status="completed", valid=True, stream=True, dispatch_ms=start,
+            completed_ms=start + duration, elapsed_ms=duration,
+            workload={"level": 2, "logprobs": True, "phase": "measured", "round": index // 3})
+            for index, (start, duration) in enumerate(zip(starts, durations))])
+    measurement, = latency_summary(saved)["targets"][0]["measurements"]
+    assert measurement["batch_timing_coverage"] == 1
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+def test_observed_range_restores_client_when_training_does_not_finish(monkeypatch, error_type):
+    original = runner.LLMClient
+
+    async def fail(*args, **kwargs):
+        raise error_type()
+
+    monkeypatch.setattr(runner, "run_suite", fail)
+    configured = RunConfig.model_validate(CASES["gather4"])
+    with pytest.raises(error_type):
+        run_virtual(monkeypatch, observed_range(configured, seed=7))
+    assert runner.LLMClient is original

@@ -289,3 +289,85 @@ async def test_shared_endpoint_keeps_failures_and_answer_links_with_their_target
     cfg.targets[0].headers_env = {"X-Tenant": "CHANGED_ROUTE"}
     assert all(row["status"] == "unknown" for row in plan(tmp_path, cfg)["correctness_history"])
     assert "private-" not in (tmp_path / "previous" / ".web.json").read_text()
+
+
+def test_combined_histories_survive_storage_and_render_visible_actions(tmp_path):
+    from tests.test_arrival_history import config as arrival_config, save as save_arrival
+    from tests.test_setup_async_regressions import SETUP
+    from tests.test_ux_results import run_render_checks
+
+    cfg = config()
+    cfg.checks.append("load")
+    cfg.load_test = arrival_config().load_test
+    cfg.targets.append(cfg.targets[0].model_copy(update={"name": "second", "url": "http://second/v1"}))
+    report = save(tmp_path, cfg, folder="source-run",
+                  record_changes={"target": "second", "id": "failed/answer"})
+    report.observations = save_arrival(tmp_path, cfg, folder="source-run").observations
+    write_report(report, tmp_path / "source-run")
+    saved = json.loads((tmp_path / "source-run" / ".web.json").read_text())["latency_summary"]
+    assert len(saved["targets"]) == 2
+    local, second = saved["targets"]
+    assert len(local["arrival_history"]) == 1
+    assert local["correctness_history"] == []
+    assert second["arrival_history"] == []
+    assert second["correctness_history"][0]["failed_request_ids"] == ["failed/answer"]
+    assert second["measurements"]
+    value = plan(tmp_path, cfg)
+    assert any(row["status"] == "warning" for row in value["arrival_history"])
+    assert any(row["status"] == "warning" for row in value["correctness_history"])
+    setup = SETUP.replace("renderRequestPreview=", "")
+    run_render_checks(setup + "\nconst config=" + cfg.model_dump_json()
+                      + ";const plan=" + json.dumps(value) + r''';
+state.config=config;state.jsonDraft=state.jsonBase='synced';renderNew();
+$('#setup-advanced').open=false;
+const original=JSON.stringify(state.config);
+const arrival=plan.arrival_history.find(row=>row.status==='warning');
+const correctness=plan.correctness_history.find(row=>row.status==='warning');
+api=()=>{throw new Error('Viewing history and opening Try one must not send requests');};
+function current(){
+  state.jsonDraft=state.jsonBase='synced';
+  state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
+  renderRequestPlan(config);
+}
+function visible(){
+  const outlet=$('#setup-history');assert(outlet&&!outlet.hidden);
+  assert(outlet.querySelector('.arrival-history'));
+  const warning=outlet.querySelector('.notice.warning');assert(warning,'Correctness warning must be in the visible outlet');
+  for(let ancestor=outlet;ancestor;ancestor=ancestor.parentNode){
+    assert(!ancestor.hidden);assert(ancestor.tagName!=='DETAILS'||ancestor.open);
+  }
+  assert(!outlet.closest('#setup-advanced'));assert(!$('#setup-advanced').open);
+  for(const row of [arrival,correctness])assert.equal($('#main').textContent.split(row.message).length-1,1);
+  assert.equal(warning.querySelector('a').getAttribute('href'),'#runs/source-run/requests/failed%2Fanswer');
+  assert.equal(warning.querySelector('button').dataset.tryTarget,'second');
+}
+function cleared(){assert($('#setup-history').hidden);assert.equal($('#setup-history').textContent,'');}
+current();visible();
+configChanged();cleared();current();visible();
+for(const status of ['pending','error']){state.requestPreview.status=status;renderRequestPreview();cleared();current();visible();}
+state.routeVersion++;renderRequestPreview();cleared();current();visible();
+state.jsonDraft='unapplied';configChanged();cleared();current();visible();
+state.requestPreview.plan={...plan,arrival_history:[],correctness_history:[{status:'unknown'}]};renderRequestPreview();cleared();
+current();visible();assert.equal(JSON.stringify(state.config),original);
+const dialog=document.createElement('dialog');dialog.setAttribute('id','dataset-dialog');document.body.insertBefore(dialog,null);
+const beforeTry=JSON.stringify(readForm().config);
+(async()=>{
+await listeners.click({target:$('#setup-history .notice button')});
+assert(dialog.open);assert.equal($('#dataset-try-form').elements.try_target.value,'second');
+assert.equal(state.datasetTry.fixture_id,'question');assert.equal(JSON.stringify(state.config),beforeTry);
+})()
+''', dom=True)
+
+
+def test_failed_answer_deep_link_survives_initial_app_routing():
+    from tests.test_ui_navigation import run_browser_script
+
+    run_browser_script(r"""
+const page=browser(undefined,'#runs/previous%2Frun/requests/bad%2Fid');
+await page.run(`let opened=[];openRequest=async id=>opened.push(id);init()`);
+await page.run(`
+assert.equal(location.hash,'#runs/previous%2Frun/requests/bad%2Fid');
+assert.equal(state.detail.id,'previous/run');assert.equal(opened[0],'bad/id');
+assert.equal(reportView.tab,'results');
+`);
+""")

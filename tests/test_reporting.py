@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,18 @@ def make_report(run_id: str = "current", *, latency: float = 100, count: int = 8
 
 def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
+
+
+def test_comparison_setting_reasons_include_structured_values_without_changing_text():
+    current, previous = make_report(), make_report("baseline")
+    current.manifest["config"]["request_timeout_seconds"] = 300
+    previous.manifest["config"]["request_timeout_seconds"] = 15
+    target = compare_baseline(current, previous).baseline["targets"][0]
+    assert "Run setting request_timeout_seconds differs." in target["reasons"]
+    detail = next(item for item in target["reason_details"] if item.get("key") == "request_timeout_seconds")
+    assert detail == {"code": "setting_differs", "key": "request_timeout_seconds",
+                      "baseline": 15, "current": 300,
+                      "text": "Run setting request_timeout_seconds differs."}
 
 
 def dead_endpoint_report():
@@ -82,7 +95,7 @@ def test_html_caps_request_details_and_raw_bodies_without_losing_json(tmp_path):
     html = html_path.read_text()
     assert "Showing 25 of 80 request details" in html
     assert "&lt;script&gt;" in html and "<script>" not in html
-    assert len(html.encode()) < 120_000
+    assert html_path.stat().st_size < 120_000
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[-1].output == report.requests[-1].output
 
@@ -113,6 +126,8 @@ def test_html_logprob_alternatives_are_visible_despite_large_token_byte_arrays(p
     # Bound evidence growth independently of shared report markup. Raw byte
     # arrays must not be duplicated into the human-readable HTML.
     assert html_path.stat().st_size - baseline_html.stat().st_size < 6_000
+    assert '"bytes":' not in html
+    assert 'data:application/json' not in html
     saved = RunReport.model_validate_json(data)
     if retained:
         assert saved.requests[0].logprob_evidence == record.logprob_evidence
@@ -206,6 +221,7 @@ def test_legacy_cancellation_grading_cannot_claim_a_server_stop_regression(verif
 def test_cancellation_baselines_ignore_only_inactive_backend_settings(change, expected, reverse):
     current, previous = make_report(), make_report("baseline")
     for report in (current, previous):
+        report.manifest["config"]["checks"] = ["cancellation", "recovery"]
         config = RunConfig.model_validate(report.manifest["config"])
         report.manifest["effective_checks"] = {
             name: config.effective_check(name) for name in config.checks
@@ -359,7 +375,8 @@ def test_lost_timing_or_correctness_measurements_prevent_a_passing_comparison():
         record.score = None
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "inconclusive"
-    assert "measurement coverage" in baseline_check(result).summary
+    assert "correctness" in baseline_check(result).summary
+    assert "at least 5 measured samples" in baseline_check(result).summary
 
 
 def test_noise_is_inconclusive_when_it_crosses_material_threshold():
@@ -367,7 +384,9 @@ def test_noise_is_inconclusive_when_it_crosses_material_threshold():
     for record, timing in zip(current.requests, [80, 90, 100, 110, 140, 180, 250, 400]):
         record.elapsed_ms = timing
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
     latency = next(row for row in result.baseline["targets"][0]["comparisons"]
                    if row["metric"] == "latency_ms")
     assert latency["status"] == "inconclusive"
@@ -379,7 +398,9 @@ def test_shorter_generations_do_not_establish_performance_stability():
         record.output_chars = 1
         record.output_tokens = 5
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
     latency = next(row for row in result.baseline["targets"][0]["comparisons"]
                    if row["metric"] == "latency_ms")
     assert latency["status"] == "inconclusive"
@@ -394,7 +415,8 @@ def test_different_fixture_proportions_are_not_a_timing_regression():
             record.elapsed_ms = 1000 if record.fixture_id == "slow" else 100
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "inconclusive"
-    assert "proportions" in baseline_check(result).summary
+    assert "correctness" in baseline_check(result).summary
+    assert any("proportions" in row["reason"] for row in result.baseline["targets"][0]["comparisons"])
 
 
 def test_absolute_failure_stays_failed_even_when_baseline_comparison_passes():
@@ -426,8 +448,10 @@ def test_generator_saturation_cannot_create_timing_regressions(saturated_run):
     noisy = current if saturated_run == "current" else previous
     noisy.observations["generator_max_lag_ms"] = 500
     result = compare_baseline(current, previous)
-    assert baseline_check(result).status == "inconclusive"
-    assert result.overall == "inconclusive"
+    # AM9: unchanged comparable correctness still covers the selected check;
+    # uncertain timing stays visible as not comparable, without vetoing it.
+    assert baseline_check(result).status == "pass"
+    assert result.overall == "pass"
     rows = result.baseline["targets"][0]["comparisons"]
     timing = {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second",
               "generation_tokens_per_second"}
@@ -513,7 +537,9 @@ def test_missing_scenario_does_not_hide_regression_in_another_comparable_scenari
     previous.requests.append(missing)
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == "fail"
-    assert result.baseline["targets"][0]["reasons"]
+    # AM9 records an unmatched scenario locally; other scenarios still compare.
+    assert not result.baseline["targets"][0]["reasons"]
+    assert any(row["metric"] == "request_shapes" for row in result.baseline["targets"][0]["comparisons"])
 
 
 @pytest.mark.parametrize("policy", ["all", "failures", "none"])
@@ -537,7 +563,7 @@ def test_serialized_retention_preserves_measurements_scores_and_source(policy, t
     assert bool(saved.requests[1].output) is (policy != "none")
     assert bool(saved.requests[1].reasoning) is (policy != "none")
     assert html_path.exists()
-    assert "Measurements by scenario" in html_path.read_text()
+    assert "Measurements by condition" in html_path.read_text()
     assert "Errors / timeouts" in html_path.read_text()
 
 
@@ -615,7 +641,7 @@ def test_legacy_tool_report_remains_readable(tmp_path):
     json_path, html_path = write_report(report, tmp_path, html=True)
     saved = RunReport.model_validate_json(json_path.read_text())
     assert saved.requests[0].tool_evaluation is None
-    assert "Request evidence" in html_path.read_text()
+    assert "<h2>Requests</h2>" in html_path.read_text()
 
 
 def test_baseline_roundtrip_works_after_bodies_are_stripped(tmp_path: Path):
@@ -818,3 +844,341 @@ def test_html_prioritizes_all_check_evidence_over_request_detail_cap(status, evi
     if evidence_count < 25:
         assert 'Request current-0 ' in html
     assert 'Request current-30 ' not in html
+
+
+def test_old_baseline_none_effective_defaults_match_same_explicit_config():
+    from copy import deepcopy
+    from giraffe.reporting import _settings_reasons
+    current = make_report()
+    current.manifest['config'].update(checks=['first_output', 'generation'])
+    config = RunConfig.model_validate(current.manifest['config'])
+    current.manifest['effective_checks'] = {name: config.effective_check(name) for name in config.checks}
+    previous = deepcopy(current)
+    previous.run_id = 'main-baseline'
+    # Old main saved a full config and None for the two formerly absent sanity defaults.
+    previous.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = None
+    previous.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = None
+    current.manifest['effective_checks']['first_output']['limits']['first_output_ms'] = 10000
+    current.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = 5000
+    assert _settings_reasons(current, previous) == []
+    current.manifest['config']['test_options'] = {'generation': {'limits': {'stream_gap_ms': 2000}}}
+    assert _settings_reasons(current, previous)
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_saved_report_records_and_displays_applied_sanity_limits(tmp_path, monkeypatch, explicit):
+    from giraffe import runner
+    from tests.test_runner import FakeClient
+
+    monkeypatch.setattr(runner, 'LLMClient', FakeClient)
+    values = {'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}],
+              'checks': ['first_output', 'generation']}
+    if explicit:
+        values['limits'] = {'first_output_ms': 800, 'stream_gap_ms': 700}
+    report = await runner.run_suite(RunConfig.model_validate(values))
+    json_path, html_path = write_report(report, tmp_path, html=True)
+    saved = RunReport.model_validate_json(json_path.read_text())
+    html = html_path.read_text()
+    for check_id, field, limit, label in (
+        ('first_output', 'first_output_ms', 800 if explicit else 10000, 'p95 first answer'),
+        ('generation', 'stream_gap_ms', 700 if explicit else 5000, 'Stream pause'),
+    ):
+        assert saved.manifest['effective_checks'][check_id]['limits'][field] == limit
+        assert (field in saved.manifest['default_check_limits'][check_id]) == (not explicit)
+        duration = f'{limit / 1000:g} s' if limit >= 1000 else f'{limit} ms'
+        assert f'{label} ≤ {duration}' + ('' if explicit else ' (default)') in html
+    if not explicit:
+        assert 'default_concurrency' not in saved.manifest['config']
+
+
+def test_old_report_with_null_effective_limit_metadata_keeps_rendering(tmp_path):
+    report = make_report()
+    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
+                                status='inconclusive', summary='Timing observed; no acceptance limit configured.')]
+    report.manifest['effective_checks'] = {'first_output': {'limits': None}}
+    report.manifest['default_check_limits'] = None
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    assert 'Timing observed; no acceptance limit configured.' in html
+    assert 'p95 first answer ≤' not in html
+
+
+@pytest.mark.parametrize('limit,label', [(999, '999 ms'), (1000, '1 s'), (1500, '1.5 s'), (10000, '10 s')])
+def test_html_applied_limit_uses_readable_duration_units(tmp_path, limit, label):
+    report = make_report()
+    report.checks = [CheckResult(id='first_output', target='local', title='First useful output',
+                                status='pass', summary='Timing met the recorded limit.')]
+    report.manifest['effective_checks'] = {'first_output': {'limits': {'first_output_ms': limit}}}
+    _, html_path = write_report(report, tmp_path, html=True)
+    assert f'p95 first answer ≤ {label}' in html_path.read_text()
+
+
+
+def test_html_baseline_table_uses_actual_comparison_contract():
+    from giraffe.reporting import _render
+
+    report = compare_baseline(make_report(latency=200), make_report("baseline"))
+    html = _render(report)
+    head = re.search(r'<table class="baseline-table">.*?<thead>(.*?)</thead>', html, re.S).group(1)
+    assert re.findall(r'<th[^>]*>(.*?)</th>', head) == ['Metric', 'Baseline', 'Current', 'Δ', 'Verdict']
+    assert '+100.0%' in html
+    assert '>Worse</strong>' in html
+    assert '>No material change</strong>' in html
+    assert 'Material worsening exceeds observed sample uncertainty.' in html
+    assert html.count('>Baseline comparison</h2>') == 1
+    assert 'Entry 1' not in html
+    assert 'vs baseline baseline:' in html
+
+
+def test_html_baseline_has_condition_headers_and_five_cells_per_metric():
+    from giraffe.reporting import _baseline_table_html
+    from giraffe.performance_html import STYLE
+
+    rows = [dict(check=check, scenario="warm", metric=metric, baseline=10, current=12,
+                 status="inconclusive", reason="Only one sample.")
+            for check, metric in (("access", "latency_ms"), ("generation", "output_tokens_per_second"))]
+    html = _baseline_table_html(dict(targets=[dict(target="local", comparisons=rows)]))
+    assert html.count('class="comparison-group"') == 1
+    assert 'colspan="5" scope="rowgroup"' in html
+    metric_rows = re.findall(r'<tr class="comparison-metric">(.*?)</tr>', html, re.S)
+    assert len(metric_rows) == 2
+    assert all(len(re.findall(r'<(?:td|th)\b', row)) == 5 for row in metric_rows)
+    assert all('class="comparison-reason"' in row for row in metric_rows)
+    assert 'table-layout:fixed' in STYLE and 'font-variant-numeric:tabular-nums' in STYLE
+    assert '.baseline-table .comparison-reason{' in STYLE and 'text-transform:none' in STYLE
+    assert '@media(max-width:599px)' in STYLE
+
+
+def test_html_json_export_is_relative_with_filename_note_and_no_embedded_json():
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    for output in ('42', 'large retained answer ' * 110_000):
+        report.requests[0].output = output
+        html = _render(report)
+        assert 'href="report.json"' in html
+        assert 'report.json — keep it next to this file' in html
+        assert 'data:application/json' not in html
+        assert 'base64' not in html
+        assert len(html.encode()) < 50_000
+
+
+@pytest.mark.parametrize("current_latency, expected", [(50, "Better"), (100, "No material change"),
+                                                       (200, "Worse")])
+def test_html_baseline_verdicts_follow_material_comparison(current_latency, expected):
+    from giraffe.reporting import _baseline_table_html
+
+    report = compare_baseline(make_report(latency=current_latency), make_report("baseline"))
+    html = _baseline_table_html(report.baseline)
+    assert f'>{expected}</strong>' in html
+
+
+def test_html_low_sample_comparison_is_not_comparable():
+    from giraffe.reporting import _render
+
+    report = compare_baseline(make_report(count=1), make_report("baseline", count=1))
+    html = _render(report)
+    assert '>Not comparable</strong>' in html
+    assert 'Needs at least 5 measured samples in each run.' in html
+    assert 'Entry 1' not in html
+
+
+def test_html_findings_include_three_bounded_expected_received_rows():
+    from giraffe.models import EvaluationEvidence
+    from giraffe.reporting import _render
+
+    report = make_report(count=5)
+    report.overall = "fail"
+    report.checks[0].status = "fail"
+    report.checks[0].summary = "Answers did not match."
+    for record in report.requests:
+        record.score = False
+        record.output = '<received> ' * 100
+        record.evaluation = EvaluationEvidence(messages=[], scorer="exact", expected='<expected> ' * 100,
+                                               expected_provided=True)
+    html = _render(report)
+    findings = html[html.index('<section id="findings">'):html.index('<section id="checks">')]
+    assert findings.count('class="answer-finding"') == 3
+    assert 'Expected: &lt;expected&gt;' in findings
+    assert 'Received: &lt;received&gt;' in findings
+    assert '<received>' not in findings
+
+
+def test_html_traffic_only_baseline_includes_capacity_delta_and_summary():
+    from giraffe.reporting import _render
+    from tests.test_traffic_reporting import traffic_report
+
+    report = compare_baseline(traffic_report(high_failure="latency"), traffic_report("baseline"))
+    assert report.baseline["targets"][0]["comparisons"] == []
+    html = _render(report)
+    assert 'vs baseline baseline: 1 worse' in html
+    table = html[html.index('<table class="baseline-table">'):]
+    assert 'Highest acceptable tested arrival rate (requests/s)' in table
+    assert '-75.0%' in table
+    assert '>Worse</strong>' in table
+
+
+@pytest.mark.parametrize('has_points', [True, False])
+def test_html_load_baseline_table_names_qualification_and_missing_comparisons(has_points):
+    from giraffe.reporting import _render
+
+    report = make_report()
+    point = dict(type='combinations', shape='short_short', pattern='concurrent',
+                 bursts=False, level=2, rate=None, source='primary', status='pass')
+    comparison = dict(status='fail' if has_points else 'inconclusive',
+                      reason='Lost acceptable load.' if has_points else 'No matched load points.',
+                      points=[dict(baseline=point, current={**point, 'status': 'fail'},
+                                   status='fail', reason='Lost acceptable load.')] if has_points else [])
+    report.baseline = dict(run_id='before', status=comparison['status'],
+                           targets=[dict(target='local', load_test=comparison)])
+    html = _render(report)
+    table = re.search(r'<table class="baseline-table">(.*?)</table>', html, re.S).group(1)
+    assert html.count('<section id="baseline">') == 1
+    if has_points:
+        assert 'short input' in table.lower() and 'concurrency 2' in table
+        assert re.search(r'data-label="Baseline"[^>]*>Pass</td>', table)
+        assert re.search(r'data-label="Current"[^>]*>Fail</td>', table)
+        assert 'Worse' in table and 'Lost acceptable load.' in table
+    else:
+        assert 'Not comparable' in table and 'No matched load points.' in table
+
+
+def test_html_baseline_groups_each_condition_with_changed_rows_first():
+    from giraffe.reporting import _baseline_table_html
+
+    unchanged = dict(status="pass", reason="No material worsening detected in these samples.",
+                     baseline=100, current=100, check="correctness", scenario="warm")
+    rows = [dict(unchanged, metric="only-unchanged", scenario="quiet"),
+            dict(unchanged, metric="unchanged"),
+            dict(unchanged, metric="uncertain", status="inconclusive", reason="Needs more samples."),
+            dict(unchanged, metric="better", current=50, worsening=-50,
+                 worsening_interval_95=[-50, -50], threshold=10),
+            dict(unchanged, metric="worse", current=200, status="fail", reason="Latency doubled.")]
+    html = _baseline_table_html(dict(targets=[dict(target="local", comparisons=rows)]))
+    assert html.index('local · Warm-up') < html.index('local · Quiet')
+    assert html.index('>Worse</strong>') < html.index('>Better</strong>')
+    assert html.index('>Better</strong>') < html.index('>No material change</strong>')
+    assert html.index('>No material change</strong>') < html.index('>Not comparable</strong>')
+    assert html.count('class="comparison-group"') == 2
+    assert html.count('class="comparison-metric"') == 5
+    assert '<details class="baseline-group"' not in html
+    assert 'Needs more samples.' in html and 'Latency doubled.' in html
+    assert 'No material worsening detected in these samples.' not in html
+    assert html.count('class="comparison-reason"') == 2
+    assert 'Entry ' not in html
+
+
+def test_html_baseline_no_regression_summary_includes_uncompared_count_and_focus_target():
+    from giraffe.reporting import _render
+
+    report = make_report()
+    report.baseline = dict(name="before-upgrade", targets=[dict(target="local", comparisons=[
+        dict(status="pass", metric=f"unchanged-{index}") for index in range(64)
+    ] + [dict(status="inconclusive", metric=f"uncompared-{index}", reason="No samples.")
+         for index in range(30)])])
+    html = _render(report)
+    assert 'vs baseline before-upgrade: no regressions (64 unchanged, 30 not comparable)' in html
+    assert '<a href="#baseline-heading">vs baseline' in html
+    assert '<h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>' in html
+    assert html.count('class="comparison-metric"') == 94
+    assert html.count('>No material change</strong>') == 64
+    assert html.count('>Not comparable</strong>') == 30
+    assert html.count('class="comparison-reason"') == 30
+
+
+@pytest.mark.parametrize('status, verdict', [('pass', 'Better'), ('inconclusive', 'Not comparable')])
+def test_html_load_improvement_requires_comparable_evidence(status, verdict):
+    from giraffe.reporting import _baseline_table_html, _baseline_summary_html
+
+    point = dict(type='combinations', shape='short_short', pattern='concurrent',
+                 bursts=False, level=2, rate=None, source='primary', status='fail')
+    baseline = dict(run_id='before', targets=[dict(target='local', load_test=dict(
+        reason='Complete matched load evidence.' if status == 'pass' else 'Client-limited evidence.',
+        points=[dict(baseline=point, current={**point, 'status': 'pass'}, status=status,
+                     reason='Acceptance changed.')]))])
+    html = _baseline_table_html(baseline)
+    assert f'>{verdict}</strong>' in html
+    assert ('Complete matched load evidence.' if status == 'pass' else 'Client-limited evidence.') in html
+    assert re.search(r'data-label="Baseline"[^>]*>Fail</td>', html)
+    assert re.search(r'data-label="Current"[^>]*>Pass</td>', html)
+    if status == 'pass':
+        assert '1 better' in _baseline_summary_html(baseline)
+
+
+@pytest.mark.parametrize('scorer, criterion, options', [
+    ('json', 'JSON schema', {'schema': {'type': 'object', 'required': ['answer']}}),
+    ('judge', 'Rubric', {'rubric': 'Answer must identify the failed deployment.'}),
+])
+def test_html_findings_include_schema_and_rubric_failures_without_expected_value(scorer, criterion, options):
+    from giraffe.models import EvaluationEvidence
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    record = report.requests[0]
+    report.overall = report.checks[0].status = 'fail'
+    record.score = False
+    record.score_message = 'Answer failed the configured criterion.'
+    record.evaluation = EvaluationEvidence(messages=[{'role': 'user', 'content': 'What failed in this deployment?'}],
+                                           scorer=scorer, **options)
+    html = _render(report)
+    findings = html[html.index('<section id="findings">'):html.index('<section id="checks">')]
+    assert '<summary>What failed in this deployment?' in findings
+    assert f'<strong>{criterion}:</strong>' in findings
+    assert 'Answer failed the configured criterion.' in findings
+    assert 'Expected: Not retained' not in findings
+
+
+def test_html_tool_only_findings_and_request_evidence_show_tool_calls():
+    from giraffe.models import EvaluationEvidence
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    record = report.requests[0]
+    report.overall = report.checks[0].status = 'fail'
+    record.score, record.output = False, ''
+    record.evaluation = EvaluationEvidence(messages=[{'role': 'user', 'content': 'Check the weather in Paris.'}],
+                                           scorer='tool')
+    record.tool_calls = [{'type': 'function', 'function': {'name': 'weather', 'arguments': '{"city":"Paris"}'}}]
+    html = _render(report)
+    assert 'Tool calls: weather({&quot;city&quot;:&quot;Paris&quot;})' in html
+    assert '<h3>Tool response</h3>' in html
+    assert 'No retained response body' not in html
+
+
+def test_html_coverage_includes_selected_blocked_and_skipped_reasons():
+    from giraffe.reporting import _render
+
+    report = make_report()
+    report.manifest['config']['checks'] = ['correctness', 'load']
+    report.checks = [
+        CheckResult(id='correctness', target='local', title='Answer correctness', status='blocked',
+                    summary='Model unavailable.'),
+        CheckResult(id='load', target='local', title='Load test', status='skipped', required=False,
+                    summary='Request budget exhausted.'),
+        CheckResult(id='json', target='local', title='JSON correctness', status='skipped', required=False,
+                    summary='Not selected.'),
+    ]
+    html = _render(report)
+    coverage = html[html.index('<h2>Coverage and limitations</h2>'):html.index('<section id="checks">')]
+    assert 'Answer correctness: Model unavailable.' in coverage
+    assert 'Load test: Request budget exhausted.' in coverage
+    assert 'JSON correctness: Not selected.' not in coverage
+
+
+@pytest.mark.parametrize("reason", [
+    "Timing observed; no acceptance limit configured. To conclude, set limits.first_output_ms to your service's acceptance target and rerun.",
+    "Timing observed; no acceptance limit configured. Set limits.first_output_ms (--first-output-ms) to your target and rerun.",
+    "Stopped by you after 16 of 20 planned requests.",
+])
+def test_html_preserves_backend_reason_sentences_without_rewriting(reason):
+    from html import escape
+    from giraffe.reporting import _render
+
+    report = make_report(count=1)
+    report.overall = report.checks[0].status = "inconclusive"
+    report.checks[0].summary = reason
+    html = _render(report)
+    # HTML does not strip prefixes or split sentences; preserve backend copy.
+    assert f"<p>{escape(reason)}</p>" in html
+    assert "Stopped by you Stopped by you" not in html
+    assert "--First-output-ms" not in html

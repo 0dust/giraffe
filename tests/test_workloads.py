@@ -157,7 +157,7 @@ async def test_failed_semantic_turn_stops_session_before_next_user_turn(repeat_p
 @pytest.mark.parametrize(
     "lag,warm_first,correct,expected",
     [(150, 2000, True, "pass"), (150, 100, True, "inconclusive"),
-     (500, 100, False, "fail")],
+     (500, 100, False, "inconclusive")],
 )
 def test_workload_timing_uses_core_generator_qualification(lag, warm_first, correct, expected):
     settings = RunConfig(

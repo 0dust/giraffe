@@ -71,7 +71,7 @@ def test_unknown_after_covered_windows_is_risk_without_a_lower_budget_action():
 
 @pytest.mark.parametrize("budget", [300, 600, 1200, 2400, 5000])
 def test_default_suite_cut_detection_uses_known_highs_and_unknown_lower_bounds(budget):
-    plan = request_plan(config(max_duration_seconds=budget, checks=list(RunConfig(targets=[TARGET]).checks)))
+    plan = request_plan(config(max_duration_seconds=budget, checks=["access", "serving", "first_output", "generation", "load", "context", "correctness", "cancellation", "recovery"]))
     assert plan["errors"] == []
     for notice in plan["time_warnings"]:
         for action in notice.get("actions", []):
@@ -105,7 +105,7 @@ async def test_cancellation_observations_cover_real_controls_and_probes(monkeypa
     saved = await runner.run_suite(configured)
     plan = request_plan(configured, observations=observations(saved))
     assert {item["title"] for item in plan["time_components"]} == {
-        "Stop-sequence control", "Cancellation & timeouts", "Cancellation health probes"}
+        "Stop-sequence control", "Cancellation & limits", "Cancellation health probes"}
     unknown, = plan["unknown_time_components"]
     assert unknown["id"] == "cancellation_intentional"
     assert unknown["requests"] == 2
@@ -250,13 +250,14 @@ async def test_history_rejected_session_turns_leave_pauses_unknown(monkeypatch):
     assert "Conversation history admission determines the pauses" in plan["time_bound_reasons"][0]
 
 
-def test_logprob_gather_tail_uses_actual_batch_width_not_single_template():
+@pytest.mark.parametrize("response_mode", ["stream", "complete"])
+def test_logprob_gather_tail_uses_actual_batch_width_not_single_template(response_mode):
     from giraffe.logprob_workload import logprob_fixtures
 
     configured = config(checks=["consistency"], consistency={"levels": [1, 16], "shapes": ["short"],
-        "repetitions": 2, "logprobs": {"priming_rounds": 1}})
+        "repetitions": 2, "logprobs": {"priming_rounds": 1, "response_mode": response_mode}})
     template = logprob_fixtures(configured, builtin_fixtures(configured))["short"]
-    measured = {"service": [{"family": "consistency", "concurrency": level, "stream": False,
+    measured = {"service": [{"family": "consistency", "concurrency": level, "stream": response_mode == "stream",
         "output_cap": template.max_tokens, "input_bucket": input_bucket(template.input_chars),
         "n": 100, "p50_ms": 10, "p90_ms": 10, "p99_ms": 100, "max_ms": 1000,
         "quantiles_ms": [10] * 91 + list(range(20, 101, 10)) + [1000], "cohort": "run"}
@@ -265,7 +266,6 @@ def test_logprob_gather_tail_uses_actual_batch_width_not_single_template():
     assert quiet["requests"] == loaded["requests"] == 48
     # Forty-eight serial requests and three 16-wide gather maxima are different
     # random sums. Their upper intervals include measured positive skew, not batch worst cases.
-    from statistics import NormalDist
     mean = .01945
     variance = .9 * .01**2 + .09 * (.01**2 + .01 * .1 + .1**2) / 3 + .01 * (.1**2 + .1 + 1) / 3 - mean**2
     # Exact raw moments of the known atom + two uniform tail segments.
@@ -275,7 +275,10 @@ def test_logprob_gather_tail_uses_actual_batch_width_not_single_template():
     third = raw_third - 3 * mean * second + 2 * mean**3
     predicted_variance = 48 * variance * 1.48
     predicted_third = 48 * third * 1.48**1.5
-    z = NormalDist().inv_cdf(.995)
+    # Independent NIST table: t(.995, 99 df) = 2.626 for n=100.
+    # Keep the analytic service moments and the existing quadrature tolerance.
+    # https://www.itl.nist.gov/div898/handbook/eda/section3/eda3672.htm
+    z = 2.626
     expected_high = (48 * mean + z * predicted_variance**.5
                      + (z*z - 1) * predicted_third / (6 * predicted_variance))
     assert quiet["low_seconds"] == 0

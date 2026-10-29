@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -12,7 +13,7 @@ import pytest
 
 from tests.fake_endpoint import FakeEndpoint
 from giraffe.models import (
-    CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, CheckResult, RequestRecord, RunConfig, RunReport,
+    CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckResult, RequestRecord, RunConfig, RunReport,
 )
 from giraffe.reporting import write_report
 from giraffe.web import create_app
@@ -309,6 +310,15 @@ async def finished(client, identifier):
     pytest.fail("Run did not finish")
 
 
+async def detail_when(client, identifier, ready):
+    for _ in range(200):
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        if ready(detail):
+            return detail
+        await asyncio.sleep(0.01)
+    pytest.fail("Run progress did not become ready")
+
+
 async def start(client, configuration=None, **values):
     response = await client.post("/api/runs", json={"config": configuration or config(), **values})
     assert response.status_code == 202, response.text
@@ -348,7 +358,7 @@ async def test_frontend_assets_require_revalidation_without_losing_validators(tm
         assert head.headers.get("cache-control") == "no-cache"
 
 
-async def test_frontend_entrypoints_and_module_dependency_share_an_upgrade_version(tmp_path):
+async def test_frontend_entrypoints_and_module_dependency_have_versioned_content_hashes(tmp_path):
     async with browser(tmp_path) as client:
         index = await client.get("/")
         app_match = re.search(r'<script type="module" src="([^"]+)"', index.text)
@@ -363,7 +373,10 @@ async def test_frontend_entrypoints_and_module_dependency_share_an_upgrade_versi
         assert form.status_code == 200
         versions = [parse_qs(urlsplit(str(asset.url)).query).get("v", [None])[0]
                     for asset in (app, style, form)]
-        assert all(versions) and len(set(versions)) == 1, versions
+        import hashlib
+        from giraffe import __version__
+        assert versions == [f"{__version__}-{hashlib.sha256(asset.content).hexdigest()[:16]}"
+                            for asset in (app, style, form)]
         for asset in (app, style, form):
             assert asset.headers.get("cache-control") == "no-cache"
 
@@ -390,9 +403,7 @@ async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monk
         assert result["config"]["targets"][0]["model"] == ""
         assert result["config"]["restart_target"] is None
         assert len(result["checks"]) == 15
-        assert {c["id"] for c in result["checks"] if c["optional"]} == {
-            "json", "gpu", "prefix", "sessions", "consistency", "tools",
-        }
+        assert {c["id"] for c in result["checks"] if not c["optional"]} == set(DEFAULT_CHECKS)
         assert result["active_run_id"] is None
         assert (await client.get("/api/runs")).json()["runs"] == []
 
@@ -407,7 +418,7 @@ async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
             assert set(check["limit_fields"]) <= result["limits_schema"]["properties"].keys()
         assert result["traffic_schema"]["properties"]["arrival"]["enum"] == ["steady", "poisson"]
         assert result["config"]["traffic"]["rates"] == [1, 2, 4]
-        assert result["config"]["checks"] == ["access", "correctness"]
+        assert result["config"]["checks"] == list(DEFAULT_CHECKS)
 
 
 async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkeypatch):
@@ -416,8 +427,8 @@ async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkey
     monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Setup sent traffic"))
     async with browser(tmp_path) as client:
         bootstrap = (await client.get("/api/bootstrap")).json()
-        assert bootstrap["request_plan"]["planned_per_target"] == 7
-        values = config(checks=["access", "correctness"])
+        assert bootstrap["request_plan"]["planned_per_target"] == 13
+        values = config(checks=list(DEFAULT_CHECKS))
         for endpoint in ("draft", "validate", "preview"):
             response = await client.post(f"/api/config/{endpoint}", json=values)
             assert response.status_code == 200, response.text
@@ -443,6 +454,7 @@ async def test_launcher_defaults_preserve_explicit_checks(tmp_path):
 
 
 async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_path, monkeypatch):
+    from giraffe import __version__
     from giraffe.capabilities import capabilities
 
     async def forbidden(*args, **kwargs):
@@ -453,6 +465,7 @@ async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_p
         discovery = (await client.get("/api/capabilities")).json()
         bootstrap = (await client.get("/api/bootstrap")).json()
         assert discovery == capabilities()
+        assert discovery["version"] == __version__
         assert discovery["checks"] == bootstrap["checks"]
         assert discovery["config_schema"] == bootstrap["config_schema"]
         assert (await client.get("/api/runs")).json()["runs"] == []
@@ -653,6 +666,7 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         evidence = await client.get(f"/api/runs/{identifier}/requests/{detail['report']['requests'][0]['id']}")
         assert evidence.json()["output"] == ""
         assert detail["report"]["run_id"] == "suite-run-id"
+        assert detail["report"]["manifest"]["invocation"] == {"source": "web_api", "argv": None}
         listing = (await client.get("/api/runs")).json()
         assert listing["active_run_id"] is None
         assert listing["runs"][0]["id"] == identifier
@@ -682,10 +696,9 @@ async def test_one_active_run_progress_and_cancel_preserves_partial_report(tmp_p
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.sleep(0)
+        detail = await detail_when(client, identifier, lambda value: value["progress"].get("completed") == 149)
         second = await client.post("/api/runs", json={"config": config()})
         assert second.status_code == 409
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
         assert detail["progress"]["completed"] == 149
         assert len(detail["events"]) == 100
         assert detail["report"] is None
@@ -701,7 +714,7 @@ async def test_one_active_run_progress_and_cancel_preserves_partial_report(tmp_p
 async def test_cancel_still_stops_traffic_when_status_write_fails(tmp_path, monkeypatch):
     from giraffe.web import _write
 
-    stopped = asyncio.Event()
+    stopped = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
         await stop_event.wait()
@@ -720,16 +733,16 @@ async def test_cancel_still_stops_traffic_when_status_write_fails(tmp_path, monk
         response = await client.post(f"/api/runs/{identifier}/cancel", json={})
         assert response.status_code == 200
         assert response.json()["state"] == "stopping"
-        await asyncio.wait_for(stopped.wait(), timeout=1)
+        assert await asyncio.to_thread(stopped.wait, 1)
         detail = await finished(client, identifier)
         assert detail["report"]["abort_reason"] == "cancelled by user"
 
 
 async def test_final_state_remains_visible_when_status_write_fails(tmp_path, monkeypatch):
-    release = asyncio.Event()
+    release = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
-        await release.wait()
+        await asyncio.to_thread(release.wait, 2)
         return report(configuration)
 
     def fail_write(*args, **kwargs):
@@ -947,8 +960,8 @@ async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_pat
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.sleep(0)
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        detail = await detail_when(client, identifier,
+                                  lambda value: len(value["phases"]) == 2)
         assert len(detail["events"]) == 100
         assert len(detail["live_requests"]) == 120
         assert [r["slot"] for r in detail["live_requests"]] == list(range(120))
@@ -991,22 +1004,21 @@ async def test_first_run_and_baseline_create_only_their_required_directories(tmp
 
 
 async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path, monkeypatch):
-    ready, release = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
         progress({"event": "offer_dropped", "budget_used": 4, "attempted": 2,
                   "completed": 2, "dropped_offers": 2})
         progress({"event": "judging_started", "phase": "judging", "budget_used": 4,
                   "attempted": 2, "completed": 2, "dropped_offers": 2})
-        ready.set()
-        await release.wait()
+        await asyncio.to_thread(release.wait, 2)
         return report(configuration)
 
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.wait_for(ready.wait(), timeout=1)
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        detail = await detail_when(client, identifier,
+                                  lambda value: value["progress"].get("phase") == "judging")
         assert detail["state"] == "running"
         assert detail["progress"]["phase"] == "judging"
         assert detail["progress"]["dropped_offers"] == 2
@@ -1018,3 +1030,51 @@ async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path
         saved = (await client.get(f"/api/runs/{identifier}")).json()
         assert saved["state"] == "completed"
         assert saved["progress"]["dropped_offers"] == 2
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_bootstrap_round_trip_keeps_serial_correctness_intent(tmp_path, monkeypatch, explicit):
+    from tests.test_check_intent_overlap import StreamEndpoint
+
+    StreamEndpoint(monkeypatch, serial=True)
+    async with browser(tmp_path) as client:
+        values = (await client.get('/api/bootstrap')).json()['config']
+        values['targets'][0].update(url='http://stream.test/v1', model='fake-model')
+        if explicit:
+            values['default_concurrency'] = 4
+        for attempt in range(2):
+            response = await client.post('/api/runs', json={'config': values})
+            assert response.status_code == 202, response.text
+            detail = await finished(client, response.json()['id'])
+            result = next(check for check in detail['report']['checks'] if check['id'] == 'correctness')
+            assert result['status'] == ('inconclusive' if explicit else 'pass')
+            assert detail['report']['overall'] == ('inconclusive' if explicit else 'pass')
+            assert result['metrics']['evidenced_overlap'] < 2
+            assert 'server answered one at a time' in result['summary'].lower()
+            values = detail['report']['manifest']['config']
+
+
+@pytest.mark.parametrize('entry', ['draft', 'launcher'])
+@pytest.mark.parametrize('explicit', [False, True])
+async def test_legacy_ui_config_keeps_concurrency_intent(tmp_path, monkeypatch, entry, explicit):
+    from giraffe.cli import migrated_configuration
+    from tests.test_check_intent_overlap import StreamEndpoint
+
+    StreamEndpoint(monkeypatch, serial=True)
+    values = {'targets': [{'name': 'local', 'url': 'http://stream.test/v1', 'model': 'fake-model'}],
+              'checks': ['correctness']}
+    if explicit:
+        values['concurrency'] = 4
+    defaults = migrated_configuration(values).model_dump(mode='json') if entry == 'launcher' else None
+    async with browser(tmp_path, defaults=defaults) as client:
+        response = (await client.get('/api/bootstrap') if entry == 'launcher' else
+                    await client.post('/api/config/draft', json=values))
+        assert response.status_code == 200, response.text
+        normalized = response.json()['config']
+        assert RunConfig.model_validate(normalized).parallelism_requested('correctness') == explicit
+        response = await client.post('/api/runs', json={'config': normalized})
+        assert response.status_code == 202, response.text
+        detail = await finished(client, response.json()['id'])
+        result = next(check for check in detail['report']['checks'] if check['id'] == 'correctness')
+        assert result['status'] == ('inconclusive' if explicit else 'pass')
+        assert result['metrics']['evidenced_overlap'] < 2

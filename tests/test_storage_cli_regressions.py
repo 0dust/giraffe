@@ -68,25 +68,28 @@ def test_cli_heartbeat_refreshes_during_traffic_and_export_then_stops(tmp_path, 
 
     directory = tmp_path / "one"
     path = directory / ".web.json"
-    original_utime, original_write = os.utime, giraffe.reporting.write_report
+    import giraffe.storage
+    original_publish, original_write = giraffe.storage._write_metadata, giraffe.reporting.write_report
     refreshed = threading.Event()
     calls = []
     monkeypatch.setattr(giraffe.cli, "_HEARTBEAT_SECONDS", 0.005)
 
-    def touch(filename, times, **kwargs):
-        original_utime(filename, times, **kwargs)
-        if filename == path and times is None:
+    def publish(directory, values):
+        original_publish(directory, values)
+        if "heartbeat_at" in values and values.get("state") == "running":
             calls.append(1)
             refreshed.set()
 
-    monkeypatch.setattr(giraffe.cli.os, "utime", touch)
+    monkeypatch.setattr(giraffe.storage, "_write_metadata", publish)
 
     def wait_for_heartbeat():
-        refreshed.clear()
-        original_utime(path, (1, 1))
+        with giraffe.storage.metadata_lock:
+            refreshed.clear()
+            os.utime(path, (1, 1))
         assert refreshed.wait(1)
         assert path.stat().st_mtime > 1
         metadata = json.loads(path.read_text())
+        assert metadata["heartbeat_at"]
         assert metadata["owner_host"] == socket.gethostname()
         assert metadata["owner_pid"] == os.getpid() and metadata["state"] == "running"
         assert not cleanup_plan(tmp_path, older_than_days=0)["candidates"]
@@ -172,16 +175,40 @@ def test_cli_heartbeat_does_not_touch_symlink_target(tmp_path, monkeypatch):
     os.utime(target, (1, 1))
     marker = tmp_path / ".web.json"
     marker.symlink_to(target)
-    touched = threading.Event()
-    original_utime = os.utime
-
-    def touch(path, times, **kwargs):
-        original_utime(path, times, **kwargs)
-        if path == marker:
-            touched.set()
-
-    monkeypatch.setattr("giraffe.cli.os.utime", touch)
-    monkeypatch.setattr("giraffe.cli._HEARTBEAT_SECONDS", 0.005)
     with _heartbeat(marker):
-        assert touched.wait(1)
+        assert marker.is_symlink()
     assert target.stat().st_mtime == 1 and target.read_text() == "unchanged"
+
+
+
+def test_cli_run_failure_has_private_scoped_traceback(tmp_path, monkeypatch, capsys, local_tokenizer):
+    directory = tmp_path / "one"
+
+    async def run(config, **kwargs):
+        raise RuntimeError("unexpected CLI failure")
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    with pytest.raises(RuntimeError, match="unexpected CLI failure"):
+        main(run_arguments(directory))
+    text = (directory / "giraffe.log").read_text()
+    assert "CLI run could not finish" in text
+    assert "Traceback" in text and "RuntimeError: unexpected CLI failure" in text
+    assert (directory / "giraffe.log").stat().st_mode & 0o777 == 0o600
+    assert "CLI run could not finish" in capsys.readouterr().err
+
+
+def test_cli_state_publication_holds_heartbeat_transaction_lock(tmp_path, monkeypatch, local_tokenizer):
+    from giraffe import reporting, storage
+    original = reporting._atomic_write
+    states = []
+    def publish(path, content):
+        if path.name == '.web.json':
+            assert storage.metadata_lock._is_owned()
+            states.append(json.loads(content)['state'])
+        return original(path, content)
+    async def run(configuration, **kwargs):
+        return report()
+    monkeypatch.setattr(reporting, '_atomic_write', publish)
+    monkeypatch.setattr('giraffe.cli._run', run)
+    assert main(run_arguments(tmp_path / 'one')) == 0
+    assert states[0] == 'running' and states[-1] == 'completed'

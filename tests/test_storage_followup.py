@@ -215,8 +215,15 @@ async def test_execute_final_write_merges_download_samples_saved_during_cleanup(
     tasks = []
     original = web.automatic_cleanup
 
-    async def runner(configuration, **kwargs):
+    original_start = web._RunThread.start
+
+    def capture_execution(worker):
         tasks.append(asyncio.current_task())
+        original_start(worker)
+
+    monkeypatch.setattr(web._RunThread, "start", capture_execution)
+
+    async def runner(configuration, **kwargs):
         return web_report(configuration)
 
     def cleanup(*args, **kwargs):

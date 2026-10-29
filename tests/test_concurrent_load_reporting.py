@@ -81,7 +81,7 @@ def test_arrival_baseline_uses_planned_arrival_clock_and_preserves_missing_evide
     assert _metric_values(rows)['latency_ms'] == [10]
 
 
-async def test_arrival_baseline_missing_one_response_clock_cannot_establish_pass():
+async def test_arrival_baseline_missing_one_response_clock_excludes_only_that_metric():
     report = await saved_report()
     for record in report.requests:
         if (record.load_point or {}).get('point_id'):
@@ -95,7 +95,11 @@ async def test_arrival_baseline_missing_one_response_clock_cannot_establish_pass
     affected = [row for row in compared.baseline['targets'][0]['comparisons']
                 if row['metric'] == 'latency_ms' and changed.id in row['evidence_ids']]
     assert affected and all(row['status'] == 'inconclusive' for row in affected)
-    assert compared.baseline['status'] == 'inconclusive'
+    # AM9: an undefined latency excludes that metric. Comparable unchanged
+    # first-output evidence still covers the selected Load test check.
+    assert any(row['metric'] == 'first_output_ms' and row['status'] == 'pass'
+               for row in compared.baseline['targets'][0]['comparisons'])
+    assert compared.baseline['status'] == 'pass'
 
 
 # Fake inference clients in this module use the matching local tokenizer.

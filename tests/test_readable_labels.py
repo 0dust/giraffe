@@ -1,14 +1,16 @@
-"""One test name follows a request from dispatch to saved evidence."""
+"""One condition name follows a request from dispatch to saved evidence."""
 
 import ast
 import itertools
 import json
+import re
 from pathlib import Path
 from typing import get_args
 
 import pytest
 
 from giraffe.conditions import _SCENARIOS, condition_for
+from giraffe.models import CHECK_NAMES
 from tests.test_ux_results import run_render_checks
 
 
@@ -86,29 +88,32 @@ def builder_scenarios():
 
 
 def test_javascript_fallback_labels_match_python():
-    pairs = [(scenario, condition_for(scenario)["label"]) for scenario in builder_scenarios()]
+    pairs = []
+    for scenario in builder_scenarios():
+        label = "AI judge" if scenario == "judging" else CHECK_NAMES.get(scenario, condition_for(scenario)["label"])
+        for check_id, old_name in [("json", "Structured JSON"), ("correctness", "Answer correctness")]:
+            if scenario.startswith(check_id + "_c"):
+                label = label.replace(old_name, CHECK_NAMES[check_id])
+        label = re.sub(r" at (\d+) concurrent requests?$", r" · \1 at once", label)
+        pairs.append((scenario, label))
     run_render_checks("for(const [id,label] of " + json.dumps(pairs) + ")assert.equal(phaseName(id),label,id);"
         "assert.equal(phaseName('traffic_stage_1',{rate_rps:2}),'2 requests/s');")
 
 
-def test_shared_label_in_spots_dialog_live_activity_and_saved_evidence():
+def test_shared_label_in_table_dialog_live_activity_and_saved_evidence():
     run_render_checks(r"""
 const condition={id:'bucket_c32_short_short',label:'Short input / short output · 32 at once',purpose:'Checks short answers under concurrent load.',parameters:{concurrency:32,input_chars:128,input_tokens_approx:32,output_tokens:24,same_prompt:true}};
 const records=Array.from({length:32},(_,i)=>({id:'r'+i,slot:i,target:'local',scenario:condition.id,fixture_id:'cryptic.fixture',condition_id:condition.id,status:'completed',valid:true,score:true,elapsed_ms:812}));
 const summary={target:'local',condition,planned:32,started:32,completed:32};
 const saved=report([check('concurrency','pass',{evidence_ids:records.map(r=>r.id)})],{requests:records,observations:{targets:{local:{conditions:[summary]}}}});
 detail(saved);
-const label=condition.label+'. Request 5 of 32 · Passed · 812 ms';
-assert(renderMosaic(records).includes('aria-label="'+label+'"'));
-const tip={hidden:true,style:{},getBoundingClientRect:()=>({width:200,height:60})};nodes['#spot-tip']=tip;window.innerWidth=1200;
-const spot={dataset:{},getAttribute:()=>label,classList:{contains:s=>s==='pass'},getBoundingClientRect:()=>({left:10,top:100,width:30}),closest:()=>spot};
-listeners.pointerover({target:spot,clientX:10,clientY:100});assert(tip.innerHTML.includes(condition.label));assert(tip.innerHTML.includes('Request 5 of 32 · Passed · 812 ms'));
-tip.hidden=true;listeners.focusin({target:spot});assert.equal(tip.hidden,false);assert(tip.innerHTML.includes(condition.label));
-listeners.focusout({target:spot});assert.equal(tip.hidden,true);
+const table=renderRequestTable(records,createRequestTableState(),{conditionName:evidenceConditionName});
+assert(table.includes('Short input / short output'));assert(table.includes('data-request="r4"'));
+assert.match(table,/class="request-evidence-row" tabindex="0"/);
 nodes['#request-dialog']={innerHTML:'',showModal(){}};openRequest('r4');let html=nodes['#request-dialog'].innerHTML;
 for(const text of [condition.label,condition.purpose,'Request 5 of 32','What was sent','128','~32','24','Same prompt','Internal ID','cryptic.fixture'])assert(html.includes(text),text);
 state.detail={id:'live',state:'running',config:{targets:[],max_requests:32},live_requests:records,live_conditions:[summary],progress:{scenario:condition.id,target:'local'},events:[{event:'scenario_started',scenario:condition.id,target:'local'}]};
-renderLive();html=nodes['#main'].innerHTML;assert(html.includes('<h2>'+condition.label+'</h2>'));assert(html.includes('Scenario started · '+condition.label));
+renderLive();html=nodes['#main'].innerHTML;assert(html.includes(condition.label));assert(html.includes('Scenario started · '+condition.label));
 openLiveRequest(4);html=nodes['#request-dialog'].innerHTML;for(const text of [condition.label,condition.purpose,'Request 5 of 32','What was sent','Internal ID'])assert(html.includes(text),text);
 detail(report([],{requests:records.map(({condition_id,...r})=>r)}));html=nodes['#main'].innerHTML;assert(html.includes(condition.label));assert(!html.includes('aria-label="Request 1: cryptic'));
 """)
@@ -160,10 +165,11 @@ const first={id:'first',target:'local',scenario:condition.id,condition_id:condit
 const records=[second,first],saved=report([],{requests:records,observations:{targets:{local:{conditions:[{condition,planned:2}]}}}});
 detail(saved);
 assert.equal(requestIdentity(second,records),'Request 2 of 2');
-assert(renderMosaic(records).includes('aria-label="Canonical test &lt;name&gt;. Request 2 of 2'));
+assert(renderRequestTable(records,createRequestTableState(),{conditionName:evidenceConditionName}).includes('Canonical test &lt;name&gt;'));
+assert.match(renderRequestTable(records,createRequestTableState(),{conditionName:evidenceConditionName}),/data-request="second"/);
 assert(renderBeeswarm(records.map(r=>({...r,elapsed_ms:1}))).includes('aria-label="Canonical test &lt;name&gt;. Request 2 of 2'));
 assert(renderPhases([{event:'scenario_started',scenario:condition.id,target:'local'}]).includes('Canonical test &lt;name&gt;'));
-assert(comparisonTable([{scenario:condition.id,target:'local',metric:'latency_ms'}]).includes('Canonical test &lt;name&gt;'));
+assert(comparisonConditionTable(comparisonConditionGroups({target:'local',comparisons:[{scenario:condition.id,target:'local',metric:'latency_ms'}]},saved)).includes('Canonical test &lt;name&gt;'));
 nodes['#request-dialog']={innerHTML:'',showModal(){}};openRequest('second');assert(nodes['#request-dialog'].innerHTML.includes('Canonical test &lt;name&gt;'));
 """)
 
@@ -200,7 +206,7 @@ async def test_condition_and_live_dialog_metadata_use_effective_output_cap(reque
     assert next(e for e in events if e["event"] == "request_started")["requested_max_tokens"] == effective
 
 
-def test_partial_condition_card_and_global_spots_use_the_same_request_total():
+def test_partial_condition_strip_and_request_table_use_the_same_request_total():
     run_render_checks(r"""
 const condition={id:'bucket_c32_short_short',label:'Short input / short output · 32 at once',parameters:{},purpose:'Checks concurrent requests.'};
 const record={id:'partial',target:'local',scenario:condition.id,condition_id:condition.id,status:'completed'};
@@ -208,11 +214,12 @@ const summary={target:'local',condition,planned:32,started:1,completed:1,status:
 const saved=report([],{requests:[record],observations:{targets:{local:{conditions:[summary]}}}});
 state.detail={id:'partial-run',report:saved,state:'completed'};
 const html=renderTests([record],{report:saved}),view=[...conditionViews.values()][0];
-assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,1);
-assert.match(html,/1 of 32 requests finished · 0 active/);
+assert.equal((html.match(/class="condition-strip-row"/g)||[]).length,1);
+assert.match(html,/1\/32 requests/);
 assert.equal(view.summary.planned,32);assert.equal(view.summary.started,1);assert.equal(view.summary.completed,1);
 const counts=conditionDialogCounts(view);assert.match(counts,/<dt>Planned<\/dt><dd>32<\/dd>/);assert.match(counts,/<dt>Started<\/dt><dd>1<\/dd>/);
-assert(renderMosaic([record]).includes('aria-label="'+condition.label+'. Request 1 of 32'));
+assert(renderRequestTable([record],createRequestTableState(),{conditionName:evidenceConditionName}).includes('Short input / short output'));
+assert.equal(requestIdentity(record,[record]),'Request 1 of 32');
 """)
 
 

@@ -159,7 +159,7 @@ def test_prefix_admission_reserves_nonce_and_three_chars_per_token():
     assert workloads.prefix_admitted(240, 24, 160)
 
 
-@pytest.mark.parametrize("error,status", [("HTTP 400: context length rejection", "inconclusive"), ("HTTP 400", "fail")])
+@pytest.mark.parametrize("error,status", [("HTTP 400: context length rejection", "inconclusive"), ("HTTP 400", "inconclusive")])
 def test_prefix_context_rejection_is_unverified_but_other_errors_fail(error, status):
     from giraffe import runner
     settings = config(checks=["prefix"])

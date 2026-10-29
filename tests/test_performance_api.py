@@ -1,4 +1,5 @@
 """Derived performance stays bounded and separate from stored request evidence."""
+import threading
 import json
 
 import httpx
@@ -14,7 +15,8 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
     report = synthetic_report_1000()
     path, _ = write_report(report, tmp_path / 'saved')
     raw = json.loads(path.read_text())
-    assert 'performance' not in raw
+    assert raw['performance']
+    assert all('request_series' not in target for target in raw['performance']['targets'])
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://localhost') as client:
         response = await client.get('/api/runs/saved')
         assert response.status_code == 200
@@ -46,22 +48,25 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
 
 @pytest.mark.asyncio
 async def test_saved_selection_cache_is_small_and_invalidated_by_file_revision(tmp_path, monkeypatch):
-    from giraffe import performance
+    from giraffe import web
 
     report = synthetic_report_1000()
     path, _ = write_report(report, tmp_path / 'saved')
     calls = []
-    original = performance.build_performance
+    original = web._ReportProcess.read
 
-    def counting(report, **selection):
+    def counting(self, *selection):
         calls.append(selection)
-        return original(report, **selection)
+        return original(self, *selection)
 
-    monkeypatch.setattr(performance, 'build_performance', counting)
+    # This report exceeds the cold-parse threshold; observe helper dispatches,
+    # while retaining the cache-hit and changed-measurement assertions.
+    monkeypatch.setattr(web._ReportProcess, 'read', counting)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://localhost') as client:
         url = '/api/runs/saved/performance'
         default = (await client.get(url)).json()
         count = len(calls)
+        assert count == 1
         assert (await client.get(url)).json() == default
         assert len(calls) == count
         windows = default['targets'][0]['windows']
@@ -69,7 +74,7 @@ async def test_saved_selection_cache_is_small_and_invalidated_by_file_revision(t
             assert (await client.get(url, params={'window': descriptor['id']})).status_code == 200
         count = len(calls)
         assert (await client.get(url)).status_code == 200
-        assert len(calls) > count  # Third selection evicts the least recently used.
+        assert len(calls) == count  # Encoded selections share the bounded byte cache.
         raw = json.loads(path.read_text())
         raw['requests'][0]['elapsed_ms'] = 999999
         path.write_text(json.dumps(raw))
@@ -86,8 +91,9 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
     from giraffe import web
 
     fixture = synthetic_report_1000()
-    release = asyncio.Event()
-    dispatched = asyncio.Event()
+    release = threading.Event()
+    dispatched = threading.Event()
+    updated = threading.Event()
     now = [1.0]
     monkeypatch.setattr(web, 'time', SimpleNamespace(monotonic=lambda: now[0]))
     monkeypatch.setattr(web, 'MAX_LIVE_REQUESTS', 1)
@@ -100,8 +106,9 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
                       'performance':{'must_not_leak':True}})
         emit(0)
         dispatched.set()
-        await release.wait()
+        assert await asyncio.to_thread(release.wait, 3)
         emit(1)
+        updated.set()
         await stop_event.wait()
         return fixture
 
@@ -112,7 +119,7 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
             response = await client.post('/api/runs', json={'config':{'targets':[{'name':'local','url':'http://localhost/v1','model':'test'}],'checks':['serving']}})
             assert response.status_code == 202
             identifier = response.json()['id']
-            await dispatched.wait()
+            assert await asyncio.to_thread(dispatched.wait, 3)
             detail = (await client.get(f'/api/runs/{identifier}')).json()
             assert detail['report'] is None
             assert 'performance' not in detail['progress']
@@ -120,7 +127,7 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
             first = (await client.get(f'/api/runs/{identifier}/performance')).json()
             assert first['coverage']['retained_requests'] == 1
             release.set()
-            await asyncio.sleep(0)
+            assert await asyncio.to_thread(updated.wait, 3)
             same = (await client.get(f'/api/runs/{identifier}/performance')).json()
             assert same == first
             now[0] += .6
@@ -132,7 +139,7 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
             await client.post(f'/api/runs/{identifier}/cancel', json={})
 
 
-def test_old_embedded_performance_is_ignored_on_load_and_export(tmp_path):
+def test_embedded_performance_is_preserved_on_load(tmp_path):
     from giraffe.cli import load_report
     from giraffe.report_stream import expanded_report_chunks
 
@@ -143,9 +150,10 @@ def test_old_embedded_performance_is_ignored_on_load_and_export(tmp_path):
     path.write_text(json.dumps(raw))
     loaded = load_report(path)
     exported = json.loads(''.join(expanded_report_chunks(path)))
-    assert loaded.performance['performance_schema'] == 1
+    # AM5: saved summaries are authoritative even when newer code is installed.
+    assert loaded.performance == raw['performance']
     assert exported['performance'] == loaded.performance
-    assert len(exported['performance']['targets'][0]['summaries']) == 1
+    assert exported['performance']['obsolete'] is True
 
 
 def test_compact_request_rows_preserve_false_and_zero_measurements():

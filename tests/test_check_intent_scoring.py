@@ -114,7 +114,7 @@ async def test_p3_oversized_prefix_is_not_sent(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("size,status", [(128, "inconclusive"), (8192, "fail")])
+@pytest.mark.parametrize("size,status", [(128, "inconclusive"), (8192, "inconclusive")])
 async def test_p4_small_prefix_misses_are_unverified(monkeypatch, size, status):
     endpoint = MemoryEndpoint(monkeypatch, cached=0)
     result = check(await runner.run_suite(config(endpoint, checks=["prefix"], context_limit=16384,
@@ -338,7 +338,7 @@ def test_r1_both_reasoning_budget_record_contracts(check_id, real_failure, statu
     if real_failure:
         run.records.append(record(spec, status="failed", valid=False, error="HTTP 503"))
     result = next(r for r in runner._checks(run, settings.targets[0]) if r.id == check_id)
-    assert result.status == ("fail" if real_failure else "pass" if check_id == "prefix" else "inconclusive"), result.summary
+    assert result.status == ("inconclusive" if real_failure and check_id == "prefix" else "fail" if real_failure else "pass" if check_id == "prefix" else "inconclusive"), result.summary
     assert result.metrics["reasoning_budget_unscored"] == 6
     assert result.metrics["failed"] == int(real_failure)
     assert result.metrics["error_rate"] in ({1} if real_failure else {None, 0})

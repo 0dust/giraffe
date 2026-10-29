@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import httpx
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from .client import completion_url
 from .conditions import condition_for
+from .stats import percentile
 
 if TYPE_CHECKING:
     from .models import RunConfig, RunReport
@@ -81,14 +83,6 @@ def _deployment_fingerprint(deployment: dict) -> str | None:
     return hashlib.sha256(json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if facts else None
 
 
-def _percentile(values: list[float], quantile: float) -> float:
-    """Interpolate one percentile from an already sorted sample."""
-    position = (len(values) - 1) * quantile
-    lower = int(position)
-    upper = min(lower + 1, len(values) - 1)
-    return values[lower] + (values[upper] - values[lower]) * (position - lower)
-
-
 def latency_summary(report: RunReport) -> dict:
     """Summarize actual specs and measured conditions without retaining answers."""
     config = report.manifest.get("config", {})
@@ -131,24 +125,25 @@ def latency_summary(report: RunReport) -> dict:
             values.sort()
         measurements = [{"family": key[0], "concurrency": key[1], "stream": key[2],
                          "output_cap": key[3], "input_bucket": key[4], "n": len(values),
-                         "p50_ms": _percentile(values, .5), "p90_ms": _percentile(values, .9),
-                         "p99_ms": _percentile(values, .99), "max_ms": max(values),
+                         "p50_ms": percentile(values, .5), "p90_ms": percentile(values, .9),
+                         "p99_ms": percentile(values, .99), "max_ms": max(values),
                          "min_ms": min(values), "histogram_ms": _histogram(values),
-                         "quantiles_ms": [round(_percentile(values, index / 20), 6) for index in range(20)] + [max(values)],
+                         "quantiles_ms": [round(percentile(values, index / 20), 6) for index in range(20)] + [max(values)],
                          "cohort": report.run_id}
                         for key, values in sorted(groups.items())]
         blocks = defaultdict(list)
         previous = None
         for record, key in sorted(((record, key) for key, records in timings.items() for record in records),
                                   key=lambda item: item[0].dispatch_ms or 0):
-            if key != previous:
+            boundary = (key, record.scenario, record.workload.get("phase"), record.workload.get("round"))
+            if boundary != previous:
                 blocks[key].append([])
             blocks[key][-1].append(record)
-            previous = key
+            previous = boundary
         for measurement, (key, records) in zip(measurements, sorted(timings.items())):
-            # A request-latency model cannot account for local work between
-            # gathers. Measure how much of the previous traffic span its actual
-            # batch maxima explain, without adding that overhead to server time.
+            # Replay immediate replenishment with the measured durations. Batch
+            # maxima can exceed the real pool span and conceal dispatch gaps.
+            # Keep local scheduling overhead separate from endpoint latency.
             if (key[0] not in {"serving", "generation", "correctness", "json", "consistency", "prefix", "tools"}
                     or any(record.dispatch_ms is None or record.completed_ms is None
                            or record.completed_ms <= record.dispatch_ms for record in records)):
@@ -157,8 +152,12 @@ def latency_summary(report: RunReport) -> dict:
             # bookkeeping overhead. Measure contiguous blocks of this setting.
             span = sum(max(record.completed_ms for record in block) - block[0].dispatch_ms
                        for block in blocks[key])
-            modeled = sum(max(record.elapsed_ms for record in block[start:start + key[1]])
-                          for block in blocks[key] for start in range(0, len(block), key[1]))
+            modeled = 0
+            for block in blocks[key]:
+                available = [0.] * min(key[1], len(block))
+                for record in block:
+                    heapq.heapreplace(available, available[0] + record.elapsed_ms)
+                modeled += max(available)
             measurement["batch_timing_coverage"] = round(min(1, modeled / span), 6)
             gaps = sum(max(0, math.ceil(len(block) / key[1]) - 1) for block in blocks[key])
             if gaps:
@@ -185,12 +184,16 @@ def latency_summary(report: RunReport) -> dict:
         observed_deployment = observation.get("deployment") or {}
         fingerprint = (observed_deployment.get("fingerprint")
                        or _deployment_fingerprint(target.get("deployment", {})))
+        from .arrival_history import measurements as arrival_measurements
         from .correctness_history import measurements as correctness_measurements
+        arrival_history = [{**entry, "deployment_known": fingerprint is not None}
+                           for entry in arrival_measurements(report, name)]
         correctness_history = [{**entry, "deployment_known": fingerprint is not None}
                                for entry in correctness_measurements(report, name)]
         summary["targets"].append({"name": name, "url": completion_url(target["url"]),
             "model": target["model"], "deployment_fingerprint": fingerprint,
-            "measurements": measurements, "correctness_history": correctness_history})
+            "measurements": measurements, "arrival_history": arrival_history,
+            "correctness_history": correctness_history})
     return summary
 
 
@@ -246,6 +249,7 @@ def load_observations(runs_dir: Path, config: RunConfig, *, now: datetime | None
                                                      "cohort": str(path.resolve()), "run_id": path.parent.name,
                                                      "source_target": saved.get("name")}
                                                      for entry in [*saved.get("measurements", []),
+                                                                   *saved.get("arrival_history", []),
                                                                    *saved.get("correctness_history", [])])
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue

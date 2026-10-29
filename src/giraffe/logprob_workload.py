@@ -143,14 +143,14 @@ async def run_logprob_consistency(run, target, client, fixtures):
                         for slot in range(width):
                             spec = templates[shape].model_copy(deep=True)
                             spec.fixture_id = f'logprob_{shape}_{slot}'
-                            spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], False
+                            spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], options.response_mode == 'stream'
                             spec.options = consistency_options(config, spec.options)
                             spec.options.update(logprobs=True, top_logprobs=options.top_logprobs)
                             spec.workload = {'level': level, 'input_bucket': shape, 'equality': settings.equality,
                                              'temperature': (config.request_options | spec.options).get('temperature'), 'seed': settings.seed,
                                              'logprobs': True, 'top_logprobs': options.top_logprobs,
                                              'phase': phase, 'round': repeat, 'corpus_index': slot,
-                                             'corpus_size': width, 'response_mode': 'complete',
+                                             'corpus_size': width, 'response_mode': options.response_mode,
                                              'option_support': 'requested; runtime enforcement unverified'}
                             specs.append(spec)
                         await refill(run, target, client, specs, width, level, condition_plan=False)
@@ -226,7 +226,7 @@ def summarize_logprobs(records, settings, *, min_samples=2):
     for shape in settings.shapes:
         for left, right in combinations(dict.fromkeys([1, *settings.levels]), 2):
             if options.compare_levels or left == 1:
-                samples = [r for r in measured if r.workload['input_bucket'] == shape and r.workload['level'] in {left, right} and usable(r) and r.workload.get('load_qualified', False)]
+                samples = [r for r in measured if r.workload['input_bucket'] == shape and r.workload['level'] in {left, right} and usable(r) and r.workload.get('load_qualified', False) and (r.workload['level'] == 1 or r.stream)]
                 comparison = compare_samples(samples, cross=True, prefix_cache=prefix_cache)
                 complete = all(c['coverage_complete'] for c in conditions if c['shape'] == shape and c['level'] in {left, right})
                 cross_status = comparison_status(comparison, options, complete)
@@ -241,7 +241,7 @@ def summarize_logprobs(records, settings, *, min_samples=2):
             'max_cross_level_delta': max(deltas, default=None),
             'cross_level_token_divergences': sum(c['token_divergences'] for c in cross_conditions), 'tolerance': options.tolerance,
             'top_logprobs': options.top_logprobs, 'support': options.support,
-            'response_mode': 'complete', 'corpus_size': width, 'repetitions': settings.repetitions,
+            'response_mode': options.response_mode, 'corpus_size': width, 'repetitions': settings.repetitions,
             'priming_rounds': options.priming_rounds, 'conditions': conditions, 'cross_conditions': cross_conditions,
             'within_level_interpretation': 'Run-to-run repeatability; cross_conditions compare concurrency against level 1.',
             'interpretation': 'Natural-log probability differences, not throughput or correctness. Client overlap does not establish server batch membership. Unknown alternatives are not probability zero.'}

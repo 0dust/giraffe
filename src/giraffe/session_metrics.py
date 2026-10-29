@@ -3,6 +3,8 @@
 from collections import Counter
 from statistics import mean
 
+from .stats import percentile
+
 
 def workload_plan(workloads, count):
     """Apportion a finite conversation budget, then interleave its task types."""
@@ -28,13 +30,9 @@ def _summary(records, stats):
     values = stats(records)
     rates = sorted(r.generation_tokens_per_second for r in records
                    if r.generation_tokens_per_second is not None)
-    # Interpolated percentile, matching the runner's percentile convention.
-    position = (len(rates) - 1) * .1
-    lower = int(position) if rates else 0
     values.update(
         generation_tokens_per_second_mean=mean(rates) if rates else None,
-        generation_tokens_per_second_p10=(rates[lower] + (rates[min(lower + 1, len(rates)-1)]
-            - rates[lower]) * (position-lower)) if rates else None,
+        generation_tokens_per_second_p10=percentile(rates, .1),
         unmeasured_generation_requests=values["completed"] - len(rates),
         capped_responses=sum(r.finish_reason == "length" for r in records),
     )

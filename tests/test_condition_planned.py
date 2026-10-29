@@ -1,4 +1,5 @@
 """The live condition skin starts from configured work, not observed requests."""
+import threading
 import asyncio
 
 import httpx
@@ -64,14 +65,14 @@ def test_exact_consistency_plan_pages_waiting_placeholders_without_fabricated_re
 
 @pytest.mark.asyncio
 async def test_run_exposes_all_waiting_conditions_before_first_event_and_updates_in_place(tmp_path, monkeypatch):
-    entered, release = asyncio.Event(), asyncio.Event()
-    emitted = asyncio.Event()
+    entered, release = threading.Event(), threading.Event()
+    emitted = threading.Event()
     config = load_config()
     planned = [row["condition_id"] for row in planned_conditions(config)]
 
     async def held_runner(config, *, progress, stop_event):
         entered.set()
-        await release.wait()
+        assert await asyncio.to_thread(release.wait, 3)
         first = planned_conditions(config)[0]
         progress({"event": "condition_started", "target": "local", "scenario": planned[0],
                   "condition_summary": {**first, "status": "running", "aggregate_status": "running"}})
@@ -90,14 +91,14 @@ async def test_run_exposes_all_waiting_conditions_before_first_event_and_updates
             assert started.status_code == 202, started.text
             identifier = started.json()["id"]
             assert [row["condition_id"] for row in started.json()["live_conditions"]] == planned
-            await entered.wait()
+            assert await asyncio.to_thread(entered.wait, 3)
             initial = (await client.get(f"/api/runs/{identifier}")).json()["live_conditions"]
             assert [row["condition_id"] for row in initial] == planned
             assert all(row["aggregate_status"] == "waiting" for row in initial)
             paged = await client.get(f"/api/runs/{identifier}/conditions/{planned[-1]}/requests")
             assert paged.status_code == 200 and paged.json()["aggregate"]["status"] == "waiting"
             release.set()
-            await emitted.wait()
+            assert await asyncio.to_thread(emitted.wait, 3)
             updated = (await client.get(f"/api/runs/{identifier}")).json()["live_conditions"]
             assert [row["condition_id"] for row in updated] == [*planned, "unplanned-extra"]
             assert updated[0]["aggregate_status"] == "running"

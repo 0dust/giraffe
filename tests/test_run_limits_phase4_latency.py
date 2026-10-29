@@ -79,14 +79,14 @@ def test_write_report_persists_summary_without_replacing_web_metadata(tmp_path):
 def test_summary_write_failure_keeps_complete_report_and_saves_warning(tmp_path, monkeypatch):
     import giraffe.reporting as reporting
 
-    original = reporting._atomic_write
+    original = reporting.update_metadata
 
-    def fail_metadata(path, content):
-        if path.name == ".web.json":
+    def fail_metadata(directory, changes):
+        if "latency_summary" in changes:
             raise OSError(errno.ENOSPC, "sensitive filesystem path")
-        return original(path, content)
+        return original(directory, changes)
 
-    monkeypatch.setattr(reporting, "_atomic_write", fail_metadata)
+    monkeypatch.setattr(reporting, "update_metadata", fail_metadata)
     current = report()
     json_path, _ = write_report(current, tmp_path)
     expected = "Latency summary could not be saved: disk full"

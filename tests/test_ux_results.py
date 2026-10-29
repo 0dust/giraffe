@@ -26,7 +26,7 @@ const bootstrap=BOOTSTRAP;
 const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}},listeners={},warnings=[];
 const context={assert,structuredClone,...formConfig,bootstrap,nodes,listeners,warnings,console:{warn:(...args)=>warnings.push(args)},
   document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},
-  window:{addEventListener(){}}};
+  window:{addEventListener(kind,fn){listeners['window:'+kind]=fn;}}};
 if(USE_DOM){context.document=browserDOM(listeners);context.location={hash:'#runs/live'};context.setTimeout=()=>{};context.clearTimeout=()=>{};context.window.innerWidth=1280;context.window.innerHeight=800;context.window.matchMedia=()=>({matches:false});nodes['#main']=context.document.querySelector('#main');}
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
@@ -102,8 +102,8 @@ assert.match(html,/placeholder="Search runs"/);
 assert.doesNotMatch(html,/Latest run|history-overview|What gets checked|suite-list|2 saved runs|table-note|run-id|Baseline compared|Duration|1 failed|2 blocked|3 inconclusive/);
 state.filter='pass';renderRuns();html=nodes['#main'].innerHTML;
 assert.match(html,/No matching runs/);assert.match(html,/data-action="clear-filter"/);
-state.filter='cancelled';renderRuns();html=nodes['#main'].innerHTML;
-assert.match(html,/#runs\/cancelled/);assert.match(html,/Cancelled/);
+state.filter='stopped';renderRuns();html=nodes['#main'].innerHTML;
+assert.match(html,/#runs\/cancelled/);assert.match(html,/Stopped/);
 assert.doesNotMatch(html.split('class="history-table"')[1],/#runs\/failed/);
 state.filter='all';state.historySearch='<target>';renderRuns();html=nodes['#main'].innerHTML;
 assert.match(html,/#runs\/failed/);assert.doesNotMatch(html.split('class="history-table"')[1],/#runs\/cancelled/);
@@ -128,35 +128,38 @@ renderRuns();assert(search.focused);assert.equal(search.start,1);assert.equal(se
 def test_failures_and_partial_results_do_not_promote_saving_a_baseline():
     run_render_checks(r"""
 const failed=report([check('correctness','fail',{
-  summary:'Expected <Paris>; inspect the returned answer.',metrics:{correct:1,scored:3}})],{overall:'fail'});
+  summary:'Expected <Paris>; inspect the returned answer.',metrics:{correct:1,scored:3},evidence_ids:['bad']})],{overall:'fail',requests:[{id:'bad',target:'local',status:'completed',score:false,output:'Lyon',evaluation:{expected:'Paris',expected_provided:true}}]});
 let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
-assert.match(html,/Expected &lt;Paris&gt;/);
-assert.match(html,/class="button primary" data-action="rerun">Review settings/);
+assert.match(html,/1 of 3 answers matched the expected answer/);
+assert.match(html,/Expected:<\/strong> Paris/);
+assert.match(html,/Expected &lt;Paris&gt;/,'the recorded failure explanation remains visible');
+assert.match(html,/class="button primary" data-action="show-failing">Show failing requests/);
 assert.doesNotMatch(html,/inspect-finding|Inspect failed answer|Inspect evidence|Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
-assert.match(html,/Save as reference baseline/);
+assert.match(html,/Save as baseline/);
 assert.match(html,/report\.html" download/);
 assert.match(html,/report\.json" download/);
 assert.match(html,/http:\/\/localhost:8000\/v1/);
 const passed=report([check('access','pass')]);
 html=detail(passed);
 assert.match(html,/class="button primary" data-action="baseline-dialog"/);
-assert.match(html,/applies to the endpoint and traffic tested here/);
+assert.match(html,/recorded checks met their configured limits/);
 html=detail({...passed,abort_reason:'maximum request budget reached',overall:'inconclusive'});
 assert.match(html,/Run stopped with partial results/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail(passed,{state:'error',error:'Could not save all artifacts'});
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail({...passed,checks:[...passed.checks,check('gpu','inconclusive',{required:false})]});
-assert.match(html,/<h1>GPU metrics is inconclusive<\/h1>/);
-assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
+assert.match(html,/<h1>1 check passed<\/h1>/);assert.match(html,/Server observations/);
+assert.match(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail({...passed,overall:'fail',baseline:{status:'fail'}});
 assert.match(html,/A material regression was detected/);
-assert.match(html,/class="button primary" data-tab="baseline">Inspect comparison/);
+assert.match(html,/class="button primary" data-action="show-comparison">Show comparison/);
+assert.doesNotMatch(html,/data-action="show-failing"/);
 html=detail(report([]));
 assert.match(html,/<h1>No checks ran<\/h1>/);
-assert.doesNotMatch(html,/Selected acceptance checks passed|checks met their configured limits/);
+assert.doesNotMatch(html,/1 check passed|checks met their configured limits/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 """)
 
@@ -171,30 +174,28 @@ const value=report([
 value.manifest.config.checks.push('tools');
 let html=detail(value);
 assert(html.indexOf('data-check="local:correctness"')<html.indexOf('data-check="local:access"'));
-assert.match(html,/<details class="checks-not-run"\s*>/);
-const disclosure=html.match(/<details class="checks-not-run"[^>]*>([\s\S]*?)<\/details>/)[1];
-assert.match(disclosure,/Not run · 2/);
-assert.match(disclosure,/data-check="local:json"/);
-assert.match(disclosure,/Server did not expose &lt;tools&gt;/);
+assert.match(html,/<details class="checks-not-selected">/);
+const disclosure=html.match(/<details class="checks-not-selected"[^>]*>([\s\S]*?)<\/details>/)[1];
+assert.match(disclosure,/JSON correctness/);for(const entry of bootstrap.checks.filter(item=>!value.manifest.config.checks.includes(item.id)))assert(disclosure.includes(escape(entry.title)),entry.title);
+assert.doesNotMatch(html,/data-check="local:json"/);
+assert.match(html,/Server did not expose &lt;tools&gt;/);
 assert.doesNotMatch(disclosure,/data-check="local:access"|data-check="local:correctness"/);
 state.selectedCheck='local:tools';html=renderChecks(value);
-assert.match(html,/<details class="checks-not-run" open>/);
 assert.match(html,/This check was skipped/);
-assert.doesNotMatch(html,/This optional check was not selected/);
 state.selectedCheck='local:json';html=renderChecks(value);
-assert.match(html,/This check was not selected/);
+assert.doesNotMatch(html,/data-check="local:json"/);
 const allSkipped=report([check('json','skipped',{summary:'Not selected for this run.'})],{overall:'skipped'});
 html=detail(allSkipped);
 assert.match(html,/<h1>No checks ran<\/h1>/);
-assert.match(html,/<details class="checks-not-run"\s*>/);
+assert.match(html,/<details class="checks-not-selected">/);
 assert.equal(state.selectedCheck,null);
 const selectedSkipped=report([check('access','pass'),check('tools','skipped',{
   summary:'The server did not expose <tools>.'})]);
 selectedSkipped.manifest.config.checks.push('tools');
 html=detail(selectedSkipped);
 assert.match(html,/<h1>Some selected checks did not run<\/h1>/);
-assert.match(html,/Acceptance inconclusive/);
-assert.doesNotMatch(html,/Acceptance passed|Selected acceptance checks passed/);
+assert.match(html,/result-heading inconclusive/);
+assert.doesNotMatch(html,/Acceptance passed|1 check passed/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 """)
 
@@ -205,15 +206,13 @@ state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'te
   max_requests:100,concurrency:4,max_duration_seconds:60,request_timeout_seconds:10,max_output_tokens:32},
   progress:{attempted:12,completed:9,elapsed_seconds:5},events:[]};
 renderLive();let html=nodes['#main'].innerHTML;
-assert.match(html,/Mission control/);
-assert.match(html,/Requests finished \/ started/);
-assert.match(html,/Active requests<\/dt><dd>3/);
-assert.match(html,/Requests started · 12 \/ 100 limit/);
-assert.match(html,/Request starts, not completions/);
-assert.match(html,/Scheduled requests can also use budget without reaching the server/);
+assert.match(html,/<h1>Running<\/h1>/);
+assert.match(html,/9 requests finished · 5s · limit 100/);
+assert.doesNotMatch(html,/Requests started ·|Active requests<\/dt>/);
+assert.doesNotMatch(html,/Scheduled requests can also use budget without reaching the server/);assert.match(fieldDescription('max_requests').help,/without reaching the server/);
 assert.doesNotMatch(html,/Request budget used/);
 state.detail.state='stopping';renderLive();html=nodes['#main'].innerHTML;
-assert.match(html,/data-action="stop" disabled/);
+assert.match(html,/data-action="stop"[^>]* disabled/);
 assert.match(html,/saving the evidence collected so far/);
 state.detail.state='running';state.detail.progress={phase:'judging',attempted:12,completed:12,
   judge_calls_completed:3,judge_calls_total:8};
@@ -235,18 +234,15 @@ const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'lo
 const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
 state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
 let html=renderComparison(value);
-assert.match(html,/The comparison is inconclusive/);assert.match(html,/does not establish improvement or regression/);
 assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
-assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);
-assert.match(html,/data-comparison-group="context"/);assert.match(html,/Context recall/);
-assert.match(html,/1 regressed · 1 inconclusive/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
-assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
-assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
-state.comparisonFilter='all';html=renderComparison(value);
-assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
-assert.equal((html.match(/<tr>/g)||[]).length,5); // Three measurements and two group headers.
-state.comparisonFilter='pass';state.comparisonCheck='context';html=renderComparison(value);
-assert.match(html,/No measurements match/);
+assert.match(html,/<th scope="col">Metric<\/th>/);assert.match(html,/worse/);assert.match(html,/not comparable/);
+assert.match(html,/no material change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>|Entry \d/);
+assert.equal((html.match(/data-comparison-condition=/g)||[]).length,1); // One condition header, then one row per measurement.
+assert.equal((html.match(/class="comparison-metric"/g)||[]).length,3);
+for(const metric of ['Latency','Time to first answer','Correct answers'])assert(html.includes(metric));
+assert.equal((html.match(/data-comparison-condition/g)||[]).length,1);
+assert.equal((html.match(/data-label="Verdict">not comparable/g)||[]).length,1);assert.match(html,/Sample variation/);
 assert.equal(JSON.stringify(value),original);
 """)
 
@@ -283,7 +279,8 @@ for(const [id,bad,failed,good] of [['correctness','correct-bad','correct-timeout
 def test_checks_without_request_evidence_show_explanation_and_measurements():
     run_render_checks(r"""
 const value=report([check('first_output','blocked',{summary:'Endpoint &lt;local&gt; did not become ready.',metrics:{attempted:3,completed:0,failed:2,timed_out:1,first_output_p95_ms:321}}),check('generation','inconclusive',{summary:'No measurable generation samples.',metrics:{attempted:2,completed:0,generation_rate_samples:0}})],{overall:'inconclusive'});
-let html=detail(value);
+state.selectedCheck='local:first_output';state.detail={report:value};
+let html=renderChecks(value);
 assert.match(html,/Endpoint &amp;lt;local&amp;gt; did not become ready/);
 assert.match(html,/321 ms/);assert.match(html,/2 failed · 1 timed out/);
 assert.match(html,/No request evidence was recorded for this check/);
@@ -297,16 +294,16 @@ def test_report_tabs_keep_one_tab_stop_and_support_keyboard_navigation():
     run_render_checks(r"""
 const value=report([check('access','pass')]);detail(value);
 assert.equal($$('[role="tab"]').length,2);
-assert.equal($('#tab-performance').getAttribute('aria-selected'),'true');
-assert.equal($('#tab-results').getAttribute('tabindex'),'-1');
+assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
+assert.equal($('#tab-performance').getAttribute('tabindex'),'-1');
 let prevented=0;
 const key=key=>listeners.keydown({target:document.activeElement,key,preventDefault(){prevented++;}});
 $('#tab-performance').focus({preventScroll:true});key('ArrowRight');
 assert.equal(reportView.tab,'results');assert.equal(document.activeElement,$('#tab-results'));
 assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
 assert.equal($('#tab-performance').getAttribute('tabindex'),'-1');
-key('Home');assert.equal(reportView.tab,'performance');
-key('ArrowLeft');assert.equal(reportView.tab,'results');
+key('Home');assert.equal(reportView.tab,'results');
+key('ArrowLeft');assert.equal(reportView.tab,'performance');
 assert.equal(prevented,3);assert.equal($$('[role="tab"][tabindex="0"]').length,1);
 """, dom=True)
 
@@ -349,9 +346,10 @@ const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive'];
 assert.equal(new Set(statuses.map(status=>statusLabels[status])).size,statuses.length);
 assert.equal(new Set(statuses.map(status=>statusIcons[status])).size,statuses.length);
 for(const status of statuses){assert(statusLabels[status]);assert.match(badge(status),new RegExp(statusLabels[status]));}
-const records=['completed','failed','timeout','cancelled','skipped','completed'].map((status,i)=>({id:'r'+i,status,valid:true,score:i===0?true:null}));
+const records=['completed','failed','timeout','cancelled','skipped','completed'].map((status,i)=>({id:'r'+i,scenario:'correctness',check_ids:['correctness'],status,valid:true,score:i===0?true:null}));
 const html=renderMosaic(records);
-for(const status of statuses){assert(html.includes('request-spot '+status));assert(html.includes(statusLabels[status]));}
+for(const status of ['pass','fail','timeout','cancelled','skipped','unscored']){assert(html.includes('status '+status),status);assert(html.includes(status==='unscored'?'Unscored':statusLabels[status]),status);}
+assert.doesNotMatch(html,/status inconclusive/,'completed unscored requests must be labeled Unscored');
 """)
 
 
@@ -395,3 +393,29 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
             assert '.queued' not in selector and '.reserved' not in selector
     assert animated, 'The parser must inspect real animation rules'
     assert '.is-landing' not in css
+
+
+def test_check_details_show_recorded_effective_limits_and_default_labels():
+    run_render_checks(r"""
+const first=check('first_output','pass'),generation=check('generation','pass');
+const value=report([first,generation]);
+value.manifest.effective_checks={first_output:{limits:{first_output_ms:10000}},generation:{limits:{stream_gap_ms:5000}}};
+value.manifest.default_check_limits={first_output:['first_output_ms'],generation:['stream_gap_ms']};
+const original=JSON.stringify(value);
+let markup=renderCheck(first,value);
+assert.match(markup,/Limit: ≤ 10 s \(default\)/);
+assert.doesNotMatch(markup,/No acceptance limit set/);
+markup=renderCheck(generation,value);
+assert.match(markup,/Limit: ≤ 5 s \(default\)/);
+assert.doesNotMatch(markup,/No stream-pause limit set/);
+assert.equal(JSON.stringify(value),original);
+value.manifest.config.limits.first_output_ms=123;
+value.manifest.effective_checks.first_output.limits.first_output_ms=800;
+value.manifest.default_check_limits.first_output=[];
+markup=renderCheck(first,value);
+assert.match(markup,/Limit: ≤ 800 ms/);assert.doesNotMatch(markup,/\(default\)|123 ms/);
+value.manifest.effective_checks.first_output.limits.first_output_ms=null;
+markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
+delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
+markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
+""")

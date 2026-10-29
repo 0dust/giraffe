@@ -5,76 +5,94 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
+from functools import cached_property
 import math
 import re
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args, get_origin
 
 from pydantic_core import PydanticCustomError
 from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
 
 
+from . import __version__
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
                    MAX_STAGE_SECONDS, MAX_SESSIONS,
                    MAX_SESSION_TURNS, MAX_SESSION_TURN_CHARS, MAX_TOOL_CONFIG_BYTES, MAX_TOOL_RESULT_BYTES,
-                   MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES)
+                   MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
+                   MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS)
 
 
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
+# Public display names have one source; compatibility imports share this object.
 CHECK_NAMES = {
-    "access": "Network and access",
-    "serving": "Serving success",
-    "first_output": "First useful output",
-    "generation": "Generation pace",
-    "capacity": "Arrival traffic capacity",
-    "fairness": "Mixed long/short fairness",
-    "context": "Long-context behavior",
-    "correctness": "Known-answer correctness",
-    "json": "Structured JSON",
-    "cancellation": "Limits and cancellation",
-    "recovery": "Sustained load and recovery",
-    "gpu": "GPU observations",
-}
-CORE_CHECKS = tuple("concurrency" if name == "fairness" else name for name in CHECK_NAMES)
-DEFAULT_CHECKS = tuple("concurrency" if name == "fairness" else name
-                       for name in CORE_CHECKS if name not in {"json", "gpu"})
-CHECK_NAMES.update({
-    "arrivals": "Scheduled arrivals", "prefix": "Shared prefixes and cache evidence",
-    "buckets": "Input/output and concurrency coverage", "mixed": "Mixed workload interference",
-    "sessions": "Multi-turn sessions", "consistency": "Repeated-request consistency",
-    "tools": "Tool-calling capability",
-})
-# Legacy titles remain readable for saved reports; execution uses public check ids.
-INTERNAL_CHECK_NAMES = {**CHECK_NAMES, "token_stress": "Token stress cases",
-                        "concurrency": "Concurrent load"}
-CHECK_NAMES = {("concurrency" if key == "fairness" else key):
-               ("Concurrent load" if key == "fairness" else title)
-               for key, title in CHECK_NAMES.items() if key not in {"buckets", "mixed"}}
-# Current check-list names for actionable diagnostics. Saved report and request
-# breakdown titles above stay stable for comparisons with earlier runs.
-CATALOGUE_NAMES = {
-    "access": "Endpoint response", "serving": "Invalid responses",
-    "correctness": "Answer correctness", "json": "JSON correctness",
-    "context": "Context recall", "tools": "Tool-call correctness",
-    "first_output": "First answer", "generation": "Generation",
-    "capacity": "Capacity under load", "concurrency": "Concurrent load",
-    "arrivals": "Arrival traffic", "recovery": "Recovery after load",
-    "sessions": "Concurrent conversations", "consistency": "Answer consistency",
-    "cancellation": "Cancellation & timeouts", "prefix": "Prompt cache evidence",
+    "access": "Endpoint access",
+    "serving": "Response validity",
+    "first_output": "Time to first answer",
+    "generation": "Generation speed",
+    "load": "Load test",
+    "context": "Long-context recall",
+    "correctness": "Answer correctness",
+    "json": "JSON correctness",
+    "cancellation": "Cancellation & limits",
+    "recovery": "Recovery after load",
     "gpu": "GPU metrics",
+    "prefix": "Prefix cache",
+    "sessions": "Multi-turn sessions",
+    "consistency": "Answer consistency",
+    "tools": "Tool calling",
 }
-for _old_check in ("concurrency", "capacity", "arrivals"):
-    CHECK_NAMES.pop(_old_check, None)
-    CATALOGUE_NAMES.pop(_old_check, None)
-CHECK_NAMES["load"] = CATALOGUE_NAMES["load"] = INTERNAL_CHECK_NAMES["load"] = "Load test"
-CORE_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in CORE_CHECKS))
-DEFAULT_CHECKS = tuple(dict.fromkeys("load" if c in {"concurrency", "capacity"} else c for c in DEFAULT_CHECKS))
+CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
+CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
+               "correctness", "json", "cancellation", "recovery", "gpu")
+DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
+# Saved pre-v2 files with no selection retain their historical workload.
+_LEGACY_DEFAULT_CHECKS = ("access", "serving", "first_output", "generation", "load",
+                          "context", "correctness", "cancellation", "recovery")
 
 SESSION_REPEAT_PROMPT = "Repeat exactly the above answer."
 
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class PersistedModel(Model):
+    """Saved evidence tolerates fields introduced by other Giraffe versions."""
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+
+
+CURRENT_SCHEMA = "4"
+SUPPORTED_SCHEMAS = frozenset({"2", "3", CURRENT_SCHEMA})
+
+
+def is_supported_schema(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (str, int)) and str(value) in SUPPORTED_SCHEMAS
+
+
+def _migrate_report_v2(value: dict) -> dict:
+    return {**value, "schema_version": "3"}
+
+
+def _migrate_report_v3(value: dict) -> dict:
+    # Pre-v4 Phase-A performance blocks were display caches, not authoritative
+    # snapshots. Rebuild them from requests; only v4 pins derived performance.
+    value = {**value, "schema_version": CURRENT_SCHEMA}
+    value.pop("performance", None)
+    return value
+
+
+REPORT_MIGRATIONS = {"2": _migrate_report_v2, "3": _migrate_report_v3}
+
+
+def migrate_report(value: dict) -> dict:
+    version = value.get("schema_version", CURRENT_SCHEMA)
+    if not is_supported_schema(version):
+        raise ValueError(f"Unsupported report schema version: {version}")
+    value = {**value, "schema_version": str(version)}
+    while value["schema_version"] in REPORT_MIGRATIONS:
+        value = REPORT_MIGRATIONS[value["schema_version"]](value)
+    return value
 
 
 class CleanupCriteria(Model):
@@ -105,7 +123,10 @@ class Deployment(Model):
     launch_command: str | list[str] | None = None
     discovery: Literal["none", "ollama", "vllm", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "none"
     collector_url: str | None = None
-    intended_change: str | None = None
+    intended_change: str | Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=MAX_SANITIZE_STRING_CHARS)]],
+        Field(min_length=1, max_length=MAX_SANITIZE_ITEMS),
+    ] | None = None
 
 
 class Arrival(Model):
@@ -595,7 +616,7 @@ def migrate_load_test(value):
     if converted:
         value["load_test"].setdefault("migrated_tests", []).extend(converted)
         notes.append("Multiple saved checks remain separate sequential tests in load_test.migrated_tests; their rates, durations and burst schedules are not blended.")
-    value["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks)) if old_checks else list(DEFAULT_CHECKS)
+    value["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks)) if old_checks else list(_LEGACY_DEFAULT_CHECKS)
     value.pop("concurrent_load", None)
     value.pop("traffic", None)
     value.pop("arrivals", None)
@@ -684,6 +705,17 @@ def migrate_run_limits(value):
     if not is_legacy_config(value):
         return value, []
     value, notes = deepcopy(value), []
+    if "checks" not in value:
+        legacy_load = any(value.get(field) is not None for field in ("concurrent_workloads", "buckets"))
+        checks = ["concurrency" if check == "load" and legacy_load else check
+                  for check in _LEGACY_DEFAULT_CHECKS]
+        checks.extend([*(["json"] if value.get("structured_json") else []),
+                       *(["gpu"] if value.get("metrics") else [])])
+        checks.extend(check for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
+                                                ("sessions", "sessions"), ("consistency", "consistency"),
+                                                ("tool_calling", "tools"), ("tool_checks", "tools"))
+                      if value.get(field) is not None and (field != "tool_calling" or value[field]))
+        value["checks"] = list(dict.fromkeys(checks))
     descriptions = {
         "max_requests": ("300 requests", "a request limit", "Maximum requests"),
         "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
@@ -695,7 +727,7 @@ def migrate_run_limits(value):
             notes.append(f"Earlier Giraffe versions stopped after {old} by default; this configuration did not set {label}, so none applies now. Enable {control} to keep that bound.")
     if value.get("concurrency") is not None:
         value.setdefault("default_concurrency", value["concurrency"])
-        checks = value.get("checks", DEFAULT_CHECKS)
+        checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)
         users = []
         for check in ("correctness", "json", "recovery", "arrivals", "capacity"):
             if check not in checks:
@@ -715,11 +747,9 @@ def migrate_run_limits(value):
         kept = (f"{', '.join(users)} retain legacy {value['default_concurrency']}-request parallelism"
                 if users else "no selected check inherits that parallelism")
         notes.append(f"concurrency: {value['concurrency']} now limits simultaneous requests; default_concurrency={value['default_concurrency']}; {kept}.")
-    else:
-        value.setdefault("default_concurrency", 4)
     if value.get("concurrency") is not None and value.get("overlap_models"):
         parallelism = value["concurrency"]
-        checks = value.get("checks", DEFAULT_CHECKS)
+        checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)
         if "correctness" in checks and value.get("request_source") == "request_pack":
             targets = len(value.get("targets") or []) or 1
             effective = max(1, parallelism // targets)
@@ -738,11 +768,7 @@ def migrate_run_limits(value):
                 own = own.model_dump(exclude_unset=True) if isinstance(own, BaseModel) else own
                 if own.get("max_in_flight") is None:
                     value[field] = {**own, "max_in_flight": parallelism}
-    checks = list(value.get("checks", DEFAULT_CHECKS))
-    if "checks" not in value:
-        checks.extend(check for field, check in (("arrivals", "arrivals"), ("sessions", "sessions"),
-                                                ("consistency", "consistency"))
-                      if value.get(field) is not None)
+    checks = value["checks"]
     parallelism = value.get("concurrency") or 4
     if value.get("custom_fixtures") and "correctness" in checks:
         value["legacy_custom_fixture_max_output_tokens"] = value.get("max_output_tokens", 128)
@@ -899,7 +925,7 @@ def migrate_concurrent_load(value):
     elif legacy:
         # The final catalogue's Load test defaults must not replace an old
         # implicit workload block before its actual scenarios are converted.
-        value["checks"] = list(dict.fromkeys("concurrency" if c == "load" else c for c in DEFAULT_CHECKS))
+        value["checks"] = list(dict.fromkeys("concurrency" if c == "load" else c for c in _LEGACY_DEFAULT_CHECKS))
     for name in ("concurrency", *legacy_checks):
         removed = options.pop(name, None)
         if removed:
@@ -1113,7 +1139,7 @@ class Sessions(Model):
 
 
 class LogprobConsistency(Model):
-    response_mode: Literal["complete"] = "complete"
+    response_mode: Literal["stream", "complete"] = "stream"
     top_logprobs: int = Field(default=5, ge=0, le=20)
     strict: bool = False
     tolerance: float | None = Field(default=None, ge=0)
@@ -1128,7 +1154,7 @@ class LogprobConsistency(Model):
         return self
 
 
-class LogprobAlternative(Model):
+class LogprobAlternative(PersistedModel):
     token: str
     bytes: list[int] | None
     token_id: int | None = None
@@ -1140,7 +1166,7 @@ class LogprobToken(LogprobAlternative):
     top_logprobs: list[LogprobAlternative]
 
 
-class LogprobEvidence(Model):
+class LogprobEvidence(PersistedModel):
     status: Literal["available", "missing", "invalid", "incomplete", "rejected"]
     reason: str
     requested_top_logprobs: int
@@ -1724,11 +1750,13 @@ class ToolChecks(ToolContractModel):
 
 
 class ToolCheckOutcome(ToolContractModel):
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
     status: Literal["pass", "fail", "inconclusive", "not_checked"]
     message: str
 
 
 class ToolEvaluation(ToolContractModel):
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
     choice: ToolCheckOutcome | None = None
     arguments: ToolCheckOutcome | None = None
     task: ToolCheckOutcome | None = None
@@ -1855,7 +1883,7 @@ class JudgingConfig(Model):
         return self
 
 
-class JudgeVote(Model):
+class JudgeVote(PersistedModel):
     judge: str
     url: str
     model: str
@@ -1866,7 +1894,7 @@ class JudgeVote(Model):
     observed_model: str | None = None
 
 
-class RequestJudgement(Model):
+class RequestJudgement(PersistedModel):
     status: Literal["pass", "fail", "inconclusive"]
     votes: list[JudgeVote] = Field(default_factory=list)
 
@@ -2067,9 +2095,16 @@ class RunConfig(Model):
             ):
                 raise ValueError("judge scoring requires at least one judge with a name, URL and model")
 
+    def parallelism_requested(self, check_id: str) -> bool:
+        options = self.test_options.get(check_id)
+        return ("default_concurrency" in self.model_fields_set
+                or bool(options and options.concurrency is not None))
+
     def effective_check(self, check_id: str) -> dict[str, Any]:
         """Resolve sparse overrides once; suite request settings are defaults."""
-        if check_id not in INTERNAL_CHECK_NAMES:
+        # Legacy saved metadata still resolves by id; the public display catalog
+        # contains only selectable checks.
+        if check_id not in CHECK_OPTION_FIELDS and check_id != "load":
             raise ValueError(f"unsupported check: {check_id}")
         if check_id == "load":
             return self.load_test.model_dump(mode="json")
@@ -2089,6 +2124,12 @@ class RunConfig(Model):
         limits = self.limits.model_dump()
         if options.limits:
             limits.update(options.limits.model_dump(exclude_unset=True))
+        supplied = self.limits.model_fields_set | (options.limits.model_fields_set if options.limits else set())
+        if check_id == "first_output" and "first_output_ms" not in supplied:
+            limits["first_output_ms"] = 10000
+        if check_id == "generation" and "stream_gap_ms" not in supplied and not any(
+                limits[key] is not None for key in ("latency_ms", "stream_gap_ms", "min_output_tokens_per_second")):
+            limits["stream_gap_ms"] = 5000
         resolved["limits"] = limits
         if check_id in {"serving", "first_output"}:
             response = self.effective_response()
@@ -2098,6 +2139,12 @@ class RunConfig(Model):
                 "request_timeout_seconds": resolved["request_timeout_seconds"],
             }
         return resolved
+
+    def default_limit_fields(self, check_id: str) -> list[str]:
+        options = self.test_options.get(check_id)
+        supplied = self.limits.model_fields_set | (options.limits.model_fields_set if options and options.limits else set())
+        return [name for name, value in self.effective_check(check_id).get("limits", {}).items()
+                if value is not None and name not in supplied]
 
     def effective_response(self) -> dict[str, Any]:
         """Endpoint response owns shared initial/warm requests.
@@ -2229,6 +2276,21 @@ class RunConfig(Model):
                     schedule.__pydantic_fields_set__ = own.model_fields_set.copy()
                     self.concurrent_load = self.concurrent_load.model_copy(update={"schedule": schedule})
 
+    @model_serializer(mode="wrap")
+    def serialize_parallelism_intent(self, handler):
+        result = handler(self)
+        if "default_concurrency" not in self.model_fields_set:
+            result.pop("default_concurrency", None)
+        return result
+
+    @field_serializer("limits")
+    def serialize_sanity_opt_outs(self, value, info):
+        result = value.model_dump(mode=info.mode)
+        for field in ("first_output_ms", "stream_gap_ms"):
+            if field not in value.model_fields_set:
+                result.pop(field, None)
+        return result
+
     @field_serializer("load_test")
     def serialize_load_test(self, value, info):
         result = value.model_dump(mode=info.mode)
@@ -2261,7 +2323,7 @@ class RunConfig(Model):
 # rebuild schemas or invoke Pydantic's environment-dependent plugin discovery.
 _MIGRATION_INPUT_ADAPTERS = {
     name: TypeAdapter(RunConfig.model_fields[name].rebuild_annotation())
-    for name in ("config_version", "checks")
+    for name in ("config_version", "checks", "structured_json", "metrics", "tool_calling")
 }
 
 
@@ -2321,9 +2383,34 @@ class RequestSpec(Model):
         return self
 
 
-class EvaluationEvidence(Model):
+def _persisted_model_input(model, value):
+    """Ignore future fields in contracts shared by saved evidence and strict config."""
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for name, field in model.model_fields.items():
+        key = field.alias if field.alias in value else name
+        if key not in value:
+            continue
+        item = value[key]
+        annotation = field.annotation
+        choices = get_args(annotation) if get_origin(annotation) is not list else (annotation,)
+        for choice in choices or (annotation,):
+            if isinstance(choice, type) and issubclass(choice, BaseModel):
+                item = _persisted_model_input(choice, item)
+                break
+            if get_origin(choice) is list and isinstance(item, list):
+                child = get_args(choice)[0]
+                if isinstance(child, type) and issubclass(child, BaseModel):
+                    item = [_persisted_model_input(child, row) for row in item]
+                break
+        result[key] = item
+    return result
+
+
+class EvaluationEvidence(PersistedModel):
     """The actual input and answer check used for one request; never credentials."""
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, populate_by_name=True, serialize_by_alias=True)
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False, populate_by_name=True, serialize_by_alias=True)
     messages: list[dict[str, Any]]
     scorer: str
     expected: Any = None
@@ -2332,12 +2419,17 @@ class EvaluationEvidence(Model):
     tool_expectation: ToolExpectation | None = None
     schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
+    @field_validator("tool_expectation", mode="before")
+    @classmethod
+    def tolerate_saved_tool_fields(cls, value):
+        return _persisted_model_input(ToolExpectation, value)
+
 
 # Coarse bursts cannot establish a reliable answer-token generation rate.
 MAX_TOKENS_PER_READ = 16
 
 
-class RequestRecord(Model):
+class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
@@ -2555,20 +2647,56 @@ class RequestRecord(Model):
         return later * 1000 / (self.last_output_ms - self.first_output_ms)
 
 
-class CheckResult(Model):
+class CheckResult(PersistedModel):
     id: str
     target: str
     title: str
     status: Status
     required: bool = True
     summary: str
+    # UI findings and actions are separate from CLI guidance retained in summary.
+    finding_summary: str | None = None
+    remediation: dict[str, Any] | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     evidence_ids: list[str] = Field(default_factory=list)
 
+    @model_serializer(mode="wrap")
+    def serialize_finding_metadata(self, handler):
+        value = handler(self)
+        for name in ("finding_summary", "remediation"):
+            if getattr(self, name) is None:
+                value.pop(name, None)
+        return value
 
-class RunReport(Model):
-    schema_version: str = "3"
-    suite_version: str = "0.1.0"
+    @model_validator(mode="before")
+    @classmethod
+    def observation_defaults(cls, value: Any) -> Any:
+        # Generated observations omit required; archived reports explicitly save it.
+        # Keep assessment-only changes out of the workload generator's identity.
+        if isinstance(value, dict) and value.get("id") == "prefix" and "required" not in value:
+            value = {**value, "required": False}
+            if value.get("status") == "fail":
+                value["status"] = "inconclusive"
+            summary = value.get("summary", "")
+            if summary.startswith("no prefix reuse observed on a majority of repeats;"):
+                value["summary"] = "Prefix caching not active;" + summary.split(";", 1)[1]
+            elif summary.startswith("Prefix is estimated below 512 tokens;"):
+                value["summary"] = "Prefix caching not active; " + summary
+        return value
+
+
+class RunReport(PersistedModel):
+    @cached_property
+    def _stored_derived(self) -> bool:
+        # Operational cache provenance is excluded from report equality and JSON.
+        return False
+
+    @cached_property
+    def _source_schema(self) -> str | int | None:
+        return CURRENT_SCHEMA
+
+    schema_version: str = CURRENT_SCHEMA
+    suite_version: str = __version__
     run_id: str
     started_at: str
     finished_at: str
@@ -2584,13 +2712,37 @@ class RunReport(Model):
     abort_reason: str | None = None
     limits_reached: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def remember_source_schema(cls, value, handler):
+        report = handler(value)
+        if isinstance(value, dict):
+            report._source_schema = value.get("schema_version")
+        return report
+
     @model_validator(mode="after")
     def aggregate_performance(self, info: ValidationInfo):
+        self._stored_derived = "performance" in self.model_fields_set
         if not (info.context or {}).get("metadata_only"):
-            from .performance import refresh_performance
+            from .performance import build_performance
+            from .conditions import aggregate_conditions
 
-            refresh_performance(self)
+            missing = {"performance", "conditions"} - self.model_fields_set
+            if "performance" in missing or self._stored_derived:
+                self.performance = build_performance(self)
+            if "conditions" in missing:
+                self.conditions = aggregate_conditions(self)
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_saved_report(cls, value):
+        if not isinstance(value, dict) or "schema_version" not in value:
+            return value
+        value = migrate_report(value)
+        if not {"performance", "conditions"} <= value.keys():
+            value["observations"] = {**value.get("observations", {}), "derived_recomputed": True}
+        return value
 
     @model_validator(mode="before")
     @classmethod
