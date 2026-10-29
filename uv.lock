@@ -394,12 +394,10 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "tiktoken" },
-    { name = "transformers" },
     { name = "uvicorn" },
 ]
 
@@ -408,6 +406,10 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+]
+hf-tokenizer = [
+    { name = "jinja2" },
+    { name = "transformers" },
 ]
 sglang-tracing = [
     { name = "opentelemetry-proto" },
@@ -424,7 +426,7 @@ release = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
-    { name = "jinja2", specifier = ">=3.1,<4" },
+    { name = "jinja2", marker = "extra == 'hf-tokenizer'", specifier = ">=3.1,<4" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "opentelemetry-proto", marker = "extra == 'sglang-tracing'", specifier = ">=1.40,<2" },
     { name = "pydantic", specifier = ">=2.11,<3" },
@@ -433,10 +435,10 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },
     { name = "tiktoken", specifier = ">=0.8,<1" },
-    { name = "transformers", specifier = ">=4.45,<6" },
+    { name = "transformers", marker = "extra == 'hf-tokenizer'", specifier = ">=4.45,<6" },
     { name = "uvicorn", specifier = ">=0.30,<1" },
 ]
-provides-extras = ["dev", "sglang-tracing"]
+provides-extras = ["dev", "hf-tokenizer", "sglang-tracing"]
 
 [package.metadata.requires-dev]
 release = [

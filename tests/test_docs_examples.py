@@ -77,8 +77,12 @@ def test_readme_quickstart_uses_shared_defaults_and_model_discovery():
 
 
 def test_docs_use_current_flags_and_describe_output_controls():
+    # Legacy spellings remain documented as migrations, but runnable examples
+    # should teach the current interface.
     for document in DOCUMENTS:
-        assert '--concurrency' not in document
+        for block in re.findall(r'```sh\n(.*?)```', document, re.DOTALL):
+            assert '--concurrency' not in block
+    assert '`--concurrency` still sets both and prints a migration note' in RUNNING
     assert '--output-format json' in README and '--json' in README
     assert '--structured-output' in README and '--verbose' in README
 
@@ -99,6 +103,13 @@ def test_running_guide_exit_codes_match_cli_help(capsys):
                          ids=lambda block: 'targets' if block.startswith('targets:') else 'traffic')
 def test_documented_yaml_settings_validate_and_cover_fixed_work(block):
     values = yaml.safe_load(block)
+    if 'steps' in values:
+        # The Action example is workflow YAML, rather than a run config.
+        action = next(step for step in values['steps'] if step.get('uses', '').startswith('0dust/giraffe@'))
+        inputs = action['with']
+        parser().parse_args(['run', '--url', inputs['url'], '--checks', inputs['checks'],
+                             '--fail-on', inputs['fail-on']])
+        return
     values.setdefault('targets', [{'name': 'local', 'url': 'http://localhost/v1', 'model': 'example'}])
     config = RunConfig.model_validate(values)
     plan = request_plan(config)

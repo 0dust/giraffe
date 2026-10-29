@@ -60,6 +60,194 @@ function detail(value,extra={}) {
     assert result.returncode == 0, result.stderr
 
 
+def test_post_run_baseline_picker_filters_self_and_ignores_stale_navigation():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  toast=message=>{throw Error(message);};
+  detail(report([check('serving','pass')]));
+  assert(document.querySelector('[data-action="compare-saved"]'));
+  let calls=[];
+  api=async path=>{calls.push(path);return {baselines:[
+    {id:'self',run_id:'saved-run',name:'Own snapshot'},
+    {id:'reference',run_id:'other-run',name:'Before <upgrade>',saved_at:'2026-10-15T09:00:00Z'}
+  ]};};
+  await openComparisonDialog();
+  assert(dialog.open);
+  assert.deepEqual(calls,['/api/baselines']);
+  const options=dialog.querySelectorAll('option');
+  assert.equal(options.length,1);assert.equal(options[0].getAttribute('value'),'reference');
+  assert.match(dialog.textContent,/Before <upgrade>/);
+  assert.equal(dialog.querySelector('upgrade'),null);
+  dialog.close();
+  api=async()=>({baselines:[{id:'self',run_id:'saved-run',name:'Own snapshot'}]});
+  await openComparisonDialog();
+  assert(dialog.querySelector('[type="submit"]').hasAttribute('disabled'));
+  assert.match(dialog.textContent,/No other saved baselines/);
+  dialog.close();
+  let resolve;
+  api=()=>new Promise(done=>{resolve=done;});
+  const opening=openComparisonDialog();state.routeVersion++;
+  resolve({baselines:[]});await opening;
+  assert.equal(dialog.open,false);
+})();
+""", dom=True)
+
+
+def test_saved_comparison_preserves_findings_and_grouped_comparison_results():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  const messages=[];toast=message=>messages.push(message);
+  const failed=report([check('correctness','fail',{metrics:{correct:0,scored:1},evidence_ids:['bad']})],{
+    overall:'fail',requests:[{id:'bad',target:'local',scenario:'question',status:'completed',valid:true,
+      score:false,output:'Lyon',evaluation:{expected:'Paris',expected_provided:true}}]
+  });
+  detail(failed);
+  const heading=()=>document.querySelector('.page-heading');
+  assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
+  const compare=heading().querySelector('[data-action="compare-saved"]');
+  assert(compare);assert.equal(compare.classList.contains('primary'),false);
+  const baseline={run_id:'reference-run',status:'inconclusive',acceptance:{baseline:'pass',current:'fail'},targets:[{target:'local',status:'pass',comparisons:[{
+    check:'correctness',metric:'latency_ms',scenario:'question',baseline:100,current:100,
+    baseline_samples:6,current_samples:6,status:'inconclusive',warnings:[{message:'Client scheduling delay affects attribution'}],reason:'Timing warning'
+  }]}]};
+  const calls=[];
+  api=async(path,options)=>{
+    calls.push([path,options?.method||'GET']);
+    if(path==='/api/baselines')return {baselines:[{id:'reference',run_id:'reference-run',name:'Before upgrade'}]};
+    if(path==='/api/runs/saved-run/compare'){
+      assert.equal(options.method,'POST');assert.deepEqual(JSON.parse(options.body),{baseline_id:'reference'});return {};
+    }
+    assert.equal(path,'/api/runs/saved-run');
+    return {id:'saved-run',state:'completed',baseline_id:'reference',report:{...failed,baseline}};
+  };
+  await listeners.click({target:compare,preventDefault(){}});
+  assert(dialog.open);
+  await compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+  assert.deepEqual(calls,[['/api/baselines','GET'],['/api/runs/saved-run/compare','POST'],['/api/runs/saved-run','GET']]);
+  assert.equal(dialog.open,false);assert.equal(state.detail.baseline_id,'reference');
+  assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
+  assert.equal(heading().querySelector('[data-action="compare-saved"]').textContent,'Change baseline');
+  const comparison=document.querySelector('#report-baseline-reference');
+  assert(comparison.open);assert.equal(comparison.querySelectorAll('[data-comparison-group]').length,1);
+  assert.match(comparison.textContent,/Before upgrade/);assert.match(comparison.textContent,/100 ms/);
+  assert.match(comparison.textContent,/Baseline: Passed/);assert.match(comparison.textContent,/Current: Failed/);
+  assert.match(comparison.textContent,/1 measurements · 1 with warnings/);
+  assert.match(comparison.textContent,/Client scheduling delay affects attribution/);
+  assert.equal(comparison.querySelectorAll('[data-metric]').length,1);
+  assert.doesNotMatch(comparison.querySelector('[data-metric]').textContent,/worse/);
+  await listeners.click({target:heading().querySelector('.button.primary'),preventDefault(){}});
+  const evidence=document.querySelector('.check-detail .evidence-table');
+  assert(evidence);assert.match(evidence.textContent,/Paris/);assert.match(evidence.textContent,/Lyon/);
+  assert.match(messages.at(-1),/No new requests were sent/);
+})();
+""", dom=True)
+
+def test_saved_comparison_stays_pending_across_close_and_reopen():
+    run_render_checks(r"""
+(async()=>{
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  const messages=[];toast=message=>messages.push(message);
+  globalThis.FormData=class{constructor(form){this.form=form;}get(){return this.form.baselineChoice;}};
+  detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail),pending=[];
+  let writes=0,persisted=initial;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'a',name:'Reference A'},{id:'b',name:'Reference B'}]};
+    if(options?.method==='POST'){
+      writes++;persisted={...initial,baseline_id:JSON.parse(options.body).baseline_id};return {};
+    }
+    const snapshot=structuredClone(persisted);
+    return new Promise(resolve=>pending.push(()=>resolve(snapshot)));
+  };
+  await openComparisonDialog();
+  const form=dialog.querySelector('form');form.baselineChoice='a';
+  const first=compareSavedRun({preventDefault(){},target:form});
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(pending.length,1);
+  await listeners.click({target:form.querySelector('[data-action="close-dialog"]'),preventDefault(){}});
+  assert.equal(dialog.open,false);
+  await openComparisonDialog();
+  assert.equal(dialog.open,false);
+  assert.match(messages.at(-1),/still being saved/);
+  form.baselineChoice='b';
+  await compareSavedRun({preventDefault(){},target:form});
+  assert.equal(writes,1);assert.equal(pending.length,1);
+  pending[0]();await first;
+  assert.equal(state.detail.baseline_id,'a');
+  await openComparisonDialog();
+  const next=dialog.querySelector('form');next.baselineChoice='b';
+  const second=compareSavedRun({preventDefault(){},target:next});
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(writes,2);pending[1]();await second;
+  assert.equal(state.detail.baseline_id,'b');assert.equal(persisted.baseline_id,'b');
+  assert.equal(dialog.open,false);
+})();
+""", dom=True)
+
+
+@pytest.mark.parametrize("phase", ["post", "detail"])
+@pytest.mark.parametrize("navigate", [False, True])
+def test_saved_comparison_failure_releases_pending_and_respects_navigation(phase, navigate):
+    run_render_checks(r"""
+(async()=>{
+  const phase=PHASE,navigate=NAVIGATE;
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  toast=()=>{};detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail);let reject;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+    if(options?.method==='POST'&&phase==='detail')return {};
+    return new Promise((_,fail)=>{reject=fail;});
+  };
+  await openComparisonDialog();
+  const form=dialog.querySelector('form'),error=dialog.querySelector('#comparison-error');
+  const saving=compareSavedRun({preventDefault(){},target:form});
+  await Promise.resolve();await Promise.resolve();
+  if(navigate){state.routeVersion++;state.detail={...initial,id:'another-run'};}
+  reject(Error('Could not '+phase));await saving;
+  assert.equal(error.hidden,navigate);
+  assert.equal(state.detail.id,navigate?'another-run':'saved-run');
+  assert.equal(form.querySelector('[type="submit"]').disabled,false);
+  dialog.close();state.routeVersion++;state.detail=initial;
+  api=async()=>({baselines:[{id:'reference',name:'Reference'}]});
+  await openComparisonDialog();assert.equal(dialog.open,true);
+})();
+""".replace("PHASE", json.dumps(phase)).replace("NAVIGATE", json.dumps(navigate)), dom=True)
+
+
+@pytest.mark.parametrize("phase", ["post", "detail"])
+def test_saved_comparison_ignores_success_after_navigation(phase):
+    run_render_checks(r"""
+(async()=>{
+  const phase=PHASE;
+  const dialog=document.createElement('dialog');dialog.setAttribute('id','comparison-dialog');document.body.insertBefore(dialog,null);
+  globalThis.FormData=class{get(){return 'reference';}};
+  toast=()=>{};detail(report([check('serving','pass')]));
+  const initial=structuredClone(state.detail);let resolve,detailReads=0;
+  api=async(path,options)=>{
+    if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+    if(options?.method==='POST'&&phase==='detail')return {};
+    if(!options)detailReads++;
+    return new Promise(done=>{resolve=done;});
+  };
+  await openComparisonDialog();
+  const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+  await Promise.resolve();await Promise.resolve();
+  state.routeVersion++;state.detail={...initial,id:'another-run'};
+  resolve({...initial,baseline_id:'reference'});await saving;
+  assert.equal(state.detail.id,'another-run');
+  assert.equal(detailReads,phase==='post'?0:1);
+  dialog.close();state.routeVersion++;state.detail=initial;
+  api=async()=>({baselines:[{id:'reference',name:'Reference'}]});
+  await openComparisonDialog();assert.equal(dialog.open,true);
+})();
+""".replace("PHASE", json.dumps(phase)), dom=True)
+
+
 def test_live_view_retains_stop_reasons_during_stopping_and_judging():
     run_render_checks(r"""
 const config={targets:[{name:'local',model:'m'}],max_requests:50,concurrency:4,max_duration_seconds:120,request_timeout_seconds:30,max_output_tokens:128};
@@ -230,20 +418,81 @@ const row=(check,metric,status,reason)=>({check,metric,status,reason,scenario:'q
 const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'local <gpu>',status:'inconclusive',
   comparisons:[row('context','latency_ms','fail','Threshold exceeded'),
     row('context','first_output_ms','inconclusive','Sample variation'),
-    row('correctness','correctness_rate','pass','No material regression')]}]};
+    row('correctness','correctness_rate','pass','no material change')]}]};
 const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
 state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
 let html=renderComparison(value);
+assert.match(html,/measurements/);assert.match(html,/Pass \/ fail/);assert.match(html,/Why this warning/);
 assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
-assert.match(html,/<th scope="col">Metric<\/th>/);assert.match(html,/worse/);assert.match(html,/not comparable/);
-assert.match(html,/no material change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
-assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>|Entry \d/);
-assert.equal((html.match(/data-comparison-condition=/g)||[]).length,1); // One condition header, then one row per measurement.
-assert.equal((html.match(/class="comparison-metric"/g)||[]).length,3);
-for(const metric of ['Latency','Time to first answer','Correct answers'])assert(html.includes(metric));
-assert.equal((html.match(/data-comparison-condition/g)||[]).length,1);
-assert.equal((html.match(/data-label="Verdict">not comparable/g)||[]).length,1);assert.match(html,/Sample variation/);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
+assert.match(html,/data-comparison-group="context"/);assert(html.includes(catalogTitle('context')));
+assert.match(html,/worse/);assert.match(html,/Δ/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
+assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
+assert.equal((html.match(/data-metric=/g)||[]).length,3); // All measured differences are visible by default.
+state.comparisonFilter='with_warnings';state.comparisonCheck='correctness';html=renderComparison(value);
+assert.match(html,/No measurements match/);
 assert.equal(JSON.stringify(value),original);
+""")
+
+
+def test_load_comparison_shows_acceptance_changes_and_groups_measurements_by_tested_load():
+    run_render_checks(r"""
+const point={source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:4,rate:null,bursts:false};
+const previous={...point,status:'inconclusive',reason_code:'load_not_delivered',valid:8,dispatched:10,required:5,server_evidenced_concurrency:1,client_mean_inflight:3.9},current={...point,status:'pass',valid:12,dispatched:12,required:5};
+const rows=[['latency_ms','raw-one'],['first_output_ms','raw-two'],['valid_completion_rate','raw-three']].map(([metric,scenario])=>({check:'load',metric,scenario,load_point:point,baseline:100,current:80,baseline_samples:6,current_samples:8,status:'pass',warnings:[{code:'load_not_delivered',message:'Baseline delivered concurrency 1 < 4.'}]}));
+const changes=['gained','lost','unchanged_accepted','unchanged_not_accepted','not_established_in_baseline','accepted_baseline_not_established','not_established_in_current','not_established','not_tested_in_baseline','not_tested_in_current'];
+const load_test={status:'pass',reason:'One newly accepted load.',baseline_highest_accepted:[{...point,value:1}],current_highest_accepted:[{...point,value:4}],points:changes.map(acceptance_change=>({baseline:previous,current,status:['gained','unchanged_accepted'].includes(acceptance_change)?'pass':acceptance_change==='lost'?'fail':'inconclusive',acceptance_change,reason:'Requested concurrency <4> was not delivered.'}))};
+const value=report([],{baseline:{targets:[{target:'local <gpu>',comparisons:rows,observed_outputs:[{...rows[0],scenario:'raw-output',metric:'output_tokens',descriptive:true}],load_test}]}});
+state.detail={report:value};const original=JSON.stringify(value);
+let html=renderComparison(value);
+assert.match(html,/id="results-load-acceptance"/);assert.match(html,/Tested load acceptance/);
+for(const text of ['Newly accepted','Lost','Still accepted','Still not accepted','Not established in baseline','Accepted now; not established in baseline','Not established in current','Not established','Not tested in baseline','Not tested in current'])assert(html.includes(text),text);
+assert.match(html,/Highest accepted concurrency \(tested\) · Baseline: <strong>1<\/strong> · Current: <strong>4<\/strong>/);
+assert.match(html,/Short input → Short output · maintained concurrency 4/);
+assert.match(html,/Baseline delivered concurrency 1 &lt; 4/);
+assert.match(html,/Inconclusive · 8 valid/);assert.match(html,/Passed · 12 valid/);
+assert.match(html,/10 dispatched · 5 required/);assert.match(html,/Server concurrency 1 · Client inflight 3.9/);
+assert.doesNotMatch(html.match(/<tbody>[\s\S]*?<\/tbody>/)[0],/class="status pass"/);
+assert.match(html,/<strong>Accepted now; not established in baseline<\/strong>/);
+assert.match(html,/Requested concurrency &lt;4&gt; was not delivered/);
+assert.doesNotMatch(html,/raw-one|raw-two|raw-three|raw-output|<gpu>|<4>/);
+assert.equal((html.match(/data-comparison-group="load"/g)||[]).length,3,'same tested load shares one group within each measurement section');
+assert(resultsSections().some(([id,label,parent])=>id==='load-acceptance'&&label==='Tested load acceptance'&&parent==='comparison'));
+assert.match(renderResultsJump(),/value="load-acceptance"/);
+assert.match(html,/class="metric-table load-acceptance-table" tabindex="0" role="region"/);
+state.comparisonFilter='without_warnings';html=renderComparison(value);
+assert.match(html,/Newly accepted/);assert.doesNotMatch(html,/data-metric="latency_ms"/);
+assert.equal(JSON.stringify(value),original);
+const fallback=comparisonOutputs({comparisons:[{...rows[0],output_work:{baseline:{reported_output_tokens_p50:10,reported_token_samples:6},current:{reported_output_tokens_p50:12,reported_token_samples:8}}}]});
+assert.equal(fallback[0].load_point,point);
+""")
+
+
+def test_load_comparison_exclusions_render_without_acceptance_points():
+    run_render_checks(r"""
+const point={source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:4};
+const value=report([],{baseline:{targets:[{target:'local <gpu>',comparisons:[],load_exclusions:[{scenario:'raw-scenario',load_point:point,reason:'Input target changed <128>.'}]}]}});
+state.detail={report:value};const html=renderComparison(value);
+assert.match(html,/Tested load acceptance/);assert.match(html,/Load measurements not compared/);
+assert.match(html,/Short input → Short output · maintained concurrency 4/);
+assert.match(html,/Input target changed &lt;128&gt;/);assert.doesNotMatch(html,/raw-scenario|<gpu>|<128>/);
+assert(resultsSections().some(([id])=>id==='load-acceptance'));
+assert.match(renderResultsJump(),/value="load-acceptance"/);
+""")
+
+
+def test_interference_comparison_keeps_control_and_probe_measurements_separate():
+    run_render_checks(r"""
+const point={source:'primary',type:'interference',workload:'interference',shape:'short_short',pattern:'interference',level:4,rate:null,bursts:false,role:'short_stream'};
+const work={baseline:{reported_output_tokens_p50:10,reported_token_samples:6},current:{reported_output_tokens_p50:12,reported_token_samples:8}};
+const rows=['baseline','probe'].map((phase,i)=>({check:'load',metric:'latency_ms',scenario:'load_interference.'+phase+'.short_short.short_stream',load_point:{...point,phase},baseline:100+i*100,current:80+i*100,baseline_samples:6,current_samples:8,status:'pass',warnings:[],output_work:work}));
+const html=renderComparison(report([],{baseline:{targets:[{target:'local',comparisons:rows,observed_outputs:[]}]}}));
+assert.equal((html.match(/data-comparison-group="load"/g)||[]).length,2);
+assert.match(html,/Short-only control/);assert.match(html,/During long-input probe/);
+assert.equal(comparisonOutputs({comparisons:rows}).length,4);
 """)
 
 
@@ -395,6 +644,117 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
     assert '.is-landing' not in css
 
 
+def test_load_acceptance_table_contains_overflow_on_narrow_screens():
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    rules = list(stylesheet_rules(css))
+    for selector in ('.load-acceptance', '.load-acceptance-target', '.load-acceptance-table'):
+        assert any(selector in group.split(', ') and declarations.get('min-width') == '0'
+                   for group, declarations, _ in rules)
+    assert any('.metric-table' in group.split(', ') and declarations.get('overflow-x') == 'auto'
+               and declarations.get('max-width') == '100%' for group, declarations, _ in rules)
+    assert any(group == '.load-acceptance-table table' and declarations.get('min-width') == '680px'
+               for group, declarations, _ in rules)
+    for selector in ('.load-acceptance-table th:nth-child(2)', '.load-acceptance-table th:nth-child(3)',
+                     '.load-acceptance-table td:nth-child(2)', '.load-acceptance-table td:nth-child(3)'):
+        assert any(selector in group.split(', ') and declarations.get('white-space') == 'nowrap'
+                   and declarations.get('min-width') == '150px' for group, declarations, _ in rules)
+
+
+def test_comparison_changes_are_directional_and_multiple_warnings_are_visible():
+    run_render_checks(r"""
+assert.equal(comparisonChange({metric:'correctness_rate',baseline:.4,current:.5}),'+10 percentage points');
+assert.equal(comparisonChange({metric:'generation_tokens_per_second',baseline:20,current:10}),'-50%');
+assert.equal(comparisonChange({metric:'latency_ms',baseline:0,current:10}),'+10 ms · from zero');
+assert.equal(comparisonChange({metric:'latency_ms',baseline:null,current:10}),'Not measured');
+const rows=[{check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,baseline_samples:5,current_samples:5,status:'inconclusive',warnings:[{message:'Answers are longer'},{message:'Client delayed <8/10>'}]}];
+const html=comparisonTable(rows);
+assert.match(html,/Answers are longer/);assert.match(html,/Client delayed &lt;8\/10&gt;/);
+assert.match(html,/Baseline/);assert.match(html,/Current/);assert.match(html,/Δ/);
+assert.doesNotMatch(html,/worse/);
+""")
+
+
+def test_comparison_warning_filter_is_independent_of_regression_status():
+    run_render_checks(r"""
+const row=(metric,status,warnings=[])=>({check:'load',scenario:'same',metric,status,warnings,baseline:10,current:20});
+const value=report([],{baseline:{targets:[{target:'local',comparisons:[
+  row('latency_ms','fail'),row('first_output_ms','pass',[{message:'Partial timing evidence'}]),
+  row('correctness_rate','inconclusive')],observed_outputs:[{...row('output_tokens',null),descriptive:true}]}]}});
+state.detail={report:value};state.comparisonFilter='with_warnings';
+let html=renderComparison(value);
+assert.match(html,/data-metric="first_output_ms"/);assert.match(html,/data-metric="correctness_rate"/);
+assert.doesNotMatch(html,/data-metric="latency_ms"|data-metric="output_tokens"/);
+state.comparisonFilter='without_warnings';html=renderComparison(value);
+assert.match(html,/data-metric="latency_ms"/);assert.match(html,/worse/);
+assert.match(html,/data-metric="output_tokens"/);
+assert.doesNotMatch(html,/data-metric="first_output_ms"|data-metric="correctness_rate"/);
+state.comparisonFilter='all';html=renderComparison(value);
+assert.equal((html.match(/data-metric=/g)||[]).length,4);
+""")
+
+
+def test_comparison_timing_summary_distinguishes_legacy_and_observed_overlap():
+    run_render_checks(r"""
+const row={metric:'latency_ms',status:'inconclusive',baseline:100,current:100,
+  warnings:[{code:'client_delayed',message:'Timing attribution is uncertain.'}],
+  timing_quality:{Current:{status:'client_delayed',scope:'legacy_run_maximum',affected_requests:8,total_requests:8}}};
+let html=comparisonTable([row]);
+assert.match(html,/run-wide Giraffe delay; request-level overlap was not recorded/);
+assert.doesNotMatch(html,/affected 8\/8/);
+row.timing_quality.Current={status:'client_delayed',scope:'request_intervals',affected_requests:1,total_requests:8};
+html=comparisonTable([row]);
+assert.match(html,/Giraffe delays affected 1\/8 current requests/);
+assert.doesNotMatch(html,/run-wide/);
+""")
+
+
+def test_comparison_preserves_deployment_and_confounding_disclosure_under_filters():
+    run_render_checks(r"""
+const target={target:'GPU <blue>',comparisons:[{check:'serving',scenario:'warm',metric:'latency_ms',status:'pass',baseline:10,current:10}],
+  configuration_diff:{confounded:true,intended_change:'runtime.version',fields:[{field:'runtime.version',baseline:{value:'v1'},current:{value:'v2'}},{field:'hardware.gpu_count',baseline:{value:1},current:{value:2}}],unknown_fields:['serving.scheduler']},
+  identity_changes:{image:{baseline:'image-before',current:'image-after'}},
+  consistency_changes:[{scenario:'same-prompt',baseline_agreement:.8,current_agreement:.9}],
+  telemetry:{baseline:{kind:'before-telemetry'},current:{kind:'after-telemetry'}}};
+const value=report([],{baseline:{targets:[target]}});
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;state.comparisonCheck='correctness';
+  const html=renderComparison(value);
+  assert.match(html,/Deployment and comparison details/);
+  assert.match(html,/GPU &lt;blue&gt;/);assert.doesNotMatch(html,/<blue>/);
+  assert.match(html,/Confounded experiment/);assert.match(html,/not proof of causality/);
+  for(const text of ['runtime.version','hardware.gpu_count','serving.scheduler','image-before','image-after','baseline_agreement','current_agreement','before-telemetry','after-telemetry'])assert(html.includes(text),text);
+}
+target.configuration_diff={unknown_baseline:true,unknown_fields:['runtime.version']};
+assert.match(renderComparison(value),/Causality unverified/);
+""")
+
+
+def test_traffic_only_comparison_preserves_accepted_rate_goodput_and_stage_loss():
+    run_render_checks(r"""
+const value=report([],{baseline:{targets:[{target:'arrival <gpu>',comparisons:[],traffic_capacity:{
+  status:'fail',reason:'Previously accepted arrival rate was lost.',
+  baseline_highest_acceptable_rate_rps:50,current_highest_acceptable_rate_rps:10,
+  delta_rps:-40,change_percent:-80,stages:[{rate_rps:50,status:'fail',
+    baseline:{goodput_rps:49},current:{goodput_rps:8},
+    reason:'This previously acceptable arrival stage now fails its configured criteria.'}]
+}}]}});
+state.detail={report:value};
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;
+  const html=renderComparison(value);
+  assert.match(html,/arrival &lt;gpu&gt;/);
+  assert.match(html,/Tested arrival capacity/);
+  assert.match(html,/Baseline accepted rate<\/dt><dd>50 req\/s/);
+  assert.match(html,/Current accepted rate<\/dt><dd>10 req\/s/);
+  assert.match(html,/-40 req\/s/);assert.match(html,/-80%/);
+  assert.match(html,/Baseline goodput/);assert.match(html,/49 req\/s/);
+  assert.match(html,/Current goodput/);assert.match(html,/8 req\/s/);
+  assert.match(html,/Previously accepted arrival rate was lost\./);
+  assert.match(html,/This previously acceptable arrival stage now fails its configured criteria\./);
+}
+""")
+
+
 def test_check_details_show_recorded_effective_limits_and_default_labels():
     run_render_checks(r"""
 const first=check('first_output','pass'),generation=check('generation','pass');
@@ -419,3 +779,30 @@ markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
 delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
 markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
 """)
+
+
+@pytest.mark.parametrize("check_id", ["first_output", "generation"])
+def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_id):
+    run_render_checks(r"""
+(async()=>{
+ const id=CHECK_ID,first=id==='first_output';
+ const limitField=first?'first_output_ms':'stream_gap_ms',observedField=first?'first_output_ms':'max_stream_gap_ms';
+ const limit=first?10000:5000,slow=first?12300:6000;
+ const records=[['slow',slow],['good',200],['client',20000]].map(([id,time])=>({id,target:'local',status:'completed',valid:true,score:true,output:'Correct',[observedField]:time}));
+ const failed=check(id,'fail',{evidence_ids:['slow','good','client'],metrics:{violations:['slow'],unattributed_timing_violations:['client']}});
+ const value=report([failed],{overall:'fail',requests:records});
+ value.manifest.config.limits={[limitField]:60000};
+ value.manifest.effective_checks={[id]:{limits:{[limitField]:limit}}};
+ value.manifest.default_check_limits={[id]:[limitField]};
+ const original=JSON.stringify(value);
+ detail(value);const action=$('[data-action="show-failing"]');assert(action);await listeners.click({target:action});
+ const panel=$('.check-detail'),table=panel.querySelector('.evidence-table');
+ assert(panel.textContent.includes(`Limit: ≤ ${limit/1000} s (default)`));
+ assert(!panel.textContent.includes('60 s'));
+ assert(table.querySelector('[data-request="slow"]'));
+ assert.equal(table.querySelector('[data-request="good"]'),null);
+ assert.equal(table.querySelector('[data-request="client"]'),null);
+ assert(table.textContent.includes(first?'Too slow: first answer 12.3 s > 10 s':'Too slow: stream pause 6 s > 5 s'));
+ assert.equal(JSON.stringify(value),original);
+})()
+""".replace('CHECK_ID', json.dumps(check_id)), dom=True)

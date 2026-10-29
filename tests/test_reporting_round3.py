@@ -16,7 +16,8 @@ def test_capacity_comparison_direction_and_delta_in_html(before, after, verdict,
     html = _render(report)
     assert f'>{verdict}</strong>' in html
     assert delta in html
-    assert f'1 {verdict.lower()}' in html
+    assert '0 measurements · 0 with warnings' in html
+    assert 'Did each run meet its requirements?' in html
 
 
 def test_html_distinguishes_unsaved_truncated_and_empty_responses():

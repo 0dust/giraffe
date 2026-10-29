@@ -106,3 +106,49 @@ def test_capacity_labels_use_arrival_timing_and_accept_old_aggregate_ids(legacy)
  assert.match($('.evidence-table').textContent,/first answer 12\.3 s > 10 s/);assert.match($('.evidence-table').textContent,/response time 12\.4 s > 11 s/);
 })()
 """.replace('LEGACY', str(legacy).lower()), dom=True)
+
+
+def test_intentional_cancellation_probes_do_not_offer_failing_requests():
+    run_render_checks(r"""
+(async()=>{
+ const probes=[
+  {id:'cancel',scenario:'client_cancel',status:'cancelled',valid:false},
+  {id:'deadline',scenario:'client_deadline',status:'timeout',valid:false},
+  {id:'legacy-deadline',scenario:'deadline_probe',status:'timed_out',valid:false},
+  {id:'marked',scenario:'custom',intentional:true,status:'failed',valid:false},
+  {id:'legacy-cancel',scenario:'custom',status:'cancelled',valid:false,error:'Intentional cancellation'}
+ ].map(record=>({target:'local',...record}));
+ const followup={id:'followup',target:'local',scenario:'backend_cancel_followup',status:'completed',valid:true};
+ const value=report([check('cancellation','blocked',{summary:'Native server-stop verification unavailable.',evidence_ids:[...probes.map(record=>record.id),'followup']})],{overall:'inconclusive',requests:[...probes,followup]});
+ detail(value);
+ assert.equal($('[data-action="show-failing"]'),null);
+ assert.equal(checkHasFailingRequests(value.checks[0],value),false);
+ await listeners.click({target:$('[data-check="local:cancellation"]')});
+ const table=$('.check-detail .evidence-table');assert(table);
+ for(const record of [...probes,followup])assert(table.querySelector('[data-request="'+record.id+'"]'),'all probe and follow-up evidence remains inspectable');
+})()
+""", dom=True)
+
+
+def test_probe_filter_preserves_protocol_answer_and_qualified_failures():
+    run_render_checks(r"""
+(async()=>{
+ const requests=[
+  {id:'cancel',scenario:'client_cancel',status:'cancelled',valid:false},
+  {id:'deadline',scenario:'client_deadline',status:'timeout',valid:false},
+  {id:'protocol',scenario:'backend_cancel_followup',status:'failed',valid:false,error:'Invalid event stream'},
+  {id:'timeout',scenario:'backend_cancel_followup',status:'timeout',valid:false},
+  {id:'invalid',scenario:'backend_cancel_followup',status:'completed',valid:false},
+  {id:'incorrect',scenario:'backend_cancel_followup',status:'completed',valid:true,score:false},
+  {id:'evaluation',scenario:'client_cancel',intentional:true,status:'cancelled',valid:false,evaluation_error:'Evaluator unavailable'},
+  {id:'evaluation-status',scenario:'client_cancel',intentional:true,status:'evaluation_error'},
+  {id:'qualified',scenario:'client_deadline',intentional:true,status:'timeout',valid:false}
+ ].map(record=>({target:'local',...record}));
+ const value=report([check('cancellation','fail',{evidence_ids:requests.map(record=>record.id),metrics:{qualified_timing_violations:['qualified']}})],{overall:'fail',requests});
+ detail(value);const action=$('[data-action="show-failing"]');assert(action);
+ await listeners.click({target:action});
+ const table=$('.check-detail .evidence-table');assert(table);
+ for(const id of ['cancel','deadline'])assert.equal(table.querySelector('[data-request="'+id+'"]'),null);
+ for(const id of ['protocol','timeout','invalid','incorrect','evaluation','evaluation-status','qualified'])assert(table.querySelector('[data-request="'+id+'"]'),'real failure '+id+' remains visible');
+})()
+""", dom=True)

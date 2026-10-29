@@ -700,6 +700,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     changed = asyncio.Event()
     rng = random.Random(settings.patterns.poisson.seed)
     reason = None
+    failure = None
     cutoff = None
     triggered = 0
     scenario = point["id"] + ("." + phase if phase else "")
@@ -714,6 +715,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
 
     def ended():
         nonlocal reason, cutoff
+        if failure is not None:
+            return True
         if time.monotonic() >= end:
             return True
         if not run.allowed(target.name):
@@ -801,6 +804,17 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     ]
     if phase == "probe":
         tasks.append(asyncio.create_task(probe()))
+
+    def worker_finished(task):
+        nonlocal failure
+        if not task.cancelled():
+            error = task.exception()
+            if failure is None and error is not None:
+                failure = error
+        changed.set()
+
+    for task in tasks:
+        task.add_done_callback(worker_finished)
     cancelled = None
     sending_end = None
     try:
@@ -813,19 +827,27 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                 )
             except TimeoutError:
                 pass
+        if failure is not None:
+            raise failure
         sending_end = min(end, cutoff if cutoff is not None else time.monotonic())
         intent.begin_drain(sending_end)
         finish_end = run.deadline
         while any(not t.done() for t in tasks) and time.monotonic() < finish_end:
+            if failure is not None:
+                raise failure
             stop = run.stop_reason(target.name)
             if stop and stop != "maximum request budget reached":
                 reason = stop
                 break
-            await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())))
+            await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())),
+                               return_when=asyncio.FIRST_EXCEPTION)
     except asyncio.CancelledError as exc:
         sending_end = min(end, time.monotonic())
         reason = run.stop_reason(target.name) or "execution cancelled"
         cancelled = exc
+    except Exception as exc:
+        if failure is None:
+            failure = exc
     finally:
         if sending_end is None:
             sending_end = min(end, time.monotonic())
@@ -840,7 +862,20 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             except asyncio.CancelledError as exc:
                 cancelled = exc
                 reason = run.stop_reason(target.name) or "execution cancelled"
+        # gather can already be complete before task callbacks get another
+        # loop turn, notably when the final offers exhaust the request budget.
+        for outcome in cleanup.result():
+            if failure is None and isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                failure = outcome
         intent.finish(time.monotonic())
+    if failure is not None:
+        reason = "internal load worker error"
+        point.update(not_run=False, execution_error=(
+            f"Internal error in Giraffe ({type(failure).__name__}); see the Giraffe log."))
+        # request() retains terminal evidence before rethrowing an internal
+        # failure; include those records even though send() did not return.
+        records = [record for record in run.records if record.target == target.name
+                   and record.scenario == scenario]
     now = time.monotonic()
     if any(r.status == "cancelled" for r in records) and reason in {
         None, "time limit reached", "maximum run duration reached"
@@ -878,6 +913,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             cut_short=any(w["cut_short"] for w in windows),
             window_reason=reason,
         )
+    if failure is not None:
+        raise failure
     if cancelled:
         raise cancelled
     return records, window
@@ -1248,6 +1285,8 @@ def score_group(settings, point, group, records):
 
     if point.get("blocked"):
         return result("blocked", "context_exceeded", point["blocked"])
+    if point.get("execution_error"):
+        return result("blocked", "internal_error", point["execution_error"])
     if point.get("calibration_failure"):
         return result("fail", "calibration_failed", point["calibration_failure"])
     if group["error_percent"] is not None and group["error_percent"] > c.max_error_percent:
@@ -1729,6 +1768,9 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
         return f"{len(points)} of {len(points)} load conditions passed."
     deciding = [point for point in points if point["status"] == status]
     code = _result_reason(points, status)
+    if code == "internal_error":
+        error = next(point["execution_error"] for point in deciding if point.get("execution_error"))
+        return f"{len(deciding)} of {len(points)} load conditions blocked: {error}"
     descriptions = {
         "budget_limited": ("request budget reached", None),
         "time_limited": ("run deadline reached", "Increase --max-duration (max_duration_seconds) to cover all selected sending windows and request timeouts, or select fewer rates."),

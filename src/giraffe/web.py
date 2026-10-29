@@ -10,6 +10,7 @@ import logging
 import os
 import queue
 import re
+import secrets
 import shutil
 import selectors
 import struct
@@ -37,7 +38,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
@@ -64,7 +65,7 @@ from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
 from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
-                               save_baseline_report, save_failure_summary, write_report)
+                               save_baseline_report, save_failure_summary, write_comparison_report, write_report)
 from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
 from giraffe.resources import PhaseSampler, SAMPLING
@@ -220,17 +221,28 @@ class _ReportProcess:
         with self.lock:
             if self.process is None or self.process.poll() is not None:
                 self.close()
-                self.process = subprocess.Popen([sys.executable, "-c",
+                package_root = str(Path(__file__).resolve().parent.parent)
+                env = os.environ.copy()
+                env["PYTHONPATH"] = os.pathsep.join(p for p in (package_root, env.get("PYTHONPATH")) if p)
+                self.process = subprocess.Popen([sys.executable, "-P", "-c",
                     "import os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
                     "os.dup2(2,1); sys.stdout=sys.stderr; "
+                    f"package_root = {package_root!r}\n"
+                    # PYTHONPATH places wheel directories ahead of the stdlib;
+                    # restore their normal precedence without duplicate entries.
+                    "if os.path.basename(package_root) in ('site-packages', 'dist-packages'):\n"
+                    "    sys.path[:] = [p for p in sys.path if p != package_root]\n"
+                    "    sys.path.append(package_root)\n"
+                    "elif package_root not in sys.path:\n"
+                    "    sys.path.insert(0, package_root)\n"
                     "from giraffe.web import _report_process_main; _report_process_main(protocol)"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
                 self.release = weakref.finalize(self, _close_report_process, self.process)
+                needs_identity = True
+            else:
+                needs_identity = False
             process = self.process
             try:
-                process.stdin.write((json.dumps([str(root), identifier, kind, target, window,
-                                                 _REPORT_CACHE_BYTES]) + "\n").encode())
-                process.stdin.flush()
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
                     size = (root / identifier / "report.json").stat().st_size
@@ -243,10 +255,29 @@ class _ReportProcess:
                                                     "its time limit; use giraffe report.")
                             chunk = os.read(process.stdout.fileno(), min(size, 64 * 1024))
                             if not chunk:
-                                raise RuntimeError("Report reader stopped")
+                                raise HTTPException(503, "Report reader stopped; restart giraffe ui "
+                                                    "from the intended Giraffe installation.")
                             chunks.append(chunk)
                             size -= len(chunk)
                         return b"".join(chunks)
+                    if needs_identity:
+                        import giraffe
+                        process.stdin.write(b'{"identity":true}\n')
+                        process.stdin.flush()
+                        status, length = struct.unpack("!II", read_exact(8))
+                        if status != 200 or length > 16 * 1024:
+                            raise HTTPException(503, "Report reader identity handshake failed. "
+                                                "Restart giraffe ui from the intended installation.")
+                        identity = json.loads(read_exact(length))
+                        expected = {"file": str(Path(giraffe.__file__).resolve()),
+                                    "version": giraffe.__version__}
+                        if identity != expected:
+                            raise HTTPException(503, "Report reader identity mismatch: "
+                                                f"expected {expected}, received {identity}. "
+                                                "Restart giraffe ui from the intended installation.")
+                    process.stdin.write((json.dumps([str(root), identifier, kind, target, window,
+                                                     _REPORT_CACHE_BYTES]) + "\n").encode())
+                    process.stdin.flush()
                     status, length = struct.unpack("!II", read_exact(8))
                     return status, read_exact(length)
             except BaseException:
@@ -267,12 +298,22 @@ def _report_process_main(protocol):
         path = f"/api/runs/{identifier}" + ("/performance" if kind == "performance" else "")
         params = {key: value for key, value in (("target", target), ("window", window)) if value is not None}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=apps[root]),
-                                     base_url="http://localhost") as client:
+                                     base_url="http://localhost",
+                                     headers={"X-Giraffe-Token": apps[root].state.giraffe_token}) as client:
             response = await client.get(path, params=params)
             return response.status_code, response.content
     with asyncio.Runner() as runner:
         for line in sys.stdin.buffer:
-            root, identifier, kind, target, window, budget = json.loads(line)
+            request = json.loads(line)
+            if request == {"identity": True}:
+                import giraffe
+                body = json.dumps({"file": str(Path(giraffe.__file__).resolve()),
+                                   "version": giraffe.__version__}).encode()
+                protocol.write(struct.pack("!II", 200, len(body)))
+                protocol.write(body)
+                protocol.flush()
+                continue
+            root, identifier, kind, target, window, budget = request
             _REPORT_CACHE_BYTES = budget
             if not budget:
                 _report_cache.clear()
@@ -608,6 +649,10 @@ class KeepRun(Model):
     keep: bool = Field(strict=True)
 
 
+class CompareRun(Model):
+    baseline_id: str = Field(min_length=1, max_length=MAX_WEB_IDENTIFIER_CHARS)
+
+
 class DatasetPreview(Model):
     text: str
     format: Literal["csv", "json"]
@@ -819,11 +864,19 @@ def _bootstrap_config(defaults: dict | None) -> dict:
 
 def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                migration_notes: list[str] | None = None,
+               token: str | None = None,
+               allow_restart_command: bool = False,
+               host: str = "127.0.0.1",
+               port: int = 8765,
                max_total_storage: int = DEFAULT_LIMITS["max_total_storage"],
                min_free_disk: int = DEFAULT_LIMITS["min_free_disk"],
                max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
                auto_cleanup: dict | None = None) -> FastAPI:
     configure_logging()
+    launch_token = token if token is not None else secrets.token_urlsafe(32)
+    if not launch_token:
+        raise ValueError("UI access token must not be empty")
+    local_host = _is_local_authority(f"[{host}]" if ":" in host and not host.startswith("[") else host)
     limits = {"max_total_storage": max_total_storage, "min_free_disk": min_free_disk,
               "max_run_storage": max_run_storage}
     if any(type(value) is not int or value < 0 for value in limits.values()):
@@ -1080,11 +1133,34 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             await run_in_threadpool(report_process.close)
 
     app = FastAPI(title="Giraffe", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.state.giraffe_token = launch_token
+    cookie_name = f"giraffe_token_{port}"
+    app.state.giraffe_cookie_name = cookie_name
+
+    def valid_token(value):
+        return value is not None and secrets.compare_digest(value.encode(), launch_token.encode())
+
+    def authenticated(request):
+        return (valid_token(request.headers.get("x-giraffe-token"))
+                or valid_token(request.cookies.get(cookie_name)))
+
+    def require_restart_allowed(config, *, mode="normal", restart_target=None):
+        if not allow_restart_command and (mode == "cold-start" or config.restart_target or restart_target):
+            raise HTTPException(403, "Restart commands are disabled. Start giraffe ui with "
+                                "--allow-restart-command to enable cold-start runs.")
 
     def local_mutation_error(request):
         # Validate before request.url uses Host, for reads as well as mutations.
         hosts = request.headers.getlist("host")
-        if len(hosts) != 1 or not _is_local_authority(hosts[0]):
+        authorized = authenticated(request)
+        token_link = request.scope["path"] == "/" and valid_token(request.query_params.get("token"))
+        if len(hosts) != 1 or (not _is_local_authority(hosts[0]) and local_host):
+            return JSONResponse({"detail": "Use a local Giraffe host"}, status_code=400)
+        if request.scope["path"].startswith("/api/") and not authorized:
+            return JSONResponse({"detail": "Open the access link printed by giraffe ui"}, status_code=401)
+        # A public bind can explain how to sign in before trusting its Host.
+        instruction_page = request.method in {"GET", "HEAD"} and request.scope["path"] == "/"
+        if not _is_local_authority(hosts[0]) and not (authorized or token_link or instruction_page):
             return JSONResponse({"detail": "Use a local Giraffe host"}, status_code=400)
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
@@ -1092,7 +1168,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             origin = request.headers.get("origin")
             try:
                 parsed_origin = urlsplit(origin) if origin else None
-                same_origin = parsed_origin is None or (
+                same_origin = (parsed_origin is None and authorized) or (
+                    parsed_origin is not None and
                     parsed_origin.netloc == request.url.netloc
                     and parsed_origin.scheme == request.url.scheme)
             except ValueError:
@@ -1112,9 +1189,6 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if scope["type"] != "http":
                 return await self.app(scope, receive, send)
             request = Request(scope)
-            error = local_mutation_error(request)
-            if error is not None:
-                return await error(scope, receive, send)
             path = scope["path"]
             revalidate = path == "/" or (path.startswith("/static/") and
                 Path(path).suffix in {".html", ".css", ".js", ".mjs"})
@@ -1123,11 +1197,18 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 nonlocal started
                 if message["type"] == "http.response.start":
                     started = True
+                    message = {**message, "headers": [*message["headers"],
+                        (b"content-security-policy", b"default-src 'self'; img-src 'self' data:; "
+                         b"style-src 'self' 'unsafe-inline'; script-src 'self'; "
+                         b"connect-src 'self'; frame-ancestors 'none'")]}
                     if revalidate:
                         headers = [(key, value) for key, value in message["headers"]
                                    if key.lower() != b"cache-control"]
                         message = {**message, "headers": [*headers, (b"cache-control", b"no-cache")]}
                 await send(message)
+            error = local_mutation_error(request)
+            if error is not None:
+                return await error(scope, receive, response_send)
             try:
                 await self.app(scope, receive, response_send)
             except Exception as error:
@@ -1139,7 +1220,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     raise
                 response = JSONResponse({"detail": f"Request could not finish ({type(error).__name__}). [error {error_id}]",
                                          "error_id": error_id}, status_code=500)
-                await response(scope, receive, send)
+                await response(scope, receive, response_send)
 
     app.add_middleware(LocalRequests)
 
@@ -1166,6 +1247,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                             result[key] = [{"status": check["status"]} for check in value]
                         elif key == "manifest":
                             result[key] = {"config": {"targets": _targets(value.get("config", {}))}}
+                        elif key == "baseline":
+                            result[key] = {"saved_baseline_id": value["saved_baseline_id"]} if (
+                                value and "saved_baseline_id" in value) else None
                 if reader.peek() or not result.get("run_id") or "overall" not in result:
                     raise ValueError("Invalid report summary")
             return {**result, "request_count": count}
@@ -1225,7 +1309,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "stoppable": bool(live) and state in {"running", "stopping"},
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
-                "baseline_id": meta.get("baseline_id"), "report": persisted, "summary": summary,
+                "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
+                "report": persisted, "summary": summary,
                 "resources": meta.get("resources", {}), "auto_cleanup": meta.get("auto_cleanup"),
                 "bytes": run_size(directory), "kept": (directory / ".keep").is_file(),
                 "started_at": (persisted or summary or {}).get("started_at", meta.get("started_at")),
@@ -1643,14 +1728,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         migrated_defaults, limit_notes = migrate_run_limits(defaults)
         migrated_defaults, load_notes = migrate_concurrent_load(migrated_defaults)
         _, combined_notes = migrate_load_test(migrated_defaults)
-        return {**capabilities(resolved), "config": resolved.model_dump(mode="json"),
+        return {**capabilities(resolved, restart_allowed=allow_restart_command), "config": resolved.model_dump(mode="json"),
                 "baseline_configs": await run_in_threadpool(setup_baseline_configs),
                 "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
                 "active_run_id": active.get("id"), "disk_active_id": await run_in_threadpool(disk_active_id), "request_plan": await run_in_threadpool(preview_plan, resolved)}
 
     @app.get("/api/capabilities")
     async def describe_capabilities():
-        return capabilities()
+        return capabilities(restart_allowed=allow_restart_command)
 
     @app.post("/api/targets/models")
     async def target_models(body: ModelDiscovery):
@@ -1713,6 +1798,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     async def try_example(body: TryExample):
         from giraffe.dataset_import import try_example_config
 
+        require_restart_allowed(body.config)
         body.attach_api_keys(body.config)
         try:
             config = try_example_config(body.config, body.fixture_id, body.target_name)
@@ -1746,10 +1832,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.post("/api/storage/cleanup")
     async def clean_storage(body: CleanupRequest):
-        for identifier in body.ids:
-            _directory(root, identifier)
-        return await run_in_threadpool(apply_cleanup, root, body.ids, active_id=active.get("id"),
-                                       **body.model_dump(exclude={"ids"}, exclude_none=True))
+        async with start_lock:
+            for identifier in body.ids:
+                _directory(root, identifier)
+            return await run_in_threadpool(apply_cleanup, root, body.ids, active_id=active.get("id"),
+                                           **body.model_dump(exclude={"ids"}, exclude_none=True))
 
     @app.post("/api/runs/{identifier}/keep")
     async def keep_run(identifier: str, body: KeepRun):
@@ -1780,9 +1867,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return {"runs": sorted(rows, key=lambda item: item.get("started_at") or "", reverse=True),
                 "active_run_id": snapshot.get("id"), "disk_active_id": disk_active_id()}
 
-    def prepare_run(body: StartRun) -> tuple[RunConfig, RunReport | None]:
+    def prepare_run(body: StartRun, *, execute: bool = True) -> tuple[RunConfig, RunReport | None]:
         """Resolve the same execution intent for Start and Copy CLI."""
         config = body.config
+        if execute:
+            require_restart_allowed(config, mode=body.mode, restart_target=body.restart_target)
         config._migration_notes = list(dict.fromkeys([*config._migration_notes, *body.migration_notes]))
         body.attach_api_keys(config)
         if body.mode == "normal":
@@ -1810,7 +1899,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     def copy_cli(body: StartRun):
         from giraffe.handoff import cli_command
 
-        config, baseline = prepare_run(body)
+        config, baseline = prepare_run(body, execute=False)
         return {"command": cli_command(config, mode=body.mode, restart_target=body.restart_target,
                                        baseline=baseline)}
 
@@ -1982,6 +2071,36 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 return _json_response(selected_performance(identifier, target, window, snapshot))
         return await run_in_threadpool(select)
 
+    @app.post("/api/runs/{identifier}/compare")
+    async def compare_saved_run(identifier: str, body: CompareRun):
+        # Serialize with cleanup/start and report downloads. Comparison uses only
+        # saved evidence; it must never start a suite or replace a reference.
+        async with start_lock, download_lock:
+            if active:
+                raise HTTPException(409, "Wait for the active run to finish before comparing saved reports")
+            detail = run_detail(identifier)
+            if detail["state"] != "completed" or detail["report"] is None:
+                raise HTTPException(409, "Wait for a completed report before comparing")
+            reference = next((item for item in saved_baselines() if item["id"] == body.baseline_id), None)
+            if reference is None:
+                raise HTTPException(404, "Unknown saved baseline")
+            directory = _directory(root, identifier)
+            current = _report(directory / "report.json")
+            baseline = _report(_directory(baseline_root, body.baseline_id) / "report.json")
+            if current.run_id == baseline.run_id:
+                raise HTTPException(422, "Choose a baseline from a different run")
+            report = await run_in_threadpool(compare_baseline, current, baseline)
+            report.baseline.update(saved_baseline_id=body.baseline_id, saved_baseline_name=reference["name"])
+            warning = None
+            try:
+                await run_in_threadpool(write_comparison_report, report, directory, max_run_storage=max_run_storage)
+            except OSError as error:
+                if not getattr(error, "json_complete", False):
+                    raise HTTPException(507, "Comparison could not be saved. Check storage limits and write permissions.") from None
+                warning = html_failure_warning(error)
+            return {"id": identifier, "baseline_id": body.baseline_id,
+                    "status": report.baseline["status"], "warning": warning}
+
     @app.get("/api/runs/{identifier}/requests/{request_id}")
     def request_evidence(identifier: str, request_id: str):
         directory = _directory(root, identifier)
@@ -2150,8 +2269,18 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     app.mount("/static", static_files, name="static")
 
-    @app.get("/")
-    def index(request: Request):
+    @app.api_route("/", methods=["GET", "HEAD"])
+    async def index(request: Request):
+        supplied_token = request.query_params.get("token")
+        if supplied_token is not None:
+            if not valid_token(supplied_token):
+                raise HTTPException(401, "Invalid Giraffe access token")
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie(cookie_name, launch_token, httponly=True, samesite="strict", path="/")
+            return response
+        if not authenticated(request):
+            return HTMLResponse("<!doctype html><title>Giraffe access</title><p>"
+                "Open the link printed by `giraffe ui` (it contains your access token).</p>")
         content = (static / "index.html").read_text()
         for name in ("boot.js", "styles.css", "app.js"):
             url = asset_url(name, app_script() if name == "app.js" else None)

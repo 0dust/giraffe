@@ -15,8 +15,8 @@ for(const table of $$('.comparison-metrics')){
  assert.deepEqual(Array.from(table.querySelectorAll('thead th'),node=>node.textContent),['Metric','Baseline','Current','Δ','Verdict']);
  for(const row of table.querySelectorAll('.comparison-metric'))assert.equal(row.childNodes.filter(node=>node.nodeType===1).length,5);
 }
-assert.equal($$('.comparison-metric').length,3);assert.equal($$('.comparison-group').length,2);
-for(const header of $$('.comparison-group th')){assert.equal(header.getAttribute('colspan'),'5');assert.equal(header.getAttribute('scope'),'rowgroup');}
+assert.equal($$('.comparison-metric').length,3);assert.equal($$('.comparison-check-group').length,3);
+assert.deepEqual($$('.comparison-check-group').map(group=>group.dataset.comparisonGroup).sort(),['access','first_output','generation']);
 assert.equal($('.comparison-reason').closest('tr').getAttribute('class'),'comparison-metric');
 assert.equal($('.comparison-metric [data-label="Baseline"]').textContent,'10 msn=6');
 assert.match($('#main').textContent,/Output slowed down|Only one sample/);
