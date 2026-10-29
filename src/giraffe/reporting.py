@@ -1685,6 +1685,15 @@ def _render(report: RunReport) -> str:
                  '<p>Deployment changes provide investigation context and do not establish causality. '
                  'Unknown fields and telemetry remain unknown. Client first output is separate from server TTFT.</p>')
     for name, observation in report.observations.get("targets", {}).items():
+        residency = (observation.get("deployment") or {}).get("model_residency", {})
+        if residency:
+            parts.append(f'<h3>{_e(name)}: model residency</h3>'
+                         '<p>Observed around this run’s preparation. Residency does not prove a cold start or explain latency.</p>')
+            for phase, label in (("before_preparation", "Before preparation"), ("after_preparation", "After preparation")):
+                row = residency.get(phase, {})
+                parts.append(f'<p><strong>{label}:</strong> {_e(row.get("state", "unknown"))} · '
+                             f'{_e(row.get("source") or "No runtime source")} · {_e(row.get("collected_at") or "Not observed")} · '
+                             f'{_e(row.get("scope", "unknown"))}</p>')
         parts.append(f'<h3>{_e(name)}</h3><details><summary>Deployment snapshot and unknowns</summary>'
                      f'<pre>{_json(observation.get("deployment"))}</pre></details>'
                      f'<details><summary>Deployment observations during the run</summary>'

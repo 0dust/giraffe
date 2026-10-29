@@ -709,6 +709,8 @@ def main(argv: list[str] | None = None) -> int:
                 emit("blocked", 3, message=str(error))
             return 3
         if args.command == "run" and not args.skip_preflight:
+            from giraffe.deployment import preparation_residency
+            config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
                 for target in config.targets:
                     try:
