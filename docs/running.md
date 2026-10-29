@@ -207,6 +207,21 @@ incompatible evidence remains unknown. The standalone HTML export follows the
 same separation. Historical reports show the evidence they recorded; newly
 computed comparisons include separate acceptance and structured warning fields.
 
+## Previous wrong answers
+
+Planning warns about recent failed scores for matching built-in correctness fixtures
+or saved questions. The UI links up to three failed answers per question and offers
+**Try one**, preselecting the target that failed. Existing retention rules still apply;
+a link may show scoring evidence without a retained answer body. No request is sent
+until you submit the trial, and pass criteria never change automatically.
+
+The last 30 days of compact history are matched by question, expected answer,
+scorer/evaluator, request and load settings, endpoint/model and nonempty configured
+deployment metadata. A newer matching run without failed scores clears an older
+warning. Unknown deployment metadata, custom fixture files, missing/stale history
+and old reports without summaries stay unknown. Runtime continuity is unverified,
+and a prior wrong answer does not establish that the next attempt will fail.
+
 ## Previous arrival delivery
 
 Load planning uses compact summaries from the last 30 days. For each constant or

@@ -895,6 +895,7 @@ async function route() {
     renderDetail();
     if(openedPerformance&&typeof fetch==='function')loadPerformance({force:true});
     if(destination.section)revealReportSection(destination.section);
+    if(destination.requestId)await openRequest(destination.requestId);
     return;
   }
   state.reportRouteActive=false;
@@ -919,6 +920,8 @@ async function route() {
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
       state.detail=detail;state.failingRequestsOnly=false;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';reportView.id=null;renderDetail();enterRoute();if(destination?.section)revealReportSection(destination.section);
       if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance({force:true});
+      if(destination?.requestId)await openRequest(destination.requestId);
+      if(version!==state.routeVersion)return;
       if(activeState(detail))schedulePoll(pollDetail,version,300);else if(state.active)schedulePoll(pollRunStatus,version,3000);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
@@ -2355,11 +2358,12 @@ function sampleDataset(){
   const text=JSON.stringify({version:1,cases:[{fixture_id:'refund-window',messages:[{role:'user',content:'A store allows refunds within 30 days with a receipt. What is its refund policy?'}],scorer:'judge',expected:'Refunds are allowed within 30 days with a receipt.'},{fixture_id:'simple-count',messages:[{role:'user',content:'How many days are in one week? Reply with only the digit, with no words or punctuation.'}],scorer:'exact',expected:'7'}]});
   return importRequestPack({name:'sample-dataset.json',size:text.length,text:async()=>text});
 }
-function openTryExample(index) {
+function openTryExample(index,targetName=null) {
   try{
     datasetEditingAllowed();captureFormDraft();const item=datasetCases()[index];if(!item)return;
     state.datasetTry={fixture_id:item.fixture_id,revision:state.configRevision,route:state.routeVersion};
     datasetDialog('Try one example',`<form id="dataset-try-form"><div class="dialog-body"><p><strong>${escape(item.fixture_id)}</strong></p><p class="hint">Sends this question once to the selected server, then checks the answer${item.scorer==='judge'?' with your configured AI judges':''}. No traffic stages or restart commands run.</p><div class="example-check">${selectField('try_target','Target',state.config.targets.map(target=>`<option value="${escape(target.name)}">${escape(target.name)} · ${escape(target.model || 'model needed')}</option>`).join(''))}</div><label class="trial-retention"><input name="save_try_output" type="checkbox" checked><span>Save this trial’s answer and judge reasons</span></label><p class="hint">Save the answer and AI judge reasons in this trial report so you can inspect them. If unchecked, only measurements and results are saved. This does not change what your main run saves.</p><div id="dataset-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary" ${state.active?'disabled':''}>Send one request</button></div></form>`);
+    if(targetName&&state.config.targets.some(target=>target.name===targetName))$('#dataset-try-form').elements.try_target.value=targetName;
   }catch(error){configError(error);}
 }
 async function tryDatasetExample(event) {
@@ -2402,6 +2406,13 @@ function renderReviewPassCriteria(config) {
   }).filter(Boolean);
   return rows.length?`<section class="review-criteria review-section"><div class="review-section-heading"><h3>Pass criteria</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit criteria</button></div><div class="plan-rows">${rows.join('')}</div></section>`:'';
 }
+function renderCorrectnessHistory(config,plan) {
+  return (plan.correctness_history || []).filter(row=>row.status==='warning').map(row=>{
+    const index=(config?.request_pack?.cases || []).findIndex(item=>item.fixture_id===row.case_id);
+    const links=(row.failed_request_ids || []).map((id,i)=>`<a href="${linkRun(row.run_id)}/requests/${encodeURIComponent(id)}">Failed answer ${i+1}</a>`).join(' · ');
+    return `<section class="notice warning"><p>${escape(row.message)}</p><p>${links}</p>${index>=0?`<button type="button" class="button small" data-action="try-example" data-case-index="${index}" data-try-target="${escape(row.target)}">Try one</button>`:''}</section>`;
+  }).join('');
+}
 function renderArrivalHistory(plan) {
   const rows=plan.arrival_history || [];
   if(!rows.length)return '';
@@ -2412,7 +2423,7 @@ function renderRequestPlan(config=null) {
   const saved=state.requestPreview,plan=currentRequestPlan();
   if(!config&&$('#run-blueprint')){try{config=readForm(true).config;}catch{}}
   config ||= (plan?saved.config:null) || state.config;
-  const history=$('#setup-history');if(history){history.innerHTML=plan?renderArrivalHistory(plan):'';history.hidden=!history.innerHTML;}
+  const history=$('#setup-history');if(history){history.innerHTML=plan?renderArrivalHistory(plan)+renderCorrectnessHistory(config,plan):'';history.hidden=!history.innerHTML;}
   syncRunBlueprint(config,plan);
   if(config)updateSharedSettingsSummaries(config);
   const durationLine=$('#setup-duration');if(durationLine)durationLine.innerHTML=renderPlanTime(plan);
@@ -3073,6 +3084,8 @@ const reportSections=[['overview','Performance overview',null],['timing','Reques
 const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
+  const request=hash.match(/^#runs\/([^/]+)\/requests\/([^/]+)$/);
+  if(request){try{return {id:decodeURIComponent(request[1]),tab:'results',section:null,requestId:decodeURIComponent(request[2])};}catch{return null;}}
   const match=hash.match(/^#runs\/([^/]+)(?:\/(performance|results)(?:\/([^/]+))?)?$/);
   if(!match)return null;
   const tab=match[2]||null,section=match[3]||null;
@@ -4522,7 +4535,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='sample-dataset')await sampleDataset();
   if(action==='apply-answer-check')await applyAnswerCheck();
   if(action==='preview-dataset-mapping')await previewDatasetMapping();
-  if(action==='try-example')openTryExample(caseIndex);
+  if(action==='try-example')openTryExample(caseIndex,event.target.closest('[data-try-target]')?.dataset.tryTarget);
   if(action==='close-dataset')closeDatasetDialog();
   if(action==='add-message'||action==='remove-message'){
     const messages=readExampleMessages();
