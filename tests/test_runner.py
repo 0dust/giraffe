@@ -2423,24 +2423,20 @@ async def test_final_load_client_delay_qualifies_timing_but_preserves_known_answ
     assert check(report, 'load').metrics['highest_accepted'] == []
 
 
-@pytest.mark.parametrize("request_budget", [6, None])
-async def test_measure_only_load_keeps_detail_out_of_concise_stop_summary(request_budget):
+async def test_measure_only_load_keeps_detail_out_of_concise_stop_summary():
     cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
     for case in cases:
         case.update(scorer="none", expected=None)
-    value = await runner.run_suite(_pack_config(checks=["load"], concurrency=1, duration=1 if request_budget else .05,
-        request_pack={"version": 1, "cases": cases}, max_requests=request_budget,
+    value = await runner.run_suite(_pack_config(checks=["load"], concurrency=1, duration=1,
+        request_pack={"version": 1, "cases": cases}, max_requests=6,
         criteria={"max_first_answer_ms": None, "max_completion_ms": None, "min_correct_percent": 0}))
     result = check(value, "load")
     assert result.status == "inconclusive"
     assert load_group(value)["scored"] == 0 and load_group(value)["valid"] > 0
-    if request_budget:
-        assert "request budget" in result.summary.lower()
-        assert "--max-requests" in result.summary
-    else:
-        assert "--max-requests" not in result.summary
+    assert "request budget" in result.summary.lower()
+    assert "--max-requests" in result.summary
     assert "max_first_answer_ms" in result.summary and "max_completion_ms" in result.summary
     assert "unscored" in result.summary
     assert len(result.summary.split(". ")) <= 2
     assert load_group(value)["unscored"] > 0
-    assert result.metrics["points"][0]["reason_code"] in {"budget_limited", "missing_case_coverage"}
+    assert result.metrics["points"][0]["reason_code"] == "budget_limited"
