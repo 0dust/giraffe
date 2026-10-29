@@ -333,7 +333,7 @@ for(const observations of [undefined,{}, {summary:''}, {summary:'  '}, {summary:
   report.observations=observations;renderDetail();
   const fallback=nodes['#main'].innerHTML.split('<div class="report-toolbar')[0];
   assert.match(fallback,/<h1>Capacity under load is inconclusive<\\/h1>/);
-  assert.match(fallback,/Highest tested acceptable arrival rate: not established/);
+  assert.match(nodes['#main'].innerHTML,/Highest tested acceptable arrival rate: not established/);
 }
 `);
 """)

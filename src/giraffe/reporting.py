@@ -1516,6 +1516,275 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+
+def _baseline_verdict(row: dict[str, Any]) -> tuple[str, str]:
+    if row.get("status") == "fail":
+        return "Worse", "fail"
+    if row.get("status") != "pass":
+        return "Not comparable", "inconclusive"
+    if row.get("acceptance_improved"):
+        return "Better", "pass"
+    interval = row.get("worsening_interval_95") or []
+    threshold = row.get("threshold")
+    if (len(interval) == 2 and interval[1] is not None and threshold is not None
+            and interval[1] <= -threshold and row.get("worsening", 0) < 0):
+        return "Better", "pass"
+    return "No material change", "muted"
+
+
+def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = list(target.get("comparisons", []))
+    traffic = target.get("traffic_capacity")
+    if traffic:
+        rows.append(dict(traffic, metric="Highest acceptable tested arrival rate (requests/s)",
+                         baseline=traffic.get("baseline_highest_acceptable_rate_rps"),
+                         current=traffic.get("current_highest_acceptable_rate_rps"),
+                         acceptance_improved=(traffic.get("status") == "pass"
+                             and isinstance(traffic.get("baseline_highest_acceptable_rate_rps"), (int, float))
+                             and isinstance(traffic.get("current_highest_acceptable_rate_rps"), (int, float))
+                             and traffic["current_highest_acceptable_rate_rps"] > traffic["baseline_highest_acceptable_rate_rps"])))
+    load = target.get("load_test")
+    if load:
+        from .load_test import point_label
+
+        for point in load.get("points", []):
+            before, after = point.get("baseline") or {}, point.get("current") or {}
+            rows.append(dict(point, metric="Load acceptance: " + point_label(after or before),
+                             baseline=before.get("status", "Unknown"),
+                             current=after.get("status", "Unknown"), check="load",
+                             scenario=point_label(after or before),
+                             acceptance_improved=(point.get("status") == "pass"
+                                                  and before.get("status") == "fail"
+                                                  and after.get("status") == "pass")))
+        if not load.get("points"):
+            rows.append(dict(load, metric="Tested load acceptance", baseline=None, current=None))
+    if not rows:
+        rows.append(dict(metric="Comparison unavailable", status="inconclusive",
+                         reason=" ".join(target.get("reasons", []))))
+    return rows
+
+
+def _baseline_summary_html(baseline: dict[str, Any]) -> str:
+    counts = Counter(_baseline_verdict(row)[0] for target in baseline.get("targets", [])
+                     for row in _baseline_display_rows(target))
+    if counts["Worse"] or counts["Better"]:
+        summary = ' · '.join(f'{counts[label]} {word}' for label, word in
+                             (("Worse", "worse"), ("Better", "better")) if counts[label])
+    else:
+        summary = (f'no regressions ({counts["No material change"]} unchanged, '
+                   f'{counts["Not comparable"]} not comparable)')
+    return (f'<p class="baseline-summary"><a href="#baseline-heading">vs baseline '
+            f'{_e(baseline.get("name") or baseline.get("run_id", "unknown"))}: {_e(summary)}</a></p>')
+
+
+def _deployment_change_html(diff: dict[str, Any]) -> str:
+    if not diff:
+        return ""
+    changed = [row["field"] for row in diff.get("fields", [])
+               if row.get("change") != "no_observed_change"]
+    intended = diff.get("intended_change")
+    summary = ("Deployment change: " + ", ".join(changed) if changed
+               else "No observed deployment changes.")
+    if changed and intended and not diff.get("confounded"):
+        summary += " (one intended change)"
+    parts = [f'<p class="deployment-change">{_e(summary)}</p>']
+    if diff.get("confounded"):
+        parts.append('<p><strong>Confounded: multiple unrelated changes.</strong></p>')
+        if intended:
+            fields = intended if isinstance(intended, list) else [intended]
+            parts.append(f'<p class="muted">Intended change: {_e(", ".join(fields))}</p>')
+    if diff.get("unknown_baseline"):
+        parts.append('<p class="muted">Baseline deployment configuration was not recorded.</p>')
+    if diff.get("interpretation"):
+        parts.append(f'<p class="muted">{_e(diff["interpretation"])}</p>')
+    return "".join(parts)
+
+
+def _baseline_table_html(baseline: dict[str, Any]) -> str:
+    conditions: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
+    notes = []
+    for target in baseline.get("targets", []):
+        deployment = _deployment_change_html(target.get("configuration_diff") or {})
+        if deployment:
+            notes.append(f'<div><h3>{_e(target.get("target", "Target"))} · Deployment</h3>'
+                         f'{deployment}</div>')
+        rows = _baseline_display_rows(target)
+        for row in rows:
+            conditions[(target.get("target"), row.get("check"), row.get("scenario"))].append(row)
+        traffic = target.get("traffic_capacity") or {}
+        if traffic.get("delta_rps") is not None:
+            delta = f'Change: {traffic["delta_rps"]:+.4g} requests/s'
+            if traffic.get("change_percent") is not None:
+                delta += f' ({traffic["change_percent"]:+.1f}%)'
+            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · '
+                         f'Tested arrival capacity · {_e(delta)}</p>')
+        load = target.get("load_test") or {}
+        if load.get("points") and load.get("reason"):
+            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · '
+                         f'Load acceptance: {_e(load["reason"])}</p>')
+
+    def table(rows):
+        reason_column = any(row.get("reason") and row["reason"] !=
+                            "No material worsening detected in these samples."
+                            for row in rows)
+        parts = ['<div class="table"><table class="baseline-table"><thead><tr>'
+                 '<th>Metric</th><th>Baseline</th><th>Current</th><th>Change</th><th>Verdict</th>'
+                 + ('<th>Reason</th>' if reason_column else '') + '</tr></thead><tbody>']
+        for row in rows:
+            label = str(row.get("metric", "Metric")).replace("_", " ")
+            label = label[:1].upper() + label[1:]
+            before, after = row.get("baseline"), row.get("current")
+            rate = row.get("change_unit") == "percentage_points"
+
+            def value(number):
+                if number is None:
+                    return "—"
+                if isinstance(number, str):
+                    return _e(number.capitalize())
+                return f"{number * 100:.1f}%" if rate else _number(number)
+
+            change = "—"
+            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                if rate:
+                    change = f"{(after - before) * 100:+.1f} pp"
+                elif before:
+                    change = f"{(after - before) * 100 / before:+.1f}%"
+                elif after == before:
+                    change = "+0.0%"
+            verdict, tone = _baseline_verdict(row)
+            parts.append(f'<tr><th scope="row">{_e(label)}</th>'
+                         f'<td>{value(before)}</td><td>{value(after)}</td>'
+                         f'<td class="{tone}">{_e(change)}</td>'
+                         f'<td><strong class="{tone}">{verdict}</strong></td>')
+            if reason_column:
+                reason = row.get("reason", "")
+                if reason == "No material worsening detected in these samples.":
+                    reason = ""
+                parts.append(f'<td class="muted">{_e(reason)}</td>')
+            parts.append('</tr>')
+        parts.append('</tbody></table></div>')
+        return ''.join(parts)
+
+    parts = notes
+    # Conditions with changed acceptance appear before conditions without changes.
+    ordered = sorted(conditions.items(), key=lambda item: min(
+        {"Worse": 0, "Better": 1, "No material change": 2, "Not comparable": 3}[
+            _baseline_verdict(row)[0]] for row in item[1]))
+    for condition, entries in ordered:
+        label = ' · '.join(str(value).replace('_', ' ') for value in condition if value)
+        parts.append(f'<div class="baseline-condition"><h3>{_e(label or "Run comparison")}</h3>')
+        for verdict, title in (("Worse", "Worse"), ("Better", "Better"),
+                               ("No material change", "Unchanged"), ("Not comparable", "Not comparable")):
+            rows = [row for row in entries if _baseline_verdict(row)[0] == verdict]
+            if not rows:
+                continue
+            if verdict in {"No material change", "Not comparable"}:
+                parts.append(f'<details class="baseline-group"><summary>{title} ({len(rows)})</summary>'
+                             f'{table(rows)}</details>')
+            else:
+                parts.append(f'<h4>{title} ({len(rows)})</h4>{table(rows)}')
+        parts.append('</div>')
+    return ''.join(parts)
+
+
+def _request_prompt_excerpt(record: RequestRecord) -> str:
+    messages = record.evaluation.messages if record.evaluation else []
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+        if isinstance(content, str) and content.strip():
+            text = " ".join(content.split())
+            return text[:80] + ("…" if len(text) > 80 else "")
+    return record.fixture_id
+
+
+def _response_saving_note(record: RequestRecord, report: RunReport) -> str:
+    policy = report.manifest.get("config", {}).get("retention", "failures")
+    if record.output and record.output_chars > len(record.output):
+        return "Response truncated"
+    if record.output or record.tool_calls:
+        return ""
+    if record.status in {"failed", "timeout"} and not record.output_chars:
+        return "No response received" + (f": {record.error}" if record.error else "")
+    if policy == "none" and not record.valid and record.output_chars == 0:
+        return ""
+    if policy == "none":
+        return "Response not saved (retention: none)"
+    omitted = report.manifest.get("storage", {}).get("response_bodies_omitted")
+    if omitted and (record.output_chars or record.valid or record.tool_evaluation):
+        return "Response not saved (storage limit)"
+    if omitted and record.evaluation and (record.evaluation.scorer == "tool" or record.evaluation.tool_expectation):
+        return "Response evidence unavailable (storage limit)"
+    if record.output_chars or record.answer_chars or (policy == "failures" and record.valid):
+        return f"Response not saved (retention: {policy})"
+    return ""
+
+
+def _received_answer(record: RequestRecord, report: RunReport) -> str:
+    if record.output:
+        return record.output
+    if record.tool_calls:
+        calls = []
+        for call in record.tool_calls:
+            function = call.get("function") or call
+            arguments = function.get("arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            calls.append(f'{function.get("name", "Unknown tool")}({arguments})')
+        return "Tool calls: " + "; ".join(calls)
+    return _response_saving_note(record, report) or ("Empty response" if record.status == "completed" else "No response recorded")
+
+
+def _answer_findings_html(check: CheckResult, records: list[RequestRecord], report: RunReport) -> str:
+    matches = [r for r in records if r.target == check.target and check.id in r.check_ids
+               and (r.score is False or r.evaluation_error) and r.evaluation][:3]
+    parts = []
+    for record in matches:
+        evidence = record.evaluation
+        if evidence.expected_provided:
+            expected = evidence.expected
+            expected = expected if isinstance(expected, str) else json.dumps(expected, ensure_ascii=False)
+            criterion = "Expected"
+        elif evidence.schema_ is not None:
+            criterion, expected = "JSON schema", json.dumps(evidence.schema_, ensure_ascii=False)
+        elif evidence.rubric:
+            criterion, expected = "Rubric", evidence.rubric
+        elif evidence.tool_expectation is not None:
+            criterion, expected = "Tool expectation", json.dumps(evidence.tool_expectation.model_dump(), ensure_ascii=False)
+        else:
+            criterion, expected = "Answer check", evidence.scorer
+        received = _received_answer(record, report)
+        saving_note = _response_saving_note(record, report)
+        received_html = _preview(received) if record.output or record.tool_calls else f'<span class="muted">{_e(received)}</span>'
+        excerpt = (f'{criterion}: {expected[:160]}{"…" if len(expected) > 160 else ""} · '
+                   f'Received: {received[:160]}{"…" if len(received) > 160 else ""}')
+        reason = record.evaluation_error or record.score_message
+        condition = f'{check.title} · {record.scenario}'
+        parts.append(f'<details class="answer-finding"><summary>{_e(_request_prompt_excerpt(record))}'
+                     f' · {_e(excerpt)}</summary><p class="muted">{_e(condition)} · {_e(record.id)}</p>'
+                     + (f'<p>{_e(reason)}</p>' if reason else '') +
+                     f'<p><strong>{criterion}:</strong> {_preview(expected)}</p>'
+                     f'<p><strong>Received:</strong> {received_html}</p>'
+                     + (f'<p class="muted">{_e(saving_note)}</p>' if saving_note and (record.output or record.tool_calls) else '')
+                     + '</details>')
+    return ''.join(parts)
+
+
+def _json_export_html(report: RunReport) -> str:
+    return ('<p class="muted"><a href="report.json">JSON export</a> · '
+            'report.json — keep it next to this file</p>')
+
+
+def _check_timing_violation_ids(check: CheckResult) -> set[str]:
+    # Current capacity reports store IDs once per stage; older reports aggregate them.
+    sources = [check.metrics.get("violations", []),
+               *(stage.get("violations", []) for stage in check.metrics.get("traffic_stages", []))]
+    return {rid for source in sources if isinstance(source, list) for rid in source if isinstance(rid, str)}
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -1523,51 +1792,48 @@ def _render(report: RunReport) -> str:
     report = refresh_performance(report.model_copy())
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
+    timing_failures = {rid for check in report.checks if check.status == "fail"
+                       for rid in _check_timing_violation_ids(check)}
+    evidence.update(timing_failures)
     ordered = sorted(report.requests, key=lambda r: (
         r.id not in evidence,
-        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error)))
+        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error or r.id in timing_failures)))
     detailed = ordered[:max(DEFAULT_HTML_REQUEST_DETAILS, sum(r.id in evidence for r in report.requests))]
     anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
     disconnected = {target["name"]: summary for target in config.get("targets", [])
                     if (summary := connection_summary(
                         [r for r in report.requests if r.target == target["name"]], target.get("url", target["name"])))}
-    headline = ("; ".join(disconnected.values()) if disconnected and len(disconnected) == len(config.get("targets", []))
-                else "Giraffe acceptance results")
+    verdict = {"pass": "Passed", "fail": "Failed", "inconclusive": "Inconclusive",
+               "partial": "Partial results"}.get(report.overall, report.overall.capitalize())
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
-    if headline == "Giraffe acceptance results":
-        for summary in disconnected.values():
-            parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
+    for summary in disconnected.values():
+        parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
     for target in config.get("targets", []):
         parts.append(f'<p class="muted"><strong>{_e(target.get("name", ""))}</strong> · '
                      f'{_e(target.get("route", "unknown"))} · Model: <code>{_e(target.get("model", ""))}</code>'
                      f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></p>')
-    # Native radio navigation keeps the portable report keyboard-accessible
-    # without scripts, external assets, or duplicating the aggregation layer.
-    parts.append('<div class="html-tabs" role="group" aria-label="Report tabs">'
-                 '<label><input id="html-tab-performance" name="report-tab" type="radio" '
-                 'aria-controls="html-performance" checked>Performance</label>'
-                 '<label><input id="html-tab-results" name="report-tab" type="radio" '
-                 'aria-controls="html-results">Test results '
-                 + str(len(report.checks)) + '</label><small>Measurement: default window per target · '
-                 '<a href="report.json">JSON export</a></small></div>'
-                 '<div id="html-performance" aria-label="Performance">')
-    for entry in report.performance["available_targets"]:
-        selected = (report.performance if entry["target"] == report.performance["selected_target"]
-                    else build_performance(report, target=entry["target"]))
-        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))))
-    if not report.performance["available_targets"]:
-        parts.append(render_performance(report.performance))
-    parts.append('</div><div id="html-results" aria-label="Test results">')
-    parts.append('<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
-                 '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
-                 '<a href="#reproduction">Reproduce</a></p>')
+    parts.append('<nav aria-label="Report sections"><a href="#checks">Checks</a> · '
+                 '<a href="#baseline">Baseline comparison</a> · <a href="#html-performance">Performance</a> · '
+                 '<a href="#requests">Request evidence</a> · <a href="#reproduction">Reproduce</a></nav>')
+    parts.append(_json_export_html(report))
+    if report.baseline:
+        parts.append(_baseline_summary_html(report.baseline))
+    parts.append('<div id="html-results" aria-label="Results"><section id="findings"><h2>Findings</h2>')
+    findings = [check for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}]
+    for check in findings:
+        parts.append(f'<article class="card"><strong>{_e(check.title)}</strong> · {_e(check.target)}'
+                     f'<p>{_e(check.summary)}</p>{_answer_findings_html(check, report.requests, report)}</article>')
+    if not findings:
+        parts.append('<p>All selected checks passed.</p>' if report.overall == "pass"
+                     else '<p>No check findings were recorded.</p>')
+    parts.append('</section>')
     storage = report.manifest.get("storage", {})
     if storage.get("response_bodies_omitted") or storage.get("limit_exceeded"):
         omitted = storage.get("response_bodies_omitted", 0)
@@ -1599,9 +1865,10 @@ def _render(report: RunReport) -> str:
             parts.append(_pack_table(check))
         elif check.id == "correctness" and "capacity" not in config.get("checks", []):
             parts.append(_pack_table(check))
-    missing = [f"{c.target} / {c.title}: {c.summary}" for c in report.checks
-               if c.status in {"skipped", "inconclusive", "blocked"}]
-    missing.extend(report.warnings)
+    selected_checks = set(config.get("checks", []))
+    missing = [*report.warnings, *(f'{check.title}: {check.summary}' for check in report.checks
+                if check.status in {"blocked", "skipped"}
+                and (check.required or check.id in selected_checks))]
     if missing:
         parts.append('<h2>Coverage and limitations</h2><ul>' +
                      "".join(f"<li>{_e(item)}</li>" for item in dict.fromkeys(missing)) + "</ul>")
@@ -1661,7 +1928,23 @@ def _render(report: RunReport) -> str:
     parts.append("</table></div>")
     if absent:
         parts.append(f'<p class="muted">Not included in this run: {_e(", ".join(absent))}.</p>')
-    parts.append('</section><section id="measurements"><h2>Measurements by scenario</h2>'
+    parts.append('</section><section id="baseline"><h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>')
+    if report.baseline:
+        parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
+                     f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
+                     'Absolute check outcomes appear separately above.</p>')
+        parts.append(_baseline_table_html(report.baseline))
+    else:
+        parts.append('<p>No baseline supplied. This run reports absolute checks only.</p>')
+    parts.append('</section></div><div id="html-performance" aria-label="Performance">')
+    for entry in report.performance["available_targets"]:
+        selected = (report.performance if entry["target"] == report.performance["selected_target"]
+                    else build_performance(report, target=entry["target"]))
+        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))))
+    if not report.performance["available_targets"]:
+        parts.append(render_performance(report.performance))
+    parts.append('</div>')
+    parts.append('<section id="measurements"><h2>Measurements by scenario</h2>'
                  '<p class="muted">Initial requests are separated from warm and loaded requests. '
                  'Latency percentiles include valid completed requests only; failures and timeouts '
                  'are counted alongside them. Small samples do not establish tail latency.</p>'
@@ -1688,20 +1971,7 @@ def _render(report: RunReport) -> str:
                      f'<td>{_number(_percentile(generation, .5))} (n={len(generation)})</td>'
                      f'<td>{_number(_percentile(end_to_end, .5))}</td>'
                      f'<td>{sum(r.score is True for r in scored)} / {len(scored)}</td></tr>')
-    parts.append('</table></div></section><section id="baseline"><h2>Baseline comparison</h2>')
-    if report.baseline:
-        parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
-                     f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
-                     'Absolute check outcomes appear separately above.</p>')
-        for target in report.baseline.get("targets", []):
-            if "traffic_capacity" in target:
-                parts.append(_traffic_baseline_html(target))
-            if "load_test" in target:
-                parts.append(_load_baseline_html(target))
-        parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
-                     f'<pre>{_json(report.baseline)}</pre></details>')
-    else:
-        parts.append('<p>No baseline supplied. This run reports absolute checks only.</p>')
+    parts.append('</table></div></section>')
     parts.append('<section id="deployment"><h2>Deployment and serving telemetry</h2>'
                  '<p>Deployment changes provide investigation context and do not establish causality. '
                  'Unknown fields and telemetry remain unknown. Client first output is separate from server TTFT.</p>')
@@ -1722,7 +1992,7 @@ def _render(report: RunReport) -> str:
                      f'<details><summary>Serving telemetry, phases and collection coverage</summary>'
                      f'<pre>{_json(observation.get("serving_telemetry"))}</pre></details>')
     parts.append('</section>')
-    parts.append('</section><section id="requests"><h2>Request evidence</h2>'
+    parts.append('<section id="requests"><h2>Request evidence</h2>'
                  f'<p class="muted">Response retention: {_e(config.get("retention", "failures"))}. '
                  'Retention controls response text; request metadata, timings, status and scores are always saved. '
                  'Retention does not cap disk usage; storage limits do.</p>'
@@ -1730,7 +2000,7 @@ def _render(report: RunReport) -> str:
                  '<a href="report.json">All requests and complete retained bodies in report.json</a>.</p>')
     input_previews = {}
     for record in detailed:
-        label = f"{record.target} · {record.scenario} · {record.fixture_id} · {record.status}"
+        label = f"{_request_prompt_excerpt(record)} · {record.target} · {record.scenario} · {record.status}"
         parts.append(f'<details id="{anchors[record.id]}"><summary>{_e(label)}'
                      f' · {_number(record.elapsed_ms)} ms</summary>'
                      f'<p>Request {_e(record.id)} · scored: {_e(record.score)} · '
@@ -1778,8 +2048,12 @@ def _render(report: RunReport) -> str:
         parts.append(_judgement_table(record))
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_preview(record.output)}</pre>')
+        elif record.tool_calls:
+            parts.append(f'<h3>Tool response</h3><pre>{_preview(_received_answer(record, report))}</pre>')
         else:
-            parts.append('<p class="muted">No retained response body.</p>')
+            parts.append(f'<p class="muted">{_e(_received_answer(record, report))}</p>')
+        if record.output and (saving_note := _response_saving_note(record, report)):
+            parts.append(f'<p class="muted">{_e(saving_note)}</p>')
         if record.reasoning:
             parts.append(f'<h3>Reasoning response</h3><pre>{_preview(record.reasoning)}</pre>')
         parts.append(f'<details><summary>Local fixture and measured request evidence</summary><pre>'
@@ -1792,7 +2066,7 @@ def _render(report: RunReport) -> str:
     if report.observations:
         parts.append(f'<details><summary>Additional observations</summary><pre>'
                      f'{_json(report.observations)}</pre></details>')
-    parts.append('</section></div></main></html>')
+    parts.append('</section></main></html>')
     return "".join(parts)
 
 

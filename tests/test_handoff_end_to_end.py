@@ -1,11 +1,13 @@
 """A browser-configured run can be handed to a shell without changing its contract."""
 
 import asyncio
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from collections import Counter
 
 import pytest
@@ -16,9 +18,97 @@ from tests.evidence_helpers import workload_payloads, workload_records
 from tests.test_web import browser, finished, start
 
 
-@pytest.mark.parametrize("compare", [False, True])
+def affected_requests(report, target, row):
+    """Independent interval oracle for this fixture's ordinary correctness traffic."""
+    records = [r for r in report["requests"] if r["target"] == target
+               and row["check"] in r["check_ids"] and r["scenario"] == row["scenario"]]
+    assert records
+    assert not any(r["scenario"] == "warm" for r in report["requests"])
+    health = report["observations"]["client_timing_health"]
+    assert health["schema_version"] == 1
+    windows = health["windows"] + ([health["overflow_window"]] if health["overflow_window"] else [])
+    affected = set()
+    for record in records:
+        assert record.get("scheduled_ms") is None and record.get("dispatch_lag_ms") is None
+        start = record["timing_start_ms"]
+        end = min(record["completed_ms"], start + record["elapsed_ms"])
+        if row["metric"] == "first_output_ms":
+            end = min(end, start + record["first_output_ms"])
+        elif row["metric"] == "generation_tokens_per_second" and record["last_output_ms"] is not None:
+            end = min(end, start + record["last_output_ms"])
+        if any(w["lag_ms"] > 100 and start < w["end_ms"] and w["start_ms"] < end for w in windows):
+            affected.add(record["id"])
+    return affected
+
+
+def assert_handoff_outcome(returncode, envelope, replay, original, *, compare):
+    """Only observed client delay may make this otherwise healthy replay inconclusive."""
+    for report in (original, replay):
+        assert report["abort_reason"] is None
+        selected = [c for c in report["checks"] if c["required"] and c["id"] != "baseline"]
+        assert selected and all(c["status"] == "pass" for c in selected)
+        assert all(r["status"] == "completed" and r["valid"] and not r["error"]
+                   and not r["evaluation_error"] for r in report["requests"])
+        assert all(r["score"] is True for r in workload_records(report["requests"]))
+    expected = "pass"
+    if compare:
+        baseline = replay["baseline"]
+        assert baseline["run_id"] == original["run_id"]
+        assert baseline["targets"]
+        for target in baseline["targets"]:
+            assert not target["reasons"]
+            assert target["comparisons"]
+            delayed = False
+            for row in target["comparisons"]:
+                if "worsening" not in row:
+                    assert row["status"] == "inconclusive"
+                    assert max(row["current_samples"], row["baseline_samples"]) < baseline["min_samples"]
+                    continue
+                affected = False
+                if row["metric"] in {"latency_ms", "first_output_ms", "max_stream_gap_ms",
+                                     "output_tokens_per_second", "generation_tokens_per_second"}:
+                    for label, report in (("Current", replay), ("Baseline", original)):
+                        ids = affected_requests(report, target["target"], row)
+                        quality = row.get("timing_quality", {}).get(label)
+                        assert quality and quality["scope"] == "request_intervals"
+                        assert quality["threshold_ms"] == 100
+                        assert set(quality["affected_request_ids"]) == ids
+                        assert quality["status"] == ("client_delayed" if ids else "qualified")
+                        affected |= bool(ids)
+                else:
+                    assert row["metric"] in {"valid_completion_rate", "error_rate", "correctness_rate"}
+                assert row["status"] == ("inconclusive" if affected else "pass"), row
+                delayed |= affected
+            assert target["status"] == ("inconclusive" if delayed else "pass")
+            if delayed:
+                expected = "inconclusive"
+        assert baseline["status"] == expected
+        assert [c["status"] for c in replay["checks"] if c["id"] == "baseline"] == [expected]
+    else:
+        assert replay["baseline"] is None
+    assert replay["overall"] == envelope["outcome"] == expected
+    assert returncode == envelope["exit_code"] == {"pass": 0, "inconclusive": 2}[expected]
+
+
+@pytest.mark.parametrize("compare,pause", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("request_source", ["builtin", "request_pack"])
-async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, compare, request_source):
+async def test_copied_command_replays_ui_configuration_and_baseline(
+    tmp_path, monkeypatch, compare, pause, request_source,
+):
+    from giraffe.client import LLMClient
+
+    execute = LLMClient.execute
+    paused = False
+
+    async def execute_with_host_pause(self, spec, **kwargs):
+        nonlocal paused
+        if pause and not paused and "correctness" in spec.check_ids:
+            paused = True
+            # Block during real HTTP traffic, leaving the production monitor active.
+            asyncio.get_running_loop().call_later(.01, time.sleep, .25)
+        return await execute(self, spec, **kwargs)
+
+    monkeypatch.setattr(LLMClient, "execute", execute_with_host_pause)
     with FakeEndpoint(first_token_delay=.02, chunk_delay=.02) as endpoint:
         config = RunConfig(
             targets=[{"name": "local", "url": endpoint.url, "model": "fake-model"}],
@@ -44,6 +134,8 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
         async with browser(tmp_path / "ui-runs") as client:
             original = await finished(client, await start(client, config))
             assert original["report"]["overall"] == "pass"
+            source_report = json.loads((tmp_path / "ui-runs" / original["id"] / "report.json").read_text())
+            assert paused == pause
             exported = await client.get(f"/api/runs/{original['id']}/config.json")
             assert exported.status_code == 200
             assert exported.json() == original["report"]["manifest"]["config"]
@@ -71,10 +163,9 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
                 subprocess.run, ["/bin/sh"], input=command, cwd=tmp_path,
                 env=env, capture_output=True, text=True, timeout=30,
             )
-            assert result.returncode == 0, result.stderr + result.stdout
             envelope = json.loads(result.stdout)
-            assert envelope["outcome"] == "pass"
             replay = json.loads(Path(envelope["report_paths"]["json"]).read_text())
+            assert_handoff_outcome(result.returncode, envelope, replay, source_report, compare=compare)
             assert replay["manifest"]["config"] == exported.json()
             traffic = endpoint.requests[before:]
             assert len(traffic) == len(replay["requests"]) + 1
@@ -98,6 +189,29 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
                     json.dumps(request, sort_keys=True) for request in original_traffic[6:])
             if compare:
                 assert replay["baseline"]["run_id"] == original["report"]["run_id"]
-                assert replay["baseline"]["status"] == "pass"
+                if pause:
+                    assert replay["baseline"]["status"] == "inconclusive"
+                    assert result.returncode == 2
+                # The oracle must reject broken exits, real failures, and lost baseline evidence.
+                with pytest.raises(AssertionError):
+                    wrong_exit = 0 if result.returncode == 2 else 2
+                    assert_handoff_outcome(wrong_exit, envelope, replay, source_report, compare=True)
+                for defect in ("failed_rate", "unexplained_inconclusive", "different_baseline", "lost_delay"):
+                    broken = deepcopy(replay)
+                    rows = broken["baseline"]["targets"][0]["comparisons"]
+                    if defect in {"failed_rate", "unexplained_inconclusive"}:
+                        next(row for row in rows if row["metric"] == "correctness_rate")["status"] = (
+                            "fail" if defect == "failed_rate" else "inconclusive"
+                        )
+                    elif defect == "different_baseline":
+                        broken["baseline"]["run_id"] = "not-the-exported-baseline"
+                    else:
+                        if not pause:
+                            continue
+                        row = next(row for row in rows if row["status"] == "inconclusive"
+                                   and "worsening" in row)
+                        row["timing_quality"]["Baseline"]["affected_request_ids"] = []
+                    with pytest.raises(AssertionError):
+                        assert_handoff_outcome(result.returncode, envelope, broken, source_report, compare=True)
             else:
                 assert replay["baseline"] is None

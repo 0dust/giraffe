@@ -26,7 +26,7 @@ const bootstrap=BOOTSTRAP;
 const nodes={'#main':{innerHTML:''},'#run-filter':{value:'all'}},listeners={},warnings=[];
 const context={assert,structuredClone,...formConfig,bootstrap,nodes,listeners,warnings,console:{warn:(...args)=>warnings.push(args)},
   document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},
-  window:{addEventListener(){}}};
+  window:{addEventListener(kind,fn){listeners['window:'+kind]=fn;}}};
 if(USE_DOM){context.document=browserDOM(listeners);context.location={hash:'#runs/live'};context.setTimeout=()=>{};context.clearTimeout=()=>{};context.window.innerWidth=1280;context.window.innerHeight=800;context.window.matchMedia=()=>({matches:false});nodes['#main']=context.document.querySelector('#main');}
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
@@ -128,11 +128,11 @@ renderRuns();assert(search.focused);assert.equal(search.start,1);assert.equal(se
 def test_failures_and_partial_results_do_not_promote_saving_a_baseline():
     run_render_checks(r"""
 const failed=report([check('correctness','fail',{
-  summary:'Expected <Paris>; inspect the returned answer.',metrics:{correct:1,scored:3}})],{overall:'fail'});
+  summary:'Expected <Paris>; inspect the returned answer.',metrics:{correct:1,scored:3},evidence_ids:['bad']})],{overall:'fail',requests:[{id:'bad',target:'local',status:'completed',score:false,output:'Lyon',evaluation:{expected:'Paris',expected_provided:true}}]});
 let html=detail(failed);
 assert.match(html,/<h1>Answer correctness: 1 of 3 correct<\/h1>/);
 assert.match(html,/Expected &lt;Paris&gt;/);
-assert.match(html,/class="button primary" data-action="rerun">Review settings/);
+assert.match(html,/class="button primary" data-action="show-failing">Show failing requests/);
 assert.doesNotMatch(html,/inspect-finding|Inspect failed answer|Inspect evidence|Inspect check/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 assert.match(html,/Save as reference baseline/);
@@ -153,7 +153,8 @@ assert.match(html,/<h1>GPU metrics is inconclusive<\/h1>/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 html=detail({...passed,overall:'fail',baseline:{status:'fail'}});
 assert.match(html,/A material regression was detected/);
-assert.match(html,/class="button primary" data-tab="baseline">Inspect comparison/);
+assert.match(html,/class="button primary" data-action="show-comparison">Show comparison/);
+assert.doesNotMatch(html,/data-action="show-failing"/);
 html=detail(report([]));
 assert.match(html,/<h1>No checks ran<\/h1>/);
 assert.doesNotMatch(html,/Selected acceptance checks passed|checks met their configured limits/);
@@ -171,29 +172,27 @@ const value=report([
 value.manifest.config.checks.push('tools');
 let html=detail(value);
 assert(html.indexOf('data-check="local:correctness"')<html.indexOf('data-check="local:access"'));
-assert.match(html,/<details class="checks-not-run"\s*>/);
-const disclosure=html.match(/<details class="checks-not-run"[^>]*>([\s\S]*?)<\/details>/)[1];
-assert.match(disclosure,/Not run · 2/);
-assert.match(disclosure,/data-check="local:json"/);
-assert.match(disclosure,/Server did not expose &lt;tools&gt;/);
+assert.match(html,/<details class="checks-not-selected">/);
+const disclosure=html.match(/<details class="checks-not-selected"[^>]*>([\s\S]*?)<\/details>/)[1];
+assert.match(disclosure,/Not selected: JSON correctness/);
+assert.doesNotMatch(html,/data-check="local:json"/);
+assert.match(html,/Server did not expose &lt;tools&gt;/);
 assert.doesNotMatch(disclosure,/data-check="local:access"|data-check="local:correctness"/);
 state.selectedCheck='local:tools';html=renderChecks(value);
-assert.match(html,/<details class="checks-not-run" open>/);
 assert.match(html,/This check was skipped/);
-assert.doesNotMatch(html,/This optional check was not selected/);
 state.selectedCheck='local:json';html=renderChecks(value);
-assert.match(html,/This check was not selected/);
+assert.doesNotMatch(html,/data-check="local:json"/);
 const allSkipped=report([check('json','skipped',{summary:'Not selected for this run.'})],{overall:'skipped'});
 html=detail(allSkipped);
 assert.match(html,/<h1>No checks ran<\/h1>/);
-assert.match(html,/<details class="checks-not-run"\s*>/);
+assert.match(html,/<details class="checks-not-selected">/);
 assert.equal(state.selectedCheck,null);
 const selectedSkipped=report([check('access','pass'),check('tools','skipped',{
   summary:'The server did not expose <tools>.'})]);
 selectedSkipped.manifest.config.checks.push('tools');
 html=detail(selectedSkipped);
 assert.match(html,/<h1>Some selected checks did not run<\/h1>/);
-assert.match(html,/Acceptance inconclusive/);
+assert.match(html,/result-heading inconclusive/);
 assert.doesNotMatch(html,/Acceptance passed|Selected acceptance checks passed/);
 assert.doesNotMatch(html,/class="button primary" data-action="baseline-dialog"/);
 """)
@@ -205,15 +204,13 @@ state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'te
   max_requests:100,concurrency:4,max_duration_seconds:60,request_timeout_seconds:10,max_output_tokens:32},
   progress:{attempted:12,completed:9,elapsed_seconds:5},events:[]};
 renderLive();let html=nodes['#main'].innerHTML;
-assert.match(html,/Mission control/);
-assert.match(html,/Requests finished \/ started/);
-assert.match(html,/Active requests<\/dt><dd>3/);
-assert.match(html,/Requests started · 12 \/ 100 limit/);
-assert.match(html,/Request starts, not completions/);
+assert.match(html,/<h1>Running<\/h1>/);
+assert.match(html,/9 requests finished · 5s · limit 100/);
+assert.doesNotMatch(html,/Requests started ·|Active requests<\/dt>/);
 assert.match(html,/Scheduled requests can also use budget without reaching the server/);
 assert.doesNotMatch(html,/Request budget used/);
 state.detail.state='stopping';renderLive();html=nodes['#main'].innerHTML;
-assert.match(html,/data-action="stop" disabled/);
+assert.match(html,/data-action="stop"[^>]* disabled/);
 assert.match(html,/saving the evidence collected so far/);
 state.detail.state='running';state.detail.progress={phase:'judging',attempted:12,completed:12,
   judge_calls_completed:3,judge_calls_total:8};
@@ -235,18 +232,14 @@ const baseline={run_id:'reference-id',status:'inconclusive',targets:[{target:'lo
 const value=report([check('context','fail')],{baseline});state.detail={report:value,baseline_id:'chosen'};
 state.baselines=[{id:'chosen',name:'Before <upgrade>'}];const original=JSON.stringify(value);
 let html=renderComparison(value);
-assert.match(html,/The comparison is inconclusive/);assert.match(html,/does not establish improvement or regression/);
 assert.match(html,/Before &lt;upgrade&gt;/);assert.match(html,/local &lt;gpu&gt;/);
-assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);
-assert.match(html,/data-comparison-group="context"/);assert.match(html,/Context recall/);
-assert.match(html,/1 regressed · 1 inconclusive/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
-assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>/);
-assert.doesNotMatch(html,/<details class="comparison-check-group"[^>]* open/);
-state.comparisonFilter='all';html=renderComparison(value);
-assert.equal((html.match(/data-comparison-group=/g)||[]).length,2);
-assert.equal((html.match(/<tr>/g)||[]).length,5); // Three measurements and two group headers.
-state.comparisonFilter='pass';state.comparisonCheck='context';html=renderComparison(value);
-assert.match(html,/No measurements match/);
+assert.match(html,/<th>Metric<\/th>/);assert.match(html,/worse/);assert.match(html,/not comparable/);
+assert.match(html,/no material change/);assert.match(html,/125 ms/);assert.match(html,/n=6/);
+assert.match(html,/Question &lt;one&gt;/);assert.doesNotMatch(html,/<one>|<upgrade>|<gpu>|Entry \d/);
+assert.equal((html.match(/<tbody><tr>/g)||[]).length,3); // Each of the three measurements survives condition grouping.
+assert.equal((html.match(/data-comparison-condition/g)||[]).length,2);
+assert.match(html,/<details class="comparison-quiet"><summary>Unchanged \(1\)/);
+assert.match(html,/<details class="comparison-quiet"><summary>Not comparable \(1\)/);
 assert.equal(JSON.stringify(value),original);
 """)
 
@@ -283,7 +276,8 @@ for(const [id,bad,failed,good] of [['correctness','correct-bad','correct-timeout
 def test_checks_without_request_evidence_show_explanation_and_measurements():
     run_render_checks(r"""
 const value=report([check('first_output','blocked',{summary:'Endpoint &lt;local&gt; did not become ready.',metrics:{attempted:3,completed:0,failed:2,timed_out:1,first_output_p95_ms:321}}),check('generation','inconclusive',{summary:'No measurable generation samples.',metrics:{attempted:2,completed:0,generation_rate_samples:0}})],{overall:'inconclusive'});
-let html=detail(value);
+state.selectedCheck='local:first_output';state.detail={report:value};
+let html=renderChecks(value);
 assert.match(html,/Endpoint &amp;lt;local&amp;gt; did not become ready/);
 assert.match(html,/321 ms/);assert.match(html,/2 failed · 1 timed out/);
 assert.match(html,/No request evidence was recorded for this check/);
@@ -297,16 +291,16 @@ def test_report_tabs_keep_one_tab_stop_and_support_keyboard_navigation():
     run_render_checks(r"""
 const value=report([check('access','pass')]);detail(value);
 assert.equal($$('[role="tab"]').length,2);
-assert.equal($('#tab-performance').getAttribute('aria-selected'),'true');
-assert.equal($('#tab-results').getAttribute('tabindex'),'-1');
+assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
+assert.equal($('#tab-performance').getAttribute('tabindex'),'-1');
 let prevented=0;
 const key=key=>listeners.keydown({target:document.activeElement,key,preventDefault(){prevented++;}});
 $('#tab-performance').focus({preventScroll:true});key('ArrowRight');
 assert.equal(reportView.tab,'results');assert.equal(document.activeElement,$('#tab-results'));
 assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
 assert.equal($('#tab-performance').getAttribute('tabindex'),'-1');
-key('Home');assert.equal(reportView.tab,'performance');
-key('ArrowLeft');assert.equal(reportView.tab,'results');
+key('Home');assert.equal(reportView.tab,'results');
+key('ArrowLeft');assert.equal(reportView.tab,'performance');
 assert.equal(prevented,3);assert.equal($$('[role="tab"][tabindex="0"]').length,1);
 """, dom=True)
 
@@ -421,3 +415,30 @@ markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
 delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
 markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
 """)
+
+
+@pytest.mark.parametrize("check_id", ["first_output", "generation"])
+def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_id):
+    run_render_checks(r"""
+(async()=>{
+ const id=CHECK_ID,first=id==='first_output';
+ const limitField=first?'first_output_ms':'stream_gap_ms',observedField=first?'first_output_ms':'max_stream_gap_ms';
+ const limit=first?10000:5000,slow=first?12300:6000;
+ const records=[['slow',slow],['good',200],['client',20000]].map(([id,time])=>({id,target:'local',status:'completed',valid:true,score:true,output:'Correct',[observedField]:time}));
+ const failed=check(id,'fail',{evidence_ids:['slow','good','client'],metrics:{violations:['slow'],unattributed_timing_violations:['client']}});
+ const value=report([failed],{overall:'fail',requests:records});
+ value.manifest.config.limits={[limitField]:60000};
+ value.manifest.effective_checks={[id]:{limits:{[limitField]:limit}}};
+ value.manifest.default_check_limits={[id]:[limitField]};
+ const original=JSON.stringify(value);
+ detail(value);const action=$('[data-action="show-failing"]');assert(action);await listeners.click({target:action});
+ const panel=$('.check-detail'),table=panel.querySelector('.evidence-table');
+ assert(panel.textContent.includes(`Limit: ≤ ${limit/1000} s (default)`));
+ assert(!panel.textContent.includes('60 s'));
+ assert(table.querySelector('[data-request="slow"]'));
+ assert.equal(table.querySelector('[data-request="good"]'),null);
+ assert.equal(table.querySelector('[data-request="client"]'),null);
+ assert(table.textContent.includes(first?'Too slow: first output 12.3 s > 10 s':'Too slow: stream pause 6 s > 5 s'));
+ assert.equal(JSON.stringify(value),original);
+})()
+""".replace('CHECK_ID', json.dumps(check_id)), dom=True)

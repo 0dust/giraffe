@@ -326,14 +326,15 @@ def _api_report(report: RunReport) -> dict:
     """Keep dispatch/condition metadata; fetch retained evidence on demand."""
     result = report.model_dump(mode="json", exclude={"requests"})
     fields = {"id", "target", "fixture_id", "scenario", "condition_id", "check_ids", "status",
-              "valid", "score", "elapsed_ms", "first_output_ms", "dispatch_ms", "completed_ms",
+              "valid", "score", "elapsed_ms", "first_output_ms", "max_stream_gap_ms", "dispatch_ms", "completed_ms",
               "started_at", "completed_at", "intentional", "http_status", "error", "score_message",
               "output_chars", "stream", "finish_reason", "input_tokens", "output_tokens", "evaluation_error",
               "requested_input_tokens", "requested_output_tokens", "input_chars", "requested_max_tokens",
-              "traffic_stage", "traffic_rate_rps", "traffic_class", "load_point", "workload"}
+              "traffic_stage", "traffic_rate_rps", "traffic_class", "arrival_elapsed_ms", "arrival_first_output_ms", "load_point", "workload"}
     result.update(request_count=len(report.requests), requests_compact=True,
                   requests=[{**row.model_dump(mode="json", include=fields, exclude_defaults=True),
-                             "valid": row.valid, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars}
+                             "valid": row.valid, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars,
+                             "generation_tokens_per_second": row.generation_tokens_per_second}
                             for row in report.requests])
     return result
 
