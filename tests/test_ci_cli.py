@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+import signal
 
 import pytest
 import yaml
@@ -228,6 +229,65 @@ def test_never_preserves_cancellation_exit(with_partial_report, tmp_path, monkey
     captured = capsys.readouterr()
     assert json.loads(captured.out)['exit_code'] == 130
     assert 'verdict accepted' not in captured.err
+
+
+@pytest.mark.parametrize('policy', ['inconclusive', 'fail', 'never'])
+@pytest.mark.parametrize('stop_mode', ['SIGINT', 'SIGTERM', 'request_limit'])
+def test_signal_stop_preserves_partial_evidence_and_cancellation_exit(
+        policy, stop_mode, tmp_path, monkeypatch, capsys, local_tokenizer):
+    from tests.test_runner import FakeClient
+
+    handlers, removed, cleanup_calls = {}, [], []
+    loop = asyncio.new_event_loop()
+    loop_type = type(loop)
+    loop.close()
+    install, remove = loop_type.add_signal_handler, loop_type.remove_signal_handler
+
+    def install_handler(loop, sig, callback, *args):
+        install(loop, sig, callback, *args)
+        handlers[sig] = (callback, args)
+
+    def remove_handler(loop, sig):
+        removed.append(sig)
+        return remove(loop, sig)
+
+    class StoppedClient(FakeClient):
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            if stop_mode != 'request_limit':
+                callback, args = handlers[getattr(signal, stop_mode)]
+                callback(*args)
+            return record
+
+    def cleanup(*args, **kwargs):
+        cleanup_calls.append(True)
+        return {'deleted': []}
+
+    monkeypatch.setattr(loop_type, 'add_signal_handler', install_handler)
+    monkeypatch.setattr(loop_type, 'remove_signal_handler', remove_handler)
+    monkeypatch.setattr('giraffe.runner.LLMClient', StoppedClient)
+    monkeypatch.setattr('giraffe.storage.automatic_cleanup', cleanup)
+    config = RunConfig(config_version=2, checks=['correctness'], samples=3, concurrency=1,
+                       max_requests=1 if stop_mode == 'request_limit' else 10,
+                       targets=[{'name': 'local', 'url': 'http://server/v1', 'model': 'tiny'}])
+    source, directory = tmp_path / 'config.json', tmp_path / 'run'
+    source.write_text(config.model_dump_json())
+    code = main(['run', '--config', str(source), '--skip-preflight', '--quiet', '--json',
+                 '--output', str(directory), '--fail-on', policy, '--min-free-disk', '0',
+                 '--runs-dir', str(tmp_path), '--auto-cleanup-keep-latest', '0'])
+    captured = capsys.readouterr()
+    saved = json.loads((directory / 'report.json').read_text())
+    assert saved['overall'] == 'inconclusive'
+    assert len(saved['requests']) == 1 and saved['requests'][0]['status'] == 'completed'
+    assert any(check['required'] and check['status'] == 'inconclusive' for check in saved['checks'])
+    assert saved['manifest']['invocation']['source'] == 'cli'
+    assert set(handlers) == set(removed) == {signal.SIGINT, signal.SIGTERM}
+    interrupted = stop_mode != 'request_limit'
+    expected = 130 if interrupted else 2 if policy == 'inconclusive' else 0
+    assert code == json.loads(captured.out)['exit_code'] == expected
+    assert (saved['abort_reason'] == 'cancelled by user') == interrupted
+    assert cleanup_calls == ([] if interrupted else [True])
+    assert ('verdict accepted' in captured.err) == (expected == 0)
 
 
 async def test_quiet_suppresses_actual_run_progress(monkeypatch, capsys):

@@ -495,11 +495,18 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
+    interrupted = False
+
+    def request_stop():
+        nonlocal interrupted
+        interrupted = True
+        stop.set()
+
     loop = asyncio.get_running_loop()
     installed = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, request_stop)
             installed.append(sig)
         except (NotImplementedError, RuntimeError):
             pass
@@ -527,7 +534,14 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             last_update = time.monotonic()
 
     try:
-        return await run_suite(config, progress=progress, stop_event=stop)
+        report = await run_suite(config, progress=progress, stop_event=stop)
+        if interrupted:
+            # Cooperative signal stops return normally from the suite. Keep
+            # their partial evidence on the same export path as task cancellation.
+            error = asyncio.CancelledError()
+            error.giraffe_report = report
+            raise error
+        return report
     finally:
         for sig in installed:
             loop.remove_signal_handler(sig)

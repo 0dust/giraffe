@@ -70,7 +70,7 @@ def _rows(report: RunReport) -> list[tuple[CheckResult, str, str]]:
         override = overrides.get((check.target, check.id))
         status, reason = check.status, check.summary
         if override:
-            if status != "fail":
+            if status not in {"fail", "blocked"}:
                 status = override[0]
             reason += " " + override[1]
         rows.append((check, status, reason))

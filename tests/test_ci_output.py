@@ -88,6 +88,32 @@ def test_baseline_regression_fails_its_selected_check_without_extra_testcase(tmp
     assert "Not selected" not in text
 
 
+@pytest.mark.parametrize('status,element', [('blocked', 'error'), ('fail', 'failure')])
+def test_inconclusive_baseline_preserves_current_error_or_failure(tmp_path, status, element):
+    from giraffe.reporting import compare_baseline
+    from tests.test_reporting import make_report
+
+    current, baseline = make_report(count=1), make_report('before', count=1)
+    for source in (current, baseline):
+        source.manifest['config']['checks'] = ['correctness']
+    current.overall = current.checks[0].status = status
+    current.checks[0].summary = 'Current check could not complete' if status == 'blocked' else 'Wrong answer'
+    compared = compare_baseline(current, baseline)
+    comparison = next(check for check in compared.checks if check.id == 'baseline')
+    assert compared.overall == status and comparison.status == 'inconclusive'
+    junit, summary = tmp_path / 'junit.xml', tmp_path / 'summary.md'
+    write_junit(compared, junit)
+    root = ET.parse(junit).getroot()
+    assert root.attrib == {'tests': '1', 'failures': str(int(status == 'fail')),
+                           'errors': str(int(status == 'blocked'))}
+    case, = root.findall('testsuite/testcase')
+    assert case.find('skipped') is None
+    reason = current.checks[0].summary + ' Baseline comparison: ' + comparison.summary
+    assert case.find(element).get('message') == reason
+    write_summary_md(compared, summary, tmp_path / 'report.json')
+    assert f'| local | correctness | {status} | {reason} |' in summary.read_text()
+
+
 def test_legacy_baseline_failure_and_markdown_escaping(tmp_path):
     source = report()
     source.checks[0].summary = "Connected | <script>\nnext"
