@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import hashlib
 import json
 import re
@@ -18,6 +19,9 @@ from .caps import (
     MAX_REPORT_SANITIZE_DEPTH, MAX_SANITIZE_DEPTH, MAX_SANITIZE_ITEMS,
     MAX_SANITIZE_KEYS, MAX_SANITIZE_KEY_CHARS, MAX_SANITIZE_STRING_CHARS,
 )
+
+logger = logging.getLogger(__name__)
+
 
 CATEGORIES = {
     "model": {
@@ -61,7 +65,7 @@ _SECRET_TEXT = re.compile(
     r"(?i)(?:bearer\s+\S+|(?:api[-_]?key|password|secret|access[-_]?token)\s*[=:]\s*[^\s,;]+|"
     r"\bsk-[a-zA-Z0-9_-]+|\bgh[pousr]_[a-zA-Z0-9]+|\$\{?\w+\}?)"
 )
-_URL = re.compile(r"https?://[^\s\"'<>]+")
+_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 REDACTED = "[redacted]"
 
 
@@ -211,6 +215,7 @@ def load_metadata(path):
                 result[key] = sanitize(data[key])[:MAX_DEPLOYMENT_SCOPE_CHARS]
         return result
     except (OSError, ValueError, UnicodeError) as exc:
+        logger.debug("Deployment metadata could not be loaded", exc_info=True)
         raise ValueError("deployment metadata file is not valid bounded JSON") from exc
 
 
@@ -526,6 +531,7 @@ async def snapshot(target, config, deadline, stop):
                         {"status": "available", "source": "configured-collector"}
                     )
         except (httpx.HTTPError, ValueError, OSError, TimeoutError) as exc:
+            logger.debug("Deployment evidence collection failed", exc_info=True)
             result["discovery"].append({"status": "unavailable", "reason": type(exc).__name__})
     for row in result["fields"].values():
         if (
@@ -585,6 +591,7 @@ def deployment_diff(current, baseline):
         rows.append({"field": key, "change": change, "baseline": b, "current": c})
     changed = [r["field"] for r in rows if r["change"] != "no_observed_change"]
     intended = current.get("intended_change")
+    intended_fields = intended if isinstance(intended, list) else [intended]
     return {
         "fields": rows,
         "unknown_baseline": not bool(baseline),
@@ -596,7 +603,7 @@ def deployment_diff(current, baseline):
             "current": current.get("continuity", "unverified"),
         },
         "intended_change": intended,
-        "confounded": bool(intended and any(f != intended for f in changed)),
+        "confounded": bool(intended and any(f not in intended_fields for f in changed)),
         "interpretation": "Changes are investigation context, not evidence of causality. Missing/stale/unobserved fields cannot establish unchanged configuration.",
     }
 

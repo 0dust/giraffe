@@ -1,5 +1,6 @@
 """Regression coverage for labels without changing request execution semantics."""
 
+import threading
 import asyncio
 import json
 
@@ -112,15 +113,15 @@ def test_named_tool_selection_has_a_tool_call_label():
 
 def test_per_scenario_rows_keep_partner_turn_and_prompt_distinctions():
     run_render_checks(r"""
-const scenarios=[['mixed_short_long_input_before_output','short request'],['mixed_heavy_long_input_before_output','heavy partner'],
- ['session_live_turn1','turn 2'],['session_live_turn2','turn 3'],
- ['consistency_c4_short_p2','prompt 3'],['consistency_c4_short_p3','prompt 4'],
- ['tools_lookup_stream_turn0','turn 1'],['tools_lookup_stream_turn1','turn 2']];
-const html=comparisonTable(scenarios.map(([scenario])=>({scenario,metric:'latency_ms'})));
-for(const [scenario,part] of scenarios)assert(html.includes(phaseName(scenario)+' · '+part),scenario);
+const scenarios=[['mixed_short_long_input_before_output','Long input interference · before output','short request'],['mixed_heavy_long_input_before_output','Long input interference · before output','heavy partner'],
+ ['session_live_turn1','Live sessions','turn 2'],['session_live_turn2','Live sessions','turn 3'],
+ ['consistency_c4_short_p2','Short input consistency','prompt 3'],['consistency_c4_short_p3','Short input consistency','prompt 4'],
+ ['tools_lookup_stream_turn0','Lookup conversation · streaming','turn 1'],['tools_lookup_stream_turn1','Lookup conversation · streaming','turn 2']];
+const html=comparisonConditionTable(comparisonConditionGroups({comparisons:scenarios.map(([scenario])=>({scenario,metric:'latency_ms'}))},{}));
+for(const [scenario,label,part] of scenarios)assert(html.includes(label+' · '+part),scenario);
 assert(renderPhases([{event:'scenario_started',scenario:'session_live_turn1',target:'local'}]).includes('Live sessions · turn 2'));
 const reportValue=report([check('serving','pass',{evidence_ids:['one','two']})],{requests:scenarios.slice(0,2).map(([scenario],i)=>({id:i?'two':'one',scenario,target:'local',status:'completed'}))});
-detail(reportValue);state.selectedCheck='serving';renderDetail();
+detail(reportValue);state.selectedCheck='local:serving';renderDetail();
 assert(nodes['#main'].innerHTML.includes('interference · before output · short request'));
 assert(nodes['#main'].innerHTML.includes('interference · before output · heavy partner'));
 """)
@@ -176,13 +177,13 @@ assert.equal(record.input_chars,0);
 async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monkeypatch, local_tokenizer):
     from tests.test_web import browser, finished, report, start
 
-    release = asyncio.Event()
+    release = threading.Event()
 
     async def waiting(config, *, progress, stop_event):
         shape = {"input_chars": 128, "requested_max_tokens": 24, "requested_input_tokens": 32}
         progress({"event": "request_started", "request_slot": 0, "target": "local",
                   "scenario": "warm", "fixture_id": "short", **shape})
-        await release.wait()
+        assert await asyncio.to_thread(release.wait, 3)
         progress({"event": "request_completed", "request_slot": 0, **shape,
                   "request": {"id": "one", "status": "completed"}})
         await stop_event.wait()

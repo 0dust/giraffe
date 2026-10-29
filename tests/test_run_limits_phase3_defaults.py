@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
 
 from giraffe.cli import migrated_configuration
 from giraffe.fixtures import builtin_fixtures, traffic_fixtures
@@ -15,15 +14,20 @@ SNAPSHOTS = json.loads(Path('tests/fixtures/run-limits-phase3-defaults.json').re
 
 
 @pytest.mark.parametrize('name', SNAPSHOTS)
-@pytest.mark.parametrize('legacy', [False, True], ids=['current-example', 'legacy-main'])
-def test_historical_requests_with_explicit_timeout_match_each_check_path(name, legacy):
+def test_historical_requests_with_explicit_timeout_match_each_check_path(name):
     expected = SNAPSHOTS[name]
-    source = (expected['source'] if legacy or name == 'default' else
-              yaml.safe_load(Path(name).read_text()))
+    # Current examples intentionally use the current schema and shared defaults.
+    # Historical request compatibility is pinned to the immutable source snapshot.
+    source = dict(expected['source'])
+    if 'checks' not in source:
+        source['checks'] = ['access', 'serving', 'first_output', 'generation', 'load',
+                            'context', 'correctness', 'cancellation', 'recovery']
+        if source.get('structured_json'):
+            source['checks'].append('json')
     # Pin the historical timeout: this snapshot verifies payload compatibility,
     # while dedicated default tests cover the new 300-second default.
     source = {"request_timeout_seconds": 30, **source}
-    config = migrated_configuration({**source, **({'config_version': 2} if name == 'default' and not legacy else {})})
+    config = migrated_configuration(source)
     actual = {}
     for check, groups in expected['requests'].items():
         if check.startswith('_suite_'):

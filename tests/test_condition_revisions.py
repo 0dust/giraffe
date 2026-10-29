@@ -122,19 +122,22 @@ async def test_full_known_plan_is_waiting_before_first_dispatch(check):
 
 
 async def test_condition_events_do_not_occupy_activity_feed(tmp_path, monkeypatch):
+    import threading
+    ready = threading.Event()
     async def waiting(config, *, progress, stop_event):
         run = _Run(config, progress, stop_event)
         await run.group(config.targets[0], Client(), [spec("x", "warm", "serving")], "warm", count=1)
         for index in range(110):
             run.start_condition("local", f"extra_{index}", planned=1)
             run.finish_condition("local", f"extra_{index}")
+        ready.set()
         await stop_event.wait()
         return report(config, cancelled=True)
 
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.sleep(.01)
+        assert await asyncio.to_thread(ready.wait, 3)
         detail = (await client.get(f"/api/runs/{identifier}")).json()
         assert all(not event["event"].startswith("condition_") for event in detail["events"])
         assert any(event["event"] == "request_completed" for event in detail["events"])

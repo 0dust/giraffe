@@ -248,7 +248,7 @@ def test_multiple_overlapping_targets_explain_the_shared_concurrency_limit():
         {"name": "first", "url": "http://localhost:1", "model": "a"},
         {"name": "second", "url": "http://localhost:2", "model": "b"},
     ])
-    assert any("share Simultaneous limit" in warning and "overlap" in warning
+    assert any("share Max concurrency" in warning and "overlap" in warning
                for warning in plan(configuration)["warnings"])
 
 
@@ -427,8 +427,15 @@ def test_adaptive_traffic_budget_warning_includes_reserved_baselines_and_load():
 @pytest.mark.parametrize("quota", [300, 400, 1000])
 def test_local_recovery_warmup_is_reserved_once_in_adaptive_estimate(quota):
     from pathlib import Path
-    import yaml
-    values = yaml.safe_load((Path(__file__).resolve().parents[1] / "examples/local.yaml").read_text())
+    import json
+    snapshots = json.loads((Path(__file__).resolve().parent / "fixtures/run-limits-phase3-defaults.json").read_text())
+    values = dict(snapshots["cases"]["examples/local.yaml"]["source"])
+    values.pop("concurrent_load")
+    values.update(config_version=2, default_concurrency=2,
+                  checks=["access", "serving", "first_output", "generation", "load", "context",
+                          "correctness", "cancellation", "recovery", "json"],
+                  load_test={"patterns": {"concurrent": {"levels": [1, 2]}}})
+    # Keep the recovery reservation scenario independent of the quickstart defaults.
     configuration = RunConfig.model_validate({**values, "max_requests": quota})
     result = plan(configuration)
     warmup = next(row for row in result["rows"] if row["id"] == "recovery_prime")

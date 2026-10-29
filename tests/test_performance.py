@@ -182,7 +182,9 @@ def test_all_sections_have_contract_rows_and_no_answer_text_leaks(tmp_path):
     value.requests[0].first_output_ms = 100
     path, html = write_report(value, tmp_path, html=True)
     saved = load_report(path)
-    assert "performance" not in json.loads(path.read_text())
+    # AM5 stores the default summary while avoiding a duplicate raw series.
+    assert "performance" in json.loads(path.read_text())
+    assert all("request_series" not in target for target in json.loads(path.read_text())["performance"]["targets"])
     assert saved.performance == json.loads(''.join(expanded_report_chunks(path)))["performance"]
     assert "private answer" not in json.dumps(saved.performance)
     assert "private thought" not in json.dumps(saved.performance)

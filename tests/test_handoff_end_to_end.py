@@ -65,8 +65,10 @@ async def test_copied_command_replays_ui_configuration_and_baseline(tmp_path, co
             env = dict(os.environ)
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
             env["NO_PROXY"] = "127.0.0.1,localhost"
+            # Paste into the shell via stdin: embedded baselines can exceed
+            # Linux's per-argument limit when passed through `sh -c`.
             result = await asyncio.to_thread(
-                subprocess.run, ["/bin/sh", "-c", command], cwd=tmp_path,
+                subprocess.run, ["/bin/sh"], input=command, cwd=tmp_path,
                 env=env, capture_output=True, text=True, timeout=30,
             )
             assert result.returncode == 0, result.stderr + result.stdout

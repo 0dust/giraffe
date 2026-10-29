@@ -151,20 +151,26 @@ async def test_pack_loaded_effective_one_with_unset_ceiling_passes(client):
     assert all(record.overlap == 1 for record in report.requests)
 
 
-async def test_recovery_unlimited_allowance_prime_and_effective_windows(client):
-    configured = RunConfig(targets=[TARGET], checks=["recovery"], concurrency=40,
-                           default_concurrency=2, samples=2, limits={"min_samples": 2},
-                           sustained_seconds=1)
-    configured.sustained_seconds = .025
-    report = await runner.run_suite(configured)
-    check = next(row for row in report.checks if row.id == "recovery")
-    assert report.abort_reason is None
-    assert any(record.scenario == "recovery_prime" for record in report.requests)
-    assert check.metrics["sustained_budget"]["allowance"] is None
-    windows = check.metrics["rolling_windows"]
-    assert windows and all(window["attempted"] == 2 for window in windows[:-1])
-    assert sum(window["attempted"] for window in windows) == check.metrics["sustained"]["attempted"]
-    assert "max_requests" not in check.summary
+def test_recovery_unlimited_allowance_prime_and_effective_windows(client, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        configured = RunConfig(targets=[TARGET], checks=["recovery"], concurrency=40,
+                               default_concurrency=2, samples=2, limits={"min_samples": 2},
+                               sustained_seconds=1)
+        configured.sustained_seconds = .025
+        report = await runner.run_suite(configured)
+        assert any(record.scenario == "sustained" for record in report.requests)
+        check = next(row for row in report.checks if row.id == "recovery")
+        assert report.abort_reason is None
+        assert any(record.scenario == "recovery_prime" for record in report.requests)
+        assert check.metrics["sustained_budget"]["allowance"] is None
+        windows = check.metrics["rolling_windows"]
+        assert windows and all(window["attempted"] == 2 for window in windows[:-1])
+        assert sum(window["attempted"] for window in windows) == check.metrics["sustained"]["attempted"]
+        assert "max_requests" not in check.summary
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_concurrent_load_unlimited_allowance_ends_at_own_window():
@@ -299,7 +305,8 @@ async def test_preparation_deadline_is_saved_when_target_finishes_before_stop_mo
                for event in events)
     check = next(check for check in report.checks if check.id == "load")
     assert check.status == "inconclusive"
-    assert "maximum run duration reached" in check.summary
+    assert "run deadline reached" in check.summary
+    assert "--max-duration" in check.summary
     saved = report.model_dump(mode="json")
     assert saved["abort_reason"] == report.abort_reason
     assert saved["limits_reached"] == report.limits_reached

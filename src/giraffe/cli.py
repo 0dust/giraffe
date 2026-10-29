@@ -8,10 +8,10 @@ import errno
 import os
 import socket
 import json
+import logging
 import signal
 import sys
 import time
-import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,9 +21,10 @@ from pydantic import ValidationError
 
 from giraffe import __version__
 from giraffe.configuration_errors import configuration_errors
-from giraffe.models import (CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
+from giraffe.diagnostics import configure_logging, run_logging
+from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
                            migrate_concurrent_load, migrate_load_test, migrate_run_limits)
-from giraffe.storage import DEFAULT_LIMITS, format_size as _disk_size, parse_size
+from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
 from giraffe.resources import PhaseSampler, SAMPLING
 
 
@@ -36,6 +37,10 @@ class UsageError(SystemExit):
 
     def __str__(self) -> str:
         return self.message
+
+
+class ModelSelectionError(ValueError):
+    """A URL-only run needs an explicit model choice before it can start."""
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -60,31 +65,17 @@ def _cleanup_size(value: str) -> int:
     return size
 
 
-_HEARTBEAT_SECONDS = 30
+logger = logging.getLogger(__name__)
+_HEARTBEAT_SECONDS = 5
 
 
 @contextmanager
 def _heartbeat(path: Path):
-    stopped = threading.Event()
-
-    def refresh():
-        while not stopped.wait(_HEARTBEAT_SECONDS):
-            try:
-                os.utime(path, None, follow_symlinks=False)
-            except OSError:
-                pass
-
-    thread = threading.Thread(target=refresh, daemon=True)
-    thread.start()
-
-    def stop():
-        stopped.set()
-        thread.join()
-
+    heartbeat = Heartbeat(path.parent, interval=_HEARTBEAT_SECONDS).start()
     try:
-        yield stop
+        yield heartbeat.close
     finally:
-        stop()
+        heartbeat.close()
 
 
 def _storage_flags(command: argparse.ArgumentParser) -> None:
@@ -213,8 +204,6 @@ Exit codes:
         run.add_argument("--checks", metavar="CHECKS", help="Comma-separated names: " + ", ".join(CHECK_NAMES))
         run.add_argument("--structured-output", action="store_true", default=None, dest="structured_json",
                          help="Include structured JSON output checks")
-        run.add_argument("--json", action="store_true", default=None, dest="structured_json",
-                         help=argparse.SUPPRESS)
         run.add_argument("--skip-preflight", action="store_true", help="Skip the bounded connection/model probe")
         run.add_argument("--deployment-file", type=Path, help="Bounded deployment JSON for the first target")
         run.add_argument("--metrics-url", help="Separate statistics endpoint for the first target")
@@ -239,6 +228,9 @@ Exit codes:
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
         run.add_argument("--save-config", type=Path, help="Write the normalized version-2 run configuration as JSON")
         run.add_argument("--output-format", choices=["text", "json"], default="text", help="Result format on stdout; progress is written to stderr")
+        run.add_argument("--json", action="store_const", const="json", dest="output_format",
+                         help="Alias for --output-format json")
+        run.add_argument("--verbose", action="store_true", help="Show internal stages and memory observations")
         _storage_flags(run)
         _auto_cleanup_flags(run)
         run.add_argument("--runs-dir", type=Path, help="Explicit root for automatic cleanup; output must be a direct child")
@@ -315,12 +307,16 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     if args.url or args.model or args.api_key_env:
         if "targets" in values:
             raise ValueError("Use targets in the config, or --url/--model; do not combine them")
-        if not args.url or not args.model:
-            raise ValueError("Provide both --url and --model, or use --config")
-        values["targets"] = [{"name": "local", "url": args.url, "model": args.model,
+        if not args.url:
+            raise ValueError("Provide --url with --model, or use --config")
+        model = args.model or _discover_model(args, values)
+        values["targets"] = [{"name": "local", "url": args.url, "model": model,
                               "api_key_env": args.api_key_env}]
     if "targets" not in values:
-        raise ValueError("Provide --url and --model, or --config with at least one target")
+        raise ValueError("Provide --url, or --config with at least one target")
+    for target in values["targets"] if isinstance(values["targets"], list) else []:
+        if isinstance(target, dict) and not target.get("model"):
+            target["model"] = _discover_model(args, values, target)
     for name in RunConfig.model_fields:
         value = getattr(args, name, None)
         if value is not None and name not in {"checks", "limits"}:
@@ -375,7 +371,49 @@ def configuration(args: argparse.Namespace) -> RunConfig:
     return _configuration_notes(RunConfig.model_validate(values), notes)
 
 
-async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
+def _discover_model(args: argparse.Namespace, values: dict | None = None, target: dict | None = None) -> str:
+    from giraffe.preflight import ModelDiscovery, PreflightError, discover_models
+
+    values, target = values or {}, target or {}
+    body = ModelDiscovery(url=target.get("url") or args.url,
+                          api_key_env=args.api_key_env or target.get("api_key_env"),
+                          headers_env=target.get("headers_env") or {},
+                          ca_bundle=args.ca_bundle if args.ca_bundle is not None else values.get("ca_bundle"),
+                          proxy=args.proxy if args.proxy is not None else values.get("proxy"))
+    try:
+        discovered = asyncio.run(discover_models(body, allow_manual=True))
+    except PreflightError as error:
+        message = str(error).rstrip(". ")
+        if "environment variable" in message and "is not set" in message:
+            raise ModelSelectionError(message) from None
+        raise ModelSelectionError(f"{message}. Provide --model to select the served model.") from None
+    models = discovered["models"]
+    if len(models) > 1:
+        raise ModelSelectionError("Choose --model: " + ", ".join(models))
+    if not models:
+        raise ModelSelectionError("No model could be discovered. Provide --model with the served model name.")
+    print(f"Using model {models[0]} (only model served)", file=sys.stderr)
+    return models[0]
+
+
+def _stage_name(scenario: str, config=None) -> str | None:
+    if scenario == "initial":
+        return "Connection check"
+    if scenario == "warm":
+        return "Warm-up"
+    for check, title in CATALOGUE_NAMES.items():
+        if scenario == check or scenario.startswith(check + "_"):
+            return title
+    if scenario in {"runtime_metrics_discovery", "performance_evidence_probe"}:
+        return None
+    from giraffe.conditions import condition_for
+    label = condition_for(scenario, config=config)["label"]
+    if label != scenario and not label.startswith(("load_", "traffic_", "pack_", "client_")):
+        return label
+    return "Running checks"
+
+
+async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False) -> RunReport:
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
@@ -393,15 +431,18 @@ async def _run(config: RunConfig, *, json_progress: bool = False) -> RunReport:
     def progress(event: dict) -> None:
         nonlocal last, last_update
         if json_progress:
-            print(json.dumps(event, allow_nan=False), file=sys.stderr, flush=True)
+            _progress_print(json.dumps(event, allow_nan=False))
             return
         current = (event.get("target"), event.get("scenario"))
-        if current[1] and (current != last or time.monotonic() - last_update >= 5):
-            budget = (f"{event.get('completed', 0)} requests; no request limit set" if config.max_requests is None
-                      else f"{event.get('completed', 0)}/{config.max_requests} request budget")
-            print(f"  {current[0]}: {current[1]} · "
-                  f"{budget} · "
-                  f"{event.get('elapsed_seconds', 0):g}s", file=sys.stderr, flush=True)
+        if current == last and time.monotonic() - last_update < 5:
+            return
+        title = (current[1] if verbose else _stage_name(current[1], config)) if current[1] else None
+        if title:
+            parts = [f"  {current[0]}: {title}"]
+            if config.max_requests is not None:
+                parts.append(f"{event.get('completed', 0)} of {config.max_requests} requests")
+            parts.append(f"{event.get('elapsed_seconds', 0):g}s")
+            _progress_print(" · ".join(parts))
             last = current
             last_update = time.monotonic()
 
@@ -433,9 +474,9 @@ def _print_memory(resources: dict) -> None:
     print(resources.get("sampling", "Sampling details not recorded."))
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or any(value == "--output-format=json" or (
+    json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or "--json" in arguments or any(value == "--output-format=json" or (
         value == "--output-format" and index + 1 < len(arguments) and arguments[index + 1] == "json"
     ) for index, value in enumerate(arguments))
     if arguments and arguments[0] == "preview" and any(value == "--output-format=text" or (
@@ -466,6 +507,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         args = parser().parse_args(arguments)
+        if hasattr(args, "output_format"):
+            json_output = args.output_format == "json"
         kind = "baseline.save" if args.command == "baseline" else args.command
         if args.command == "sglang-traces":
             from giraffe.sglang_traces import serve
@@ -715,7 +758,7 @@ def main(argv: list[str] | None = None) -> int:
                         await check_target(target, config)
                     except PreflightError as error:
                         if error.blocking:
-                            return target.name, str(error) + " Use --skip-preflight to run anyway."
+                            return target.name, str(error).rstrip(". ") + ". Use --skip-preflight to run anyway."
                         warning = f"preflight for {target.name}: {error}; continuing."
                         warnings.append(warning)
                         print(f"Warning: {warning}", file=sys.stderr)
@@ -737,15 +780,19 @@ def main(argv: list[str] | None = None) -> int:
 
         def save_state(state: str, **details) -> None:
             from giraffe.reporting import _atomic_write
+            from giraffe.storage import metadata_lock
 
-            try:
-                saved = json.loads((directory / ".web.json").read_text())
-            except (OSError, ValueError):
-                saved = {}
-            _atomic_write(directory / ".web.json", json.dumps(
-                {"id": directory.name, "state": state, "started_at": started_at,
-                 **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
-                 "owner_pid": os.getpid(), "owner_host": socket.gethostname(), **details}, allow_nan=False, separators=(",", ":")) + "\n")
+            with metadata_lock:
+                try:
+                    saved = json.loads((directory / ".web.json").read_text())
+                except (OSError, ValueError):
+                    saved = {}
+                _atomic_write(directory / ".web.json", json.dumps(
+                    {"id": directory.name, "state": state, "started_at": started_at,
+                     **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
+                     "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+                     **({"heartbeat_at": datetime.now(timezone.utc).isoformat()}
+                        if state in {"running", "stopping"} else {}), **details}, allow_nan=False, separators=(",", ":")) + "\n")
 
         save_state("running")
         requests = f"{config.max_requests:,}" if config.max_requests is not None else "Not set"
@@ -769,14 +816,42 @@ def main(argv: list[str] | None = None) -> int:
         from giraffe.reporting import _retained, compare_baseline, html_failure_warning, save_failure_summary, write_report
 
         warning = None
-        with _heartbeat(directory / ".web.json") as stop_heartbeat:
+        cancelled = None
+
+        async def run_with_partial_report():
             try:
-                report = asyncio.run(_run(config, json_progress=True) if json_output else _run(config))
+                report = await (_run(config, json_progress=True) if json_output else
+                                _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
+            except asyncio.CancelledError as error:
+                report = getattr(error, "giraffe_report", None)
+                if report is None:
+                    raise
+                return report, error
+            return report, None
+
+        with run_logging(directory), _heartbeat(directory / ".web.json") as stop_heartbeat:
+            try:
+                report, cancelled = asyncio.run(run_with_partial_report())
+                from giraffe.invocation import cli_invocation
+                report.manifest["invocation"] = cli_invocation(arguments)
                 if guard is not None:
                     report.manifest["open_files"] = guard
                 if baseline:
                     report = compare_baseline(report, baseline)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
+                stop_heartbeat()
+                try:
+                    save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
+                               abort_reason="run cancelled")
+                except OSError:
+                    pass
+                print("Stopped.", file=sys.stderr)
+                if json_output:
+                    emit("interrupted", 130, message="Stopped.")
+                return 130
             except BaseException as error:
+                logger.exception("CLI run could not finish")
                 stop_heartbeat()
                 try:
                     save_state("error", finished_at=datetime.now(timezone.utc).isoformat(),
@@ -800,6 +875,7 @@ def main(argv: list[str] | None = None) -> int:
                     json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
                                                        html=getattr(args, "html", False))
             except OSError as error:
+                logger.exception("CLI report export failed")
                 export_resources()
                 if getattr(error, "json_complete", False):
                     warning = html_failure_warning(error)
@@ -818,14 +894,15 @@ def main(argv: list[str] | None = None) -> int:
                         emit("error", 4, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
                     else:
                         print(f"giraffe: {message}", file=sys.stderr)
-                        _print_memory(resources)
+                        if getattr(args, "verbose", False):
+                            _print_memory(resources)
                     return 4
         export_resources()
         from giraffe.storage import automatic_cleanup
 
         policy = _auto_cleanup_policy(args)
         cleanup_result = None
-        if policy:
+        if policy and cancelled is None:
             try:
                 cleanup_result = automatic_cleanup(runs_root, policy, active_id=directory.name)
             except OSError as error:
@@ -834,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not json_output:
                     print(f"Automatic cleanup deleted run: {identifier}")
         try:
-            save_state("completed", run_id=report.run_id, finished_at=report.finished_at,
+            save_state("completed", run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
                        **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
                        **({"error": warning} if warning else {}), resources={
                 "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
@@ -844,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
             warnings.append(warning)
             print(f"Warning: {warning}", file=sys.stderr)
         report = _retained(report)
-        exit_code = {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+        exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
         summary = report.observations.get("summary")
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
@@ -853,32 +930,15 @@ def main(argv: list[str] | None = None) -> int:
                  **({"summary": summary} if summary else {}),
                  report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
         else:
-            from giraffe.performance import cli_summary
-            for line in cli_summary(report):
-                print(line)
-            for check in report.checks:
-                print(f"  {check.target} / {check.id}: {check.status} — {check.summary}")
-            for name, observation in report.observations.get("targets", {}).items():
-                telemetry = observation.get("serving_telemetry", {})
-                states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
-                print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
-            if report.baseline:
-                for target in report.baseline["targets"]:
-                    diff = target["configuration_diff"]
-                    changes = [row["field"] for row in diff["fields"] if row["change"]!="no_observed_change"]
-                    print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
-            print(f"JSON: {json_path.resolve()}")
-            if html_path:
-                print(f"HTML: {html_path.resolve()}")
-            else:
-                print(f"Export HTML: giraffe report {directory.resolve()} --html")
-            _print_memory(resources)
-            print(f"{report.overall.upper()}: {len(report.requests)} requests")
-            if report.abort_reason:
-                print(f"Stopped: {report.abort_reason}")
-            if summary:
-                print(summary)
+            _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False))
         return exit_code
+    except ModelSelectionError as error:
+        print(f"giraffe: {error}", file=sys.stderr)
+        if json_output:
+            emit("inconclusive", 2, message=str(error))
+        return 2
+    except BrokenPipeError:
+        raise
     except UsageError as error:
         return failure([{"loc": [], "message": str(error), "type": "UsageError"}])
     except ValidationError as error:
@@ -899,6 +959,111 @@ def main(argv: list[str] | None = None) -> int:
         return failure([{"loc": location, "message": "Invalid YAML/JSON configuration", "type": "parse_error"}])
     except (OSError, ValueError, KeyError) as error:
         return failure([{"loc": [], "message": str(error), "type": type(error).__name__}])
+
+
+def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
+                  directory: Path, resources: dict, *, verbose: bool = False) -> None:
+    from giraffe.performance import cli_summary
+
+    passed = sum(check.status == "pass" for check in report.checks)
+    report_path = html_path or json_path
+    print(f"{report.overall.upper()}  {passed} checks passed · {len(report.requests)} requests · report: {report_path}")
+    for check in report.checks:
+        if check.status in {"fail", "inconclusive", "blocked"}:
+            print(f"  {check.target} / {check.id}: {check.status} — {' '.join(check.summary.split())}")
+    if report.abort_reason:
+        print(f"Stopped: {report.abort_reason}")
+    if summary := report.observations.get("summary"):
+        print(summary)
+    for line in cli_summary(report):
+        if not verbose and line.startswith("Performance · "):
+            _, target_name, window_id = line.split(" · ", 2)
+            window = next((window for target in (report.performance or {}).get("targets", [])
+                           if target["target"] == target_name for window in target.get("windows", [])
+                           if window["id"] == window_id), {})
+            label = window.get("workload_label") or _stage_name(window_id.removeprefix("full:"))
+            line = f"Performance · {target_name} · {label}"
+        print(line)
+    unselected = []
+    for check in report.checks:
+        if check.status == "skipped" and check.summary.rstrip(".") in {"Not selected", "Not selected for this run"}:
+            if check.id not in unselected:
+                unselected.append(check.id)
+        elif check.status in {"pass", "skipped"}:
+            print(f"  {check.target} / {check.id}: {check.status} — {' '.join(check.summary.split())}")
+    if unselected:
+        print("Not selected: " + ", ".join(unselected))
+    for name, observation in report.observations.get("targets", {}).items():
+        telemetry = observation.get("serving_telemetry", {})
+        states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
+        print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
+    if report.baseline:
+        for target in report.baseline["targets"]:
+            diff = target["configuration_diff"]
+            changes = [row["field"] for row in diff["fields"] if row["change"] != "no_observed_change"]
+            print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
+    print(f"JSON: {json_path.resolve()}")
+    if html_path:
+        print(f"HTML: {html_path.resolve()}")
+    else:
+        print(f"Export HTML: giraffe report {directory.resolve()} --html")
+    if verbose:
+        _print_memory(resources)
+
+
+class _PipeSafeStream:
+    def __init__(self, stream):
+        self.stream, self.broken = stream, False
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def _call(self, method, *args):
+        if self.broken:
+            return len(args[0]) if args else None
+        try:
+            return getattr(self.stream, method)(*args)
+        except OSError as error:
+            if error.errno != errno.EPIPE and not isinstance(error, BrokenPipeError):
+                raise
+            self.broken = True
+            try:
+                with open(os.devnull, "w") as sink:
+                    os.dup2(sink.fileno(), self.stream.fileno())
+            except (OSError, ValueError, AttributeError):
+                pass
+            return len(args[0]) if args else None
+
+    def write(self, text):
+        return self._call("write", text)
+
+    def flush(self):
+        return self._call("flush")
+
+
+def _progress_print(message):
+    stream = sys.stderr if isinstance(sys.stderr, _PipeSafeStream) else _PipeSafeStream(sys.stderr)
+    print(message, file=stream, flush=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    configure_logging()
+    stdout, stderr = sys.stdout, sys.stderr
+    out, err = _PipeSafeStream(stdout), _PipeSafeStream(stderr)
+    sys.stdout, sys.stderr = out, err
+    try:
+        try:
+            return _main(argv)
+        except SystemExit as error:
+            if out.broken or err.broken:
+                return int(error.code or 0)
+            raise
+    finally:
+        try:
+            out.flush()
+            err.flush()
+        finally:
+            sys.stdout, sys.stderr = stdout, stderr
 
 
 if __name__ == "__main__":

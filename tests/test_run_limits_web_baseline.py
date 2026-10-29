@@ -141,7 +141,7 @@ def test_a23_old_baseline_matches_v2_effective_workload_despite_optional_limits(
     current, old = make_report(), make_report("baseline")
     old_config = old.manifest["config"]
     old_config.pop("config_version")
-    old_config.pop("default_concurrency")
+    old_config.pop("default_concurrency", None)
     old_config.update(concurrency=4, max_requests=300, max_duration_seconds=300)
     for value in (current, old):
         value.manifest["effective_checks"] = {name: RunConfig.model_validate(current.manifest["config"]).effective_check(name)
@@ -164,7 +164,7 @@ def test_a23_legacy_arrivals_inflight_default_normalizes_without_losing_workload
     current.manifest["config"].update(checks=["arrivals"], arrivals={"requests": 10, "max_in_flight": None})
     old.manifest["config"] = deepcopy(current.manifest["config"])
     old.manifest["config"].pop("config_version")
-    old.manifest["config"].pop("default_concurrency")
+    old.manifest["config"].pop("default_concurrency", None)
     old.manifest["config"]["arrivals"].pop("max_in_flight")
     assert _settings_reasons(current, old) == []
     current.manifest["config"]["arrivals"]["max_in_flight"] = 8

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import ssl
 from pathlib import Path
@@ -15,6 +16,9 @@ from .caps import (
 )
 from giraffe.client import LLMClient, _headers, completion_url
 from giraffe.models import Model, RequestSpec, RunConfig, Target
+
+
+logger = logging.getLogger(__name__)
 
 
 class PreflightError(Exception):
@@ -111,9 +115,8 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
     target = body.target()
     try:
         headers = _headers(target)
-    except ValueError:
-        raise PreflightError("An authentication environment variable is not set. "
-                            "Set it before starting Giraffe, then check the API key section.") from None
+    except ValueError as error:
+        raise PreflightError(str(error)) from None
     url = completion_url(target.url).removesuffix("/chat/completions") + "/models"
     try:
         verify = ssl.create_default_context(cafile=body.ca_bundle) if body.ca_bundle else True
@@ -153,9 +156,11 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
         models = list(dict.fromkeys(item["id"] for item in data if isinstance(item, dict)
                                    and isinstance(item.get("id"), str) and item["id"].strip()))
     except (httpx.HTTPError, httpx.InvalidURL, TimeoutError):
+        logger.debug("Model discovery failed", exc_info=True)
         raise PreflightError("Could not reach the model list. Check that the server is running "
                             "and check the address, TLS trust and proxy settings.") from None
     except (ValueError, UnicodeError):
+        logger.debug("Model discovery response could not be read", exc_info=True)
         if allow_manual:
             return {"models": [], "message": "The server's model list could not be read. "
                     "Enter the model name to test the connection."}
@@ -200,6 +205,7 @@ async def check_connection(body: ConnectionTest) -> dict:
         raise PreflightError("Could not load the TLS trust file. "
                             "Check ca_bundle on the machine running Giraffe.") from None
     except (ValueError, ImportError, httpx.HTTPError, httpx.InvalidURL):
+        logger.debug("Connection preflight failed", exc_info=True)
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.") from None
 
@@ -212,9 +218,8 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         async with asyncio.timeout(15):
             try:
                 _headers(target)
-            except ValueError:
-                raise PreflightError("An authentication environment variable is not set. "
-                                    "Set it before starting Giraffe.") from None
+            except ValueError as error:
+                raise PreflightError(str(error)) from None
             async with _PreflightClient(target, config) as client:
                 record = await client.execute(RequestSpec(
                     fixture_id="connection", scenario="connection", check_ids=["access"],
@@ -231,6 +236,7 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.") from None
     except httpx.HTTPError as error:
+        logger.debug("Target preflight failed", exc_info=True)
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.",
                             blocking=isinstance(error, (httpx.ConnectError, httpx.UnsupportedProtocol))) from None
@@ -241,7 +247,20 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         raise PreflightError("Server denied access. Check your authentication: the API key, "
                             "environment variable and header settings.")
     if not record.valid:
-        blocking = record.http_status == 404
+        if record.http_status in {400, 404, 422} and record.workload.get("model_not_served"):
+            discovery = ModelDiscovery(url=target.url, api_key_env=target.api_key_env,
+                                       headers_env=target.headers_env, ca_bundle=config.ca_bundle,
+                                       proxy=config.proxy, api_key=target._api_key)
+            try:
+                available = (await discover_models(discovery, allow_manual=True))["models"]
+            except PreflightError:
+                available = []
+            message = f'Model "{target.model}" not served at {target.url}.'
+            if target.model not in available:
+                if available:
+                    message += " Available: " + ", ".join(available) + "."
+                raise PreflightError(message)
+        blocking = record.http_status == 404 and not record.workload.get("model_not_served")
         if record.http_status is None:
             error = record.error or ""
             timeout = "Timeout" in error

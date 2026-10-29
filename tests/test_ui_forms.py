@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import * as formConfig from {json.dumps((static / 'form-config.mjs').as_uri())};
-const nodes={{'#request-plan':{{innerHTML:''}},'#request-pack-preview':{{innerHTML:''}}}},listeners={{}},timers=[];
+const nodes={{'#request-plan':{{innerHTML:''}},'#request-pack-preview':{{innerHTML:''}},'#run-ceilings-summary':{{textContent:''}},'#setup-duration':{{innerHTML:''}}}},listeners={{}},timers=[];
 const context={{assert,structuredClone,...formConfig,nodes,listeners,timers,
   setTimeout(fn){{timers.push(fn);return timers.length;}},clearTimeout(){{}},
   document:{{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn}},window:{{addEventListener(){{}}}}}};
@@ -51,19 +51,19 @@ config.load_test.profile.long.output_tokens=config.max_output_tokens+1;
 assert.doesNotMatch(renderSettingIssues(loadTestIssues(config,bootstrap.load_test.defaults,bootstrap.limits)),/output cap.*run.*cap/i);
 assert.doesNotMatch(renderSettingIssues(loadTestIssues(config,bootstrap.load_test.defaults,bootstrap.limits)),/data-setting-path="max_output_tokens"/);
 config.load_test.profile.long.output_tokens=512;
-const plan={{count_kind:'exact',planned_per_target:164,planned_total:164,known_per_target:164,known_total:164,request_limit:20,required_request_limit:164,target_quotas:{{local:20}},rows:[{{id:'initial',title:'Connection check',requests_per_target:1,kind:'exact',source:'generated examples',summary:'One generated request checks the connection.'}},{{id:'access',title:'Shared accounting',requests_per_target:0,kind:'exact',source:'generated examples',summary:'Adds no requests.'}}],bucket_cases:[{{input_chars:64,actual_input_chars:96,output_tokens:16}}],bucket_levels:[],evaluator:{{active:true,ready:true,call_upper_bound:12,judge_count:1,readiness_errors:[]}},warnings:[]}};
+const plan={{count_kind:'exact',planned_per_target:164,planned_total:164,known_per_target:164,known_total:164,request_limit:20,required_request_limit:164,target_quotas:{{local:20}},rows:[{{id:'initial',title:'Endpoint access',requests_per_target:1,kind:'exact',source:'generated examples',summary:'One generated request checks the connection.'}},{{id:'access',title:'Shared accounting',requests_per_target:0,kind:'exact',source:'generated examples',summary:'Adds no requests.'}}],bucket_cases:[{{input_chars:64,actual_input_chars:96,output_tokens:16}}],bucket_levels:[],evaluator:{{active:true,ready:true,call_upper_bound:12,judge_count:1,readiness_errors:[]}},warnings:[]}};
 config.max_requests=20;
 plan.request_warnings=[{{kind:'incomplete_coverage',fields:['max_requests'],msg:'The request budget leaves checks unfinished.',actions:[{{label:'Use 164 total requests',field:'max_requests',value:164}}]}}];
 plan.estimated_seconds=0;plan.estimated_low_seconds=0;plan.estimated_high_seconds=0;plan.confidence='unknown';
 state.requestPreview={{status:'current',revision:state.configRevision,route:state.routeVersion,plan,config}};
 renderRequestPlan();
-assert.match(nodes['#request-plan'].innerHTML,/164 requests/);
-assert.match(nodes['#request-plan'].innerHTML,/12 evaluator calls/);
+assert.equal(nodes['#run-ceilings-summary'].textContent,'≤ 20 requests · 164 planned, budget too small · 5 m default request timeout · 8 at once');
+assert.match(renderJudgingPreview({{...plan.evaluator,planned_call_upper_bound:12}}),/12/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Flight plan|<h3>Traffic<|<h3>Pass criteria</);
 assert.match(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"/);
 assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning">/);
-assert.match(nodes['#request-plan'].innerHTML,/96 characters sent/);assert.match(nodes['#request-plan'].innerHTML,/64 configured, plus instructions/);
-assert.match(nodes['#request-plan'].innerHTML,/Connection check/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
-configChanged();assert.match(nodes['#request-plan'].innerHTML,/stale/i);
+assert.match(markup,/name="load_profile_short_input_tokens"/);assert.match(markup,/name="load_profile_short_output_tokens"/);
+assert.match(nodes['#request-plan'].innerHTML,/Endpoint access/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
+configChanged();assert.equal(currentRequestPlan(),null);assert.match(nodes['#run-ceilings-summary'].textContent,/^≤ 20 requests/);assert.doesNotMatch(nodes['#run-ceilings-summary'].textContent,/164 planned/);assert.match(nodes['#setup-duration'].innerHTML,/Duration unknown until first requests/);
 assert.doesNotMatch(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"|164 requests/);
 let current=structuredClone(config),resolve;
 readForm=()=>({{config:structuredClone(current)}});
@@ -86,7 +86,7 @@ nodes['#cli-fallback']={{hidden:false}};
 const syncView=syncConfigView;syncConfigView=()=>{{}};
 listeners.input({{target:{{id:'config-editor',value:'dirty',matches(){{return false;}},closest(){{return {{}};}}}}}});
 syncConfigView=syncView;
-assert.match(nodes['#request-plan'].innerHTML,/Apply or discard JSON changes/);
+assert.equal(currentRequestPlan(),null);assert.match(nodes['#setup-duration'].innerHTML,/Duration unknown until first requests/);
 assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 requests|data-action="use-request-budget"/);
 // Debounced live planning never sends inference, and a replaced timer cannot plan an old form.
 state.jsonDraft=state.jsonBase;nodes['#new-run-form']={{}};
@@ -195,7 +195,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   const markup=nodes['#main'].innerHTML;
   assert.doesNotMatch(markup,/setup-side-summary|setup-planned-traffic|review-baseline/);
   const options=markup.slice(markup.indexOf('id="execution-settings"'),markup.indexOf('</details>',markup.indexOf('id="execution-settings"')));
-  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare with baseline'));
+  assert(!options.includes('name="baseline_id"'));assert(markup.includes('name="baseline_id"'));assert(markup.indexOf('name="baseline_id"')<markup.indexOf('id="setup-advanced"'));
   assert(markup.indexOf('id="run-bounds"')<markup.indexOf('id="request-plan"'));
   for(const name of ['mode','restart_target','baseline_id','name'])assert(controls.some(input=>input.name===name));
   assert(markup.indexOf('id="setup-deployment"')<markup.indexOf('id="test-selection"'));assert(!markup.includes('name="setup_goal"'));
@@ -230,9 +230,10 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   }}
 }}
 // Explicit goal changes use the form's latest draft rather than a stale applied config.
+state.bootstrap.config={{...structuredClone(state.bootstrap.config),checks:bootstrap.defaults.checks}};
 form.elements.model.value='latest-model';await listeners.click({{target:{{closest:q=>q==='[data-action]'?{{dataset:{{action:'quick-checks'}}}}:null}}}});
 assert.equal(state.config.targets[0].model,'latest-model');
-assert.equal(state.config.checks.join(','),'access,correctness');
+assert.equal(state.config.checks.join(','),bootstrap.defaults.checks.join(','));
 assert.equal(JSON.stringify(state.config.request_pack),savedPack);
 assert.equal(state.config.max_requests,config.max_requests);
 // Reruns and imported advanced selections infer Custom without rewriting them.
@@ -240,7 +241,7 @@ const custom={{...structuredClone(config),checks:['access','correctness','recove
 state.detail={{report:{{manifest:{{config:custom}}}},baseline_id:'saved-baseline'}};rerun();
 const rerunBefore=JSON.stringify(state.config);renderNew();
 assert.equal(state.setupPreset,'custom');assert.equal(JSON.stringify(state.config),rerunBefore);
-assert.equal(state.config.concurrency,16);assert.equal(state.prefillBaseline,'saved-baseline');
+assert.equal(state.config.concurrency,16);assert.equal(state.prefillBaseline,''); // A rerun requires a fresh explicit baseline choice.
 // Dedicated response criteria edit only this check; Reset restores its defaults.
 state.config=applySetupPreset(config,'arrival',state.bootstrap.load_test.defaults);renderNew('arrival');
 const primary=form.elements.load_pass_criteria_max_completion_ms;primary.value='900';
@@ -645,13 +646,13 @@ const target={{target:'local',status:'pass',comparisons:[],
 const report={{checks:[],baseline:{{run_id:'before',status:'pass',targets:[target]}}}};
 state.comparisonFilter='all';
 let markup=renderComparison(report);
-assert.match(markup,/2 traffic stages compared/);
+assert.match(markup,/Arrival stage evidence/);
 assert.doesNotMatch(markup,/0 recorded metric comparisons|0 comparable metrics|No metric rows|comparison-filters/);
 target.comparisons.push({{check:'correctness',metric:'error_rate',status:'pass'}});
 markup=renderComparison(report);
-assert.match(markup,/comparison-filters/);
-assert.match(markup,/1 measurements, grouped by check/);
-assert.match(markup,/data-comparison-group="correctness"/);
+assert.match(markup,/<th scope="col">Metric<\\/th>/);
+assert.match(markup,/Error rate/);
+assert.match(markup,/no material change/);
 target.configuration_diff={{confounded:true,changed_fields:['runtime.version']}};
 target.telemetry={{coverage:'partial'}};
 markup=renderComparison(report);
@@ -1091,7 +1092,7 @@ state.bootstrap=bootstrap;
 state.config=draft;state.jsonDraft=state.jsonBase='synced';
 let captured=0,rendered=0;
 captureFormDraft=()=>{captured++;};renderNew=()=>{rendered++;};
-let markup=renderJudging(draft);assert.match(markup,/AI evaluator/);assert.match(markup,/judge_0_model/);assert.match(markup,/Evaluation limits/);assert.match(markup,/configured evaluators/);
+let markup=renderJudging(draft);assert.match(markup,/AI judge/);assert.match(markup,/judge_0_model/);assert.match(markup,/Evaluation limits/);assert.match(markup,/configured AI judges/);
 assert.equal(renderJudging({...draft,request_source:'builtin'}),'');
 assert.equal(renderJudging({...draft,request_pack:{cases:[{scorer:'exact'}]}}),'');
 changeJudge('add');assert.equal(state.config.judging.judges.length,2);assert.equal(captured,1);assert.equal(rendered,1);
@@ -1107,10 +1108,10 @@ markup=renderJudgement({status:'inconclusive',votes});assert.match(markup,/Tie/)
 markup=renderJudgement({status:'pass',votes:[...votes,{judge:'third',status:'completed',verdict:true}]});assert.match(markup,/Disagreement/);assert.match(markup,/Passed/);
 markup=renderJudgement({status:'inconclusive',votes:[votes[0],{judge:'second',status:'error',verdict:null,error_category:'timeout'}]});assert.match(markup,/Incomplete panel/);assert.match(markup,/timeout/);assert.match(markup,/Reason not retained/);
 state.detail={report:{requests:[{id:'r',fixture_id:'refund',judgement:{status:'inconclusive',votes},score:null}],manifest:{config:{retention:'all'}}}};
-openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI evaluation/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
+openRequest('r');assert(nodes['#request-dialog'].shown);assert.match(nodes['#request-dialog'].innerHTML,/AI judge/);assert.match(nodes['#request-dialog'].innerHTML,/Wrong quantity/);
 state.detail={id:'run',state:'running',config:{targets:[{name:'target',model:'m'}],judging:config.judging,max_requests:50},progress:{event:'judging_progress',attempted:20,completed:20,judge_calls_total:40,judge_calls_completed:7,elapsed_seconds:10},events:[]};
-renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Judge calls completed/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
-state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Mission control</h1>'));assert(nodes['#main'].innerHTML.includes('One spot per test. Select a spot for its requests and results.'));
+renderLive();markup=nodes['#main'].innerHTML;assert.match(markup,/Evaluating answers/);assert.match(markup,/Target traffic finished/);assert.match(markup,/Evaluation calls/);assert.match(markup,/7.*40/s);assert.match(markup,/data-action="stop"/);assert(!markup.includes('Measuring the configured endpoint'));
+state.detail.progress={event:'request_finished',attempted:20,completed:19};renderLive();assert(nodes['#main'].innerHTML.includes('<h1>Running</h1>'));assert(nodes['#main'].innerHTML.includes('Inspect conditions and requests as they finish.'));
 `,context);
 """.replace("APP_PATH", json.dumps(str(static / "app.js"))).replace(
         "FORM_PATH", json.dumps((static / "form-config.mjs").as_uri()))
@@ -1271,7 +1272,7 @@ form.elements.example_scorer.value='exact';syncExampleScorer();assert.equal(form
 let sample;importRequestPack=async(file)=>{sample=JSON.parse(await file.text());assert.equal(file.name,'sample-dataset.json');};applyDataset=()=>{throw Error('sample must wait for explicit application');};await sampleDataset();
 const exact=sample.cases.find(item=>item.scorer==='exact');assert.equal(exact.expected,'7');assert.match(exact.messages[0].content,/only the digit/);
 const record={evaluation:{messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<Paris>',expected_provided:true,rubric:'No <invention>'}};
-let html=renderEvaluationEvidence(record,{});assert.match(html,/&lt;question&gt;/);assert.match(html,/&lt;Paris&gt;/);assert.match(html,/No &lt;invention&gt;/);assert.match(html,/AI evaluator/);assert(!html.includes('<question>'));
+let html=renderEvaluationEvidence(record,{});assert.match(html,/&lt;question&gt;/);assert.match(html,/&lt;Paris&gt;/);assert.match(html,/No &lt;invention&gt;/);assert.match(html,/AI judge/);assert(!html.includes('<question>'));
 record.evaluation={messages:[],scorer:'json',expected:null,expected_provided:true,schema:{type:'null'}};
 html=renderEvaluationEvidence(record,{});assert(html.includes("<pre>null</pre>"));assert.match(html,/JSON schema/);
 record.evaluation={messages:[],scorer:'json',expected:{purpose:'<semantic target>'},expected_provided:true};
@@ -1329,19 +1330,19 @@ state.config.request_pack={cases:[{fixture_id:'one',scorer:'judge'}]};
 let additions=0;changeJudge=action=>{assert.equal(action,'add');additions++;};
 await startRun({preventDefault(){},target:{}});
 assert.equal(calls,0);assert.equal(additions,1);assert(nodes['.judge-configuration'].open);
-assert.match(nodes['#form-error'].textContent,/Set up the AI evaluator/);
+assert.match(nodes['#form-error'].textContent,/Set up the AI judge/);
 assert(!judgesReady(state.config));
 state.config.judging={judges:[{name:'evaluator',url:'http://localhost/v1',model:'m'}]};
 assert(judgesReady(state.config));state.config.judging.judges[0].model=' ';assert(!judgesReady(state.config));
-// Bulk controls are contextual; exact matches never require an AI evaluator.
+// Bulk controls are contextual; exact matches never require an AI judge.
 state.judgeEditorOpen=false;state.datasetSelection=[];
 let markup=renderAnswerChecks(state.config);
-assert(!markup.includes('dataset-bulk-scorer'));assert(markup.includes('Configure evaluator'));
+assert(!markup.includes('dataset-bulk-scorer'));assert(markup.includes('Configure AI judge'));
 assert(!markup.includes('class="judge-configuration" open'));
 state.datasetSelection=['one'];markup=renderAnswerChecks(state.config);
 assert(markup.includes('dataset-bulk-scorer'));
 state.config.request_pack.cases[0].scorer='exact';markup=renderAnswerChecks(state.config);
-assert(!markup.includes('judge_count'));assert(!markup.includes('Configure evaluator'));
+assert(!markup.includes('judge_count'));assert(!markup.includes('Configure AI judge'));
 })()
 `,context);
 """.replace("APP_PATH", json.dumps(str(app)))

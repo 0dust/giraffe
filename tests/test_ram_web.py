@@ -67,19 +67,18 @@ def test_real_sampler_exception_after_high_rss_allows_another_web_run(tmp_path, 
 
 
 def test_runs_listing_caches_compact_report_summaries_and_refreshes_changed_reports(tmp_path, monkeypatch):
-    import giraffe.web
-
     directory = tmp_path / "saved"
     value = report(RunConfig.model_validate(config()))
     write_report(value, directory)
-    original = giraffe.web._report
+    from giraffe.report_stream import _Reader
+    original = _Reader.__init__
     loads = []
 
-    def load(path):
-        loads.append(path)
-        return original(path)
+    def load(reader, stream):
+        loads.append(stream.name)
+        return original(reader, stream)
 
-    monkeypatch.setattr(giraffe.web, "_report", load)
+    monkeypatch.setattr(_Reader, "__init__", load)
     with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         for _ in range(3):
             rows = client.get("/api/runs").json()["runs"]
@@ -102,18 +101,17 @@ def test_runs_listing_caches_compact_report_summaries_and_refreshes_changed_repo
 
 
 def test_unreadable_report_listing_is_cached_without_losing_error_state(tmp_path, monkeypatch):
-    import giraffe.web
-
     directory = tmp_path / "broken"
     directory.mkdir()
     (directory / "report.json").write_text('{"broken":')
-    original, loads = giraffe.web._report, []
+    from giraffe.report_stream import _Reader
+    original, loads = _Reader.__init__, []
 
-    def load(path):
-        loads.append(path)
-        return original(path)
+    def load(reader, stream):
+        loads.append(stream.name)
+        return original(reader, stream)
 
-    monkeypatch.setattr(giraffe.web, "_report", load)
+    monkeypatch.setattr(_Reader, "__init__", load)
     with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         for _ in range(2):
             rows = client.get("/api/runs").json()["runs"]

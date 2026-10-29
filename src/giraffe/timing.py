@@ -52,7 +52,7 @@ class TimingHealth:
 
 
 def threshold(records: list[RequestRecord]) -> float:
-    from statistics import median
+    from .stats import median
 
     warm = [r.first_output_ms for r in records if r.scenario == "warm"
             and r.status == "completed" and r.valid and r.first_output_ms is not None]

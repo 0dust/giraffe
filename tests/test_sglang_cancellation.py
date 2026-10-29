@@ -329,4 +329,4 @@ async def test_unavailable_backend_evidence_never_passes_or_dispatches_requests(
     check = next(c for c in report.checks if c.id == "cancellation")
     assert check.metrics["backend_cancellation"]["status"] == expected
     assert not any(r.scenario == "backend_cancel" for r in report.requests)
-    assert "cancellation" in DEFAULT_CHECKS
+    assert "cancellation" not in DEFAULT_CHECKS

@@ -1,24 +1,41 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/giraffe-dark.svg">
-    <img alt="Giraffe" src="docs/assets/giraffe-light.svg" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/giraffe-dark.svg">
+    <img alt="Giraffe" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/giraffe-light.svg" width="360">
   </picture>
 </p>
 
-<h3 align="center">Acceptance checks for existing LLM endpoints</h3>
+<h3 align="center">Check whether your self-hosted LLM performs as expected.</h3>
 
 <p align="center">
-  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Version 0.1.0a1" src="docs/assets/badges/version.svg"></a>
-  <a href="docs/README.md"><img alt="Documentation" src="docs/assets/badges/docs.svg"></a>
-  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Python 3.11+" src="docs/assets/badges/python.svg"></a>
-  <a href="https://github.com/0dust/giraffe/blob/main/LICENSE"><img alt="License Apache 2.0" src="docs/assets/badges/license.svg"></a>
+  <a href="https://pypi.org/project/giraffe-llm/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/giraffe-llm"></a>
+  <a href="https://github.com/0dust/giraffe/actions/workflows/checks.yml"><img alt="CI checks" src="https://github.com/0dust/giraffe/actions/workflows/checks.yml/badge.svg?branch=main&amp;event=push"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/docs/README.md"><img alt="Documentation" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/docs.svg"></a>
+  <a href="https://discord.gg/GBefPbWebr"><img alt="Join the Giraffe Discord" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/discord.svg"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/pyproject.toml"><img alt="Python 3.11+" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/python.svg"></a>
+  <a href="https://github.com/0dust/giraffe/blob/main/LICENSE"><img alt="License Apache 2.0" src="https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/badges/license.svg"></a>
 </p>
 
 ---
 
-Run repeatable tests against an existing **OpenAI-compatible text endpoint**. Inspect request evidence and compare results with a [saved baseline](#save-a-baseline-and-compare).
+Giraffe is a test suite for engineers running self-hosted LLMs. Point it at an
+existing **OpenAI-compatible chat API**, such as Ollama or vLLM, to check answers
+against expected results, measure response times, and test behavior under load.
+Run it from the command line or a local web UI, inspect failed requests, and
+compare results before and after a deployment change.
 
-[Quick start](#quick-start) · [Inference engines](#inference-engines) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation)
+Use it to answer questions like:
+
+- Do answers that pass individually still pass when requests run concurrently?
+- Which tested traffic rates meet our correctness and response-time limits?
+- After a server upgrade, which checks or measurements got worse?
+
+Start with built-in checks, or supply your own questions and expected answers.
+You choose the checks, traffic and acceptance limits. A passing run applies to
+those tests and settings; it does not establish general model quality or certify
+production capacity.
+
+[Quick start](#quick-start) · [Inference engines](#inference-engines) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
 
 ## Quick start
 
@@ -26,26 +43,40 @@ Start your inference server separately and have a model ready to use.
 
 ### 1. Install
 
+Install [`giraffe-llm` from PyPI](https://pypi.org/project/giraffe-llm/) in a virtual environment. The command is `giraffe`:
+
 ```sh
-git clone https://github.com/0dust/giraffe.git && cd giraffe
 python3 -m venv .venv
 source .venv/bin/activate
-pip install .
+python -m pip install "giraffe-llm==0.1.0a1"
 ```
 
 ### 2. Start your run
 
-This example uses Ollama with `llama3.2:3b` already installed. Replace the URL and model for your server.
+This example uses Ollama with a model already installed. Replace the URL for your server.
 
 ```sh
-giraffe run --url http://127.0.0.1:11434/v1 \
-  --model llama3.2:3b --checks access,serving,correctness \
-  --concurrency 1 --html
+giraffe run --url http://127.0.0.1:11434/v1 --html
 ```
 
-This checks endpoint access, response validity and known-answer correctness, one request at a time.
+The model is auto-detected when only one is served; otherwise add `--model MODEL_ID`.
+The CLI and UI select the same four checks by default:
+`access, serving, correctness, first_output`. These check endpoint access, response
+validity, answer correctness and p95 time to the first answer.
+The default first-output limit is **10,000 ms**, a generous laptop sanity bound;
+override it with `--first-output-ms` or YAML `limits.first_output_ms`.
+Default check concurrency is four. Fully scored answers can conclude on accuracy when
+concurrency is inherited; missing server overlap is reported as an observation.
+Set `--default-concurrency` or a per-check concurrency override above one to require concurrent evidence.
+The 10,000 ms sanity bound applies only to `first_output`.
 
-**Outputs:** results in the terminal, plus JSON and HTML reports in `runs/<timestamp>/`. The command exits when finished.
+**Outputs:** results in the terminal, plus JSON and HTML reports in `runs/<timestamp>/`. The command exits when finished. Open `report.html` to inspect each check and its requests.
+
+A **pass** means the selected required checks have enough evidence and meet their
+limits. A **fail** means a check observed a failure. **Inconclusive** means there
+is not enough evidence to decide; **blocked** means the run or check could not
+proceed. See the [results guide](https://github.com/0dust/giraffe/blob/main/docs/running.md#results-and-stopping)
+for exit codes and partial runs.
 
 ### Prefer the browser UI?
 
@@ -61,19 +92,19 @@ Open **[localhost:8765](http://127.0.0.1:8765)**, enter your endpoint and model,
 
 Connect through the engine’s **OpenAI-compatible chat API**. Discovery, metrics and server-side evidence vary by engine.
 
-The YAML files below are included in the cloned repository’s `examples/` directory. Each file defines the endpoint, model, checks, load settings and acceptance limits for a run.
+Download a YAML configuration from the links below into a local `examples/` directory. Engine files define an endpoint, model and metrics profile, and inherit the shared default checks and limits. Dedicated workload examples show additional tests.
 
 | Engine | YAML configuration |
 | --- | --- |
 | Ollama | [`local.yaml`](https://github.com/0dust/giraffe/blob/main/examples/local.yaml) |
 | vLLM / vLLM-Metal | [`vllm.yaml`](https://github.com/0dust/giraffe/blob/main/examples/vllm.yaml) |
-| SGLang | Use your endpoint URL and model ID in the [CLI command above](#2-start-your-run) |
+| SGLang | [`sglang.yaml`](https://github.com/0dust/giraffe/blob/main/examples/sglang.yaml) |
 | llama.cpp server | [`llamacpp.yaml`](https://github.com/0dust/giraffe/blob/main/examples/llamacpp.yaml) |
 | TensorRT-LLM | [`tensorrt-llm.yaml`](https://github.com/0dust/giraffe/blob/main/examples/tensorrt-llm.yaml) |
 | LMDeploy | [`lmdeploy.yaml`](https://github.com/0dust/giraffe/blob/main/examples/lmdeploy.yaml) |
 | Hugging Face TGI | [`tgi.yaml`](https://github.com/0dust/giraffe/blob/main/examples/tgi.yaml) |
 
-Open the file for your engine and edit its URL, model, checks and limits. From the repository root, pass that file to `--config`. For example, after editing `examples/vllm.yaml`:
+Open the file for your engine and edit its URL, model, checks and limits. From the directory containing `examples/`, pass that file to `--config`. For example, after editing `examples/vllm.yaml`:
 
 ```sh
 giraffe run --config examples/vllm.yaml \
@@ -82,9 +113,23 @@ giraffe run --config examples/vllm.yaml \
 
 Giraffe reads the run settings from YAML; `--output` chooses where to save the results, and `--html` adds an HTML report.
 
+## Test behavior under load
+
+Select **Load test** to repeat requests at different concurrency levels or arrival
+rates. Set the traffic and correctness, response-time and error limits for your
+service, then inspect which tested settings pass and which fail. The highest
+passing setting is a tested result, not a discovered maximum capacity.
+
+Built-in workloads cover different input and output lengths. You can also supply
+your own questions and expected answers to test the work your application needs.
+See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
+for traffic patterns, answer checks and configuration examples.
+
 ## Save a baseline and compare
 
-Save the completed `runs/before` run as a reference. After a deployment change, run the same configuration with `--baseline`:
+Save the completed `runs/before` run as a reference. After a deployment change,
+such as a server upgrade, run the same configuration with `--baseline`. Keep the
+endpoint URL, model ID, workload and acceptance settings the same across runs:
 
 ```sh
 giraffe baseline save runs/before baselines/before.json
@@ -96,37 +141,57 @@ giraffe run --config examples/vllm.yaml \
 
 The new report shows acceptance results and changes against the saved baseline. Keep the workload comparable; incompatible measurements stay inconclusive.
 
-In the UI, open a completed run and choose **Save as reference baseline**, then **Compare a new run with this baseline**. [Baseline guide →](docs/running.md#compare-with-a-baseline)
+In the UI, open a completed run and choose **Save baseline** (fully passing runs) or **Save as baseline** (other completed runs). Name and save it, then choose **Compare a new run with this baseline** at the bottom of the report, or **Compare a new run** when shown at the top. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
 
 ## Tests
 
-15 built-in checks. Select the ones that matter to your endpoint.
+15 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
 
 | Check · CLI ID | What it checks |
 | --- | --- |
-| Network and access · `access` | Connection, authentication and ordinary inference |
-| Serving success · `serving` | Complete, valid, nonempty responses |
-| First useful output · `first_output` | Time to the first useful answer |
-| Generation pace · `generation` | Answer rate, response time and stream pauses |
+| Endpoint access · `access` | Connection, authentication and ordinary inference |
+| Response validity · `serving` | Complete, valid, nonempty responses |
+| Time to first answer · `first_output` | Time to the first useful answer |
+| Generation speed · `generation` | Answer rate, response time and stream pauses |
 | Load test · `load` | Correctness and timing under selected traffic patterns |
-| Long-context behavior · `context` | Recall of known facts across long inputs |
-| Known-answer correctness · `correctness` | Answers against expected values |
-| Structured JSON · `json` | Expected fields, types and values |
-| Limits and cancellation · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
-| Sustained load and recovery · `recovery` | Heavy traffic followed by matched light probes |
-| GPU observations · `gpu` | Available GPU telemetry |
-| Shared prefixes and cache evidence · `prefix` | Reported cache reuse against independent controls |
+| Long-context recall · `context` | Recall of known facts across long inputs |
+| Answer correctness · `correctness` | Answers against expected values |
+| JSON correctness · `json` | Expected fields, types and values |
+| Cancellation & limits · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
+| Recovery after load · `recovery` | Heavy traffic followed by matched light probes |
+| GPU metrics · `gpu` | Available GPU telemetry |
+| Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
-| Repeated-request consistency · `consistency` | Answer agreement across repeated requests |
-| Tool-calling capability · `tools` | Tool-call structure, names and expected arguments |
+| Answer consistency · `consistency` | Answer agreement across repeated requests |
+| Tool calling · `tools` | Tool-call structure, names and expected arguments |
+
+The catalog has 13 verdict checks and two server observations: **GPU metrics** and
+**Prefix cache**. Both remain in the selected checks and baseline configuration.
+Missing GPU telemetry and missing or inactive prefix caching do not change the
+verdict. GPU hardware faults and an exceeded configured temperature limit can
+still fail the run. Prefix cache never fails the run.
+
+When selected, generation uses a **5,000 ms stream-gap limit** if no generation
+limit is supplied; this catches stalls without imposing a token speed. Set
+`--stream-gap-ms` or YAML `limits.stream_gap_ms` to override it; an explicit YAML
+`stream_gap_ms: null` disables this fallback. Recovery can pass
+on correctness and error rate without a timing limit; timing remains an observation.
+
+Use `--json` (an alias of `--output-format json`) for machine-readable CLI output.
+Use `--structured-output` to add the structured-JSON check, and `--verbose` to show
+diagnostic stages and RAM measurements. JSON reports retain those measurements.
 
 Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Missing delivery or measurement evidence stays inconclusive. Inspect the request evidence before attributing a failure to your inference server.
 
 ## Documentation
 
-[Documentation index](docs/README.md) — detailed guides in the same repository:
+[Documentation index](https://github.com/0dust/giraffe/blob/main/docs/README.md) — detailed guides in the same repository:
 
-[Running & baselines](docs/running.md) · [Workloads & measurements](docs/workloads.md) · [Offline & Docker](docs/offline.md) · [Resource limits](docs/resources.md)
+[Running & baselines](https://github.com/0dust/giraffe/blob/main/docs/running.md) · [Workloads & measurements](https://github.com/0dust/giraffe/blob/main/docs/workloads.md) · [Offline & Docker](https://github.com/0dust/giraffe/blob/main/docs/offline.md) · [Resource limits](https://github.com/0dust/giraffe/blob/main/docs/resources.md)
+
+## Community
+
+[Join the Giraffe Discord](https://discord.gg/GBefPbWebr) to get help with runs and reports, share feedback, and discuss ideas. Start a post in **#help-and-feedback** for a question, bug, or suggestion, and follow **#updates** for releases and improvements.
 
 [Report an issue](https://github.com/0dust/giraffe/issues) with your Giraffe version, engine/model and reproduction steps. Remove API keys and private prompts or answers before sharing reports.
 

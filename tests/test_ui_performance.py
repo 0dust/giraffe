@@ -211,7 +211,7 @@ syncReportView();$('#main').innerHTML=renderPerformance();
 assert.equal($$('.performance-chart').length,0);
 assert.match($('#performance-overview').textContent,/no |not yet|available|loading/i);
 assert.match($('#performance-timing').textContent,/no |not yet|available/i);
-assert.match($('#main').textContent,/View test results/);
+assert.match($('#main').textContent,/View results/);
 """, dom=True)
 
 

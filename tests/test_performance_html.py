@@ -7,16 +7,24 @@ from giraffe.reporting import _render
 from tests.performance_fixture import synthetic_report_1000
 
 
-def test_standalone_performance_default_tabs_and_complete_sections():
+def test_standalone_findings_first_order_and_complete_sections():
     report = synthetic_report_1000()
     before = report.model_dump_json()
     html = _render(report)
-    assert 'id="html-tab-performance"' in html
-    assert 'id="html-tab-results"' in html
-    assert re.search(r'id="html-tab-performance"[^>]*checked', html)
+    assert 'id="html-tab-performance"' not in html
+    assert 'id="html-results"' in html
+    sections = ['id="findings"', 'id="checks"', 'id="baseline"',
+                'id="html-performance"', 'id="requests"', 'id="reproduction"']
+    assert [html.index(section) for section in sections] == sorted(html.index(section) for section in sections)
+    assert html.count('>Baseline comparison</h2>') == 1
+    assert 'Entry 1' not in html
+    assert '@media(prefers-color-scheme:light)' in html
+    assert '@media print' in html
+    assert 'details>*:not(summary){display:block!important}' in html
+    assert 'details::details-content{content-visibility:visible!important;height:auto!important}' in html
     headings = ['Performance overview', '02 Request timing', '03 Throughput &amp; capacity',
                 '04 Load delivery', '05 Outcomes &amp; quality', '06 Workload &amp; tokens',
-                '07 Conversations &amp; workload effects', '08 Server observations', '09 Baseline comparison']
+                '07 Conversations &amp; workload effects', '08 Server observations']
     positions = [html.index(f'>{heading}</h2>') for heading in headings]
     assert positions == sorted(positions)
     assert 'All timing percentiles &amp; definitions' in html
@@ -59,7 +67,8 @@ def test_standalone_old_empty_reports_show_availability_without_empty_charts():
     assert 'Not collected' in html and 'Not applicable' in html
     assert 'no runtime telemetry collection evidence' in html
     assert '<svg' not in html
-    assert 'Request evidence' in html and 'Reproduce this run' in html
+    assert '<h2>Requests</h2>' in html and 'Reproduce this run' in html
+    assert 'Request evidence' not in html
 
 
 def test_standalone_values_come_from_selected_backend_summary():
@@ -135,7 +144,10 @@ def test_standalone_repeated_input_preview_links_to_preserved_evidence():
         record.evaluation = EvaluationEvidence(messages=[{'role': 'user', 'content': '<shared-input>'}],
                                                scorer='exact', expected='42', expected_provided=True)
     html = _render(report)
-    assert html.count('&lt;shared-input&gt;') == 1
+    # The full input is rendered once; each request summary shows its prompt label.
+    assert html.count('<h3>Input messages</h3><pre>') == 1
+    assert html.count('<summary>&lt;shared-input&gt; · local · Warm-up') == 2
+    assert html.count('&lt;shared-input&gt;') == 3
     assert 'Same recorded input as <a href="#request-0">earlier request evidence</a>' in html
     assert '<details id="request-1">' in html
 
@@ -157,3 +169,9 @@ def test_standalone_measurement_catalog_preview_is_bounded():
     html = render_performance(performance)
     assert 'Showing 50 of 1000 windows; complete catalog in report.json.' in html
     assert 'window-canary-49' in html and 'window-canary-50' not in html
+
+
+def test_standalone_report_timing_labels_use_time_to_first_answer():
+    html = _render(synthetic_report_1000())
+    assert 'Time to first answer' in html
+    assert not re.search(r'\bfirst output\b', html, re.I)

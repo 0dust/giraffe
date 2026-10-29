@@ -1,8 +1,6 @@
 """Resource previews stay portable; only traffic start enforces process limits."""
 
 import json
-import threading
-from types import SimpleNamespace
 
 import pytest
 
@@ -51,7 +49,7 @@ api=async(path,options)=>{
 };
 assert.equal(currentSettingErrors().length,0);
 assert.equal(canStartRun(),false);
-assert.match(renderPlanTime(VALIDATED.request_plan),/Restart `giraffe web`/);
+assert.match(renderPlanWarnings(VALIDATED.request_plan),/Restart `giraffe web`/);
 await copyCli();
 assert.equal(JSON.stringify(paths),JSON.stringify(['/api/config/validate','/api/config/cli']));
 assert.equal(nodes['#config-error'].hidden,true);
@@ -131,31 +129,31 @@ def test_other_traffic_cli_commands_guard_before_dispatch(tmp_path, monkeypatch,
 async def test_web_summary_and_lifecycle_metadata_share_one_lock(tmp_path, monkeypatch, limits):
     from giraffe import web
 
-    metadata_lock = threading.RLock()
-    monkeypatch.setattr(web, "threading", SimpleNamespace(RLock=lambda: metadata_lock))
-    original_report, original_write = web.write_report, web._write
+    from giraffe import storage
+    metadata_lock = storage.metadata_lock
+    original_report, original_write = web.write_report, storage._write_metadata
     calls = []
 
     def write_report(*args, **kwargs):
-        assert metadata_lock._is_owned()
-        calls.append("report summary")
+        assert not metadata_lock._is_owned()  # Slow export must not hold the publication lock.
+        calls.append("report export")
         return original_report(*args, **kwargs)
 
-    def write_metadata(path, *args, **kwargs):
-        if path.name == ".web.json":
-            assert metadata_lock._is_owned()
-            calls.append("lifecycle metadata")
-        return original_write(path, *args, **kwargs)
+    def write_metadata(directory, values):
+        assert metadata_lock._is_owned()
+        calls.append("report summary" if "latency_summary" in values else "lifecycle metadata")
+        return original_write(directory, values)
 
     monkeypatch.setattr(web, "write_report", write_report)
-    monkeypatch.setattr(web, "_write", write_metadata)
+    monkeypatch.setattr(storage, "_write_metadata", write_metadata)
     monkeypatch.setattr(web, "run_suite", successful_runner)
     async with browser(tmp_path) as client:
         response = await client.post("/api/runs", json={"config": config().model_dump(mode="json")})
         assert response.status_code == 202, response.text
         identifier = response.json()["id"]
         assert (await finished(client, identifier))["state"] == "completed"
-    assert "report summary" in calls and calls.count("lifecycle metadata") >= 2
+    assert "report export" in calls and "report summary" in calls
+    assert calls.count("lifecycle metadata") >= 2
     saved = json.loads((tmp_path / identifier / ".web.json").read_text())
     assert saved["state"] == "completed"
     assert saved["latency_summary"]["version"] == 3

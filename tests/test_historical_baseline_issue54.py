@@ -92,7 +92,7 @@ def test_new_configuration_still_rejects_historical_unsupported_versions(version
 
 
 @pytest.mark.parametrize("version", [1, 3, 2, "unversioned"])
-def test_cli_baseline_comparison_persists_completed_run(version, tmp_path, monkeypatch, capsys):
+def test_cli_baseline_comparison_persists_completed_run(version, tmp_path, monkeypatch, capsys, local_tokenizer):
     baseline = historical_report(version)
     source, saved = tmp_path / "previous.json", tmp_path / "baseline.json"
     source.write_text(baseline.model_dump_json())
@@ -133,7 +133,7 @@ def test_cli_baseline_comparison_persists_completed_run(version, tmp_path, monke
 
 
 @pytest.mark.parametrize("version", [1, 3, 2, "unversioned"])
-async def test_web_saved_baseline_comparison_persists_completed_run(version, tmp_path, monkeypatch):
+async def test_web_saved_baseline_comparison_persists_completed_run(version, tmp_path, monkeypatch, local_tokenizer):
     baseline = historical_report(version)
     previous = tmp_path / "previous"
     write_report(baseline, previous)

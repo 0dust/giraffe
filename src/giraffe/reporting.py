@@ -9,6 +9,7 @@ from fractions import Fraction
 from hashlib import sha256
 from html import escape
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,7 +17,6 @@ import random
 import re
 import shutil
 import tempfile
-from statistics import median
 from typing import Any
 
 from pydantic import ValidationError
@@ -27,10 +27,13 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
 from .models import (CHECK_NAMES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
-                     migrate_concurrent_load, migrate_run_limits)
-from .storage import DEFAULT_LIMITS, format_size
+                     migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
+from .stats import median, percentile
+from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
 from .workloads import WORKLOAD_CHECKS
 from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
+
+logger = logging.getLogger(__name__)
 
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
@@ -41,16 +44,6 @@ _MATCH_CONFIG = (
     "unresponsive_after_failures", "unresponsive_for_seconds",
     "limits",
 )
-
-
-def _percentile(values: list[float], percentile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * percentile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def _rate(record: RequestRecord) -> float | None:
@@ -83,6 +76,8 @@ def _comparison_config(value: dict) -> dict:
     config, _ = migrate_concurrent_load(config)
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
+        for field in ("first_output_ms", "stream_gap_ms"):
+            config["limits"].setdefault(field, None)
     default = config.setdefault("default_concurrency", 4)
     ceiling = config.get("concurrency")
     if isinstance(ceiling, int):
@@ -141,6 +136,12 @@ def _comparison_manifest(manifest: dict) -> dict:
                     **settings} if isinstance(settings, dict) else settings
             for check, settings in value["effective_checks"].items()
         }
+    for check, field in (("first_output", "first_output_ms"), ("generation", "stream_gap_ms")):
+        settings = value.get("effective_checks", {}).get(check)
+        if isinstance(settings, dict) and isinstance(settings.get("limits"), dict):
+            supplied = (config.get("test_options", {}).get(check) or {}).get("limits") or {}
+            threshold = supplied[field] if field in supplied else (config.get("limits") or {}).get(field)
+            value["effective_checks"][check] = {**settings, "limits": {**settings["limits"], field: threshold}}
     if "capacity" in resolved.checks:
         value.setdefault("effective_traffic", resolved.effective_traffic().model_dump(mode="json"))
     return value
@@ -243,13 +244,18 @@ def _limits_reached(report: RunReport) -> set[str]:
     return reached
 
 
-def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
+def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[str, dict[str, Any]] | None = None) -> list[str]:
     reasons = []
-    if report.suite_version != baseline.suite_version:
-        reasons.append("Suite versions differ.")
-    if (report.schema_version != baseline.schema_version
-            and {report.schema_version, baseline.schema_version} != {"2", "3"}):
+
+    def setting_reason(text, code, key, current=None, previous=None):
+        reasons.append(text)
+        if details is not None:
+            details[text] = {"code": code, "key": key, "current": current,
+                             "baseline": previous, "text": text}
+    if not is_supported_schema(report.schema_version) or not is_supported_schema(baseline.schema_version):
         reasons.append("Report schema versions differ.")
+    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
+        reasons.append("Client timing measurement methods differ; rerun the baseline.")
     if report.abort_reason or report.observations.get("target_abort_reasons"):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
     if baseline.abort_reason or baseline.observations.get("target_abort_reasons"):
@@ -280,7 +286,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
     reached = _limits_reached(report) | _limits_reached(baseline)
     for key in ("concurrency", "max_requests", "max_duration_seconds"):
         if key in reached and current_config.get(key) != old_config.get(key):
-            reasons.append(f"Run setting {key} differs and its limit stopped work or constrained concurrency.")
+            setting_reason(f"Run setting {key} differs and its limit stopped work or constrained concurrency.",
+                           "limit_constrained", key, current_config.get(key), old_config.get(key))
     pack_modes = [config.get("request_source") == "request_pack"
                   and bool({"load", "capacity", "correctness"}.intersection(config.get("checks", [])))
                   for config in (current_config, old_config)]
@@ -362,9 +369,11 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
         if key in inactive_pack_globals:
             continue
         if key not in old_config or key not in current_config:
-            reasons.append(f"Recorded {key} is missing; comparability is unknown.")
+            setting_reason(f"Recorded {key} is missing; comparability is unknown.",
+                           "setting_missing", key)
         elif old_config[key] != current_config[key]:
-            reasons.append(f"Run setting {key} differs.")
+            setting_reason(f"Run setting {key} differs.", "setting_differs", key,
+                           current_config[key], old_config[key])
     if any(config.get("test_options", {}).get("cancellation", {}).get("backend_verification") == "required"
            for config in (current_config, old_config)):
         cancellation_grading = [{check.target: "cancellation_results" in check.metrics
@@ -380,23 +389,25 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
             continue  # Saved drafts and explicit defaults do not change executed work.
         if key in current_config or key in old_config:
             if key not in current_config or key not in old_config:
-                reasons.append(f"Recorded {key} is missing; comparability is unknown.")
+                setting_reason(f"Recorded {key} is missing; comparability is unknown.",
+                               "setting_missing", key)
             elif current_config[key] != old_config[key]:
-                reasons.append(f"Run setting {key} differs.")
+                setting_reason(f"Run setting {key} differs.", "setting_differs", key,
+                               current_config[key], old_config[key])
     for key in ("effective_checks", "effective_traffic"):
         if key not in current_manifest and key not in old_manifest:
             continue
         if key == "effective_checks" and ((key in report.manifest) != (key in baseline.manifest)):
             missing = baseline.manifest if key in report.manifest else report.manifest
             if "config_version" in missing.get("config", {}):
-                reasons.append(f"Recorded {key} differs or is missing.")
+                setting_reason(f"Recorded {key} differs or is missing.", "setting_unknown", key)
                 continue
         if key == "effective_traffic" and not traffic_selected:
             continue
         if key in current_manifest or key in old_manifest:
             if effective_value(current_manifest, key) != effective_value(old_manifest, key):
-                reasons.append(f"Recorded {key} differs or is missing.")
-    # The suite version identifies bundled fixtures; custom packs also need a content identity.
+                setting_reason(f"Recorded {key} differs or is missing.", "setting_unknown", key)
+    # Fixture-set identity is independent of the installed package version.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
@@ -417,7 +428,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
                 reasons.append(f"{label} custom fixtures have no recorded content hash.")
     for key in ("run_location", "load_shape"):
         if key not in report.manifest or key not in baseline.manifest:
-            reasons.append(f"Recorded {key} is missing; comparability is unknown.")
+            setting_reason(f"Recorded {key} is missing; comparability is unknown.", "setting_missing", key)
         else:
             current, old = report.manifest[key], baseline.manifest[key]
             if key == "load_shape" and "max_requests" not in reached:
@@ -425,7 +436,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport) -> list[str]:
                                  if name != "target_request_quotas"} if isinstance(shape, dict) else shape
                                 for shape in (current, old))
             if current != old:
-                reasons.append(f"{key} differs.")
+                setting_reason(f"{key} differs.", "setting_differs", key, current, old)
     return reasons
 
 
@@ -515,7 +526,7 @@ def _compare_metric(
         c = aggregate(rng.choices(current, k=len(current)))
         b = aggregate(rng.choices(old, k=len(old)))
         bootstrap.append((c - b) * direction * scale)
-    low, high = _percentile(bootstrap, 0.025), _percentile(bootstrap, 0.975)
+    low, high = percentile(bootstrap, 0.025), percentile(bootstrap, 0.975)
     result.update(worsening=worsening, worsening_interval_95=[low, high], threshold=threshold)
     if worsening > 0 and low is not None and low >= threshold:
         result.update(status="fail", reason="Material worsening exceeds observed sample uncertainty.")
@@ -560,9 +571,6 @@ def _compare_load_tests(
     }
     if reasons:
         result["reason"] = "Load test comparison is unavailable: " + " ".join(reasons)
-        return result
-    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline."
         return result
     if current is None or old is None:
         result["reason"] = "One run lacks final Load test evidence."
@@ -663,9 +671,6 @@ def _compare_traffic(
         "method": "Matched planned arrival cohorts and acceptance criteria. Stage acceptance "
                   "changes are observed qualification results, not statistical capacity estimates.",
     }
-    if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-        result["reason"] = "Client timing measurement boundaries differ; rerun the baseline before comparing traffic acceptance."
-        return result
     for label, metrics in (("current", current), ("baseline", old)):
         pack = (metrics or {}).get("request_pack")
         if pack and pack.get("control_status") != "pass":
@@ -817,7 +822,7 @@ def _concurrent_load_html(metrics):
         parts.append(f"<h4>{_e(group['title'])}</h4><div class=table><table><tr>" + "".join(
             f"<th>{_e(h)}</th>" for h in ("Workload", "Requested concurrency", "Delivered / configured window (s)",
             "Sent / completed", "Errors failed / timeouts", "Cancelled", "Valid / required", "Correct %",
-            "Client concurrency mean / peak", "Server-evidenced concurrency", "First-output p95 (ms)", "Response p95 (ms)",
+            "Client concurrency mean / peak", "Server-evidenced concurrency", "Time to first answer p95 (ms)", "Response p95 (ms)",
             "Requests/s", "Output tok/s", "Input tokens actual median (min–max) / target", "Output tokens actual median (min–max) / cap", "Status and reason")) + "</tr>")
         for point in group["points"]:
             lengths = point["token_lengths"]
@@ -835,7 +840,7 @@ def _concurrent_load_html(metrics):
             if point.get("throughput_warning"):
                 notes.append(point["throughput_warning"])
             if kind == "mixed":
-                notes.append("Requested / observed request mix / observed in-flight time: " + "; ".join(
+                notes.append("Requested / observed request mix / observed concurrent request time: " + "; ".join(
                     f"{load_shape_label(shape)}: {shown(m['requested_percent'])}% / {shown(m['sent_percent'])}% ({m['sent']} sent) / {shown(m['inflight_percent'])}%"
                     for shape, m in point.get("observed_mix", {}).items()))
             if kind == "interference" and (data := point.get("interference")):
@@ -850,7 +855,7 @@ def _concurrent_load_html(metrics):
                 notes.append(f"Output coverage: {coverage['covered_valid_responses']} / {coverage['required']} required responses at or above {coverage['threshold_tokens']} {'token' if coverage['threshold_tokens'] == 1 else 'tokens'}.")
             parts.append('<tr><td colspan="17">' + _e(" ".join(notes)) + "</td></tr>")
         parts.append("</table></div>")
-    parts.append("<p><strong>How these are measured.</strong> Sending windows begin at first dispatch; individual slots refill until the window ends. In-flight requests drain and remain in latency, correctness and error counts. Client concurrency is a time-weighted mean and peak during sending; server concurrency needs overlapping streamed output. Interference qualifies its N−1 continuous short streams plus enough matched probes in both groups; probe trigger idle time does not count against short-stream load. Throughput uses completions from the first completion through the sending-window end, excluding drain. With few samples p95 is effectively the maximum. Missing token counts are not reported, never zero. Input tokens are targets; output tokens are caps and answers may finish sooner.</p>")
+    parts.append("<p><strong>How these are measured.</strong> Sending windows begin at first dispatch; individual slots refill until the window ends. Active requests drain and remain in latency, correctness and error counts. Client concurrency is a time-weighted mean and peak during sending; server concurrency needs overlapping streamed output. Interference qualifies its N−1 continuous short streams plus enough matched probes in both groups; probe trigger idle time does not count against short-stream load. Throughput uses completions from the first completion through the sending-window end, excluding drain. With few samples p95 is effectively the maximum. Missing token counts are not reported, never zero. Input tokens are targets; output tokens are caps and answers may finish sooner.</p>")
     for calibration in metrics.get("calibrations", []):
         if calibration.get("reason_code") == "minimum_prompt_length":
             parts.append("<p>Local input preparation: " + _e(calibration["reason"]) + "</p>")
@@ -863,7 +868,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
     result.checks = [check for check in result.checks if check.id != "baseline"]
-    reasons = _settings_reasons(report, baseline)
+    reason_details = {}
+    reasons = _settings_reasons(report, baseline, details=reason_details)
     current_load = [c for c in report.checks if c.id == "concurrency" and c.required]
     previous_load = [c for c in baseline.checks if c.id == "concurrency" and c.required]
     if any("load_types" in c.metrics for c in current_load) != any("load_types" in c.metrics for c in previous_load) and current_load and previous_load:
@@ -889,6 +895,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     for target in targets or [{"name": "unknown"}]:
         name = target["name"]
         target_reasons = list(reasons)
+        target_details = dict(reason_details)
         saturated_runs = [label for label, run in (("Current", report), ("Baseline", baseline))
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
@@ -898,7 +905,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         else:
             for key in ("model", "url", "route", "parent"):
                 if key not in target or key not in old_target or target[key] != old_target[key]:
-                    target_reasons.append(f"Target {key} differs or is unknown.")
+                    text = f"Target {key} differs or is unknown."
+                    target_reasons.append(text)
+                    target_details[text] = {"code": "target_differs", "key": key,
+                                            "baseline": old_target.get(key), "current": target.get(key), "text": text}
             for key in set(target.get("identity", {})) | set(old_target.get("identity", {})):
                 previous, current = old_target.get("identity", {}).get(key), target.get("identity", {}).get(key)
                 if previous != current:
@@ -918,13 +928,22 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
-        traffic = _compare_traffic(report, baseline, name, target_reasons, threshold)
-        load_tests = _compare_load_tests(report, baseline, name, target_reasons)
+        # Optional observations and checks without inference/acceptance cohorts
+        # do not participate in baseline verdicts or sample-collection guidance.
+        non_request_checks = {"gpu"}
+        non_verdict_checks = non_request_checks | {
+            check.id for run in (report, baseline) for check in run.checks
+            if check.target == name and not check.required
+        }
+        traffic = (_compare_traffic(report, baseline, name, target_reasons, threshold)
+                   if "capacity" not in non_verdict_checks else None)
+        load_tests = (_compare_load_tests(report, baseline, name, target_reasons)
+                      if "load" not in non_verdict_checks else None)
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
-        if (not current_groups or not old_groups) and traffic is None:
-            target_reasons.append("Measured request samples are absent from one or both runs.")
         if not target_reasons:
             for check, scenario in sorted(set(current_groups) | set(old_groups)):
+                if check in non_verdict_checks:
+                    continue
                 current_records = current_groups.get((check, scenario), [])
                 old_records = old_groups.get((check, scenario), [])
                 # Requested shape is checked too, rather than relying on configuration alone.
@@ -933,7 +952,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                      for r in records)
                     return {shape: Fraction(count, len(records)) for shape, count in counts.items()}
                 if not current_records or not old_records or shapes(current_records) != shapes(old_records):
-                    target_reasons.append(f"{check}/{scenario}: missing or different request shapes or proportions.")
+                    rows.append({"check": check, "scenario": scenario, "metric": "request_shapes",
+                                 "status": "inconclusive", "reason": "Missing or different request shapes or proportions.",
+                                 "current_samples": len(current_records), "baseline_samples": len(old_records),
+                                 "evidence_ids": [record.id for record in current_records]})
                     continue
                 current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
@@ -945,7 +967,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
-                    row = _compare_metric(metric, values, old_metrics[metric], minimum, threshold)
+                    row = _compare_metric(metric, values, old_metrics[metric],
+                                          1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
+                                          threshold)
                     if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         row.update(status="inconclusive", reason="Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
@@ -964,19 +988,40 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
                                 row.update(status="inconclusive", reason="Per-response timing evidence is incomplete; missing clocks remain unknown.")
-                        if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-                            row.update(status="inconclusive", reason="Client timing measurement boundaries differ; rerun the baseline.")
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
                                evidence_ids=[record.id for record in current_records])
                     rows.append(row)
-        assessed = [row for row in rows if "worsening" in row]
+        assessed = [row for row in rows if "worsening" in row and row["status"] in {"pass", "fail"}]
         failures = [row for row in assessed if row["status"] == "fail"]
-        uncertain = [row for row in assessed if row["status"] == "inconclusive"]
-        missing_measurements = [row for row in rows if "worsening" not in row and
-                                max(row["current_samples"], row["baseline_samples"]) >= minimum]
+        # A sparse secondary metric cannot invalidate an otherwise measured check.
+        # Coverage must nevertheless concern that check's actual verdict evidence.
+        verdict_metrics = {
+            "access": {"valid_completion_rate", "error_rate"},
+            "serving": {"valid_completion_rate", "error_rate"},
+            "first_output": {"first_output_ms"},
+            "generation": {"generation_tokens_per_second", "max_stream_gap_ms", "output_tokens_per_second"},
+            **{check: {"correctness_rate"} for check in
+               ("correctness", "json", "context", "tools", "consistency")},
+        }
+        request_paths = ((set(CHECK_NAMES) - non_request_checks)
+                         | {"capacity", "concurrency", "fairness", "arrivals", "buckets", "mixed", "token_stress"}
+                         | {check for check, _ in set(current_groups) | set(old_groups)})
+        selected_checks = {check.id for check in report.checks
+                           if check.target == name and check.id != "baseline" and check.required
+                           and check.status != "skipped" and check.id not in non_verdict_checks
+                           and check.id in config.get("checks", []) and check.id in request_paths}
+        covered = {row["check"] for row in assessed
+                   if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
+        if any(row["status"] in {"pass", "fail"} for row in (traffic or {}).get("stages", [])):
+            covered.add("capacity")
+        if any(row["status"] in {"pass", "fail"} for row in (load_tests or {}).get("points", [])):
+            covered.add("load")
+        missing_checks = sorted(selected_checks - covered)
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
+        point_count = sum(row["status"] in {"pass", "fail"}
+                          for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
         if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
@@ -987,35 +1032,35 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
         elif target_reasons:
             status = "inconclusive"
-            summary = "Baseline comparison is inconclusive: " + " ".join(target_reasons)
-        elif traffic is not None and traffic["status"] == "inconclusive":
+            prefix = ("Nothing comparable between the runs. " if not assessed and not point_count
+                      else "Baseline comparison is inconclusive: ")
+            summary = prefix + " ".join(target_reasons)
+            if missing_checks:
+                summary += " No comparable verdict metric for selected check(s): " + ", ".join(missing_checks) + "."
+        elif missing_checks:
             status = "inconclusive"
-            summary = traffic["reason"]
-        elif load_tests is not None and load_tests["status"] == "inconclusive":
+            prefix = "Nothing comparable between the runs. " if not assessed and not point_count else ""
+            summary = prefix + "No comparable verdict metric for selected check(s): " + ", ".join(missing_checks) + "."
+        elif not assessed and not point_count:
             status = "inconclusive"
-            summary = load_tests["reason"]
-        elif (not assessed and traffic is None and load_tests is None) or uncertain or missing_measurements:
-            status = "inconclusive"
-            if not assessed:
-                summary = "No metric has enough comparable samples."
-            elif missing_measurements:
-                summary = "Some metrics lost measurement coverage or have undefined baseline values."
-            elif saturated_runs:
-                summary = "Overlapping client scheduling delay prevents a reliable timing/rate comparison."
-            else:
-                summary = "Sample variation or changed output lengths prevent a clear material-regression decision."
+            summary = "Nothing comparable between the runs."
         else:
             status = "pass"
-            summary = f"No material regression detected in {len(assessed)} comparable metric(s)."
+            measurements = ([f"{len(assessed)} comparable metric(s)"] if assessed else [])
+            if point_count:
+                measurements.append(f"{point_count} comparable acceptance point(s)")
+            summary = "No material regression detected in " + " and ".join(measurements) + "."
             if traffic is not None:
                 summary += " " + traffic["reason"]
         excluded = len(rows) - len(assessed)
         if excluded:
-            summary += f" {excluded} low-sample or undefined metric(s) excluded; see comparison details."
-        if status == "inconclusive":
+            summary += f" {excluded} metric(s) not comparable (low samples, undefined values or uncertain attribution); see comparison details."
+        if status == "inconclusive" and missing_checks:
             summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
                         " using the same workload and settings; rerun longer if variation remains uncertain.")
         entry = {"target": name, "status": status, "reasons": target_reasons,
+                 "reason_details": [target_details.get(text, {"code": "comparison_unavailable", "text": text})
+                                    for text in target_reasons],
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,
@@ -1046,11 +1091,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted
                                      for check in result.checks))
     from .performance import refresh_performance
-    return refresh_performance(result)
+    return refresh_performance(result, force=True)
 
 
 def _retained(report: RunReport) -> RunReport:
+    from .invocation import safe_invocation
     result = report.model_copy(update={"manifest": {**report.manifest,
+        **({"invocation": safe_invocation(report.manifest["invocation"])}
+           if "invocation" in report.manifest else {}),
         "config": safe_config(report.manifest.get("config", {}))}})
     if result.baseline:
         result.baseline = sanitize(result.baseline, bounded=False)
@@ -1119,7 +1167,10 @@ def _request_json(record: RequestRecord) -> str:
 
 def _report_json_chunks(report: RunReport):
     # Keep defaults for raw consumers. Only exact input messages move to the table.
-    metadata = report.model_copy(update={"schema_version": "3"}).model_dump_json(exclude={"requests", "performance"})
+    metadata = report.model_copy(update={"schema_version": CURRENT_SCHEMA, "performance": {
+        **report.performance, "targets": [{key: value for key, value in target.items() if key != "request_series"}
+                                         for target in report.performance.get("targets", [])]
+    }}).model_dump_json(exclude={"requests"})
     yield metadata[:-1] + ',"report_format":2,"inputs":{'
     seen = set()
     for record in report.requests:
@@ -1142,7 +1193,10 @@ def _report_json_chunks(report: RunReport):
 
 
 def _portable_json_chunks(report: RunReport):
-    metadata = report.model_copy(update={"schema_version": "2"}).model_dump_json(exclude={"requests", "performance"})
+    metadata = report.model_copy(update={"schema_version": CURRENT_SCHEMA, "performance": {
+        **report.performance, "targets": [{key: value for key, value in target.items() if key != "request_series"}
+                                         for target in report.performance.get("targets", [])]
+    }}).model_dump_json(exclude={"requests"})
     yield metadata[:-1] + ',"requests":['
     for index, record in enumerate(report.requests):
         yield "," if index else ""
@@ -1152,7 +1206,7 @@ def _portable_json_chunks(report: RunReport):
 
 def save_baseline_report(source: Path, destination: Path, *, replace: bool = False,
                          report: RunReport | None = None, portable: bool = False) -> None:
-    """Publish an independent snapshot, sharing immutable bytes where supported."""
+    """Publish a private snapshot; portable CLI exports remain mode 0644."""
     source, destination = Path(source), Path(destination)
     report = report if report is not None else RunReport.model_validate_json(source.read_text())
     retained = _retained(report)
@@ -1166,15 +1220,19 @@ def save_baseline_report(source: Path, destination: Path, *, replace: bool = Fal
         if portable:
             _atomic_write_chunks(temporary, _portable_json_chunks(retained))
             os.chmod(temporary, 0o644)
-        elif (source.is_symlink() or source.name != "report.json"
-              or retained != report or report.schema_version != "3"):
-            _atomic_write_chunks(temporary, _report_json_chunks(retained))
+        elif (source.name == "report.json" and not source.is_symlink() and retained == report
+              and report._source_schema == CURRENT_SCHEMA):
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as outgoing, source.open("rb") as incoming:
+                shutil.copyfileobj(incoming, outgoing, length=65536)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
         else:
-            try:
-                os.link(source, temporary)
-            except OSError:
-                with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-                    shutil.copyfileobj(incoming, outgoing, length=65536)
+            # Never chmod an inode shared with the source report. Managed
+            # baselines are independent mode-0600 snapshots.
+            _atomic_write_chunks(temporary, _report_json_chunks(retained))
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
         if replace:
             temporary.replace(destination)
         else:
@@ -1191,6 +1249,7 @@ def save_baseline_report(source: Path, destination: Path, *, replace: bool = Fal
                 except OSError:
                     destination.unlink(missing_ok=True)
                     raise
+        fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1336,6 +1395,11 @@ def _number(value: float | None) -> str:
     return "—" if value is None or not math.isfinite(value) else f"{value:,.1f}"
 
 
+def _duration_ms(value: float) -> str:
+    amount, unit = (value / 1000, "s") if value >= 1000 else (value, "ms")
+    return f"{_number(amount).rstrip('0').rstrip('.')} {unit}"
+
+
 def _badge(status: str) -> str:
     return f'<span class="badge {_e(status)}">{_e(status)}</span>'
 
@@ -1402,7 +1466,7 @@ def _traffic_table(check: CheckResult) -> str:
              + ('<th>Valid throughput</th>' if pack else '')
              + f'<th>{goodput_label} / good fraction</th>'
              '<th>Dispatch delay p95 ms</th><th>Service latency p95 ms</th>'
-             '<th>Arrival first output / latency p95 ms</th></tr>']
+             '<th>Arrival time to first answer / latency p95 ms</th></tr>']
     for stage in check.metrics["traffic_stages"]:
         def count(name: str) -> str:
             return _e(stage.get(name, "—"))
@@ -1449,7 +1513,7 @@ def _session_performance_html(data: dict[str, Any]) -> str:
                     f'{_e(row["capped_responses"])}</td></tr>')
     return (headline + '<details><summary>Conversation performance by task and turn</summary>'
             '<div class="table"><table><tr><th>Task / mode / turn</th><th>Completed / sent</th>'
-            '<th>Generation mean / median / p10 tok/s</th><th>First output p95 ms</th>'
+            '<th>Generation mean / median / p10 tok/s</th><th>Time to first answer p95 ms</th>'
             '<th>Response p95 ms</th><th>Unmeasured rate / capped replies</th></tr>'
             + ''.join(rows) + '</table></div></details>')
 
@@ -1500,6 +1564,287 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+
+def _baseline_verdict(row: dict[str, Any]) -> tuple[str, str]:
+    if row.get("status") == "fail":
+        return "Worse", "fail"
+    if row.get("status") != "pass":
+        return "Not comparable", "inconclusive"
+    if row.get("acceptance_improved"):
+        return "Better", "pass"
+    interval = row.get("worsening_interval_95") or []
+    threshold = row.get("threshold")
+    if (len(interval) == 2 and interval[1] is not None and threshold is not None
+            and interval[1] <= -threshold and row.get("worsening", 0) < 0):
+        return "Better", "pass"
+    return "No material change", "muted"
+
+
+def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = list(target.get("comparisons", []))
+    traffic = target.get("traffic_capacity")
+    if traffic:
+        rows.append(dict(traffic, metric="Highest acceptable tested arrival rate (requests/s)",
+                         baseline=traffic.get("baseline_highest_acceptable_rate_rps"),
+                         current=traffic.get("current_highest_acceptable_rate_rps"),
+                         acceptance_improved=(traffic.get("status") == "pass"
+                             and isinstance(traffic.get("baseline_highest_acceptable_rate_rps"), (int, float))
+                             and isinstance(traffic.get("current_highest_acceptable_rate_rps"), (int, float))
+                             and traffic["current_highest_acceptable_rate_rps"] > traffic["baseline_highest_acceptable_rate_rps"])))
+    load = target.get("load_test")
+    if load:
+        from .load_test import point_label
+
+        for point in load.get("points", []):
+            before, after = point.get("baseline") or {}, point.get("current") or {}
+            rows.append(dict(point, metric="Load acceptance: " + point_label(after or before),
+                             baseline=before.get("status", "Unknown"),
+                             current=after.get("status", "Unknown"), check="load",
+                             scenario=point_label(after or before),
+                             acceptance_improved=(point.get("status") == "pass"
+                                                  and before.get("status") == "fail"
+                                                  and after.get("status") == "pass")))
+        if not load.get("points"):
+            rows.append(dict(load, metric="Tested load acceptance", baseline=None, current=None))
+    if not rows:
+        rows.append(dict(metric="Comparison unavailable", status="inconclusive",
+                         reason=" ".join(target.get("reasons", []))))
+    return rows
+
+
+def _baseline_summary_html(baseline: dict[str, Any]) -> str:
+    counts = Counter(_baseline_verdict(row)[0] for target in baseline.get("targets", [])
+                     for row in _baseline_display_rows(target))
+    if counts["Worse"] or counts["Better"]:
+        summary = ' · '.join(f'{counts[label]} {word}' for label, word in
+                             (("Worse", "worse"), ("Better", "better")) if counts[label])
+    else:
+        summary = (f'no regressions ({counts["No material change"]} unchanged, '
+                   f'{counts["Not comparable"]} not comparable)')
+    return (f'<p class="baseline-summary"><a href="#baseline-heading">vs baseline '
+            f'{_e(baseline.get("name") or baseline.get("run_id", "unknown"))}: {_e(summary)}</a></p>')
+
+
+def _deployment_change_html(diff: dict[str, Any]) -> str:
+    if not diff:
+        return ""
+    changed = [row["field"] for row in diff.get("fields", [])
+               if row.get("change") != "no_observed_change"]
+    intended = diff.get("intended_change")
+    summary = ("Deployment change: " + ", ".join(changed) if changed
+               else "No observed deployment changes.")
+    if changed and intended and not diff.get("confounded"):
+        summary += " (one intended change)"
+    parts = [f'<p class="deployment-change">{_e(summary)}</p>']
+    if diff.get("confounded"):
+        parts.append('<p><strong>Confounded: multiple unrelated changes.</strong></p>')
+        if intended:
+            fields = intended if isinstance(intended, list) else [intended]
+            parts.append(f'<p class="muted">Intended change: {_e(", ".join(fields))}</p>')
+    if diff.get("unknown_baseline"):
+        parts.append('<p class="muted">Baseline deployment configuration was not recorded.</p>')
+    if diff.get("interpretation"):
+        parts.append(f'<p class="muted">{_e(diff["interpretation"])}</p>')
+    return "".join(parts)
+
+
+def _condition_label(scenario: str, *, target: str | None = None,
+                     report: RunReport | None = None, workload: dict[str, Any] | None = None) -> str:
+    from .conditions import condition_display_name
+
+    summaries = list(report.conditions or []) if report else []
+    if report:
+        summaries.extend({**row, "target": name} for name, observation in report.observations.get("targets", {}).items()
+                         for row in observation.get("conditions", []))
+    summary = next((row for row in summaries if (target is None or row.get("target", target) == target)
+                    and (row.get("condition_id") or row.get("condition", {}).get("id")) == scenario), {})
+    return condition_display_name(scenario, workload, condition=summary.get("condition"), name=summary.get("name"))
+
+
+def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = None) -> str:
+    conditions = {}
+    notes = []
+    priority = {"Worse": 0, "Better": 1, "No material change": 2, "Not comparable": 3}
+    for target in baseline.get("targets", []):
+        deployment = _deployment_change_html(target.get("configuration_diff") or {})
+        if deployment:
+            notes.append(f'<div><h3>{_e(target.get("target", "Target"))} · Deployment</h3>{deployment}</div>')
+        for row in _baseline_display_rows(target):
+            identity = row.get("condition_id") or row.get("scenario_label") or row.get("scenario") or row.get("check") or "Run comparison"
+            key = (target.get("target"), identity)
+            if key not in conditions:
+                label = row.get("scenario_label") or _condition_label(row.get("condition_id") or row.get("scenario") or row.get("check") or identity, target=target.get("target"), report=report)
+                conditions[key] = {"label": f'{target.get("target", "Target")} · {label}', "rows": [], "seen": set()}
+            group = conditions[key]
+            fingerprint = json.dumps([row.get(name) for name in ("metric", "baseline", "current", "status", "reason")], sort_keys=True)
+            if fingerprint not in group["seen"]:
+                group["seen"].add(fingerprint)
+                group["rows"].append(row)
+        traffic = target.get("traffic_capacity") or {}
+        if traffic.get("delta_rps") is not None:
+            delta = f'Change: {traffic["delta_rps"]:+.4g} requests/s'
+            if traffic.get("change_percent") is not None:
+                delta += f' ({traffic["change_percent"]:+.1f}%)'
+            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · Tested arrival capacity · {_e(delta)}</p>')
+        load = target.get("load_test") or {}
+        if load.get("points") and load.get("reason"):
+            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · Load acceptance: {_e(load["reason"])}</p>')
+    if not conditions:
+        return ''.join(notes)
+    parts = notes + ['<div class="table baseline-comparison"><table class="baseline-table"><colgroup>'
+                     '<col class="comparison-name-col"><col class="comparison-value-col"><col class="comparison-value-col">'
+                     '<col class="comparison-delta-col"><col class="comparison-verdict-col"></colgroup><thead><tr>'
+                     '<th scope="col">Metric</th><th scope="col" class="comparison-number">Baseline</th>'
+                     '<th scope="col" class="comparison-number">Current</th><th scope="col" class="comparison-number">Δ</th>'
+                     '<th scope="col">Verdict</th></tr></thead>']
+    ordered = sorted(conditions.values(), key=lambda group: min(priority[_baseline_verdict(row)[0]] for row in group["rows"]))
+    for group in ordered:
+        parts.append(f'<tbody><tr class="comparison-group"><th colspan="5" scope="rowgroup">{_e(group["label"])}</th></tr>')
+        for row in sorted(group["rows"], key=lambda row: priority[_baseline_verdict(row)[0]]):
+            metric = row.get("metric", "Metric")
+            label = {"latency_ms": "Latency", "first_output_ms": "Time to first answer",
+                     "max_stream_gap_ms": "Stream gap", "output_tokens_per_second": "Output tokens/s",
+                     "generation_tokens_per_second": "Generation tokens/s", "correctness_rate": "Correct answers",
+                     "error_rate": "Error rate", "valid_completion_rate": "Valid responses"}.get(metric, str(metric).replace("_", " ").capitalize())
+            before, after = row.get("baseline"), row.get("current")
+            rate = row.get("change_unit") == "percentage_points"
+
+            def value(number):
+                if number is None:
+                    return "—"
+                if isinstance(number, str):
+                    return _e(number.capitalize())
+                if rate:
+                    return f"{number * 100:.1f}%"
+                unit = " ms" if metric.endswith("_ms") else " tok/s" if metric.endswith("tokens_per_second") else ""
+                return _number(number) + unit
+
+            change = "—"
+            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                if rate:
+                    change = f"{(after - before) * 100:+.1f} pp"
+                elif before:
+                    change = f"{(after - before) * 100 / abs(before):+.1f}%"
+                elif after == before:
+                    change = "+0.0%"
+            verdict, tone = _baseline_verdict(row)
+            reason = row.get("reason", "")
+            if reason == "No material worsening detected in these samples.":
+                reason = ""
+            parts.append(f'<tr class="comparison-metric"><th scope="row">{_e(label)}'
+                         + (f'<small class="comparison-reason">{_e(reason)}</small>' if reason else '') + '</th>')
+            for field, number in (("Baseline", before), ("Current", after)):
+                samples = row.get(field.lower() + "_samples")
+                parts.append(f'<td class="comparison-number" data-label="{field}" title="{_e(number)}">{value(number)}'
+                             + (f'<small class="comparison-samples">n={_e(samples)}</small>' if samples is not None else '') + '</td>')
+            parts.append(f'<td class="comparison-number {tone}" data-label="Δ">{_e(change)}</td>'
+                         f'<td data-label="Verdict"><strong class="{tone}">{verdict}</strong></td></tr>')
+        parts.append('</tbody>')
+    parts.append('</table></div>')
+    return ''.join(parts)
+
+
+def _request_prompt_excerpt(record: RequestRecord) -> str:
+    messages = record.evaluation.messages if record.evaluation else []
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+        if isinstance(content, str) and content.strip():
+            text = " ".join(content.split())
+            return text[:80] + ("…" if len(text) > 80 else "")
+    return record.fixture_id
+
+
+def _response_saving_note(record: RequestRecord, report: RunReport) -> str:
+    policy = report.manifest.get("config", {}).get("retention", "failures")
+    if record.output and record.output_chars > len(record.output):
+        return "Response truncated"
+    if record.output or record.tool_calls:
+        return ""
+    if record.status in {"failed", "timeout"} and not record.output_chars:
+        return "No response received" + (f": {record.error}" if record.error else "")
+    if policy == "none" and not record.valid and record.output_chars == 0:
+        return ""
+    if policy == "none":
+        return "Response not saved (retention: none)"
+    omitted = report.manifest.get("storage", {}).get("response_bodies_omitted")
+    if omitted and (record.output_chars or record.valid or record.tool_evaluation):
+        return "Response not saved (storage limit)"
+    if omitted and record.evaluation and (record.evaluation.scorer == "tool" or record.evaluation.tool_expectation):
+        return "Response evidence unavailable (storage limit)"
+    if record.output_chars or record.answer_chars or (policy == "failures" and record.valid):
+        return f"Response not saved (retention: {policy})"
+    return ""
+
+
+def _received_answer(record: RequestRecord, report: RunReport) -> str:
+    if record.output:
+        return record.output
+    if record.tool_calls:
+        calls = []
+        for call in record.tool_calls:
+            function = call.get("function") or call
+            arguments = function.get("arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            calls.append(f'{function.get("name", "Unknown tool")}({arguments})')
+        return "Tool calls: " + "; ".join(calls)
+    return _response_saving_note(record, report) or ("Empty response" if record.status == "completed" else "No response recorded")
+
+
+def _answer_findings_html(check: CheckResult, records: list[RequestRecord], report: RunReport) -> str:
+    matches = [r for r in records if r.target == check.target and check.id in r.check_ids
+               and (r.score is False or r.evaluation_error) and r.evaluation][:3]
+    parts = []
+    for record in matches:
+        evidence = record.evaluation
+        if evidence.expected_provided:
+            expected = evidence.expected
+            expected = expected if isinstance(expected, str) else json.dumps(expected, ensure_ascii=False)
+            criterion = "Expected"
+        elif evidence.schema_ is not None:
+            criterion, expected = "JSON schema", json.dumps(evidence.schema_, ensure_ascii=False)
+        elif evidence.rubric:
+            criterion, expected = "Rubric", evidence.rubric
+        elif evidence.tool_expectation is not None:
+            criterion, expected = "Tool expectation", json.dumps(evidence.tool_expectation.model_dump(), ensure_ascii=False)
+        else:
+            criterion, expected = "Answer check", evidence.scorer
+        received = _received_answer(record, report)
+        saving_note = _response_saving_note(record, report)
+        received_html = _preview(received) if record.output or record.tool_calls else f'<span class="muted">{_e(received)}</span>'
+        excerpt = (f'{criterion}: {expected[:160]}{"…" if len(expected) > 160 else ""} · '
+                   f'Received: {received[:160]}{"…" if len(received) > 160 else ""}')
+        reason = record.evaluation_error or record.score_message
+        check_name = CHECK_NAMES.get(check.id, check.id)
+        condition = _condition_label(record.scenario, target=record.target, report=report, workload=record.workload)
+        if condition != check_name:
+            condition = f'{check_name} · {condition}'
+        parts.append(f'<details class="answer-finding"><summary>{_e(_request_prompt_excerpt(record))}'
+                     f' · {_e(excerpt)}</summary><p class="muted">{_e(condition)} · {_e(record.id)}</p>'
+                     + (f'<p>{_e(reason)}</p>' if reason else '') +
+                     f'<p><strong>{criterion}:</strong> {_preview(expected)}</p>'
+                     f'<p><strong>Received:</strong> {received_html}</p>'
+                     + (f'<p class="muted">{_e(saving_note)}</p>' if saving_note and (record.output or record.tool_calls) else '')
+                     + '</details>')
+    return ''.join(parts)
+
+
+def _json_export_html(report: RunReport) -> str:
+    return ('<p class="muted"><a href="report.json">JSON export</a> · '
+            'report.json — keep it next to this file</p>')
+
+
+def _check_timing_violation_ids(check: CheckResult) -> set[str]:
+    # Current capacity reports store IDs once per stage; older reports aggregate them.
+    sources = [check.metrics.get("violations", []),
+               *(stage.get("violations", []) for stage in check.metrics.get("traffic_stages", []))]
+    return {rid for source in sources if isinstance(source, list) for rid in source if isinstance(rid, str)}
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -1507,51 +1852,48 @@ def _render(report: RunReport) -> str:
     report = refresh_performance(report.model_copy())
     evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
                 for rid in check.evidence_ids}
+    timing_failures = {rid for check in report.checks if check.status == "fail"
+                       for rid in _check_timing_violation_ids(check)}
+    evidence.update(timing_failures)
     ordered = sorted(report.requests, key=lambda r: (
         r.id not in evidence,
-        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error)))
+        not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error or r.id in timing_failures)))
     detailed = ordered[:max(DEFAULT_HTML_REQUEST_DETAILS, sum(r.id in evidence for r in report.requests))]
     anchors = {record.id: f"request-{index}" for index, record in enumerate(detailed)}
     config = report.manifest.get("config", {})
     disconnected = {target["name"]: summary for target in config.get("targets", [])
                     if (summary := connection_summary(
                         [r for r in report.requests if r.target == target["name"]], target.get("url", target["name"])))}
-    headline = ("; ".join(disconnected.values()) if disconnected and len(disconnected) == len(config.get("targets", []))
-                else "Giraffe acceptance results")
+    verdict = {"pass": "Passed", "fail": "Failed", "inconclusive": "Inconclusive",
+               "partial": "Partial results"}.get(report.overall, report.overall.capitalize())
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(headline)} {_badge(report.overall)}</h1>",
-             f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
+             f'<p class="muted">Run {_e(report.run_id)} · Giraffe {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
-    if headline == "Giraffe acceptance results":
-        for summary in disconnected.values():
-            parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
+    for summary in disconnected.values():
+        parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
     for target in config.get("targets", []):
         parts.append(f'<p class="muted"><strong>{_e(target.get("name", ""))}</strong> · '
                      f'{_e(target.get("route", "unknown"))} · Model: <code>{_e(target.get("model", ""))}</code>'
                      f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></p>')
-    # Native radio navigation keeps the portable report keyboard-accessible
-    # without scripts, external assets, or duplicating the aggregation layer.
-    parts.append('<div class="html-tabs" role="group" aria-label="Report tabs">'
-                 '<label><input id="html-tab-performance" name="report-tab" type="radio" '
-                 'aria-controls="html-performance" checked>Performance</label>'
-                 '<label><input id="html-tab-results" name="report-tab" type="radio" '
-                 'aria-controls="html-results">Test results '
-                 + str(len(report.checks)) + '</label><small>Measurement: default window per target · '
-                 '<a href="report.json">JSON export</a></small></div>'
-                 '<div id="html-performance" aria-label="Performance">')
-    for entry in report.performance["available_targets"]:
-        selected = (report.performance if entry["target"] == report.performance["selected_target"]
-                    else build_performance(report, target=entry["target"]))
-        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))))
-    if not report.performance["available_targets"]:
-        parts.append(render_performance(report.performance))
-    parts.append('</div><div id="html-results" aria-label="Test results">')
-    parts.append('<p><a href="#checks">Checks</a> · <a href="#measurements">Measurements</a> · '
-                 '<a href="#baseline">Baseline</a> · <a href="#requests">Request evidence</a> · '
-                 '<a href="#reproduction">Reproduce</a></p>')
+    parts.append('<nav aria-label="Report sections"><a href="#checks">Checks</a> · '
+                 '<a href="#baseline">Baseline comparison</a> · <a href="#html-performance">Performance</a> · '
+                 '<a href="#requests">Requests</a> · <a href="#reproduction">Reproduce</a></nav>')
+    parts.append(_json_export_html(report))
+    if report.baseline:
+        parts.append(_baseline_summary_html(report.baseline))
+    parts.append('<div id="html-results" aria-label="Results"><section id="findings"><h2>Findings</h2>')
+    findings = [check for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}]
+    for check in findings:
+        parts.append(f'<article class="card"><strong>{_e(CHECK_NAMES.get(check.id, check.id))}</strong> · {_e(check.target)}'
+                     f'<p>{_e(check.summary)}</p>{_answer_findings_html(check, report.requests, report)}</article>')
+    if not findings:
+        parts.append('<p>All selected checks passed.</p>' if report.overall == "pass"
+                     else '<p>No check findings were recorded.</p>')
+    parts.append('</section>')
     storage = report.manifest.get("storage", {})
     if storage.get("response_bodies_omitted") or storage.get("limit_exceeded"):
         omitted = storage.get("response_bodies_omitted", 0)
@@ -1583,9 +1925,10 @@ def _render(report: RunReport) -> str:
             parts.append(_pack_table(check))
         elif check.id == "correctness" and "capacity" not in config.get("checks", []):
             parts.append(_pack_table(check))
-    missing = [f"{c.target} / {c.title}: {c.summary}" for c in report.checks
-               if c.status in {"skipped", "inconclusive", "blocked"}]
-    missing.extend(report.warnings)
+    selected_checks = set(config.get("checks", []))
+    missing = [*report.warnings, *(f'{CHECK_NAMES.get(check.id, check.id)}: {check.summary}' for check in report.checks
+                if check.status in {"blocked", "skipped"}
+                and (check.required or check.id in selected_checks))]
     if missing:
         parts.append('<h2>Coverage and limitations</h2><ul>' +
                      "".join(f"<li>{_e(item)}</li>" for item in dict.fromkeys(missing)) + "</ul>")
@@ -1611,7 +1954,15 @@ def _render(report: RunReport) -> str:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
-        parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(check.title)}</strong>'
+        applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
+        default_limits = (report.manifest.get("default_check_limits") or {}).get(check.id) or []
+        timing = {"first_output": [("first_output_ms", "p95 first answer")],
+                  "generation": [("latency_ms", "Response time"), ("stream_gap_ms", "Stream pause")]}
+        limit_text = "; ".join(f"{label} ≤ {_duration_ms(applied[field])}" + (" (default)" if field in default_limits else "")
+                               for field, label in timing.get(check.id, []) if applied.get(field) is not None)
+        if limit_text:
+            metrics = f'<p>{_e(limit_text)}</p>' + metrics
+        parts.append(f'<tr><td>{_e(check.target)}<br><strong>{_e(CHECK_NAMES.get(check.id, check.id))}</strong>'
                      f'<br>{"Required" if check.required else "Optional"}</td>'
                      f'<td>{_badge(check.status)}</td><td>{_e(check.summary)}'
                      f'{metrics}<div>{evidence}</div></td></tr>')
@@ -1637,13 +1988,29 @@ def _render(report: RunReport) -> str:
     parts.append("</table></div>")
     if absent:
         parts.append(f'<p class="muted">Not included in this run: {_e(", ".join(absent))}.</p>')
-    parts.append('</section><section id="measurements"><h2>Measurements by scenario</h2>'
+    parts.append('</section><section id="baseline"><h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>')
+    if report.baseline:
+        parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
+                     f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
+                     'Absolute check outcomes appear separately above.</p>')
+        parts.append(_baseline_table_html(report.baseline, report))
+    else:
+        parts.append('<p>No baseline supplied. This run reports absolute checks only.</p>')
+    parts.append('</section></div><div id="html-performance" aria-label="Performance">')
+    for entry in report.performance["available_targets"]:
+        selected = (report.performance if entry["target"] == report.performance["selected_target"]
+                    else build_performance(report, target=entry["target"]))
+        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))).replace("First useful output limit", "First answer limit").replace("Test results", "Results").replace("Requests in flight", "Requests at once"))
+    if not report.performance["available_targets"]:
+        parts.append(render_performance(report.performance).replace("First useful output limit", "First answer limit").replace("Test results", "Results").replace("Requests in flight", "Requests at once"))
+    parts.append('</div>')
+    parts.append('<section id="measurements"><h2>Measurements by condition</h2>'
                  '<p class="muted">Initial requests are separated from warm and loaded requests. '
                  'Latency percentiles include valid completed requests only; failures and timeouts '
                  'are counted alongside them. Small samples do not establish tail latency.</p>'
-                 '<div class="table"><table><tr><th>Target / scenario</th><th>Requests</th>'
+                 '<div class="table"><table><tr><th>Target / condition</th><th>Requests</th>'
                  '<th>Valid</th><th>Errors / timeouts</th><th>Cancelled</th><th>Latency p50 / p95 ms</th>'
-                 '<th>First output p50 ms</th><th>Generation pace p50 tok/s (estimate)</th>'
+                 '<th>Time to first answer p50 ms</th><th>Generation speed p50 tok/s (estimate)</th>'
                  '<th>End-to-end output p50 tok/s</th><th>Scored correct</th></tr>')
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in report.requests:
@@ -1655,32 +2022,19 @@ def _render(report: RunReport) -> str:
         generation = [rate for r in valid if (rate := r.generation_tokens_per_second) is not None]
         end_to_end = [rate for r in valid if (rate := _rate(r)) is not None]
         scored = [r for r in records if r.score is not None]
-        parts.append(f'<tr><td>{_e(target)} / {_e(scenario)}</td><td>{len(records)}</td><td>{len(valid)}</td>'
+        parts.append(f'<tr><td>{_e(target)} / {_e(_condition_label(scenario, target=target, report=report, workload=records[0].workload))}</td><td>{len(records)}</td><td>{len(valid)}</td>'
                      f'<td>{sum(r.status == "failed" for r in records)} / '
                      f'{sum(r.status == "timeout" for r in records)}</td>'
                      f'<td>{sum(r.status == "cancelled" for r in records)}</td>'
-                     f'<td>{_number(_percentile(times, .5))} / {_number(_percentile(times, .95))}</td>'
-                     f'<td>{_number(_percentile(first, .5))}</td>'
-                     f'<td>{_number(_percentile(generation, .5))} (n={len(generation)})</td>'
-                     f'<td>{_number(_percentile(end_to_end, .5))}</td>'
+                     f'<td>{_number(percentile(times, .5))} / {_number(percentile(times, .95))}</td>'
+                     f'<td>{_number(percentile(first, .5))}</td>'
+                     f'<td>{_number(percentile(generation, .5))} (n={len(generation)})</td>'
+                     f'<td>{_number(percentile(end_to_end, .5))}</td>'
                      f'<td>{sum(r.score is True for r in scored)} / {len(scored)}</td></tr>')
-    parts.append('</table></div></section><section id="baseline"><h2>Baseline comparison</h2>')
-    if report.baseline:
-        parts.append(f'<p>{_badge(report.baseline.get("status", "inconclusive"))} '
-                     f'Compared with {_e(report.baseline.get("run_id", "unknown"))}. '
-                     'Absolute check outcomes appear separately above.</p>')
-        for target in report.baseline.get("targets", []):
-            if "traffic_capacity" in target:
-                parts.append(_traffic_baseline_html(target))
-            if "load_test" in target:
-                parts.append(_load_baseline_html(target))
-        parts.append(f'<details><summary>Changes, comparability and metric evidence</summary>'
-                     f'<pre>{_json(report.baseline)}</pre></details>')
-    else:
-        parts.append('<p>No baseline supplied. This run reports absolute checks only.</p>')
+    parts.append('</table></div></section>')
     parts.append('<section id="deployment"><h2>Deployment and serving telemetry</h2>'
                  '<p>Deployment changes provide investigation context and do not establish causality. '
-                 'Unknown fields and telemetry remain unknown. Client first output is separate from server TTFT.</p>')
+                 'Unknown fields and telemetry remain unknown. Client time to first answer is separate from server TTFT.</p>')
     for name, observation in report.observations.get("targets", {}).items():
         parts.append(f'<h3>{_e(name)}</h3><details><summary>Deployment snapshot and unknowns</summary>'
                      f'<pre>{_json(observation.get("deployment"))}</pre></details>'
@@ -1689,7 +2043,7 @@ def _render(report: RunReport) -> str:
                      f'<details><summary>Serving telemetry, phases and collection coverage</summary>'
                      f'<pre>{_json(observation.get("serving_telemetry"))}</pre></details>')
     parts.append('</section>')
-    parts.append('</section><section id="requests"><h2>Request evidence</h2>'
+    parts.append('<section id="requests"><h2>Requests</h2>'
                  f'<p class="muted">Response retention: {_e(config.get("retention", "failures"))}. '
                  'Retention controls response text; request metadata, timings, status and scores are always saved. '
                  'Retention does not cap disk usage; storage limits do.</p>'
@@ -1697,7 +2051,7 @@ def _render(report: RunReport) -> str:
                  '<a href="report.json">All requests and complete retained bodies in report.json</a>.</p>')
     input_previews = {}
     for record in detailed:
-        label = f"{record.target} · {record.scenario} · {record.fixture_id} · {record.status}"
+        label = f"{_request_prompt_excerpt(record)} · {record.target} · {_condition_label(record.scenario, target=record.target, report=report, workload=record.workload)} · {record.status}"
         parts.append(f'<details id="{anchors[record.id]}"><summary>{_e(label)}'
                      f' · {_number(record.elapsed_ms)} ms</summary>'
                      f'<p>Request {_e(record.id)} · scored: {_e(record.score)} · '
@@ -1745,8 +2099,12 @@ def _render(report: RunReport) -> str:
         parts.append(_judgement_table(record))
         if record.output:
             parts.append(f'<h3>Raw response</h3><pre>{_preview(record.output)}</pre>')
+        elif record.tool_calls:
+            parts.append(f'<h3>Tool response</h3><pre>{_preview(_received_answer(record, report))}</pre>')
         else:
-            parts.append('<p class="muted">No retained response body.</p>')
+            parts.append(f'<p class="muted">{_e(_received_answer(record, report))}</p>')
+        if record.output and (saving_note := _response_saving_note(record, report)):
+            parts.append(f'<p class="muted">{_e(saving_note)}</p>')
         if record.reasoning:
             parts.append(f'<h3>Reasoning response</h3><pre>{_preview(record.reasoning)}</pre>')
         parts.append(f'<details><summary>Local fixture and measured request evidence</summary><pre>'
@@ -1759,25 +2117,32 @@ def _render(report: RunReport) -> str:
     if report.observations:
         parts.append(f'<details><summary>Additional observations</summary><pre>'
                      f'{_json(report.observations)}</pre></details>')
-    parts.append('</section></div></main></html>')
+    parts.append('</section></main></html>')
     return "".join(parts)
 
 
 def _atomic_write_chunks(path: Path, chunks) -> None:
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = None
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=path.name + ".",
+                                         suffix=".tmp", dir=path.parent, delete=False) as file:
+            temporary = Path(file.name)
             for chunk in chunks:
                 file.write(chunk)
             file.flush()
+            os.fsync(file.fileno())
         temporary.replace(path)
+        fsync_directory(path.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _atomic_write(path: Path, contents: str) -> None:
-    _atomic_write_chunks(path, (contents,))
+    if path.name == ".web.json":
+        write_metadata(path.parent, json.loads(contents))
+    else:
+        _atomic_write_chunks(path, (contents,))
 
 
 class ReportWriteError(OSError):
@@ -1794,11 +2159,13 @@ def _write_failure_reason(error: OSError) -> str:
 
 
 def html_failure_warning(error: OSError) -> str:
+    if getattr(error, "failed_file", "report.html") != "report.html":
+        return f"Report cleanup could not finish: {_write_failure_reason(error)}; report.json is complete"
     return f"HTML report could not be saved: {_write_failure_reason(error)}; report.json is complete"
 
 
 def write_report(report: RunReport, directory: Path, *, max_run_storage: int = DEFAULT_LIMITS["max_run_storage"],
-                 html: bool = False) -> tuple[Path, Path | None]:
+                 html: bool = False, preserve_evidence: bool = False) -> tuple[Path, Path | None]:
     """Save compact JSON; standalone HTML is an explicit optional export."""
     if isinstance(max_run_storage, bool) or not isinstance(max_run_storage, int) or max_run_storage < 0:
         raise ValueError("max_run_storage must be a non-negative integer")
@@ -1811,17 +2178,10 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = D
     json_path, html_path = directory / "report.json", directory / "report.html"
     from .latency import latency_summary
 
-    metadata_path = directory / ".web.json"
     try:
-        try:
-            metadata = json.loads(metadata_path.read_text())
-            if not isinstance(metadata, dict):
-                metadata = {}
-        except (OSError, ValueError):
-            metadata = {}
-        metadata["latency_summary"] = latency_summary(report)
-        _atomic_write(metadata_path, json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+        update_metadata(directory, {"latency_summary": latency_summary(report)})
     except Exception as error:
+        logger.exception("Could not save latency summary for %s", report.run_id)
         reason = _write_failure_reason(error) if isinstance(error, OSError) else type(error).__name__
         warning = f"Latency summary could not be saved: {reason}"
         report.warnings.append(warning)
@@ -1832,6 +2192,14 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = D
         _atomic_write_chunks(json_path, _report_json_chunks(retained))
     except OSError as error:
         raise ReportWriteError(error, "report.json", json_complete=False) from error
+    # The completed, durably published report now owns the evidence. A crash
+    # before this point must leave the journal available for recovery.
+    try:
+        if not preserve_evidence:
+            (directory / "evidence.jsonl").unlink(missing_ok=True)
+        fsync_directory(directory)
+    except OSError as error:
+        raise ReportWriteError(error, "evidence.jsonl", json_complete=True) from error
     if not html:
         return json_path, None
     try:
@@ -1881,9 +2249,11 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
 
 
 def reproduction_export(report: RunReport) -> dict:
+    from .invocation import safe_invocation
     retained = _retained(report)
     return {"schema_version": "1", "source_run_id": report.run_id,
             "source_outcome": report.overall,
+            "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
             "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},

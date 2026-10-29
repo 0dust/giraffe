@@ -57,6 +57,58 @@ def _plain(value: str) -> str:
     return value.replace("_", " ").replace("-", " ").capitalize()
 
 
+def condition_labels() -> dict[str, str]:
+    """Display vocabulary shared by the UI and portable HTML, not persisted IDs."""
+    from .models import CHECK_NAMES
+
+    return {
+        **{key: label for key, (label, _) in _SCENARIOS.items()},
+        **CHECK_NAMES,
+        "judging": "AI judge",
+        "performance_evidence_probe": "Compatibility probe",
+    }
+
+
+def condition_display_name(scenario: str, workload: Mapping[str, Any] | None = None, *,
+                           condition: Mapping[str, Any] | None = None, name: str | None = None) -> str:
+    """Short condition heading; concurrency remains a separate measurement."""
+    from .models import SHAPES
+
+    if scenario == "performance_evidence_probe":
+        return condition_labels()[scenario]
+    info = {**_identity(scenario, workload), **(condition or {})}
+    parameters = info.get("parameters") or {}
+    point = re.match(r"^load_(?:primary|legacy_.+?)_(combinations|mixed|stress)_([a-z_]+?)_(?:concurrent|constant|poisson|bursts)(?:_bursts)?_(?:c[0-9]+|r[0-9.e+-]+|only)(?:\.|$)", scenario)
+    if point:
+        kind, shape = point.groups()
+        if shape in SHAPES:
+            first, last = shape.split("_")
+            return f"{first.capitalize()} input / {last} output"
+        if kind == "mixed":
+            return "Mixed traffic"
+        if kind == "stress":
+            return {"input": "Large-input stress", "large_input": "Large-input stress",
+                    "output": "Large-output stress", "large_output": "Large-output stress"}.get(shape, "Token stress")
+    if re.match(r"^load_(?:primary|legacy_.+?)_interference_c[0-9]+(?:\.|$)", scenario):
+        return "Short answers alone" if ".baseline" in scenario else "Short answers with a long request"
+    first, last = info.get("input", parameters.get("input_shape")), info.get("output", parameters.get("output_shape"))
+    if first and last:
+        return f"{_plain(first)} input / {str(last).lower()} output"
+    label = name or (condition or {}).get("label") or condition_labels().get(scenario) or info["label"]
+    if not (name or (condition or {}).get("label")) and re.fullmatch(r"(correctness|json)_c[0-9]+", scenario):
+        label = condition_labels()[info["check"]]
+    label = re.sub(r"\s*[·→]?\s*(?:at )?[\d,]+ (?:at once|concurrent requests?)$", "", label, flags=re.I).rstrip(" ·")
+    if not (condition or name):
+        if role := re.match(r"^mixed_(short|heavy)_", scenario):
+            label += " · short request" if role[1] == "short" else " · heavy partner"
+        elif turn := re.search(r"_turn(\d+)$", scenario):
+            if scenario.startswith(("session_", "tools_")):
+                label += f" · turn {int(turn[1]) + 1}"
+        elif prompt := re.fullmatch(r"consistency_.+_p(\d+)", scenario):
+            label += f" · prompt {int(prompt[1]) + 1}"
+    return label
+
+
 def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a stable condition and plain label without changing request metadata."""
     workload = workload or {}

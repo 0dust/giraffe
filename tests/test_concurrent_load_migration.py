@@ -147,7 +147,7 @@ def test_cli_prints_notes_on_stderr(command, capsys, monkeypatch, tmp_path):
 async def test_run_start_accepts_notes_as_metadata_and_manifest_stores_them(tmp_path, monkeypatch):
     import httpx
     from giraffe.web import create_app
-    from tests.test_web import report
+    from tests.test_web import report, finished
     received = []
     async def run(config, **kwargs):
         received.extend(config._migration_notes)
@@ -156,15 +156,10 @@ async def test_run_start_accepts_notes_as_metadata_and_manifest_stores_them(tmp_
         return saved
     monkeypatch.setattr('giraffe.web.run_suite', run)
     app = create_app(tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
+    async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8787') as client:
         response = await client.post('/api/runs', json={'config': configuration().model_dump(), 'migration_notes': ['Original limits dropped']})
         assert response.status_code == 202
-        import asyncio
-        for _ in range(20):
-            await asyncio.sleep(0)
-            detail = (await client.get('/api/runs/' + response.json()['id'])).json()
-            if detail.get('state') == 'completed':
-                break
+        detail = await finished(client, response.json()["id"])
     assert received == ['Original limits dropped']
     assert detail['report']['manifest']['config_migration_notes'] == received
 
@@ -189,12 +184,12 @@ def test_manifest_rerun_recomputes_legacy_notes(tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize('arrivals', [{}, {'requests': 2}])
 def test_unrunnable_legacy_default_keeps_automatic_check_selection(arrivals):
-    from giraffe.models import DEFAULT_CHECKS
     values = {'targets': [TARGET], 'concurrent_workloads': {'scenarios': ['streaming_fairness']},
         'structured_json': True, 'arrivals': arrivals}
     config = load_saved(values)
     # The unrunnable old stream comparison cannot hide independent arrivals.
-    assert config.checks == [*[check for check in DEFAULT_CHECKS if check != 'load'], 'json', 'load']
+    assert config.checks == ['access', 'serving', 'first_output', 'generation', 'context',
+                             'correctness', 'cancellation', 'recovery', 'json', 'load']
     assert config.load_test.workloads.combinations.selected == ['short_short']
     assert config.load_test.patterns.constant.enabled
     assert any('streaming_fairness ran at 2 concurrent requests; interference left off' in note for note in config._migration_notes)

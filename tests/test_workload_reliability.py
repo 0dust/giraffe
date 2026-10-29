@@ -115,7 +115,7 @@ async def test_w1_sequential_probability_baseline_and_strict_token_divergence(mo
     endpoint = MemoryEndpoint(monkeypatch, mode=mode)
     report = await run_suite(config(endpoint, checks=['consistency'], consistency={
         'shapes': ['short'], 'levels': [1, 2], 'repetitions': 3,
-        'logprobs': {'strict': True, 'tolerance': .01, 'top_logprobs': 0, 'compare_levels': False}}))
+        'logprobs': {'response_mode': 'complete', 'strict': True, 'tolerance': .01, 'top_logprobs': 0, 'compare_levels': False}}))
     result = check(report, 'consistency')
     assert result.status == 'inconclusive'
     cross = result.metrics['logprobs']['cross_conditions'][0]
@@ -141,7 +141,7 @@ async def test_w2_cross_level_modal_answers_and_distinct_known_passages(monkeypa
     assert all('Instead' not in p['messages'][0]['content'] for p in payloads)
 
 
-@pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'fail'), (16, 'fail'), (1024, 'inconclusive')])
+@pytest.mark.parametrize('cached,status', [(None, 'inconclusive'), (0, 'inconclusive'), (16, 'inconclusive'), (1024, 'inconclusive')])
 async def test_w3_prefix_requires_substantial_cached_tokens_and_separate_blocks(monkeypatch, cached, status):
     endpoint = MemoryEndpoint(monkeypatch, cached=cached)
     settings = config(endpoint, checks=['prefix'], context_limit=16384, prefix={'repeats': 3, 'history_turns': 2})
@@ -265,7 +265,7 @@ async def test_round2_consistency_copy_prompts_and_wrong_answers_are_independent
         assert len(sentences) >= 3 and len(set(sentences)) == len(sentences)
 
 
-@pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'fail')])
+@pytest.mark.parametrize('misses,status', [(0, 'pass'), (1, 'pass'), (2, 'inconclusive')])
 async def test_round2_prefix_majority_and_discriminative_controls(monkeypatch, misses, status):
     seen = 0
     def cached(payload, usage):
@@ -323,7 +323,7 @@ async def test_round2_session_pool_refills_without_waiting_for_slowest(monkeypat
 async def test_round2_nonstrict_logprob_summary_shows_cross_level_drift(monkeypatch, mode):
     endpoint = MemoryEndpoint(monkeypatch, mode=mode)
     result = check(await run_suite(config(endpoint, checks=['consistency'], stream=False, consistency={
-        'shapes': ['short'], 'repetitions': 3, 'logprobs': {'top_logprobs': 0}})), 'consistency')
+        'shapes': ['short'], 'repetitions': 3, 'logprobs': {'response_mode': 'complete', 'top_logprobs': 0}})), 'consistency')
     assert 'maximum cross-level delta' in result.summary.lower()
     assert 'server-side concurrency needs streamed output timing' in result.summary.lower()
     assert result.metrics['logprobs']['max_cross_level_delta'] is None

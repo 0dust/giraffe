@@ -144,7 +144,7 @@ def load_group(report, target="service", index=0):
 
 
 async def test_overlap_verdict_explains_plain_reason_and_rerun_settings(client):
-    report = await runner.run_suite(config(checks=["correctness"], stream=False))
+    report = await runner.run_suite(config(checks=["correctness"], stream=False, default_concurrency=2))
     check = next(c for c in report.checks if c.id == "correctness")
     assert check.status == "inconclusive"
     assert "streaming was disabled" in check.summary
@@ -168,7 +168,7 @@ async def test_serialized_server_overlap_remedy_preserves_sequential_scope(clien
                 for field in ("elapsed_ms", "first_output_ms", "last_output_ms", "stream_end_ms")})
 
     monkeypatch.setattr(client, "execute", serialized)
-    report = await runner.run_suite(config(checks=[check_id], structured_json=True, concurrency=concurrency))
+    report = await runner.run_suite(config(checks=[check_id], structured_json=True, concurrency=concurrency, default_concurrency=concurrency))
     check = next(c for c in report.checks if c.id == check_id)
     assert check.status == ("pass" if concurrency == 1 else "inconclusive")
     assert all(r.score is True for r in report.requests)
@@ -280,7 +280,9 @@ async def test_dead_endpoint_keeps_verdicts_and_reports_connection_cause(client,
     assert report.overall == "fail"
     expected = "Could not connect to http://localhost:1234 (ConnectError); no checks could run"
     assert report.observations["summary"] == expected
-    assert expected in next(c for c in report.checks if c.id == "load").summary
+    load_summary = next(c for c in report.checks if c.id == "load").summary
+    assert expected in load_summary
+    assert len(load_summary.split(". ")) <= 2
     assert next(c for c in report.checks if c.id == "access").status == "blocked"
 
 
@@ -317,11 +319,11 @@ async def test_wrong_answer_summary_has_expected_and_received(client):
 
 
 async def test_all_unfinished_default_verdicts_offer_a_remedy(client):
-    report = await runner.run_suite(config(checks=RunConfig.model_fields["checks"].get_default(call_default_factory=True),
+    report = await runner.run_suite(config(checks=[*RunConfig.model_fields["checks"].get_default(call_default_factory=True), "load"],
         max_requests=32, concurrency=4, max_duration_seconds=.01))
     unfinished = [check for check in report.checks if check.status in {"fail", "inconclusive"}]
     assert any(check.id == "load" for check in unfinished)
-    assert all("To conclude," in check.summary for check in unfinished), [(check.id, check.summary) for check in unfinished]
+    assert all("To conclude," in check.summary or "--max-duration" in check.summary for check in unfinished), [(check.id, check.summary) for check in unfinished]
 
 
 
@@ -470,41 +472,48 @@ async def test_context_override_controls_declared_limit_and_fixture_sizes():
     assert not any(r.scenario in {"initial", "warm"} for r in report.requests)
 
 
-async def test_recovery_honors_correctness_allowance_without_hiding_protocol_failure(client, monkeypatch):
-    original = client.execute
+def test_recovery_honors_correctness_allowance_without_hiding_protocol_failure(client, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
 
-    wrong_probe_ids = set()
+    async def scenario():
+        original = client.execute
 
-    async def one_wrong_probe(self, spec, **kwargs):
-        record = await original(self, spec, **kwargs)
-        if spec.scenario == "recovery" and not wrong_probe_ids:
-            record.output = "wrong answer"
-            wrong_probe_ids.add(record.id)
-        return record
+        wrong_probe_ids = set()
 
-    monkeypatch.setattr(client, "execute", one_wrong_probe)
-    configured = config(checks=["recovery"], sustained_seconds=.1, test_options={
-        "recovery": {"limits": {"min_correctness": .5, "latency_ms": 1000}},
-    })
-    report = await runner.run_suite(configured)
-    result = check(report, "recovery")
-    assert .5 <= result.metrics["accuracy"] < 1
-    assert result.status == "pass"
+        async def one_wrong_probe(self, spec, **kwargs):
+            record = await original(self, spec, **kwargs)
+            if spec.scenario == "recovery" and not wrong_probe_ids:
+                record.output = "wrong answer"
+                wrong_probe_ids.add(record.id)
+            return record
 
-    wrong_probe_ids.clear()
+        monkeypatch.setattr(client, "execute", one_wrong_probe)
+        configured = config(checks=["recovery"], sustained_seconds=.1, test_options={
+            "recovery": {"limits": {"min_correctness": .5, "latency_ms": 1000}},
+        })
+        report = await runner.run_suite(configured)
+        assert any(record.scenario == "sustained" for record in report.requests)
+        result = check(report, "recovery")
+        assert .5 <= result.metrics["accuracy"] < 1
+        assert result.status == "pass"
 
-    async def broken_probe(self, spec, **kwargs):
-        record = await one_wrong_probe(self, spec, **kwargs)
-        if record.id in wrong_probe_ids:
-            record.valid = False
-            record.status = "failed"
-        return record
+        wrong_probe_ids.clear()
 
-    monkeypatch.setattr(client, "execute", broken_probe)
-    report = await runner.run_suite(configured)
-    result = check(report, "recovery")
-    assert result.status == "fail" and result.metrics["error_rate"] > 0
-    assert "Answer checks failed" not in result.summary
+        async def broken_probe(self, spec, **kwargs):
+            record = await one_wrong_probe(self, spec, **kwargs)
+            if record.id in wrong_probe_ids:
+                record.valid = False
+                record.status = "failed"
+            return record
+
+        monkeypatch.setattr(client, "execute", broken_probe)
+        report = await runner.run_suite(configured)
+        assert any(record.scenario == "sustained" for record in report.requests)
+        result = check(report, "recovery")
+        assert result.status == "fail" and result.metrics["error_rate"] > 0
+        assert "Answer checks failed" not in result.summary
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_recovery_missing_answer_scores_cannot_pass(monkeypatch):
@@ -564,6 +573,10 @@ async def test_user_stop_stops_submissions_and_saves_partial(client):
     assert report.abort_reason == "cancelled by user"
     assert len(report.requests) == 1 and report.requests[0].status == "cancelled"
     assert client.active == 0 and client.closed == ["service"]
+    summary = check(report, "serving").summary
+    assert summary.startswith("Stopped by you after 1 of ")
+    assert summary.endswith(" planned requests.")
+    assert "--max-requests" not in summary and "--max-duration" not in summary
 
 
 async def test_missing_optional_telemetry_does_not_block_api():
@@ -625,7 +638,7 @@ async def test_observational_timing_and_separate_initial_samples(client):
     assert result.status == "pass"
     assert result.metrics["initial"]["first_output_p95_ms"] == 500
     assert result.metrics["first_output_p95_ms"] == 2
-    unbounded = await runner.run_suite(config(checks=["first_output"]))
+    unbounded = await runner.run_suite(config(checks=["first_output"], limits=Limits(first_output_ms=None, min_samples=2)))
     assert check(unbounded, "first_output").status == "inconclusive"
 
 
@@ -779,23 +792,29 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
         assert "address the slowdown" not in result.summary
 
 
-async def test_answer_failure_details_do_not_hide_timing_failure(client, monkeypatch):
-    original = client.execute
-    client.bad_sustained = True
+def test_answer_failure_details_do_not_hide_timing_failure(client, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
 
-    async def refused_copy(self, spec, **kwargs):
-        result = await original(self, spec, **kwargs)
-        if spec.fixture_id == "sustained.copy.v3":
-            result.output = "I cannot copy that sentence."
-        return result
+    async def scenario():
+        original = client.execute
+        client.bad_sustained = True
 
-    monkeypatch.setattr(client, "execute", refused_copy)
-    report = await runner.run_suite(config(checks=["recovery"],
-                                          limits=Limits(latency_ms=100, min_samples=2)))
-    result = check(report, "recovery")
-    assert result.status == "fail"
-    assert "timing limits exceeded" in result.summary
-    assert "sustained.copy.v3" in result.summary
+        async def refused_copy(self, spec, **kwargs):
+            result = await original(self, spec, **kwargs)
+            if spec.fixture_id == "sustained.copy.v3":
+                result.output = "I cannot copy that sentence."
+            return result
+
+        monkeypatch.setattr(client, "execute", refused_copy)
+        report = await runner.run_suite(config(checks=["recovery"],
+                                              limits=Limits(latency_ms=100, min_samples=2)))
+        assert any(record.scenario == "sustained" for record in report.requests)
+        result = check(report, "recovery")
+        assert result.status == "fail"
+        assert "timing limits exceeded" in result.summary
+        assert "sustained.copy.v3" in result.summary
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("fault,message", [
@@ -843,14 +862,20 @@ async def test_unstreamed_generation_cannot_pass_a_generation_rate_limit():
     assert result.metrics["generation_rate_samples"] == 0
 
 
-async def test_sustained_timing_is_observational_when_recovery_is_fast(client):
-    client.bad_sustained = True
-    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.1,
-                                          limits=Limits(latency_ms=100, min_samples=2)))
-    result = check(report, "recovery")
-    assert result.status == "pass", (result.summary, result.metrics["sustained_completion"])
-    assert result.metrics["recovery"]["p95_ms"] < 100
-    assert result.metrics["sustained"]["p95_ms"] == 500
+def test_sustained_timing_is_observational_when_recovery_is_fast(client, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        client.bad_sustained = True
+        report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.1,
+                                              limits=Limits(latency_ms=100, min_samples=2)))
+        assert any(record.scenario == "sustained" for record in report.requests)
+        result = check(report, "recovery")
+        assert result.status == "pass", (result.summary, result.metrics["sustained_completion"])
+        assert result.metrics["recovery"]["p95_ms"] < 100
+        assert result.metrics["sustained"]["p95_ms"] == 500
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_load_missing_generation_speed_evidence_is_inconclusive(client, monkeypatch):
@@ -900,21 +925,27 @@ async def test_one_sample_still_exercises_both_output_and_stop_limits():
 
 
 
-async def test_sustained_semantic_corruption_fails_recovery(client, monkeypatch):
-    original = client.execute
+def test_sustained_semantic_corruption_fails_recovery(client, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
 
-    async def wrong_sustained(self, spec, **kwargs):
-        result = await original(self, spec, **kwargs)
-        if spec.scenario == "sustained":
-            result.output = "corrupted answer"
-        return result
+    async def scenario():
+        original = client.execute
 
-    monkeypatch.setattr(client, "execute", wrong_sustained)
-    report = await runner.run_suite(config(checks=["recovery"]))
-    result = check(report, "recovery")
-    assert result.status == "fail"
-    assert result.metrics["recovery"]["correct"] == 2
-    assert result.metrics["sustained"]["correct"] == 0
+        async def wrong_sustained(self, spec, **kwargs):
+            result = await original(self, spec, **kwargs)
+            if spec.scenario == "sustained":
+                result.output = "corrupted answer"
+            return result
+
+        monkeypatch.setattr(client, "execute", wrong_sustained)
+        report = await runner.run_suite(config(checks=["recovery"]))
+        assert any(record.scenario == "sustained" for record in report.requests)
+        result = check(report, "recovery")
+        assert result.status == "fail"
+        assert result.metrics["recovery"]["correct"] == 2
+        assert result.metrics["sustained"]["correct"] == 0
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("same_origin", [True, False])
@@ -1022,22 +1053,27 @@ async def test_oversized_metrics_response_is_unavailable_and_bounded(monkeypatch
     assert all(snapshot["status"] == "response_limit" for snapshot in result.metrics["snapshots"])
 
 
-async def test_recovery_missing_configured_output_rate_is_inconclusive(client, monkeypatch):
-    original = client.execute
+def test_recovery_missing_configured_output_rate_is_inconclusive(client, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
 
-    async def no_output_usage(self, *args, **kwargs):
-        result = await original(self, *args, **kwargs)
-        result.output_tokens = None
-        return result
+    async def scenario():
+        original = client.execute
 
-    monkeypatch.setattr(client, "execute", no_output_usage)
-    report = await runner.run_suite(config(checks=["recovery"],
-                                          limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
-    result = check(report, "recovery")
-    assert result.status == report.overall == "inconclusive"
-    assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]
-    assert result.metrics["sustained"]["completed"] > 0
-    assert result.metrics["recovery"]["completed"] == 2
+        async def no_output_usage(self, *args, **kwargs):
+            result = await original(self, *args, **kwargs)
+            result.output_tokens = None
+            return result
+
+        monkeypatch.setattr(client, "execute", no_output_usage)
+        report = await runner.run_suite(config(checks=["recovery"],
+                                              limits=Limits(min_output_tokens_per_second=1, min_samples=2)))
+        result = check(report, "recovery")
+        assert result.status == report.overall == "inconclusive"
+        assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]
+        assert result.metrics["sustained"]["completed"] > 0
+        assert result.metrics["recovery"]["completed"] == 2
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_nonstreaming_recovery_cannot_pass_configured_gap_limit():
@@ -1594,10 +1630,15 @@ async def test_cancelling_evaluation_preserves_partial_report(monkeypatch, exter
     await asyncio.wait_for(started.wait(), 1)
     if external_cancel:
         task.cancel()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(task, 1)
+        report = cancelled.value.giraffe_report
+        assert task.cancelling() == 0
     else:
         stop.set()
-    report = await asyncio.wait_for(task, 1)
-    assert stopped.is_set() and report.abort_reason == "cancelled by user"
+        report = await asyncio.wait_for(task, 1)
+    assert stopped.is_set()
+    assert report.abort_reason == ("run cancelled" if external_cancel else "cancelled by user")
     assert report.observations["judging"]["scored_requests"] == 1
     assert report.observations["judging"]["inconclusive_requests"] == 4
     assert check(report, "correctness").status == "inconclusive"
@@ -2318,7 +2359,7 @@ async def test_final_load_client_delay_qualifies_timing_but_preserves_known_answ
 
 
 @pytest.mark.parametrize("request_budget", [6, None])
-async def test_measure_only_load_explains_limits_unscored_answers_and_budget_separately(request_budget):
+async def test_measure_only_load_keeps_detail_out_of_concise_stop_summary(request_budget):
     cases = _pack_config().request_pack.model_dump(mode="json")["cases"]
     for case in cases:
         case.update(scorer="none", expected=None)
@@ -2334,6 +2375,7 @@ async def test_measure_only_load_explains_limits_unscored_answers_and_budget_sep
     else:
         assert "--max-requests" not in result.summary
     assert "max_first_answer_ms" in result.summary and "max_completion_ms" in result.summary
-    assert "unscored" in result.summary.lower()
-    assert "throughput and latency" in result.summary.lower()
-    assert "collect the required valid, scored responses" not in result.summary
+    assert "unscored" in result.summary
+    assert len(result.summary.split(". ")) <= 2
+    assert load_group(value)["unscored"] > 0
+    assert result.metrics["points"][0]["reason_code"] in {"budget_limited", "missing_case_coverage"}

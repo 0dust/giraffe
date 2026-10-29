@@ -89,19 +89,19 @@ def test_input_hash_tampering_fails_loaders_and_downloads(tmp_path, extension):
         assert "SHA-256 mismatch" in result.json()["detail"]
 
 
-def test_cli_baseline_export_is_expanded_schema_two_with_previous_mode(tmp_path, capsys):
+def test_cli_baseline_export_is_expanded_current_schema_with_previous_mode(tmp_path, capsys):
     source = tmp_path / "saved"
     write_report(synthetic_report(3, 10, "failures"), source)
     destination = tmp_path / "portable.json"
     assert main(["baseline", "save", str(source), str(destination)]) == 0
     capsys.readouterr()
     value = json.loads(destination.read_text())
-    assert value["schema_version"] == "2"
+    assert value["schema_version"] == "4"
     assert "inputs" not in value and "report_format" not in value
     assert all("input_ref" not in row and "messages" in row["evaluation"] for row in value["requests"])
     assert destination.stat().st_mode & 0o777 == 0o644
     assert destination.stat().st_ino != (source / "report.json").stat().st_ino
-    assert json.loads((source / "report.json").read_text())["schema_version"] == "3"
+    assert json.loads((source / "report.json").read_text())["schema_version"] == "4"
 
 
 @pytest.mark.parametrize("fault", ["link_publish", "copy_write", "invalid_source", "validation_error"])
@@ -230,10 +230,18 @@ async def test_download_cancellation_waits_for_worker_before_releasing_lock(tmp_
 
 
 async def test_cancelled_run_skips_cleanup_and_always_persists_final_state(tmp_path, monkeypatch, local_tokenizer):
-    captured, entered = [], asyncio.Event()
+    import giraffe.web as web
+    captured, entered = [], threading.Event()
+
+    original_start = web._RunThread.start
+
+    def capture_execution(worker):
+        captured.append(asyncio.current_task())
+        original_start(worker)
+
+    monkeypatch.setattr(web._RunThread, "start", capture_execution)
 
     async def runner(configuration, **kwargs):
-        captured.append(asyncio.current_task())
         entered.set()
         await asyncio.Event().wait()
 
@@ -243,7 +251,7 @@ async def test_cancelled_run_skips_cleanup_and_always_persists_final_state(tmp_p
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://127.0.0.1:8787") as client:
             identifier = (await client.post("/api/runs", json={"config": config()})).json()["id"]
-            await entered.wait()
+            assert await asyncio.to_thread(entered.wait, 2)
             captured[0].cancel()
             with pytest.raises(asyncio.CancelledError):
                 await captured[0]
@@ -261,8 +269,15 @@ async def test_cancellation_during_cleanup_waits_and_records_log_before_clearing
     entered, release = threading.Event(), threading.Event()
     original = web.automatic_cleanup
 
-    async def runner(configuration, **kwargs):
+    original_start = web._RunThread.start
+
+    def capture_execution(worker):
         captured.append(asyncio.current_task())
+        original_start(worker)
+
+    monkeypatch.setattr(web._RunThread, "start", capture_execution)
+
+    async def runner(configuration, **kwargs):
         return web_report(configuration)
 
     def cleanup(*args, **kwargs):
@@ -360,7 +375,7 @@ def test_managed_baseline_upgrades_unversioned_format_two_without_changing_sourc
     original = path.read_bytes()
     baseline = tmp_path / ".baselines" / "chosen" / "report.json"
     save_baseline_report(path, baseline)
-    assert json.loads(baseline.read_text())["schema_version"] == "3"
+    assert json.loads(baseline.read_text())["schema_version"] == "4"
     assert path.read_bytes() == original
     assert load_report(path).requests == load_report(baseline).requests
 

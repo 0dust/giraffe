@@ -40,7 +40,7 @@ def test_cli_prints_export_ram_and_saves_it_in_metadata(tmp_path, monkeypatch, c
     directory = tmp_path / "run"
     assert main(["run", "--url", "http://localhost", "--model", "tiny", "--skip-preflight",
                  "--min-free-disk", "0", "--output", str(directory),
-                 "--output-format", output_format]) == 0
+                 "--output-format", output_format, "--verbose"]) == 0
     output = capsys.readouterr().out
     metadata = json.loads((directory / ".web.json").read_text())
     assert metadata["resources"]["sampled_peak_rss_bytes"]["export"] == 789
@@ -92,7 +92,7 @@ def test_unavailable_export_rss_is_saved_as_null(tmp_path, monkeypatch, capsys, 
     monkeypatch.setattr("giraffe.resources.current_rss_bytes", lambda: None)
     directory = tmp_path / "run"
     assert main(["run", "--url", "http://localhost", "--model", "tiny", "--skip-preflight",
-                 "--min-free-disk", "0", "--output", str(directory)]) == 0
+                 "--min-free-disk", "0", "--output", str(directory), "--verbose"]) == 0
     assert "not measured on this platform" in capsys.readouterr().out
     assert json.loads((directory / ".web.json").read_text())["resources"]["sampled_peak_rss_bytes"]["export"] is None
 

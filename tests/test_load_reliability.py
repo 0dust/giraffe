@@ -96,31 +96,38 @@ async def test_recovery_ratio_compares_same_fixture_before_and_after_load(endpoi
     assert result.metrics[f"{slow_metric}_ratio"] == 4
 
 
-async def test_recovery_without_timing_acceptance_limit_is_inconclusive(endpoint):
+async def test_recovery_without_timing_acceptance_limit_passes_correct_answers(endpoint):
     # Amortize worker startup/refill delays so occupancy is not the inconclusive reason.
-    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.25))
+    report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.25, limits=Limits(first_output_ms=None, min_samples=2)))
     result = check(report, "recovery")
     assert result.metrics["sustained"]["completed"] > 0
     assert result.metrics["recovery"]["correct"] == 2
-    assert result.status == "inconclusive"
-    assert result.summary.startswith("Recovery observed; no acceptance limit configured.")
-    assert "To conclude, set limits.recovery_max_ratio" in result.summary
+    assert result.status == "pass"
+    assert "no ratio limit configured" in result.summary
+    assert result.metrics["latency_ratio"] is not None
 
 
-async def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):
-    def delay(spec, index):
-        return .07 if spec.scenario == "sustained" and index == 0 else .008
-    monkeypatch.setattr(endpoint, "delay", staticmethod(delay))
-    report = await runner.run_suite(config(checks=["recovery"], concurrency=3,
-        sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
-    sustained = [item for item in endpoint.calls if item[0].scenario == "sustained"]
-    assert len([item for item in sustained if item[1] < sustained[0][2]]) > 3
-    specs = [item[0] for item in sustained]
-    assert all(spec.scorer == "exact" and spec.expected is not None for spec in specs)
-    assert any(spec.input_chars >= 4096 for spec in specs)
-    assert any(len(spec.expected.split()) >= 32 for spec in specs)
-    assert len({spec.fixture_id for spec in specs}) >= 2
-    assert all(record.score is True for record in report.requests)
+def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
+        def delay(spec, index):
+            return .07 if spec.scenario == "sustained" and index == 0 else .008
+        monkeypatch.setattr(endpoint, "delay", staticmethod(delay))
+        report = await runner.run_suite(config(checks=["recovery"], concurrency=3,
+            sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+        sustained = [item for item in endpoint.calls if item[0].scenario == "sustained"]
+        assert sustained
+        assert len([item for item in sustained if item[1] < sustained[0][2]]) > 3
+        specs = [item[0] for item in sustained]
+        assert all(spec.scorer == "exact" and spec.expected is not None for spec in specs)
+        assert any(spec.input_chars >= 4096 for spec in specs)
+        assert any(len(spec.expected.split()) >= 32 for spec in specs)
+        assert len({spec.fixture_id for spec in specs}) >= 2
+        assert all(record.score is True for record in report.requests)
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_recovery_reserves_later_fixed_checks_and_caps_remaining_budget_share(endpoint, monkeypatch):
@@ -138,15 +145,21 @@ async def test_recovery_reserves_later_fixed_checks_and_caps_remaining_budget_sh
     assert report.abort_reason is None
 
 
-async def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(endpoint, monkeypatch):
-    monkeypatch.setattr(endpoint, "delay", staticmethod(
-        lambda spec, index: .06 if spec.scenario == "sustained" else .004))
-    report = await runner.run_suite(config(checks=["recovery"], concurrency=3, max_requests=5,
-        sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
-    result = check(report, "recovery")
-    assert result.metrics["sustained"]["attempted"] == 1
-    assert result.status == "inconclusive"
-    assert not report.observations["targets"]["service"]["sustained_complete"]
+def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(endpoint, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
+        monkeypatch.setattr(endpoint, "delay", staticmethod(
+            lambda spec, index: .06 if spec.scenario == "sustained" else .004))
+        report = await runner.run_suite(config(checks=["recovery"], concurrency=3, max_requests=5,
+            sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+        result = check(report, "recovery")
+        assert result.metrics["sustained"]["attempted"] == 1
+        assert result.status == "inconclusive"
+        assert not report.observations["targets"]["service"]["sustained_complete"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 

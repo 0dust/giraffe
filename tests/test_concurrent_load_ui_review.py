@@ -158,15 +158,15 @@ def test_old_records_group_with_their_original_check_and_concurrency():
 const r={id:'old',target:'local',scenario:'bucket_c1_short_short',check_ids:['concurrency'],status:'completed',valid:true,elapsed_ms:10};
 assert.equal(conditionInfo(r).check,'concurrency');
 let html=renderTests([r]);let view=[...conditionViews.values()][0];
-assert.equal(view.checkName,'Concurrent load');assert.equal(view.description,'1 at once');
-assert.match(html,/aria-label="Condition #01 · Concurrent load · Short input \/ short output · 1 at once/);
+assert.equal(view.checkName,'Load test');assert.equal(view.description,'1 at once');
+assert.match(html,/data-condition-id="bucket_c1_short_short"/);assert.match(html,/Short input \/ short output · 1 at once/);
 // Historical bucket ownership and concurrency survive without any condition summary.
 const bucket={...r,check_ids:['buckets']};
 html=renderTests([bucket]);view=[...conditionViews.values()][0];assert.equal(view.condition.check,'buckets');
-assert.equal(view.description,'1 at once');assert.match(html,/>1 test condition</);assert.doesNotMatch(html,/— at once|>1 tests</);
-html=renderTests([bucket,{...bucket,id:'old2',scenario:'bucket_c1_long_short'}]);assert.match(html,/>2 test conditions</);
-assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,2);
-assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
+assert.equal(view.description,'1 at once');assert.equal(conditionViews.size,1);assert.doesNotMatch(html,/— at once|>1 tests</);
+html=renderTests([bucket,{...bucket,id:'old2',scenario:'bucket_c1_long_short'}]);assert.equal(conditionViews.size,2);
+assert.equal((html.match(/class="condition-strip-row"/g)||[]).length,2);
+assert.equal((html.match(/class="condition-strip"/g)||[]).length,1);
 const generic={...r,scenario:'custom_old',check_ids:['correctness']};assert.equal(conditionInfo(generic).check,'correctness');
 ''')
 
@@ -175,7 +175,7 @@ def test_stress_workload_names_describe_the_experiment():
     run_render_checks(r'''
 const base={level:4,type:'stress',status:'inconclusive',reason:'not sent',token_lengths:{},shape:'long_short',workload:'input'};
 const html=renderLoadResults({load_types:{stress:{title:'Stress',points:[base,{...base,shape:'short_long',workload:'output'}]}}});
-assert.match(html,/Large-input stress at 4 concurrent requests/);assert.match(html,/Large-output stress at 4 concurrent requests/);
+assert.match(html,/Large-input stress.*4 at once/);assert.match(html,/Large-output stress.*4 at once/);
 ''')
 
 
@@ -259,7 +259,7 @@ api=async(path,options)=>{
  if(path==='/api/runs'){const sent=JSON.parse(options.body);assert.deepEqual(sent.migration_notes,response.migration_notes);return {id:'new'};}
  return {config:JSON.parse(options.body),migration_notes:[],request_plan:{rows:[],errors:[]}};
 };
-initReticulate=()=>{};connectionError=()=>{};setActive=()=>{};route=async()=>{};refreshRuns=async()=>{};
+initInterface=()=>{};connectionError=()=>{};setActive=()=>{};route=async()=>{};refreshRuns=async()=>{};
 for(const id of ['suite-version','runner-location','form-error','start-run','request-plan'])nodes['#'+id]={innerHTML:'',hidden:false};
 await init();assert.match(renderLoadEditor(state.config),/samples_per_bucket=7/);
 const form={elements:{baseline_id:{value:''},mode:{value:'normal'},restart_target:{value:''}}};nodes['#new-run-form']=form;

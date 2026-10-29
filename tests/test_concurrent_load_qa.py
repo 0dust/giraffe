@@ -17,7 +17,7 @@ pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def test_final_default_window_and_bootstrap_match():
-    config = RunConfig(targets=[TARGET])
+    config = RunConfig(targets=[TARGET], checks=["load"])
     plan = request_plan(config)
     assert config.load_test.schedule.duration_seconds == 15
     assert plan['load_test']['scheduled_tests'] == 12
@@ -76,8 +76,8 @@ async def test_final_summary_counts_sequential_tests_without_duplicate_status():
     _, check, _, _ = await perform(configuration(load={
         'combinations': {'selected': ['short_short', 'long_short']},
         'pass_criteria': {'max_completion_ms': 1000}}))
-    assert check.summary.startswith('2 sequential load tests:')
-    assert 'pass: 2' in check.summary
+    assert check.summary == '2 of 2 load conditions passed.'
+    assert check.summary.count('passed') == 1
     assert 'pass · pass' not in _load_test_html(check.metrics)
 
 
@@ -126,9 +126,10 @@ def test_nonpassing_final_summary_names_only_deciding_points_and_limits_them(sta
     monkeypatch.setattr(load_test, 'assess_point', lambda *_: None)
     monkeypatch.setattr(load_test, 'publish_point', lambda *_: None)
     summary = result(run, configured.targets[0]).summary
-    assert 'and 2 more' in summary
-    assert all(f'Deciding reason {i}' in summary for i in range(3))
-    assert all(f'Deciding reason {i}' not in summary for i in range(3, 6))
+    assert summary.startswith('5 of 6 load conditions ')
+    assert len(summary.split('. ')) == 2
+    assert all(f'Deciding reason {i}' not in summary for i in range(6))
+    assert [point['reason'] for point in points] == [f'Deciding reason {i}' for i in range(6)]
 
 
 def test_singular_plural_final_drawer_plan_and_results():
@@ -137,10 +138,10 @@ def test_singular_plural_final_drawer_plan_and_results():
     browser_logic('const plan=' + json.dumps(request_plan(configured)) + r''';
 config.checks=['load'];
 let html=renderLoadEditor(config)+renderLoadPlan(config,plan);
-assert.match(html,/Scheduled load tests/);assert.match(html,/Send new requests for/);
+assert.match(html,/Scheduled conditions/);assert.match(html,/Send new requests for/);
 const point={id:'one',source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:1,groups:[]};
-html+=renderLoadTestResults({points:[point]});assert.match(html,/1 concurrent request/);assert.doesNotMatch(html,/1 concurrent requests/);
-point.level=2;assert.match(renderLoadTestResults({points:[point]}),/2 concurrent requests/);
+html+=renderLoadTestResults({points:[point]});assert.match(html,/1 at once/);assert.doesNotMatch(html,/1 requests at once/);
+point.level=2;assert.match(renderLoadTestResults({points:[point]}),/2 at once/);
 config.load_test.profile.long.output_tokens=1;config.load_test.workloads.stress.enabled=true;config.load_test.workloads.stress.min_output_percent=100;
 assert.match(renderLoadEditor(config),/At least 1 generated token/);
 ''', config=configured)

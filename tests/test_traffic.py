@@ -5,8 +5,9 @@ import time
 
 import pytest
 
-from giraffe import traffic
+from giraffe import runner, traffic
 from giraffe.models import Limits, RequestRecord, RequestSpec, TrafficConfig
+from tests.test_review26_phase4_accuracy import run_virtual
 
 
 def profile(**overrides):
@@ -42,7 +43,7 @@ class Harness:
         self.available += 1
         assert self.available <= self.slots
 
-    async def execute(self, spec):
+    async def execute(self, spec, finalize_record):
         start = time.monotonic()
         self.starts.append(start)
         self.on_start()
@@ -60,7 +61,9 @@ class Harness:
             answer_chunks=2, output_tokens=2, max_stream_gap_ms=1,
         )
         self.records.append(record)
-        return self.transform(record)
+        record = self.transform(record)
+        finalize_record(record)
+        return record
 
     async def run(self, settings=None, limits=None, deadline=None, **pack):
         settings = settings or profile()
@@ -93,36 +96,57 @@ def test_seeded_poisson_and_fixture_mix_are_reproducible_and_uneven():
     assert all(0 < offset < 1 for offset, _ in schedule)
 
 
-async def test_arrivals_start_while_earlier_request_is_still_running():
-    harness = Harness(delay=.11)
-    result = await harness.run(profile(rates=[25], duration_seconds=.12))
-    assert len(harness.starts) == 3
-    assert harness.starts[1] < harness.finishes[0]
-    assert result["peak_in_flight"] == 3
-    assert result["accepted"] and result["goodput_rps"] == 25
-    assert result["good_fraction"] == 1
-    assert all(record.traffic_stage == 0 and record.traffic_class == "short"
-               and record.arrival_elapsed_ms >= record.elapsed_ms for record in harness.records)
+def test_arrivals_start_while_earlier_request_is_still_running(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        harness = Harness(delay=.11)
+        result = await harness.run(profile(rates=[25], duration_seconds=.12))
+        assert len(harness.starts) == 3
+        assert harness.starts[1] < harness.finishes[0]
+        assert result["peak_in_flight"] == 3
+        assert result["accepted"] and result["goodput_rps"] == 25
+        assert result["good_fraction"] == 1
+        assert all(record.traffic_stage == 0 and record.traffic_class == "short"
+                   and record.arrival_elapsed_ms >= record.elapsed_ms for record in harness.records)
+
+    run_virtual(monkeypatch, scenario())
 
 
-async def test_nearly_coincident_arrivals_within_tolerance_are_not_missed_ticks(monkeypatch):
-    # A valid uneven cluster can be closer than the event loop's clock/timer
-    # resolution. Dispatch lateness, not the next random gap, governs admission.
-    schedule = [(0, "short"), (.000001, "short"), (.000002, "short"), (.04, "short")]
-    monkeypatch.setattr(traffic, "arrival_schedule", lambda *_: (schedule, False))
-    harness = Harness()
-    result = await harness.run()
-    assert result["started"] == result["scheduled"] == 4
-    assert result["dropped_late"] == 0 and result["accepted"]
+def test_nearly_coincident_arrivals_within_tolerance_are_not_missed_ticks(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        # A valid uneven cluster can be closer than the event loop's clock/timer
+        # resolution. Dispatch lateness, not the next random gap, governs admission.
+        schedule = [(0, "short"), (.000001, "short"), (.000002, "short"), (.04, "short")]
+        monkeypatch.setattr(traffic, "arrival_schedule", lambda *_: (schedule, False))
+        harness = Harness()
+        clock = asyncio.get_running_loop()
+
+        def coalesce_first_cluster():
+            if len(harness.starts) == 1:
+                clock.now += .001
+
+        harness.on_start = coalesce_first_cluster
+        result = await harness.run()
+        assert result["started"] == result["scheduled"] == 4
+        assert result["dropped_late"] == 0 and result["accepted"]
+        assert any(0 < record.dispatch_lag_ms < profile().scheduler_lag_tolerance_ms
+                   for record in harness.records)
+
+    run_virtual(monkeypatch, scenario())
 
 
-async def test_seeded_poisson_profile_does_not_drop_healthy_nearby_arrivals():
-    harness = Harness(slots=8, delay=.005)
-    result = await harness.run(profile(
-        rates=[20], duration_seconds=1, arrival="poisson", seed=43, max_in_flight=8,
-    ))
-    assert result["scheduled"] == result["started"] == 20
-    assert result["dropped_late"] == 0 and result["accepted"]
+def test_seeded_poisson_profile_does_not_drop_healthy_nearby_arrivals(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        harness = Harness(slots=8, delay=.005)
+        result = await harness.run(profile(
+            rates=[20], duration_seconds=1, arrival="poisson", seed=43, max_in_flight=8,
+        ))
+        assert result["scheduled"] == result["started"] == 20
+        assert result["dropped_late"] == 0 and result["accepted"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_local_ceiling_drops_arrivals_without_waiting_or_exceeding_bound():
@@ -136,16 +160,20 @@ async def test_local_ceiling_drops_arrivals_without_waiting_or_exceeding_bound()
     assert harness.budget == 100 - result["scheduled"]
 
 
-async def test_budget_exhaustion_counts_exact_remainder_and_drains_admitted_requests():
-    harness = Harness(budget=2, delay=.07)
-    drops = []
-    result = await harness.run(profile(rates=[20], duration_seconds=.2),
-                               on_drop=lambda: drops.append(harness.budget))
-    assert drops == []
-    assert result["scheduled"] == 4
-    assert result["started"] == result["completed"] == result["not_offered"] == 2
-    assert result["good_fraction"] == .5
-    assert result["status"] == "inconclusive" and not result["fully_offered"]
+def test_budget_exhaustion_counts_exact_remainder_and_drains_admitted_requests(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        harness = Harness(budget=2, delay=.07)
+        drops = []
+        result = await harness.run(profile(rates=[20], duration_seconds=.2),
+                                   on_drop=lambda: drops.append(harness.budget))
+        assert drops == []
+        assert result["scheduled"] == 4
+        assert result["started"] == result["completed"] == result["not_offered"] == 2
+        assert result["good_fraction"] == .5
+        assert result["status"] == "inconclusive" and not result["fully_offered"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_stop_cancels_active_tasks_and_preserves_exact_plan():
@@ -202,9 +230,9 @@ async def test_monitor_cancellation_during_stop_cleanup_keeps_partial_stage():
     execute = harness.execute
     cleanup_started = asyncio.Event()
 
-    async def slow_cleanup(spec):
+    async def slow_cleanup(spec, finalize_record):
         try:
-            return await execute(spec)
+            return await execute(spec, finalize_record)
         finally:
             cleanup_started.set()
             await asyncio.sleep(.02)
@@ -302,7 +330,7 @@ async def test_poisson_schedule_overflow_is_bounded_and_never_dispatched(monkeyp
 async def test_callback_that_does_not_start_request_releases_reserved_slot():
     harness = Harness()
 
-    async def no_request(_):
+    async def no_request(_, finalize_record):
         return None
 
     harness.execute = no_request
@@ -315,7 +343,7 @@ async def test_callback_that_does_not_start_request_releases_reserved_slot():
 async def test_escaped_callback_failure_is_not_reported_as_success():
     harness = Harness()
 
-    async def broken_callback(_):
+    async def broken_callback(_, finalize_record):
         raise RuntimeError("private transport details")
 
     harness.execute = broken_callback
@@ -417,27 +445,31 @@ async def test_deferred_scores_refinalize_original_stage_evidence_without_extend
     assert original["goodput_rps"] == 0  # Earlier reports are not mutated.
 
 
-async def test_one_missing_deferred_score_blocks_acceptance_despite_case_coverage():
-    alpha = pack_spec("alpha")
-    harness = Harness()
-    captured = []
-    limits = Limits(latency_ms=1000, min_samples=2)
-    original = await harness.run(
-        limits=limits, case_specs=[alpha] * 4, active_case_specs=[alpha],
-        capture_evidence=captured.append,
-    )
-    assert original["accepted"]
-    harness.records[-1].score = None
-    result = traffic.finalize_stage(captured[0], limits)
-    assert result["coverage_complete"] and result["all_cases_scored"]
-    assert result["case_counts"]["alpha"]["scored"] == 3
-    assert result["unscored_completions"] == 1
-    assert result["status"] == "inconclusive" and not result["accepted"]
-    harness.records[-1].score = False
-    failed = traffic.finalize_stage(captured[0], limits)
-    assert failed["status"] == "fail" and not failed["accepted"]
-    assert failed["correctness"] == .75
-    assert failed["goodput_rps"] == result["goodput_rps"]
+def test_one_missing_deferred_score_blocks_acceptance_despite_case_coverage(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        alpha = pack_spec("alpha")
+        harness = Harness()
+        captured = []
+        limits = Limits(latency_ms=1000, min_samples=2)
+        original = await harness.run(
+            limits=limits, case_specs=[alpha] * 4, active_case_specs=[alpha],
+            capture_evidence=captured.append,
+        )
+        assert original["accepted"]
+        harness.records[-1].score = None
+        result = traffic.finalize_stage(captured[0], limits)
+        assert result["coverage_complete"] and result["all_cases_scored"]
+        assert result["case_counts"]["alpha"]["scored"] == 3
+        assert result["unscored_completions"] == 1
+        assert result["status"] == "inconclusive" and not result["accepted"]
+        harness.records[-1].score = False
+        failed = traffic.finalize_stage(captured[0], limits)
+        assert failed["status"] == "fail" and not failed["accepted"]
+        assert failed["correctness"] == .75
+        assert failed["goodput_rps"] == result["goodput_rps"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("wrong,minimum,slow,status", [
@@ -447,31 +479,35 @@ async def test_one_missing_deferred_score_blocks_acceptance_despite_case_coverag
     (3, .8, False, "fail"),
     (1, .8, True, "fail"),
 ])
-async def test_incomplete_judgements_fail_only_when_remaining_votes_cannot_meet_correctness(
-    wrong, minimum, slow, status,
+def test_incomplete_judgements_fail_only_when_remaining_votes_cannot_meet_correctness(
+    wrong, minimum, slow, status, monkeypatch,
 ):
-    alpha = pack_spec("alpha", "judge")
-    harness = Harness()
-    captured = []
-    limits = Limits(latency_ms=1000, min_samples=2, min_correctness=minimum)
-    if slow:
-        harness.transform = lambda record: record.model_copy(update={"elapsed_ms": 2000})
-    await harness.run(
-        profile(duration_seconds=.2), limits=limits,
-        case_specs=[alpha] * 10, active_case_specs=[alpha], capture_evidence=captured.append,
-    )
-    records = [record for _, record in captured[0].records]
-    assert len(records) == 10
-    for index, record in enumerate(records):
-        record.score = True if index == 0 else False if index <= wrong else None
-    result = traffic.finalize_stage(captured[0], limits)
-    assert result["scored"] == wrong + 1
-    assert result["correctness"] == 1 / (wrong + 1)
-    assert result["unscored_completions"] == 9 - wrong
-    assert result["status"] == status and not result["accepted"]
-    assert ("Known-answer correctness was below the required fraction." in result["reasons"]) is (
-        (10 - wrong) / 10 < minimum
-    )
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        alpha = pack_spec("alpha", "judge")
+        harness = Harness()
+        captured = []
+        limits = Limits(latency_ms=1000, min_samples=2, min_correctness=minimum)
+        if slow:
+            harness.transform = lambda record: record.model_copy(update={"elapsed_ms": 2000})
+        await harness.run(
+            profile(duration_seconds=.2), limits=limits,
+            case_specs=[alpha] * 10, active_case_specs=[alpha], capture_evidence=captured.append,
+        )
+        records = [record for _, record in captured[0].records]
+        assert len(records) == 10
+        for index, record in enumerate(records):
+            record.score = True if index == 0 else False if index <= wrong else None
+        result = traffic.finalize_stage(captured[0], limits)
+        assert result["scored"] == wrong + 1
+        assert result["correctness"] == 1 / (wrong + 1)
+        assert result["unscored_completions"] == 9 - wrong
+        assert result["status"] == status and not result["accepted"]
+        assert ("Known-answer correctness was below the required fraction." in result["reasons"]) is (
+            (10 - wrong) / 10 < minimum
+        )
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("kind", ["local", "late"])

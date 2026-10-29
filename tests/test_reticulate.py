@@ -1,4 +1,4 @@
-"""Reticulate must preserve the identity and uncertainty of real evidence."""
+"""Request evidence preserves identity, uncertainty and inspection state."""
 
 from tests.test_ux_results import run_render_checks
 
@@ -7,8 +7,8 @@ def test_request_colors_do_not_promote_unscored_or_probe_requests_to_pass():
     run_render_checks(r"""
 const completed={id:'one',status:'completed',valid:true,score:true};
 assert.equal(requestOutcome(completed),'pass');
-for(const extra of [{score:null},{score:undefined},{valid:undefined},
- {intentional:true},{scenario:'client_cancel'},{status:'cancelled'}]){
+for(const extra of [{score:null},{score:undefined},{valid:undefined}])assert.equal(requestOutcome({...completed,...extra}),'unscored');
+for(const extra of [{intentional:true},{scenario:'client_cancel'},{status:'cancelled'}]){
  assert.equal(requestOutcome({...completed,...extra}),'inconclusive');
 }
 for(const extra of [{score:false},{valid:false},{status:'failed'},{status:'timeout'}]){
@@ -19,87 +19,66 @@ assert.equal(requestOutcome({}),'inconclusive');
 """)
 
 
-def test_mosaic_is_one_spot_per_record_with_stable_paginated_identity():
+def test_request_table_has_one_row_per_record_with_stable_paginated_identity():
     run_render_checks(r"""
-const records=Array.from({length:245},(_,i)=>({id:'request-'+i,fixture_id:'case <'+i+'>',scenario:'bucket_c32_short_short',
- status:'completed',valid:true,score:i%2===0,elapsed_ms:i}));
-let html=renderMosaic(records);
-assert.equal((html.match(/data-request=/g)||[]).length,240);
-assert.match(html,/data-request="request-0"/);assert.match(html,/data-request="request-239"/);
-assert.doesNotMatch(html,/data-request="request-240"/);assert.match(html,/Short input \/ short output · 32 at once\. Request 1 of 245/);
-assert.equal((html.match(/tabindex="0"/g)||[]).length,1);
-state.mosaicPage=1;html=renderMosaic(records);
-assert.equal((html.match(/data-request=/g)||[]).length,5);
+const records=Array.from({length:245},(_,i)=>({id:'request-'+i,question:'case <'+i+'>',scenario:'bucket_c32_short_short',status:'completed',valid:true,score:i%2===0,elapsed_ms:i}));
+const table=createRequestTableState();let html=renderRequestTable(records,table);
+assert.equal((html.match(/class="request-evidence-row"/g)||[]).length,200);
+assert.match(html,/data-request="request-0"/);assert.match(html,/data-request="request-199"/);
+assert.doesNotMatch(html,/data-request="request-200"|request-spot|<svg/);assert.match(html,/case &lt;0&gt;/);
+assert.equal((html.match(/tabindex="0"/g)||[]).length,200);
+updateRequestTableState(table,'page',2);html=renderRequestTable(records,table);
+assert.equal((html.match(/class="request-evidence-row"/g)||[]).length,45);
 assert.match(html,/data-request="request-244"/);assert.doesNotMatch(html,/data-request="request-0"/);
-const shape=reticulateCells(240);
-assert.equal(shape.cells.length,240);assert.equal(new Set(shape.cells).size,240);
-assert.equal(JSON.stringify(shape),JSON.stringify(reticulateCells(240)));
-for(const polygon of shape.cells)for(const point of polygon.split(' ')){
- const [x,y]=point.split(',').map(Number);assert(Number.isFinite(x)&&Number.isFinite(y));
- assert(x>=0&&x<=shape.width&&y>=0&&y<=shape.height);
-}
+assert.equal(new Set(requestTablePage(records,table).rows.map(row=>row.id)).size,45);
+assert.equal(records[0].id,'request-0');
 """)
 
 
-def test_live_mosaic_tracks_start_slots_when_completion_order_changes():
+def test_live_request_table_tracks_start_slots_without_unused_budget_rows():
     run_render_checks(r"""
-state.mosaicPage=0;
-const records=[{slot:2,id:'fast',status:'completed',score:true,valid:true},
- {slot:0,status:'running'},{slot:1,id:'slow',status:'completed',score:null,valid:true}];
-const html=renderMosaic(records,{budget:5,live:true,budgetUsed:4});
+const records=[{slot:0,status:'running'},{slot:1,id:'slow',status:'completed',score:null,valid:true},{slot:2,id:'fast',status:'completed',score:true,valid:true}];
+const html=renderRequestTable(records,createRequestTableState(),{live:true});
 assert(html.indexOf('data-live-slot="0"')<html.indexOf('data-live-slot="1"'));
 assert(html.indexOf('data-live-slot="1"')<html.indexOf('data-live-slot="2"'));
-assert.equal((html.match(/class="request-spot /g)||[]).length,5);
-assert.equal((html.match(/class="request-spot idle"/g)||[]).length,1);
-assert.match(html,/Budget slot 4: Reserved, request evidence unavailable/);
-assert.match(html,/Budget slot 5: not used/);
-assert.doesNotMatch(html,/data-request=/);
+assert.equal((html.match(/class="request-evidence-row"/g)||[]).length,3);
+assert.match(html,/data-live-key="request:slot-0"/);assert.match(html,/data-request="slow"/);assert.match(html,/data-request="fast"/);
+assert.doesNotMatch(html,/Budget slot|Unused|request-spot/);
 """)
 
 
-def test_live_mosaic_follows_frontier_and_allows_manual_inspection():
+def test_live_request_table_preserves_manual_page_and_sort_when_rows_append():
     run_render_checks(r"""
-const records=Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}));
-delete state.mosaicFollow;
-let html=renderMosaic(records,{budget:600,live:true});
-assert.equal(state.mosaicPage,1);assert.equal(state.mosaicLivePage,1);
-assert.match(html,/data-live-slot="250"/);assert.doesNotMatch(html,/data-live-slot="0"/);
-assert.match(html,/<g class="request-spot running current"[^>]*data-live-slot="253"[^>]*aria-label="Requests\. Request 254 of 254/);
-assert.equal((html.match(/request-spot running current/g)||[]).length,1);
-assert.match(html,/Following live/);assert.doesNotMatch(html,/data-action="mosaic-live"/);
-state.mosaicFollow=false;state.mosaicPage=0;
-html=renderMosaic(records,{budget:600,live:true});
-assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,1);
-assert.match(html,/data-live-slot="0"/);assert.doesNotMatch(html,/data-live-slot="250"/);
-assert.match(html,/data-action="mosaic-live">Back to live/);
-assert.match(html,/Live on requests 241–480/);assert.match(html,/live on another page/);
-records.push({slot:490,status:'running'});renderMosaic(records,{budget:600,live:true});
-assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,2);
+const records=Array.from({length:254},(_,slot)=>({id:'request-'+slot,slot,status:slot<250?'completed':'running',elapsed_ms:slot}));
+const table=createRequestTableState();updateRequestTableState(table,'sort','elapsed_ms');updateRequestTableState(table,'page',2);
+let html=renderRequestTable(records,table,{live:true});assert.match(html,/data-live-slot="250"/);assert.doesNotMatch(html,/data-live-slot="0"/);
+records.push({id:'new',slot:254,status:'running',elapsed_ms:254});html=renderRequestTable(records,table,{live:true});
+assert.equal(table.page,2);assert.equal(table.sort,'elapsed_ms');assert.equal(table.direction,'asc');
+assert.match(html,/data-live-slot="254"/);assert.match(html,/Page 2 of 2/);assert.doesNotMatch(html,/Following live|mosaic-live/);
 """)
 
 
-def test_live_mosaic_frontier_prefers_running_then_latest_record_then_budget():
+def test_request_table_filters_real_evidence_and_preserves_status_separation():
     run_render_checks(r"""
-let html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'running'}],{budget:600,live:true});
-assert.equal(state.mosaicLivePage,1);assert.match(html,/Requests\. Request 1 of 2/);
-html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'completed'}],{budget:600,live:true});
-assert.equal(state.mosaicPage,2);assert.doesNotMatch(html,/request-spot \w+ current|Newest running request/);
-renderMosaic([],{budget:600,live:true,budgetUsed:481});assert.equal(state.mosaicPage,2);
-renderMosaic([],{budget:600,live:true,budgetUsed:0});assert.equal(state.mosaicPage,0);
-renderMosaic([],{budget:600,live:true,budgetUsed:999});assert.equal(state.mosaicPage,2);
+const records=[{id:'completed',status:'completed',valid:true,score:true},{id:'running',status:'running'},{id:'unscored',status:'completed',valid:true},{id:'failed',status:'failed',error:'HTTP 500'}],table=createRequestTableState();
+updateRequestTableState(table,'status','running');let page=requestTablePage(records,table);assert.equal(page.rows.length,1);assert.equal(page.rows[0].id,'running');
+updateRequestTableState(table,'status','unscored');assert.equal(requestTablePage(records,table).rows[0].id,'unscored');
+updateRequestTableState(table,'status','all');updateRequestTableState(table,'search','HTTP 500');page=requestTablePage(records,table);assert.equal(page.rows.length,1);assert.equal(page.rows[0].id,'failed');
+assert.match(renderRequestTable([],createRequestTableState()),/No requests match these filters/);
 """)
 
 
-def test_report_mosaic_ignores_follow_state_and_preserves_selected_page():
+def test_report_request_table_preserves_selected_page_and_scroll_during_append():
     run_render_checks(r"""
-const records=Array.from({length:600},(_,i)=>({id:'request-'+i,status:'completed'}));
-for(const follow of [false,undefined,true]){
- state.mosaicFollow=follow;state.mosaicPage=1;state.mosaicLivePage=2;
- const html=renderMosaic(records);
- assert.equal(state.mosaicPage,1);assert.match(html,/data-request="request-240"/);
- assert.doesNotMatch(html,/data-request="request-0"|mosaic-live|Following live|live on another page|Newest running request/);
-}
-""")
+const records=Array.from({length:600},(_,i)=>({id:'request-'+i,status:'completed',elapsed_ms:i})),table=createRequestTableState();
+table.page=2;table.sort='elapsed_ms';table.direction='asc';
+const parent=$('#main');patchHTML(parent,renderRequestTable(records,table));const scroll=$('.request-table-scroll');scroll.scrollTop=120;scroll.scrollLeft=40;
+const first=$('[data-request="request-200"]');first.focus({preventScroll:true});records.push({id:'request-600',status:'running'});
+patchHTML(parent,renderRequestTable(records,table));
+assert.equal($('.request-table-scroll'),scroll);assert.equal(scroll.scrollTop,120);assert.equal(scroll.scrollLeft,40);
+assert.equal($('[data-request="request-200"]'),first);assert.equal(document.activeElement,first);assert.equal(table.page,2);
+assert.doesNotMatch(parent.innerHTML,/data-request="request-0"|request-spot|condition-mosaic/);
+""",dom=True)
 
 
 def test_beeswarm_excludes_missing_latency_and_preserves_each_measured_request():
@@ -130,7 +109,7 @@ assert.match(renderPhases([]),/Waiting for scenario events/);
 """)
 
 
-def test_report_mosaic_orders_by_dispatch_without_mutating_saved_evidence():
+def test_report_requests_order_by_dispatch_without_mutating_saved_evidence():
     run_render_checks(r"""
 const value={requests:[{id:'finished-first',dispatch_ms:20},{id:'started-first',dispatch_ms:10}]};
 assert.equal(orderedRequests(value).map(r=>r.id).join(','),'started-first,finished-first');

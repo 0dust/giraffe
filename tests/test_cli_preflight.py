@@ -102,6 +102,10 @@ def test_successful_preflight_checks_each_target_with_run_settings(skip_prefligh
     from giraffe.planning import request_plan
 
     assert result["warnings"] == request_plan(RunConfig.model_validate(config))["warnings"]
+    invocation = json.loads((tmp_path / "output" / "report.json").read_text())["manifest"]["invocation"]
+    assert invocation["source"] == "cli"
+    assert invocation["argv"] == ["run", "--config", str(path), "--output", str(tmp_path / "output"),
+                                  "--output-format", "json", *(["--skip-preflight"] if skip_preflight else [])]
     assert captured.err.startswith("Warning:")
     if not skip_preflight:
         for request, model in zip(requests, ["tiny", "second"], strict=True):
@@ -201,7 +205,7 @@ def test_run_help_has_all_flags_examples_and_exit_codes(capsys):
         main(["run", "--help"])
     assert stopped.value.code == 0
     output = capsys.readouterr().out
-    assert "--structured-output" in output and "--json " not in output
+    assert "--structured-output" in output and "--json" in output and "--verbose" in output
     assert "(default: 300)" not in output
     help_text = " ".join(output.split())  # Argparse wraps the longer field labels.
     assert help_text.count("(default: Not set)") == 3
@@ -216,7 +220,8 @@ def test_run_help_has_all_flags_examples_and_exit_codes(capsys):
     assert all(action.help for action in run._actions)
     for flag in ["--json", "--structured-output"]:
         config = configuration(app.parse_args(["run", "--url", "http://server", "--model", "tiny", flag]))
-        assert config.structured_json and "json" in config.checks
+        assert config.structured_json == (flag == "--structured-output")
+        assert ("json" in config.checks) == (flag == "--structured-output")
 
 
 def test_parser_errors_exit_four():
@@ -277,7 +282,7 @@ async def test_progress_throttles_text_and_preserves_json_events(json_progress, 
         assert [json.loads(line) for line in output] == events
     else:
         assert len(output) == 3
-        assert "warm" in output[0] and "warm" in output[1] and "generation" in output[2]
+        assert "Warm-up" in output[0] and "Warm-up" in output[1] and "Generation" in output[2]
 
 
 @pytest.mark.parametrize("command", ["inspect", "export", "baseline", "manifest", "compare"])
@@ -332,10 +337,11 @@ def test_run_surfaces_optional_overall_summary(summary, output_format, tmp_path,
             assert "summary" not in result
     else:
         lines = output.splitlines()
-        expected = ["BLOCKED: 0 requests", "Stopped: stopped"] + ([summary] if summary else [])
-        assert lines[-len(expected):] == expected
-        memory_line = next(i for i, line in enumerate(lines) if line.startswith("Peak memory (RAM), process RSS: "))
-        assert memory_line < len(lines) - len(expected)
+        assert lines[0].startswith("BLOCKED  0 checks passed · 0 requests · report: ")
+        assert lines[1] == "Stopped: stopped"
+        if summary:
+            assert lines[2] == summary
+        assert "RAM" not in output
 
 
 @pytest.mark.parametrize("source", ["config", "manifest"])
@@ -475,9 +481,8 @@ def test_cli_prints_the_retained_check_summary(policy, retained, tmp_path, monke
     saved = json.loads((directory / "report.json").read_text())
     assert saved["checks"][0]["summary"] in captured.out
     lines = captured.out.splitlines()
-    assert lines[-1] == "FAIL: 0 requests"
-    memory_line = next(i for i, line in enumerate(lines) if line.startswith("Peak memory (RAM), process RSS: "))
-    assert memory_line < len(lines) - 1
+    assert lines[0].startswith("FAIL  0 checks passed · 0 requests · report: ")
+    assert "RAM" not in captured.out
     for secret in ["EXPECTED_SECRET", "RECEIVED_SECRET"]:
         assert (secret in captured.out) == retained
         assert (secret in (directory / "report.html").read_text()) == retained

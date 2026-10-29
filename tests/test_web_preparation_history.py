@@ -1,9 +1,7 @@
 """Preparation evidence survives the bounded activity feed and server restarts."""
 
-import asyncio
-
 from giraffe.web import _track_live_progress
-from tests.test_web import browser, finished, report, start
+from tests.test_web import browser, detail_when, finished, report, start
 
 
 def test_preparation_cache_is_bounded_and_refreshes_existing_scenarios():
@@ -25,8 +23,6 @@ def test_preparation_cache_is_bounded_and_refreshes_existing_scenarios():
 
 
 async def test_preparation_history_survives_event_eviction_and_saved_metadata(tmp_path, monkeypatch, local_tokenizer):
-    ready = asyncio.Event()
-
     async def waiting(configuration, *, progress, stop_event):
         for scenario, status, reason in [
             ("context_preparation", "unavailable", "Context input could not be sized"),
@@ -37,15 +33,14 @@ async def test_preparation_history_survives_event_eviction_and_saved_metadata(tm
                                 "step": "Preparing input locally", "reason": reason}})
         for _ in range(120):
             progress({"event": "progress", "target": "local"})
-        ready.set()
         await stop_event.wait()
         return report(configuration, cancelled=True)
 
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        await asyncio.wait_for(ready.wait(), 2)
-        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        detail = await detail_when(client, identifier, lambda value:
+            len(value["events"]) == 100 and not any(event.get("preparation") for event in value["events"]))
         assert len(detail["events"]) == 100
         assert not any(event.get("preparation") for event in detail["events"])
         preparations = detail["live_preparations"]

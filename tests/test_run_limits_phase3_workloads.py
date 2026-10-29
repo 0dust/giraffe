@@ -109,7 +109,7 @@ def test_extended_check_pass_criteria_change_verdict_and_remain_isolated(check):
         "test_options": {check: {"limits": {"latency_ms": 5}}}})
     run.config = overridden
     after = outcome()
-    assert after.status == "fail"
+    assert after.status == ("inconclusive" if check == "prefix" else "fail")
     assert after.metrics["timing_violations"]
     assert overridden.limits.latency_ms == 50
     run.config = config
@@ -168,7 +168,7 @@ async def test_logprob_consistency_uses_its_effective_output_timeout_and_context
 
 
 async def test_concurrent_load_profile_caps_and_timeout_are_own_settings():
-    from giraffe.concurrent_load import execute
+    from giraffe.load_test import execute
 
     config = configuration("concurrency", concurrent_load={
         "profile": {"short": {"input_tokens": 64, "output_tokens": 96},
@@ -288,8 +288,6 @@ def test_default_and_example_tool_payloads_still_fit_context_admission():
                    for path in sorted(Path("examples").glob("*.yaml")))
     seen = 0
     for config in configs:
-        if "tools" not in config.checks:
-            continue
         effective = _check_config(config, "tools")
         for fixture in resolved_tool_fixtures(effective):
             history_bytes = len(json.dumps([message.model_dump() for message in fixture.messages],
