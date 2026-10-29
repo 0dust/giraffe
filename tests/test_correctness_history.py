@@ -228,6 +228,10 @@ def test_failed_answer_deep_link_opens_request_after_run_load_and_same_run_navig
 const page=browser();await page.run('init()');
 await page.run(`(async()=>{
 let opened=[];openRequest=async id=>opened.push(id);
+assert.equal(reportRoute('#runs/previous/results/load-acceptance').section,'load-acceptance');
+assert.equal(reportRoute('#runs/previous/results/unknown-section'),null);
+assert.equal(reportRoute('#runs/previous/requests/%ZZ'),null);
+assert.equal(reportRoute('#runs/%ZZ/requests/answer'),null);
 location.hash='#runs/previous/requests/bad%2Fid';await route();
 assert.equal(state.detail.id,'previous');assert.equal(opened[0],'bad/id');
 location.hash='#runs/previous/requests/second';await route();

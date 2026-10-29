@@ -76,10 +76,12 @@ async def main():
     subprocess.run([str(command), "--help"], check=True, timeout=30)
     static = resources.files("giraffe").joinpath("static")
     with tempfile.TemporaryDirectory() as directory:
-        app = create_app(Path(directory) / "runs")
+        app = create_app(Path(directory) / "runs", token="package-smoke-token")
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://localhost"
         ) as client:
+            response = await client.get("/?token=package-smoke-token", follow_redirects=True)
+            response.raise_for_status()
             await check_ui_assets(client, static)
     print(f"Installed giraffe-llm {installed.version}: CLI and UI assets passed")
 

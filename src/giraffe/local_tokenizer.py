@@ -22,6 +22,7 @@ SETUP_TIMEOUT_SECONDS = 30.0
 AUTOMATIC_SETUP_TIMEOUT_SECONDS = 5.0
 BUILTIN = "builtin"
 BUILTIN_ENCODING = "o200k_base"
+HF_INSTALL_HINT = "Install giraffe-llm[hf-tokenizer] to use the model's own tokenizer"
 BUILTIN_NOTICE = ("Using built-in tiktoken o200k_base for prompt sizing. These are reference "
                   "token counts, not the served model's counts; chat formatting is excluded. "
                   "Measured token usage comes from the server.")
@@ -108,7 +109,10 @@ async def resolve_hub_name(name):
            for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")):
         return None
     # Only repository-shaped names go to the Hub, never URLs or local paths.
-    from huggingface_hub.utils import validate_repo_id
+    try:
+        from huggingface_hub.utils import validate_repo_id
+    except ImportError:
+        return None
     try:
         validate_repo_id(name)
     except ValueError:
@@ -154,7 +158,9 @@ async def _resolve_tokenizer(config, target, verified, *, include_server_metadat
         ready = verified.get(name) or await _verify_tokenizer(name, allow_download=False)
         verified[name] = ready
         return name, source
-    except TokenizerUnavailable:
+    except TokenizerUnavailable as error:
+        if error.code == "missing_dependency":
+            raise
         pass
     if include_server_metadata:
         # Server metadata is useful when a serving alias hides the actual model.
@@ -449,7 +455,8 @@ def _worker(tokenizer_name, *, allow_download=False):
                            for message in messages)
         count([{"role": "user", "content": "Tokenizer setup."}])
     except ImportError:
-        print(json.dumps({"error": "Tokenizer dependencies are missing; reinstall giraffe with its declared dependencies",
+        print(json.dumps({"error": ("Built-in tokenizer dependencies are missing; reinstall giraffe-llm"
+                                   if builtin else HF_INSTALL_HINT),
                           "code": "missing_dependency"}), flush=True)
         return
     except Exception:

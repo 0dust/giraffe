@@ -69,10 +69,13 @@ def test_capacity_comparison_direction_and_delta(before, after, verdict, delta):
 const before=BEFORE,after=AFTER,expected=VERDICT;
 const capacity={status:after>before?'pass':'fail',baseline_highest_acceptable_rate_rps:before,current_highest_acceptable_rate_rps:after,delta_rps:after-before,change_percent:(after-before)/before*100,reason:'Matched complete stages.'};
 const value=report([check('access','pass')],{baseline:{run_id:'old',targets:[{target:'local',traffic_capacity:capacity}]}});detail(value);
-const html=renderComparison(value);assert.match(html,new RegExp('>'+expected+'<'));assert(html.includes(DELTA));assert.match(renderBaselineSummary(value),new RegExp('1 '+expected));
+const html=renderComparison(value);assert.match(html,/Tested arrival capacity/);assert(html.includes(DELTA));
+assert(html.includes(`Baseline accepted rate</dt><dd>${before} req/s`));assert(html.includes(`Current accepted rate</dt><dd>${after} req/s`));
+assert(html.includes(after>before?'Passed':'Failed'));
 for(const metric of ['throughput','output_tokens_per_second','generation_tokens_per_second']){
  const row={metric,status:after>before?'pass':'fail',baseline:before,current:after,threshold:20,worsening:after>before?-300:75,worsening_interval_95:after>before?[-310,-290]:[70,80]};
- assert.equal(comparisonVerdict(row),expected);assert.equal(comparisonVerdict({...row,status:'inconclusive'}),'not comparable');const table=comparisonConditionTable(comparisonConditionGroups({comparisons:[row]},{}));assert(table.includes('>'+expected+'<'));assert(table.includes(DELTA));
+ const table=comparisonTable([row]);assert(table.includes('data-label="Verdict">'+expected+'</td>'));assert(table.includes(DELTA));
+ const uncertain=comparisonTable([{...row,status:'inconclusive',reason:'Insufficient samples'}]);assert(uncertain.includes('Insufficient samples'));assert(uncertain.includes('data-label="Verdict">not comparable</td>'));
 }
 """.replace('BEFORE', str(before)).replace('AFTER', str(after)).replace('VERDICT', repr(verdict)).replace('DELTA', repr(delta)))
 
