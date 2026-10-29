@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 
+import pytest
+
 from giraffe import load_test
 from giraffe.models import RunConfig
 from giraffe.runner import _Run
@@ -188,3 +190,40 @@ def test_seeded_poisson_budget_admits_all_arrivals_and_fixed_work_for_each_targe
         for _ in range(actual):
             assert rerun.reserve_offer(target.name)
     assert rerun.budget_used == advised == actual * len(config.targets)
+
+
+@pytest.mark.parametrize(("reason_code", "cause", "remedy"), [
+    ("missing_case_coverage", "saved questions lack scored responses",
+     "Lengthen load_test.schedule.duration_seconds"),
+    ("incomplete_delivery", "scheduled requests were not delivered",
+     "Reduce the offered rates or raise --simultaneous-limit"),
+])
+def test_measure_only_load_keeps_detail_out_of_concise_stop_summary(
+        monkeypatch, reason_code, cause, remedy):
+    # Summary policy consumes recorded conditions; it must not depend on whether
+    # a busy test runner can deliver every offer in a 50 ms traffic window.
+    _, run = summary(monkeypatch, causes=[reason_code], budget=6)
+    run.config.max_requests = None
+    criteria = run.config.load_test.pass_criteria
+    criteria.max_first_answer_ms = criteria.max_completion_ms = None
+    target = run.config.targets[0]
+    point = run.observations[target.name]["load_test"]["points"][0]
+    group = point["groups"][0]
+    group.update(scored=0, unscored=group["valid"])
+    detail = point["reason"]
+    result = load_test.result(run, target)
+
+    assert result.status == "inconclusive"
+    assert result.summary.startswith(f"1 of 1 load conditions unfinished: {cause}.")
+    assert remedy in result.summary
+    assert "--max-requests" not in result.summary
+    assert "load_test.pass_criteria.max_first_answer_ms" in result.summary
+    assert "load_test.pass_criteria.max_completion_ms" in result.summary
+    assert "configure scorers for unscored answers" in result.summary
+    assert len(result.summary.split(". ")) == 2
+    assert detail not in result.summary
+    recorded = result.metrics["points"][0]
+    assert recorded["reason_code"] == reason_code
+    assert recorded["reason"] == detail
+    assert recorded["groups"][0]["scored"] == 0
+    assert recorded["groups"][0]["unscored"] == recorded["groups"][0]["valid"] == 6
