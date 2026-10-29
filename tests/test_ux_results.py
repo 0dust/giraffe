@@ -415,3 +415,30 @@ markup=renderCheck(first,value);assert.match(markup,/No acceptance limit set/);
 delete value.manifest.effective_checks;delete value.manifest.default_check_limits;
 markup=renderCheck(first,value);assert.match(markup,/Limit: 123 ms/);assert.doesNotMatch(markup,/\(default\)/);
 """)
+
+
+@pytest.mark.parametrize("check_id", ["first_output", "generation"])
+def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_id):
+    run_render_checks(r"""
+(async()=>{
+ const id=CHECK_ID,first=id==='first_output';
+ const limitField=first?'first_output_ms':'stream_gap_ms',observedField=first?'first_output_ms':'max_stream_gap_ms';
+ const limit=first?10000:5000,slow=first?12300:6000;
+ const records=[['slow',slow],['good',200],['client',20000]].map(([id,time])=>({id,target:'local',status:'completed',valid:true,score:true,output:'Correct',[observedField]:time}));
+ const failed=check(id,'fail',{evidence_ids:['slow','good','client'],metrics:{violations:['slow'],unattributed_timing_violations:['client']}});
+ const value=report([failed],{overall:'fail',requests:records});
+ value.manifest.config.limits={[limitField]:60000};
+ value.manifest.effective_checks={[id]:{limits:{[limitField]:limit}}};
+ value.manifest.default_check_limits={[id]:[limitField]};
+ const original=JSON.stringify(value);
+ detail(value);const action=$('[data-action="show-failing"]');assert(action);await listeners.click({target:action});
+ const panel=$('.check-detail'),table=panel.querySelector('.evidence-table');
+ assert(panel.textContent.includes(`Limit: ≤ ${limit/1000} s (default)`));
+ assert(!panel.textContent.includes('60 s'));
+ assert(table.querySelector('[data-request="slow"]'));
+ assert.equal(table.querySelector('[data-request="good"]'),null);
+ assert.equal(table.querySelector('[data-request="client"]'),null);
+ assert(table.textContent.includes(first?'Too slow: first output 12.3 s > 10 s':'Too slow: stream pause 6 s > 5 s'));
+ assert.equal(JSON.stringify(value),original);
+})()
+""".replace('CHECK_ID', json.dumps(check_id)), dom=True)

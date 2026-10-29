@@ -273,6 +273,7 @@ class _Run:
         else:
             base, extra = divmod(config.max_requests, len(config.targets))
             self.quotas = {t.name: base + (i < extra) for i, t in enumerate(config.targets)}
+        self.preparation_residency = {}
         self.unfinished = defaultdict(set)
         self.observations = {t.name: {
                                      "restart": None, "metrics": [], "capacity": []}
@@ -1073,6 +1074,10 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             run.unfinished[target.name].update(enabled)
             return
         run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop)
+        run.observations[target.name]["deployment"]["model_residency"] = {
+            "before_preparation": run.preparation_residency.get(target.name, deployment.unknown_residency(target, "Initial observation unavailable.")),
+            "after_preparation": deployment.unknown_residency(target, "Preparation did not reach the second observation."),
+        }
         if not await _restart(run, target):
             run.stop_reason(target.name)
             return
@@ -1154,6 +1159,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 client.on_response = lambda: run.endpoint_response(target.name)
                 evidence = run.observations[target.name].setdefault("token_evidence", {"status": "unavailable", "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
                 run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage capability", "completed" if evidence.get("status") in {"available", "observed"} else "unavailable", evidence.get("reason"))
+            run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
+                await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
                 response = config.effective_response()
                 response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}), check_id="serving")["short"]
@@ -2320,10 +2327,16 @@ def _verdict_summary(check, config, records, budget):
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None) -> RunReport:
     from .local_tokenizer import ensure_tokenizers
+    from .deployment import preparation_residency
+    residency = config._preparation_residency
+    config._preparation_residency = {}
+    if not residency:
+        residency = await preparation_residency(config, stop=stop_event)
     await ensure_tokenizers(config)
     with PhaseSampler("traffic") as sampler:
         try:
-            return await _run_suite(config, progress=progress, stop_event=stop_event, sampler=sampler)
+            return await _run_suite(config, progress=progress, stop_event=stop_event,
+                                    sampler=sampler, residency=residency)
         except Exception:
             logger.exception("Unexpected suite failure")
             raise
@@ -2359,7 +2372,7 @@ async def _stop_judging(evaluation, run):
             "duration_seconds": None, "stop_reason": "cancelled"}
 
 
-async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> RunReport:
+async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     outer_cancellation = None
     suite_task = asyncio.current_task()
@@ -2391,6 +2404,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler) -> Run
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     run.run_id = run_id
+    run.preparation_residency = residency
     loop = asyncio.get_running_loop()
     sampler.run = run
     run.rss_at_start_bytes = sampler.initial_rss_bytes
