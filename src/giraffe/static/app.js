@@ -794,8 +794,8 @@ async function route() {
   try {
     if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
     if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);renderNew();enterRoute();schedulePoll(pollNew,version,3000);return; }
-    if (hash.startsWith('#runs/')) {
-      const id=destination?.id||decodeURIComponent(hash.slice(6).split('/')[0]);updateNav('runs','Run detail');
+    if (destination) {
+      const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
       const detail=await api(runPath(id));if(version!==state.routeVersion)return;
@@ -807,7 +807,7 @@ async function route() {
     renderRuns();enterRoute();schedulePoll(pollRuns,version,3000);
   } catch(error) {
     if(version!==state.routeVersion)return;
-    if(hash.startsWith('#runs/')&&error.status===404){
+    if(destination&&error.status===404){
       updateNav('runs','Run not found');
       $('#main').innerHTML='<div class="page-heading"><h1>Run not found</h1><p>This run is not available in the current run directory.</p></div><a class="button" href="#runs">Back to runs</a>';schedulePoll(pollRunStatus,version,3000);return;
     }
@@ -2721,9 +2721,15 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
+const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
-  const match=hash.match(/^#runs\/([^/]+)(?:\/(performance|results)(?:\/([a-z]+))?)?$/);
-  return match?{id:decodeURIComponent(match[1]),tab:match[2]||null,section:match[3]||null}:null;
+  const match=hash.match(/^#runs\/([^/]+)(?:\/(performance|results)(?:\/([^/]+))?)?$/);
+  if(!match)return null;
+  const tab=match[2]||null,section=match[3]||null;
+  const sections=tab==='performance'?reportSections:reportResultSections;
+  if(section&&!sections.some(([id])=>id===section))return null;
+  try{return {id:decodeURIComponent(match[1]),tab,section};}catch{return null;}
 }
 function syncReportView() {
   const d=state.detail;if(!d)return;
@@ -2755,7 +2761,11 @@ function chooseReportTab(tab,{focus=false,anchor=true}={}) {
 function resultsSections() {
   const report=state.detail?.report;if(!report?.baseline)return [];
   const rows=(report.baseline.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)]);
-  return [['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],...(report.baseline.targets?.some(target=>target.load_test)?[['load-acceptance','Tested load acceptance','comparison']]:[]),...comparisonSections.filter(([id])=>rows.some(row=>comparisonCategory(row)===id)).map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
+  return reportResultSections.filter(([id])=>{
+    if(id==='load-acceptance')return report.baseline.targets?.some(target=>target.load_test);
+    if(comparisonSections.some(([section])=>section===id))return rows.some(row=>comparisonCategory(row)===id);
+    return true;
+  });
 }
 function renderResultsJump() {
   const sections=resultsSections();if(!sections.length)return '';
@@ -3264,7 +3274,6 @@ function comparisonMetricLabel(row) {
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
 }
-const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
 function comparisonCategory(row){return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
 function comparisonWarningSummary(row) {
   const notes=[];

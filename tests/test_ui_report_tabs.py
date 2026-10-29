@@ -329,20 +329,21 @@ await page.run(`
 def test_results_sections_navigate_without_reloading_and_reopen_comparison():
     run_render_checks(r"""
 (async()=>{
-const baseline={run_id:'reference',status:'inconclusive',targets:[{target:'local',comparisons:[
+const baseline={run_id:'reference',status:'inconclusive',targets:[{target:'local',load_test:{status:'inconclusive'},comparisons:[
   {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'},
   {check:'load',scenario:'same',metric:'correctness_rate',baseline:.5,current:.6,status:'pass'},
   {check:'load',scenario:'same',metric:'error_rate',baseline:0,current:0,status:'pass'}]}]};
 detail(report([check('load','fail')],{baseline}));chooseReportTab('results');
 const links=[...$('#report-sections').querySelectorAll('a')];
-assert.equal(links.length,9);
+assert.equal(links.length,10);
 for(const link of links){
   assert.equal(link.dataset.reportSectionTab,'results');
   assert($('#results-'+link.dataset.reportSection));
+  assert.deepEqual(reportRoute(link.getAttribute('href')),{id:'saved-run',tab:'results',section:link.dataset.reportSection});
 }
-assert.equal($('#results-section-jump').querySelectorAll('option').length,9);
+assert.equal($('#results-section-jump').querySelectorAll('option').length,10);
 assert.match($('#baseline-content').innerHTML,/data-action="compare-saved"/);
-assert.equal($('#report-sections').querySelectorAll('ul ul a').length,4);
+assert.equal($('#report-sections').querySelectorAll('ul ul a').length,5);
 assert.equal($('#results-timing').closest('.report-result-section').id,'report-baseline-reference');
 assert.equal($('#results-configuration').closest('#report-baseline-reference'),null);
 assert.equal($('#results-checks').closest('#report-baseline-reference'),null);
@@ -361,5 +362,47 @@ $('#report-baseline-reference').open=false;
 jump.value='configuration';listeners.change({target:jump});await route();
 assert.equal($('#report-config-reference').open,true);
 assert.equal($('#report-baseline-reference').open,false);
+jump.value='load-acceptance';listeners.change({target:jump});await route();
+assert.equal(location.hash,'#runs/saved-run/results/load-acceptance');
+assert.equal(reportView.tab,'results');assert.equal($('#report-baseline-reference').open,true);
+assert.equal($('#results-section-jump').value,'load-acceptance');
+$('#report-baseline-reference').open=false;
+const link=$('#report-sections').querySelector('[data-report-section="load-acceptance"]');
+listeners.click({target:link,preventDefault(){}});await route();
+assert.equal(reportView.tab,'results');assert.equal($('#report-baseline-reference').open,true);
 })()
 """, dom=True)
+
+
+def test_hyphenated_result_deep_links_survive_actual_hashchange_without_reloading():
+    run_browser_script(r"""
+const page=browser(defaults,'#runs/saved%20run/results/load-acceptance');await page.run('init()');
+assert.equal(page.run('state.detail.id'),'saved run');assert.equal(page.run('reportView.tab'),'results');
+const count=()=>page.paths.filter(path=>path==='/api/runs/saved%20run').length;
+const calls=count(),version=page.run('state.routeVersion');
+for(const hash of ['#runs/saved%20run/performance/timing','#runs/saved%20run/results/load-acceptance']){
+  page.location.hash=hash;await page.windowListeners.hashchange();
+}
+assert.equal(page.run('reportView.tab'),'results');
+assert.equal(page.run('reportRoute().section'),'load-acceptance');
+assert.equal(page.run('state.routeVersion'),version);assert.equal(count(),calls);
+""")
+
+
+def test_invalid_report_hashes_use_runs_view_without_loading_or_throwing():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+for(const hash of [
+  '#runs/saved/results/unknown-section','#runs/saved/results/load--acceptance',
+  '#runs/saved/performance/load-acceptance','#runs/saved/results/server',
+  '#runs/saved/unknown','#runs/saved/results/timing/extra','#runs/saved/results/',
+  '#runs//results','#runs/%E0%A4%A/results',
+]){
+  const before=page.paths.length;page.location.hash=hash;
+  await assert.doesNotReject(()=>page.windowListeners.hashchange(),hash);
+  assert.equal(page.run('reportRoute()'),null,hash);
+  assert.equal(page.run('state.reportRouteActive'),false,hash);
+  assert(page.paths.slice(before).includes('/api/runs'),hash);
+  assert(!page.paths.slice(before).some(path=>path.startsWith('/api/runs/')),hash);
+}
+""")
