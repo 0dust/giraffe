@@ -3310,7 +3310,6 @@ function renderDetail() {
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
   syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
-  if(reportView.tab==='performance'&&!reportView.performance&&typeof fetch==='function')loadPerformance();
 }
 function renderDiagnostics(report,detail) {
   return `<details class="run-diagnostics"><summary>Run diagnostics</summary><p>Internal run ID: <code>${escape(report?.run_id || 'Not recorded')}</code></p>${renderResources(report,detail)}</details>`;
