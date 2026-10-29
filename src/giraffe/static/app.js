@@ -2828,7 +2828,7 @@ function resultsSections() {
   const report=state.detail?.report;if(!report?.baseline)return [];
   const rows=(report.baseline.targets||[]).flatMap(t=>[...(t.comparisons||[]),...comparisonOutputs(t)]);
   return reportResultSections.filter(([id])=>{
-    if(id==='load-acceptance')return report.baseline.targets?.some(target=>target.load_test);
+    if(id==='load-acceptance')return report.baseline.targets?.some(target=>target.load_test||target.load_exclusions?.length);
     if(comparisonSections.some(([section])=>section===id))return rows.some(row=>comparisonCategory(row)===id);
     return true;
   });
@@ -3471,6 +3471,36 @@ function renderTrafficComparison(capacity){
   const rate=value=>value==null?'Unconfirmed':`${number(value,2)} req/s`;
   return `<div class="traffic-summary"><h3>Tested arrival capacity ${badge(capacity.status)}</h3><p class="hint">${escape(capacity.reason || '')}</p><dl class="metrics-grid"><div class="metric"><dt>Baseline accepted rate</dt><dd>${rate(capacity.baseline_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Current accepted rate</dt><dd>${rate(capacity.current_highest_acceptable_rate_rps)}</dd></div><div class="metric"><dt>Capacity change</dt><dd>${capacity.delta_rps==null?'Unconfirmed':`${capacity.delta_rps>0?'+':''}${number(capacity.delta_rps,2)} req/s`}</dd><small>${capacity.change_percent==null?'Matching, complete stages required':`${capacity.change_percent>0?'+':''}${number(capacity.change_percent,1)}%`}</small></div></dl></div>${capacity.stages?.length?`<div class="metric-table"><table><thead><tr><th>Rate</th><th>Baseline goodput</th><th>Current goodput</th><th>Capacity evidence</th></tr></thead><tbody>${capacity.stages.map(stage=>`<tr><td>${rate(stage.rate_rps)}</td><td>${rate(stage.baseline?.goodput_rps)}</td><td>${rate(stage.current?.goodput_rps)}</td><td>${badge(stage.status)}<small>${escape(stage.reason || '')}</small>${stage.timing_comparable===false?`<small>${escape(stage.timing_comparison_reason || '')}</small>`:''}</td></tr>`).join('')}</tbody></table></div>`:''}`;
 }
+function comparisonLoadLabel(point) {
+  const shape=point.shape||point.workload;
+  const workload=loadShapes.includes(shape)?loadShapeLabel(shape):loadTitles[point.type]||human(shape||point.type);
+  const traffic=point.pattern==='concurrent'?`maintained concurrency${point.level!=null?' '+number(point.level):''}`:({constant:'constant arrivals',poisson:'Poisson arrivals',bursts:'bursts',interference:'short-answer comparison'})[point.pattern]||human(point.pattern);
+  const phase=point.pattern==='interference'?(point.role==='probe'?'Long-input probe':({baseline:'Short-only control',probe:'During long-input probe'})[point.phase]):null;
+  return `${workload} · ${traffic}${point.rate!=null?' · '+number(point.rate,2)+' requests/second':''}${point.bursts&&point.pattern!=='bursts'?' + bursts':''}${point.source&&point.source!=='primary'?' · '+human(point.source):''}${phase?' · '+phase:''}`;
+}
+function loadAcceptanceChangeLabel(change, status) {
+  if(change===undefined)return `Recorded: ${human(status||'inconclusive')}`;
+  return ({gained:'Newly accepted',lost:'Lost',unchanged_accepted:'Still accepted',unchanged_not_accepted:'Still not accepted',not_established_in_baseline:'Not established in baseline',accepted_baseline_not_established:'Accepted now; not established in baseline',not_established_in_current:'Not established in current',not_established:'Not established',not_tested_in_baseline:'Not tested in baseline',not_tested_in_current:'Not tested in current',work_changed:'Requested work changed'})[change]||human(change||'inconclusive');
+}
+function renderLoadAcceptance(targets,sectionPrefix='results') {
+  const tested=targets.filter(target=>target.load_test||target.load_exclusions?.length);
+  if(!tested.length)return '';
+  return `<section id="${sectionPrefix}-load-acceptance" class="comparison-section load-acceptance"><h3>Tested load acceptance</h3>${tested.map(target=>{
+    const load=target.load_test||{},key=point=>JSON.stringify([point.source||'primary',point.type,point.workload,point.pattern,Boolean(point.bursts)]);
+    const previous=new Map((load.baseline_highest_accepted||[]).map(point=>[key(point),point])),current=new Map((load.current_highest_accepted||[]).map(point=>[key(point),point]));
+    const scopes=new Map((load.points||[]).map(row=>row.current||row.baseline).filter(point=>point&&['concurrent','constant','poisson'].includes(point.pattern)).map(point=>[key(point),point]));
+    for(const point of [...previous.values(),...current.values()])if(!scopes.has(key(point)))scopes.set(key(point),point);
+    const highest=(points,id,point)=>points.has(id)?`${number(points.get(id).value,2)}${point.pattern==='concurrent'?'':' requests/second'}`:'Not established';
+    const pointStatus=point=>{
+      if(!point)return 'Not tested';
+      const status=point.not_run?'Not run':point.cut_short?'Cut short':statusLabels[point.status]||human(point.status||'inconclusive');
+      const samples=[point.dispatched!=null?`${number(point.dispatched)} dispatched`:null,point.required!=null?`${number(point.required)} required`:null].filter(Boolean);
+      const concurrency=[point.server_evidenced_concurrency!=null?`Server concurrency ${number(point.server_evidenced_concurrency,2)}`:null,point.client_mean_inflight!=null?`Client inflight ${number(point.client_mean_inflight,2)}`:null].filter(Boolean);
+      return `${escape(status)}${point.valid!=null?` · ${number(point.valid)} valid`:''}${samples.length?`<small>${escape(samples.join(' · '))}</small>`:''}${concurrency.length?`<small>${escape(concurrency.join(' · '))}</small>`:''}`;
+    };
+    return `<div class="load-acceptance-target"><h4>${escape(target.target||target.name||'Target')} ${load.status?badge(load.status):''}</h4>${load.reason?`<p class="hint">${escape(load.reason)}</p>`:''}${[...scopes].map(([id,point])=>`<div class="load-acceptance-highest"><h5>${escape(comparisonLoadLabel({...point,level:null,rate:null}))}</h5><p>Highest accepted ${point.pattern==='concurrent'?'concurrency':'request rate'} (tested) · Baseline: <strong>${highest(previous,id,point)}</strong> · Current: <strong>${highest(current,id,point)}</strong></p></div>`).join('')}${load.points?.length?`<div class="metric-table load-acceptance-table" tabindex="0" role="region" aria-label="${escape(target.target||target.name||'Target')} tested load acceptance"><table><thead><tr><th scope="col">Tested load</th><th scope="col">Baseline</th><th scope="col">Current</th><th scope="col">Change</th><th scope="col">Reason</th></tr></thead><tbody>${load.points.map(row=>`<tr><th scope="row">${escape(comparisonLoadLabel(row.current||row.baseline||{}))}</th><td>${pointStatus(row.baseline)}</td><td>${pointStatus(row.current)}</td><td><strong>${escape(loadAcceptanceChangeLabel(row.acceptance_change,row.status))}</strong></td><td>${escape(row.reason||'')}</td></tr>`).join('')}</tbody></table></div>`:''}${target.load_exclusions?.length?`<div class="load-comparison-exclusions"><h5>Load measurements not compared</h5><ul>${target.load_exclusions.map(row=>`<li><strong>${escape(row.load_point?comparisonLoadLabel(row.load_point):row.scenario||'Tested load')}</strong><span>${escape(row.reason||'')}</span></li>`).join('')}</ul></div>`:''}</div>`;
+  }).join('')}</section>`;
+}
 function isProbe(r){return ['client_cancel','client_deadline','deadline_probe'].includes(r.scenario)||/intentional cancellation/i.test(r.error || '');}
 function renderBaselineSummary(report) {
   const baseline=report.baseline;if(!baseline)return '';
@@ -3483,10 +3513,10 @@ function comparisonOutputs(target) {
   if(target.observed_outputs)return target.observed_outputs;
   const seen=new Set(),rows=[];
   for(const row of target.comparisons||[]){
-    const key=JSON.stringify([row.check,row.scenario]),work=row.output_work;
+    const key=JSON.stringify([row.check,comparisonCohort(row)]),work=row.output_work;
     if(seen.has(key)||!work?.current||!work?.baseline)continue;
     seen.add(key);
-    for(const [metric,valueKey,countKey] of [['output_tokens','reported_output_tokens_p50','reported_token_samples'],['output_chars','output_chars_p50','valid_completions']])rows.push({metric,check:row.check,scenario:row.scenario,baseline:work.baseline[valueKey],current:work.current[valueKey],baseline_samples:work.baseline[countKey],current_samples:work.current[countKey],descriptive:true,aggregation:'median'});
+    for(const [metric,valueKey,countKey] of [['output_tokens','reported_output_tokens_p50','reported_token_samples'],['output_chars','output_chars_p50','valid_completions']])rows.push({metric,check:row.check,scenario:row.scenario,load_point:row.load_point,baseline:work.baseline[valueKey],current:work.current[valueKey],baseline_samples:work.baseline[countKey],current_samples:work.current[countKey],descriptive:true,aggregation:'median'});
   }
   return rows;
 }
@@ -3525,12 +3555,14 @@ function comparisonWarningSummary(row) {
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row);
-    const label=row.descriptive?'Observed':warnings.length?'Warning':row.status==='fail'?'Regression detected':'No material regression';
+    const label=row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
     return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${row.aggregation==='mean'?'Rate':'Median'} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
   }).join('')}</div>`;
 }
+function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}
 function comparisonGroup(id,rows) {
-  return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(rows[0]?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(scenarioLabel(rows[0]))}</p>${comparisonTable(rows)}</div>`;
+  const row=rows[0],label=row?.load_point?comparisonLoadLabel(row.load_point):scenarioLabel(row);
+  return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(row?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(label)}</p>${comparisonTable(rows)}</div>`;
 }
 
 function baselineIdentity(baseline) {
@@ -3548,17 +3580,6 @@ function renderDeploymentChange(diff) {
   const fields=Array.isArray(intended)?intended:[intended];
   return `<p class="deployment-change">${escape(summary)}</p>${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
 }
-function renderLoadAcceptance(targets,sectionPrefix='results') {
-  const tested=targets.filter(target=>target.load_test);
-  if(!tested.length)return '';
-  const label=point=>loadPointLabel({...point,type:point.type||point.workload||'load',shape:point.shape||(loadShapes.includes(point.workload)?point.workload:null)});
-  const status=point=>point?`${badge(point.status||'inconclusive')}${point.not_run?'<small>Not run</small>':point.cut_short?'<small>Cut short</small>':''}${point.dispatched!=null?`<small>${number(point.dispatched)} dispatched</small>`:''}`:'Not tested';
-  return `<section id="${sectionPrefix}-load-acceptance" class="comparison-section"><h3>Tested load acceptance</h3><p class="hint">Acceptance at tested levels is separate from statistical changes in individual measurements.</p>${tested.map(target=>{
-    const load=target.load_test;
-    const highest=points=>points?.length?points.map(point=>`<strong>${point.value==null?'Not established':number(point.value,2)}${point.pattern==='concurrent'?' concurrent requests':' requests/second'}</strong><small>${escape(label({...point,level:null,rate:null}))}</small>`).join(''):'Not established';
-    return `<section><h4>${escape(target.target||target.name||'Target')} ${badge(load.status||'inconclusive')}</h4>${load.reason?`<p>${escape(load.reason)}</p>`:''}<dl class="metrics-grid"><div class="metric"><dt>Baseline highest accepted (tested)</dt><dd>${highest(load.baseline_highest_accepted)}</dd></div><div class="metric"><dt>Current highest accepted (tested)</dt><dd>${highest(load.current_highest_accepted)}</dd></div></dl>${load.points?.length?`<div class="metric-table" tabindex="0" role="region" aria-label="${escape(target.target||target.name||'Target')} tested load acceptance"><table><thead><tr><th scope="col">Tested load</th><th scope="col">Baseline</th><th scope="col">Current</th><th scope="col">Comparison evidence</th></tr></thead><tbody>${load.points.map(row=>`<tr><th scope="row">${escape(label(row.current||row.baseline||{}))}</th><td>${status(row.baseline)}</td><td>${status(row.current)}</td><td>${badge(row.status||'inconclusive')}<small>${escape(row.reason||'')}</small></td></tr>`).join('')}</tbody></table></div>`:''}</section>`;
-  }).join('')}</section>`;
-}
 function renderComparisonDetails(targets) {
   if(!targets.length)return '';
   return `<details class="comparison-support comparison-deployment"><summary>Deployment and comparison details</summary><p class="hint">Changes provide investigation context, not proof of causality. Missing or stale fields do not establish unchanged configuration.</p>${targets.map(target=>`<section><h4>${escape(target.target||target.name||'Target')}</h4><p>${target.configuration_diff?.confounded?'Confounded experiment: other recorded settings changed alongside the intended change.':'Causality unverified.'}</p><pre>${escape(JSON.stringify({configuration_diff:target.configuration_diff,identity_changes:target.identity_changes,telemetry:target.telemetry,consistency:target.consistency_changes},null,2))}</pre></section>`).join('')}</details>`;
@@ -3574,7 +3595,7 @@ function renderComparison(report,{scope='results'}={}) {
   const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='with_warnings'?comparisonWarnings(row).length>0:comparisonWarnings(row).length===0))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
   return `<header id="${sectionPrefix}-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="${sectionPrefix}-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${(b.targets||[]).filter(target=>target.configuration_diff).map(target=>`<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')} · Deployment</h3>${renderDeploymentChange(target.configuration_diff)}</section>`).join('')}${renderLoadAcceptance(b.targets||[],sectionPrefix)}<div class="comparison-filters">${allRows.length?`<div><label for="${filterPrefix}-outcome">Show</label><select id="${filterPrefix}-outcome" data-comparison-filter="outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="${filterPrefix}-check">Check</label><select id="${filterPrefix}-check" data-comparison-filter="check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).filter(t=>t.traffic_capacity).map(t=>`<section class="comparison-section"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`).join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
     const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
-    for(const row of rows){const key=JSON.stringify([row.targetName,row.check,row.scenario]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+    for(const row of rows){const key=JSON.stringify([row.targetName,row.check,comparisonCohort(row)]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
     return `<section id="${sectionPrefix}-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
   }).join('')}${renderComparisonDetails(b.targets||[])}`;
 }

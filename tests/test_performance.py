@@ -339,6 +339,93 @@ def test_baseline_rows_reuse_comparable_results_and_preserve_no_baseline_states(
     assert rows["baseline_capacity"]["state"] == "measured"
 
 
+@pytest.mark.parametrize("stored_without_point_id", [False, True])
+def test_load_window_baseline_rows_match_point_shape_and_role(stored_without_point_id):
+    from giraffe.reporting import compare_baseline
+    from tests.test_load_test_baseline import arrival_report
+
+    current = arrival_report(("short_short", "short_long"), concurrent=True, count=16)
+    compared = compare_baseline(current, current.model_copy(deep=True))
+    entry = compared.baseline["targets"][0]
+    for row in entry["comparisons"]:
+        if stored_without_point_id:
+            row["load_point"].pop("point_id", None)
+        else:
+            assert row["load_point"]["point_id"] == row["scenario"].rsplit(".", 1)[0]
+    measured = next(row for row in entry["comparisons"] if row["metric"] == "latency_ms")
+    entry["comparisons"].append({**measured, "load_point": {**measured["load_point"], "phase": "probe"}})
+    entry["comparisons"].append({**measured, "load_point": {**measured["load_point"], "role": "probe"}})
+    entry["comparisons"].append({**measured, "load_point": {**measured["load_point"], "shape": "unrelated"}})
+    data = build_performance(compared)["targets"][0]
+    rows = data["summaries"][data["default_window"]]["metrics"]
+
+    for metric, expected in (("baseline_timing", 4), ("baseline_throughput", 2), ("baseline_quality", 6)):
+        assert rows[metric]["state"] == "measured"
+        assert len(rows[metric]["value"]) == expected
+        assert {row["load_point"]["shape"] for row in rows[metric]["value"]} == {"short_long"}
+        assert not any(row["load_point"].get("phase") or row["load_point"].get("role") == "probe"
+                       for row in rows[metric]["value"])
+
+
+def test_load_window_capacity_uses_established_changes_even_when_neutral():
+    from giraffe.reporting import compare_baseline
+    from tests.test_load_test_baseline import arrival_report
+
+    current = arrival_report(concurrent=True, count=16)
+    compared = compare_baseline(current, current.model_copy(deep=True))
+    points = compared.baseline["targets"][0]["load_test"]["points"]
+    points[1].update(acceptance_change="unchanged_not_accepted", status="inconclusive")
+    points.append({**points[0], "acceptance_change": "accepted_baseline_not_established", "status": "pass"})
+    data = build_performance(compared)["targets"][0]
+    rows = data["summaries"][data["default_window"]]["metrics"]
+
+    assert rows["baseline_capacity"]["state"] == "measured"
+    assert [row["acceptance_change"] for row in rows["baseline_capacity"]["value"]] == [
+        "unchanged_accepted", "unchanged_not_accepted"]
+
+
+@pytest.mark.parametrize('status', ['pass', 'fail', 'inconclusive'])
+def test_historical_load_capacity_preserves_recorded_status_after_reload(status):
+    from giraffe.reporting import compare_baseline
+    from tests.test_load_test_baseline import concurrent_report
+
+    current = concurrent_report()
+    compared = compare_baseline(current, current.model_copy(deep=True))
+    points = compared.baseline['targets'][0]['load_test']['points']
+    for point in points:
+        point.pop('acceptance_change')
+        point['status'] = status
+    reloaded = RunReport.model_validate_json(compared.model_dump_json())
+    recorded = json.dumps(reloaded.baseline, sort_keys=True)
+
+    data = build_performance(reloaded)['targets'][0]
+    capacity = data['summaries'][data['default_window']]['metrics']['baseline_capacity']
+
+    established = status in {'pass', 'fail'}
+    assert capacity['state'] == ('measured' if established else 'insufficient_evidence')
+    assert capacity['sample_count'] == (2 if established else 0)
+    assert capacity['value'] == (points if established else None)
+    assert json.dumps(reloaded.baseline, sort_keys=True) == recorded
+
+
+@pytest.mark.parametrize('change', [None, 'unknown', 'work_changed', 'not_established'])
+@pytest.mark.parametrize('status', ['pass', 'fail'])
+def test_current_load_capacity_does_not_fall_back_to_status_for_unqualified_change(change, status):
+    from giraffe.reporting import compare_baseline
+    from tests.test_load_test_baseline import concurrent_report
+
+    current = concurrent_report()
+    compared = compare_baseline(current, current.model_copy(deep=True))
+    for point in compared.baseline['targets'][0]['load_test']['points']:
+        point.update(acceptance_change=change, status=status)
+
+    data = build_performance(compared)['targets'][0]
+    capacity = data['summaries'][data['default_window']]['metrics']['baseline_capacity']
+
+    assert capacity['state'] == 'insufficient_evidence'
+    assert capacity['sample_count'] == 0 and capacity['value'] is None
+
+
 def test_missing_completion_clock_does_not_inflate_token_rate():
     a=record("clocked",output_tokens=10,input_tokens=10,completion_tokens=10)
     b=record("unclocked",output_tokens=100,input_tokens=100,completion_tokens=100)

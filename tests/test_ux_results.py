@@ -436,6 +436,64 @@ assert.equal(JSON.stringify(value),original);
 """)
 
 
+def test_load_comparison_shows_acceptance_changes_and_groups_measurements_by_tested_load():
+    run_render_checks(r"""
+const point={source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:4,rate:null,bursts:false};
+const previous={...point,status:'inconclusive',reason_code:'load_not_delivered',valid:8,dispatched:10,required:5,server_evidenced_concurrency:1,client_mean_inflight:3.9},current={...point,status:'pass',valid:12,dispatched:12,required:5};
+const rows=[['latency_ms','raw-one'],['first_output_ms','raw-two'],['valid_completion_rate','raw-three']].map(([metric,scenario])=>({check:'load',metric,scenario,load_point:point,baseline:100,current:80,baseline_samples:6,current_samples:8,status:'pass',warnings:[{code:'load_not_delivered',message:'Baseline delivered concurrency 1 < 4.'}]}));
+const changes=['gained','lost','unchanged_accepted','unchanged_not_accepted','not_established_in_baseline','accepted_baseline_not_established','not_established_in_current','not_established','not_tested_in_baseline','not_tested_in_current'];
+const load_test={status:'pass',reason:'One newly accepted load.',baseline_highest_accepted:[{...point,value:1}],current_highest_accepted:[{...point,value:4}],points:changes.map(acceptance_change=>({baseline:previous,current,status:['gained','unchanged_accepted'].includes(acceptance_change)?'pass':acceptance_change==='lost'?'fail':'inconclusive',acceptance_change,reason:'Requested concurrency <4> was not delivered.'}))};
+const value=report([],{baseline:{targets:[{target:'local <gpu>',comparisons:rows,observed_outputs:[{...rows[0],scenario:'raw-output',metric:'output_tokens',descriptive:true}],load_test}]}});
+state.detail={report:value};const original=JSON.stringify(value);
+let html=renderComparison(value);
+assert.match(html,/id="results-load-acceptance"/);assert.match(html,/Tested load acceptance/);
+for(const text of ['Newly accepted','Lost','Still accepted','Still not accepted','Not established in baseline','Accepted now; not established in baseline','Not established in current','Not established','Not tested in baseline','Not tested in current'])assert(html.includes(text),text);
+assert.match(html,/Highest accepted concurrency \(tested\) · Baseline: <strong>1<\/strong> · Current: <strong>4<\/strong>/);
+assert.match(html,/Short input → Short output · maintained concurrency 4/);
+assert.match(html,/Baseline delivered concurrency 1 &lt; 4/);
+assert.match(html,/Inconclusive · 8 valid/);assert.match(html,/Passed · 12 valid/);
+assert.match(html,/10 dispatched · 5 required/);assert.match(html,/Server concurrency 1 · Client inflight 3.9/);
+assert.doesNotMatch(html.match(/<tbody>[\s\S]*?<\/tbody>/)[0],/class="status pass"/);
+assert.match(html,/<strong>Accepted now; not established in baseline<\/strong>/);
+assert.match(html,/Requested concurrency &lt;4&gt; was not delivered/);
+assert.doesNotMatch(html,/raw-one|raw-two|raw-three|raw-output|<gpu>|<4>/);
+assert.equal((html.match(/data-comparison-group="load"/g)||[]).length,3,'same tested load shares one group within each measurement section');
+assert(resultsSections().some(([id,label,parent])=>id==='load-acceptance'&&label==='Tested load acceptance'&&parent==='comparison'));
+assert.match(renderResultsJump(),/value="load-acceptance"/);
+assert.match(html,/class="metric-table load-acceptance-table" tabindex="0" role="region"/);
+state.comparisonFilter='without_warnings';html=renderComparison(value);
+assert.match(html,/Newly accepted/);assert.doesNotMatch(html,/data-metric="latency_ms"/);
+assert.equal(JSON.stringify(value),original);
+const fallback=comparisonOutputs({comparisons:[{...rows[0],output_work:{baseline:{reported_output_tokens_p50:10,reported_token_samples:6},current:{reported_output_tokens_p50:12,reported_token_samples:8}}}]});
+assert.equal(fallback[0].load_point,point);
+""")
+
+
+def test_load_comparison_exclusions_render_without_acceptance_points():
+    run_render_checks(r"""
+const point={source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:4};
+const value=report([],{baseline:{targets:[{target:'local <gpu>',comparisons:[],load_exclusions:[{scenario:'raw-scenario',load_point:point,reason:'Input target changed <128>.'}]}]}});
+state.detail={report:value};const html=renderComparison(value);
+assert.match(html,/Tested load acceptance/);assert.match(html,/Load measurements not compared/);
+assert.match(html,/Short input → Short output · maintained concurrency 4/);
+assert.match(html,/Input target changed &lt;128&gt;/);assert.doesNotMatch(html,/raw-scenario|<gpu>|<128>/);
+assert(resultsSections().some(([id])=>id==='load-acceptance'));
+assert.match(renderResultsJump(),/value="load-acceptance"/);
+""")
+
+
+def test_interference_comparison_keeps_control_and_probe_measurements_separate():
+    run_render_checks(r"""
+const point={source:'primary',type:'interference',workload:'interference',shape:'short_short',pattern:'interference',level:4,rate:null,bursts:false,role:'short_stream'};
+const work={baseline:{reported_output_tokens_p50:10,reported_token_samples:6},current:{reported_output_tokens_p50:12,reported_token_samples:8}};
+const rows=['baseline','probe'].map((phase,i)=>({check:'load',metric:'latency_ms',scenario:'load_interference.'+phase+'.short_short.short_stream',load_point:{...point,phase},baseline:100+i*100,current:80+i*100,baseline_samples:6,current_samples:8,status:'pass',warnings:[],output_work:work}));
+const html=renderComparison(report([],{baseline:{targets:[{target:'local',comparisons:rows,observed_outputs:[]}]}}));
+assert.equal((html.match(/data-comparison-group="load"/g)||[]).length,2);
+assert.match(html,/Short-only control/);assert.match(html,/During long-input probe/);
+assert.equal(comparisonOutputs({comparisons:rows}).length,4);
+""")
+
+
 def test_checks_expose_all_requests_with_incorrect_and_failed_first():
     run_render_checks(r"""
 const request=(id,score,status='completed')=>({id,score,status,target:'local',scenario:id,elapsed_ms:12,output:'Answer '+id,output_chars:8,valid:true});
@@ -581,6 +639,22 @@ def test_reduced_motion_disables_animations_instead_of_shortening_them():
             assert '.queued' not in selector and '.reserved' not in selector
     assert animated, 'The parser must inspect real animation rules'
     assert '.is-landing' not in css
+
+
+def test_load_acceptance_table_contains_overflow_on_narrow_screens():
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    rules = list(stylesheet_rules(css))
+    for selector in ('.load-acceptance', '.load-acceptance-target', '.load-acceptance-table'):
+        assert any(selector in group.split(', ') and declarations.get('min-width') == '0'
+                   for group, declarations, _ in rules)
+    assert any('.metric-table' in group.split(', ') and declarations.get('overflow-x') == 'auto'
+               and declarations.get('max-width') == '100%' for group, declarations, _ in rules)
+    assert any(group == '.load-acceptance-table table' and declarations.get('min-width') == '680px'
+               for group, declarations, _ in rules)
+    for selector in ('.load-acceptance-table th:nth-child(2)', '.load-acceptance-table th:nth-child(3)',
+                     '.load-acceptance-table td:nth-child(2)', '.load-acceptance-table td:nth-child(3)'):
+        assert any(selector in group.split(', ') and declarations.get('white-space') == 'nowrap'
+                   and declarations.get('min-width') == '150px' for group, declarations, _ in rules)
 
 
 def test_comparison_changes_are_directional_and_multiple_warnings_are_visible():

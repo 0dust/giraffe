@@ -134,10 +134,11 @@ async def test_sustained_allowance_needs_successes_not_only_attempts(monkeypatch
     assert outcome.status == 'inconclusive'
 
 
+@pytest.mark.parametrize('client_stall', [0, .2])
 @pytest.mark.parametrize('example', ['local', 'vllm'])
 @pytest.mark.parametrize('mode', ['hang', 'phase_cancel', 'healthy'])
 async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evidence(
-    monkeypatch, example, mode,
+    monkeypatch, example, mode, client_stall,
 ):
     snapshots = json.loads((Path(__file__).parent / 'fixtures/run-limits-phase3-defaults.json').read_text())['cases']
     values = dict(snapshots[f'examples/{example}.yaml']['source'])
@@ -160,6 +161,19 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
                for spec in specs}
     heavy_prompts = {tuple(m['content'] for m in spec.messages)
                      for specs in [heavy['long_input'], heavy['long_output']] for spec in specs}
+    if client_stall:
+        original_execute = runner.LLMClient.execute
+        stalled = False
+
+        async def stalled_warm(client, spec, **kwargs):
+            nonlocal stalled
+            result = await original_execute(client, spec, **kwargs)
+            if spec.scenario == 'warm' and not stalled:
+                stalled = True
+                time.sleep(client_stall)
+            return result
+
+        monkeypatch.setattr(runner.LLMClient, 'execute', stalled_warm)
     original = httpx.AsyncClient
     heavy_open, heavy_started, hangs, interrupted = 0, 0, 0, 0
     phase_end = None
@@ -225,8 +239,29 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
     completion = outcome.metrics['sustained_completion']
     assert heavy_started == len(sustained) and heavy_open == 0
     assert outcome.metrics['recovery']['completed'] == configured.samples
+    controls = {c.id: c for c in report.checks if c.id in {'access', 'serving', 'first_output'}}
+    assert controls['access'].status == controls['serving'].status == 'pass'
+    first_output = controls['first_output']
+    warm = [r for r in report.requests if r.scenario == 'warm']
+    assert len(warm) == configured.samples and all(r.valid and r.first_output_ms is not None for r in warm)
+    quality = first_output.metrics['timing_quality']
+    intervals = [(r.id, r.timing_start_ms if r.timing_start_ms is not None else r.dispatch_ms,
+                  r.first_output_ms) for r in warm]
+    # Derive the expected qualification from measured windows and request intervals.
+    delayed_ids = {identifier for identifier, start, first in intervals if any(
+        window['lag_ms'] > quality['threshold_ms'] and window['start_ms'] < start + first
+        and window['end_ms'] > start for window in report.observations['client_timing_health']['windows'])}
+    expected_first_output = 'inconclusive' if delayed_ids else 'pass'
+    assert first_output.status == expected_first_output, first_output.model_dump()
+    if delayed_ids:
+        assert quality['status'] == first_output.metrics['reason_code'] == 'client_delayed'
+        assert set(quality['affected_request_ids']) == delayed_ids
+    else:
+        assert quality['status'] == 'qualified'
+    if client_stall:
+        assert delayed_ids
     if mode == 'healthy':
-        assert outcome.status == report.overall == 'pass', (
+        assert outcome.status == 'pass' and report.overall == expected_first_output, (
             outcome.model_dump(), report.abort_reason, completion)
         assert len(sustained) >= 5 and all(r.status == 'completed' and r.valid for r in sustained)
         assert outcome.metrics['sustained']['error_rate'] == 0
@@ -249,8 +284,6 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
     else:
         assert interrupted == 0
         assert sum(r.status == 'failed' for r in sustained) == 2
-    assert all(c.status == 'pass' for c in report.checks
-               if c.id in {'access', 'serving', 'first_output'})
 
 
 async def test_declared_gpu_count_reaches_assessment(monkeypatch):
