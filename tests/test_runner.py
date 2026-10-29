@@ -198,10 +198,21 @@ async def test_serial_timing_sample_remedy_changes_the_serial_sample_count(clien
     assert next(c for c in enough.checks if c.id == check_id).status == "pass"
 
 
-async def test_serial_generation_measurement_remedy_does_not_raise_concurrency(client):
-    report = await runner.run_suite(config(checks=["generation"], stream=False,
-        limits=Limits(min_samples=2, stream_gap_ms=1000)))
-    check = next(c for c in report.checks if c.id == "generation")
+def test_serial_generation_measurement_remedy_does_not_raise_concurrency():
+    from tests.test_timing import request
+
+    settings = config(checks=["generation"], stream=False,
+        limits=Limits(min_samples=2, stream_gap_ms=1000))
+    state = runner._Run(settings, None, None)
+    # This remedy assumes qualified timing; live client-delay behavior is tested separately.
+    state.records = [request(f"generation-{index}", start=index * 2000).model_copy(update={
+        "target": "service", "stream": False, "answer_chunks": 0,
+    }) for index in range(2)]
+    check = next(c for c in runner._checks(state, settings.targets[0]) if c.id == "generation")
+    assert check.metrics["timing_quality"]["status"] == "qualified"
+    assert check.metrics["completed"] == 2
+    assert check.metrics["measured_gap_samples"] == 0
+    assert check.metrics["missing_timing_metrics"] == ["stream_gap_ms"]
     assert check.status == "inconclusive"
     assert "stream: true" in check.summary and "buffering" in check.summary
     assert "concurrency of at least 2" not in check.summary
