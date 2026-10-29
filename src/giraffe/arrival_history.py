@@ -4,14 +4,14 @@ import math
 
 from .deployment import fixture_hash
 from .fixtures import FIXTURE_VERSION
-from .load_test import point_shapes, settings_sets, test_points
+from .load_test import admission_limit, point_shapes, settings_sets, test_points
 from .models import RunConfig
 
 
 def workload_keys(config):
     if config.custom_fixtures:
         return {}
-    shared = fixture_hash({"version": 2, "fixtures": FIXTURE_VERSION,
+    shared = fixture_hash({"version": 3, "fixtures": FIXTURE_VERSION, "proxy": config.proxy,
         "request_source": config.request_source,
         "request_pack": config.request_pack.model_dump(mode="json") if config.request_source == "request_pack" and config.request_pack else None,
         "request_options": config.request_options, "stream": config.stream,
@@ -30,6 +30,8 @@ def workload_keys(config):
     for source, settings in settings_sets(config.load_test):
         values = settings.model_dump(mode="json")
         values.pop("pass_criteria", None)
+        # Other rate points can change the automatic pool used at this point.
+        values["admission_limit"] = admission_limit(config, settings)
         values["patterns"].pop("rates", None)
         settings_keys[source] = fixture_hash(values)
     return {point["id"]: fixture_hash({"shared": shared, "settings": settings_keys[point["source"]],

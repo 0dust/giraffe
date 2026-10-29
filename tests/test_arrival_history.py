@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from giraffe.latency import load_observations
+from giraffe.load_test import admission_limit, settings_sets
 from giraffe.load_test import test_points as points
 from giraffe.models import RunConfig, RunReport
 from giraffe.planning import request_plan
@@ -33,10 +34,10 @@ def config():
     )
 
 
-def save(root, cfg=None, *, age=0, folder="previous", sent=4):
+def save(root, cfg=None, *, age=0, folder="previous", sent=4, source="primary"):
     cfg = cfg or config()
     timestamp = (datetime.now(timezone.utc) - timedelta(days=age)).isoformat()
-    point = points(cfg.load_test)[0]
+    point = next(point for point in points(cfg.load_test) if point["source"] == source)
     point["groups"] = [
         {
             "shape": "short_short",
@@ -130,6 +131,69 @@ def test_incompatible_history_is_unknown(tmp_path, change):
     elif change == "scorer":
         cfg.request_options = {"temperature": 0.7}
     assert all(row["status"] == "unknown" for row in plan(tmp_path, cfg)["arrival_history"])
+
+
+@pytest.mark.parametrize("saved_proxy,planned_proxy", [
+    (None, "http://proxy-a.local:8080"),
+    ("http://proxy-a.local:8080", None),
+    ("http://proxy-a.local:8080", "http://proxy-b.local:8080"),
+])
+def test_proxy_route_change_does_not_reuse_persisted_history(tmp_path, saved_proxy, planned_proxy):
+    cfg = RunConfig.model_validate({**config().model_dump(mode="json"), "proxy": saved_proxy})
+    save(tmp_path, cfg)
+    assert plan(tmp_path, cfg)["arrival_history"][0]["status"] == "warning"
+
+    changed = RunConfig.model_validate({**cfg.model_dump(mode="json"), "proxy": planned_proxy})
+    row = plan(tmp_path, changed)["arrival_history"][0]
+    assert row["status"] == "unknown"
+    assert "completion_p95_ms_by_shape" not in row
+    assert "suggested_trial_rate" not in row
+
+    # The new route contributes only a hash to history, not a persisted proxy URL.
+    summary = json.loads((tmp_path / "previous" / ".web.json").read_text())["latency_summary"]
+    assert "proxy-a.local" not in json.dumps(summary)
+    assert "proxy-b.local" not in json.dumps(summary)
+
+
+@pytest.mark.parametrize("concurrency,before_rates,after_rates,limits,status", [
+    (None, [1], [1, 100], (1, 100), "unknown"),
+    (None, [1, 100], [1], (100, 1), "unknown"),
+    (None, [1, 100], [1, 50, 100], (100, 100), "warning"),
+    (4, [1], [1, 100], (4, 4), "warning"),
+])
+@pytest.mark.parametrize("source", ["primary", "legacy_0_arrivals"])
+def test_rate_list_reuses_history_only_with_same_admission_limit(
+    tmp_path, concurrency, before_rates, after_rates, limits, status, source,
+):
+    values = config().model_dump(mode="json")
+    values["concurrency"] = concurrency
+    settings = values["load_test"]
+    settings["patterns"]["constant"]["enabled"] = False
+    settings["patterns"]["poisson"]["enabled"] = True
+    settings["patterns"]["rates"] = before_rates
+    settings["request_timeout_seconds"] = 1
+    if source != "primary":
+        settings.pop("migrated_tests")
+        values["load_test"] = config().load_test.model_dump(mode="json")
+        values["load_test"]["migrated_tests"] = [{"source": "arrivals", "settings": settings}]
+    previous = RunConfig.model_validate(values)
+    save(tmp_path, previous, source=source)
+    point_id = next(point["id"] for point in points(previous.load_test) if point["source"] == source)
+    old_row = next(row for row in plan(tmp_path, previous)["arrival_history"]
+                   if row["point_id"] == point_id)
+    assert old_row["status"] == "warning"
+
+    settings["patterns"]["rates"] = after_rates
+    current = RunConfig.model_validate(values)
+    assert (admission_limit(previous, dict(settings_sets(previous.load_test))[source]),
+            admission_limit(current, dict(settings_sets(current.load_test))[source])) == limits
+    row = next(row for row in plan(tmp_path, current)["arrival_history"] if row["point_id"] == point_id)
+    assert row["status"] == status
+    if status == "warning":
+        assert row["run_id"] == "previous"
+        assert row["suggested_trial_rate"] == 0.5
+    else:
+        assert "suggested_trial_rate" not in row
 
 
 @pytest.mark.parametrize("kind", ["missing", "stale", "unknown_deployment", "malformed"])
