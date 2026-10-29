@@ -12,6 +12,23 @@ from tests.test_reporting import make_report
 from tests.test_ux_results import run_render_checks
 
 
+def assert_rendered_comparison_label(target, expected, *, conditions=()):
+    run_render_checks(
+        "const target=" + json.dumps(target) + ";const expected=" + json.dumps(expected)
+        + ";const conditions=" + json.dumps(conditions) + ";" + r"""
+const value=report([],{conditions,baseline:{targets:[target]}});
+$('#main').innerHTML=renderComparison(value);
+const heading=$('.comparison-group-heading');
+assert(heading);
+assert(heading.textContent.endsWith(' · '+expected),heading.textContent);
+if(expected.includes('<')){
+ assert(heading.innerHTML.includes('&lt;'));
+ assert.equal(heading.querySelector('condition'),null);
+}
+""", dom=True,
+    )
+
+
 @pytest.mark.parametrize(
     "scenario,label",
     [
@@ -39,16 +56,8 @@ def test_html_comparison_group_header_matches_ui_condition_label(scenario, label
     ).removeprefix("local · ")
     assert header == label
     condition = condition_for(scenario)
-    run_render_checks(
-        "const target="
-        + json.dumps(target)
-        + ";const condition="
-        + json.dumps(condition)
-        + ";"
-        + r"""
-const value=report([],{conditions:[{target:'local',condition}]});
-assert.equal(comparisonConditionGroups(target,value)[0].name,EXPECTED);
-""".replace("EXPECTED", json.dumps(header))
+    assert_rendered_comparison_label(
+        target, header, conditions=[{"target": "local", "condition": condition}],
     )
 
 
@@ -114,19 +123,13 @@ def test_html_comparison_fallback_matches_ui_without_saved_condition_metadata(sc
     target = {"target": "local", "comparisons": [{"scenario": scenario, "metric": "latency_ms"}]}
     html = _baseline_table_html({"targets": [target]})
     assert f"local · {label}</th>" in html
-    run_render_checks(
-        "const target="
-        + json.dumps(target)
-        + ";"
-        + "assert.equal(comparisonConditionGroups(target,report([]))[0].name,"
-        + json.dumps(label)
-        + ");"
-    )
+    assert_rendered_comparison_label(target, label)
 
 
 def test_html_comparison_preserves_custom_condition_label_and_escapes_it():
     report = make_report(count=1)
     report.conditions = [
+        {"target": "other", "condition": {"id": "custom_c2", "label": "Another target"}},
         {
             "target": "local",
             "condition": {"id": "custom_c2", "label": "Custom <condition> · 2 at once"},
@@ -135,11 +138,4 @@ def test_html_comparison_preserves_custom_condition_label_and_escapes_it():
     target = {"target": "local", "comparisons": [{"scenario": "custom_c2", "metric": "latency_ms"}]}
     html = _baseline_table_html({"targets": [target]}, report)
     assert "local · Custom &lt;condition&gt;</th>" in html
-    run_render_checks(
-        "const target="
-        + json.dumps(target)
-        + ";const conditions="
-        + json.dumps(report.conditions)
-        + ";"
-        + "assert.equal(comparisonConditionGroups(target,report([],{conditions}))[0].name,'Custom <condition>');"
-    )
+    assert_rendered_comparison_label(target, "Custom <condition>", conditions=report.conditions)

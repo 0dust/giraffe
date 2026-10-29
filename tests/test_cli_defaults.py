@@ -260,21 +260,26 @@ def test_piped_command_has_no_broken_pipe_traceback(arguments):
     assert "BrokenPipe" not in error and "Traceback" not in error
 
 
-async def test_sigint_sets_the_runner_user_stop_event_and_removes_handlers(monkeypatch):
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
+async def test_sigint_sets_the_runner_user_stop_event_and_removes_handlers(monkeypatch, stop_signal):
     loop = asyncio.get_running_loop()
     handlers, removed = {}, []
     monkeypatch.setattr(loop, "add_signal_handler", lambda sig, callback: handlers.__setitem__(sig, callback))
     monkeypatch.setattr(loop, "remove_signal_handler", removed.append)
 
+    partial = report(abort_reason="cancelled by user")
+
     async def run(config, *, progress, stop_event):
         assert not stop_event.is_set()
-        handlers[signal.SIGINT]()
+        handlers[stop_signal]()
         assert stop_event.is_set()
-        return report(abort_reason="cancelled by user")
+        return partial
 
     monkeypatch.setattr("giraffe.runner.run_suite", run)
-    result = await _run(RunConfig(targets=[{"name": "local", "url": "http://server", "model": "tiny"}]))
-    assert result.abort_reason == "cancelled by user"
+    with pytest.raises(asyncio.CancelledError) as interrupted:
+        await _run(RunConfig(targets=[{"name": "local", "url": "http://server", "model": "tiny"}]))
+    assert interrupted.value.giraffe_report is partial
+    assert partial.abort_reason == "cancelled by user"
     assert set(handlers) == set(removed) == {signal.SIGINT, signal.SIGTERM}
 
 
