@@ -10,7 +10,7 @@ assert.match(html,/<h1>5 checks passed<\/h1>/);
 assert.match(html,/class="button primary" data-action="show-comparison">Show comparison/);
 assert.doesNotMatch(html,/Save a baseline|data-action="baseline-dialog"|Selected acceptance checks passed/);
 const failed=detail(report([check('correctness','fail',{evidence_ids:['bad']})],{overall:'fail',baseline:{status:'fail'},requests:[{id:'bad',score:false,status:'completed'}]}));
-assert.match(failed,/class="button primary" data-action="show-comparison"/);assert.doesNotMatch(failed,/data-action="baseline-dialog"/);
+assert.match(failed,/class="button primary" data-action="show-failing"/);assert.doesNotMatch(failed,/data-action="baseline-dialog"/);
 ''')
 
 
@@ -23,8 +23,8 @@ const rows=[
 ];
 const value=report([],{baseline:{status:'pass',targets:[{target:'local',comparisons:rows,reason_details:[{code:'setting_differs',key:'request_timeout_seconds',baseline:15,current:300,text:'Changed backend wording.'}]}]}});
 state.detail={id:'r',report:value};const html=renderComparison(value);
-assert.equal((html.match(/data-comparison-condition=/g)||[]).length,2);
-assert.match(html,/<th[^>]*>Metric<\/th>/);assert.match(html,/Not comparable \(1\)/);
+assert.equal((html.match(/data-comparison-group=/g)||[]).length,3);
+assert.match(html,/<th[^>]*>Metric<\/th>/);assert.match(html,/data-label="Verdict">not comparable/);
 assert.match(html,/Only one sample/);assert.match(html,/Request timeout differs from baseline \(5 m vs 15 s\)/);
 assert.doesNotMatch(html,/Endpoint access · Generation speed|Changed backend wording|Run setting|request_timeout_seconds/);
 value.baseline.targets[0].comparisons=[];

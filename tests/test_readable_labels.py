@@ -169,7 +169,8 @@ assert(renderRequestTable(records,createRequestTableState(),{conditionName:evide
 assert.match(renderRequestTable(records,createRequestTableState(),{conditionName:evidenceConditionName}),/data-request="second"/);
 assert(renderBeeswarm(records.map(r=>({...r,elapsed_ms:1}))).includes('aria-label="Canonical test &lt;name&gt;. Request 2 of 2'));
 assert(renderPhases([{event:'scenario_started',scenario:condition.id,target:'local'}]).includes('Canonical test &lt;name&gt;'));
-assert(comparisonConditionTable(comparisonConditionGroups({target:'local',comparisons:[{scenario:condition.id,target:'local',metric:'latency_ms'}]},saved)).includes('Canonical test &lt;name&gt;'));
+assert(renderComparison({...saved,baseline:{targets:[{target:'local',comparisons:[
+  {check:'serving',scenario:condition.id,target:'local',metric:'latency_ms',status:'pass',baseline:10,current:10}]}]}}).includes('Canonical test &lt;name&gt;'));
 nodes['#request-dialog']={innerHTML:'',showModal(){}};openRequest('second');assert(nodes['#request-dialog'].innerHTML.includes('Canonical test &lt;name&gt;'));
 """)
 

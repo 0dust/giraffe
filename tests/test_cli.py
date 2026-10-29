@@ -449,4 +449,6 @@ def test_cli_zero_disables_endpoint_watchdog_and_help_explains_it():
     config = configuration(parsed.parse_args([
         "run", "--url", "http://localhost", "--model", "test", "--unresponsive-after-failures", "0"]))
     assert config.unresponsive_after_failures == 0
-    assert "0 disables" in parsed._subparsers._group_actions[0].choices["run"].format_help()
+    run = parsed._subparsers._group_actions[0].choices["run"]
+    run.show_advanced = True
+    assert "0 disables" in run.format_help()

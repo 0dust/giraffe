@@ -39,7 +39,7 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
-      - run: uv sync --locked --group release --extra dev --extra sglang-tracing
+      - run: uv sync --locked --group release --extra dev --extra hf-tokenizer --extra sglang-tracing
       - name: Check release source
         if: github.event_name != 'pull_request'
         run: |

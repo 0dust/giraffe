@@ -86,13 +86,24 @@ Run this in your terminal:
 giraffe ui
 ```
 
-Open **[localhost:8765](http://127.0.0.1:8765)**, enter your endpoint and model, choose checks, then **Launch**. Keep the terminal open; **Ctrl+C** stops the UI. Use `--port` to choose a different port.
+Open the access link printed in the terminal (it contains a per-launch token), enter your endpoint and model, choose checks, then **Launch**. Keep the terminal open; **Ctrl+C** stops the UI. Use `--port` to choose a different port.
 
 ## Inference engines
 
 Connect through the engine’s **OpenAI-compatible chat API**. Discovery, metrics and server-side evidence vary by engine.
 
-Download a YAML configuration from the links below into a local `examples/` directory. Engine files define an endpoint, model and metrics profile, and inherit the shared default checks and limits. Dedicated workload examples show additional tests.
+Generate a starter configuration from your installed package:
+
+```sh
+giraffe init --engine vllm --url http://127.0.0.1:8000/v1
+giraffe validate --config giraffe.yaml
+giraffe run --config giraffe.yaml --html
+```
+
+`init` discovers the model when exactly one is served; otherwise edit the model
+placeholder. It refuses to overwrite `giraffe.yaml` without `--force`.
+Supported engines are `ollama`, `vllm`, `sglang`, `llamacpp`, `tgi`, `lmdeploy`
+and `tensorrt-llm`. The repository also has detailed examples:
 
 | Engine | YAML configuration |
 | --- | --- |
@@ -104,14 +115,57 @@ Download a YAML configuration from the links below into a local `examples/` dire
 | LMDeploy | [`lmdeploy.yaml`](https://github.com/0dust/giraffe/blob/main/examples/lmdeploy.yaml) |
 | Hugging Face TGI | [`tgi.yaml`](https://github.com/0dust/giraffe/blob/main/examples/tgi.yaml) |
 
-Open the file for your engine and edit its URL, model, checks and limits. From the directory containing `examples/`, pass that file to `--config`. For example, after editing `examples/vllm.yaml`:
+Edit the generated `giraffe.yaml` for your endpoint, model, checks and limits:
 
 ```sh
-giraffe run --config examples/vllm.yaml \
+giraffe run --config giraffe.yaml \
   --output runs/before --html
 ```
 
 Giraffe reads the run settings from YAML; `--output` chooses where to save the results, and `--html` adds an HTML report.
+
+## CI and GitHub Actions
+
+Use `--quiet --junit junit.xml --summary-md summary.md` for CI output. Saved
+runs support `giraffe report runs/before --junit junit.xml --summary-md summary.md`.
+`--fail-on inconclusive` is the default; `--fail-on fail` accepts an inconclusive
+verdict with a stderr note. `--fail-on never` accepts failed and inconclusive
+verdicts, including baseline regressions, with a stderr note. Blocked runs and
+errors keep their exit codes.
+
+The composite Action installs the selected package release, adds a job summary
+and uploads run artifacts, including when checks fail. Choose a package version
+containing these CLI options:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: 0dust/giraffe@main
+    with:
+      url: http://127.0.0.1:8000/v1
+      model: your-model
+      checks: access,serving,correctness,first_output
+      fail-on: inconclusive
+      python-version: '3.12'
+      version: latest
+```
+
+`run --help` shows common options; `run --help-all` includes advanced settings.
+Manage saved runs with `giraffe runs list`, `runs cleanup` and `runs keep`.
+
+The default install includes the CLI, UI and built-in tiktoken sizing. To use a
+model's Hugging Face tokenizer, install `giraffe-llm[hf-tokenizer]`.
+
+For Docker, build with `docker build -t giraffe .`, then run:
+
+```sh
+docker run --rm -p 127.0.0.1:8765:8765 giraffe ui --host 0.0.0.0
+```
+
+Open the printed token link (wildcard binds use `localhost` in the link). The
+published port is accessible only from the Docker host. To expose it beyond
+localhost, change the published address deliberately and use a trusted network.
+Keep the access link private; it permits run control and access to saved reports.
 
 ## Test behavior under load
 

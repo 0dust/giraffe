@@ -1,5 +1,7 @@
 """Report navigation and measurement selection without a browser server."""
 
+import pytest
+
 from tests.test_ui_navigation import run_browser_script
 from tests.test_ux_results import run_render_checks
 
@@ -45,9 +47,9 @@ assert.match(cards[2].textContent,/12.5 tok\/s/);assert.match(cards[2].textConte
 assert.match($('#performance-window').textContent,/Full request window · 0–10 s · 8 requests/);
 assert.match($('#performance-window').textContent,/Stage C4 · 2–6 s · 3 requests/);
 assert.equal($('#performance-target').querySelectorAll('option').length,2);
-assert.equal($('#report-sections').hidden,false);assert.equal($('#report-sections').querySelectorAll('a').length,14);for(const section of ['Findings','Checks','Conditions','Requests','Baseline','Performance overview'])assert($('#report-sections').textContent.includes(section));
+assert.equal($('#report-sections').hidden,false);assert.equal($('#report-sections').querySelectorAll('a').length,9);
 assert.match($('#report-performance').textContent,/View results/);
-chooseReportTab('results');assert.equal($('#report-sections').hidden,false);
+chooseReportTab('results');assert.equal($('#report-sections').hidden,true);
 assert.equal($('#report-performance').hidden,true);assert.equal($('#report-results').hidden,false);
 """, dom=True)
 
@@ -74,9 +76,9 @@ const config={targets:[{name:'local',model:'m'}],max_requests:4,concurrency:2};
 function live(id){state.detail={id,state:'running',config,progress:{},events:[],live_requests:[]};renderDetail();}
 function finish(){state.detail={...state.detail,state:'completed',report:report([check('correctness','pass')])};renderDetail();}
 live('automatic');assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
-assert.equal($('#report-sections').hidden,false);finish();
+assert.equal($('#report-sections').hidden,true);finish();
 assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
-assert.equal($('#report-sections').hidden,false);
+assert.equal($('#report-sections').hidden,true);
 chooseReportTab('results');renderDetail();renderDetail();
 assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
 live('explicit-results');chooseReportTab('results');finish();
@@ -284,7 +286,7 @@ def test_inspect_comparison_opens_preserved_disclosure_on_results_tab():
     run_render_checks(r"""
 (async()=>{
  const value=report([check('access','pass')],{overall:'fail',baseline:{status:'fail',rows:[]}});
- detail(value);const reference=$('#report-baseline-reference');assert(!reference.open);
+ detail(value);const reference=$('#report-baseline-reference');assert(reference.open);reference.open=false;
  await listeners.click({target:$('[data-tab="baseline"]'),preventDefault(){}});
  assert.equal(reportView.tab,'results');assert.equal(reference.open,true);
  assert.equal(document.activeElement,$('summary',reference));
@@ -350,3 +352,134 @@ await page.run(`
 })()
 `);
 """)
+
+
+def test_results_sections_navigate_without_reloading_and_reopen_comparison():
+    run_render_checks(r"""
+(async()=>{
+const baseline={run_id:'reference',status:'inconclusive',targets:[{target:'local',load_test:{status:'inconclusive'},comparisons:[
+  {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'},
+  {check:'load',scenario:'same',metric:'correctness_rate',baseline:.5,current:.6,status:'pass'},
+  {check:'load',scenario:'same',metric:'error_rate',baseline:0,current:0,status:'pass'}]}]};
+detail(report([check('load','fail')],{baseline}));chooseReportTab('results');
+const links=[...$('#report-sections').querySelectorAll('a')];
+assert.equal(links.length,10);
+for(const link of links){
+  assert.equal(link.dataset.reportSectionTab,'results');
+  assert($('#results-'+link.dataset.reportSection));
+  assert.deepEqual(reportRoute(link.getAttribute('href')),{id:'saved-run',tab:'results',section:link.dataset.reportSection});
+}
+assert.equal($('#results-section-jump').querySelectorAll('option').length,10);
+assert.match($('#baseline-content').innerHTML,/data-action="compare-saved"/);
+assert.equal($('#report-sections').querySelectorAll('ul ul a').length,5);
+assert.equal($('#results-timing').closest('.report-result-section').id,'report-baseline-reference');
+assert.equal($('#results-configuration').closest('#report-baseline-reference'),null);
+assert.equal($('#results-checks').closest('#report-baseline-reference'),null);
+assert.doesNotMatch($('#baseline-content').textContent,/Assessment details|load and regression assessment/);
+const method=[...$('#baseline-content').querySelectorAll('details')].find(node=>node.querySelector('summary')?.textContent==='How comparison is done');
+assert(method);assert.equal(method.open,false);assert(method.closest('.comparison-filters'));assert.equal(method.closest('.comparison-section'),null);
+api=async()=>{throw Error('Section navigation must not reload the run');};
+$('#report-baseline-reference').open=false;
+const jump=$('#results-section-jump');jump.value='timing';
+listeners.change({target:jump});await route();
+assert.equal(location.hash,'#runs/saved-run/results/timing');
+assert.equal($('#report-baseline-reference').open,true);
+assert.equal(reportView.tab,'results');
+assert.equal($('#results-section-jump').value,'timing');
+$('#report-baseline-reference').open=false;
+jump.value='configuration';listeners.change({target:jump});await route();
+assert.equal($('#report-config-reference').open,true);
+assert.equal($('#report-baseline-reference').open,false);
+assert.equal($('.run-diagnostics').open,false);jump.value='resources';listeners.change({target:jump});await route();
+assert.equal($('.run-diagnostics').open,true);assert.equal($('#report-baseline-reference').open,false);
+jump.value='load-acceptance';listeners.change({target:jump});await route();
+assert.equal(location.hash,'#runs/saved-run/results/load-acceptance');
+assert.equal(reportView.tab,'results');assert.equal($('#report-baseline-reference').open,true);
+assert.equal($('#results-section-jump').value,'load-acceptance');
+$('#report-baseline-reference').open=false;
+const link=$('#report-sections').querySelector('[data-report-section="load-acceptance"]');
+listeners.click({target:link,preventDefault(){}});await route();
+assert.equal(reportView.tab,'results');assert.equal($('#report-baseline-reference').open,true);
+})()
+""", dom=True)
+
+
+def test_hyphenated_result_deep_links_survive_actual_hashchange_without_reloading():
+    run_browser_script(r"""
+const page=browser(defaults,'#runs/saved%20run/results/load-acceptance');await page.run('init()');
+assert.equal(page.run('state.detail.id'),'saved run');assert.equal(page.run('reportView.tab'),'results');
+const count=()=>page.paths.filter(path=>path==='/api/runs/saved%20run').length;
+const calls=count(),version=page.run('state.routeVersion');
+for(const hash of ['#runs/saved%20run/performance/timing','#runs/saved%20run/results/load-acceptance']){
+  page.location.hash=hash;await page.windowListeners.hashchange();
+}
+assert.equal(page.run('reportView.tab'),'results');
+assert.equal(page.run('reportRoute().section'),'load-acceptance');
+assert.equal(page.run('state.routeVersion'),version);assert.equal(count(),calls);
+""")
+
+
+def test_invalid_report_hashes_use_runs_view_without_loading_or_throwing():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+for(const hash of [
+  '#runs/saved/results/unknown-section','#runs/saved/results/load--acceptance',
+  '#runs/saved/performance/load-acceptance','#runs/saved/results/server',
+  '#runs/saved/unknown','#runs/saved/results/timing/extra','#runs/saved/results/',
+  '#runs//results','#runs/%E0%A4%A/results',
+]){
+  const before=page.paths.length;page.location.hash=hash;
+  await assert.doesNotReject(()=>page.windowListeners.hashchange(),hash);
+  assert.equal(page.run('reportRoute()'),null,hash);
+  assert.equal(page.run('state.reportRouteActive'),false,hash);
+  assert(page.paths.slice(before).includes('/api/runs'),hash);
+  assert(!page.paths.slice(before).some(path=>path.startsWith('/api/runs/')),hash);
+}
+""")
+
+
+@pytest.mark.parametrize("tab", ["results", "performance"])
+def test_comparison_filters_work_in_both_report_tabs_and_keep_visible_focus(tab):
+    run_render_checks(PERFORMANCE + r"""
+const baseline={run_id:'reference',status:'inconclusive',acceptance:{baseline:'pass',current:'fail'},targets:[{target:'local',comparisons:[
+  {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'},
+  {check:'generation',scenario:'same',metric:'latency_ms',baseline:10,current:10,status:'pass'}]}]};
+detail(report([check('load','fail')],{baseline,performance:performanceFixture()}));chooseReportTab(TAB);
+const panel=()=>$('#report-'+TAB),controls=()=>panel().querySelectorAll('.comparison-filters select');
+const rows=()=>panel().querySelectorAll('[data-metric]');
+assert.equal(rows().length,2);assert.equal(controls().length,2);
+let control=controls()[0];control.value='with_warnings';listeners.change({target:control});
+assert.equal(rows().length,1);assert.match(rows()[0].textContent,/Timing warning/);
+assert.equal(controls()[0].value,'with_warnings');assert.equal(document.activeElement,controls()[0]);
+control=controls()[1];control.value='generation';listeners.change({target:control});
+assert.equal(rows().length,0);assert.match(panel().textContent,/No measurements match/);
+assert.equal(controls()[1].value,'generation');assert.equal(document.activeElement,controls()[1]);
+control=controls()[0];control.value='without_warnings';listeners.change({target:control});
+assert.equal(rows().length,1);assert.match(rows()[0].textContent,/no material change/);
+chooseReportTab(TAB==='results'?'performance':'results');
+const other=$('#report-'+reportView.tab),otherControls=other.querySelectorAll('.comparison-filters select');
+assert.equal(other.querySelectorAll('[data-metric]').length,1);
+assert.equal(otherControls[0].value,'without_warnings');assert.equal(otherControls[1].value,'generation');
+assert.match(other.textContent,/Baseline: Passed/);assert.match(other.textContent,/Current: Failed/);
+""".replace('TAB', repr(tab)), dom=True)
+
+
+def test_results_section_links_reveal_results_after_performance_comparison_is_loaded():
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+const baseline={run_id:'reference',status:'inconclusive',targets:[{target:'local',load_test:{status:'inconclusive'},comparisons:[
+  {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'}]}]};
+detail(report([check('load','fail')],{baseline,performance:performanceFixture()}));
+chooseReportTab('performance');assert.match($('#performance-baseline').textContent,/Timing warning/);
+chooseReportTab('results');api=async()=>{throw Error('Section navigation must not reload the run');};
+for(const section of ['timing','load-acceptance']){
+  $('#report-baseline-reference').open=false;
+  const link=$('#report-sections').querySelector('[data-report-section="'+section+'"]');
+  await listeners.click({target:link,preventDefault(){}});await route();
+  assert.equal(reportView.tab,'results');assert.equal($('#report-performance').hidden,true);
+  assert.equal($('#report-baseline-reference').open,true);
+  assert.equal($('#results-'+section).closest('[role="tabpanel"]').id,'report-results');
+}
+const ids=$$('[id]').map(node=>node.id);assert.equal(new Set(ids).size,ids.length);
+})()
+""", dom=True)
