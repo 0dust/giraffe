@@ -1032,10 +1032,18 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"Warning: {warning}", file=sys.stderr)
         report = _retained(report)
         exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+        # The aggregate verdict prioritizes failed checks over blocked targets.
+        # A client error can also occur after all of its checks already failed.
+        operational_error = (any(check.required and check.status == "blocked" for check in report.checks)
+                             or any(target.get("client_error")
+                                    for target in report.observations.get("targets", {}).values()))
+        if cancelled is None and operational_error:
+            exit_code = 3
         _ci_outputs(report, args, directory)
         policy = getattr(args, "fail_on", "inconclusive")
-        if cancelled is None and ((report.overall == "inconclusive" and policy in {"fail", "never"})
-                                  or (report.overall == "fail" and policy == "never")):
+        if cancelled is None and not operational_error and (
+                (report.overall == "inconclusive" and policy in {"fail", "never"})
+                or (report.overall == "fail" and policy == "never")):
             exit_code = 0
             print(f"Note: {report.overall} verdict accepted by --fail-on {policy}.", file=sys.stderr)
         summary = report.observations.get("summary")

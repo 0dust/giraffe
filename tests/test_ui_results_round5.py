@@ -1,6 +1,12 @@
 """Round-five qualification and evidence wording regressions."""
+import json
+from types import SimpleNamespace
+
 import pytest
 
+from giraffe.load_test import measurements, score_group, test_points as load_points
+from giraffe.timing import TimingHealth
+from tests.test_load_test_phase_a import config, record
 from tests.test_ux_results import run_render_checks
 
 
@@ -13,6 +19,62 @@ const value=report([check('tools','fail',{evidence_ids:['client','wrong'],metric
 state.selectedCheck='local:tools';state.failingRequestsOnly=true;const html=renderCheck(value.checks[0],value);
 assert.doesNotMatch(html,/data-request="client"|Too slow/);assert.match(html,/data-request="wrong"/);
 """)
+
+
+@pytest.mark.parametrize("source", ["point", "condition"])
+@pytest.mark.parametrize("wrong_answer", [False, True])
+def test_qualified_load_failures_survive_partial_client_delay(source, wrong_answer):
+    settings = config()
+    settings.load_test.pass_criteria.max_completion_ms = 100
+    records = [
+        record().model_copy(update={
+            "id": "slow", "elapsed_ms": 200, "dispatch_ms": 0, "completed_ms": 200,
+        }),
+        record().model_copy(update={
+            "id": "delayed", "elapsed_ms": 200, "dispatch_ms": 1000, "completed_ms": 1200,
+        }),
+        record().model_copy(update={
+            "id": "other", "score": not wrong_answer,
+            "dispatch_ms": 2000, "completed_ms": 2020,
+        }),
+    ]
+    health = TimingHealth(0)
+    health.windows = [{"start_ms": 1000, "end_ms": 1200, "lag_ms": 150}]
+    run = SimpleNamespace(records=records, max_lag_ms=150, timing_health=health)
+    point = load_points(settings.load_test)[0]
+    point.update(
+        sending_start_ms=0, sending_end_ms=2100, delivered_window_seconds=2.1,
+        observation_seconds=2.1, cut_short=False, load_qualified=True,
+    )
+    group = score_group(settings.load_test, point, measurements(
+        run, settings.targets[0], settings.load_test, point, records, "short_short",
+    ), records)
+    assert group["status"] == "fail"
+    assert group["timing_violations"] == ["slow"]
+    assert group["unattributed_timing_violations"] == ["delayed"]
+    assert group["timing_quality"]["status"] == "client_delayed"
+
+    fixture = json.dumps({
+        "source": source, "wrongAnswer": wrong_answer,
+        "point": {**point, "groups": [group]},
+        "records": [row.model_dump(mode="json") for row in records],
+    })
+    run_render_checks("const fixture=" + fixture + ";" + r"""
+(async()=>{
+ const group=fixture.point.groups[0],metrics={timing_quality:group.timing_quality};
+ if(fixture.source==='point')metrics.points=[fixture.point];
+ const value=report([check('load','fail',{metrics,evidence_ids:fixture.records.map(row=>row.id)})],{overall:'fail',requests:fixture.records});
+ if(fixture.source==='condition')value.conditions=[{target:'local',check_id:'load',metrics:group}];
+ detail(value);
+ assert.deepEqual([...checkViolationIds(value.checks[0],value)],['slow']);
+ const action=$('[data-action="show-failing"]');assert(action,'qualified timing failures need an action');
+ await listeners.click({target:action});
+ const table=$('.check-detail .evidence-table');
+ assert(table.querySelector('[data-request="slow"]'),'independently slow response stays visible');
+ assert.equal(table.querySelector('[data-request="delayed"]'),null);
+ assert.equal(Boolean(table.querySelector('[data-request="other"]')),fixture.wrongAnswer);
+})()
+""", dom=True)
 
 
 @pytest.mark.parametrize('status', ['failed', 'timeout'])

@@ -1,4 +1,5 @@
 """Socket-free CLI contracts for CI, init and discoverable help."""
+import asyncio
 import json
 import re
 
@@ -6,7 +7,7 @@ import pytest
 import yaml
 
 from giraffe.cli import main, parser
-from giraffe.models import RunReport
+from giraffe.models import CheckResult, RunConfig, RunReport
 
 
 @pytest.mark.parametrize('policy,verdict,expected', [
@@ -140,6 +141,93 @@ def test_never_does_not_remap_errors(failure, expected, tmp_path, monkeypatch, c
         monkeypatch.setattr('giraffe.cli._run', broken)
     assert main(arguments) == expected
     assert capsys.readouterr().err
+
+
+@pytest.mark.parametrize('policy', ['inconclusive', 'fail', 'never'])
+def test_failed_verdict_preserves_recorded_client_error(
+        policy, tmp_path, monkeypatch, capsys, local_tokenizer):
+    from tests.test_runner import FakeClient
+
+    class BrokenClient(FakeClient):
+        bad_target = 'wrong'
+
+        async def __aenter__(self):
+            if self.target.name == 'broken':
+                raise RuntimeError('client initialization defect')
+            return self
+
+    monkeypatch.setattr('giraffe.runner.LLMClient', BrokenClient)
+    config = RunConfig(config_version=2, checks=['correctness'], samples=2,
+                       targets=[{'name': name, 'url': 'http://server/v1', 'model': 'tiny'}
+                                for name in ['wrong', 'broken']])
+    source = tmp_path / 'config.json'
+    source.write_text(config.model_dump_json())
+    directory = tmp_path / 'run'
+    exit_code = main(['run', '--config', str(source), '--skip-preflight', '--quiet', '--json',
+                     '--output', str(directory), '--fail-on', policy])
+    captured = capsys.readouterr()
+    assert exit_code == 3
+    saved = json.loads((directory / 'report.json').read_text())
+    assert saved['overall'] == 'fail'
+    required = [check for check in saved['checks'] if check['required']]
+    assert any(check['status'] == 'fail' for check in required)
+    assert any(check['status'] == 'blocked' for check in required)
+    assert any('Internal error' in target.get('client_error', '')
+               for target in saved['observations']['targets'].values())
+    result = json.loads(captured.out)
+    assert result['outcome'] == 'fail' and result['exit_code'] == 3
+    assert 'verdict accepted' not in captured.err
+
+
+@pytest.mark.parametrize('verdict,required,client_error,expected', [
+    ('fail', True, False, 3), ('inconclusive', True, False, 3),
+    ('fail', False, False, 0), ('inconclusive', False, False, 0), ('pass', False, False, 0),
+    ('fail', False, True, 3), ('inconclusive', False, True, 3),
+])
+def test_never_distinguishes_required_and_optional_blockers(
+        verdict, required, client_error, expected, tmp_path, monkeypatch, capsys):
+    async def run(config, **kwargs):
+        return RunReport(run_id='blocked-check', started_at='now', finished_at='now',
+                         overall=verdict, manifest={'config': config.model_dump(mode='json')},
+                         checks=[CheckResult(id='tools', target='local', title='Tools',
+                                             status='blocked', required=required,
+                                             summary='Tool support unavailable')],
+                         observations={'targets': {'local': {
+                             'client_error': 'Internal error in Giraffe' if client_error else None}}})
+
+    async def prepare(*args):
+        pass
+
+    monkeypatch.setattr('giraffe.cli._run', run)
+    monkeypatch.setattr('giraffe.local_tokenizer.ensure_tokenizers', prepare)
+    assert main(['run', '--url', 'http://server/v1', '--model', 'tiny', '--skip-preflight',
+                 '--output', str(tmp_path / 'run'), '--fail-on', 'never', '--quiet']) == expected
+    captured = capsys.readouterr()
+    assert captured.out.startswith(verdict.upper())
+    assert ('verdict accepted' in captured.err) == (expected == 0 and verdict != 'pass')
+
+
+@pytest.mark.parametrize('with_partial_report', [False, True])
+def test_never_preserves_cancellation_exit(with_partial_report, tmp_path, monkeypatch, capsys):
+    async def run(config, **kwargs):
+        error = asyncio.CancelledError()
+        if with_partial_report:
+            error.giraffe_report = RunReport(
+                run_id='cancelled', started_at='now', finished_at='now', overall='fail',
+                manifest={'config': config.model_dump(mode='json')},
+                observations={'targets': {'local': {'client_error': 'Client setup failed'}}})
+        raise error
+
+    async def prepare(*args):
+        pass
+
+    monkeypatch.setattr('giraffe.cli._run', run)
+    monkeypatch.setattr('giraffe.local_tokenizer.ensure_tokenizers', prepare)
+    assert main(['run', '--url', 'http://server/v1', '--model', 'tiny', '--skip-preflight',
+                 '--output', str(tmp_path / 'run'), '--fail-on', 'never', '--quiet', '--json']) == 130
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)['exit_code'] == 130
+    assert 'verdict accepted' not in captured.err
 
 
 async def test_quiet_suppresses_actual_run_progress(monkeypatch, capsys):

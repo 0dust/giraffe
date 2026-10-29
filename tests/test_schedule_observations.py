@@ -34,7 +34,7 @@ async def test_partial_traffic_stage_records_observed_bounds_not_configured_dura
     fixture = RequestSpec(fixture_id="fixture", scenario="traffic", check_ids=["load"],
                           messages=[], scorer="none")
 
-    async def never_execute(spec):
+    async def never_execute(spec, finalize_record):
         raise AssertionError("Budget exhausted before dispatch")
 
     result = await run_stage(

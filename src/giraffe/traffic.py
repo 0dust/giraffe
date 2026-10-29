@@ -20,6 +20,11 @@ from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, Tr
 from .timing import qualify, qualified_violations
 
 
+AUTHORITATIVE_TERMINATION_REASONS = {
+    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "run_duration_limit",
+}
+
+
 class ScheduleObservation:
     """Record scheduler intent, independently of admission or actual occupancy.
 
@@ -190,7 +195,7 @@ async def run_stage(
     rate_rps: float,
     stage_index: int,
     fixtures: dict[str, list[RequestSpec]],
-    execute: Callable[[RequestSpec], Awaitable[RequestRecord | None]],
+    execute: Callable[[RequestSpec, Callable[[RequestRecord], None]], Awaitable[RequestRecord | None]],
     reserve_offer: Callable[[], bool],
     try_acquire: Callable[[], bool],
     release: Callable[[], None],
@@ -217,7 +222,8 @@ async def run_stage(
 
     ``traffic.max_in_flight`` must already be resolved against the global bound.
     ``execute`` uses the reserved slot without waiting for another semaphore and
-    must finish promptly after cancellation, returning its terminal record or
+    calls its second argument to annotate the terminal record before persisting
+    or returning it. It must finish promptly after cancellation, returning that record or
     attaching it as ``giraffe_record`` to the propagated CancelledError.
     ``on_drop`` reports reserved offers that never dispatch, including tasks
     cancelled before starting; unreserved schedule entries are not drops.
@@ -295,7 +301,7 @@ async def run_stage(
             if on_drop:
                 on_drop()
 
-    def retain(index: int, kind: str, offset: float, lag_ms: float, record: RequestRecord):
+    def annotate(kind: str, offset: float, lag_ms: float, record: RequestRecord):
         record.traffic_stage = stage_index
         record.traffic_rate_rps = rate_rps
         record.traffic_class = kind
@@ -308,7 +314,13 @@ async def run_stage(
         record.arrival_first_output_ms = (lag_ms + record.first_output_ms
                                            if record.first_output_ms is not None else None)
         record.arrival_elapsed_ms = lag_ms + record.elapsed_ms
-        records.append((index, record))
+        if record.status == "cancelled" and record.load_point is not None:
+            if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
+                record.error = (
+                    "overall run deadline reached" if drain_expired
+                    else "; ".join(reasons) or "run stopped"
+                )
+            record.load_point["cancellation_reason"] = record.error
 
     async def dispatch(index: int, kind: str, offset: float):
         nonlocal execution_errors
@@ -325,16 +337,16 @@ async def run_stage(
             })
             if run_start is not None:
                 spec.workload = {**spec.workload, "scheduled_ms": (started_at - run_start + offset) * 1000}
-            record = await execute(spec)
+            record = await execute(spec, lambda record: annotate(kind, offset, lag_ms, record))
             if record is None:
                 drop(index, "not_offered")
                 return
-            retain(index, kind, offset, lag_ms, record)
+            records.append((index, record))
         except asyncio.CancelledError as exc:
             outcomes[index] = "cancelled"
             record = getattr(exc, "giraffe_record", None)
             if record is not None:
-                retain(index, kind, offset, lag_ms, record)
+                records.append((index, record))
         except Exception:
             # Backend normally records exceptions. Keep a truthful failure if a
             # callback unexpectedly escapes without leaking transport text.
