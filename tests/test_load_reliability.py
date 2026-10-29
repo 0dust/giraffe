@@ -107,20 +107,27 @@ async def test_recovery_without_timing_acceptance_limit_passes_correct_answers(e
     assert result.metrics["latency_ratio"] is not None
 
 
-async def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):
-    def delay(spec, index):
-        return .07 if spec.scenario == "sustained" and index == 0 else .008
-    monkeypatch.setattr(endpoint, "delay", staticmethod(delay))
-    report = await runner.run_suite(config(checks=["recovery"], concurrency=3,
-        sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
-    sustained = [item for item in endpoint.calls if item[0].scenario == "sustained"]
-    assert len([item for item in sustained if item[1] < sustained[0][2]]) > 3
-    specs = [item[0] for item in sustained]
-    assert all(spec.scorer == "exact" and spec.expected is not None for spec in specs)
-    assert any(spec.input_chars >= 4096 for spec in specs)
-    assert any(len(spec.expected.split()) >= 32 for spec in specs)
-    assert len({spec.fixture_id for spec in specs}) >= 2
-    assert all(record.score is True for record in report.requests)
+def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
+        def delay(spec, index):
+            return .07 if spec.scenario == "sustained" and index == 0 else .008
+        monkeypatch.setattr(endpoint, "delay", staticmethod(delay))
+        report = await runner.run_suite(config(checks=["recovery"], concurrency=3,
+            sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+        sustained = [item for item in endpoint.calls if item[0].scenario == "sustained"]
+        assert sustained
+        assert len([item for item in sustained if item[1] < sustained[0][2]]) > 3
+        specs = [item[0] for item in sustained]
+        assert all(spec.scorer == "exact" and spec.expected is not None for spec in specs)
+        assert any(spec.input_chars >= 4096 for spec in specs)
+        assert any(len(spec.expected.split()) >= 32 for spec in specs)
+        assert len({spec.fixture_id for spec in specs}) >= 2
+        assert all(record.score is True for record in report.requests)
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_recovery_reserves_later_fixed_checks_and_caps_remaining_budget_share(endpoint, monkeypatch):
@@ -138,15 +145,21 @@ async def test_recovery_reserves_later_fixed_checks_and_caps_remaining_budget_sh
     assert report.abort_reason is None
 
 
-async def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(endpoint, monkeypatch):
-    monkeypatch.setattr(endpoint, "delay", staticmethod(
-        lambda spec, index: .06 if spec.scenario == "sustained" else .004))
-    report = await runner.run_suite(config(checks=["recovery"], concurrency=3, max_requests=5,
-        sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
-    result = check(report, "recovery")
-    assert result.metrics["sustained"]["attempted"] == 1
-    assert result.status == "inconclusive"
-    assert not report.observations["targets"]["service"]["sustained_complete"]
+def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(endpoint, monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
+        monkeypatch.setattr(endpoint, "delay", staticmethod(
+            lambda spec, index: .06 if spec.scenario == "sustained" else .004))
+        report = await runner.run_suite(config(checks=["recovery"], concurrency=3, max_requests=5,
+            sustained_seconds=.045, limits=Limits(recovery_max_ratio=10, min_samples=2)))
+        result = check(report, "recovery")
+        assert result.metrics["sustained"]["attempted"] == 1
+        assert result.status == "inconclusive"
+        assert not report.observations["targets"]["service"]["sustained_complete"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 
