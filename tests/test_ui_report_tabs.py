@@ -1,5 +1,7 @@
 """Report navigation and measurement selection without a browser server."""
 
+import pytest
+
 from tests.test_ui_navigation import run_browser_script
 from tests.test_ux_results import run_render_checks
 
@@ -434,3 +436,50 @@ for(const hash of [
   assert(!page.paths.slice(before).some(path=>path.startsWith('/api/runs/')),hash);
 }
 """)
+
+
+@pytest.mark.parametrize("tab", ["results", "performance"])
+def test_comparison_filters_work_in_both_report_tabs_and_keep_visible_focus(tab):
+    run_render_checks(PERFORMANCE + r"""
+const baseline={run_id:'reference',status:'inconclusive',acceptance:{baseline:'pass',current:'fail'},targets:[{target:'local',comparisons:[
+  {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'},
+  {check:'generation',scenario:'same',metric:'latency_ms',baseline:10,current:10,status:'pass'}]}]};
+detail(report([check('load','fail')],{baseline,performance:performanceFixture()}));chooseReportTab(TAB);
+const panel=()=>$('#report-'+TAB),controls=()=>panel().querySelectorAll('.comparison-filters select');
+const rows=()=>panel().querySelectorAll('[data-metric]');
+assert.equal(rows().length,2);assert.equal(controls().length,2);
+let control=controls()[0];control.value='with_warnings';listeners.change({target:control});
+assert.equal(rows().length,1);assert.match(rows()[0].textContent,/Timing warning/);
+assert.equal(controls()[0].value,'with_warnings');assert.equal(document.activeElement,controls()[0]);
+control=controls()[1];control.value='generation';listeners.change({target:control});
+assert.equal(rows().length,0);assert.match(panel().textContent,/No measurements match/);
+assert.equal(controls()[1].value,'generation');assert.equal(document.activeElement,controls()[1]);
+control=controls()[0];control.value='without_warnings';listeners.change({target:control});
+assert.equal(rows().length,1);assert.match(rows()[0].textContent,/No material regression/);
+chooseReportTab(TAB==='results'?'performance':'results');
+const other=$('#report-'+reportView.tab),otherControls=other.querySelectorAll('.comparison-filters select');
+assert.equal(other.querySelectorAll('[data-metric]').length,1);
+assert.equal(otherControls[0].value,'without_warnings');assert.equal(otherControls[1].value,'generation');
+assert.match(other.textContent,/Baseline: Passed/);assert.match(other.textContent,/Current: Failed/);
+""".replace('TAB', repr(tab)), dom=True)
+
+
+def test_results_section_links_reveal_results_after_performance_comparison_is_loaded():
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+const baseline={run_id:'reference',status:'inconclusive',targets:[{target:'local',load_test:{status:'inconclusive'},comparisons:[
+  {check:'load',scenario:'same',metric:'latency_ms',baseline:10,current:20,status:'inconclusive',reason:'Timing warning'}]}]};
+detail(report([check('load','fail')],{baseline,performance:performanceFixture()}));
+chooseReportTab('performance');assert.match($('#performance-baseline').textContent,/Timing warning/);
+chooseReportTab('results');api=async()=>{throw Error('Section navigation must not reload the run');};
+for(const section of ['timing','load-acceptance']){
+  $('#report-baseline-reference').open=false;
+  const link=$('#report-sections').querySelector('[data-report-section="'+section+'"]');
+  await listeners.click({target:link,preventDefault(){}});await route();
+  assert.equal(reportView.tab,'results');assert.equal($('#report-performance').hidden,true);
+  assert.equal($('#report-baseline-reference').open,true);
+  assert.equal($('#results-'+section).closest('[role="tabpanel"]').id,'report-results');
+}
+const ids=$$('[id]').map(node=>node.id);assert.equal(new Set(ids).size,ids.length);
+})()
+""", dom=True)
