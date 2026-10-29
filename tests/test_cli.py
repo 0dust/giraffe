@@ -11,9 +11,9 @@ from giraffe.models import RunReport
 def test_cli_one_command_has_builtin_suite():
     config = configuration(parser().parse_args([
         "run", "--url", "http://localhost:11434/v1", "--model", "tiny",
-        "--max-requests", "50", "--json", "--latency-ms", "5000",
+        "--max-requests", "50", "--structured-output", "--latency-ms", "5000",
     ]))
-    assert len(config.checks) == 10
+    assert config.checks == ["access", "serving", "correctness", "first_output", "json"]
     assert "json" in config.checks and "gpu" not in config.checks
     assert config.max_requests == 50
     assert config.structured_json
@@ -53,7 +53,7 @@ def test_cli_optional_flags_extend_saved_selection_but_explicit_checks_win(tmp_p
         "targets": [{"name": "test", "url": "http://localhost", "model": "tiny"}],
         "checks": ["correctness"],
     }))
-    args = ["run", "--config", str(path), "--json", "--metrics", "--tool-calling"]
+    args = ["run", "--config", str(path), "--structured-output", "--metrics", "--tool-calling"]
     selected = configuration(parser().parse_args(args))
     assert selected.checks == ["correctness", "json", "gpu", "tools"]
     explicit = configuration(parser().parse_args(args + ["--checks", "correctness"]))

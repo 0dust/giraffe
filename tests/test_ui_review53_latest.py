@@ -72,7 +72,8 @@ assert.match(html,/Context input could not be sized/);assert.match(html,/The aff
 assert.doesNotMatch(html,/No metrics exporter/);
 state.detail={id:'history',state:'completed',events:[],report:{observations:{targets:{local:{preparations:{context_preparation:failed,runtime_metrics_discovery:optional,load_preparation_short_short_answer:success},preparation:success}}}}};
 html=renderPreparation();
-assert.equal((html.match(/class="run-preparation"/g)||[]).length,2);
+assert.equal((html.match(/class="run-preparation"/g)||[]).length,1);
+assert.match(html,/<details class="preparation-status">/);
 assert.match(html,/Context input could not be sized/);assert.match(html,/Preparation complete/);
 state.detail.id='another-run';state.detail.report={};assert.equal(renderPreparation(),'');
 ''')

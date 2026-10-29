@@ -76,7 +76,8 @@ async def test_builtin_scored_check_needs_actual_concurrent_exercise(client, che
 
 
 @pytest.mark.parametrize("check_id", ["correctness", "json"])
-async def test_configured_concurrency_without_observed_overlap_is_inconclusive(client, monkeypatch, check_id):
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_configured_concurrency_without_observed_overlap_is_inconclusive(client, monkeypatch, check_id, explicit):
     original = runner._Run.request
     async def serial_evidence(self, *args, **kwargs):
         record = await original(self, *args, **kwargs)
@@ -85,9 +86,19 @@ async def test_configured_concurrency_without_observed_overlap_is_inconclusive(c
             record.timing_start_ms = None
         return record
     monkeypatch.setattr(runner._Run, "request", serial_evidence)
-    report = await runner.run_suite(config(checks=[check_id]))
-    assert check(report, check_id).status == "inconclusive"
-    assert "not exercised concurrently" in check(report, check_id).summary
+    options = {"test_options": {check_id: {"concurrency": 2}}} if explicit else {}
+    report = await runner.run_suite(config(checks=[check_id], **options))
+    result = check(report, check_id)
+    assert result.metrics["accuracy"] == 1
+    assert result.metrics["scored"] == result.metrics["completed"] == result.metrics["attempted"]
+    assert result.metrics["evidenced_overlap"] < 2
+    if explicit:
+        assert result.status == "inconclusive"
+        assert "not exercised concurrently" in result.summary
+    else:
+        assert result.status == "pass"
+        assert "answered one at a time" in result.summary
+        assert result.metrics["concurrency_evidence"].startswith("not observed")
 
 
 @pytest.mark.parametrize("check_id", ["correctness", "json"])

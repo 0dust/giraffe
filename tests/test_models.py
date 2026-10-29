@@ -182,3 +182,44 @@ def test_judge_vote_bool_is_strict_and_capabilities_are_discoverable():
     assert "judge" in discovered["request_pack"]["scorers"]
     assert discovered["judging"]["defaults"]["concurrency"] == 2
     assert discovered["judging"]["schema"]["properties"]["judges"]["maxItems"] == 8
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+@pytest.mark.parametrize('encoding', ['json', 'yaml'])
+def test_serial_answer_verdict_preserves_concurrency_intent_on_round_trip(explicit, encoding):
+    import yaml
+    from giraffe import runner
+    from tests.test_check_intent_round2_core import record
+
+    values = {'targets': [{'name': 't', 'url': 'http://local', 'model': 'm'}],
+              'checks': ['correctness']}
+    if explicit:
+        values['default_concurrency'] = 4
+    original = RunConfig.model_validate(values)
+    if encoding == 'json':
+        restored = RunConfig.model_validate_json(original.model_dump_json())
+    else:
+        restored = RunConfig.model_validate(yaml.safe_load(yaml.safe_dump(original.model_dump(mode='json'))))
+    for configured in (original, restored):
+        run = runner._Run(configured, None, None)
+        run.records = [record(str(index), scenario='correctness_c4', check_ids=['correctness'],
+                              timing_start_ms=index * 100)
+                       for index in range(6)]
+        result = next(check for check in runner._checks(run, configured.targets[0]) if check.id == 'correctness')
+        assert result.status == ('inconclusive' if explicit else 'pass')
+        assert configured.parallelism_requested('correctness') == explicit
+        assert result.metrics['evidenced_overlap'] < 2
+        if not explicit:
+            assert 'server answered one at a time' in result.summary
+
+
+@pytest.mark.parametrize('legacy,explicit', [({}, False), ({'concurrency': None}, False),
+                                            ({'concurrency': 4}, True)])
+def test_legacy_migration_preserves_whether_parallelism_was_requested(legacy, explicit):
+    from giraffe.cli import _migrated_values
+
+    values, _ = _migrated_values({'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}], **legacy})
+    config = RunConfig.model_validate(values)
+    assert config.default_concurrency == 4
+    assert config.parallelism_requested('correctness') == explicit
+    assert ('default_concurrency' in config.model_dump(mode='json')) == explicit

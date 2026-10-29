@@ -309,7 +309,7 @@ assert.equal($$('.request-spot',mosaic).length,3);assert.equal($('[tabindex="0"]
 assert.equal($('[data-live-slot="500"]',mosaic).dataset.state,'timeout');assert.equal($('[data-live-slot="502"]',mosaic).dataset.state,'cancelled');
 assert.equal($('[data-live-slot="500"] .spot-glyph',mosaic).textContent,statusIcons.timeout);
 assert.match($('#main').textContent,/503 started · 3 in live window/);assert.match($('#main').textContent,/3 dropped before sending/);
-assert.match($('#main').textContent,/500 earlier requests outside the live window/);assert.match($('#main').textContent,/No request limit set/);
+assert.match($('#main').textContent,/500 earlier requests outside the live window/);assert.match($('#main').textContent,/limit not set/);
 assert.equal($('.budget-track'),null);assert.equal($('.request-spot.idle, .request-spot.reserved, .request-spot.skipped',mosaic),null);
 assert.doesNotMatch($('.mosaic-legend').textContent,/Unused|Reserved/);
 state.detail.live_requests[1]={slot:501,id:'pending',status:'completed',valid:true,score:true};renderDetail();

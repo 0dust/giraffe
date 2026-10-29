@@ -120,7 +120,7 @@ const html=comparisonTable(scenarios.map(([scenario])=>({scenario,metric:'latenc
 for(const [scenario,part] of scenarios)assert(html.includes(phaseName(scenario)+' · '+part),scenario);
 assert(renderPhases([{event:'scenario_started',scenario:'session_live_turn1',target:'local'}]).includes('Live sessions · turn 2'));
 const reportValue=report([check('serving','pass',{evidence_ids:['one','two']})],{requests:scenarios.slice(0,2).map(([scenario],i)=>({id:i?'two':'one',scenario,target:'local',status:'completed'}))});
-detail(reportValue);state.selectedCheck='serving';renderDetail();
+detail(reportValue);state.selectedCheck='local:serving';renderDetail();
 assert(nodes['#main'].innerHTML.includes('interference · before output · short request'));
 assert(nodes['#main'].innerHTML.includes('interference · before output · heavy partner'));
 """)
