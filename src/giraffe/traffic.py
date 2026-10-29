@@ -145,6 +145,7 @@ def _record_stats(records: list[RequestRecord], limits: Limits) -> dict:
         "scored": len(scored), "correct": sum(r.score is True for r in scored),
         "correctness": sum(r.score is True for r in scored) / len(scored) if scored else None,
         "good": good, "timing_violations": sum(bad for bad, _ in timings),
+        "violations": [r.id for r, (bad, _) in zip(completed, timings, strict=True) if bad],
         "missing_timing": sum(missing for _, missing in timings),
         "unscored_completions": len(completed) - len(scored),
     }
@@ -500,9 +501,11 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
                 if overage > 0 and record.id in quality["affected_metrics"][metric] and record.id not in qualify(
                         [record], health, max(0, overage * .5 - 1e-9), metrics=(metric,))["affected_metrics"][metric]:
                     quality["affected_metrics"][metric].remove(record.id)
-        timing_failure = any(_timing(record, limits)[0] and qualified_violations(
-            [record], limits if record.stream_gap_applicable else limits.model_copy(update={"stream_gap_ms": None}),
-            quality, arrival=True) for record in timing_records)
+        stats["violations"] = [record.id for record in timing_records
+            if _timing(record, limits)[0] and qualified_violations(
+                [record], limits if record.stream_gap_applicable else limits.model_copy(update={"stream_gap_ms": None}),
+                quality, arrival=True)]
+        timing_failure = bool(stats["violations"])
     if service_failure:
         reasons.append("Service failures exceeded the error limit.")
     if answer_failure:
@@ -568,6 +571,8 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         window_records = [record for index, record in records if index in indices]
         window_counts = Counter(outcomes[index] for index in indices)
         window_stats = _record_stats(window_records, limits)
+        # Qualified request IDs belong to the stage; window counts remain raw.
+        window_stats.pop("violations", None)
         window_started = window_counts["started"] + window_counts["cancelled"]
         windows.append({
             "from_seconds": lower, "to_seconds": upper, "scheduled": len(indices),

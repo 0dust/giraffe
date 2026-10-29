@@ -121,6 +121,46 @@ def test_losing_accepted_rate_fails_baseline_without_bootstrap_sample_minimum():
     assert "previously acceptable tested load now fails" in _render(compared)
 
 
+@pytest.mark.parametrize("missing_current", [False, True])
+def test_browser_load_acceptance_preserves_loss_or_missing_evidence_under_filters(missing_current):
+    from tests.test_ux_results import run_render_checks
+
+    old = arrival_report()
+    old.manifest["config"]["limits"]["min_samples"] = 5
+    current = old.model_copy(deep=True)
+    if missing_current:
+        current.checks[0].metrics = {"points": []}
+    else:
+        lose_rate(current)
+    compared = compare_baseline(current, old)
+    target = compared.baseline["targets"][0]
+    assert all(row["status"] == "pass" for row in target["comparisons"])
+    assert target["load_test"]["status"] == ("inconclusive" if missing_current else "fail")
+    run_render_checks(r"""
+const value=VALUE,missing=MISSING;
+state.detail={report:value};
+for(const filter of ['all','with_warnings','without_warnings']){
+  state.comparisonFilter=filter;state.comparisonCheck='correctness';
+  const html=renderComparison(value);
+  assert.match(html,/id="results-load-acceptance"/);
+  assert.match(html,/Tested load acceptance/);
+  assert.match(html,/Highest accepted request rate \(tested\)/);
+  assert.match(html,/50 requests\/second/);
+  if(missing){
+    assert.match(html,/This level was not tested in the current/);assert.match(html,/Not tested in current/);assert.doesNotMatch(html,/<strong>Lost<\/strong>/);
+    assert.match(html,/Not established/);
+  }else{
+    assert.match(html,/10 requests\/second/);
+    assert.match(html,/previously acceptable tested load now fails; current:/);
+    assert.match(html,/1 lost/);assert.match(html,/<strong>Lost<\/strong>/);
+    assert.match(html,/<th scope="col">Change<\/th>/);assert.match(html,/<th scope="col">Reason<\/th>/);
+  }
+}
+assert(resultsSections().some(section=>section[0]==='load-acceptance'));
+""".replace("VALUE", json.dumps(compared.model_dump(mode="json")))
+        .replace("MISSING", json.dumps(missing_current)))
+
+
 @pytest.mark.parametrize("missing_side", ["current", "baseline"])
 def test_missing_load_cohorts_preserve_only_previously_accepted_levels(missing_side):
     current = arrival_report()
@@ -690,7 +730,7 @@ def test_arrival_false_concurrency_flag_does_not_qualify_delivered_timing():
 
 @pytest.mark.parametrize('renderer', ['export', 'browser'])
 def test_preserved_metric_failure_displays_verdict_and_delivery_warning(renderer):
-    from giraffe.reporting import _comparison_values_html
+    from giraffe.reporting import _baseline_table_html
     from tests.test_ux_results import run_render_checks
 
     old, current = concurrent_report(), concurrent_report()
@@ -702,8 +742,8 @@ def test_preserved_metric_failure_displays_verdict_and_delivery_warning(renderer
     row = next(row for row in target['comparisons'] if row['metric'] == 'latency_ms' and row['load_point']['level'] == 4)
     assert row['status'] == 'fail' and row['observed_change'] == 900
     if renderer == 'export':
-        html = _comparison_values_html({'comparisons': [row], 'observed_outputs': []})
-        assert 'Regression detected' in html
+        html = _baseline_table_html({'targets': [{'comparisons': [row], 'observed_outputs': []}]})
+        assert '>Worse</strong>' in html
         assert row['warnings'][0]['message'] in html
     else:
         run_render_checks('const row=' + json.dumps(row) + ";" + r'''
@@ -840,3 +880,23 @@ def test_missing_calibration_metadata_differs_from_present_null(field):
     target = compare_baseline(current, old).baseline['targets'][0]
     assert len(target['load_exclusions']) == 2 and not target['comparisons']
     assert target['load_test']['status'] == 'inconclusive'
+
+
+@pytest.mark.parametrize("limited_side, before, after, verdict", [
+    ("baseline", "Fail", "Pass", "Better"), ("current", "Pass", "Fail", "Worse"),
+])
+def test_html_load_acceptance_uses_qualified_outcomes_not_raw_point_status(limited_side, before, after, verdict):
+    from giraffe.reporting import _baseline_table_html
+
+    old, current = concurrent_report(), concurrent_report()
+    run = old if limited_side == "baseline" else current
+    point = run.checks[0].metrics['points'][1]
+    server_limited(point)
+    target = compare_baseline(current, old).baseline['targets'][0]
+    row = target['load_test']['points'][1]
+    assert row[limited_side]['status'] == 'inconclusive'
+    assert row[limited_side + '_acceptance'] == 'fail'
+    html = _baseline_table_html({'targets': [{'target': 'local', 'load_test': {'points': [row]}}]})
+    assert f'<td>{before}</td><td>{after}</td>' in html
+    assert f'>{verdict}</strong>' in html
+    assert 'streamed output evidenced peak overlap of 1 against 4' in html

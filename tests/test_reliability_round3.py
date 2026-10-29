@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-import yaml
 
 from giraffe import runner, telemetry
 from giraffe.fixtures import builtin_fixtures, final_answer, score_response, traffic_fixtures
@@ -78,8 +77,9 @@ async def test_recovery_absolute_only_pass_discloses_slowdown(monkeypatch, ratio
 
 
 @pytest.mark.parametrize('name', ['local', 'vllm', 'workloads'])
-def test_shipped_examples_enforce_recovery_ratio(name):
-    example = yaml.safe_load((Path(__file__).parents[1] / 'examples' / f'{name}.yaml').read_text())
+def test_historical_examples_preserve_explicit_recovery_ratio(name):
+    snapshots = json.loads((Path(__file__).parent / "fixtures/run-limits-phase3-defaults.json").read_text())["cases"]
+    example = snapshots[f"examples/{name}.yaml"]["source"]
     assert example['limits']['recovery_max_ratio'] == 2
 
 
@@ -139,7 +139,8 @@ async def test_sustained_allowance_needs_successes_not_only_attempts(monkeypatch
 async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evidence(
     monkeypatch, example, mode,
 ):
-    values = yaml.safe_load((Path(__file__).parents[1] / 'examples' / f'{example}.yaml').read_text())
+    snapshots = json.loads((Path(__file__).parent / 'fixtures/run-limits-phase3-defaults.json').read_text())['cases']
+    values = dict(snapshots[f'examples/{example}.yaml']['source'])
     # Preserve concurrency, sample counts and all acceptance limits. Scale only
     # time: local fault window/deadline/hang = .05/.3/.6; vllm = .3/1.2/.6.
     values.update(checks=['access', 'serving', 'first_output', 'recovery'],

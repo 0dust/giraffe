@@ -1,122 +1,27 @@
 config_version: 2
-# Match the URL, model and server limits to your deployment.
+# Optional diagnostics beyond the four default checks; edit for your endpoint.
 targets:
-- name: local
-  url: http://127.0.0.1:11434/v1
-  model: llama3.2:3b
-  deployment:
-    discovery: ollama
-    scope: local configured endpoint; other replicas unverified
-    serving:
-      context_limit: 4096
-  metrics_profile: ollama
-concurrency: 2
-default_concurrency: 2
-max_requests: 2000
-max_duration_seconds: 1800
-request_timeout_seconds: 120
+  - name: local
+    url: http://127.0.0.1:11434/v1
+    model: llama3.2:3b
+    metrics_profile: ollama
+checks: [prefix, sessions, consistency]
+context_limit: 16384
 max_output_tokens: 128
-context_limit: 4096
-samples: 6
-sustained_seconds: 30
-retention: failures
-request_options:
-  temperature: 0
-metrics: true
-metrics_interval_seconds: 2
-metrics_max_samples: 1024
-arrivals:
-  mode: steady
-  requests: 12
-  requests_per_second: 0.5
-  max_pending: 4
 prefix:
   prefix_chars: 8192
   repeats: 6
-  history_turns: 3
 sessions:
-  modes:
-  - fixed
-  - live
+  modes: [fixed, live]
   sessions: 5
   concurrency: 2
   max_tokens: 64
-  delay_seconds: 0.05
 consistency:
-  prompts_per_shape: 3
   repetitions: 6
-  shapes:
-  - short
-  - long
-  levels:
-  - 1
-  - 2
+  shapes: [short, long]
+  levels: [1, 2]
   temperature: 0
   seed: 17
-  equality: bytes
-  strict: false
-tool_calling: false
-forced_tool_diagnostic: false
 limits:
-  min_samples: 5
   first_output_ms: 60000
   latency_ms: 90000
-  stream_gap_ms: 10000
-  min_output_tokens_per_second: 1
-  recovery_max_ratio: 2
-  max_error_rate: 0
-  min_correctness: 1
-test_options: {}
-concurrent_load:
-  profile:
-    short:
-      input_tokens: 128
-      output_tokens: 24
-    medium:
-      input_tokens: 512
-      output_tokens: 64
-    long:
-      input_tokens: 2048
-      output_tokens: 128
-  combinations:
-    enabled: true
-    selected:
-    - short_short
-    - short_medium
-    - short_long
-    - medium_short
-    - medium_medium
-    - medium_long
-    - long_short
-    - long_medium
-    - long_long
-  mixed:
-    enabled: false
-    shares:
-      short_short: 60
-      long_short: 20
-      short_long: 20
-    seed: null
-  interference:
-    enabled: false
-    trigger: first_output
-    trigger_chunks: 5
-    max_slowdown: 1.5
-  stress:
-    enabled: false
-    large_input: true
-    large_output: true
-    min_output_percent: 80
-  schedule:
-    levels:
-    - 1
-    - 2
-    duration_seconds: 10
-  pass_criteria:
-    first_output_p95_ms: null
-    response_p95_ms: null
-    max_error_percent: 0
-    min_correct_percent: 100
-    min_valid_responses: 5
-  input_token_tolerance: 0.1
-  calibration_attempts: 3

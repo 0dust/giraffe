@@ -7,18 +7,20 @@ OpenAI-compatible text endpoint; it does not start the inference engine.
 
 ## Start your run
 
-This example assumes Ollama already serves `llama3.2:3b`. Change the URL and model
-for your deployment:
+This example assumes Ollama already serves a model. Change the URL for your deployment:
 
 ```sh
-giraffe run --url http://127.0.0.1:11434/v1 \
-  --model llama3.2:3b --checks access,serving,correctness \
-  --concurrency 1 --html
+giraffe run --url http://127.0.0.1:11434/v1 --html
 ```
 
-It selects endpoint access, serving success and known-answer correctness, using
-built-in prompts with one request at a time. Results appear in the terminal and
-in `runs/<timestamp>/report.json` and `report.html`. The command exits when done.
+The model is auto-detected when only one is served. If several are served, add
+`--model MODEL_ID`; if discovery is unsupported, supply the model explicitly.
+The shared CLI and UI default checks are `access, serving, correctness, first_output`:
+endpoint access, serving success, known-answer correctness and time to the first
+useful answer. The default p95 first-output limit is 10,000 ms; override it with
+`--first-output-ms` or YAML `limits.first_output_ms` for your service.
+Results appear in the terminal and in `runs/<timestamp>/report.json` and
+`report.html`. The command exits when done.
 
 For a saved configuration, edit an example's endpoint, model and limits first:
 
@@ -29,13 +31,19 @@ giraffe run --config examples/local.yaml --html
 ```
 
 Validate and preview send no test traffic. Preview shows effective settings,
-migration notes, request estimates and limit warnings. Examples may select more
-work than the three-check command above.
+request estimates and limit warnings. Current examples use the current schema;
+older configurations can also show migration notes.
 
-`--concurrency N` sets both the suite's simultaneous-request ceiling and default
-check parallelism. Use `--simultaneous-limit` and `--default-concurrency` to set
-them separately. Check-specific settings and Load test pattern levels can use
-fewer requests. See [workload limits](workloads.md#configure-and-run).
+Use `--simultaneous-limit` to set the suite's simultaneous-request ceiling and
+`--default-concurrency` for default check parallelism. Check-specific settings
+and Load test pattern levels can use fewer requests. See
+[workload limits](workloads.md#configure-and-run).
+
+`--json` is an alias of `--output-format json` for machine-readable CLI output.
+`--structured-output` instead adds the structured-JSON check. Normal text output
+shows a final verdict, selected check results and one list of unselected checks.
+Use `--verbose` to include diagnostic stages and RAM measurements; JSON reports
+retain the measurements regardless of verbosity.
 
 ## Browser UI
 
@@ -69,8 +77,8 @@ a usable response, not accuracy or load capacity, and creates no run report.
 Editing the endpoint, model or authentication clears the result. A manually
 specified model can be used without a successful connection test.
 
-**Checks** initially shows the full catalog. Without `--config`, **Endpoint
-response** and **Answer correctness** are selected. Use **Selected** to show only
+**Checks** initially shows the full catalog. Without `--config`, `access`,
+`serving`, `correctness` and `first_output` are selected. Use **Selected** to show only
 selected checks or **All checks** to browse and search the catalog. Use the **i**
 button for details and **Settings** for a check's controls.
 The review shows planned requests, run limits and separate evaluator calls.

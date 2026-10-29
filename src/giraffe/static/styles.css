@@ -1673,3 +1673,49 @@ main > #report-results { padding-top:20px; }
   .comparison-method > summary { font-size:11px; }
   .comparison-filters > .comparison-method[open] { flex-basis:100%; }
 }
+
+/* Findings lead; request and process details stay close and expandable. */
+.report-measurement[hidden] { display:none; }
+.result-heading { padding:20px 24px; }
+.result-heading .run-meta { margin-top:8px; font-size:12px; }
+.result-heading > div:first-child > .hint { margin-top:6px; }
+.findings { display:grid; gap:10px; scroll-margin-top:145px; }
+.finding-check { padding:14px 18px; min-width:0; }
+.finding-check-heading { display:flex; justify-content:space-between; gap:12px; align-items:center; }
+.finding-check-heading h2 { margin:0; font-size:15px; }
+.finding-check-heading button { text-align:left; font:inherit; }
+.finding-check-reason { margin:6px 0 0; color:var(--text-2); font-size:13px; }
+.finding-requests { margin-top:10px; display:grid; gap:6px; }
+.finding-request { display:grid; grid-template-columns:minmax(100px,1fr) minmax(0,4fr); gap:12px; padding-top:6px; border-top:1px solid var(--line); font-size:12px; }
+.finding-question { min-width:0; }
+.finding-question button { text-align:left; overflow-wrap:anywhere; }
+.finding-question small { display:block; margin-top:4px; color:var(--text-3); }
+.answer-difference { display:grid; grid-template-columns:1fr 1fr; gap:12px; min-width:0; }
+.answer-difference > span { min-width:0; overflow-wrap:anywhere; }
+.answer-difference strong { color:var(--text-2); font-weight:500; }
+.answer-excerpt { display:inline; }
+.answer-excerpt summary { display:inline-block; max-width:calc(100% - 70px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:top; cursor:pointer; text-decoration:underline dotted; }
+.answer-excerpt pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; }
+.finding-expanded { margin-top:14px; border-top:1px solid var(--line); }
+.passed-checks > summary, .checks-not-selected > summary, .run-diagnostics > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }
+.passed-checks .finding-check { margin-top:8px; }
+.preparation-status { margin:4px 0; }
+.run-diagnostics { margin-top:20px; }
+.baseline-delta { margin:8px 0; font-size:13px; }
+.baseline-delta a { color:var(--accent); text-decoration:underline; text-underline-offset:3px; }
+.comparison-condition { margin-top:18px; }
+.comparison-condition h4 { margin:0 0 8px; font-size:13px; }
+.comparison-quiet > summary { padding:8px 0; color:var(--text-2); cursor:pointer; font-size:12px; }
+.comparison-table { overflow-x:auto; }
+.comparison-table .fail { color:var(--fail); }
+.comparison-table .pass { color:var(--pass); }
+.comparison-table .inconclusive { color:var(--unknown); }
+.live-progress { font:14px/1.6 var(--mono); margin-top:16px; }
+.live-activity { margin-top:16px; padding:14px 18px; }
+.live-activity > summary { cursor:pointer; color:var(--text-2); }
+.rail-run-model small { display:block; color:var(--text-3); font-size:10px; margin-top:4px; }
+@media(max-width:700px) {
+  .finding-request, .answer-difference { grid-template-columns:1fr; gap:5px; }
+  .result-heading { padding:16px; }
+  .result-heading > .actions { flex-wrap:wrap; }
+}

@@ -147,11 +147,15 @@ def test_supported_legacy_check_ids_still_migrate_and_export_v2(check):
 
 
 def test_missing_and_empty_checks_keep_distinct_draft_semantics():
-    missing = migrated_configuration({"targets": [TARGET]}, ConfigDraft)
+    legacy = migrated_configuration({"targets": [TARGET]}, ConfigDraft)
+    current = migrated_configuration({"config_version": 2, "targets": [TARGET]}, ConfigDraft)
+    direct = ConfigDraft(targets=[TARGET])
     empty = migrated_configuration({"targets": [TARGET], "checks": []}, ConfigDraft)
-    assert missing.checks == list(DEFAULT_CHECKS)
+    assert legacy.checks == ["access", "serving", "first_output", "generation", "load",
+                             "context", "correctness", "cancellation", "recovery"]
+    assert current.checks == direct.checks == list(DEFAULT_CHECKS)
     assert empty.checks == []
-    for config in (missing, empty):
+    for config in (legacy, current, direct, empty):
         assert config.config_version == 2
         assert migrated_configuration(config.model_dump(mode="json"), ConfigDraft).checks == config.checks
 

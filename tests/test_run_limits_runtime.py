@@ -299,7 +299,8 @@ async def test_preparation_deadline_is_saved_when_target_finishes_before_stop_mo
                for event in events)
     check = next(check for check in report.checks if check.id == "load")
     assert check.status == "inconclusive"
-    assert "maximum run duration reached" in check.summary
+    assert "run deadline reached" in check.summary
+    assert "--max-duration" in check.summary
     saved = report.model_dump(mode="json")
     assert saved["abort_reason"] == report.abort_reason
     assert saved["limits_reached"] == report.limits_reached

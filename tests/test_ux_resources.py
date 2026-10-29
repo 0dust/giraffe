@@ -63,10 +63,10 @@ def test_memory_stop_verdict_is_inconclusive_without_erasing_blocked_checks():
     run_render_checks(r"""
 const value=report([check('access','blocked')],{overall:'inconclusive',abort_reason:'memory limit reached',observations:{resources:{memory_limit_reached:true,memory_limit_stopped_run:true,memory_interrupted_checks:[{target:'local',id:'access'}]}}});
 let html=detail(value);
-assert.match(html,/Acceptance inconclusive/);assert.doesNotMatch(html,/Acceptance blocked/);
+assert.match(html,/result-heading inconclusive/);assert.match(html,/<h1>Run stopped with partial results<\/h1>/);assert.doesNotMatch(html,/result-heading blocked/);
 assert.match(html,/Recorded blocked reason/);
 value.checks.push(check('correctness','fail'));value.overall='fail';html=detail(value);
-assert.match(html,/Acceptance failed/);
+assert.match(html,/result-heading fail/);assert.match(html,/<h1>[^<]*failed<\/h1>/);
 """)
 
 
@@ -74,7 +74,7 @@ def test_ram_growth_warning_preserves_completed_results_and_binary_units():
     run_render_checks(r"""
 const resources={memory_limit_reached:true,memory_limit_stopped_run:false,memory_interrupted_checks:[],memory_limit_bytes:4096*1024**2,rss_at_start_bytes:8*1024**3,sampled_peak_rss_bytes:{traffic:12*1024**3},sampled_peak_growth_bytes:{traffic:4*1024**3}};
 let html=detail(report([check('access','pass')],{observations:{resources}}));
-assert.match(html,/Acceptance passed/);assert.doesNotMatch(html,/Acceptance inconclusive|stopped with partial results/);
+assert.match(html,/result-heading pass/);assert.match(html,/<h1>Selected acceptance checks passed<\/h1>/);assert.doesNotMatch(html,/result-heading inconclusive|stopped with partial results/);
 assert.match(html,/Memory limit exceeded; completed checks keep their results. No work was stopped/);
 assert.match(html,/<dt>At run start<\/dt><dd>8 GiB/);assert.match(html,/<dt>Traffic RAM growth<\/dt><dd>4 GiB/);
 assert.equal(memorySize(0),'0 MiB');assert.equal(memorySize(1024**2),'1 MiB');assert.equal(memorySize(1024**3),'1 GiB');
@@ -98,7 +98,7 @@ def test_only_interrupted_required_checks_make_ram_verdict_inconclusive():
 const resources={memory_limit_reached:true,memory_limit_stopped_run:true,memory_interrupted_checks:[{target:'second',id:'access'}]};
 const checks=[check('access','pass'),check('access','inconclusive',{target:'second',required:false})];
 let html=detail(report(checks,{observations:{resources}}));
-assert.match(html,/Acceptance passed/);assert.match(html,/unfinished work stopped with partial results/);
+assert.match(html,/result-heading pass/);assert.match(html,/<h1>Selected acceptance checks passed<\/h1>/);assert.match(html,/unfinished work stopped with partial results/);
 checks[1].required=true;html=detail(report(checks,{overall:'inconclusive',observations:{resources}}));
-assert.match(html,/Acceptance inconclusive/);assert.match(html,/data-check="local:access"[^>]*>[\s\S]*?status pass/);
+assert.match(html,/result-heading inconclusive/);assert.match(html,/<article class="panel finding-check pass" data-finding="local:access"/);
 """)
