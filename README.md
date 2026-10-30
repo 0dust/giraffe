@@ -153,7 +153,8 @@ steps:
 `run --help` shows common options; `run --help-all` includes advanced settings.
 Manage saved runs with `giraffe runs list`, `runs cleanup` and `runs keep`.
 
-The default install includes the CLI, UI and built-in tiktoken sizing. To use a
+The default install includes the CLI, UI and built-in tiktoken sizing with bundled
+encoding data; built-in sizing needs no internet or writable cache. To use a
 model's Hugging Face tokenizer, install `giraffe-llm[hf-tokenizer]`.
 
 For Docker, build with `docker build -t giraffe .`, then run:

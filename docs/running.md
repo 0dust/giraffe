@@ -354,7 +354,10 @@ and report data still require authentication. Mount a writable directory at
 ## Optional Hugging Face tokenizer
 
 The core install uses built-in tiktoken sizing when automatic model-tokenizer
-resolution is unavailable. It includes FastAPI and Uvicorn for the UI, without
+resolution is unavailable. Its encoding data is bundled, so built-in sizing needs
+no internet or writable cache. It includes FastAPI and Uvicorn for the UI, without
 transformers or torch. Install `giraffe-llm[hf-tokenizer]` to use a model's own
 tokenizer. Explicitly configuring an HF tokenizer without the extra fails with
 an install hint; automatic resolution silently falls back to built-in sizing.
+The UI verifies a typed **Token ID / tokenizer** before continuing. **Automatic**
+and **builtin** need no setup check; Automatic resolves when the run starts.

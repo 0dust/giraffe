@@ -9,7 +9,7 @@ describe the current configuration contract (`config_version: 2`).
 | --- | --- |
 | [Running and baselines](running.md) | CLI commands, browser UI, credentials, results and before/after comparisons |
 | [Workloads and measurements](workloads.md) | Load patterns, check settings, acceptance criteria and evidence limits |
-| [Offline and container use](offline.md) | Dependency wheels, tokenizer caches and Docker commands |
+| [Offline and container use](offline.md) | Dependency wheels, bundled encoding, Hugging Face caches and Docker commands |
 | [Resource limits](resources.md) | Disk and RAM limits, response retention and cleanup |
 
 Engine configurations live in [`examples/`](../examples/). Edit their endpoint,

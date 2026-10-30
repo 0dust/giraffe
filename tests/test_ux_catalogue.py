@@ -29,7 +29,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import * as formConfig from MODULE_PATH;
 const nodes={},groups={},listeners={},storage=new Map();
-const context={assert,structuredClone,FormData,...formConfig,nodes,groups,listeners,console,
+const context={assert,structuredClone,FormData,AbortController,...formConfig,nodes,groups,listeners,console,
   sessionStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
   document:{querySelector:q=>nodes[q],querySelectorAll:q=>groups[q] || [],addEventListener:(event,fn)=>listeners[event]=fn},
   window:{addEventListener(){}},location:{hash:'#new'},setTimeout(){},clearTimeout(){}};

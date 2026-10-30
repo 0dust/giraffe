@@ -840,7 +840,7 @@ const document={{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListe
   createElement:()=>({{click(){{this.clicked=true;}}}})}};
 const context={{positiveBoundErrors,structuredClone,document,window:{{addEventListener(){{}}}},assert,nodes,form,listeners,
   Blob,URL:{{createObjectURL(blob){{downloads.push(blob);return 'blob:config';}},revokeObjectURL(){{}}}},
-  navigator:{{clipboard:{{async writeText(){{throw new Error('denied');}}}}}},setTimeout(){{}},downloads}};
+  navigator:{{clipboard:{{async writeText(){{throw new Error('denied');}}}}}},setTimeout(){{}},clearTimeout(){{}},downloads}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+`

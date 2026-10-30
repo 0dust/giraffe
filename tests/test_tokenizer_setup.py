@@ -202,7 +202,7 @@ async def test_explicit_override_timeout_still_reports_error(monkeypatch):
     monkeypatch.setattr(sizing, "SETUP_TIMEOUT_SECONDS", .02)
     config = configuration()
     config.targets[0].tokenizer = "explicit/model"
-    with pytest.raises(sizing.TokenizerUnavailable, match="Select builtin"):
+    with pytest.raises(sizing.TokenizerUnavailable, match='Could not load tokenizer "explicit/model": setup timed out'):
         await sizing.ensure_tokenizers(config)
 
 

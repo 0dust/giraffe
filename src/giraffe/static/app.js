@@ -2495,48 +2495,45 @@ function tokenizerChoice() {
   return ['auto','automatic','builtin'].includes(value.toLowerCase())?(value.toLowerCase()==='automatic'?'auto':value.toLowerCase()):value;
 }
 function tokenizerSelectionKey() {
-  const form=$('#new-run-form');
-  return form?.elements.tokenizer?JSON.stringify({model:form.elements.model.value.trim(),token_id:tokenizerChoice()}):null;
+  const form=$('#new-run-form'),token_id=tokenizerChoice();
+  return form?.elements.tokenizer&&!['auto','builtin'].includes(token_id)?JSON.stringify({token_id}):null;
 }
 function currentTokenizerSelection() {
-  const result=state.tokenizerSelection;
-  return result?.key===tokenizerSelectionKey()&&result.route===state.routeVersion?result:null;
+  const key=tokenizerSelectionKey(),result=state.tokenizerSelection;
+  return key&&result?.key===key&&result.route===state.routeVersion?result:null;
 }
 function tokenizerSetupReady() {
-  if(!$('#new-run-form')?.elements.tokenizer)return true;
-  return ['ready','fallback'].includes(currentTokenizerSelection()?.status);
+  return !tokenizerSelectionKey()||currentTokenizerSelection()?.status==='ready';
 }
 function renderTokenizerSelection() {
   const node=$('#tokenizer-status');if(!node)return;
   const result=currentTokenizerSelection();
-  node.textContent=result?.message || 'Enter a model name to resolve its tokenizer, or choose builtin in Token ID.';
-  node.classList.toggle('error',result?.status==='error');
-  node.classList.toggle('warning',result?.status==='fallback');
-  const retry=$('[data-action="retry-tokenizer"]');if(retry)retry.hidden=result?.status!=='error';
+  node.textContent=['pending','error'].includes(result?.status)?result.message:'';
+  node.className=result?.status==='error'?'notice error':'hint';
+  node.hidden=!node.textContent;
   syncSetupStep();
 }
-function scheduleTokenizerSelection({immediate=false,force=false}={}) {
-  const key=tokenizerSelectionKey();if(!key||hasJsonChanges())return;
-  if(!force&&currentTokenizerSelection())return;
+function scheduleTokenizerSelection({immediate=false}={}) {
+  const key=tokenizerSelectionKey();if(hasJsonChanges())return;
+  if(key&&currentTokenizerSelection())return;
   clearTimeout(state.tokenizerTimer);
   const sequence=state.tokenizerSequence=(state.tokenizerSequence || 0)+1,route=state.routeVersion;
-  const body=JSON.parse(key);
-  if(body.token_id==='auto'&&!body.model){state.tokenizerSelection=null;renderTokenizerSelection();return;}
-  state.tokenizerSelection={key,route,status:'pending',message:'Resolving and loading tokenizer… Files download here if needed.'};
+  state.tokenizerSelection=key?{key,route,status:'pending',message:'Resolving and loading tokenizer… Files download here if needed.'}:null;
   renderTokenizerSelection();
-  state.tokenizerTimer=setTimeout(()=>resolveTokenizerSelection(key,sequence,route),immediate?0:500);
+  if(key)state.tokenizerTimer=setTimeout(()=>resolveTokenizerSelection(key,sequence,route),immediate?0:500);
 }
 async function resolveTokenizerSelection(key,sequence,route) {
-  if(sequence!==state.tokenizerSequence||route!==state.routeVersion||key!==tokenizerSelectionKey())return;
+  if(!key||sequence!==state.tokenizerSequence||route!==state.routeVersion||key!==tokenizerSelectionKey())return;
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),state.bootstrap.tokenizer_setup_timeout_seconds*1000);
   try{
-    const result=await api('/api/targets/tokenizer',{method:'POST',body:key});
+    const result=await api('/api/targets/tokenizer',{method:'POST',body:key,signal:controller.signal});
     if(sequence!==state.tokenizerSequence||route!==state.routeVersion||key!==tokenizerSelectionKey())return;
     state.tokenizerSelection={...result,key,route};
-    configChanged();updateBounds();renderTokenizerSelection();
+    renderTokenizerSelection();
   }catch(error){
     if(sequence!==state.tokenizerSequence||route!==state.routeVersion||key!==tokenizerSelectionKey())return;
-    state.tokenizerSelection={key,route,status:'error',message:error.message};renderTokenizerSelection();
-  }
+    state.tokenizerSelection={key,route,status:'error',message:controller.signal.aborted?'Tokenizer check timed out. Edit the Token ID or pick Automatic.':error.message};renderTokenizerSelection();
+  }finally{clearTimeout(timeout);}
 }
 function modelDiscoveryKey() {
   const form=$('#new-run-form');if(!form)return null;
@@ -2664,7 +2661,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <div class="connection-details" id="connection-options">
   <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model || '',{required:true,placeholder:'Found when you connect',hint:''})}</div><p class="hint" id="model-options-label"></p></div></div>
   <details class="connection-row connection-auth" id="connection-auth" ${target.api_key_env||apiKeyFor(target.url)?'open':''}><summary><span class="row-label">API key</span><span class="row-value">${apiKeyFor(target.url)?'Set for this tab':target.api_key_env?`<code>${escape(target.api_key_env)}</code>`:'Not needed for most local servers'}</span><span class="row-action">${target.api_key_env||apiKeyFor(target.url)?'Change':'Add'}</span></summary><div class="row-control">${field('api_key','API key','',{type:'password',placeholder:'Paste your API key',hint:'Kept in memory for this tab. Never included in saved setups or reports. Paste it again after reloading. Leave blank for an open endpoint.'})}<button type="button" class="text-button" data-action="clear-api-key">Clear key</button><details><summary>Use an environment variable instead</summary>${field('api_key_env','Environment variable name',apiKeyFor(target.url)?'':target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:'Advanced: use a variable already set on the machine running Giraffe. Saved setups and terminal commands require this variable or a freshly pasted key.'})}</details></div></details>
-  <section class="automatic-metrics"><label for="field-tokenizer">Token ID</label><div class="tokenizer-combobox"><input id="field-tokenizer" name="tokenizer" role="combobox" aria-autocomplete="list" aria-controls="tokenizer-options" aria-expanded="false" value="${escape(target.tokenizer && target.tokenizer!=='auto'?target.tokenizer:'Automatic')}" maxlength="512" autocomplete="off" aria-describedby="tokenizer-status tokenizer-help"><button type="button" class="tokenizer-dropdown" data-action="tokenizer-options" aria-label="Show Token ID options" aria-controls="tokenizer-options" aria-expanded="false">▾</button><div id="tokenizer-options" class="tokenizer-options" role="listbox" aria-label="Token ID options" hidden><button type="button" role="option" tabindex="-1" data-action="select-tokenizer" data-token-id="Automatic">Automatic</button><button type="button" role="option" tabindex="-1" data-action="select-tokenizer" data-token-id="builtin">builtin</button></div></div><p id="tokenizer-status" class="hint" role="status" aria-live="polite"></p><button type="button" class="text-button" data-action="retry-tokenizer" hidden>Retry tokenizer check</button><p class="hint" id="tokenizer-help">Automatic checks the model name here before you continue. If it cannot resolve or load a tokenizer, built-in o200k_base will be used. Enter a model name in this box to try another tokenizer, or choose builtin.</p><p class="hint">Tokenizer files download to this machine and are cached for reuse. First use needs internet access; model weights are never downloaded. Built-in counts may differ from your model; measured usage comes from the server.</p></section><section class="automatic-metrics"><h3>Performance metrics</h3><p class="hint">Giraffe automatically collects supported timing, throughput, token usage and runtime metrics. Missing server metrics remain unavailable.</p><p class="hint">Preparation may send up to 3 one-token compatibility probes sharing the configured request timeout, bounded by remaining run time and spare request budget. These setup requests are separate from the planned test requests; local input sizing sends no inference requests.</p><details><summary>Additional exporter addresses</summary><div class="fields">${field('metrics_url','Server metrics URL (optional)',target.metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}${field('host_metrics_url','Host metrics exporter URL (optional)',target.host_metrics_url,{type:'url',placeholder:'http://localhost:9100/metrics'})}</div></details></section>${selectField('stream','How answers arrive',`<option value="true" ${c.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${c.stream?'':'selected'}>Wait for the complete answer</option>`,{help:'Applies to every check. First-answer timing, cancellation and stream interference need streaming.'})}</div>
+  <section class="automatic-metrics"><div class="form-field"><label for="field-tokenizer">Token ID / tokenizer</label><div class="tokenizer-combobox"><input id="field-tokenizer" name="tokenizer" role="combobox" aria-autocomplete="list" aria-controls="tokenizer-options" aria-expanded="false" value="${escape(target.tokenizer && target.tokenizer!=='auto'?target.tokenizer:'Automatic')}" maxlength="512" autocomplete="off" aria-describedby="tokenizer-status"><button type="button" class="tokenizer-dropdown" data-action="tokenizer-options" aria-label="Show Token ID options" aria-controls="tokenizer-options" aria-expanded="false">▾</button><div id="tokenizer-options" class="tokenizer-options" role="listbox" aria-label="Token ID options" hidden><button type="button" role="option" tabindex="-1" data-action="select-tokenizer" data-token-id="Automatic">Automatic</button><button type="button" role="option" tabindex="-1" data-action="select-tokenizer" data-token-id="builtin">builtin</button></div></div><p id="tokenizer-status" class="hint" role="status" aria-live="polite"></p></div></section><section class="automatic-metrics"><h3>Performance metrics</h3><p class="hint">Giraffe automatically collects supported timing, throughput, token usage and runtime metrics. Missing server metrics remain unavailable.</p><p class="hint">Preparation may send up to 3 one-token compatibility probes sharing the configured request timeout, bounded by remaining run time and spare request budget. These setup requests are separate from the planned test requests; local input sizing sends no inference requests.</p><details><summary>Additional exporter addresses</summary><div class="fields">${field('metrics_url','Server metrics URL (optional)',target.metrics_url,{type:'url',placeholder:'http://localhost:9400/metrics'})}${field('host_metrics_url','Host metrics exporter URL (optional)',target.host_metrics_url,{type:'url',placeholder:'http://localhost:9100/metrics'})}</div></details></section>${selectField('stream','How answers arrive',`<option value="true" ${c.stream?'selected':''}>Stream answers as they are generated</option><option value="false" ${c.stream?'':'selected'}>Wait for the complete answer</option>`,{help:'Applies to every check. First-answer timing, cancellation and stream interference need streaming.'})}</div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
   </div></section></div>
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
@@ -4033,12 +4030,6 @@ async function importConfig(file) {
   try{assertAppliedConfig();const text=await file.text();if(version!==state.routeVersion||revision!==state.configRevision)return;await applyConfig(text,{importing:true});}
   catch(error){if(version===state.routeVersion)configError(error);}
 }
-function pinPreparedTokenizer(config) {
-  if(!tokenizerSelectionKey())return config;
-  const selection=currentTokenizerSelection();
-  if(!selection||!['ready','fallback'].includes(selection.status))throw new Error('Wait for the Token ID check on the connection page before continuing.');
-  const prepared=clone(config);prepared.targets[0].tokenizer=selection.tokenizer;return prepared;
-}
 async function validatedSnapshot({draft=false}={}) {
   assertAppliedConfig();
   const version=state.routeVersion,revision=state.configRevision,payload=clone(readForm(draft));
@@ -4055,7 +4046,7 @@ async function validatedSnapshot({draft=false}={}) {
   try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes);payload.config=result.config;}
   catch(error){if(version===state.routeVersion&&revision===state.configRevision&&error.errors?.length){state.requestPreview={status:'error',revision,route:version,error:error.message,errors:error.errors};renderRequestPreview();focusFirstSettingError(error);}throw error;}
   if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed during validation. Try again with the current settings.');
-  assertAppliedConfig();if(!draft)payload.config=pinPreparedTokenizer(payload.config);
+  assertAppliedConfig();if(!draft&&!tokenizerSetupReady())throw new Error(currentTokenizerSelection()?.message || 'Wait for the Token ID check on the connection page before continuing.');
   return {...payload,migration_notes:[...(state.migrationNotes || [])]};
 }
 async function exportConfig() {
@@ -4135,7 +4126,6 @@ document.addEventListener('click',async(event)=>{
   if(action==='quick-checks'){try{assertAppliedConfig();captureFormDraft();state.config.checks=clone(state.bootstrap.config.checks);state.config.structured_json=false;state.config.metrics=false;state.config.tool_calling=false;state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;configChanged();renderNew('custom');$('[data-catalogue-filter="selected"]')?.focus();}catch(error){configError(error);}return;}
   if(action==='tokenizer-options'){showTokenizerOptions($('#tokenizer-options').hidden);return;}
   if(action==='select-tokenizer'){const input=$('#field-tokenizer');input.value=event.target.closest('[data-token-id]').dataset.tokenId;showTokenizerOptions(false);input.focus();scheduleTokenizerSelection({immediate:true});configChanged();updateBounds();return;}
-  if(action==='retry-tokenizer'){scheduleTokenizerSelection({immediate:true,force:true});return;}
   if(action==='setup-next'){navigateSetup(state.returnToReview?3:state.setupStep+1);return;}
   if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
   if(action==='test-connection'){await testConnection();return;}

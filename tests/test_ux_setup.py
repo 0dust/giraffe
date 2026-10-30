@@ -31,7 +31,7 @@ function element(extra={}) {
     focus(){this.focused=true;},...extra};
 }
 const document={querySelector:q=>nodes[q],querySelectorAll:q=>groups[q] || [],addEventListener:(kind,fn)=>listeners[kind]=fn};
-const context={assert,...formConfig,nodes,listeners,groups,element,loadDefaults,bootstrap,structuredClone,document,window:{addEventListener(){}},location:{hash:'#new'}};
+const context={assert,...formConfig,nodes,listeners,groups,element,loadDefaults,bootstrap,structuredClone,document,window:{addEventListener(){}},location:{hash:'#new'},setTimeout(){},clearTimeout(){}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+'\nstate.bootstrap=bootstrap;\n(async()=>{'+BODY+'\n})()',context);
 """.replace("MODULE_PATH", json.dumps(APP.with_name("form-config.mjs").as_uri())).replace("APP_PATH", json.dumps(str(APP))).replace("BODY", json.dumps(body)).replace("LOAD_DEFAULTS", json.dumps(LoadTest().model_dump())).replace("BOOTSTRAP", json.dumps(capabilities()))
