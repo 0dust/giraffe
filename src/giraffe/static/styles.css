@@ -1719,3 +1719,14 @@ main > #report-results { padding-top:20px; }
   .result-heading { padding:16px; }
   .result-heading > .actions { flex-wrap:wrap; }
 }
+
+.connection-auth { margin: 0; padding-block: 8px; border-block: 1px solid var(--line); }
+.connection-auth > .api-key-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) auto; gap: 16px; align-items: center; min-height: 36px; color: var(--text-2); font-size: 13px; }
+.api-key-label { color: var(--text); font-weight: 500; }
+.api-key-value { min-width: 0; overflow-wrap: anywhere; }
+.api-key-action { color: var(--accent); }
+.connection-auth > .form-field { margin-top: 12px; }
+.setup-advanced > .details-content { padding: 12px 0; gap: 16px; }
+@media (max-width: 599px) {
+  .connection-auth > .api-key-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; }
+}

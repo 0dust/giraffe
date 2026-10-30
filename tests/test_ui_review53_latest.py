@@ -14,11 +14,12 @@ from tests.test_ux_setup import run_browser_logic
 
 
 def test_shared_timeout_and_load_override_are_visible_and_independent():
+    connection = rendered_form().split('data-setup-panel="2"', 1)[0]
+    assert 'Request timeout (seconds)' in connection
+    assert 'name="request_timeout_seconds" type="number" value="300"' in connection
     browser_logic(FORM + r'''
 const shared=renderSharedRunSettings(config),load=renderLoadEditor(config);
-assert.match(shared,/<h3>Request default<\/h3>/);
-assert.match(shared,/Request timeout \(seconds\)/);
-assert.match(shared,/name="request_timeout_seconds"[^>]*value="300"/);
+assert.doesNotMatch(shared,/name="request_timeout_seconds"/);
 assert.match(load,/Send new requests for \(seconds\)/);
 assert.doesNotMatch(load,/load_schedule_finish_seconds|Wait for unfinished|Duration per workload/);
 assert.equal(settingDestination('request_timeout_seconds').name,'request_timeout_seconds');
@@ -129,10 +130,10 @@ def test_connection_setup_has_one_editable_token_id_box(token_id):
     assert connection.count('role="option" tabindex="-1"') == 2
     assert 'id="tokenizer-status" class="hint" role="status" aria-live="polite"' in connection
     assert 'retry-tokenizer' not in connection
-    assert 'automatically collects supported timing' in connection
-    assert 'name="metrics_url"' in connection and 'Server metrics URL (optional)' in connection
-    assert 'up to 3 one-token compatibility probes sharing the configured request timeout, bounded by remaining run time and spare request budget' in connection
-    assert 'separate from the planned test requests' in connection
+    assert 'name="metrics_url"' in connection and 'Server metrics URL</label>' in connection
+    assert 'Performance metrics' not in connection
+    assert 'Additional exporter addresses' not in connection
+    assert 'How answers arrive' not in connection
     browser_logic(r'''
 const gpu=renderTestCard(bootstrap.checks.find(c=>c.id==='gpu'),config);
 assert.doesNotMatch(gpu,/name="metrics_url"|name="host_metrics_url"/);

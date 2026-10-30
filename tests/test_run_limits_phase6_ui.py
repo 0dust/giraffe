@@ -83,8 +83,7 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
     limits = next(node for node in tree.nodes if node.get('id') == 'shared-settings')
     controls = [node['name'] for node in tree.nodes if node.get('name') and limits in node['parents']]
     assert set(controls) == {'max_requests', 'max_requests_enabled', 'concurrency', 'concurrency_enabled',
-                             'max_duration_seconds', 'max_duration_seconds_enabled', 'max_duration_unit',
-                             'max_memory_mb', 'max_memory_mb_enabled', 'request_timeout_seconds'}
+                             'max_duration_seconds', 'max_duration_seconds_enabled', 'max_duration_unit'}
     for check in capabilities()['checks']:
         for name in check['option_fields'] + ['limit_' + name for name in check['limit_fields']]:
             fields = tree.named(f'test_{check["id"]}_{name}')
@@ -97,7 +96,7 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
     stream, = tree.named('stream')
     assert any(parent.get('id') == 'setup-panel-1' for parent in stream['parents'])
     regression, = tree.named('limit_regression_percent')
-    assert any(parent.get('id') == 'setup-panel-3' for parent in regression['parents'])
+    assert any(parent.get('id') == 'setup-panel-1' for parent in regression['parents'])
     assert len(tree.named('request_timeout_seconds')) == 1
     for name in ['samples', 'max_output_tokens', 'context_limit']:
         assert not tree.named(name)
@@ -132,21 +131,21 @@ def test_a4_each_nullable_limit_restores_only_session_value_and_time_units():
 state.jsonDraft=state.jsonBase='synced';const elements={};
 const enabledMarkup=renderSharedRunSettings({...config,max_requests:7,max_duration_seconds:7,concurrency:7});
 for(const name of ['max_requests','max_duration_seconds','concurrency']){assert(enabledMarkup.includes('id="field-'+name+'-hint"></span>'));assert(enabledMarkup.includes('aria-describedby="field-'+name+'-hint"'));}
-for(const name of ['max_requests','max_duration_seconds','concurrency','max_memory_mb']){
+for(const name of ['max_requests','max_duration_seconds','concurrency']){
  elements[name]={value:'',disabled:true,required:false,removeAttribute(){}};
  elements[name+'_enabled']={checked:false};nodes['#field-'+name+'-hint']={};
 }
 nodes['#new-run-form']={elements};configChanged=updateBounds=()=>{};
-for(const name of ['max_requests','max_duration_seconds','concurrency','max_memory_mb']){
+for(const name of ['max_requests','max_duration_seconds','concurrency']){
  const toggle={name:name+'_enabled',checked:true,dataset:{limitToggle:name},matches:()=>false};
  await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].required,true);
- elements[name].value=name==='max_memory_mb'?'4096':'7';toggle.checked=false;
+ elements[name].value='7';toggle.checked=false;
  await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].disabled,true);
- assert.equal(nodes['#field-'+name+'-hint'].textContent,name==='max_memory_mb'?'Off':'Not set');
- toggle.checked=true;await listeners.change({target:toggle});assert.equal(elements[name].value,name==='max_memory_mb'?'4096':'7');
+ assert.equal(nodes['#field-'+name+'-hint'].textContent,'Not set');
+ toggle.checked=true;await listeners.change({target:toggle});assert.equal(elements[name].value,'7');
  const values=new Map([[name+'_enabled','off']]);const disabled=configureRunLimits(config,values);
- assert.equal(disabled[name],name==='max_memory_mb'?0:null);
- assert.equal(JSON.parse(JSON.stringify(portableConfig({config:disabled,mode:'normal'})))[name],name==='max_memory_mb'?0:null);
+ assert.equal(disabled[name],null);
+ assert.equal(JSON.parse(JSON.stringify(portableConfig({config:disabled,mode:'normal'})))[name],null);
 }
 const values=new Map([['max_duration_seconds_enabled','on'],['max_duration_seconds','2'],['max_duration_unit','h']]);
 assert.equal(configureRunLimits(config,values).max_duration_seconds,7200);
