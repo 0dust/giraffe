@@ -323,7 +323,7 @@ def test_combined_histories_survive_storage_and_render_visible_actions(tmp_path)
     run_render_checks(setup + "\nconst config=" + cfg.model_dump_json()
                       + ";const plan=" + json.dumps(value) + r''';
 state.config=config;state.jsonDraft=state.jsonBase='synced';renderNew();
-$('#setup-advanced').open=false;
+state.setupStep=3;syncSetupStep();
 const original=JSON.stringify(state.config);
 const arrival=plan.arrival_history.find(row=>row.status==='warning');
 const correctness=plan.correctness_history.find(row=>row.status==='warning');
@@ -340,7 +340,7 @@ function visible(){
   for(let ancestor=outlet;ancestor;ancestor=ancestor.parentNode){
     assert(!ancestor.hidden);assert(ancestor.tagName!=='DETAILS'||ancestor.open);
   }
-  assert(!outlet.closest('#setup-advanced'));assert(!$('#setup-advanced').open);
+  assert(outlet.closest('#setup-panel-3'));assert.equal(state.setupStep,3);
   for(const row of [arrival,correctness])assert.equal($('#main').textContent.split(row.message).length-1,1);
   assert.equal(warning.querySelector('a').getAttribute('href'),'#runs/source-run/requests/failed%2Fanswer');
   assert.equal(warning.querySelector('button').dataset.tryTarget,'second');

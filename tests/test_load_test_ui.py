@@ -45,9 +45,9 @@ ISSUES=[
     ("form.elements.load_pass_criteria_min_correct_percent.value='101'",'load_test.pass_criteria.min_correct_percent','Percentages must be from 0 to 100.'),
     *[(f"form.elements.load_pass_criteria_{key}.value='0'",'load_test.pass_criteria.'+key,'Enter a number greater than 0 for '+label+'.') for key,label in [
         ('max_first_answer_ms','Maximum time to first answer per response (ms)'),('max_completion_ms','Maximum completion time per response (ms)'),('max_stream_pause_ms','Maximum pause between streamed chunks (ms)'),('min_generation_tokens_per_second','Minimum generation speed per response (tokens/sec)')]],
-    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Max concurrency.'),
-    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Max requests.'),
-    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Max duration.'),
+    ("form.elements.concurrency.value='0'",'concurrency','Enter a whole number greater than 0 for Simultaneous limit.'),
+    ("form.elements.max_requests.value='0'",'max_requests','Enter a whole number greater than 0 for Maximum requests.'),
+    ("form.elements.max_duration_seconds.value='0'",'max_duration_seconds','Enter a number greater than 0 for Maximum duration.'),
 ]
 
 
@@ -95,20 +95,20 @@ assert.equal(runLimitIssues(draft).length,0); // All three numbers are server ow
 ''',config)
 
 
-def test_limits_click_targets_and_scrollable_request_evidence_css():
+def test_run_limits_click_targets_and_scrollable_plan_css():
     css=(STATIC/'styles.css').read_text()
     selectors=[match.group(1).strip() for match in re.finditer(r'([^{}]+)\{[^{}]*\}',css) if '.test-selection::after' in match.group(1)]
     assert selectors and all('.test-card > .test-card-heading ' in selector for selector in selectors)
     assert re.search(r'\.test-card-heading\s*\{[^}]*position:\s*relative',css)
-    evidence_scroll = re.search(r'\.request-evidence > \.request-table-scroll\s*\{([^}]+)', css)[1]
-    assert 'overflow: auto' in evidence_scroll
-    assert 'max-height:' in evidence_scroll
-    assert re.search(r'\.request-evidence-row:focus-visible\s*\{[^}]*outline:', css)
+    desktop=re.search(r'\.run-blueprint\s*\{([^}]+)',css)[1]
+    for rule in ['max-height: calc(100dvh - 76px - var(--run-dock-clearance, 112px) - env(safe-area-inset-bottom, 0px))','overflow-y: auto','overscroll-behavior: contain']:
+        assert rule in desktop
+    assert re.search(r'@media\s*\(max-width:\s*\d+px\)[\s\S]*?\.run-blueprint\s*\{[^}]*position:\s*static;[^}]*max-height:\s*none;[^}]*overflow-y:\s*visible',css)
     browser_logic(r'''
-const html=renderSharedRunSettings(config);for(const name of ['max_requests','max_duration_seconds','concurrency']){assert.match(html,new RegExp('name="'+name+'"'));assert.doesNotMatch(html,new RegExp('name="'+name+'_enabled"'));}assert.doesNotMatch(html,/class="test-selection"/);
+const html=renderSharedRunSettings(config);assert.equal((html.match(/class="run-limit-selection"/g)||[]).length,4);assert.doesNotMatch(html,/class="test-selection"/);
 for(const label of html.matchAll(/<label\b[^>]*>[\s\S]*?<\/label>/g))assert.doesNotMatch(label[0],/class="field-info"/);
-for(const field of ['max_duration_seconds','max_requests','concurrency'])assert(html.includes('for="field-'+field+'"'));
-assert.match(renderNew.toString(),/<aside id="run-blueprint" hidden>/);assert.match(renderSharedRunSettings(config),/id="run-ceilings-summary"/);assert.doesNotMatch(renderSharedRunSettings(config),/checks-plan-summary/);
+for(const field of ['max_duration_seconds','max_requests','concurrency','max_memory_mb'])assert(html.includes('popovertarget="field-'+field+'-help"'));
+assert.match(renderNew.toString(),/class="run-blueprint" tabindex="0" aria-label="Run plan"/);
 ''')
 
 
@@ -166,7 +166,7 @@ assert(views.every(view=>view.name==='Long input / short output'));
 assert.equal(views[0].description,'Poisson arrivals · 10 requests/s · with bursts');
 assert.equal(views[1].description,'Constant arrivals · 10 requests/s');
 assert.match(html,/Poisson arrivals · 10 requests\/s · with bursts/);assert.match(html,/Constant arrivals · 10 requests\/s/);
-assert.equal((html.match(/class="condition-strip-row"/g)||[]).length,2);assert.equal((html.match(/class="condition-strip"/g)||[]).length,1);
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,2);assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
 ''')
 
 
@@ -201,8 +201,8 @@ const point={id:'load_primary_interference_c4',type:'interference',workload:'int
 const html=renderLoadTestResults({points:[point]});
 assert.doesNotMatch(html,/not reported ms/);
 for(const [suffix,label] of [['.baseline','Short answers alone'],['.probe','Short answers with a long request']]){
- const record={scenario:point.id+suffix};assert.match(phaseName(record.scenario),new RegExp('^'+label+'.*4 at once$'));
- assert.match(testLabel(record),new RegExp('^'+label+'.*4 at once$'));
+ const record={scenario:point.id+suffix};assert.equal(phaseName(record.scenario),label+' at 4 concurrent requests');
+ assert.equal(testLabel(record),label+' at 4 concurrent requests');
 }
 ''')
 
@@ -223,10 +223,10 @@ def test_mixed_unknown_count_keeps_scheduled_requests_in_headline_and_footer(poi
     plan=request_plan(config)
     assert plan['request_count_label']==label
     browser_logic('const plan='+json.dumps(plan)+',label='+json.dumps(label)+r''';
-nodes['#request-plan']={};nodes['#dock-summary']={};nodes['#checks-plan-summary']={classList:{toggle(){}}};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+nodes['#request-plan']={};nodes['#dock-summary']={};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};renderRequestPlan();
 const headline=label.startsWith('Unknown + ≈')?'≈ 20 expected requests + adaptive checks':'20 known requests + adaptive checks';
-assert(nodes['#checks-plan-summary'].textContent.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
+assert(nodes['#request-plan'].innerHTML.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
 ''',config)
 
 
@@ -254,9 +254,9 @@ def test_local_preparation_preserves_exact_and_expected_scheduled_counts(poisson
     assert next(row for row in plan['rows'] if row['id']=='load_calibration')['requests_per_target']==0
     assert plan['request_count_label']==label
     browser_logic('const plan='+json.dumps(plan)+',headline='+json.dumps(headline)+r""";
-nodes['#request-plan']={};nodes['#dock-summary']={};nodes['#checks-plan-summary']={classList:{toggle(){}}};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
+nodes['#request-plan']={};nodes['#dock-summary']={};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};renderRequestPlan();
-assert(nodes['#checks-plan-summary'].textContent.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
+assert(nodes['#request-plan'].innerHTML.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
 """,config)
 
 

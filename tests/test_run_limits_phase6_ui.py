@@ -57,42 +57,53 @@ renderNew();console.log(JSON.stringify(nodes['#main'].innerHTML));
 
 def test_run_limit_value_controls_have_distinct_accessible_labels():
     tree = Markup(rendered_form())
-    for name, label in [('max_requests', 'Max requests'), ('max_duration_seconds', 'Max duration (seconds)'), ('concurrency', 'Max concurrency')]:
+    for name, label, hidden in [('max_requests', 'Request count', True),
+                                ('max_duration_seconds', 'Duration', False),
+                                ('concurrency', 'Simultaneous request count', True)]:
         control, = tree.named(name)
         value_label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == control['id']]
         assert value_label['text'] == label
-        assert 'sr-only' not in value_label.get('class', '').split()
-        assert control['type'] == 'number'
-        assert 'disabled' not in control
-        assert not tree.named(name + '_enabled')
-        assert control['aria-describedby'] == 'run-limit-empty-hint'
-        hint, = [node for node in tree.nodes if node.get('id') == control['aria-describedby']]
-        assert hint['text'] == 'Empty = off'
-    assert sum(node.get('text') == 'Empty = off' for node in tree.nodes if node.get('id') == 'run-limit-empty-hint') == 1
+        assert ('sr-only' in value_label.get('class', '').split()) == hidden
+        toggle, = tree.named(name + '_enabled')
+        toggle_label = next(node for node in toggle['parents'] if node['tag'] == 'label')
+        assert toggle_label['text'] == ('Maximum requests' if name == 'max_requests'
+                                        else 'Maximum duration' if name == 'max_duration_seconds' else 'Simultaneous limit')
+        assert toggle['aria-controls'] == control['id']
+        assert control['aria-describedby'] == control['id'] + '-hint'
 
 
 def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields():
     markup = rendered_form()
     tree = Markup(markup)
-    assert markup.index('What to test') < markup.index('id="shared-settings"') < markup.index('Compare with') < markup.index('id="setup-advanced"')
-    assert not any(node.get('id', '').startswith('setup-panel-') for node in tree.nodes)
+    assert markup.index('id="shared-settings"') < markup.index('id="test-selection"')
+    headings = {node['text'].strip(): node for node in tree.nodes if node['tag'] == 'h2'}
+    assert headings['Run limits'].get('class') != 'sr-only'
+    assert headings['Choose your checks'].get('class') != 'sr-only'
     assert 'order: -1' not in (STATIC / 'styles.css').read_text()
     limits = next(node for node in tree.nodes if node.get('id') == 'shared-settings')
     controls = [node['name'] for node in tree.nodes if node.get('name') and limits in node['parents']]
-    assert set(controls) == {'max_requests', 'concurrency', 'max_duration_seconds'}
-    advanced = next(node for node in tree.nodes if node.get('id') == 'setup-advanced')
+    assert set(controls) == {'max_requests', 'max_requests_enabled', 'concurrency', 'concurrency_enabled',
+                             'max_duration_seconds', 'max_duration_seconds_enabled', 'max_duration_unit',
+                             'max_memory_mb', 'max_memory_mb_enabled', 'request_timeout_seconds'}
     for check in capabilities()['checks']:
         for name in check['option_fields'] + ['limit_' + name for name in check['limit_fields']]:
             fields = tree.named(f'test_{check["id"]}_{name}')
             assert len(fields) == 1, (check['id'], name)
             assert any(parent.get('data-test-editor') == check['id'] for parent in fields[0]['parents'])
-            assert advanced in fields[0]['parents']
-    for name in ['profile_sessions_concurrency', 'profile_sessions_max_tokens', 'profile_consistency_levels', 'load_request_timeout_seconds', 'stream', 'limit_regression_percent', 'request_timeout_seconds']:
-        field, = tree.named(name)
-        assert advanced in field['parents']
+    for name in ['profile_sessions_concurrency', 'profile_sessions_max_tokens', 'profile_consistency_levels',
+                 'load_request_timeout_seconds']:
+        assert len(tree.named(name)) == 1
     assert not tree.named('sessions_max_tokens')
+    stream, = tree.named('stream')
+    assert any(parent.get('id') == 'setup-panel-1' for parent in stream['parents'])
+    regression, = tree.named('limit_regression_percent')
+    assert any(parent.get('id') == 'setup-panel-3' for parent in regression['parents'])
+    assert len(tree.named('request_timeout_seconds')) == 1
     for name in ['samples', 'max_output_tokens', 'context_limit']:
         assert not tree.named(name)
+    browser_logic("nodes['#setup-panel-1']={};nodes['#setup-title']={};state.setupStep=2;"
+                  "syncSetupIdentity=()=>{};syncSetupStep=syncSetupStep;"
+                  "assert.match(syncSetupStep.toString(),/Set limits and choose checks/);")
 
 
 def test_a2_exact_open_rows_and_outer_state_survive_repeated_refreshes():
@@ -107,27 +118,39 @@ nodes['#run-blueprint']=element;
 const plan={estimated_seconds:1,estimated_low_seconds:0,estimated_high_seconds:2,time_estimate_assumptions:['Observed batch time.'],rows:rows.map(id=>({id,title:id,requests_per_target:1,summary:'kept',source:'built-in'}))};
 syncRunBlueprint(config,plan);
 assert.equal(element.outer.open,false);assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'one,three');
-element.outer.open=true;element.rows[0].open=false;element.rows[1].open=true;
+element.outer.open=true;element.rows[0].open=false;element.rows[1].open=true;element.assumptions.open=true;
 syncRunBlueprint(config,null);assert.equal(element.outer,null);assert.equal(element.rows.length,0);
 syncRunBlueprint(config,plan);
-assert.equal(element.outer.open,true);assert.equal(element.assumptions,null);
+assert.equal(element.outer.open,true);assert.equal(element.assumptions.open,true);
 assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'two,three');
 assert.equal(generation.length,3);assert.doesNotMatch(generation[2],/planCheck=undefined/);
 """)
 
 
-def test_a4_each_nullable_limit_reads_empty_as_off_without_changing_other_limits():
-    from tests.test_concurrent_load_ui_review import FORM
-    browser_logic(FORM + r"""
-for(const name of ['max_requests','max_duration_seconds','concurrency']){
- delete form.elements[name+'_enabled'];
- for(const other of ['max_requests','max_duration_seconds','concurrency'])form.elements[other].value='7';
- form.elements[name].value='';let read=readForm(false).config;assert.equal(read[name],null);
- for(const other of ['max_requests','max_duration_seconds','concurrency'].filter(key=>key!==name))assert.equal(read[other],7);
- form.elements[name].value='12';read=readForm(false).config;assert.equal(read[name],12);
- assert.equal(JSON.parse(JSON.stringify(portableConfig({config:read,mode:'normal'})))[name],12);
+def test_a4_each_nullable_limit_restores_only_session_value_and_time_units():
+    browser_logic(r"""
+state.jsonDraft=state.jsonBase='synced';const elements={};
+const enabledMarkup=renderSharedRunSettings({...config,max_requests:7,max_duration_seconds:7,concurrency:7});
+for(const name of ['max_requests','max_duration_seconds','concurrency']){assert(enabledMarkup.includes('id="field-'+name+'-hint"></span>'));assert(enabledMarkup.includes('aria-describedby="field-'+name+'-hint"'));}
+for(const name of ['max_requests','max_duration_seconds','concurrency','max_memory_mb']){
+ elements[name]={value:'',disabled:true,required:false,removeAttribute(){}};
+ elements[name+'_enabled']={checked:false};nodes['#field-'+name+'-hint']={};
 }
-assert.doesNotMatch(sharedLimitsSummary({...config,max_requests:null,max_duration_seconds:null,concurrency:null}),/No .*limit|undefined|NaN/);
+nodes['#new-run-form']={elements};configChanged=updateBounds=()=>{};
+for(const name of ['max_requests','max_duration_seconds','concurrency','max_memory_mb']){
+ const toggle={name:name+'_enabled',checked:true,dataset:{limitToggle:name},matches:()=>false};
+ await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].required,true);
+ elements[name].value=name==='max_memory_mb'?'4096':'7';toggle.checked=false;
+ await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].disabled,true);
+ assert.equal(nodes['#field-'+name+'-hint'].textContent,name==='max_memory_mb'?'Off':'Not set');
+ toggle.checked=true;await listeners.change({target:toggle});assert.equal(elements[name].value,name==='max_memory_mb'?'4096':'7');
+ const values=new Map([[name+'_enabled','off']]);const disabled=configureRunLimits(config,values);
+ assert.equal(disabled[name],name==='max_memory_mb'?0:null);
+ assert.equal(JSON.parse(JSON.stringify(portableConfig({config:disabled,mode:'normal'})))[name],name==='max_memory_mb'?0:null);
+}
+const values=new Map([['max_duration_seconds_enabled','on'],['max_duration_seconds','2'],['max_duration_unit','h']]);
+assert.equal(configureRunLimits(config,values).max_duration_seconds,7200);
+assert.equal(sharedLimitsSummary({...config,max_requests:null,max_duration_seconds:null,concurrency:null}),'No suite limits set');
 """)
 
 
@@ -153,25 +176,30 @@ def test_a7_a16_plan_copy_observed_counts_bursts_and_distinct_controls():
     cfg=RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['load'],load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':False},'poisson':{'enabled':True},'bursts':{'enabled':True,'first_seconds':0,'gap_seconds':1,'size':4},'rates':[2]},'schedule':{'duration_seconds':3}})
     browser_logic('const plan='+json.dumps(request_plan(cfg))+r''';
 plan.estimated_seconds=3;plan.estimated_low_seconds=2;plan.estimated_high_seconds=4;plan.time_estimate_assumptions=['Finite batches use comparable observations.'];plan.confidence_details={insufficient_observations:['At least 150 comparable samples are required.']};plan.time_bound_reasons=['+ 10 requests at unknown speed'];
-const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.match(renderPlanTime(plan),/~2 s–4 s/);assert.doesNotMatch(markup,/Confidence:|Estimated duration:|At least 150 comparable samples|Additional work at unknown speed/);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
-for(const text of ['Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
-assert.doesNotMatch(limits,/No .*limit|class="checks-plan-summary sr-only"/);
+const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
+for(const text of ['Confidence: low','Additional work at unknown speed','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation','Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
+assert.equal((markup.match(/Not set/g)||[]).length,3);assert.match(markup,/Maximum memory/);
 const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Duration-based');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Duration-based · ~12 (estimate, from your last run)');
-const editor=renderLoadEditor(config);for(const label of ['Requests per burst','Rates (requests/second)','First burst after (seconds)','Time between burst starts (seconds)','Max concurrency · Limits'])assert(editor.includes(label),label);assert.doesNotMatch(editor,/Pending queue|traffic_max_in_flight|profile_arrivals_max_in_flight/);
+const editor=renderLoadEditor(config);for(const label of ['Requests per burst','Rates (requests/second)','First burst after (seconds)','Time between burst starts (seconds)','Concurrency ceiling · Run limits'])assert(editor.includes(label));assert.doesNotMatch(editor,/Pending queue|traffic_max_in_flight|profile_arrivals_max_in_flight/);
 ''',cfg)
 
 
-def test_a25_request_table_uses_real_slots_and_reports_capped_evidence():
+def test_a25_budget_free_mosaic_uses_slots_not_unused_budget_and_eviction_summary():
     browser_logic(r"""
 const records=[{slot:500,status:'running',scenario:'warm',target:'local'}];
-state.detail={id:'live',live_request_count:501,live_request_summary:{evicted:500,statuses:{completed:500,running:1}}};
-let markup=renderMosaic(records,{live:true});
-assert.equal((markup.match(/class="request-evidence-row"/g)||[]).length,1);
-assert.match(markup,/data-live-slot="500"/);assert.match(markup,/1 of 501 requests available/);
-assert.doesNotMatch(markup,/Unused|Budget slot|request-spot|condition-spot/);
-nodes['#main']={};state.detail={...state.detail,state:'running',config,live_requests:records,progress:{attempted:501,completed:500},events:[],live_conditions:[]};
+state.detail={id:'live',live_request_summary:{evicted:500,statuses:{completed:499,running:1}}};
+state.mosaicPage=0;state.mosaicFollow=false;
+let markup=renderMosaic(records,{budget:null,live:true,budgetUsed:501});
+assert.match(markup,/Earlier request evidence was evicted/);assert.match(markup,/500 earlier requests/);
+assert.doesNotMatch(markup,/request-spot|Unused/);
+state.mosaicPage=2;markup=renderMosaic(records,{budget:null,live:true,budgetUsed:999});
+assert.match(markup,/501 started · 1 in live window/);
+assert.equal((markup.match(/class="request-spot /g)||[]).length,1);
+assert.match(markup,/data-live-slot="500"[^>]*tabindex="0"/);
+assert.match(markup,/481–501 \/ 501/);assert.doesNotMatch(markup,/Unused|Budget slot|Request budget/);
+nodes['#main']={};state.detail={id:'live',state:'running',config,live_requests:records,progress:{attempted:501,completed:500},events:[],live_conditions:[],live_request_summary:{evicted:500,statuses:{completed:500}}};
 renderTests=renderAllRequests=renderLiveLoadResults=renderPhases=()=>'';renderLive();
-assert.match(nodes['#main'].innerHTML,/500 requests finished/);assert.match(nodes['#main'].innerHTML,/500 earlier requests outside the live window/);
+assert.match(nodes['#main'].innerHTML,/500 requests finished · 0s · limit not set/);assert.match(nodes['#main'].innerHTML,/500 earlier requests outside the live window/);
 assert.doesNotMatch(nodes['#main'].innerHTML,/budget-track|NaN|Infinity|undefined/);
 """)
 
@@ -207,7 +235,7 @@ const markup=renderSessionEditor(config);
 assert.match(markup,/name="profile_sessions_concurrency"[^>]*value="2"/);
 const first=bootstrap.checks.find(check=>check.id==='first_output');
 assert.match(renderTestCard(first,config),/name="test_first_output_request_timeout_seconds"[^>]*value="60"[^>]*readonly/);
-assert.match(renderTestCard(first,config),/Response validity owns this shared request setting/);
+assert.match(renderTestCard(first,config),/Endpoint response owns this shared request setting/);
 const input={name:'test_first_output_request_timeout_seconds',value:'30',dataset:{inherited:'true'}};
 nodes['#new-run-form']={elements:{test_first_output_request_timeout_seconds:input}};
 updateCheckFieldHints(config);assert.equal(input.value,60);assert.equal(input.readOnly,true);

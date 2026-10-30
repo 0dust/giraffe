@@ -26,21 +26,21 @@ def test_visible_traffic_keeps_count_certainty_and_limits(config, kind):
         assert all(row["requests_per_target"] is None for row in plan["rows"] if row["kind"] == "duration")
     browser_logic(r"""
 const plan=PLAN;
-nodes['#request-plan']={};nodes['#start-run']={};nodes['#run-bar-summary']={textContent:'unchanged'};nodes['#run-ceilings-summary']={textContent:''};
+nodes['#request-plan']={};nodes['#start-run']={};nodes['#run-bar-summary']={textContent:'unchanged'};
 state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
-renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,limits=renderSharedRunSettings(config);
-assert.equal(nodes['#run-ceilings-summary'].textContent,sharedLimitsSummary(config,plan));
-assert.match(limits,/id="run-ceilings-summary"/);assert.doesNotMatch(limits,/checks-plan-summary/);
-assert.equal((limits.match(/Empty = off/g)||[]).length,1);
-for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.match(limits,new RegExp('name="'+name+'"[^>]*value="'+(config[name]??'')+'"'));
-assert.doesNotMatch(markup,/<h3>Traffic<\/h3>|Endpoint request budgets|<dt>Max requests<\/dt>|<dt>Max duration<\/dt>/);
+renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
+assert.match(visible,/<h3>Traffic<\/h3>/);assert(visible.includes(setupPlanCount(plan)));
+assert.match(visible,/<dt>Maximum requests<\/dt>/);assert.match(visible,/<dt>Maximum duration<\/dt>/);
+assert(visible.includes(`<dd>${config.max_requests==null?'Not set':number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${config.max_duration_seconds==null?'Not set':elapsed(config.max_duration_seconds)}</dd>`));
+assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass criteria|requests per endpoint/);
 assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
-assert.equal(nodes['#run-bar-summary'].textContent,'unchanged');assert.equal(nodes['#start-run'].disabled,false);
-if(plan.count_kind==='bounded'){assert.match(nodes['#run-ceilings-summary'].textContent,/\d+\+ requests/);assert.match(markup,/Sending \/ maintained-load time/);assert.match(markup,/Adaptive/);}
-if(plan.count_kind==='estimate')assert.match(nodes['#run-ceilings-summary'].textContent,new RegExp(plan.planned_total+' requests'));
+assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
+assert.equal(nodes['#start-run'].disabled,false);
+if(plan.count_kind==='bounded'){assert.match(visible,/Unknown requests/);assert.match(visible,/Sending \/ maintained-load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/Duration-based/);}
+if(plan.count_kind==='estimate')assert.match(visible,/≈ /);
 state.configRevision++;renderRequestPlan();assert.equal(nodes['#start-run'].disabled,true);
-assert.match(nodes['#run-ceilings-summary'].textContent,/Requests updating/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/plan-total|Request breakdown/);
+assert.match(nodes['#request-plan'].innerHTML,/stale/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/plan-total|Request breakdown/);
 """.replace("PLAN", json.dumps(plan)), config)
 
 
@@ -55,7 +55,8 @@ assert.match(visible,/incomplete coverage/);assert.match(visible,/data-action="u
 assert(visible.includes('data-budget="'+plan.required_request_limit+'"'));assert.match(visible,/data-action="edit-setting"/);
 assert.match(visible,/Answer correctness/);
 for(const warning of plan.warnings)assert(visible.includes(escape(warning)));
-assert.doesNotMatch(markup,/Endpoint request budgets/);assert.equal(plan.target_quotas.local,2);assert.match(renderSharedRunSettings(config),/name="max_requests"[^>]*value="2"/);
+assert(markup.indexOf('Endpoint request budgets')>markup.indexOf('Request breakdown'));
+assert.match(markup,/local: up to 2 requests/);
 """.replace("PLAN", json.dumps(plan)), config)
 
 
@@ -69,8 +70,8 @@ let markup=renderReviewScope({config,mode:'cold-start',restart_target:'staging <
 for(const value of ['http://local/v1','https://stage.example/v1','model-a','model-b','staging &lt;b&gt;'])assert(markup.includes(value));
 assert.match(markup,/Your questions · 2 saved questions/);assert.match(markup,/Restart staging &lt;b&gt; before testing/);
 assert.match(markup,/data-setup-step="1">Edit connection/);assert.match(markup,/data-setup-step="2">Edit checks/);
-assert.doesNotMatch(markup,/Your run|setup-side-summary|Max concurrency|Whole-run time limit/);
-assert.match(markup,/<dl class="review-identity">/);assert.match(markup,/<ul class="review-check-names"><li>Endpoint access<\/li><li>Answer correctness<\/li><\/ul>/);
+assert.doesNotMatch(markup,/Your run|setup-side-summary|Simultaneous limit|Whole-run time limit/);
+assert.match(markup,/<dl class="review-identity">/);assert.match(markup,/<ul class="review-check-names"><li>Endpoint response<\/li><li>Answer correctness<\/li><\/ul>/);
 assert.equal(JSON.stringify(config),before);
 config.checks=['access'];markup=renderReviewScope({config,mode:'normal'});
 assert.doesNotMatch(markup,/Your questions|saved questions|Restart /); // Inactive dataset is not advertised as traffic.
@@ -92,12 +93,16 @@ def test_evaluator_destinations_and_scope_stay_visible_and_thresholds_stay_separ
 const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
-const judge=renderJudging(config);assert.match(judge,/Questions, expected answers and model answers/);assert.match(judge,/judge-model/);assert.match(judge,/https:\/\/judge.example\/v1/);for(const name of ['judging_concurrency','judging_request_timeout_seconds','judging_max_duration_seconds','judging_max_output_tokens'])assert(judge.includes('name="'+name+'"'));assert.doesNotMatch(visible,/AI judge calls|Questions, expected answers and model answers/);
+assert(visible.includes('Up to '+number(plan.evaluator.call_upper_bound)+' evaluator calls'));
+assert.match(visible,/Questions, expected answers and model answers/);assert.match(visible,/separate limits/);
+assert.match(visible,/judge-model/);assert.match(visible,/https:\/\/judge.example\/v1/);
 const criteria=renderReviewPassCriteria(config);
 assert(criteria.includes(catalogTitle('correctness')));assert(criteria.includes(catalogTitle('load')));
 assert.match(criteria,/Correct answers 95%/);assert.match(criteria,/Correct answers required \(%\): 80/);
-assert.doesNotMatch(markup,/<h3>Pass criteria<\/h3>/);assert.match(criteria,/<h3>Pass criteria<\/h3>/);
-const preview=renderJudgingPreview({...plan.evaluator,ready:false,readiness_errors:['AI judge needs a URL']});assert.equal((preview.match(/AI judge needs a URL/g)||[]).length,1);assert.match(preview,/class="notice warning"/);
+assert(markup.indexOf('Pass criteria')>markup.indexOf('Request breakdown'));
+plan.evaluator.readiness_errors=['Evaluator needs a URL'];plan.warnings.push('Evaluator needs a URL');renderRequestPlan();
+assert.equal((nodes['#request-plan'].innerHTML.match(/Evaluator needs a URL/g)||[]).length,1);
+assert(nodes['#request-plan'].innerHTML.indexOf('Evaluator needs a URL')<nodes['#request-plan'].innerHTML.indexOf('Request breakdown'));
 """.replace("PLAN", json.dumps(plan)), config)
 
 
@@ -140,7 +145,7 @@ nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 const original=JSON.stringify(config);renderRequestPlan();const visible=nodes['#request-plan'].innerHTML;
 assert.match(visible,/Poisson/);for(const rate of [.125,2,8])assert(visible.includes(rate+' requests/second'));
-assert.match(renderSharedRunSettings(config),/name="concurrency"[^>]*value="3"/);assert.match(sharedLimitsSummary(config),/3 at once/);assert(visible.includes(plan.load_test.expected_requests_label));
+assert.match(visible,/<dt>Simultaneous limit<\/dt><dd>3<\/dd>/);assert(visible.includes(plan.load_test.expected_requests_label));
 assert.equal(JSON.stringify(config),original);
 config.checks=['access','correctness'];assert.equal(renderLoadPlan(config,plan),'');
 """,config)
@@ -154,13 +159,13 @@ def test_review_explains_measurement_only_timing_with_explicit_null_overrides():
     browser_logic(r"""
 const original=JSON.stringify(config);let markup=renderReviewPassCriteria(config);
 assert.equal((markup.match(/Measurement only — no timing target; result is inconclusive/g)||[]).length,2);
-assert.match(markup,/Minimum usable answers/);assert.doesNotMatch(markup,/Time to first answer ≤ 0.4 s|Completion limit 2,000/);
+assert.match(markup,/Minimum usable answers/);assert.doesNotMatch(markup,/First output within 400|Completion limit 2,000/);
 assert.equal(JSON.stringify(config),original);
 config.test_options.generation.limits.stream_gap_ms=150;markup=renderReviewPassCriteria(config);
 assert.equal((markup.match(/Measurement only — no timing target/g)||[]).length,1);
 assert.match(markup,/Stream pause 150 ms/);
 delete config.test_options.first_output;markup=renderReviewPassCriteria(config);
-assert.doesNotMatch(markup,/Measurement only/);assert.match(markup,/Time to first answer ≤ 0.4 s/);
+assert.doesNotMatch(markup,/Measurement only/);assert.match(markup,/First output within 400 ms/);
 """, config)
 
 
@@ -168,10 +173,10 @@ def test_review_surfaces_only_an_active_baseline_and_escapes_its_name():
     browser_logic(r"""
 state.baselines=[{id:'baseline-123',name:'Before <upgrade>'}];
 let markup=renderReviewScope({config,baseline_id:'baseline-123'});
-assert.match(markup,/Compare with Baseline: Before &lt;upgrade&gt;/);
+assert.match(markup,/Compare with saved run: Before &lt;upgrade&gt;/);
 assert.doesNotMatch(markup,/baseline-123/);
 markup=renderReviewScope({config,baseline_id:'missing-<id>'});
-assert.match(markup,/Compare with Baseline: missing-&lt;id&gt;/);
+assert.match(markup,/Compare with saved run: missing-&lt;id&gt;/);
 assert.doesNotMatch(renderReviewScope({config,baseline_id:null}),/review-baseline|Compare with saved run/);
 """)
 

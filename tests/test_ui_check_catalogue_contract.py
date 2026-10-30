@@ -61,25 +61,6 @@ def test_prefix_never_fails_or_changes_verdict(cached, correct, latency_limit):
     assert overall_status([passing, prefix, fault]) == 'fail'
 
 
-def test_user_facing_vocabulary_has_no_retired_phrases():
-    """CLI flags/config keys and deferred documentation prose are outside this check."""
-    import re
-    from pathlib import Path
-    root = Path(__file__).parents[1]
-    forbidden = re.compile(r'\b(?:reference baseline|AI evaluator|golden answers|Run limits|suite limits|Test results|simultaneous|parallelism|in[ -]flight|Flight plan|First output within|Connection check|Repeated connection checks|Saved runs on disk)\b', re.I)
-    from giraffe.capabilities import CHECK_DETAILS
-    assert not forbidden.search('\n'.join(CHECK_DETAILS.values()))
-    for name in ['src/giraffe/static/app.js', 'src/giraffe/static/index.html',
-                 'src/giraffe/reporting.py', 'src/giraffe/planning.py', 'README.md']:
-        source = (root / name).read_text()
-        # Display-only normalization keeps the delegated HTML renderer untouched.
-        if name == 'src/giraffe/reporting.py':
-            source = re.sub(r'\.replace\("[^"]*",\s*"[^"]*"\)', '', source)
-        # README flag tables and commands document immutable CLI names.
-        if name == 'README.md':
-            source = '\n'.join(line for line in source.splitlines() if not line.startswith('| `--'))
-        assert not forbidden.search(source), name
-        assert not re.search(r'[\"\']Invalid responses[\"\']', source), name
 
 
 def test_html_displays_current_names_without_rewriting_saved_titles():
@@ -116,40 +97,55 @@ def test_request_plan_uses_check_names_for_initial_and_repeated_requests():
     assert titles['warm'] == CHECK_NAMES['serving']
 
 
-def test_exported_html_uses_giraffe_version_and_requests_navigation():
+def test_exported_html_preserves_version_and_request_evidence_navigation():
     from giraffe.models import RunReport
     from giraffe.reporting import _render
     report = RunReport(run_id='copy', suite_version='0.1.0a1', started_at='2026-10-29T00:00:00Z',
                        finished_at='2026-10-29T00:00:01Z', overall='pass', checks=[],
                        manifest={'config': {'checks': []}})
     html = _render(report)
-    assert 'Giraffe 0.1.0a1' in html
-    assert 'suite 0.1.0a1' not in html
-    assert '<a href="#requests">Requests</a>' in html
-    assert '<h2>Requests</h2>' in html
-    assert 'Requests in flight' not in html
+    assert 'suite 0.1.0a1' in html
+    assert '<a href="#requests">Request evidence</a>' in html
+    assert '<h2>Request evidence</h2>' in html
 
 
-def test_rendered_setup_and_html_have_no_remaining_vocabulary_drift():
-    """Check visible text, excluding immutable keys, flags and HTML attributes."""
-    from tests.test_ux_results import run_render_checks
-    run_render_checks(r'''
-const cfg=structuredClone(bootstrap.defaults);cfg.request_source='request_pack';cfg.request_pack={cases:[{fixture_id:'q',scorer:'judge',messages:[{role:'user',content:'Question'}],expected:'Answer'}]};state.config=cfg;
-const html=renderJudging(cfg)+renderRequestSource(cfg)+renderSharedRunSettings(cfg);
-const visible=html.replace(/<[^>]*>/g,' ');
-assert.doesNotMatch(visible,/\b(?:evaluators?|flight plan|saved runs?|invalid responses|first output within|parallel|in flight)\b/i);
-''')
-    import inspect
-    import re
-    from giraffe import reporting
+
+
+@pytest.mark.parametrize('gpu_status,required,overall', [
+    ('inconclusive', False, 'pass'),
+    ('fail', False, 'fail'),
+    ('fail', True, 'fail'),
+    ('inconclusive', True, 'inconclusive'),
+])
+def test_results_respect_backend_optional_observations(gpu_status, required, overall):
+    import json
     from giraffe.models import RunReport
-    html = reporting._render(RunReport(
-        run_id='vocabulary', suite_version='0.1.0a1',
-        started_at='2026-10-29T00:00:00Z', finished_at='2026-10-29T00:00:01Z',
-        overall='pass', checks=[], manifest={'config': {'checks': []}}))
-    visible = re.sub(r'<[^>]*>', ' ', html)
-    assert not re.search(r'\b(?:evaluators?|flight plan|saved runs?|invalid responses|first output within|parallel|in flight|suite\s+\d)\b', visible, re.I)
-    # Labels in the renderer itself are covered even when this fixture has no requests.
-    renderer = re.sub(r'\.replace\("[^"]*",\s*"[^"]*"\)', '', inspect.getsource(reporting._render))
-    assert '<h2>Request evidence</h2>' not in renderer
-    assert 'Requests in flight' not in renderer
+    from tests.test_ux_results import run_render_checks
+
+    checks = [
+        CheckResult(id='access', target='local', title=CHECK_NAMES['access'],
+                    status='pass', summary='Endpoint connected'),
+        CheckResult(id='gpu', target='local', title=CHECK_NAMES['gpu'], required=required,
+                    status=gpu_status, summary='Recorded GPU observation'),
+        CheckResult(id='prefix', target='local', title=CHECK_NAMES['prefix'], required=False,
+                    status='inconclusive', summary='Prefix caching not active'),
+    ]
+    assert overall_status(checks) == overall
+    value = RunReport(run_id='observations', started_at='2026-10-29T00:00:00Z',
+                      finished_at='2026-10-29T00:00:01Z', overall=overall, checks=checks,
+                      manifest={'config': {'targets': [{'name': 'local', 'model': 'm'}],
+                                           'checks': ['access', 'gpu', 'prefix']}})
+    run_render_checks('const value=' + value.model_dump_json() + ';const expected='
+                      + json.dumps(overall) + r''';
+const html=detail(value);
+assert(!html.includes('undefined'));
+assert.match(html,new RegExp('class="page-heading result-heading '+expected+'(?: is-entering)?"'));
+if(expected==='pass'){
+ assert.equal(mainFinding(value),'Selected acceptance checks passed');
+ assert.match(html,/<h1>Selected acceptance checks passed<\/h1>/);
+ assert.match(html,/<button class="button primary" data-action="baseline-dialog">Save baseline<\/button>/);
+}else{
+ assert.match(mainFinding(value),expected==='fail'?/GPU metrics failed/:/GPU metrics is inconclusive/);
+ assert.doesNotMatch(html,/<button class="button primary" data-action="baseline-dialog">Save baseline<\/button>/);
+}
+''')

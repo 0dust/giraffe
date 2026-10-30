@@ -15,7 +15,7 @@ await refreshRuns();renderRuns();
 assert.equal(state.runs[0].id,'available');assert.equal(state.storage,null);assert(state.storageUnavailable);
 assert.match(nodes['#main'].innerHTML,/available-model/);assert.match(nodes['#main'].innerHTML,/Storage information unavailable/);
 failStorage=false;await pollRuns(state.routeVersion);
-assert.match(nodes['#main'].innerHTML,/Runs: 10 B/);assert(!state.storageUnavailable);
+assert.match(nodes['#main'].innerHTML,/Saved runs on disk: 10 B/);assert(!state.storageUnavailable);
 failStorage=true;await pollRuns(state.routeVersion);
 assert.match(nodes['#main'].innerHTML,/Storage information unavailable/);
 failRuns=true;await assert.rejects(refreshRuns(),/Runs unavailable/);
@@ -27,7 +27,7 @@ def test_completed_report_warning_does_not_override_passing_verdict():
     run_render_checks(r"""
 const warning='HTML report could not be saved: disk full; report.json is complete';
 const html=detail(report([check('access','pass')]),{state:'completed',error:warning});
-assert.match(html,/<h1>1 check passed<\/h1>/);assert.doesNotMatch(html,/verdict-word|Acceptance passed/);
+assert.match(html,/<h1>Selected acceptance checks passed<\/h1>/);assert.doesNotMatch(html,/verdict-word|Acceptance passed/);
 assert.match(html,/class="notice warning"/);assert.match(html,/HTML report could not be saved/);
 assert.match(html,/data-action="baseline-dialog">Save baseline/);
 assert.doesNotMatch(html,/Runner error|Run could not finish|class="notice error"/);
@@ -48,7 +48,7 @@ let calls=0;api=async()=>{calls++;return {candidates:[],protected:[],bytes_freed
 for(const value of ['0','-1','NaN','0.00000001']){
   form.elements.max_total_mib.value=value;await previewCleanup({preventDefault(){}});
   assert.equal(calls,0);assert.equal(state.cleanup.preview,null);assert(nodes['#cleanup-confirm'].disabled);
-  assert(!nodes['#cleanup-error'].hidden);assert.match(nodes['#cleanup-error'].textContent,/greater than 0/);assert.match(nodes['#cleanup-error'].textContent,/Older than 0 days/);assert.doesNotMatch(nodes['#cleanup-error'].textContent,/--older-than/);
+  assert(!nodes['#cleanup-error'].hidden);assert.match(nodes['#cleanup-error'].textContent,/greater than 0/);assert.match(nodes['#cleanup-error'].textContent,/--older-than 0/);
 }
 form.elements.max_total_mib.value='';await previewCleanup({preventDefault(){}});assert.equal(calls,0);
 valid=true;await previewCleanup({preventDefault(){}});assert.equal(calls,1);

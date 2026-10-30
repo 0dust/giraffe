@@ -984,7 +984,7 @@ def _concurrent_load_html(metrics):
         parts.append(f"<h4>{_e(group['title'])}</h4><div class=table><table><tr>" + "".join(
             f"<th>{_e(h)}</th>" for h in ("Workload", "Requested concurrency", "Delivered / configured window (s)",
             "Sent / completed", "Errors failed / timeouts", "Cancelled", "Valid / required", "Correct %",
-            "Client concurrency mean / peak", "Server-evidenced concurrency", "Time to first answer p95 (ms)", "Response p95 (ms)",
+            "Client concurrency mean / peak", "Server-evidenced concurrency", "First-output p95 (ms)", "Response p95 (ms)",
             "Requests/s", "Output tok/s", "Input tokens actual median (min–max) / target", "Output tokens actual median (min–max) / cap", "Status and reason")) + "</tr>")
         for point in group["points"]:
             lengths = point["token_lengths"]
@@ -1002,7 +1002,7 @@ def _concurrent_load_html(metrics):
             if point.get("throughput_warning"):
                 notes.append(point["throughput_warning"])
             if kind == "mixed":
-                notes.append("Requested / observed request mix / observed concurrent request time: " + "; ".join(
+                notes.append("Requested / observed request mix / observed in-flight time: " + "; ".join(
                     f"{load_shape_label(shape)}: {shown(m['requested_percent'])}% / {shown(m['sent_percent'])}% ({m['sent']} sent) / {shown(m['inflight_percent'])}%"
                     for shape, m in point.get("observed_mix", {}).items()))
             if kind == "interference" and (data := point.get("interference")):
@@ -1017,7 +1017,7 @@ def _concurrent_load_html(metrics):
                 notes.append(f"Output coverage: {coverage['covered_valid_responses']} / {coverage['required']} required responses at or above {coverage['threshold_tokens']} {'token' if coverage['threshold_tokens'] == 1 else 'tokens'}.")
             parts.append('<tr><td colspan="17">' + _e(" ".join(notes)) + "</td></tr>")
         parts.append("</table></div>")
-    parts.append("<p><strong>How these are measured.</strong> Sending windows begin at first dispatch; individual slots refill until the window ends. Active requests drain and remain in latency, correctness and error counts. Client concurrency is a time-weighted mean and peak during sending; server concurrency needs overlapping streamed output. Interference qualifies its N−1 continuous short streams plus enough matched probes in both groups; probe trigger idle time does not count against short-stream load. Throughput uses completions from the first completion through the sending-window end, excluding drain. With few samples p95 is effectively the maximum. Missing token counts are not reported, never zero. Input tokens are targets; output tokens are caps and answers may finish sooner.</p>")
+    parts.append("<p><strong>How these are measured.</strong> Sending windows begin at first dispatch; individual slots refill until the window ends. In-flight requests drain and remain in latency, correctness and error counts. Client concurrency is a time-weighted mean and peak during sending; server concurrency needs overlapping streamed output. Interference qualifies its N−1 continuous short streams plus enough matched probes in both groups; probe trigger idle time does not count against short-stream load. Throughput uses completions from the first completion through the sending-window end, excluding drain. With few samples p95 is effectively the maximum. Missing token counts are not reported, never zero. Input tokens are targets; output tokens are caps and answers may finish sooner.</p>")
     for calibration in metrics.get("calibrations", []):
         if calibration.get("reason_code") == "minimum_prompt_length":
             parts.append("<p>Local input preparation: " + _e(calibration["reason"]) + "</p>")
@@ -1736,7 +1736,7 @@ def _traffic_table(check: CheckResult) -> str:
              + ('<th>Valid throughput</th>' if pack else '')
              + f'<th>{goodput_label} / good fraction</th>'
              '<th>Dispatch delay p95 ms</th><th>Service latency p95 ms</th>'
-             '<th>Arrival time to first answer / latency p95 ms</th></tr>']
+             '<th>Arrival first output / latency p95 ms</th></tr>']
     for stage in check.metrics["traffic_stages"]:
         def count(name: str) -> str:
             return _e(stage.get(name, "—"))
@@ -1783,7 +1783,7 @@ def _session_performance_html(data: dict[str, Any]) -> str:
                     f'{_e(row["capped_responses"])}</td></tr>')
     return (headline + '<details><summary>Conversation performance by task and turn</summary>'
             '<div class="table"><table><tr><th>Task / mode / turn</th><th>Completed / sent</th>'
-            '<th>Generation mean / median / p10 tok/s</th><th>Time to first answer p95 ms</th>'
+            '<th>Generation mean / median / p10 tok/s</th><th>First output p95 ms</th>'
             '<th>Response p95 ms</th><th>Unmeasured rate / capped replies</th></tr>'
             + ''.join(rows) + '</table></div></details>')
 
@@ -1893,7 +1893,7 @@ def _load_baseline_html(target: dict[str, Any]) -> str:
                     for field, label in (("valid", "valid"), ("dispatched", "dispatched"), ("required", "required")):
                         if point.get(field) is not None:
                             evidence.append(f'{point[field]} {label}')
-                    for field, label in (("server_evidenced_concurrency", "server-evidenced concurrency"), ("client_mean_inflight", "mean client requests at once")):
+                    for field, label in (("server_evidenced_concurrency", "server-evidenced concurrency"), ("client_mean_inflight", "mean client in flight")):
                         if point.get(field) is not None:
                             evidence.append(f'{label} {point[field]:g}')
                 parts.append(f'<td>{_e(point_status(point).capitalize())}'
@@ -2028,52 +2028,43 @@ def _condition_label(scenario: str, *, target: str | None = None,
 
 
 def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = None) -> str:
-    conditions = {}
+    conditions: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     notes = []
-    priority = {"Worse": 0, "Better": 1, "Interpretation limited": 2, "No material change": 3, "Not comparable": 4, "Observed result": 5}
+    seen = defaultdict(set)
     for target in baseline.get("targets", []):
         deployment = _deployment_change_html(target.get("configuration_diff") or {})
         if deployment:
-            notes.append(f'<div><h3>{_e(target.get("target", "Target"))} · Deployment</h3>{deployment}</div>')
-        for row in _baseline_display_rows(target):
-            identity = row.get("condition_id") or row.get("scenario_label") or row.get("scenario") or row.get("check") or "Run comparison"
+            notes.append(f'<div><h3>{_e(target.get("target", "Target"))} · Deployment</h3>'
+                         f'{deployment}</div>')
+        rows = _baseline_display_rows(target)
+        for row in rows:
             key = (target.get("target"), row.get("check"), _comparison_cohort(row))
-            if key not in conditions:
-                label = (_comparison_load_label(row["load_point"]) if row.get("load_point") else row.get("scenario_label")) or _condition_label(row.get("condition_id") or row.get("scenario") or row.get("check") or identity, target=target.get("target"), report=report)
-                check_label = CHECK_NAMES.get(row.get("check"))
-                heading = " · ".join(str(value) for value in (target.get("target", "Target"), label, check_label) if value)
-                conditions[key] = {"label": heading, "rows": [], "seen": set()}
-            group = conditions[key]
             fingerprint = json.dumps([row.get(name) for name in ("metric", "baseline", "current", "status", "reason")], sort_keys=True)
-            if fingerprint not in group["seen"]:
-                group["seen"].add(fingerprint)
-                group["rows"].append(row)
+            if fingerprint not in seen[key]:
+                seen[key].add(fingerprint)
+                conditions[key].append(row)
         traffic = target.get("traffic_capacity") or {}
         if traffic.get("delta_rps") is not None:
             delta = f'Change: {traffic["delta_rps"]:+.4g} requests/s'
             if traffic.get("change_percent") is not None:
                 delta += f' ({traffic["change_percent"]:+.1f}%)'
-            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · Tested arrival capacity · {_e(delta)}</p>')
+            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · '
+                         f'Tested arrival capacity · {_e(delta)}</p>')
         load = target.get("load_test") or {}
         if load.get("points") and load.get("reason"):
-            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · Load acceptance: {_e(load["reason"])}</p>')
-    if not conditions:
-        return ''.join(notes)
-    parts = notes + ['<div class="table baseline-comparison"><table class="baseline-table"><colgroup>'
-                     '<col class="comparison-name-col"><col class="comparison-value-col"><col class="comparison-value-col">'
-                     '<col class="comparison-delta-col"><col class="comparison-verdict-col"></colgroup><thead><tr>'
-                     '<th scope="col">Metric</th><th scope="col" class="comparison-number">Baseline</th>'
-                     '<th scope="col" class="comparison-number">Current</th><th scope="col" class="comparison-number">Δ</th>'
-                     '<th scope="col">Verdict</th></tr></thead>']
-    ordered = sorted(conditions.values(), key=lambda group: min(priority[_baseline_verdict(row)[0]] for row in group["rows"]))
-    for group in ordered:
-        parts.append(f'<tbody><tr class="comparison-group"><th colspan="5" scope="rowgroup">{_e(group["label"])}</th></tr>')
-        for row in sorted(group["rows"], key=lambda row: priority[_baseline_verdict(row)[0]]):
-            metric = row.get("metric", "Metric")
-            label = {"latency_ms": "Latency", "first_output_ms": "Time to first answer",
-                     "max_stream_gap_ms": "Stream gap", "output_tokens_per_second": "Output tokens/s",
-                     "generation_tokens_per_second": "Generation tokens/s", "correctness_rate": "Correct answers",
-                     "error_rate": "Error rate", "valid_completion_rate": "Valid responses"}.get(metric, str(metric).replace("_", " ").capitalize())
+            notes.append(f'<p class="muted">{_e(target.get("target", "Target"))} · '
+                         f'Load acceptance: {_e(load["reason"])}</p>')
+
+    def table(rows):
+        reason_column = any(row.get("warnings") or (row.get("reason") and row["reason"] !=
+                            "No material worsening detected in these samples.")
+                            for row in rows)
+        parts = ['<div class="table"><table class="baseline-table"><thead><tr>'
+                 '<th>Metric</th><th>Baseline</th><th>Current</th><th>Observed change</th><th>Interpretation</th>'
+                 + ('<th>Reason</th>' if reason_column else '') + '</tr></thead><tbody>']
+        for row in rows:
+            label = str(row.get("metric", "Metric")).replace("_", " ")
+            label = label[:1].upper() + label[1:]
             before, after = row.get("baseline"), row.get("current")
             rate = row.get("change_unit") == "percentage_points"
 
@@ -2081,11 +2072,8 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                 if number is None:
                     return "—"
                 if isinstance(number, str):
-                    return _e(number.capitalize())
-                if rate:
-                    return f"{number * 100:.1f}%"
-                unit = " ms" if metric.endswith("_ms") else " tok/s" if metric.endswith("tokens_per_second") else ""
-                return _number(number) + unit
+                    return _e(number.replace("_", " ").capitalize())
+                return f"{number * 100:.1f}%" if rate else _number(number)
 
             change = "—"
             if isinstance(before, (int, float)) and isinstance(after, (int, float)):
@@ -2103,19 +2091,46 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                               " chars" if metric == "output_chars" else "")
                     change = f"{after - before:+,.1f}{suffix} · from zero"
             verdict, tone = _baseline_verdict(row)
-            reason = " ".join(warning["message"] for warning in row.get("warnings", [])) or row.get("reason", "")
-            if reason == "No material worsening detected in these samples.":
-                reason = ""
-            parts.append(f'<tr class="comparison-metric"><th scope="row">{_e(label)}'
-                         + (f'<small class="comparison-reason">{_e(reason)}</small>' if reason else '') + '</th>')
-            for field, number in (("Baseline", before), ("Current", after)):
-                samples = row.get(field.lower() + "_samples")
-                parts.append(f'<td class="comparison-number" data-label="{field}" title="{_e(number)}">{value(number)}'
-                             + (f'<small class="comparison-samples">n={_e(samples)}</small>' if samples is not None else '') + '</td>')
-            parts.append(f'<td class="comparison-number {tone}" data-label="Δ">{_e(change)}</td>'
-                         f'<td data-label="Verdict"><strong class="{tone}">{verdict}</strong></td></tr>')
-        parts.append('</tbody>')
-    parts.append('</table></div>')
+            parts.append(f'<tr><th scope="row">{_e(label)}</th>'
+                         f'<td>{value(before)}</td><td>{value(after)}</td>'
+                         f'<td class="{tone}">{_e(change)}</td>'
+                         f'<td><strong class="{tone}">{verdict}</strong></td>')
+            if reason_column:
+                reason = row.get("reason", "")
+                if reason == "No material worsening detected in these samples.":
+                    reason = ""
+                warnings = [warning["message"] for warning in row.get("warnings", [])]
+                if warnings:
+                    reason = " ".join(warnings)
+                parts.append(f'<td class="muted">{_e(reason)}</td>')
+            parts.append('</tr>')
+        parts.append('</tbody></table></div>')
+        return ''.join(parts)
+
+    parts = notes
+    # Conditions with changed acceptance appear before conditions without changes.
+    ordered = sorted(conditions.items(), key=lambda item: min(
+        {"Worse": 0, "Better": 1, "Interpretation limited": 2, "No material change": 3, "Not comparable": 4, "Observed result": 5}[
+            _baseline_verdict(row)[0]] for row in item[1]))
+    for condition, entries in ordered:
+        row = entries[0]
+        context = ((_comparison_load_label(row['load_point']) if row.get('load_point') else row.get('scenario_label'))
+                   or _condition_label(row.get('condition_id') or row.get('scenario') or row.get('check') or condition[2] or 'Run comparison',
+                                       target=condition[0], report=report))
+        label = ' · '.join(str(value) for value in (condition[0], CHECK_NAMES.get(condition[1], condition[1]), context) if value)
+        parts.append(f'<div class="baseline-condition"><h3>{_e(label or "Run comparison")}</h3>')
+        for verdict, title in (("Worse", "Worse"), ("Better", "Better"),
+                               ("Interpretation limited", "Warnings"), ("No material change", "Unchanged"),
+                               ("Not comparable", "Not comparable"), ("Observed result", "Observed outputs")):
+            rows = [row for row in entries if _baseline_verdict(row)[0] == verdict]
+            if not rows:
+                continue
+            if verdict in {"No material change", "Not comparable"}:
+                parts.append(f'<details class="baseline-group"><summary>{title} ({len(rows)})</summary>'
+                             f'{table(rows)}</details>')
+            else:
+                parts.append(f'<h4>{title} ({len(rows)})</h4>{table(rows)}')
+        parts.append('</div>')
     return ''.join(parts)
 
 
@@ -2244,7 +2259,7 @@ def _render(report: RunReport) -> str:
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
              f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
-             f'<p class="muted">Run {_e(report.run_id)} · Giraffe {_e(report.suite_version)}<br>'
+             f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     for summary in disconnected.values():
         parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
@@ -2256,7 +2271,7 @@ def _render(report: RunReport) -> str:
                      f'<br>Endpoint: <code>{_e(target.get("url", ""))}</code></p>')
     parts.append('<nav aria-label="Report sections"><a href="#checks">Checks</a> · '
                  '<a href="#baseline">Baseline comparison</a> · <a href="#html-performance">Performance</a> · '
-                 '<a href="#requests">Requests</a> · <a href="#reproduction">Reproduce</a></nav>')
+                 '<a href="#requests">Request evidence</a> · <a href="#reproduction">Reproduce</a></nav>')
     parts.append(_json_export_html(report))
     if report.baseline:
         parts.append(_baseline_summary_html(report.baseline))
@@ -2331,7 +2346,7 @@ def _render(report: RunReport) -> str:
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
         default_limits = (report.manifest.get("default_check_limits") or {}).get(check.id) or []
-        timing = {"first_output": [("first_output_ms", "p95 first answer")],
+        timing = {"first_output": [("first_output_ms", "p95 first useful output")],
                   "generation": [("latency_ms", "Response time"), ("stream_gap_ms", "Stream pause")]}
         limit_text = "; ".join(f"{label} ≤ {_duration_ms(applied[field])}" + (" (default)" if field in default_limits else "")
                                for field, label in timing.get(check.id, []) if applied.get(field) is not None)
@@ -2390,17 +2405,17 @@ def _render(report: RunReport) -> str:
     for entry in report.performance["available_targets"]:
         selected = (report.performance if entry["target"] == report.performance["selected_target"]
                     else build_performance(report, target=entry["target"]))
-        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))).replace("First useful output limit", "First answer limit").replace("Test results", "Results").replace("Requests in flight", "Requests at once"))
+        parts.append(render_performance(selected, prefix="performance-" + str(len(parts))))
     if not report.performance["available_targets"]:
-        parts.append(render_performance(report.performance).replace("First useful output limit", "First answer limit").replace("Test results", "Results").replace("Requests in flight", "Requests at once"))
+        parts.append(render_performance(report.performance))
     parts.append('</div>')
-    parts.append('<section id="measurements"><h2>Measurements by condition</h2>'
+    parts.append('<section id="measurements"><h2>Measurements by scenario</h2>'
                  '<p class="muted">Initial requests are separated from warm and loaded requests. '
                  'Latency percentiles include valid completed requests only; failures and timeouts '
                  'are counted alongside them. Small samples do not establish tail latency.</p>'
-                 '<div class="table"><table><tr><th>Target / condition</th><th>Requests</th>'
+                 '<div class="table"><table><tr><th>Target / scenario</th><th>Requests</th>'
                  '<th>Valid</th><th>Errors / timeouts</th><th>Cancelled</th><th>Latency p50 / p95 ms</th>'
-                 '<th>Time to first answer p50 ms</th><th>Generation speed p50 tok/s (estimate)</th>'
+                 '<th>First output p50 ms</th><th>Generation pace p50 tok/s (estimate)</th>'
                  '<th>End-to-end output p50 tok/s</th><th>Scored correct</th></tr>')
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in report.requests:
@@ -2424,7 +2439,7 @@ def _render(report: RunReport) -> str:
     parts.append('</table></div></section>')
     parts.append('<section id="deployment"><h2>Deployment and serving telemetry</h2>'
                  '<p>Deployment changes provide investigation context and do not establish causality. '
-                 'Unknown fields and telemetry remain unknown. Client time to first answer is separate from server TTFT.</p>')
+                 'Unknown fields and telemetry remain unknown. Client first output is separate from server TTFT.</p>')
     for name, observation in report.observations.get("targets", {}).items():
         residency = (observation.get("deployment") or {}).get("model_residency", {})
         if residency:
@@ -2442,7 +2457,7 @@ def _render(report: RunReport) -> str:
                      f'<details><summary>Serving telemetry, phases and collection coverage</summary>'
                      f'<pre>{_json(observation.get("serving_telemetry"))}</pre></details>')
     parts.append('</section>')
-    parts.append('<section id="requests"><h2>Requests</h2>'
+    parts.append('<section id="requests"><h2>Request evidence</h2>'
                  f'<p class="muted">Response retention: {_e(config.get("retention", "failures"))}. '
                  'Retention controls response text; request metadata, timings, status and scores are always saved. '
                  'Retention does not cap disk usage; storage limits do.</p>'
