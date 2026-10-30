@@ -378,8 +378,21 @@ conversation has its own history and sampled pauses after completed responses.
 Blank length distributions retain original prompts, task output caps and the full
 configured turn count. Dynamic pauses require at least one value.
 
-Run `giraffe run --config examples/session-distributions.yaml --output runs/sessions`
-after setting the example's model. CLI/config and the UI use `sessions.sampling`:
+Download [session-distributions.yaml](../examples/session-distributions.yaml)
+from GitHub, then edit its endpoint and model. From the
+download folder, run:
+
+```sh
+giraffe validate --config session-distributions.yaml
+giraffe run --config session-distributions.yaml --output runs/sessions --html
+```
+
+The example lives in the repository; pip does not copy it into your working
+directory. You can also configure the test in the UI and choose **Copy terminal
+command**, or **Save setup** and run `giraffe run --config giraffe-config.json`
+from the download folder.
+
+CLI/config and the UI use `sessions.sampling`:
 `seed`, `think_time_seconds`, `input_tokens`, `output_tokens` and `turn_count`.
 Each distribution has `values` and optional `weights`.
 

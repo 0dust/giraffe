@@ -9,6 +9,7 @@ describe the current configuration contract (`config_version: 2`).
 | --- | --- |
 | [Running and baselines](running.md) | CLI commands, browser UI, credentials, results and before/after comparisons |
 | [Workloads and measurements](workloads.md) | Load patterns, check settings, acceptance criteria and evidence limits |
+| [Multi-turn conversation settings](workloads.md#sampled-conversation-traffic) | Fixed/dynamic pauses, sampled token lengths and turn counts, and a downloadable YAML example |
 | [Offline and container use](offline.md) | Dependency wheels, tokenizer caches and Docker commands |
 | [Resource limits](resources.md) | Disk and RAM limits, response retention and cleanup |
 
