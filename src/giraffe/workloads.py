@@ -202,6 +202,11 @@ async def sessions(run, target, client):
     config = _check_config(run.config, "sessions")
     settings = config.sessions
     mixed = settings.profile == "performance"
+    from .session_sampling import prepare_session_input, session_plan
+
+    plans = session_plan(settings) if mixed or settings.sampling else []
+    recall_plans = {(plan["mode"], plan["index"]): plan for plan in plans} if not mixed else {}
+    prepared_inputs = {}
     observation = {
         "failure_policy": settings.failure_policy,
         "sessions": [],
@@ -209,23 +214,35 @@ async def sessions(run, target, client):
         "live_baseline": "Live generated inputs can differ; compare measured shape/hash evidence, not presumed identical histories.",
         "kind": settings.profile,
         "planned_sessions": settings.sessions * len(settings.modes),
+        "planned_turns": sum(len(plan["turns"]) for plan in plans) if mixed else
+            settings.sessions * len(settings.modes) * len(settings.turns),
         "configured_concurrency": settings.concurrency,
+        "sampling": settings.sampling.model_dump(mode="json") if settings.sampling else None,
+        "input_target_scope": "New user message content only; excludes prior history and chat formatting. Local tokenizer counts can differ from server usage.",
     }
     run.observations[target.name]["sessions"] = observation
 
-    async def session(mode, index, workload=None):
+    async def session(mode, index, plan=None):
         history, previous = [], None
         session_id = f"{target.name}:{mode}:{index}"
-        turns = workload.turns if workload else settings.turns
-        budget = (workload.max_tokens if workload else None) or settings.max_tokens
+        workload = plan["workload"] if plan else None
+        turns = workload.turns[:len(plan["turns"])] if workload else settings.turns
         item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None,
                 "task_type": workload.name if workload else "exact_repeat",
                 "planned_turns": len(turns)}
+        if plan:
+            item["sampled_turns"] = plan["turns"]
         observation["sessions"].append(item)
         value = f"Session_{index:04d}_{mode}"
         item["seeded_value"] = value
-        due = time.monotonic()
+        previous_completed_ms = None
         for turn, prompt in enumerate(turns):
+            sampled = plan["turns"][turn] if plan else {
+                "think_time_seconds": settings.delay_seconds if turn else 0,
+                "input_tokens": None, "output_tokens": settings.max_tokens}
+            budget = sampled["output_tokens"]
+            delay = sampled["think_time_seconds"]
+            due = time.monotonic() + delay
             if not run.allowed(target.name):
                 item["stop_reason"] = run.reason or "target request budget reached"
                 run.unfinished[target.name].add("sessions")
@@ -233,8 +250,20 @@ async def sessions(run, target, client):
             await asyncio.sleep(
                 max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
             )
+            if not run.allowed(target.name):
+                item["stop_reason"] = run.reason or "request budget reached during turn pause"
+                run.unfinished[target.name].add("sessions")
+                break
             if not workload:
                 prompt = session_prompt(prompt, turn, value)
+            preparation = None
+            if sampled["input_tokens"] is not None:
+                preparation = prepared_inputs[(prompt, sampled["input_tokens"])]
+                if preparation["status"] != "calibrated" or preparation.get("reason_code") == "minimum_prompt_length":
+                    item["stop_reason"] = preparation.get("reason") or "requested input length could not be prepared"
+                    run.unfinished[target.name].add("sessions")
+                    break
+                prompt = preparation["messages"][0]["content"]
             messages = [*history, {"role": "user", "content": prompt}]
             input_chars = sum(len(m["content"]) for m in messages)
             if input_chars + budget + 32 > config.context_limit:
@@ -254,9 +283,15 @@ async def sessions(run, target, client):
                 turn_id=turn,
                 mode=mode,
                 history_messages=len(history),
-                configured_delay_seconds=settings.delay_seconds,
+                configured_delay_seconds=delay,
+                sampled_input_tokens=sampled["input_tokens"],
+                sampled_output_tokens=budget,
+                sampling_seed=settings.sampling.seed if settings.sampling else None,
                 scheduled_ms=(due - run.start) * 1000,
             )
+            if preparation:
+                request.workload["input_preparation"] = {key: value for key, value in preparation.items()
+                                                        if key not in {"messages", "request_ids"}}
             request.messages, request.input_chars = messages, input_chars
             if not workload:
                 request.scorer, request.expected = "exact", value
@@ -267,6 +302,10 @@ async def sessions(run, target, client):
                 run.unfinished[target.name].add("sessions")
                 break
             item["turns"].append(record.id)
+            record.workload["actual_pause_seconds"] = (
+                max(0, (record.dispatch_ms - previous_completed_ms) / 1000)
+                if previous_completed_ms is not None and record.dispatch_ms is not None else None)
+            previous_completed_ms = record.completed_ms
             if reasoning_budget(record):
                 item["stop_reason"] = "reasoning exhausted the output budget before an answer; session recall unverified"
                 run.unfinished[target.name].add("sessions")
@@ -291,25 +330,31 @@ async def sessions(run, target, client):
                 break
             previous = final_answer(record.output)[0] if mode == "live" else value
             history = [*messages, {"role": "assistant", "content": previous}]
-            due = time.monotonic() + settings.delay_seconds
         item["completed_turns"] = len(item["turns"])
 
-    from .session_metrics import workload_plan
-
-    session_workloads = workload_plan(settings.workloads, settings.sessions) if mixed else []
     for mode in settings.modes:
-        planned = sum(len(workload.turns) for workload in session_workloads) if mixed else settings.sessions * len(settings.turns)
+        planned = sum(len(plan["turns"]) for plan in plans) if mixed else settings.sessions * len(settings.turns)
         run.plan_condition(target.name, f"session_{mode}_turn0", planned=planned)
     try:
         if mixed:
+            # All new user messages are known before traffic. Size them once so
+            # tokenizer startup does not distort the requested inter-turn pauses.
+            for plan in plans:
+                for prompt, sampled in zip(plan["workload"].turns, plan["turns"]):
+                    if not run.allowed(target.name):
+                        return
+                    tokens = sampled["input_tokens"]
+                    key = (prompt, tokens)
+                    if tokens is not None and key not in prepared_inputs:
+                        prepared_inputs[key] = await prepare_session_input(run, target, prompt, tokens)
             pending = asyncio.Queue()
-            for index, workload in enumerate(session_workloads):
-                pending.put_nowait((index, workload))
+            for index, plan in enumerate(plans):
+                pending.put_nowait((index, plan))
 
             async def worker():
                 while not pending.empty():
-                    index, workload = pending.get_nowait()
-                    await session("live", index, workload)
+                    index, plan = pending.get_nowait()
+                    await session("live", index, plan)
 
             await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
             return
@@ -322,10 +367,15 @@ async def sessions(run, target, client):
                 while next_index < settings.sessions:
                     index = next_index
                     next_index += 1
-                    await session(mode, index)
+                    await session(mode, index, recall_plans.get((mode, index)))
 
             await asyncio.gather(*(worker() for _ in range(min(settings.concurrency, settings.sessions))))
     finally:
+        for item in observation["sessions"]:
+            item["completed_turns"] = len(item["turns"])
+            if item["completed_turns"] < item["planned_turns"] and not item["stop_reason"]:
+                item["stop_reason"] = run.reason or "session interrupted before all planned turns completed"
+                run.unfinished[target.name].add("sessions")
         for mode in settings.modes:
             skipped = any(item["mode"] == mode and item["stop_reason"] and
                           len(item["turns"]) < item["planned_turns"] for item in observation["sessions"])

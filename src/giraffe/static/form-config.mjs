@@ -288,14 +288,41 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
 export function configureSessions(source, values, defaults, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   if (!values.has('sessions_profile')) return config;
-  if (values.get('sessions_profile') === 'correctness' && !config.sessions) return config;
+  const pauseMode=values.get('session_pause_mode');
+  if (values.get('sessions_profile') === 'correctness' && !config.sessions &&
+      pauseMode !== 'dynamic' && (pauseMode === 'fixed' || (
+        !String(values.get('session_sample_think_time_seconds') || '').trim() &&
+        !String(values.get('session_weights_think_time_seconds') || '').trim()))) return config;
   const settings = config.sessions ||= {...structuredClone(defaults),
     max_tokens:Math.min(defaults.max_tokens,config.max_output_tokens)};
   settings.profile = values.get('sessions_profile');
+  if (values.has('session_sampling_seed')) {
+    const sampling={};
+    for (const key of ['think_time_seconds','input_tokens','output_tokens','turn_count']) {
+      if (settings.profile !== 'performance' && key !== 'think_time_seconds') continue;
+      if (key === 'think_time_seconds' && pauseMode === 'fixed') continue;
+      const text=String(values.get(`session_sample_${key}`)||'').trim();
+      const weights=String(values.get(`session_weights_${key}`)||'').trim();
+      if (key === 'think_time_seconds' && pauseMode === 'dynamic' && !text && !allowInvalid) {
+        throw Object.assign(new Error('Enter pause values for dynamic pauses.'), {
+          errors:[{fields:['sessions.sampling.think_time_seconds.values'],msg:'Enter pause values for dynamic pauses.'}],
+        });
+      }
+      if (key === 'think_time_seconds' && pauseMode === 'dynamic' && !text) {sampling[key]={values:[]};continue;}
+      if (!text && !weights) continue;
+      const parse=(value,label)=>value.split(',').map(item=>{
+        if (!item.trim() && !allowInvalid) throw new Error(`${label}: enter comma-separated numbers.`);
+        return numeric(item.trim(),label,allowInvalid);
+      });
+      sampling[key]={values:text?parse(text,key):[]};
+      if(weights)sampling[key].weights=parse(weights,`${key} weights`);
+    }
+    settings.sampling=Object.keys(sampling).length?{seed:numeric(values.get('session_sampling_seed'), 'Sampling seed', allowInvalid),...sampling}:null;
+  }
   if (settings.profile !== 'performance') return config;
   settings.modes = ['live'];
   settings.sessions = numeric(values.get('sessions_count'), 'Total conversations', allowInvalid);
-  settings.delay_seconds = numeric(values.get('sessions_delay'), 'Pause between turns', allowInvalid);
+  if (pauseMode !== 'dynamic') settings.delay_seconds = numeric(values.get(values.has('profile_sessions_delay_seconds') ? 'profile_sessions_delay_seconds' : 'sessions_delay'), 'Pause between turns', allowInvalid);
   if (values.has('profile_sessions_concurrency')) {
     const value = numeric(values.get('profile_sessions_concurrency'), 'Concurrent conversations', allowInvalid);
     const edited = JSON.parse(values.get('profile_edits_sessions') || '[]').includes('concurrency');
@@ -436,6 +463,7 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false,
     const profile = structuredClone(config[key] || effectiveProfileDefaults(config, defaults, key));
     for (const name of edits) {
       if (!Object.hasOwn(defaults[key], name)) continue;
+      if (key === 'sessions' && name === 'delay_seconds' && values.get('session_pause_mode') === 'dynamic') continue;
       const raw = values.get(`profile_${key}_${name}`);
       if (key === 'consistency' && name === 'logprobs') {
         try { profile[name] = parseLogprobSettings(String(raw || 'null')); }

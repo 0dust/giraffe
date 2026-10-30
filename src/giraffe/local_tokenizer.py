@@ -38,7 +38,10 @@ class TokenizerUnavailable(Exception):
 
 
 def needs_tokenizer(config):
-    return "context" in config.checks or (
+    session_sizing = ("sessions" in config.checks and config.sessions is not None
+                     and config.sessions.sampling is not None
+                     and config.sessions.sampling.input_tokens is not None)
+    return session_sizing or "context" in config.checks or (
         "load" in config.checks and not config.custom_fixtures
         and not (config.request_source == "request_pack" and config.request_pack)
     )
@@ -271,7 +274,7 @@ def _progress(run, target, scenario, status, **metadata):
         run.preparation(target.name, scenario, "Preparing input locally", status, **metadata)
 
 
-async def prepare_messages(run, target, scenario, build_messages, target_tokens, *, tolerance=.1):
+async def prepare_messages(run, target, scenario, build_messages, target_tokens, *, tolerance=.1, content_only=False):
     """Size a message builder accepting a filler-character count, without inference.
 
     Returns the messages actually counted, local token count, provenance and the
@@ -313,8 +316,9 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
             ready = await _read_worker(process)
             if ready.get("error"):
                 raise TokenizerUnavailable(ready["error"])
+            scope = "message_content" if content_only else ready.get("token_count_scope", "message_content")
             result.update(chat_template=ready.get("chat_template", False),
-                          token_count_scope="builtin_reference" if builtin else ready.get("token_count_scope", "message_content"))
+                          token_count_scope="builtin_reference" if builtin else scope)
             low, high = 0, None
             filler = 0
             for attempt in range(MAX_SIZING_ATTEMPTS):
@@ -322,7 +326,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 if reason and reason != "maximum request budget reached":
                     raise TokenizerUnavailable(reason)
                 messages = build_messages(filler)
-                process.stdin.write((json.dumps({"messages": messages}) + "\n").encode())
+                process.stdin.write((json.dumps({"messages": messages, "content_only": content_only}) + "\n").encode())
                 await process.stdin.drain()
                 answer = await _read_worker(process)
                 if answer.get("error"):
@@ -447,8 +451,8 @@ def _worker(tokenizer_name, *, allow_download=False):
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=False,
                                                            trust_remote_code=False)
             has_template = bool(tokenizer.chat_template)
-            def count(messages):
-                if has_template:
+            def count(messages, content_only=False):
+                if has_template and not content_only:
                     return len(tokenizer.apply_chat_template(messages, tokenize=True,
                         add_generation_prompt=True, return_dict=False))
                 return sum(len(tokenizer.encode(message["content"], add_special_tokens=False))
@@ -468,7 +472,9 @@ def _worker(tokenizer_name, *, allow_download=False):
     for line in sys.stdin:
         try:
             payload = json.loads(line)
-            print(json.dumps({"input_tokens": count(payload["messages"])}), flush=True)
+            messages = payload["messages"]
+            tokens = count(messages) if builtin else count(messages, payload.get("content_only", False))
+            print(json.dumps({"input_tokens": tokens}), flush=True)
         except (ImportError, ValueError, TypeError, KeyError) as exc:
             print(json.dumps({"error": f"Local tokenization unavailable: {exc}"}), flush=True)
 

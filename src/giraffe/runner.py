@@ -2658,6 +2658,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
         "settings": workload_settings,
     }
+    if "sessions" in config.checks and config.sessions and config.sessions.sampling:
+        from giraffe import session_sampling
+        workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
+            Path(session_sampling.__file__).read_bytes()).hexdigest()
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic
         workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()

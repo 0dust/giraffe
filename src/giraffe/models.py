@@ -1070,6 +1070,39 @@ def migrate_concurrent_load(value):
 
 
 
+class SessionDistribution(Model):
+    """A finite distribution; omitted weights give every value equal probability."""
+
+    values: list[Annotated[float, Field(strict=True, ge=0, le=131072)]] = Field(min_length=1, max_length=64)
+    weights: list[Annotated[float, Field(strict=True, ge=0, le=10000)]] | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def valid_weights(self):
+        if self.weights is not None and (len(self.weights) != len(self.values) or not any(self.weights)):
+            raise ValueError("distribution weights must match the values and include a positive weight")
+        return self
+
+
+class SessionSampling(Model):
+    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
+    think_time_seconds: SessionDistribution | None = None
+    input_tokens: SessionDistribution | None = None
+    output_tokens: SessionDistribution | None = None
+    turn_count: SessionDistribution | None = None
+
+    @field_validator("think_time_seconds", "input_tokens", "output_tokens", "turn_count")
+    @classmethod
+    def valid_range(cls, distribution, info: ValidationInfo):
+        field = info.field_name
+        minimum, maximum = {"think_time_seconds": (0, 60), "input_tokens": (1, 131072),
+                            "output_tokens": (1, 65536), "turn_count": (2, MAX_SESSION_TURNS)}[field]
+        if distribution and any(not minimum <= value <= maximum or
+                (field != "think_time_seconds" and not value.is_integer()) for value in distribution.values):
+            unit = "numbers" if field == "think_time_seconds" else "whole numbers"
+            raise ValueError(f"{field} values must be {unit} from {minimum} to {maximum}")
+        return distribution
+
+
 class SessionWorkload(Model):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
     weight: float = Field(default=1, gt=0, le=10000)
@@ -1109,20 +1142,24 @@ class Sessions(Model):
     sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
     concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     turns: list[Annotated[str, Field(min_length=1, max_length=MAX_SESSION_TURN_CHARS)]] = Field(min_length=2, max_length=MAX_SESSION_TURNS, default_factory=lambda: [
-        "Suggest a name for a bakery. Reply with only the name, without quotation marks or a trailing full stop.",
+        "Remember the name assigned to this conversation and reply with that name only.",
         SESSION_REPEAT_PROMPT])
-    saved_answers: list[str] = Field(default_factory=lambda: ["Golden Crust", "Golden Crust"],
+    saved_answers: list[str] = Field(default_factory=list,
         description="Retained for config compatibility; seeded name-recall histories use the session name at every turn.")
     delay_seconds: float = Field(default=0, ge=0, le=60)
     max_tokens: int = Field(default=32, ge=1)
     # Non-empty workloads select live performance conversations. Empty retains
     # the existing fixed/live exact-repeat correctness test and its saved config.
     workloads: list[SessionWorkload] = Field(default_factory=list, max_length=16)
+    sampling: SessionSampling | None = None
     # Stop rather than inventing an answer or silently cropping required history.
     failure_policy: Literal["stop"] = "stop"
 
     @model_validator(mode="after")
     def valid_session(self):
+        if self.sampling is not None and self.profile != "performance" and any(
+                getattr(self.sampling, field) is not None for field in ("input_tokens", "output_tokens", "turn_count")):
+            raise ValueError("input, output and turn-count sampling require the performance profile; pause sampling supports both profiles")
         if self.profile == "performance":
             if not self.workloads:
                 raise ValueError("select at least one performance workload")
@@ -1131,6 +1168,9 @@ class Sessions(Model):
             names = [workload.name for workload in self.workloads]
             if len(names) != len(set(names)):
                 raise ValueError("session workload names must be unique")
+            if self.sampling and self.sampling.turn_count and any(
+                    max(self.sampling.turn_count.values) > len(workload.turns) for workload in self.workloads):
+                raise ValueError("sampled turn counts cannot exceed the configured turns in any selected task; add turns or lower the sampled counts")
         if not self.modes or len(set(self.modes)) != len(self.modes):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= MAX_SESSION_TURNS or any(not t.strip() or len(t) > MAX_SESSION_TURN_CHARS for t in self.turns):

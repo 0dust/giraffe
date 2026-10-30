@@ -455,6 +455,10 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .test-editor-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .test-editor-footer { display: flex; justify-content: flex-end; }
 .test-settings { display: grid; gap: 12px; }
+.test-editor [data-session-description] { margin: 6px 0 16px; }
+.test-editor [data-session-fixed] { margin: 16px 0; }
+.test-editor [data-session-mix] > h5 { margin: 0 0 8px; }
+.session-pause-choice { margin: 12px 0; }
 .reset-test { justify-self: end; font-size: 12px; }
 .check-prerequisite { font-size: 12.5px; color: var(--text-2); }
 .check-prerequisite strong { color: var(--accent); font-weight: 600; }

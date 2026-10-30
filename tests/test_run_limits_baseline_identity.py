@@ -129,7 +129,7 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue45")
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue95_pauses")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
     }
@@ -138,6 +138,32 @@ def test_unchanged_text_generator_has_reviewed_identity_table_entry():
         assert identity[field] == digest, (
             f"{field} changed: review request-level compatibility and update/extend "
             "_run_limits_workload_identity in src/giraffe/reporting.py; do not bridge changed workloads.")
+
+
+def test_presampling_generator_identity_retains_the_original_session_settings():
+    current, old, _, _ = reports()
+    prior = deepcopy(current.manifest)
+    prior["config"]["sessions"].pop("sampling")
+    identity = _run_limits_workload_identity(prior, revision="issue45")
+    assert "sampling" not in identity["settings"]["sessions"]
+    assert identity["generator_source_sha256"] == "9c47aa627a061bd90f0e181ce26b7faa912be790ae75547348c72445c4144b35"
+    prior["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    old.manifest = prior
+    # Use an actual legacy baseline so the bridge is eligible.
+    old.manifest["config"].pop("config_version")
+    legacy = _run_limits_workload_identity(old.manifest, revision="legacy")
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(legacy)
+    assert _settings_reasons(current, old) == []
+
+
+@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses"])
+def test_sampled_sessions_are_never_attested_as_unchanged_historical_traffic(revision):
+    current, _, _, _ = reports()
+    current.manifest["config"]["sessions"].update(
+        profile="performance", modes=["live"],
+        workloads=[{"name": "chat", "turns": ["First", "Second"]}],
+        sampling={"seed": 42, "think_time_seconds": {"values": [0, 1]}})
+    assert _run_limits_workload_identity(current.manifest, revision=revision) is None
 
 
 @pytest.mark.parametrize("check", ["arrivals", "concurrency"])

@@ -127,6 +127,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                                  + (" Latency drift detected; only the most recent consistent block is used." if observed["drift_detected"] else ""))
 
     def time_field(identifier):
+        if identifier == "sessions_wait" and config.sessions and config.sessions.sampling and config.sessions.sampling.think_time_seconds:
+            return "sessions.sampling.think_time_seconds"
         if identifier.startswith("load_"):
             return "load_test.schedule.duration_seconds"
         if identifier.startswith("pack_"):
@@ -573,18 +575,27 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 continue
             if name == "sessions":
                 from giraffe.workloads import session_prompt, spec
+                from giraffe.session_sampling import session_plan
                 settings = config.sessions
-                turns = (max(len(workload.turns) for workload in settings.workloads) if settings.profile == "performance"
+                sampled = session_plan(settings) if settings.profile == "performance" or settings.sampling else []
+                turns = (max(len(plan["turns"]) for plan in sampled) if sampled
                          else len(settings.turns))
                 modes = 1 if settings.profile == "performance" else len(settings.modes)
                 concurrency = min(settings.sessions, settings.concurrency, shares[target.name])
                 waves = math.ceil(settings.sessions / concurrency)
                 timeline_start = len(timeline)
-                count = count if count is not None else settings.sessions * modes * turns
+                count = count if count is not None else (sum(len(plan["turns"]) for plan in sampled)
+                                                        if sampled else settings.sessions * modes * turns)
                 truncated = settings.profile != "performance" and settings.modes == ["fixed"] and count < settings.sessions * turns
                 pauses = {"id": "sessions_wait", "title": "Conversation pauses"}
                 pause_seconds = modes * waves * (turns - 1) * settings.delay_seconds
-                if truncated and pause_seconds:
+                if settings.sampling:
+                    pause_seconds = sum(turn["think_time_seconds"] for plan in sampled for turn in plan["turns"])
+                    unknown(target.name, pauses, None, 0, pause_seconds)
+                    unknowns[-1]["reason"] = "Seeded conversation pauses may overlap; elapsed pause time depends on live response timing."
+                    timeline[-1]["reason"] = unknowns[-1]["reason"]
+                    timeline[-1]["wait"] = True
+                elif truncated and pause_seconds:
                     unknown(target.name, pauses, None, 0, pause_seconds)
                     unknowns[-1]["reason"] = f"Conversation history admission determines the pauses (up to {pause_seconds:g} s)."
                     timeline[-1]["wait"] = True
@@ -621,8 +632,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                                      "high_seconds": (requests["high_seconds"] / batch_count
                                                       if requests["high_seconds"] is not None else None)})
                     if pause and (batch + 1) % turns:
-                        timeline.append({**pause, "low_seconds": 0 if truncated else settings.delay_seconds,
-                                         "high_seconds": settings.delay_seconds})
+                        maximum_delay = (max(turn["think_time_seconds"] for plan in sampled for turn in plan["turns"])
+                                         if settings.sampling else settings.delay_seconds)
+                        timeline.append({**pause, "low_seconds": 0 if truncated or settings.sampling else settings.delay_seconds,
+                                         "high_seconds": maximum_delay})
                 continue
             if name == "prefix" and has_observations:
                 from giraffe.workloads import spec
@@ -769,6 +782,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 if item["kind"] == "setup":
                     reasons.append(f"{CHECK_NAMES['access']} for {item['target']} may wait up to {item['high_seconds']:,g} s "
                                    "if the server is slow to respond; this allowance shares the time limit and is excluded from the estimated duration.")
+                elif item.get("id") == "sessions_wait" and item.get("reason"):
+                    reasons.append(f"{item['target']} · conversation pauses can add up to {item['high_seconds']:,g} s. " + item["reason"])
                 elif item["high_seconds"] is not None:
                     reasons.append(f"{item['target']} · {_warning_title(item)} has no comparable timing measurements; "
                                    f"its requests may take up to {item['high_seconds']:,g} s in total "
@@ -1068,10 +1083,12 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":
-            maximum = settings.sessions * max(len(workload.turns) for workload in settings.workloads)
-            add("sessions", None,
-                f"Up to {maximum} requests; prior responses and history admission determine whether later turns run.",
-                source="configured performance conversations and live history", kind="bounded")
+            from giraffe.session_sampling import session_plan
+            maximum = sum(len(plan["turns"]) for plan in session_plan(settings))
+            add("sessions", maximum if settings.sampling else None,
+                f"{maximum} planned turns; prior responses and history admission determine whether all can be sent.",
+                source="configured performance conversations and live history",
+                kind="exact" if settings.sampling else "bounded")
         else:
             fixed = sum(fixed_session_turns(settings, index, config.effective_check("sessions")["context_limit"])
                         for index in range(settings.sessions)) if "fixed" in settings.modes else 0
