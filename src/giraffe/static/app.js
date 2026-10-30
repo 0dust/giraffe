@@ -1212,6 +1212,9 @@ function settingDestination(path) {
     return {name,check,step,label:loadFieldLabel(parts.slice(1).join('.'))};
   }
   else if(root==='test_options'){check=parts[1];name=check==='correctness'&&state.config?.request_source==='request_pack'&&parts[2]!=='limits'?'request_pack_correctness':`test_${check}_${parts.slice(2).join('_').replace('limits_','limit_')}`;}
+  else if(root==='sessions'&&parts[1]==='sampling'){
+    check='sessions';name=parts[2]==='seed'?'session_sampling_seed':`session_${parts[3]==='weights'?'weights':'sample'}_${parts[2]||'think_time_seconds'}`;
+  }
   else if(root==='sessions'&&parts[1]==='workloads'&&parts.length===2)return {section:true,check:'sessions',step,label:'Conversation sessions'};
   else if(root==='sessions'&&parts[1]==='workloads'){
     check='sessions';const form=$('#new-run-form'),count=Number(form?.elements?.session_workload_count?.value),selected=[];
@@ -1220,7 +1223,7 @@ function settingDestination(path) {
     name=parts[3]==='turns'?`session_turn_${index}_${parts[4]||0}`:`session_${parts[3]==='max_tokens'?'cap':parts[3]}_${index}`;
   }
   else if(root==='sessions'&&($('#new-run-form')?.elements?.sessions_profile?.value||state.config?.sessions?.profile)==='performance'){
-    name={max_tokens:'profile_sessions_max_tokens',sessions:'sessions_count',delay_seconds:'sessions_delay',concurrency:'profile_sessions_concurrency'}[parts[1]]||`profile_sessions_${parts[1]}`;check=name==='concurrency'?null:'sessions';
+    name={max_tokens:'profile_sessions_max_tokens',sessions:'sessions_count',delay_seconds:'profile_sessions_delay_seconds',concurrency:'profile_sessions_concurrency'}[parts[1]]||`profile_sessions_${parts[1]}`;check=name==='concurrency'?null:'sessions';
   }
   else if(['arrivals','prefix','sessions','consistency'].includes(root)){check=root;name=`profile_${root}_${parts[1]}`;}
   else if(root==='traffic'){check='capacity';name=`traffic_${parts[1]}`;}
@@ -1228,7 +1231,7 @@ function settingDestination(path) {
   else if(root==='limits'){name=`limit_${parts[1]}`;if(parts[1]==='regression_percent')step=3;}
   else if(root==='judging')name=parts[1]==='judges'?`judge_${parts[2]}_${parts[3]}`:`judging_${parts[1]}`;
   else if(root==='config')name='config_editor';
-  const labels={max_memory_mb:'Maximum memory',concurrency:'Max concurrency',max_duration_seconds:'Max duration',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'Max requests',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'send new requests for',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
+  const labels={session_sampling_seed:'sampling seed',session_sample_think_time_seconds:'pause values',session_sample_input_tokens:'input message lengths',session_sample_output_tokens:'output cap values',session_sample_turn_count:'turns per conversation',max_memory_mb:'Maximum memory',concurrency:'Max concurrency',max_duration_seconds:'Max duration',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'Max requests',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'send new requests for',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
   if(name.startsWith('session_cap_'))return {name,check,step,label:'task output cap'};
   return {name,check,step,label:labels[name]||human(name.replace(/^load_|^profile_|^test_/,'')).toLowerCase()};
 }
@@ -1538,6 +1541,7 @@ function catalogTitle(id) {const canonical={concurrency:'load',fairness:'load',b
 function renderProfileEditor(check,config) {
   const key=check.id;
   if(key==='load')return renderLoadEditor(config);
+  if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
     const profile=config.tool_checks || {fixtures:[],modes:null},selected=profile.modes?.join(',') || '';
     const modes=[['','Run default'],['complete','Complete responses'],['stream','Streaming responses'],['complete,stream','Complete and streaming']];
@@ -1548,7 +1552,6 @@ function renderProfileEditor(check,config) {
   }
   const profiles={
     prefix:{schema:'Prefix',fields:['prefix_chars','repeats','history_turns']},
-    sessions:{schema:'Sessions',fields:['modes','sessions'],advanced:['delay_seconds','turns','saved_answers']},
     consistency:{schema:'Consistency',fields:['repetitions','levels','shapes','equality','strict'],advanced:['temperature','seed','logprobs']},
   };
   const descriptor=profiles[key];if(!descriptor)return '';
@@ -1563,7 +1566,7 @@ function renderProfileEditor(check,config) {
     if(['turns','saved_answers'].includes(name))return textField(fieldName,labels[name],(value || []).join('\n'),{hint:'Editing replaces this list. Keep prepared answers aligned with the saved conversation questions.'});
     return schemaField(fieldName,value,schema.properties[name],{label:labels[name] || human(name),hint:name==='max_in_flight'?`Inherited default ${effectiveParallelism(config)}. `:hints[name]});
   };
-  return `${key==='sessions'?renderSessionEditor(config):''}<input type="hidden" name="profile_edits_${key}" value="[]"><button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="${key}">Reset this profile</button><div data-profile-settings="${key}" ${key==='sessions'?`data-session-fixed ${config.sessions?.profile==='performance'?'hidden':''}`:''}><fieldset class="fields">${descriptor.fields.map(render).join('')}</fieldset>${descriptor.advanced?`<details class="check-advanced"><summary>More ${escape(checkGuide[key].name.toLowerCase())} settings</summary><fieldset class="fields">${descriptor.advanced.map(render).join('')}</fieldset></details>`:''}</div>`;
+  return `<input type="hidden" name="profile_edits_${key}" value="[]"><button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="${key}">Reset this profile</button><div data-profile-settings="${key}"><fieldset class="fields">${descriptor.fields.map(render).join('')}</fieldset>${descriptor.advanced?`<details class="check-advanced"><summary>More ${escape(checkGuide[key].name.toLowerCase())} settings</summary><fieldset class="fields">${descriptor.advanced.map(render).join('')}</fieldset></details>`:''}</div>`;
 }
 function checkCoverageWarning(check,config) {
   if(check.id==='load')return '';
@@ -1799,11 +1802,11 @@ function renderTestCard(check,config) {
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
   ${check.option_fields.length||check.limit_fields.length||check.id==='load'?`<button type="button" class="text-button reset-test" data-reset-test="${check.id}" aria-label="${check.id==='load'?'Reset workload settings':'Reset overrides'} for ${escape(guide.name)}" ${custom||check.id==='load'?'':'hidden'}>${check.id==='load'?'Reset workload settings':'Reset overrides'}</button>`:''}${inactiveControls}
   ${requests?`${requestFields.length>1?'<h4>Requests</h4>':''}<fieldset class="fields check-request-fields">${requests}</fieldset>`:''}
-  ${criteria?`${criteriaFields.length>1?'<h4>Pass criteria</h4>':''}<fieldset class="fields check-criteria-fields">${criteria}</fieldset>`:''}
   ${inherited?`<details class="check-advanced check-run-overrides"><summary>Override run defaults</summary><fieldset class="fields">${inherited}</fieldset></details>`:''}
-  ${moreCriteria?`<details class="check-advanced"><summary>More pass criteria</summary><fieldset class="fields">${moreCriteria}</fieldset></details>`:''}
   ${diagnostics?`<details class="check-advanced"><summary>Server verification & cleanup</summary><fieldset class="fields">${diagnostics}</fieldset></details>`:''}
-  ${renderProfileEditor(check,config)}</div>
+  ${renderProfileEditor(check,config)}
+  ${criteria?`${criteriaFields.length>1?'<h4>Pass criteria</h4>':''}<fieldset class="fields check-criteria-fields">${criteria}</fieldset>`:''}
+  ${moreCriteria?`<details class="check-advanced"><summary>More pass criteria</summary><fieldset class="fields">${moreCriteria}</fieldset></details>`:''}</div>
   <div class="test-editor-footer"><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
 }
 
@@ -1993,33 +1996,66 @@ function renderSessionResults(performance) {
   const columns=row=>`<td>${row.completed ?? 0} / ${row.attempted ?? 0}</td><td>${rate(row.generation_tokens_per_second_mean)}</td><td>${rate(row.generation_tokens_per_second_p50)}</td><td>${rate(row.generation_tokens_per_second_p10)}</td><td>${ms(row.first_output_p95_ms)}</td><td>${ms(row.p95_ms)}</td><td>${ms(row.max_stream_gap_ms)}</td><td>${row.unmeasured_generation_requests ?? 0}</td><td>${row.capped_responses ?? 0}</td>`;
   const header='<th>Completed / sent</th><th>Mean tok/s</th><th>Median tok/s</th><th>p10 tok/s</th><th>Time to first answer · p95</th><th>Response p95</th><th>Longest pause</th><th>Unmeasured rate</th><th>Capped replies</th>';
   return `<section class="check-observations"><h3>Conversation performance</h3><dl class="metrics-grid">${metric('Average generation speed per user',rate(performance.mean_user_generation_tokens_per_second),`Equal weight for ${performance.users_with_measured_generation} measured users; excludes first-answer waiting and inter-turn pauses`)}${metric('Conversation completion',`${performance.completed_conversations} / ${performance.planned_conversations}`,'All planned turns completed; output caps and answer quality are reported separately')}${metric('Concurrent requests observed',`${performance.achieved_request_overlap} / ${performance.configured_concurrency}`,'Observed client overlap / configured conversation concurrency; users may pause between turns')}${metric('Total output throughput',rate(performance.aggregate_output_tokens_per_second),'All measured users combined over the recorded workload window, including pauses')}</dl><p class="hint">Raw client-observed estimates; see client timing quality above. p10 describes slower responses. Capped replies are not quality-certified.</p>
+  ${performance.sampling?`<details><summary>Sampled pauses and lengths · seed ${number(performance.sampling.seed)}</summary><p class="hint">${number(performance.attempted)} sent / ${number(performance.planned_turns)} planned turns. Input target and locally prepared tokens cover only the new user message; server input usage covers the whole conversation. Inputs are prepared before traffic; pauses include dispatch wait. Output caps do not guarantee answer lengths.</p><div class="metric-table"><table><thead><tr><th>Conversation / turn</th><th>Pause requested / actual (s)</th><th>Input target / local new message</th><th>Server input / output tokens</th><th>Output cap</th></tr></thead><tbody>${(performance.sampled_requests||[]).map(row=>`<tr><td>${escape(row.session_id)} · ${number(row.turn)}</td><td>${number(row.requested_pause_seconds,3)} / ${number(row.actual_pause_seconds,3)}</td><td>${number(row.input_target_tokens)} / ${number(row.input_preparation?.input_tokens)}</td><td>${number(row.actual_input_tokens)} / ${number(row.actual_output_tokens)}</td><td>${number(row.output_cap_tokens)}</td></tr>`).join('')}</tbody></table></div></details>`:''}
   <h3>By task type</h3><div class="metric-table"><table><thead><tr><th>Task</th>${header}</tr></thead><tbody>${performance.tasks.map(row=>`<tr><td>${escape(row.task_type)}<small>${escape(row.mode)}</small></td>${columns(row)}</tr>`).join('')}</tbody></table></div>
   <details><summary>By conversation turn</summary><div class="metric-table"><table><thead><tr><th>Task / turn</th>${header}</tr></thead><tbody>${performance.turns.map(row=>`<tr><td>${escape(row.task_type)} · turn ${row.turn}<small>${escape(row.mode)}</small></td>${columns(row)}</tr>`).join('')}</tbody></table></div></details>
   <details><summary>Each user's results</summary><div class="metric-table"><table><thead><tr><th>User / task</th>${header}<th>Conversation</th></tr></thead><tbody>${performance.users.map(row=>`<tr><td>${escape(row.session_id)}<small>${escape(row.task_type)}</small></td>${columns(row)}<td>${row.conversation_completed?'Completed':escape(row.stop_reason || 'Incomplete')}</td></tr>`).join('')}</tbody></table></div></details></section>`;
 }
 
+function sessionProfileDescription(profile) {
+  return profile==='performance'
+    ? 'Measure conversation performance using the model’s actual replies as history, without scoring answer quality.'
+    : 'Giraffe assigns a unique name, adds it to the first message, and checks that every reply repeats it exactly.';
+}
+function sessionHistoryDescription(modes) {
+  if(modes.includes(','))return 'Test each conversation twice: once with prewritten replies and once with the model’s actual replies.';
+  return modes==='live'
+    ? 'Keep the model’s actual replies in the conversation to test it like a normal chat.'
+    : 'Use prewritten earlier replies to test each answer against a controlled conversation.';
+}
 function renderSessionEditor(config) {
   const defaults=state.bootstrap.session_workloads,settings={...defaults.defaults,...profileDefaults('sessions',config),...config.sessions};
-  const mixed=settings.profile==='performance',saved=settings.workloads || [];
+  const mixed=settings.profile==='performance',saved=settings.workloads || [],dynamic=Boolean(settings.sampling?.think_time_seconds);
   const workloads=[...saved,...defaults.presets.filter(item=>!saved.some(row=>row.name===item.name))];
-  return `<div data-session-settings><label>Conversation test<select name="sessions_profile"><option value="correctness" ${mixed?'':'selected'}>Exact-repeat correctness</option><option value="performance" ${mixed?'selected':''}>Mixed workload performance</option></select></label>
-  <p class="hint">Mixed performance runs use actual replies as conversation history. Concurrent users share Max concurrency with other target requests. Answer quality is not scored.</p>
-  <div data-profile-settings="sessions" class="fields">${schemaField('profile_sessions_concurrency',settings.concurrency,state.bootstrap.config_schema.$defs.Sessions.properties.concurrency,{label:'Concurrent conversations',hint:''})}${schemaField('profile_sessions_max_tokens',settings.max_tokens,state.bootstrap.config_schema.$defs.Sessions.properties.max_tokens,{label:'Output cap per turn',hint:'Answer cap for each turn.'})}</div>
-  <div data-session-mix ${mixed?'':'hidden'}><div class="fields">${field('sessions_count','Total conversations',mixed?settings.sessions:Math.max(6,settings.sessions),{type:'number',step:1})}${field('sessions_delay','Pause between turns (seconds)',settings.delay_seconds,{type:'number',step:'any'})}</div>
-  <p class="hint">Weights divide the total conversation budget among selected tasks. Each conversation keeps its task and history. Output caps limit length; actual input/output tokens are reported.</p>
-  <input type="hidden" name="session_workload_count" value="${workloads.length}">${workloads.map((item,i)=>`<details class="setup-disclosure"><summary>${escape(human(item.name))} · ${item.turns.length} turns</summary><label class="test-selection"><input type="checkbox" name="session_enabled_${i}" ${(saved.length?saved.some(row=>row.name===item.name):true)?'checked':''}><span>Include this task</span></label><div class="fields">${field(`session_name_${i}`,'Task name',item.name,{required:true})}${field(`session_weight_${i}`,'Conversation weight',item.weight,{type:'number',step:'any',required:true})}${field(`session_cap_${i}`,'Task output cap (optional)',item.max_tokens,{type:'number',step:1,placeholder:'Use conversation output cap'})}</div><input type="hidden" name="session_turn_count_${i}" value="${item.turns.length}">${item.turns.map((turn,j)=>renderField(`session_turn_${i}_${j}`,`Turn ${j+1}`,`<textarea id="field-session_turn_${i}_${j}" name="session_turn_${i}_${j}" rows="3" maxlength="${state.bootstrap.limits['sessions.workloads[].turns']?.items?.maxLength||state.bootstrap.limits['sessions.turns']?.items?.maxLength}" required>${escape(turn)}</textarea>`)).join('')}<button type="button" class="text-button" data-action="add-session-turn" data-session-index="${i}">Add turn</button>${item.turns.length>state.bootstrap.limits['sessions.workloads[].turns'].minItems?`<button type="button" class="text-button" data-action="remove-session-turn" data-session-index="${i}">Remove last turn</button>`:''}</details>`).join('')}
-  <p class="hint">${escape(state.bootstrap.cap_explanations?.['sessions.workloads']?.help||'')} ${escape(state.bootstrap.cap_explanations?.['sessions.workloads[].turns']?.help||'')}</p><button type="button" class="text-button" data-action="add-session-workload" ${workloads.length>=state.bootstrap.limits['sessions.workloads'].maxItems?'disabled':''}>Add custom task</button></div>
-  <p class="hint" data-session-legacy ${mixed?'hidden':''}>Uses the saved fixed/live exact-repeat conversations. Their prompts, modes and concurrency can be changed below.</p></div>`;
+  const history=settings.modes.join(','),historyOptions=[['fixed','Prewritten replies'],['live','Replies from this run'],['fixed,live','Test both']];
+  if(!historyOptions.some(([value])=>value===history))historyOptions.push([history,'Saved selection']);
+  const schema=state.bootstrap.config_schema.$defs.Sessions;
+  return `<div data-session-settings><h4>Conversation</h4><label>Conversation test<select name="sessions_profile"><option value="correctness" ${mixed?'':'selected'}>Exact-repeat correctness</option><option value="performance" ${mixed?'selected':''}>Mixed workload performance</option></select></label>
+  <p class="hint" data-session-description>${escape(sessionProfileDescription(settings.profile))}</p>
+  <div data-session-legacy ${mixed?'hidden':''}><div data-profile-settings="sessions">${selectField('profile_sessions_modes','Conversation history',historyOptions.map(([value,label])=>`<option value="${escape(value)}" ${value===history?'selected':''}>${label}</option>`).join(''),{hint:sessionHistoryDescription(history)})}</div></div>
+  <div data-session-fixed ${mixed?'hidden':''}>
+  <div data-profile-settings="sessions">${textField('profile_sessions_turns','Recall prompts (one line per turn)',settings.turns.join('\n'),{hint:''})}</div></div>
+  <div data-session-mix ${mixed?'':'hidden'}><h5>Conversation tasks</h5><p class="hint">Choose conversation types and their prompts; weights divide the total conversations among selected tasks.</p>
+  <input type="hidden" name="session_workload_count" value="${workloads.length}">${workloads.map((item,i)=>`<details class="setup-disclosure"><summary>${escape(human(item.name))} · ${item.turns.length} turns</summary><label class="test-selection"><input type="checkbox" name="session_enabled_${i}" ${(saved.some(row=>row.name===item.name)||(!mixed&&!saved.length))?'checked':''}><span>Include this task</span></label><div class="fields">${field(`session_name_${i}`,'Task name',item.name,{required:true})}${field(`session_weight_${i}`,'Conversation weight',item.weight,{type:'number',step:'any',required:true})}${field(`session_cap_${i}`,'Task output cap (optional)',item.max_tokens,{type:'number',step:1,placeholder:'Use conversation output cap'})}</div><input type="hidden" name="session_turn_count_${i}" value="${item.turns.length}">${item.turns.map((turn,j)=>renderField(`session_turn_${i}_${j}`,`Turn ${j+1}`,`<textarea id="field-session_turn_${i}_${j}" name="session_turn_${i}_${j}" rows="3" maxlength="${state.bootstrap.limits['sessions.workloads[].turns']?.items?.maxLength||state.bootstrap.limits['sessions.turns']?.items?.maxLength}" required>${escape(turn)}</textarea>`)).join('')}<div class="actions"><button type="button" class="text-button" data-action="add-session-turn" data-session-index="${i}">Add turn</button>${item.turns.length>state.bootstrap.limits['sessions.workloads[].turns'].minItems?`<button type="button" class="text-button" data-action="remove-session-turn" data-session-index="${i}">Remove last turn</button>`:''}${!defaults.presets.some(preset=>preset.name===item.name)?`<button type="button" class="text-button danger" data-action="remove-session-workload" data-session-index="${i}">Delete task</button>`:''}</div></details>`).join('')}
+  <button type="button" class="text-button" data-action="add-session-workload" ${workloads.length>=state.bootstrap.limits['sessions.workloads'].maxItems?'disabled':''}>Add custom task</button><details class="setup-disclosure"><summary>Task limits</summary><p class="hint">${escape(state.bootstrap.cap_explanations?.['sessions.workloads']?.help||'')} ${escape(state.bootstrap.cap_explanations?.['sessions.workloads[].turns']?.help||'')}</p></details>
+  </div>
+  <h4>Traffic and timing</h4>
+  <div data-profile-settings="sessions" class="fields">${schemaField('profile_sessions_concurrency',settings.concurrency,schema.properties.concurrency,{label:'Concurrent conversations',hint:''})}${schemaField('profile_sessions_max_tokens',settings.max_tokens,schema.properties.max_tokens,{label:'Output cap per turn',hint:'Answer cap for each turn.'})}</div>
+  <div data-session-correctness-traffic ${mixed?'hidden':''}><div data-profile-settings="sessions" class="fields">${schemaField('profile_sessions_sessions',settings.sessions,schema.properties.sessions,{label:'Conversations per history type',hint:'Run this many conversations for each selected history type.'})}</div></div>
+  <div data-session-performance-traffic ${mixed?'':'hidden'}><div class="fields">${field('sessions_count','Total conversations',mixed?settings.sessions:Math.max(6,settings.sessions),{type:'number',step:1})}</div></div>
+  <fieldset class="dataset-source session-pause-choice"><legend>Pause between turns</legend><label><input type="radio" name="session_pause_mode" value="fixed" ${dynamic?'':'checked'}><span>Fixed</span></label><label><input type="radio" name="session_pause_mode" value="dynamic" ${dynamic?'checked':''}><span>Dynamic</span></label></fieldset>
+  <div data-session-fixed-pause ${dynamic?'hidden':''}><div data-profile-settings="sessions">${schemaField('profile_sessions_delay_seconds',settings.delay_seconds,schema.properties.delay_seconds,{label:'Pause (seconds)',hint:'Use the same pause between every turn.'})}</div></div>
+  <div data-session-dynamic-pause ${dynamic?'':'hidden'}><p class="hint">Choose a pause from these comma-separated values for each turn; optional weights make some values more likely.</p><div class="fields">${field('session_sample_think_time_seconds','Pause values (seconds)',settings.sampling?.think_time_seconds?.values?.join(', ')||'',{placeholder:'0, 1, 5',required:true})}${field('session_weights_think_time_seconds','Weights (optional)',settings.sampling?.think_time_seconds?.weights?.join(', ')||'',{placeholder:'1, 1, 1'})}</div></div>
+  <details class="setup-disclosure" data-session-length-sampling ${mixed?'':'hidden'}><summary>Vary message lengths and turns</summary>
+  <p class="hint">Enter comma-separated values. Each value is equally likely unless you supply matching weights. Blank values keep the settings above.</p>
+  ${[['input_tokens','New user message lengths (tokens)','128, 512, 1024'],['output_tokens','Output cap values (tokens)','32, 64, 128'],['turn_count','Turns per conversation','2, 3']].map(([key,label,placeholder])=>`<div class="fields">${field(`session_sample_${key}`,label,settings.sampling?.[key]?.values?.join(', ')||'',{placeholder})}${field(`session_weights_${key}`,'Weights (optional)',settings.sampling?.[key]?.weights?.join(', ')||'',{placeholder:'1, 1, 1'})}</div>`).join('')}
+  <p class="hint">Input targets size only the new user message, excluding history and chat formatting. Short prompts are padded with synthetic context; longer prompts stop that conversation. Local token counts may differ from server counts. Output values are caps, not guaranteed answer lengths. Turn counts cannot exceed the prompts configured in any selected task.</p></details>
+  <div data-session-seed ${dynamic||(mixed&&['input_tokens','output_tokens','turn_count'].some(key=>settings.sampling?.[key]))?'':'hidden'}>${field('session_sampling_seed','Sampling seed',settings.sampling?.seed??42,{type:'number',step:1,hint:'Reuse this seed to repeat the same random choices.'})}</div>
+  </div>`;
 }
 
 function editSessionWorkload(action,index) {
   const form=$('#new-run-form'),name=form.elements[`session_name_${index}`]?.value;
-  if(index!==undefined&&!form.elements[`session_enabled_${index}`]?.checked){toast('Select this task before changing its turn count.');return;}
+  if(index!==undefined&&action!=='remove-session-workload'&&!form.elements[`session_enabled_${index}`]?.checked){toast('Select this task before changing its turn count.');return;}
   captureFormDraft();
   const settings=state.config.sessions;
+  let taskName=name;
   if(action==='add-session-workload'){
     let suffix=1;while(settings.workloads.some(item=>item.name===`custom-${suffix}`))suffix++;
-    settings.workloads.push({name:`custom-${suffix}`,weight:1,max_tokens:null,turns:['Explain a topic relevant to your users in detail.','Build on your previous answer with a detailed example.']});
+    taskName=`custom-${suffix}`;
+    settings.workloads.push({name:taskName,weight:1,max_tokens:null,turns:['Explain a topic relevant to your users in detail.','Build on your previous answer with a detailed example.']});
+  }else if(action==='remove-session-workload'){
+    settings.workloads=settings.workloads.filter(item=>item.name!==name);
   }else{
     const item=settings.workloads.find(row=>row.name===name);if(!item)return;
     if(action==='add-session-turn'&&item.turns.length<state.bootstrap.limits['sessions.workloads[].turns'].maxItems)item.turns.push('Build on your previous answer and explain the next step in detail.');
@@ -2027,6 +2063,11 @@ function editSessionWorkload(action,index) {
   }
   configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
   state.openTest='sessions';syncTestControls();
+  const advanced=$('#setup-advanced');if(advanced)advanced.open=true;
+  const taskIndex=settings.workloads.findIndex(item=>item.name===taskName);
+  const input=action==='remove-session-workload'?$('[data-action="add-session-workload"]'):$(`#field-session_name_${taskIndex}`);
+  const task=input?.closest('details');if(task)task.open=true;
+  input?.focus({preventScroll:true});input?.scrollIntoView({block:'nearest'});
 }
 
 
@@ -2050,7 +2091,25 @@ function syncTestControls() {
     for(const fieldset of $$('fieldset',editor))fieldset.disabled=!open;
   }
   const sessionProfile=form.elements.sessions_profile;
-  if(sessionProfile){const mixed=sessionProfile.value==='performance';$('[data-session-mix]',form).hidden=!mixed;$('[data-session-legacy]',form).hidden=mixed;const fixed=$('[data-session-fixed]',form);if(fixed)fixed.hidden=mixed;}
+  if(sessionProfile){
+    const mixed=sessionProfile.value==='performance';
+    $('[data-session-mix]',form).hidden=!mixed;$('[data-session-legacy]',form).hidden=mixed;
+    const fixed=$('[data-session-fixed]',form);if(fixed)fixed.hidden=mixed;
+    const correctnessTraffic=$('[data-session-correctness-traffic]',form);if(correctnessTraffic)correctnessTraffic.hidden=mixed;
+    const performanceTraffic=$('[data-session-performance-traffic]',form);if(performanceTraffic)performanceTraffic.hidden=!mixed;
+    for(const row of $$('[data-session-length-sampling]'))row.hidden=!mixed;
+    const dynamic=form.elements.session_pause_mode?.value==='dynamic';
+    const fixedPause=$('[data-session-fixed-pause]',form);if(fixedPause)fixedPause.hidden=dynamic;
+    const dynamicPause=$('[data-session-dynamic-pause]',form);if(dynamicPause)dynamicPause.hidden=!dynamic;
+    const seed=$('[data-session-seed]',form);if(seed)seed.hidden=!(dynamic||mixed&&['input_tokens','output_tokens','turn_count'].some(key=>String(form.elements[`session_sample_${key}`]?.value||'').trim()||String(form.elements[`session_weights_${key}`]?.value||'').trim()));
+    const description=$('[data-session-description]',form);
+    if(description)description.textContent=sessionProfileDescription(sessionProfile.value);
+  }
+  const sessionHistory=form.elements.profile_sessions_modes;
+  if(sessionHistory){
+    const historyHint=$('#field-profile_sessions_modes-hint',form);
+    if(historyHint)historyHint.textContent=sessionHistoryDescription(sessionHistory.value);
+  }
   for(const group of $$('[data-catalogue-group]')){
     const cards=$$('[data-test-card]',group);group.hidden=cards.every(card=>card.hidden);
     const chosen=cards.filter(card=>card.querySelector?.('input[name="check"]')?.checked).length;
@@ -2098,6 +2157,7 @@ function editProfileField(input) {
   const key=profile.dataset.profileSettings,name=input.name.replace(`profile_${key}_`,'');
   const marker=$('#new-run-form').elements[`profile_edits_${key}`];
   const edits=new Set(JSON.parse(marker.value || '[]'));edits.add(name);marker.value=JSON.stringify([...edits]);
+  if(key==='sessions'&&name==='modes')syncTestControls();
 }
 
 function toggleTestEditor(id,close=false) {
@@ -2122,6 +2182,11 @@ function validateProfileDrafts(form,id=null) {
   if(!form)return true;
   for(const input of form.querySelectorAll('input, select, textarea')){
     const profile=input.closest('[data-profile-settings]');if(!profile||id&&profile.dataset.profileSettings!==id||!savedProfileInput(input,form))continue;
+    if(profile.dataset.profileSettings==='sessions'&&form.elements.sessions_profile){
+      const mixed=form.elements.sessions_profile.value==='performance';
+      if(mixed&&input.closest('[data-session-fixed], [data-session-legacy], [data-session-correctness-traffic]'))continue;
+      if(form.elements.session_pause_mode?.value==='dynamic'&&input.closest('[data-session-fixed-pause]'))continue;
+    }
     if(['profile_consistency_logprobs','profile_tools_fixtures','profile_tools_conversations'].includes(input.name)){
       let message='';try{(input.name==='profile_consistency_logprobs'?parseLogprobSettings:parseToolFixtures)(input.value,state.bootstrap.limits);}catch(error){message=error.message;}
       input.setCustomValidity?.(message);
@@ -2156,7 +2221,12 @@ function validateRunForm(form,step=null) {
     if(step&&Number(input.closest('[data-setup-panel]')?.dataset.setupPanel)!==step)continue;
     if(packSettingInactive(input.name)||input.disabled&&input.closest('[data-run-limit]'))continue;
     if(input.closest('[data-session-settings]')&&input.name!=='sessions_profile'){
-      if(form.elements.sessions_profile.value!=='performance')continue;
+      const mixed=form.elements.sessions_profile.value==='performance';
+      if(!mixed&&input.closest('[data-session-mix], [data-session-performance-traffic], [data-session-length-sampling]'))continue;
+      if(mixed&&input.closest('[data-session-fixed], [data-session-legacy], [data-session-correctness-traffic]'))continue;
+      const dynamic=form.elements.session_pause_mode?.value==='dynamic';
+      if(input.closest(dynamic?'[data-session-fixed-pause]':'[data-session-dynamic-pause]'))continue;
+      if(input.closest('[data-session-seed]')?.hidden)continue;
       const match=input.name.match(/^session_(?:name|weight|cap|turn)_([0-9]+)_?/);
       if(match&&!form.elements[`session_enabled_${match[1]}`]?.checked)continue;
     }
@@ -2827,7 +2897,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
 function readForm(allowEmpty=false) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
   // Disabled editors still retain their values when a test is unchecked.
-  for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea'))data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);
+  for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea')){if(input.type==='radio'&&!input.checked)continue;data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);}
   if(!config.targets?.length)throw new Error('Configuration must contain at least one target.');
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
   if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
@@ -4508,7 +4578,7 @@ document.addEventListener('click',async(event)=>{
       else{state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;const search=$('#check-search');if(search)search.value='';syncTestControls();$('[data-catalogue-filter="selected"]')?.focus();}
     }catch(error){configError(error);}return;
   }
-  if(['add-session-workload','add-session-turn','remove-session-turn'].includes(action)){editSessionWorkload(action,event.target.closest('[data-session-index]')?.dataset.sessionIndex);return;}
+  if(['add-session-workload','remove-session-workload','add-session-turn','remove-session-turn'].includes(action)){editSessionWorkload(action,event.target.closest('[data-session-index]')?.dataset.sessionIndex);return;}
   if(action==='toggle-available-tests'){state.showAvailableTests=!state.showAvailableTests;syncTestControls();return;}
   if(action==='select-group'){
     configChanged();const category=event.target.closest('[data-category]').dataset.category;
@@ -4581,11 +4651,13 @@ document.addEventListener('input',event=>{
   if(event.target.id==='config-editor'){syncConfigView();return;}
   if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);
   else if(event.target.closest('[data-test-settings]')||event.target.closest('[data-traffic-settings]'))editTestField(event.target);
+  if(event.target.name==='session_pause_mode'||/^session_(sample|weights)_/.test(event.target.name))syncTestControls();
   if(['traffic_rates','traffic_duration_seconds'].includes(event.target.name))$('#new-run-form').elements.traffic_mode.value='custom';
   if(numericFields.some(([name])=>name===event.target.name)||event.target.name==='samples'||event.target.name.startsWith('limit_'))for(const check of state.bootstrap.checks)refreshInheritedFields(check.id,true);
   updateBounds();
 });
 document.addEventListener('change',event=>{
+  if(event.target.name==='session_pause_mode'){syncTestControls();updateBounds();}
   if(event.target.name==='baseline_id'){state.prefillBaseline=event.target.value;updateBaselineDrift(readForm(true).config);saveDraft();return;}
   if(event.target.hasAttribute?.('data-evidence-sort-order')){if(!updateConditionEvidence(event.target,'sort-order',event.target.value)){updateRequestTableState(evidenceTableState(),'sort-order',event.target.value);refreshRequestTable();}return;}
   if(event.target.dataset?.evidenceFilter){if(!updateConditionEvidence(event.target,event.target.dataset.evidenceFilter,event.target.value)){updateRequestTableState(evidenceTableState(),event.target.dataset.evidenceFilter,event.target.value);refreshRequestTable();}return;}

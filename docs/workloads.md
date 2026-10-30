@@ -366,11 +366,60 @@ Former bucket/scenario configurations migrate into Load test. Use its token prof
 per-response criteria and occupancy/streamed-overlap evidence described above;
 old character-span and per-request bucket-overlap rules do not describe current runs.
 
+### Sampled conversation traffic
+
+Choose **Fixed** or **Dynamic** under **Pause between turns** to use one delay or
+sample from multiple values. In the **Mixed workload performance** session profile,
+expand **Vary message lengths and turns** to also vary new user message lengths,
+output caps and turn counts. Enter comma-separated values and optional matching weights; omitted
+weights make values equally likely. The seed fixes each conversation's sampled
+plan independently of worker order, response timing and early failures. Each
+conversation has its own history and sampled pauses after completed responses.
+Blank length distributions retain original prompts, task output caps and the full
+configured turn count. Dynamic pauses require at least one value.
+
+Download [session-distributions.yaml](../examples/session-distributions.yaml)
+from GitHub, then edit its endpoint and model. From the
+download folder, run:
+
+```sh
+giraffe validate --config session-distributions.yaml
+giraffe run --config session-distributions.yaml --output runs/sessions --html
+```
+
+The example lives in the repository; pip does not copy it into your working
+directory. You can also configure the test in the UI and choose **Copy terminal
+command**, or **Save setup** and run `giraffe run --config giraffe-config.json`
+from the download folder.
+
+CLI/config and the UI use `sessions.sampling`:
+`seed`, `think_time_seconds`, `input_tokens`, `output_tokens` and `turn_count`.
+Each distribution has `values` and optional `weights`.
+
+Input targets cover **new user message content only**, excluding history and chat
+formatting. The existing local tokenizer adds synthetic neutral context to short
+prompts within 5% of the target (at least one token tolerance). If the original
+prompt exceeds a target, sizing is unavailable, or intact history exceeds the
+context admission limit, the conversation stops as incomplete. No history or
+configured prompt is cropped. Built-in tokenizer counts are reference counts;
+server-reported input usage covers the whole conversation and can differ.
+Output samples set caps, not guaranteed generated lengths. Sampled turn counts
+must fit the prompts in every selected task; add prompts to support longer sessions.
+Pauses range from 0–60 seconds; token and turn values must be whole numbers.
+Correctness sessions also accept `sampling.seed` and `sampling.think_time_seconds`
+for both fixed and live histories; token lengths and turn-count sampling remain
+performance settings so recall prompts and exact-answer scoring stay unchanged.
+
+Reports retain planned/completed turns, sampled values, local token preparation,
+actual server usage and observed inter-turn pauses. Inputs are prepared locally
+before conversation traffic; actual pauses include dispatch wait and can exceed requested think time. Sampling remains
+subject to request/time/concurrency budgets, cancellation and retention rules.
+
 Sessions seed a distinct index-derived bakery name in turn zero and score each
 turn against that session's original value. This detects mixed histories even
 when every session follows the same turn template. Live history preserves its own
 final answers after stripping inline reasoning. Fixed history uses the seeded name
-at every turn; legacy `saved_answers` fields are retained for compatibility and
+at every turn; the unused `saved_answers` default is empty, and legacy values are retained for compatibility and
 do not inject contradictory names. The session worker pool refills immediately
 when a conversation finishes. The session name recall instruction is added to configured
 turns; saved configurations retain their fields.

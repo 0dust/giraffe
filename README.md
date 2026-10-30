@@ -35,7 +35,7 @@ You choose the checks, traffic and acceptance limits. A passing run applies to
 those tests and settings; it does not establish general model quality or certify
 production capacity.
 
-[Quick start](#quick-start) · [Inference engines](#inference-engines) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
+[Quick start](#quick-start) · [Inference engines](#inference-engines) · [Conversations](#test-multi-turn-conversations) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
 
 ## Quick start
 
@@ -178,6 +178,27 @@ Built-in workloads cover different input and output lengths. You can also supply
 your own questions and expected answers to test the work your application needs.
 See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
 for traffic patterns, answer checks and configuration examples.
+
+## Test multi-turn conversations
+
+Select **Multi-turn sessions** in the UI to test recall or conversation performance.
+Choose fixed or dynamic pauses; performance runs can also vary new-message token
+lengths, output caps and turns per conversation with a reproducible seed.
+
+To run the same settings from the CLI, choose **Copy terminal command** in the UI,
+or **Save setup** and run the downloaded file:
+
+```sh
+giraffe run --config giraffe-config.json --html
+```
+
+Run this from the folder containing the downloaded file, or pass its full path.
+For a YAML starting point, download [session-distributions.yaml](examples/session-distributions.yaml)
+from GitHub, update its endpoint and model, then run
+`giraffe run --config session-distributions.yaml --html` from that folder.
+Repository examples are not installed into your working directory by pip.
+See [conversation settings](docs/workloads.md#sampled-conversation-traffic) for
+weights, seeds and token-length limits.
 
 ## Save a baseline and compare
 

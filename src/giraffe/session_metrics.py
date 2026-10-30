@@ -75,6 +75,19 @@ def performance(observation, records, stats):
         mean_user_generation_tokens_per_second=mean(user_rates) if user_rates else None,
         actual_task_mix=dict(Counter(session.get("task_type", "exact_repeat") for session in sessions)),
         users=users, tasks=tasks, turns=turns,
+        sampling=observation.get("sampling"),
+        planned_turns=observation.get("planned_turns", sum(session["planned_turns"] for session in sessions)),
+        sampled_requests=[{
+            "request_id": record.id, "session_id": record.workload.get("session_id"),
+            "turn": record.workload.get("turn_id", 0) + 1,
+            "requested_pause_seconds": record.workload.get("configured_delay_seconds"),
+            "actual_pause_seconds": record.workload.get("actual_pause_seconds"),
+            "input_target_tokens": record.workload.get("sampled_input_tokens"),
+            "input_preparation": record.workload.get("input_preparation"),
+            "actual_input_tokens": record.input_tokens,
+            "output_cap_tokens": record.requested_max_tokens,
+            "actual_output_tokens": record.output_tokens,
+        } for record in records] if observation.get("sampling") else [],
         interpretation="Mean of each user's mean response generation rate; each measured user has equal weight. "
                        "Excludes first-output wait and configured inter-turn pauses. Raw rates are estimates; "
                        "see client timing quality and missing-measurement coverage. Aggregate throughput includes "

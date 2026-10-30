@@ -200,7 +200,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   for(const name of ['mode','restart_target','baseline_id','name'])assert(controls.some(input=>input.name===name));
   assert(markup.indexOf('id="setup-deployment"')<markup.indexOf('id="test-selection"'));assert(!markup.includes('name="setup_goal"'));
   for(const name of new Set(controls.map(input=>input.name))){{
-    if(['check','setup_goal','setup_load','request_source'].includes(name))continue;
+    if(['check','setup_goal','setup_load','request_source','session_pause_mode'].includes(name))continue;
     assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
   }}
   assert.equal(controls.filter(input=>input.name==='check').length,15);

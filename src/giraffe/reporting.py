@@ -157,8 +157,10 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision == "issue45" and not set(resolved.checks) <= {"sessions", "consistency"}:
+    if revision in {"issue45", "issue95", "issue95_pauses"} and not set(resolved.checks) <= {"sessions", "consistency"}:
         return None  # Load generators changed; this attestation covers unchanged specialists only.
+    if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
+        return None  # Sampled traffic has no historical equivalent.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
         if not checks.intersection(resolved.checks):
@@ -167,6 +169,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             return None  # A fingerprint cannot attest settings missing from the saved config.
         value = raw[field] if legacy else getattr(resolved, field)
         settings[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+        if revision == "issue45" and field == "sessions" and isinstance(settings[field], dict):
+            settings[field].pop("sampling", None)
     # These exact source revisions preserve default generated workloads across
     # the bounds/request-setting split. Unknown revisions retain strict matching.
     identity = {
@@ -177,6 +181,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "review26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
             "caps26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
             "issue45": "9c47aa627a061bd90f0e181ce26b7faa912be790ae75547348c72445c4144b35",
+            "issue95": "ebc8dc0b150701e1a97f571a6ea7a37cdcf62f4d3d9db97244d8c2bd5c17b092",
+            "issue95_pauses": "37bf5c074bfdb19f367e5348b678e5a923977fe7bf013b8c781a43bb8efca19e",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -197,6 +203,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "review26": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
             "caps26": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "issue45": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "issue95": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "issue95_pauses": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -215,7 +223,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
@@ -1770,6 +1778,20 @@ def _session_performance_html(data: dict[str, Any]) -> str:
                 f'conversations completed; {_e(data["achieved_request_overlap"])} / '
                 f'{_e(data["configured_concurrency"])} concurrent requests observed/configured.</p>'
                 f'<p class="muted">{_e(data["interpretation"])}</p>')
+    if data.get("sampling"):
+        headline += (f'<details><summary>Sampled pauses and lengths · seed {_e(data["sampling"]["seed"])}</summary>'
+                     f'<p>{_e(data["attempted"])} sent / {_e(data["planned_turns"])} planned turns. '
+                     'Input targets and local counts cover the new user message only; server input usage includes history. '
+                     'Actual pauses include dispatch wait. Output caps do not guarantee answer lengths.</p>'
+                     '<div class="table"><table><tr><th>Conversation / turn</th><th>Requested / actual pause (s)</th>'
+                     '<th>Input target / local new message</th><th>Server input / output tokens</th><th>Output cap</th></tr>')
+        for row in data.get("sampled_requests", []):
+            headline += (f'<tr><td>{_e(row["session_id"])} / {_e(row["turn"])}</td>'
+                         f'<td>{_number(row["requested_pause_seconds"])} / {_number(row["actual_pause_seconds"])}</td>'
+                         f'<td>{_e(row["input_target_tokens"])} / {_e((row.get("input_preparation") or {}).get("input_tokens"))}</td>'
+                         f'<td>{_e(row["actual_input_tokens"])} / {_e(row["actual_output_tokens"])}</td>'
+                         f'<td>{_e(row["output_cap_tokens"])}</td></tr>')
+        headline += '</table></div></details>'
     rows = []
     for row in data["turns"]:
         rows.append(f'<tr><td>{_e(row["task_type"])} / {_e(row["mode"])} / turn {_e(row["turn"])}</td>'
