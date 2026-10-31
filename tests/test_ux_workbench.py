@@ -24,6 +24,19 @@ assert.equal(state.setupStep,2);assert.equal(state.returnToReview,true);
 """)
 
 
+def test_return_from_advanced_editor_at_launch_keeps_step_and_reveals_form():
+    run_browser_logic(r"""
+state.jsonDraft=state.jsonBase='synced';state.setupStep=3;state.configView='json';
+nodes['#config-panel-form']=element();
+syncConfigView=syncSetupStep=()=>{};
+for(const returnToReview of [false,true]){
+ state.returnToReview=returnToReview;state.configView='json';
+ await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'setup-next'}}:null}});
+ assert.equal(state.setupStep,3);assert.equal(state.configView,'form');assert.equal(state.returnToReview,false);
+}
+""")
+
+
 def test_run_blueprint_uses_current_allocations_and_never_invents_results():
     run_browser_logic(r"""
 state.config={checks:['access','correctness'],targets:[{model:'<private>',url:'http://local/v1'}],max_requests:12,max_duration_seconds:30,concurrency:2};

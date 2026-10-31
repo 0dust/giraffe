@@ -316,7 +316,11 @@ config.max_requests=160;config.max_duration_seconds=300;config.concurrency=4;
 const before=JSON.stringify(config),markup=renderSharedRunSettings(config);
 assert.match(markup,/<details class="shared-settings-editor" id="shared-settings">/);
 assert.match(markup,/<summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits<\/h2>/);
-assert.match(markup,/Up to 160 requests · 5m 0s · 4 at once/);assert.match(markup,/class="shared-settings-edit" aria-hidden="true">⌄/);
+assert.match(markup,/160 requests · 5m 0s · 4 at once/);
+assert.match(markup,/<span class="shared-settings-edit" aria-hidden="true">Edit limits <span class="shared-settings-caret">⌄<\/span><\/span>/);
+assert.equal(sharedLimitsSummary({...config,max_requests:null,max_duration_seconds:null,concurrency:null}),'Requests not set · Duration not set · Simultaneous not set');
+assert.equal(sharedLimitsSummary({...config,max_duration_seconds:null}),'160 requests · Duration not set · 4 at once');
+assert.doesNotMatch(markup,/Up to|No suite limits set/);
 assert(markup.lastIndexOf('</details>')<markup.indexOf('id="checks-plan-summary"'));
 assert.match(markup,/class="run-ceilings-values" id="run-ceilings-summary"/);
 assert.match(markup,/class="checks-plan-summary sr-only" id="checks-plan-summary"/);
@@ -334,7 +338,7 @@ assert.match(markup,/AI evaluator calls have separate limits/); // Available thr
 assert.equal(JSON.stringify(config),before);
 for(const id of ['run-ceilings-summary','request-defaults-summary','acceptance-summary'])nodes['#'+id]={};
 config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;updateSharedSettingsSummaries(config);
-assert.equal(nodes['#run-ceilings-summary'].textContent,'Up to 80 requests · 12.5s · 2 at once');
+assert.equal(nodes['#run-ceilings-summary'].textContent,'80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
 assert(!catalogue.includes('id="shared-settings"')); // Run limits is a preceding sibling in renderNew.
 assert.doesNotMatch(markup,/name="request_timeout_seconds"/);

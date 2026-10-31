@@ -58,7 +58,7 @@ renderNew();console.log(JSON.stringify(nodes['#main'].innerHTML));
 def test_run_limit_value_controls_have_distinct_accessible_labels():
     tree = Markup(rendered_form())
     for name, label, hidden in [('max_requests', 'Request count', True),
-                                ('max_duration_seconds', 'Duration', False),
+                                ('max_duration_seconds', 'Duration', True),
                                 ('concurrency', 'Simultaneous request count', True)]:
         control, = tree.named(name)
         value_label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == control['id']]
@@ -149,7 +149,7 @@ for(const name of ['max_requests','max_duration_seconds','concurrency']){
 }
 const values=new Map([['max_duration_seconds_enabled','on'],['max_duration_seconds','2'],['max_duration_unit','h']]);
 assert.equal(configureRunLimits(config,values).max_duration_seconds,7200);
-assert.equal(sharedLimitsSummary({...config,max_requests:null,max_duration_seconds:null,concurrency:null}),'No suite limits set');
+assert.equal(sharedLimitsSummary({...config,max_requests:null,max_duration_seconds:null,concurrency:null}),'Requests not set · Duration not set · Simultaneous not set');
 """)
 
 

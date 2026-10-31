@@ -1,6 +1,7 @@
 """The owner's Connect settings block and its existing configuration contract."""
 
 import re
+from pathlib import Path
 
 from tests.test_run_limits_phase6_ui import Markup, rendered_form
 
@@ -40,6 +41,17 @@ def test_connect_settings_match_reference_order_labels_and_single_controls():
             fields = next(parent for parent in control['parents'] if parent.get('class') == 'fields')
             grid = fields if grid is None else grid
             assert fields is grid, name
+    assert grid is not None
+    details = grid['parents'][-1]
+    assert details['class'] == 'details-content'
+    assert details['parents'][-1]['class'] == 'setup-advanced'
+    tokenizer, = tree.named('tokenizer')
+    assert grid not in tokenizer['parents']
+    assert tokenizer['parents'][-2]['parents'][-1] is details
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    assert '#setup-deployment .fields { display: block; }' not in css
+    assert '#setup-deployment > .setup-body > .fields { display: block; }' in css
+    assert re.search(r'\.fields\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2,', css)
     assert positions == sorted(positions)
     assert '0 turns off the memory limit.' in html
     connection = html.split('data-setup-panel="2"', 1)[0]

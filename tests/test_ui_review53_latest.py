@@ -137,7 +137,7 @@ def test_connection_setup_has_one_editable_token_id_box(token_id):
     browser_logic(r'''
 const gpu=renderTestCard(bootstrap.checks.find(c=>c.id==='gpu'),config);
 assert.doesNotMatch(gpu,/name="metrics_url"|name="host_metrics_url"/);
-assert.match(gpu,/collected automatically during every run/);
+assert.match(gpu,/Metrics are collected automatically\. Add exporter addresses in Connection settings\./);
 assert.match(gpu,/Automatic metrics discovery/);assert.doesNotMatch(gpu,/Metrics URL needed/);
 ''')
 
