@@ -8,8 +8,8 @@ from tests.test_run_limits_phase6_ui import Markup, rendered_form
 
 CONNECT_FIELDS = [
     ('tokenizer', 'Token ID / tokenizer'),
-    ('metrics_url', 'Server metrics URL'),
-    ('host_metrics_url', 'Host metrics URL'),
+    ('metrics_url', 'Server metrics URL (optional)'),
+    ('host_metrics_url', 'Host metrics URL (optional)'),
     ('stream', 'Streaming'),
 ]
 
@@ -22,7 +22,7 @@ def test_connect_settings_keep_tokenizer_full_width_and_metrics_stream_in_grid()
     assert summary['class'] == 'api-key-row'
     spans = [node for node in tree.nodes if node['tag'] == 'span' and summary in node['parents']]
     assert [(node['class'], node['text']) for node in spans] == [
-        ('api-key-label', 'API key'), ('row-value api-key-value', 'Not set'),
+        ('api-key-label', 'API key (optional)'), ('row-value api-key-value', 'Not set'),
         ('row-action api-key-action', 'EditClose'),
         ('when-closed', 'Edit'), ('when-open', 'Close'),
     ]
@@ -172,6 +172,8 @@ def test_disclosures_use_css_only_edit_close_labels_without_a_caret():
     assert re.search(r'details\[open\]\s*>\s*summary\s+\.when-closed,\s*details:not\(\[open\]\)\s*>\s*summary\s+\.when-open\s*\{\s*display:\s*none;', css)
     assert re.search(r'\.connection-auth\s*\{[^}]*margin:\s*0 0 20px;', css)
     assert re.search(r'\.connection-auth\[open\]\s*\{\s*padding-bottom:\s*16px;', css)
+    assert re.search(r'\.connection-auth > \.api-key-row \{[^}]*grid-template-columns: 140px ', css)
+    assert '  .connection-auth > .api-key-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; }' in css
     assert 'shared-settings-caret' not in css
     assert not any('shared-settings-caret' in node.get('class', '') for node in tree.nodes)
 

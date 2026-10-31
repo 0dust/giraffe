@@ -1428,9 +1428,15 @@ def test_step_one_metrics_url_placeholders():
 
     tree = Markup(rendered_form())
     for name, expected in [
-        ('metrics_url', 'Optional, e.g. http://localhost:8000/metrics'),
-        ('host_metrics_url', 'Optional, e.g. http://localhost:9100/metrics'),
+        ('metrics_url', 'http://localhost:8000/metrics'),
+        ('host_metrics_url', 'http://localhost:9100/metrics'),
     ]:
         control, = tree.named(name)
         assert control['placeholder'] == expected
+        label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == control['id']]
+        assert label['text'] == {'metrics_url': 'Server metrics URL (optional)',
+                                 'host_metrics_url': 'Host metrics URL (optional)'}[name]
         assert any(parent.get('id') == 'setup-panel-1' for parent in control['parents'])
+    key, = tree.named('api_key')
+    key_label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == key['id']]
+    assert key_label['text'] == 'API key (optional)'

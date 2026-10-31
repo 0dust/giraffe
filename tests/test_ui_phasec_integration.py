@@ -32,7 +32,7 @@ state.jsonDraft=state.jsonBase='synced';
 syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=()=>{};
 renderNew();const markup=nodes['#main'].innerHTML;
 assert.match(markup,/name="host_metrics_url" type="url" value="http:\/\/node:9100\/metrics"/);
-assert.match(markup,/Host metrics URL<\/label>/);assert.match(markup,/server-wide CPU and host RAM/);assert.match(markup,/Inference and runtime metrics credentials are not forwarded/);
+assert.match(markup,/Host metrics URL \(optional\)<\/label>/);assert.match(markup,/server-wide CPU and host RAM/);assert.match(markup,/Inference and runtime metrics credentials are not forwarded/);
 assert.doesNotMatch(markup,/name="host_metrics_url"[^>]*required/);
 """)
 

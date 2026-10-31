@@ -442,35 +442,42 @@ assert(prevented);assert(scrolled);
 """)
 
 
-def test_connect_has_one_primary_action_and_manual_model_bypass():
+def test_connect_keeps_next_visible_and_updates_the_model_hint():
     run_browser_logic(r"""
-for(const id of ['setup-panel-1','start-run','setup-navigation-hint','run-bar-summary','model-discovery-status','model-options','model-options-label','connection-options'])nodes['#'+id]=element();
+for(const id of ['setup-panel-1','start-run','setup-navigation-hint','run-bar-summary','model-discovery-status','model-options','model-options-label','connection-options','cli-fallback'])nodes['#'+id]=element();
 for(const action of ['setup-next','setup-back','test-connection'])nodes['[data-action="'+action+'"]']=element();
 const primary=new Set();nodes['[data-action="test-connection"]'].classList={toggle(name,value){if(value)primary.add(name);else primary.delete(name);}};
-nodes['#new-run-form']={querySelectorAll:()=>[],elements:{model:element(),url:element({value:'http://local/v1'}),api_key_env:element()}};
+const model=element({name:'model',setCustomValidity(){},matches:()=>false,closest:q=>q==='#new-run-form'?form:null});
+const form={querySelectorAll:()=>[],elements:{model,url:element({value:'http://local/v1',setCustomValidity(){},checkValidity:()=>true}),api_key_env:element()}};
+nodes['#new-run-form']=form;
 state.config={targets:[{}]};state.jsonDraft=state.jsonBase='synced';state.setupStep=1;
-renderModelDiscovery();
-assert(nodes['[data-action="setup-next"]'].hidden);assert(primary.has('primary'));
+configChanged=updateBounds=()=>{};
+const next=nodes['[data-action="setup-next"]'],hint=nodes['#setup-navigation-hint'];
+const checkEmpty=()=>{assert.equal(next.hidden,false);assert.equal(next.disabled,true);assert.equal(hint.hidden,false);assert.equal(hint.textContent,'Connect to your server or enter a model name to continue.');};
+const checkReady=()=>{assert.equal(next.hidden,false);assert.equal(next.disabled,false);assert.equal(hint.hidden,true);};
+renderModelDiscovery();checkEmpty();assert(primary.has('primary'));
 assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
-assert(nodes['#setup-navigation-hint'].hidden);
-// A manual model permits continuing without endpoint traffic.
-nodes['#new-run-form'].elements.model.value='manual-model';renderModelDiscovery();
-assert(!nodes['[data-action="setup-next"]'].hidden);assert.match(nodes['[data-action="setup-next"]'].innerHTML,/Choose checks/);
-assert(!primary.has('primary'));assert(primary.has('small'));
-assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
+// The real input handler updates navigation without any endpoint traffic.
+model.value='manual-model';await listeners.input({target:model});checkReady();
+assert.match(next.innerHTML,/Choose checks/);assert(!primary.has('primary'));assert(primary.has('small'));
 assert.equal(nodes['[data-action="test-connection"]'].title,'Sends one short request (32-token limit).');
-// Successful discovery selects the same next action, while a reset restores testing.
-state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:'connected',message:'Connected'};renderModelDiscovery();
-assert(!nodes['[data-action="setup-next"]'].hidden);assert(!primary.has('primary'));
-nodes['#new-run-form'].elements.model.value='';invalidateModelDiscovery();
-assert(nodes['[data-action="setup-next"]'].hidden);assert(primary.has('primary'));
-// Model selection and connection problems reveal their controls automatically.
+model.value='';await listeners.input({target:model});checkEmpty();assert(primary.has('primary'));
+// Both connection outcomes refresh the hint and preserve the visible next action.
+api=async()=>({status:'connected',model:'detected-model'});await testConnection();checkReady();
+assert.equal(model.value,'detected-model');
+model.value='';await listeners.input({target:model});checkEmpty();
+api=async()=>{throw new Error('Endpoint unavailable');};await testConnection();checkEmpty();
+assert.equal(state.modelDiscovery.status,'error');assert(nodes['#connection-options'].open);
+model.value='manual-after-failure';await listeners.input({target:model});checkReady();
+assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
+model.value='';await listeners.input({target:model});
 for(const status of ['needs_model','error']){
   nodes['#connection-options'].open=false;
   state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status,message:'Configure connection'};renderModelDiscovery();
-  assert(nodes['#connection-options'].open);
+  checkEmpty();assert(nodes['#connection-options'].open);
 }
 assert(nodes['#model-options'].open);
+state.configView='json';syncSetupStep();assert.equal(next.hidden,false);assert.equal(hint.hidden,true);
 """)
 
 

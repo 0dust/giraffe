@@ -129,7 +129,7 @@ def test_connection_setup_has_one_native_tokenizer_select(token_id, mode):
     assert 'tokenizer-combobox' not in connection
     assert 'tokenizer-options' not in connection
     assert 'retry-tokenizer' not in connection
-    assert 'name="metrics_url"' in connection and 'Server metrics URL</label>' in connection
+    assert 'name="metrics_url"' in connection and 'Server metrics URL (optional)</label>' in connection
     assert 'Performance metrics' not in connection
     assert 'Additional exporter addresses' not in connection
     assert 'How answers arrive' not in connection
@@ -262,7 +262,7 @@ for(const choice of ['auto','builtin']){
  state.setupStep=3;syncSetupStep();assert.equal(nodes['#start-run'].disabled,false);
 }
 form.elements.model.value='';state.setupStep=1;syncSetupStep();
-assert.equal(nodes['[data-action="setup-next"]'].disabled,true);assert.equal(nodes['[data-action="setup-next"]'].hidden,true);
+assert.equal(nodes['[data-action="setup-next"]'].disabled,true);assert.equal(nodes['[data-action="setup-next"]'].hidden,false);
 """)
 
 
