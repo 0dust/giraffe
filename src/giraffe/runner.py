@@ -577,8 +577,7 @@ class _Run:
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
-        readiness = spec.scenario == "readiness" or (
-            spec.scenario == "initial" and self.config.restart_target == target.name)
+        readiness = spec.scenario in {"readiness", "cold_start_warm"}
         evidence_probe = spec.scenario == "performance_evidence_probe"
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         async with self.slot(slot_reserved, slot_deadline) as admitted:
@@ -909,42 +908,107 @@ class _Run:
 async def _restart(run: _Run, target: Target) -> bool:
     if run.config.restart_target != target.name:
         return True
+    from .restart_script import CHANGED_SCRIPT, preview_script
+    import os
+
     observation = {"requested": True, "status": "blocked", "readiness_ms": None,
-                   "coverage": "Only this configured hook; individual backend restart unverified"}
+                   "script_ms": None, "service_answered_ms": None, "warm_requests": [],
+                   "model_load": "Not reported by this server",
+                   "model_loaded_before_first_request": "Unknown"}
     run.observations[target.name]["restart"] = observation
-    if not target.restart_command:
-        observation["reason"] = "Explicit restart requires a configured restart_command"
+    if not target.restart_script:
+        observation["reason"] = "Explicit restart requires a configured restart_script"
+        return False
+    if not run.config.restart_script_sha256:
+        observation["reason"] = "Review and confirm the restart script before each run."
         return False
     if not run.allowed(target.name):
         observation["reason"] = "No remaining run budget for restart and readiness"
         return False
     process = None
-    started = time.monotonic()
+    waiter = stopper = None
+    started = None
+    log_path = None
+    run.preparation(target.name, "restart_script", "Running restart script", "running")
     try:
-        process = await asyncio.create_subprocess_exec(
-            *target.restart_command, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(process.wait(), min(run.config.request_timeout_seconds,
-                                                  max(.001, run.deadline-time.monotonic())))
-        observation["hook_ms"] = round((time.monotonic()-started)*1000, 3)
-        if process.returncode:
-            observation["reason"] = f"Restart hook exited with status {process.returncode}"
-            return False
-        observation["status"] = "hook_completed"
-        observation["started_monotonic"] = started
-        return True
-    except (OSError, TimeoutError) as exc:
-        observation["reason"] = f"Restart hook did not complete ({type(exc).__name__})"
+        # File output matters: a background server can inherit these descriptors.
+        # Only the script's exit is awaited; EOF from its children is irrelevant.
+        directory = run.config._restart_log_dir
+        if directory is None:
+            directory = Path("runs") / run.run_id
+        directory.mkdir(parents=True, exist_ok=True)
+        log_path = directory / "restart.log"
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            preview = preview_script(target.restart_script)
+            if preview["sha256"] != run.config.restart_script_sha256:
+                observation["reason"] = CHANGED_SCRIPT
+                return False
+            observation.update({key: preview[key] for key in ("path", "sha256", "machine")})
+            started = time.monotonic()
+            process = await asyncio.create_subprocess_exec(
+                preview["path"], cwd=str(Path(preview["path"]).parent),
+                stdin=asyncio.subprocess.DEVNULL, stdout=output, stderr=output,
+                start_new_session=True,
+            )
+            waiter = asyncio.create_task(process.wait())
+            stopper = asyncio.create_task(run.stop.wait())
+            timeout = min(run.config.restart_script_timeout_seconds,
+                          max(0, run.deadline - time.monotonic()))
+            done, _ = await asyncio.wait({waiter, stopper}, timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if stopper in done:
+                observation["reason"] = "Restart script stopped by user"
+                return False
+            if waiter not in done:
+                observation["reason"] = "Restart script timed out"
+                return False
+            observation["script_ms"] = round((time.monotonic()-started)*1000, 3)
+            observation["exit_code"] = process.returncode
+            if process.returncode:
+                observation["reason"] = f"Restart script exited with status {process.returncode}"
+                return False
+            observation["status"] = "hook_completed"
+            observation["started_monotonic"] = started
+            return True
+    except (OSError, ValueError) as exc:
+        observation["reason"] = str(exc) if isinstance(exc, ValueError) else f"Restart script did not complete ({type(exc).__name__})"
         return False
+    except asyncio.CancelledError:
+        observation["reason"] = "Restart script stopped by user"
+        raise
     finally:
+        # Never signal a group: its descendants may include the restarted server.
         if process and process.returncode is None:
-            process.terminate()
             try:
-                await asyncio.wait_for(process.wait(), 1)
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(waiter or asyncio.create_task(process.wait())), 1)
             except TimeoutError:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
                 await process.wait()
+        for task in (waiter, stopper):
+            if task is not None and not task.done():
+                task.cancel()
+        if waiter is not None or stopper is not None:
+            await asyncio.gather(*(task for task in (waiter, stopper) if task is not None), return_exceptions=True)
+        if started is not None and observation["script_ms"] is None:
+            observation["script_ms"] = round((time.monotonic()-started)*1000, 3)
+        if process is not None:
+            observation["exit_code"] = process.returncode
+        if log_path is not None and log_path.exists():
+            with log_path.open("rb") as source:
+                source.seek(max(0, log_path.stat().st_size - 4096))
+                observation["output_tail"] = source.read(4096).decode("utf-8", errors="replace")
+        run.preparation(target.name, "restart_script", "Running restart script",
+                        "completed" if observation["status"] == "hook_completed" else "blocked",
+                        observation.get("reason"))
 
 
 _GPU_FAMILIES = {"memory", "utilization", "temperature", "throttling", "device_errors"}
@@ -1089,51 +1153,92 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         async with LLMClient(target, config, max_connections=run.connection_limits[target.name]) as client:
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
-            data = run.observations[target.name]["serving_telemetry"]
-            data["host_configured"] = bool(target.host_metrics_url)
-            run.preparation(target.name, "runtime_metrics_discovery", "Checking available runtime telemetry", "running")
-            await _metrics(run, target, "start")
-            available = data["snapshots"] and data["snapshots"][-1]["status"] in {"available", "stale_samples"}
-            discovery = run.observations[target.name].get("runtime_metrics_discovery", {})
-            run.preparation(target.name, "runtime_metrics_discovery", "Runtime telemetry capability", "completed" if available else "unavailable", discovery.get("reason"))
-            if available or target.metrics_url or config.metrics or target.host_metrics_url or target.deployment.collector_url:
-                telemetry_task = asyncio.create_task(telemetry.sample_during(
-                    run, target, stop_event=telemetry_stop))
+            async def start_metrics():
+                data = run.observations[target.name]["serving_telemetry"]
+                data["host_configured"] = bool(target.host_metrics_url)
+                run.preparation(target.name, "runtime_metrics_discovery", "Checking available runtime telemetry", "running")
+                await _metrics(run, target, "start")
+                available = data["snapshots"] and data["snapshots"][-1]["status"] in {"available", "stale_samples"}
+                discovery = run.observations[target.name].get("runtime_metrics_discovery", {})
+                run.preparation(target.name, "runtime_metrics_discovery", "Runtime telemetry capability", "completed" if available else "unavailable", discovery.get("reason"))
+                if available or target.metrics_url or config.metrics or target.host_metrics_url or target.deployment.collector_url:
+                    return asyncio.create_task(telemetry.sample_during(
+                        run, target, stop_event=telemetry_stop))
+                return None
+
             restart = run.observations[target.name]["restart"]
+            if not restart:
+                telemetry_task = await start_metrics()
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
                 response = config.effective_initial()
                 response_config = config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")})
                 initial_specs = builtin_fixtures(response_config, check_id="serving")["short"]
                 if restart and restart["status"] == "hook_completed":
+                    from .cold_start import (NATIVE_API_LABEL, OllamaColdClient, cold_spec,
+                                             detect_ollama, model_load_evidence, residency)
+                    started = restart["started_monotonic"]
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
-                    backoff = .1
                     initial = []
                     restart["health_polls"] = []
+                    measured_client = client
+                    native = False
+                    before = "unknown"
+                    first = None
                     while time.monotonic() < ready_deadline and not run.stop_reason(target.name):
                         try:
                             async with asyncio.timeout_at(ready_deadline):
-                                ready = await client.ready(ready_deadline)
+                                # Any HTTP response establishes service availability;
+                                # a successful inference is a separate measurement.
+                                if hasattr(client, "service_answered"):
+                                    answered = await client.service_answered(ready_deadline)
+                                else:
+                                    answered = await client.ready(ready_deadline)
                         except TimeoutError:
-                            ready = False
-                        restart["health_polls"].append({"elapsed_seconds": time.monotonic()-run.start,
-                                                        "ready": ready})
-                        if ready:
-                            probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
-                            record = await run.request(target, client, probe, deadline_override=ready_deadline,
+                            answered = False
+                        restart["health_polls"].append({"elapsed_seconds": time.monotonic()-started,
+                                                        "ready": answered})
+                        if answered:
+                            if restart["service_answered_ms"] is None:
+                                restart["service_answered_ms"] = round((time.monotonic()-started)*1000, 3)
+                                native = await detect_ollama(target, config, deadline=ready_deadline, stop=run.stop)
+                                if native:
+                                    measured_client = OllamaColdClient(client)
+                                    restart["measurement_api"] = NATIVE_API_LABEL
+                                    before = await residency(target, config, deadline=ready_deadline, stop=run.stop)
+                            probe = cold_spec(initial_specs[0])
+                            record = await run.request(target, measured_client, probe, deadline_override=ready_deadline,
                                                        budget_exempt=True)
+                            inference_finished_ms = round((time.monotonic()-started)*1000, 3)
+                            if first is None and record is not None:
+                                first = record
+                                restart["first_request"] = {"first_output_ms": record.first_output_ms,
+                                                            "elapsed_ms": record.elapsed_ms}
+                                if native:
+                                    after = await residency(target, config, deadline=ready_deadline, stop=run.stop)
+                                    restart.update(model_load_evidence(before, after,
+                                        record.workload.get("reported_load_duration_ns")))
                             if record and record.valid:
-                                record.check_ids = [name for name in ("access", "serving", "first_output")
-                                                    if name in enabled]
+                                restart["readiness_ms"] = inference_finished_ms
                                 initial = [record]
-                            break
-                        await asyncio.sleep(min(backoff, max(0, ready_deadline-time.monotonic())))
-                        backoff = min(5, backoff * 2)
+                                break
+                        await asyncio.sleep(min(.25, max(0, ready_deadline-time.monotonic())))
                     restart["status"] = "ready" if initial else "blocked"
-                    restart["readiness_ms"] = round((time.monotonic()-restart.pop("started_monotonic"))*1000, 3)
+                    restart.pop("started_monotonic", None)
                     if restart["status"] == "blocked":
                         restart["reason"] = "No successful inference within readiness budget"
                         run.stop_reason(target.name)
                         return
+                    # Same prompt token size, different text: do not reward prefix
+                    # cache reuse in the two cold-start follow-up measurements.
+                    from .cold_start import warm_specs
+                    for probe in warm_specs(initial_specs[0]):
+                        record = await run.request(target, measured_client, probe, budget_exempt=True)
+                        if record is not None:
+                            restart["warm_requests"].append({"first_output_ms": record.first_output_ms,
+                                                             "elapsed_ms": record.elapsed_ms})
+                    telemetry_task = await start_metrics()
+                    if enabled & {"access", "serving", "first_output", "generation"}:
+                        await run.group(target, client, initial_specs, "initial", count=1)
                 else:
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
@@ -1495,8 +1600,10 @@ def _pack_results(run: _Run, target: Target) -> dict:
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
-    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
-                or _serving_failure(r, r.scenario)]
+    ordinary = [r for r in all_records
+                if not (config.restart_target == target.name and r.scenario in {"readiness", "cold_start_warm"})
+                and (r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
+                     or _serving_failure(r, r.scenario))]
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]

@@ -70,7 +70,7 @@ def test_config_cannot_restart_without_explicit_command(tmp_path, capsys):
     parsed = configuration(parser().parse_args([
         "cold-start", "--config", str(config), "--restart", "test",
     ]))
-    assert parsed.restart_target == "test"
+    assert parsed.restart_target is None
 
 
 def test_baseline_save_never_replaces_implicitly(tmp_path):
@@ -144,7 +144,9 @@ def test_ui_launch_and_shutdown_stay_local_and_clear_implicit_restart(
             pass
 
         def bind(self, address):
-            assert "Giraffe UI:" not in capsys.readouterr().out
+            before_bind = capsys.readouterr()
+            assert "Giraffe UI:" not in before_bind.out
+            captured["migration_stderr"] = before_bind.err
             captured["bound"] = address
 
         def listen(self, backlog):
@@ -169,13 +171,14 @@ def test_ui_launch_and_shutdown_stay_local_and_clear_implicit_restart(
     output = capsys.readouterr()
     assert "open in your browser" in output.out
     assert ("Giraffe UI stopped." in output.out) == interrupted
-    assert not output.err
+    assert "restart_command" in captured["migration_stderr"]
     assert captured["defaults"]["restart_target"] is None
-    assert captured["defaults"]["targets"][0]["restart_command"] == ["false"]
+    assert "restart_command" not in captured["defaults"]["targets"][0]
+    assert captured["defaults"]["targets"][0]["restart_script"] is None
     if legacy:
         assert any("samples_per_bucket=7" in note for note in captured["migration_notes"])
     else:
-        assert captured["migration_notes"] == []
+        assert any("restart_command" in note for note in captured["migration_notes"])
 
 
 def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, capsys):
@@ -265,11 +268,12 @@ def test_run_json_outcome_has_saved_report_paths_and_preserves_exit_code(
     assert len(captured.out.splitlines()) == 1
     assert result["kind"] == command and result["outcome"] == outcome and result["exit_code"] == exit_code
     assert result["run_id"] == "machine-run"
+    assert "cold_start" not in result
     assert json.loads(Path(result["report_paths"]["json"]).read_text())["run_id"] == "machine-run"
     assert result["report_paths"]["html"] is None
     assert not (tmp_path / "report.html").exists()
     assert "Giraffe:" in captured.err
-    assert captured_config[0].restart_target == ("local" if command == "cold-start" else None)
+    assert captured_config[0].restart_target is None
 
 
 def test_baseline_save_json_preserves_explicit_replace_boundary(tmp_path, capsys):

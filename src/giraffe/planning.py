@@ -381,6 +381,15 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         ordered[after_context:after_context] = pack_rows
     for target in config.targets:
         has_observations = bool((observations or {}).get(target.name))
+        if config.restart_target == target.name:
+            for identifier, title, field, bound in (
+                ("restart_script", "Running restart script", "restart_script_timeout_seconds", config.restart_script_timeout_seconds),
+                ("restart_readiness", "First answer after", "readiness_timeout_seconds", config.readiness_timeout_seconds),
+                ("cold_start_warm", "Cold vs warm", "request_timeout_seconds", 2 * config.effective_initial()["request_timeout_seconds"]),
+            ):
+                timeline.append({"id": identifier, "title": title, "target": target.name,
+                                 "kind": "setup", "field": field, "low_seconds": 0,
+                                 "high_seconds": bound, "wait": True})
         for row in ordered:
             name, count = row["id"], row["requests_per_target"]
             if name == "recovery_prime" and "cancellation" in selected:
@@ -393,7 +402,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                      "recovery_prime": "recovery", "recovery_baseline": "recovery",
                      "limits.stop_control": "cancellation", "backend_cancellation": "cancellation",
                      "sustained": "recovery"}.get(name, name)
-            if name in {"initial", "restart_readiness"}:
+            if name in {"initial", "restart_readiness", "cold_start_warm"}:
                 # Setup stays outside the headline. Initial inference still
                 # consumes the shared deadline, so budget remedies reserve its
                 # full effective timeout before the selected traffic starts.
@@ -896,6 +905,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         add("restart_readiness", None,
             f"GET readiness polls for {config.restart_target}, then one inference probe outside the request budget.",
             kind="bounded", title="Restart readiness")
+        add("cold_start_warm", 2, "Two follow-up requests of the same token size with different text, outside the request budget.",
+            title="Cold vs warm")
     warm_count = config.effective_response()["samples"] if selected & {"serving", "first_output"} else 0
     if warm_count:
         add("warm", warm_count, "Repeated connection requests reused to compare response timing and mixed-length requests.",
@@ -1136,6 +1147,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append("Models run at the same time and share Max concurrency. Their actual overlap depends on when request slots become free.")
     known = sum(row.get("known_scheduled_requests", row["requests_per_target"] or 0
                         if row["kind"] == "exact" else 0) for row in rows)
+    budget_known = known - (2 if config.restart_target else 0)
     unknown = any(row["requests_per_target"] is None for row in rows)
     estimated = any(row["kind"] == "estimate" for row in rows)
     kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
@@ -1180,14 +1192,16 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     for target, quota in quotas.items():
         if quota is None:
             continue
-        if known > quota or planned is not None and planned > quota:
+        if budget_known > quota or planned is not None and planned > quota:
             elapsed, cut = 0, []
             for row in rows:
+                if row["id"] == "cold_start_warm":
+                    continue
                 row_count = row["requests_per_target"] or row.get("known_scheduled_requests", 0)
                 elapsed += row_count
                 if elapsed > quota and row_count:
                     cut.append(row)
-            required = planned * target_count if kind == "exact" else known * target_count
+            required = planned * target_count if kind == "exact" else budget_known * target_count
             if load_plan:
                 # Calibration has a finite attempt allowance. A suggested
                 # budget must cover that allowance as well as scheduled work.
@@ -1278,7 +1292,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             "load_warnings": load_warnings, "concurrency_warnings": concurrency_warnings,
             "capacity_warnings": capacity_warnings,
             "required_concurrency": required_concurrency(config),
-            "minimum_reserved_per_target": known + (minimum_reservation(config.load_test) if load_plan else 0),
+            "minimum_reserved_per_target": budget_known + (minimum_reservation(config.load_test) if load_plan else 0),
             "known_per_target": known, "known_total": known * target_count,
             "request_warnings": request_warnings, "request_limit": config.max_requests, "memory_limit_bytes": config.max_memory_mb * 1024**2,
             "memory_limit_label": "Maximum memory (RAM growth during this run)",

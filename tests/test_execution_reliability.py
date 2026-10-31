@@ -140,15 +140,19 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
             attempts.append(spec.scenario)
             return await super().execute(spec, **kwargs)
     async def restart(run, target):
-        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic()}
+        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic(),
+                                          "service_answered_ms": None, "warm_requests": []}
         return True
+    async def not_ollama(*args, **kwargs):
+        return False
+    monkeypatch.setattr("giraffe.cold_start.detect_ollama", not_ollama)
     monkeypatch.setattr(runner, "LLMClient", Cold)
     monkeypatch.setattr(runner, "_restart", restart)
     run = runner._Run(cfg, None, None)
     await runner._target(run, cfg.targets[0], builtin_fixtures(cfg))
-    assert attempts == ["GET models"] * 4 + ["readiness"]
-    assert run.errors == run.budget_used == 0 and run.reason is None
-    assert len(run.observations["t"]["readiness_requests"]) == 1
+    assert attempts == ["GET models"] * 4 + ["readiness", "cold_start_warm", "cold_start_warm", "initial"]
+    assert run.errors == 0 and run.budget_used == 1 and run.reason is None
+    assert len(run.observations["t"]["readiness_requests"]) == 3
     assert run.observations["t"]["restart"]["status"] == "ready"
     result = next(c for c in runner._checks(run, cfg.targets[0]) if c.id == "access")
     assert result.status == "pass" and result.metrics["attempted"] == 1
@@ -166,7 +170,8 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
         async def ready(self, deadline):
             await asyncio.sleep(1)
     async def restart(run, target):
-        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic()}
+        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic(),
+                                          "service_answered_ms": None, "warm_requests": []}
         return True
     monkeypatch.setattr(runner, "LLMClient", Cold)
     monkeypatch.setattr(runner, "_restart", restart)

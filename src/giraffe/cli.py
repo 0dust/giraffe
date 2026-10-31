@@ -185,7 +185,8 @@ def parser() -> argparse.ArgumentParser:
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     web.add_argument("--no-browser", action="store_true", help="Print the access link without opening a browser")
-    web.add_argument("--allow-restart-command", action="store_true", help="Allow configured server restart commands")
+    web.add_argument("--allow-restart-script", action="store_true",
+                     help="Allow restart scripts when the UI is bound beyond loopback")
     web.add_argument("--runs-dir", type=Path, default=Path("runs"))
     web.add_argument("--config", type=Path, help="Prefill the run form from a YAML/JSON config")
     _storage_flags(web)
@@ -305,12 +306,17 @@ Exit codes:
         run.add_argument("--runs-dir", type=Path, help="Explicit root for automatic cleanup; output must be a direct child")
         run.add_argument("--html", action="store_true", help="Also save a standalone HTML report")
         if name == "cold-start":
-            run.add_argument("--restart", required=True, help="Name of target with restart_command")
+            run.add_argument("--restart", help="Target to restart (optional with one server)")
+            run.add_argument("--restart-script", help="Executable UTF-8 restart script on this machine")
+            run.add_argument("--restart-script-timeout-seconds", type=float,
+                             help="Restart script timeout in seconds (default: 600), bounded by the run limit")
+            run.add_argument("--yes", action="store_true", help="Confirm the displayed restart script without a terminal prompt")
         legacy = {"--concurrency", "--metrics", "--structured-output", "--tool-calling", "--nonstream"}
         common = {"help", "help_all", "config", "url", "model", "api_key_env", "simultaneous_limit",
                   "default_concurrency", "max_requests", "max_duration_seconds", "request_timeout_seconds",
                   "max_output_tokens", "checks", "stream", "baseline", "output", "output_format", "verbose",
-                  "quiet", "fail_on", "junit", "summary_md", "html", "skip_preflight", "restart"}
+                  "quiet", "fail_on", "junit", "summary_md", "html", "skip_preflight", "restart",
+                  "restart_script", "restart_script_timeout_seconds", "yes"}
         advanced = run.add_argument_group("advanced (shown with --help-all)")
         for action in list(run._actions):
             if legacy.intersection(action.option_strings):
@@ -364,7 +370,7 @@ def _migrated_values(values):
 
 def _configuration_notes(config, notes):
     config._migration_notes = list(dict.fromkeys([*notes, *config._migration_notes]))
-    for note in notes:
+    for note in config._migration_notes:
         print(f"Migration: {note}", file=sys.stderr)
     return config
 
@@ -454,7 +460,18 @@ def configuration(args: argparse.Namespace) -> RunConfig:
         values["request_pack"] = load_request_pack(args.request_pack_file).model_dump(mode="json")
         values["request_source"] = "request_pack"
     if args.command == "cold-start":
-        values["restart_target"] = args.restart
+        targets = values["targets"]
+        restart = args.restart
+        if restart is None:
+            if len(targets) != 1:
+                raise ValueError("Provide --restart NAME when more than one server is configured")
+            restart = targets[0].get("name", "local")
+        target = next((target for target in targets if target.get("name", "local") == restart), None)
+        if target is None:
+            raise ValueError("--restart must name one configured target")
+        if args.restart_script is not None:
+            target["restart_script"] = args.restart_script
+        values["restart_target"] = restart if target.get("restart_script") else None
     if getattr(args, "deployment_file", None):
         from giraffe.deployment import load_metadata
         values["targets"][0].setdefault("deployment", {}).update(load_metadata(args.deployment_file))
@@ -463,6 +480,41 @@ def configuration(args: argparse.Namespace) -> RunConfig:
             values["targets"][0][key] = getattr(args, key)
     args._configuration_input = values
     return _configuration_notes(RunConfig.model_validate(values), notes)
+
+
+def _confirm_restart_script(config: RunConfig, *, yes: bool = False) -> None:
+    """Confirm the exact local bytes for this invocation, including copied commands."""
+    if config.restart_target is None:
+        return
+    from giraffe.restart_script import preview_script
+
+    target = next(target for target in config.targets if target.name == config.restart_target)
+    if not target.restart_script:
+        return
+    config.restart_script_sha256 = None
+    preview = preview_script(target.restart_script)
+    print(f"Restart script: {preview['path']}\nMachine: {preview['machine']}\n"
+          f"SHA-256: {preview['sha256']}\nSize: {preview['size']} bytes\n"
+          f"Script contents:\n{preview['contents']}", file=sys.stderr, flush=True)
+    if not yes:
+        terminal = None
+        try:
+            if sys.stdin.isatty():
+                terminal = sys.stdin
+            else:
+                try:
+                    terminal = open("/dev/tty", "r+", encoding="utf-8")
+                except OSError:
+                    raise ValueError("Restart script requires an interactive terminal or --yes") from None
+            print("Restart the server with this script before testing? [y/N] ",
+                  file=sys.stderr, end="", flush=True)
+            if terminal.readline().strip().lower() not in {"y", "yes"}:
+                raise ValueError("Restart script was not confirmed")
+        finally:
+            if terminal is not None and terminal is not sys.stdin:
+                terminal.close()
+    target.restart_script = preview["path"]
+    config.restart_script_sha256 = preview["sha256"]
 
 
 def _discover_model(args: argparse.Namespace, values: dict | None = None, target: dict | None = None) -> str:
@@ -774,7 +826,7 @@ def _main(argv: list[str] | None = None) -> int:
                     raise
                 token = secrets.token_urlsafe(32)
                 app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes,
-                                 token=token, host=args.host, port=args.port, allow_restart_command=args.allow_restart_command,
+                                 token=token, host=args.host, port=args.port, allow_restart_script=args.allow_restart_script,
                                  auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
                 try:
                     loopback = ipaddress.ip_address(args.host).is_loopback
@@ -840,6 +892,8 @@ def _main(argv: list[str] | None = None) -> int:
             baseline = None
         else:
             config = configuration(args)
+            if args.command == "cold-start":
+                _confirm_restart_script(config, yes=args.yes)
             baseline = load_report(args.baseline) if args.baseline else None
         if getattr(args, "save_config", None):
             args.save_config.write_text(json.dumps(config.model_dump(mode="json"), indent=2, allow_nan=False) + "\n")
@@ -962,6 +1016,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         async def run_with_partial_report():
             try:
+                config._restart_log_dir = directory
                 report = await (_run(config, quiet=True) if getattr(args, "quiet", False) else
                                 _run(config, json_progress=True) if json_output else
                                 _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
@@ -1080,11 +1135,15 @@ def _main(argv: list[str] | None = None) -> int:
             exit_code = 0
             print(f"Note: {report.overall} verdict accepted by --fail-on {policy}.", file=sys.stderr)
         summary = report.observations.get("summary")
+        cold_start = {name: observation["restart"]
+                      for name, observation in report.observations.get("targets", {}).items()
+                      if observation.get("restart") is not None}
         if json_output:
             emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
                  performance=report.performance,
                  abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
                  **({"summary": summary} if summary else {}),
+                 **({"cold_start": cold_start} if cold_start else {}),
                  report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
         else:
             _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False))
@@ -1175,6 +1234,29 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
     if unselected:
         print("Not selected: " + ", ".join(unselected))
     for name, observation in report.observations.get("targets", {}).items():
+        if restart := observation.get("restart"):
+            print(f"Cold start · {name}")
+            for label, field in (("Script time", "script_ms"),
+                                 ("Service answered after", "service_answered_ms"),
+                                 ("First answer after", "readiness_ms")):
+                value = restart.get(field)
+                print(f"  {label}: {value:g} ms" if isinstance(value, (float, int)) else f"  {label}: Not measured")
+            first = restart.get("first_request") or {}
+            for label, request in [("First request", first), *[
+                    (f"Warm request {index}", request)
+                    for index, request in enumerate(restart.get("warm_requests", []), 1)]]:
+                def timing(field):
+                    value = request.get(field)
+                    return f"{value:g} ms" if isinstance(value, (float, int)) else "Not measured"
+                print(f"  {label}: first answer {timing('first_output_ms')}; latency {timing('elapsed_ms')}")
+            print(f"  {restart.get('model_load', 'Not reported by this server')}")
+            print(f"  Model loaded before first request: {restart.get('model_loaded_before_first_request', 'Unknown')}")
+            if restart.get("measurement_api"):
+                print(f"  {restart['measurement_api']}")
+            if restart.get("reason"):
+                print(f"  {restart['reason']}")
+            if restart.get("output_tail"):
+                print(f"  Script output (last 4 KiB):\n{restart['output_tail']}")
         telemetry = observation.get("serving_telemetry", {})
         states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
         print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")

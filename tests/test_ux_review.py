@@ -63,12 +63,12 @@ assert.match(markup,/local: up to 2 requests/);
 def test_multi_endpoint_dataset_and_restart_scope_are_preserved_without_duplicates():
     browser_logic(r"""
 config.targets=[{name:'local',url:'http://local/v1',model:'model-a'},
-  {name:'staging <b>',url:'https://stage.example/v1',model:'model-b',restart_command:['restart','server']}];
+  {name:'staging <b>',url:'https://stage.example/v1',model:'model-b',restart_script:'/tmp/restart.sh'}];
 config.request_source='request_pack';config.request_pack={version:1,cases:[{scorer:'exact'},{scorer:'exact'}]};
 config.checks=['access','correctness'];const before=JSON.stringify(config);
 let markup=renderReviewScope({config,mode:'cold-start',restart_target:'staging <b>'});
 for(const value of ['http://local/v1','https://stage.example/v1','model-a','model-b','staging &lt;b&gt;'])assert(markup.includes(value));
-assert.match(markup,/Your questions · 2 saved questions/);assert.match(markup,/Restart staging &lt;b&gt; before testing/);
+assert.match(markup,/Your questions · 2 saved questions/);assert.doesNotMatch(markup,/Restart staging &lt;b&gt; before testing/);
 assert.match(markup,/data-setup-step="1">Edit connection/);assert.match(markup,/data-setup-step="2">Edit checks/);
 assert.doesNotMatch(markup,/Your run|setup-side-summary|Simultaneous limit|Whole-run time limit/);
 assert.match(markup,/<dl class="review-identity">/);assert.match(markup,/<ul class="review-check-names"><li>Endpoint response<\/li><li>Answer correctness<\/li><\/ul>/);
@@ -77,7 +77,7 @@ config.checks=['access'];markup=renderReviewScope({config,mode:'normal'});
 assert.doesNotMatch(markup,/Your questions|saved questions|Restart /); // Inactive dataset is not advertised as traffic.
 config.checks=['correctness'];config.request_pack.cases=[];config.targets[0].model='';
 markup=renderReviewScope({config,mode:'cold-start',restart_target:'local'});
-assert.match(markup,/Enter an endpoint URL and model/);assert.match(markup,/Add a question/);assert.match(markup,/no restart command/);
+assert.match(markup,/Enter an endpoint URL and model/);assert.match(markup,/Add a question/);assert.doesNotMatch(markup,/restart command|Restart the server with this script/);
 """)
 
 

@@ -135,22 +135,22 @@ async def test_nonloopback_host_exception_needs_authentication(tmp_path, host, a
             assert response.status_code == 303
 
 
-@pytest.mark.parametrize("mode,hook", [("cold-start", None), ("cold-start", ["echo", "restart"])])
-async def test_restart_requires_launch_opt_in(tmp_path, mode, hook):
+@pytest.mark.parametrize("script", [None, "/unused/restart.sh"])
+async def test_restart_requires_launch_opt_in(tmp_path, script):
     values = config()
-    values["targets"][0]["restart_command"] = hook
-    app = create_app(tmp_path, token="launch-token")
+    values["targets"][0]["restart_script"] = script
+    app = create_app(tmp_path, token="launch-token", host="0.0.0.0")
     async with client_for(app, headers={"X-Giraffe-Token": "launch-token"}) as client:
-        response = await client.post("/api/runs", json={"config": values, "mode": mode})
+        response = await client.post("/api/runs", json={"config": values, "mode": "cold-start"})
         assert response.status_code == 403
-        assert "--allow-restart-command" in response.text
+        assert "--allow-restart-script" in response.text
         assert (await client.get("/api/bootstrap")).json()["restart_allowed"] is False
 
 
 async def test_restart_opt_in_exposed_and_preserves_cold_start_validation(tmp_path):
-    app = create_app(tmp_path, token="launch-token", allow_restart_command=True)
+    app = create_app(tmp_path, token="launch-token", host="0.0.0.0", allow_restart_script=True)
     values = config()
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
+    values["targets"][0]["restart_script"] = "/unused/restart.sh"
     async with client_for(app, headers={"X-Giraffe-Token": "launch-token"}) as client:
         assert (await client.get("/api/bootstrap")).json()["restart_allowed"] is True
         response = await client.post("/api/config/cli", json={
@@ -162,7 +162,7 @@ async def test_restart_opt_in_exposed_and_preserves_cold_start_validation(tmp_pa
 @pytest.mark.parametrize("path", ["draft", "plan", "validate", "preview"])
 async def test_submitted_restart_configuration_stays_editable(tmp_path, path):
     values = config()
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
+    values["targets"][0]["restart_script"] = "/unused/restart.sh"
     app = create_app(tmp_path, token="launch-token")
     async with client_for(app, headers={"X-Giraffe-Token": "launch-token"}) as client:
         response = await client.post(f"/api/config/{path}", json=values)
@@ -171,8 +171,8 @@ async def test_submitted_restart_configuration_stays_editable(tmp_path, path):
 
 async def test_copy_cold_start_cli_does_not_need_server_restart_permission(tmp_path):
     values = config()
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
-    app = create_app(tmp_path, token="launch-token")
+    values["targets"][0]["restart_script"] = "/unused/restart.sh"
+    app = create_app(tmp_path, token="launch-token", host="0.0.0.0")
     async with client_for(app, headers={"X-Giraffe-Token": "launch-token"}) as client:
         response = await client.post("/api/config/cli", json={
             "config": values, "mode": "cold-start", "restart_target": "local"})
@@ -181,7 +181,7 @@ async def test_copy_cold_start_cli_does_not_need_server_restart_permission(tmp_p
 
 
 @pytest.mark.parametrize("endpoint", ["/api/runs", "/api/runs/try-example"])
-async def test_unused_restart_command_does_not_block_run_admission(tmp_path, monkeypatch, endpoint):
+async def test_unused_restart_script_does_not_block_run_admission(tmp_path, monkeypatch, endpoint):
     from fastapi import HTTPException
 
     def reached_admission(config):
@@ -189,7 +189,7 @@ async def test_unused_restart_command_does_not_block_run_admission(tmp_path, mon
 
     monkeypatch.setattr("giraffe.web._validated_plan", reached_admission)
     values = config()
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
+    values["targets"][0]["restart_script"] = "/unused/restart.sh"
     values.update(request_source="request_pack", request_pack={"version": 1, "cases": [{
         "fixture_id": "one", "messages": [{"role": "user", "content": "Hello"}], "scorer": "none"}]})
     app = create_app(tmp_path, token="launch-token")
@@ -202,14 +202,14 @@ async def test_unused_restart_command_does_not_block_run_admission(tmp_path, mon
 
 async def test_try_example_rejects_restart_execution_intent(tmp_path):
     values = config()
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
+    values["targets"][0]["restart_script"] = "/unused/restart.sh"
     values["restart_target"] = "local"
-    app = create_app(tmp_path, token="launch-token")
+    app = create_app(tmp_path, token="launch-token", host="0.0.0.0")
     async with client_for(app, headers={"X-Giraffe-Token": "launch-token"}) as client:
         response = await client.post("/api/runs/try-example", json={
             "config": values, "fixture_id": "one", "target_name": "local"})
         assert response.status_code == 403
-        assert "--allow-restart-command" in response.text
+        assert "--allow-restart-script" in response.text
 
 
 async def test_cookie_credentials_for_two_ports_coexist(tmp_path):
@@ -245,9 +245,9 @@ async def test_nonlocal_bind_serves_access_instructions_before_auth(tmp_path, ho
 
 async def test_restart_target_in_execution_request_requires_opt_in(tmp_path):
     values = config()
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
-    app = create_app(tmp_path, token="launch-token")
+    values["targets"][0]["restart_script"] = "/unused/restart.sh"
+    app = create_app(tmp_path, token="launch-token", host="0.0.0.0")
     async with client_for(app, headers={"X-Giraffe-Token": "launch-token"}) as client:
         response = await client.post("/api/runs", json={"config": values, "restart_target": "local"})
         assert response.status_code == 403
-        assert "--allow-restart-command" in response.text
+        assert "--allow-restart-script" in response.text

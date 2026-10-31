@@ -361,6 +361,19 @@ class LLMClient:
             except (httpx.HTTPError, OSError):
                 pass  # Transport cleanup cannot invalidate a completed response.
 
+    async def service_answered(self, deadline: float) -> bool:
+        """A response from the models route proves HTTP availability, not inference."""
+        remaining = min(1, deadline - time.monotonic())
+        if remaining <= 0:
+            return False
+        url = completion_url(self.target.url).removesuffix("/chat/completions") + "/models"
+        try:
+            async with asyncio.timeout(remaining):
+                async with self._client.stream("GET", url, timeout=remaining):
+                    return True
+        except (httpx.HTTPError, OSError, TimeoutError):
+            return False
+
     async def ready(self, deadline: float) -> bool:
         """Poll the advertised model route without spending an inference request."""
         if self._client is None:

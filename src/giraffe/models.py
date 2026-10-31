@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
@@ -506,6 +508,12 @@ def migrate_load_test(value):
         return value, []
     value = deepcopy(value)
     notes = []
+    targets = value.get("targets")
+    for target in targets if isinstance(targets, (list, tuple)) else ():
+        if isinstance(target, dict) and "restart_command" in target:
+            target.pop("restart_command")
+            value["restart_target"] = None
+            notes.append("restart_command was removed and will not run. To restart, put it in a script and set restart_script; review and confirm it for each run.")
     old_checks = list(value.get("checks", []))
     older = {"fairness", "buckets", "mixed", "token_stress"}.intersection(old_checks)
     if older or value.get("concurrent_workloads") is not None or value.get("buckets") is not None:
@@ -1219,7 +1227,7 @@ class Target(Model):
     metrics_runtime_version: str | None = None
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)
-    restart_command: list[str] | None = None
+    restart_script: str | None = None
 
     @field_validator("tokenizer", mode="before")
     @classmethod
@@ -1914,6 +1922,7 @@ class RunConfig(Model):
         description="Maximum memory (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
     request_timeout_seconds: float = Field(default=300, gt=0)
     readiness_timeout_seconds: float = Field(default=180, gt=0)
+    restart_script_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     max_output_tokens: int = Field(default=128, ge=1)
     context_limit: int = Field(default=4096, ge=128)
     samples: int = Field(default=6, ge=1)
@@ -1959,6 +1968,8 @@ class RunConfig(Model):
     ca_bundle: str | None = None
     proxy: str | None = None
     restart_target: str | None = None
+    restart_script_sha256: str | None = Field(default=None, exclude=True, pattern=r"^[0-9a-f]{64}$")
+    _restart_log_dir: Path | None = PrivateAttr(default=None)
     limits: Limits = Field(default_factory=Limits)
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     test_options: dict[str, CheckOptions] = Field(default_factory=dict)

@@ -3,7 +3,8 @@
 [Documentation index](README.md) · [Installation](../README.md)
 
 Start your inference server separately. Giraffe connects to an existing
-OpenAI-compatible text endpoint; it does not start the inference engine.
+OpenAI-compatible text endpoint. An optional, confirmed restart script can restart
+the server before a cold-start run.
 
 ## Start your run
 
@@ -61,7 +62,7 @@ inference automatically. Keep the terminal open; **Ctrl+C** stops the UI server.
 | --- | --- |
 | `--host HOST` | Bind address; default `127.0.0.1`. Non-loopback binding prints a warning. |
 | `--no-browser` | Print the access link; no browser is opened automatically. |
-| `--allow-restart-command` | Permit cold-start execution. Configurations may retain unused restart commands without it. |
+| `--allow-restart-script` | Permit restart scripts when binding beyond loopback. Scripts are allowed on loopback by default, with confirmation for every run. |
 | `--port PORT` | Choose a different port; default `8765`. |
 | `--runs-dir PATH` | Report/history directory; default `runs` relative to the working directory. |
 | `--config FILE` | Prefill from YAML/JSON, including the selected checks. |
@@ -97,6 +98,89 @@ model for every target and at least one selected check.
 All UI assets are bundled locally. One run is active at a time. Closing the
 browser leaves the server and run active; use **Stop run** to stop work and retain
 partial results.
+
+## Cold start
+
+Set **Restart script (optional)** in **Connect**, then review the full path,
+machine name, SHA-256 and read-only script contents. On **Launch**, tick
+**Restart the server with this script before testing**. Confirmation is cleared
+on every new run, **Run again** and **Load saved setup**. Without a script or
+confirmation, an ordinary run sends the same traffic as before.
+
+The CLI accepts the same script and timeout:
+
+```sh
+giraffe cold-start --url http://127.0.0.1:11434/v1 --model qwen3:0.6b \
+  --restart-script ./restart.sh --restart-script-timeout-seconds 600 --html
+```
+
+Or configure `targets[].restart_script` and top-level
+`restart_script_timeout_seconds`, then run `giraffe cold-start --config giraffe.yaml`.
+`--restart NAME` is optional with one server and required with multiple servers.
+Normal `giraffe run` never executes a configured script. The CLI prints the same
+script details and asks for confirmation; CI must supply `--yes`. With neither
+an interactive terminal nor `--yes`, it refuses. Copied terminal commands also
+require fresh confirmation, including when their configuration comes from stdin.
+
+The script runs directly, without a shell or arguments, on the machine running
+Giraffe, with its folder as the working directory. It must be a regular,
+executable UTF-8 text file no larger than 64 KiB, with an executable interpreter
+line such as `#!/bin/sh`. It should exit after issuing the restart; Giraffe polls
+the service afterwards. Redirect the server's own output, for example:
+
+```sh
+#!/bin/sh
+# Stop the previous server using your deployment's normal command first.
+/path/to/your-server > /path/to/server.log 2>&1 &
+```
+
+Giraffe writes script output to `restart.log` in the run folder with mode `0600`
+and includes its last 4 KiB in the report. Scripts should not print secrets.
+Giraffe waits only for the script process to exit. A non-zero exit blocks the
+run and reports its exit code and output. The script timeout defaults to 600
+seconds and is bounded by the run's duration limit. Timeout and **Stop run**
+terminate only the script process; they never terminate its children, so a server
+it started survives. Successful exit does not terminate any process.
+
+The confirmed hash is rechecked immediately before execution. Changed files are
+refused with **The script changed. Review it again.** A local writer can still
+swap the file between that check and execution; keep scripts in a trusted,
+controlled location. The authenticated API provides
+`POST /api/targets/restart-script/preview` for the same preview; `POST /api/runs`
+requires the confirmed hash and returns `409` if it changed. Confirmation is not
+saved in exported configurations or terminal handoffs.
+
+The **Cold start** section appears in UI, text, JSON and HTML results:
+
+| Measurement | Meaning |
+| --- | --- |
+| Script time | Script start to exit. |
+| Service answered after | Script start to the first HTTP response from the models route, polled every 250 ms. |
+| First answer after | Script start to the first successful inference. |
+| Cold vs warm | First-request first-answer time and latency beside two follow-up requests with different text of the same token size. |
+| Model load | Server evidence only; never inferred from first-answer or startup timing. |
+| Model loaded before first request | Yes, No or Unknown, based on residency evidence. |
+
+With a script configured, Giraffe probes `/api/ps` and `/api/version` with a short
+timeout to detect Ollama. On detected Ollama only, the first request and two warm
+requests use streaming `/api/chat`, with equivalent messages and output cap,
+labelled **Measured through Ollama's native API**. All normal checks afterwards
+use the usual OpenAI-compatible route unchanged.
+
+A load duration is reported only when `/api/ps` showed the model absent before
+the first request and present afterwards, and the server reported the duration:
+**Model load: 4.2 s, reported by Ollama**. A non-zero duration with a resident
+model says **Model was already loaded**. Absence without a confirmed duration
+says **Model was not loaded before the first request**; uncertain first-answer
+timing says **Slow first answer; model load not confirmed**. Other servers say
+**Not reported by this server**. Some servers load weights at startup, in which
+case it's part of **Service answered after**. No per-engine startup behavior is
+assumed. These measurements do not change check verdicts and are not compared
+against baselines.
+
+Legacy `restart_command` values are dropped with a visible migration note and
+never executed. Put the command in an executable script and set `restart_script`.
+Old reports remain readable.
 
 ## Credentials
 
@@ -320,10 +404,10 @@ including bootstrap, event polling and downloads, require that cookie or an
 `X-Giraffe-Token` header. A plain report download link works after opening the
 access link. For curl, send `-H 'X-Giraffe-Token: YOUR_TOKEN'`. Static assets are
 public; opening `/` without authentication shows instructions to open the access
-link. Keep that link private. Cold-start execution and requests setting a restart
-target require `giraffe ui --allow-restart-command`. Unused restart commands may
-remain in configurations for ordinary runs, editing, preview and copied CLI
-commands. Ordinary CLI runs retain their existing explicit cold-start flow.
+link. Keep that link private. Restart scripts are allowed on loopback by default.
+A non-loopback bind requires `giraffe ui --allow-restart-script`; without it, the
+UI hides the script controls and the API refuses script preview and execution.
+Every script run also requires confirmation of its current SHA-256 hash.
 
 Cookies are scoped to the host, not the port: other local HTTP servers on the
 same host receive these cookies when you visit them. Port-specific names prevent

@@ -186,7 +186,7 @@ await vm.runInNewContext(source+`
 state.bootstrap=bootstrap;state.bootstrap.config=structuredClone(config);state.config=structuredClone(config);
 state.jsonDraft=state.jsonBase='synced';
 const renderBounds=updateBounds;
-syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=()=>{{}};
+syncTestControls=updateBounds=syncConfigView=syncPackControls=renderRequestPreview=()=>{{}};
 const savedPack=JSON.stringify(config.request_pack),savedProfile=JSON.stringify(config.prefix),savedOptions=JSON.stringify(config.test_options);
 for(const preset of ['answers','concurrent','arrival','custom']){{
   state.config=applySetupPreset(config,preset,state.bootstrap.load_test.defaults);state.jsonDraft=state.jsonBase='synced';
@@ -197,7 +197,8 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   const options=markup.slice(markup.indexOf('id="execution-settings"'),markup.indexOf('</details>',markup.indexOf('id="execution-settings"')));
   assert(options.includes('name="baseline_id"'));assert(options.includes('Compare with baseline'));
   assert(markup.indexOf('id="run-bounds"')<markup.indexOf('id="request-plan"'));
-  for(const name of ['mode','restart_target','baseline_id','name'])assert(controls.some(input=>input.name===name));
+  for(const name of ['baseline_id','name'])assert(controls.some(input=>input.name===name));
+  for(const name of ['mode','restart_target'])assert(!controls.some(input=>input.name===name));
   assert(markup.indexOf('id="setup-deployment"')<markup.indexOf('id="test-selection"'));assert(!markup.includes('name="setup_goal"'));
   for(const name of new Set(controls.map(input=>input.name))){{
     if(['check','setup_goal','setup_load','request_source'].includes(name))continue;
@@ -884,12 +885,13 @@ state.jsonDraft='{{"checks":["correctness"]}}';state.configRevision++;
 resolve({{config:{{checks:['capacity']}}}});await pending;
 assert.equal(JSON.stringify(state.config),before);
 assert.equal(state.jsonDraft,'{{"checks":["correctness"]}}');
-// Successful import makes an explicit restart intent visible.
+// Successful import clears any previous restart confirmation.
 discardConfig();let renders=0;
-renderNew=()=>{{renders++;state.jsonDraft=JSON.stringify({{...state.config,restart_target:state.formRestartTarget}});state.jsonBase=state.jsonDraft;}};
+renderNew=()=>{{renders++;state.jsonDraft=JSON.stringify({{...state.config,restart_target:null}});state.jsonBase=state.jsonDraft;}};
 api=async()=>({{config:{{targets:[{{name:'local',model:'b'}}],checks:['capacity'],restart_target:'local'}}}});
+state.restartConfirmedHash='previous-confirmation';state.restartPreview={{sha256:'previous-confirmation'}};
 await importConfig({{text:async()=>'{{"restart_target":"local"}}'}});
-assert.equal(renders,1);assert.equal(state.formMode,'cold-start');assert.equal(state.formRestartTarget,'local');
+assert.equal(renders,1);assert.equal(state.restartConfirmedHash,null);assert.equal(state.restartPreview,null);
 assert.equal(state.config.restart_target,null);
 // Export and CLI use the current form snapshot, including shared baseline/execution settings.
 current={{config:{{targets:[{{name:'local',model:'current'}}],checks:['capacity'],restart_target:null}},baseline_id:'before',mode:'cold-start',restart_target:'local'}};

@@ -276,7 +276,7 @@ def test_capacity_without_a_timing_goal_explains_the_inconclusive_verdict():
 
 @pytest.mark.parametrize("updates,known", [
     ({"checks": ["access", "recovery"]}, 14),
-    ({"checks": ["access"], "restart_target": "local"}, 1),
+    ({"checks": ["access"], "restart_target": "local"}, 3),
     ({"checks": ["access", "correctness"], "custom_fixtures": "/unread/questions.json"}, 1),
 ])
 def test_adaptive_and_unread_workloads_do_not_claim_a_full_count(updates, known):
