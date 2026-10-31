@@ -22,6 +22,7 @@ def script(tmp_path, text):
 def run_context(tmp_path, path, **options):
     target = Target(name="local", url="http://localhost:11434/v1", model="tiny", restart_script=str(path))
     config = RunConfig(targets=[target], restart_target="local", **options)
+    target = config.targets[0]
     config.restart_script_sha256 = preview_script(str(path))["sha256"]
     config._restart_log_dir = tmp_path
     events = []
@@ -51,6 +52,124 @@ def test_preview_field_errors(tmp_path, kind, match):
         path.chmod(0o600 if kind == "permission" else 0o700)
     with pytest.raises(ValueError, match=match):
         preview_script(str(path))
+
+
+FORBIDDEN_CHARACTERS = [chr(code) for code in (
+    *range(0x20), *range(0x7f, 0xa0), *range(0x200b, 0x2010),
+    *range(0x202a, 0x202f), *range(0x2066, 0x206a), 0x2060, 0xfeff)
+    if code not in (9, 10)]
+
+
+@pytest.mark.parametrize("character", FORBIDDEN_CHARACTERS)
+def test_preview_rejects_controls_bidi_and_invisible_characters(tmp_path, character):
+    path = script(tmp_path, f"# safe{character}hidden\nexit 0\n")
+    with pytest.raises(ValueError) as error:
+        preview_script(str(path))
+    assert str(error.value) == "Restart script contains control or invisible characters. Remove them to review it safely."
+
+
+def test_preview_accepts_newlines_tabs_and_visible_unicode(tmp_path):
+    path = script(tmp_path, "# café 🦒\n\ttrue\n")
+    assert preview_script(str(path))["contents"] == path.read_text()
+
+
+@pytest.mark.parametrize("contents", ["echo restart\n", "\n#!/bin/sh\ntrue\n", ""])
+def test_preview_requires_shebang_at_start(tmp_path, contents):
+    path = script(tmp_path, "")
+    path.write_text(contents)
+    with pytest.raises(ValueError) as error:
+        preview_script(str(path))
+    assert str(error.value) == "Restart script must start with a #! line."
+
+
+async def test_script_environment_removes_credentials_for_every_target_only(tmp_path, monkeypatch):
+    names = ["COLD_API_ONE", "COLD_HEADER_ONE", "COLD_API_TWO", "COLD_HEADER_TWO"]
+    for name in names:
+        monkeypatch.setenv(name, "test-secret")
+    monkeypatch.setenv("COLD_INHERITED", "kept")
+    path = script(tmp_path, "\n".join(f'printf "%s\\n" "${{{name}-removed}}"' for name in names)
+                  + '\nprintf "%s\\n" "$COLD_INHERITED"\n')
+    run, target, _ = run_context(tmp_path, path)
+    target.api_key_env, target.headers_env = names[0], {"X-Test": names[1]}
+    run.config.targets.append(Target(name="other", url="http://localhost", model="tiny",
+        api_key_env=names[2], headers_env={"X-Other": names[3]}))
+    assert await runner._restart(run, target)
+    assert (tmp_path / "restart.log").read_text().splitlines() == ["removed"] * 4 + ["kept"]
+    assert all(os.environ[name] == "test-secret" for name in names)
+
+
+async def test_log_tail_redacts_all_configured_keys_and_headers_but_preserves_private_raw_log(tmp_path, monkeypatch, capsys):
+    from pydantic import SecretStr
+    from giraffe.cli import _print_result
+    from giraffe.models import RunReport
+    from giraffe.reporting import _cold_start_html, write_report
+
+    secrets = ["pasted-session-key", "configured-env-key", "header-value", "other-target-key", "other-header"]
+    for name, value in zip(["COLD_API", "COLD_HEADER", "COLD_OTHER_API", "COLD_OTHER_HEADER"], secrets[1:]):
+        monkeypatch.setenv(name, value)
+    path = script(tmp_path, "printf '%s\\n' '" + " ".join(secrets) + "'\n")
+    run, target, _ = run_context(tmp_path, path)
+    target._api_key = SecretStr(secrets[0])
+    target.api_key_env, target.headers_env = "COLD_API", {"X-Test": "COLD_HEADER"}
+    run.config.targets.append(Target(name="other", url="http://localhost", model="tiny",
+        api_key_env="COLD_OTHER_API", headers_env={"X-Other": "COLD_OTHER_HEADER"}))
+    assert await runner._restart(run, target)
+    raw = (tmp_path / "restart.log").read_text()
+    assert all(secret in raw for secret in secrets)
+    assert stat.S_IMODE((tmp_path / "restart.log").stat().st_mode) == 0o600
+    tail = run.observations["local"]["restart"]["output_tail"]
+    assert tail.count("[redacted]") == len(secrets)
+    report = RunReport(run_id="cold", started_at="now", finished_at="now", overall="pass",
+        manifest={}, observations={"targets": run.observations})
+    write_report(report, tmp_path)
+    _print_result(report, tmp_path / "report.json", None, tmp_path, {})
+    for rendered in (report.model_dump_json(), _cold_start_html(report),
+                     (tmp_path / "report.json").read_text(), capsys.readouterr().out):
+        assert all(secret not in rendered for secret in secrets)
+        assert "[redacted]" in rendered
+
+
+async def test_redaction_covers_secret_crossing_raw_tail_cutoff(tmp_path, monkeypatch):
+    secret = "boundary-credential-1234567890"
+    monkeypatch.setenv("COLD_BOUNDARY", secret)
+    path = script(tmp_path, f"printf '%s' '{secret}'\nprintf '%04080d' 0\n")
+    run, target, _ = run_context(tmp_path, path)
+    target.api_key_env = "COLD_BOUNDARY"
+    assert await runner._restart(run, target)
+    tail = run.observations["local"]["restart"]["output_tail"]
+    assert secret[-16:] not in tail
+    assert tail.startswith("[redacted]")
+
+
+@pytest.mark.parametrize("secret", [b"boundary-credential", b"very-long-key-" * 1000])
+def test_redaction_bounds_large_logs_and_secrets_before_truncation(tmp_path, secret):
+    from giraffe.restart_script import read_output_tail
+
+    path = tmp_path / "restart.log"
+    path.write_bytes(b"prefix" * 10000 + secret + b"a" * 4080)
+    result = read_output_tail(path, {secret})
+    assert result == "[redacted]" + "a" * 4080
+    assert len(result.encode()) <= 4096
+
+
+@pytest.mark.parametrize("padding", [0, 4080])
+def test_redaction_merges_overlapping_credential_values(tmp_path, padding):
+    from giraffe.restart_script import read_output_tail
+
+    path = tmp_path / "restart.log"
+    path.write_bytes(b"prefixABCdef" + b"." * padding)
+    assert read_output_tail(path, {b"prefixABC", b"ABCdef"}) == "[redacted]" + "." * padding
+
+
+@pytest.mark.parametrize("contents,message", [
+    ("#!/bin/sh\n# hidden\u202espoof\n", "Restart script contains control or invisible characters. Remove them to review it safely."),
+    ("echo not-a-script\n", "Restart script must start with a #! line.")])
+async def test_execution_revalidates_unsafe_contents_before_launch(tmp_path, contents, message):
+    path = script(tmp_path, "true\n")
+    run, target, _ = run_context(tmp_path, path)
+    path.write_text(contents)
+    assert not await runner._restart(run, target)
+    assert run.observations["local"]["restart"]["reason"] == message
 
 
 async def test_no_confirmation_or_changed_hash_never_executes(tmp_path):

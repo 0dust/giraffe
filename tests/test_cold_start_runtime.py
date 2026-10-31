@@ -47,7 +47,8 @@ def observation(report):
 
 def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_000,
                 first_delay=0, models_status=200, reasoning_only=False,
-                cold_failure=None, warm_failure=False, native_failure=None, native_failure_on=1):
+                cold_failure=None, warm_failure=False, native_failure=None, native_failure_on=1,
+                interruption=None, native_wait=None):
     calls = []
     native_count = 0
     measurement_count = 0
@@ -61,6 +62,18 @@ def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_00
         measured = payload and ": Reply with " in payload.get("messages", [{}])[-1].get("content", "")
         if measured:
             measurement_count += 1
+            if measurement_count == 1 and interruption:
+                class InterruptedStream(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        if path == "/api/chat":
+                            yield b'{"message":{"content":"1"},"done":false}\n'
+                        else:
+                            yield b'data: {"choices":[{"delta":{"content":"1"}}]}\n\n'
+                        raise {"reset": httpx.ReadError, "timeout": httpx.ReadTimeout,
+                               "cancel": asyncio.CancelledError}[interruption]("interrupted")
+
+                return httpx.Response(200, stream=InterruptedStream(),
+                    headers={"content-type": "application/x-ndjson" if path == "/api/chat" else "text/event-stream"})
             if measurement_count == 1 and cold_failure is not None:
                 if cold_failure == "connect":
                     raise httpx.ConnectError("not up yet")
@@ -86,6 +99,11 @@ def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_00
         if path == "/api/chat":
             native_count += 1
             if native_failure is not None and native_count == native_failure_on:
+                if native_failure == "cancel":
+                    raise asyncio.CancelledError()
+                if native_failure == "wait":
+                    native_wait.set()
+                    await asyncio.sleep(30)
                 if isinstance(native_failure, int):
                     return httpx.Response(native_failure, json={"error": "native unavailable"})
                 return httpx.Response(200, content=native_failure)
@@ -106,11 +124,16 @@ def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_00
             prompt = "\n".join(m.get("content") or "" for m in payload["messages"])
             answer = (prompt.split(":", 1)[0] if ": Reply with " in prompt
                       else FakeEndpoint._answer(prompt))
-            return httpx.Response(200, json={"choices": [{"message": {
+            result = {"choices": [{"message": {
                 "content": "" if reasoning_only else answer,
                 **({"reasoning_content": "Let me think through the requested number."} if reasoning_only else {})},
                 "finish_reason": "length" if reasoning_only else "stop"}],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 128 if reasoning_only else 2}})
+                "usage": {"prompt_tokens": 8, "completion_tokens": 128 if reasoning_only else 2}}
+            if payload.get("stream"):
+                result["choices"][0]["delta"] = result["choices"][0].pop("message")
+                return httpx.Response(200, content="data: " + json.dumps(result) + "\n\ndata: [DONE]\n\n",
+                    headers={"content-type": "text/event-stream"})
+            return httpx.Response(200, json=result)
         return httpx.Response(404)
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: actual_client(
@@ -175,16 +198,65 @@ async def test_unusable_native_cold_request_falls_back_for_cold_and_warm(monkeyp
     assert "Measured through" not in _cold_start_html(report)
 
 
-async def test_unusable_native_warm_request_falls_back_and_removes_native_label(monkeypatch, tmp_path):
-    calls = mocked_http(monkeypatch, native_failure=404, native_failure_on=2)
+@pytest.mark.parametrize("failure,reason", [(404, "HTTP 404"), ("cancel", "run cancelled"),
+    ('{"done":true,"message":{"content":"2"},"done_reason":"error"}\n',
+     "endpoint did not finish a usable answer")])
+async def test_failed_native_warm_request_is_unmeasured_and_preserves_cold_evidence(monkeypatch, tmp_path, failure, reason):
+    calls = mocked_http(monkeypatch, native_failure=failure, native_failure_on=2)
     report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass")))
     restart = observation(report)
     assert restart["status"] == "ready"
-    assert restart["model_load"] == "Not reported by this server"
-    assert "measurement_api" not in restart and "model_load_ms" not in restart
-    assert all(item["first_output_ms"] is not None for item in restart["warm_requests"])
+    assert restart["model_load"] == "Model load: 0.903 s, reported by Ollama"
+    assert restart["measurement_api"] == cold_start.NATIVE_API_LABEL
+    assert restart["model_load_ms"] == 903
+    assert restart["model_loaded_before_first_request"] == "No"
+    assert restart["warm_requests"][0]["first_output_ms"] is None
+    assert restart["warm_requests"][0]["reason"] == reason
+    assert restart["warm_requests"][1]["first_output_ms"] is not None
     paths = [path for method, path, _ in calls if method == "POST"]
-    assert paths == ["/api/chat"] * 2 + ["/v1/chat/completions"] * 5
+    assert paths == ["/api/chat"] * 3 + ["/v1/chat/completions"] * 3
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("interruption", ["reset", "timeout", "cancel"])
+async def test_interrupted_cold_output_retries_instead_of_counting_ready(monkeypatch, tmp_path, native, interruption):
+    mocked_http(monkeypatch, native=native, interruption=interruption)
+    original = cold_start.cold_spec
+    monkeypatch.setattr(cold_start, "cold_spec", lambda base: original(base).model_copy(update={"stream": True}))
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=2, stream=True))
+    restart = observation(report)
+    assert restart["status"] == "ready"
+    attempts = [record for record in report.requests if record.scenario == "readiness"]
+    assert len(attempts) == 2
+    assert attempts[0].http_status == 200 and attempts[0].output == "1"
+    assert attempts[0].finish_reason is None
+    assert attempts[1].finish_reason == "stop"
+    assert restart["first_request"]["elapsed_ms"] == attempts[1].elapsed_ms
+    if native:
+        assert restart["measurement_api"] == cold_start.NATIVE_API_LABEL
+
+
+async def test_stop_during_native_warm_request_retains_cold_evidence_and_reports_not_measured(monkeypatch, tmp_path):
+    warming, stop = asyncio.Event(), asyncio.Event()
+    mocked_http(monkeypatch, native_failure="wait", native_failure_on=2, native_wait=warming)
+    task = asyncio.create_task(runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass")), stop_event=stop))
+    try:
+        await asyncio.wait_for(warming.wait(), 2)
+        stop.set()
+        report = await asyncio.wait_for(task, 2)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    restart = observation(report)
+    assert restart["status"] == "ready"
+    assert restart["model_load_ms"] == 903
+    assert restart["model_load"] == "Model load: 0.903 s, reported by Ollama"
+    assert restart["measurement_api"] == cold_start.NATIVE_API_LABEL
+    assert restart["model_loaded_before_first_request"] == "No"
+    assert restart["warm_requests"] == [{"first_output_ms": None, "elapsed_ms": None,
+                                          "reason": "cancelled by user"}]
 
 
 async def test_native_detection_without_native_numbers_never_claims_native_measurement(monkeypatch, tmp_path):

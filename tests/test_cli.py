@@ -67,10 +67,10 @@ def test_config_cannot_restart_without_explicit_command(tmp_path, capsys):
                                              "model": "tiny"}], "restart_target": "test"}))
     assert main(["run", "--config", str(config)]) == 4
     assert "cold-start --restart" in capsys.readouterr().err
-    parsed = configuration(parser().parse_args([
-        "cold-start", "--config", str(config), "--restart", "test",
-    ]))
-    assert parsed.restart_target is None
+    with pytest.raises(ValueError, match="cold-start needs a restart script"):
+        configuration(parser().parse_args([
+            "cold-start", "--config", str(config), "--restart", "test",
+        ]))
 
 
 def test_baseline_save_never_replaces_implicitly(tmp_path):
@@ -245,9 +245,13 @@ def test_argument_errors_use_json_when_requested(capsys):
 def test_run_json_outcome_has_saved_report_paths_and_preserves_exit_code(
     outcome, exit_code, command, monkeypatch, capsys, tmp_path,
 ):
+    script = tmp_path / "restart.sh"
+    script.write_text("#!/bin/sh\ntrue\n")
+    script.chmod(0o700)
     configuration = {
         "targets": [{"name": "local", "url": "http://localhost", "model": "tiny",
-                     "restart_command": ["unused-command"]}],
+                     **({"restart_script": str(script)} if command == "cold-start"
+                        else {"restart_command": ["unused-command"]})}],
         "checks": ["correctness"],
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(configuration)))
@@ -259,9 +263,9 @@ def test_run_json_outcome_has_saved_report_paths_and_preserves_exit_code(
                          manifest={"config": config.model_dump(mode="json")})
 
     monkeypatch.setattr("giraffe.cli._run", run)
-    arguments = [command, "--config", "-", "--output", str(tmp_path), "--output-format", "json", "--skip-preflight"]
+    arguments = [command, "--config", "-", "--output", str(tmp_path / "output"), "--output-format", "json", "--skip-preflight"]
     if command == "cold-start":
-        arguments += ["--restart", "local"]
+        arguments += ["--restart", "local", "--yes"]
     assert main(arguments) == exit_code
     captured = capsys.readouterr()
     result = json.loads(captured.out)
@@ -271,9 +275,9 @@ def test_run_json_outcome_has_saved_report_paths_and_preserves_exit_code(
     assert "cold_start" not in result
     assert json.loads(Path(result["report_paths"]["json"]).read_text())["run_id"] == "machine-run"
     assert result["report_paths"]["html"] is None
-    assert not (tmp_path / "report.html").exists()
+    assert not (tmp_path / "output" / "report.html").exists()
     assert "Giraffe:" in captured.err
-    assert captured_config[0].restart_target is None
+    assert captured_config[0].restart_target == ("local" if command == "cold-start" else None)
 
 
 def test_baseline_save_json_preserves_explicit_replace_boundary(tmp_path, capsys):
@@ -318,7 +322,10 @@ def test_request_pack_file_embeds_portable_configuration(tmp_path, command):
     path.write_text(json.dumps(operator_pack()))
     args = [command, "--url", "http://localhost", "--model", "tiny", "--request-pack", str(path)]
     if command == "cold-start":
-        args += ["--restart", "local"]
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\ntrue\n")
+        script.chmod(0o700)
+        args += ["--restart", "local", "--restart-script", str(script)]
     result = configuration(parser().parse_args(args))
     path.unlink()
     exported = tmp_path / "exported.json"

@@ -34,7 +34,8 @@ def test_restart_measurement_uses_first_generated_output_without_reclassifying_r
     record = RequestRecord(id="first", target="local", fixture_id="cold", scenario="readiness",
         check_ids=[], started_at="now", status="completed", http_status=200, valid=False,
         first_output_ms=answer_time, first_reasoning_ms=reasoning_time,
-        elapsed_ms=40, error="reasoning exhausted the output budget before an answer")
+        elapsed_ms=40, stream_terminated=True, finish_reason="length",
+        error="reasoning exhausted the output budget before an answer")
     original = record.model_dump()
     measurement = output_measurement(record)
     assert measurement == {"first_output_ms": first, "first_output_kind": kind, "elapsed_ms": 40}
@@ -46,11 +47,23 @@ def test_generated_text_without_timing_still_establishes_restart_readiness():
 
     record = RequestRecord(id="first", target="local", fixture_id="cold", scenario="readiness",
         check_ids=[], started_at="now", status="completed", http_status=200, valid=False,
-        reasoning="Thinking", elapsed_ms=40)
+        reasoning="Thinking", elapsed_ms=40, stream_terminated=True, finish_reason="length")
     assert output_measurement(record) == {
         "first_output_ms": None, "first_output_kind": "reasoning", "elapsed_ms": 40}
     record.http_status = 201
     assert "first_output_kind" not in output_measurement(record)
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "timeout"])
+def test_failed_or_interrupted_output_is_not_a_completed_measurement(status):
+    from giraffe.cold_start import output_measurement
+
+    record = RequestRecord(id="first", target="local", fixture_id="cold", scenario="readiness",
+        check_ids=[], started_at="now", status=status, http_status=200, valid=False,
+        output="1", first_output_ms=2, elapsed_ms=3, finish_reason="error", stream_terminated=True,
+        error="endpoint did not finish a usable answer")
+    assert output_measurement(record) == {"first_output_ms": None, "elapsed_ms": None,
+                                          "reason": record.error}
 
 
 def install_transport(monkeypatch, handler):

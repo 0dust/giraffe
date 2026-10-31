@@ -40,6 +40,24 @@ async def test_preview_requires_auth_and_executable_file_and_uses_existing_csp(t
         assert invalid.status_code == 422 and "executable" in invalid.json()["detail"][0]["msg"]
 
 
+@pytest.mark.parametrize("contents,message", [
+    ("#!/bin/sh\n# hidden\u200btext\n", "Restart script contains control or invisible characters. Remove them to review it safely."),
+    ("echo not-a-script\n", "Restart script must start with a #! line.")])
+async def test_preview_and_run_reject_unsafe_script_even_with_matching_hash(tmp_path, contents, message):
+    import hashlib
+
+    path = script(tmp_path, "")
+    path.write_bytes(contents.encode())
+    async with client(create_app(tmp_path / "runs", token="test")) as http:
+        preview = await http.post("/api/targets/restart-script/preview", json={"path": str(path)})
+        assert preview.status_code == 422
+        assert preview.json()["detail"][0]["msg"] == message
+        response = await http.post("/api/runs", json={"config": values(path), "mode": "cold-start",
+            "restart_target": "local", "restart_script_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        assert response.status_code == 422
+        assert message in str(response.json())
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.2.3.4"])
 async def test_loopback_allows_scripts_by_default(tmp_path, host):
     async with client(create_app(tmp_path, token="test", host=host)) as http:

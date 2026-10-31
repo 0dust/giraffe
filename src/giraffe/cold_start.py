@@ -23,7 +23,9 @@ def output_measurement(record):
     candidates = [(value, kind) for value, kind in (
         (record.first_output_ms, "answer"), (record.first_reasoning_ms, "reasoning"))
         if value is not None]
-    if record.http_status == 200 and (candidates or record.output.strip() or record.reasoning.strip()):
+    if (record.http_status == 200 and record.finish_reason is not None and record.stream_terminated
+            and record.status == "completed"
+            and (candidates or record.output.strip() or record.reasoning.strip())):
         first, kind = min(candidates) if candidates else (
             None, "reasoning" if record.reasoning.strip() or record.reasoning_stripped else "answer")
         return {"first_output_ms": first, "first_output_kind": kind,
@@ -34,13 +36,13 @@ def output_measurement(record):
 
 def retry_readiness(record):
     """Only startup/transport failures warrant another cold request."""
-    if record.status == "timeout" or record.http_status == 429:
+    if record.status in {"timeout", "cancelled"} or record.http_status == 429:
         return True
     if record.http_status is not None and 500 <= record.http_status <= 599:
         return True
     if record.http_status == 404:
         return bool(record.workload.get("model_not_served"))
-    return record.http_status is None and record.error in {
+    return record.error in {
         f"{prefix} ({kind})"
         for prefix in ("request failed", "client failure")
         for kind in ("ConnectError", "ConnectTimeout", "ReadError", "WriteError", "CloseError",

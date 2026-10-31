@@ -908,7 +908,7 @@ class _Run:
 async def _restart(run: _Run, target: Target) -> bool:
     if run.config.restart_target != target.name:
         return True
-    from .restart_script import CHANGED_SCRIPT, preview_script
+    from .restart_script import CHANGED_SCRIPT, preview_script, read_output_tail, script_environment
     import os
 
     observation = {"requested": True, "status": "blocked", "readiness_ms": None,
@@ -929,6 +929,7 @@ async def _restart(run: _Run, target: Target) -> bool:
     waiter = stopper = None
     started = None
     log_path = None
+    environment, script_secrets = script_environment(run.config.targets)
     run.preparation(target.name, "restart_script", "Running restart script", "running")
     try:
         # File output matters: a background server can inherit these descriptors.
@@ -950,7 +951,7 @@ async def _restart(run: _Run, target: Target) -> bool:
             process = await asyncio.create_subprocess_exec(
                 preview["path"], cwd=str(Path(preview["path"]).parent),
                 stdin=asyncio.subprocess.DEVNULL, stdout=output, stderr=output,
-                start_new_session=True,
+                start_new_session=True, env=environment,
             )
             waiter = asyncio.create_task(process.wait())
             stopper = asyncio.create_task(run.stop.wait())
@@ -1003,9 +1004,7 @@ async def _restart(run: _Run, target: Target) -> bool:
         if process is not None:
             observation["exit_code"] = process.returncode
         if log_path is not None and log_path.exists():
-            with log_path.open("rb") as source:
-                source.seek(max(0, log_path.stat().st_size - 4096))
-                observation["output_tail"] = source.read(4096).decode("utf-8", errors="replace")
+            observation["output_tail"] = read_output_tail(log_path, script_secrets)
         run.preparation(target.name, "restart_script", "Running restart script",
                         "completed" if observation["status"] == "hook_completed" else "blocked",
                         observation.get("reason"))
@@ -1189,7 +1188,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         nonlocal measured_client, native
                         record = await run.request(target, measured_client, probe,
                                                    deadline_override=deadline_override, budget_exempt=True)
-                        if native and record is not None and native_fallback(record):
+                        if native and not initial and record is not None and native_fallback(record):
                             native = False
                             measured_client = client
                             restart.pop("measurement_api", None)
@@ -1252,7 +1251,14 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     # cache reuse in the two cold-start follow-up measurements.
                     from .cold_start import warm_specs
                     for probe in warm_specs(initial_specs[0]):
-                        record = await measure_restart(probe)
+                        try:
+                            record = await measure_restart(probe)
+                        except asyncio.CancelledError as exc:
+                            record = getattr(exc, "giraffe_record", None)
+                            restart["warm_requests"].append(output_measurement(record) if record is not None else {
+                                "first_output_ms": None, "elapsed_ms": None,
+                                "reason": run.stop_reason(target.name) or "run cancelled"})
+                            raise
                         restart["warm_requests"].append(output_measurement(record) if record is not None else {
                             "first_output_ms": None, "elapsed_ms": None,
                             "reason": run.stop_reason(target.name) or "No request completed"})

@@ -117,6 +117,7 @@ giraffe cold-start --url http://127.0.0.1:11434/v1 --model qwen3:0.6b \
 Or configure `targets[].restart_script` and top-level
 `restart_script_timeout_seconds`, then run `giraffe cold-start --config giraffe.yaml`.
 `--restart NAME` is optional with one server and required with multiple servers.
+`giraffe cold-start` requires a restart script; without one it exits with code 2.
 Normal `giraffe run` never executes a configured script. The CLI prints the same
 script details and asks for confirmation; CI must supply `--yes`. With neither
 an interactive terminal nor `--yes`, it refuses. Copied terminal commands also
@@ -124,8 +125,13 @@ require fresh confirmation, including when their configuration comes from stdin.
 
 The script runs directly, without a shell or arguments, on the machine running
 Giraffe, with its folder as the working directory. It must be a regular,
-executable UTF-8 text file no larger than 64 KiB, with an executable interpreter
-line such as `#!/bin/sh`. It should exit after issuing the restart; Giraffe polls
+executable UTF-8 text file no larger than 64 KiB, starting with `#!`, such as
+`#!/bin/sh`. C0 controls except newline and tab, C1 controls, DEL, bidi controls
+(U+200E, U+200F, U+202A–U+202E, U+2066–U+2069), and zero-width characters
+(U+200B–U+200D, U+2060, U+FEFF) are rejected, including CRLF line endings.
+Only this file is reviewed; anything it calls is not. Don't print secrets: output is saved in the report.
+The script inherits the environment except the variables named by `api_key_env`
+and `headers_env` on every target. It should exit after issuing the restart; Giraffe polls
 the service afterwards. Redirect the server's own output, for example:
 
 ```sh
@@ -134,8 +140,12 @@ the service afterwards. Redirect the server's own output, for example:
 /path/to/your-server > /path/to/server.log 2>&1 &
 ```
 
-Giraffe writes script output to `restart.log` in the run folder with mode `0600`
-and includes its last 4 KiB in the report. Scripts should not print secrets.
+Giraffe writes script output to `restart.log` in the run folder with mode `0600`.
+The file on disk stays as written, without redaction. Configured API key values
+(pasted session keys and environment values) and header values are replaced with
+`[redacted]` before the output tail reaches reports, HTML, UI or CLI. The report
+includes up to the last 4 KiB of redacted output. A server started by the script
+keeps its output handles, so redirect its output to avoid `restart.log` growing.
 Giraffe waits only for the script process to exit. A non-zero exit blocks the
 run and reports its exit code and output. The script timeout defaults to 600
 seconds and is bounded by the run's duration limit. Timeout and **Stop run**

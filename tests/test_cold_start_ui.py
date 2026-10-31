@@ -51,6 +51,23 @@ def test_connection_rows_share_wider_desktop_label_column_and_original_phone_rul
     assert "@media (max-width: 599px) {\n  .connection-auth > .api-key-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; }" in css
 
 
+def test_restart_help_and_docs_explain_review_output_and_inherited_server_handles():
+    run_browser_logic(r'''
+state.bootstrap.restart_allowed=true;
+const html=renderRestartScriptRow({restart_script:'/tmp/restart.sh'},{restart_script_timeout_seconds:600});
+assert.match(html,/Only this file is reviewed; anything it calls is not\./);
+assert.match(html,/Don&#39;t print secrets: output is saved in the report\./);
+assert.match(html,/class="field-info"/);
+const result=renderColdStart({observations:{targets:{local:{restart:{output_tail:'[redacted]'}}}}});
+assert.match(result,/\[redacted\]/);
+''')
+    root = APP.parents[3]
+    for name in ("README.md", "docs/running.md"):
+        docs = (root / name).read_text()
+        assert "Only this file is reviewed; anything it calls is not. Don't print secrets: output is saved in the report." in docs
+        assert "output handles" in docs and "restart.log" in docs and "0600" in docs
+
+
 def test_confirmation_is_explicit_ephemeral_and_invalidated_by_config_or_path_changes():
     run_browser_logic(r"""
 state.bootstrap.restart_allowed=true;

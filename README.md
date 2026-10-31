@@ -104,6 +104,11 @@ for each run. The **Cold start** results separate script time, service response,
 first answer and two warm requests. Model load is reported only with server
 load-duration and before/after residency evidence; timing alone never proves it.
 Scripts run on Giraffe's machine and should redirect their server's output.
+Only this file is reviewed; anything it calls is not. Don't print secrets: output is saved in the report.
+Configured API key and header environment variables are removed from the script's
+environment. Known credential values are redacted from reported output; the raw
+`restart.log` on disk stays as written with mode `0600`. A server started by the
+script keeps its output handles, so redirect its output to avoid `restart.log` growing.
 Stop and timeout terminate only the script; a server it starts survives.
 See [cold-start setup and measurements](docs/running.md#cold-start) for script
 rules, confirmation, output handling and `restart_command` migration.

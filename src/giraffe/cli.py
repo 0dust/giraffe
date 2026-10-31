@@ -62,6 +62,10 @@ class ModelSelectionError(ValueError):
     """A URL-only run needs an explicit model choice before it can start."""
 
 
+class MissingRestartScriptError(ValueError):
+    """An explicit cold-start command requires a script before any work starts."""
+
+
 class LegacyNonstream(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         namespace.stream = False
@@ -409,13 +413,13 @@ def configuration(args: argparse.Namespace) -> RunConfig:
             raise ValueError("Use targets in the config, or --url/--model; do not combine them")
         if not args.url:
             raise ValueError("Provide --url with --model, or use --config")
-        model = args.model or _discover_model(args, values)
+        model = args.model or (None if args.command == "cold-start" else _discover_model(args, values))
         values["targets"] = [{"name": "local", "url": args.url, "model": model,
                               "api_key_env": args.api_key_env}]
     if "targets" not in values:
         raise ValueError("Provide --url, or --config with at least one target")
     for target in values["targets"] if isinstance(values["targets"], list) else []:
-        if isinstance(target, dict) and not target.get("model"):
+        if isinstance(target, dict) and not target.get("model") and args.command != "cold-start":
             target["model"] = _discover_model(args, values, target)
     for name in RunConfig.model_fields:
         value = getattr(args, name, None)
@@ -471,7 +475,14 @@ def configuration(args: argparse.Namespace) -> RunConfig:
             raise ValueError("--restart must name one configured target")
         if args.restart_script is not None:
             target["restart_script"] = args.restart_script
-        values["restart_target"] = restart if target.get("restart_script") else None
+        if not target.get("restart_script"):
+            for note in notes:
+                print(f"Migration: {note}", file=sys.stderr)
+            raise MissingRestartScriptError("cold-start needs a restart script. Use --restart-script or set restart_script in the config.")
+        values["restart_target"] = restart
+        for target in targets:
+            if not target.get("model"):
+                target["model"] = _discover_model(args, values, target)
     if getattr(args, "deployment_file", None):
         from giraffe.deployment import load_metadata
         values["targets"][0].setdefault("deployment", {}).update(load_metadata(args.deployment_file))
@@ -653,11 +664,11 @@ def _main(argv: list[str] | None = None) -> int:
         print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
                          allow_nan=False))
 
-    def failure(errors: list[dict]) -> int:
+    def failure(errors: list[dict], exit_code: int = 4) -> int:
         errors = [{**error, "message": error["message"].removeprefix("Value error, ").removeprefix("Assertion failed, ")}
                   for error in errors]
         if json_output:
-            emit("error", 4, errors=errors)
+            emit("error", exit_code, errors=errors)
         else:
             for error in errors:
                 location = ".".join(map(str, error["loc"]))
@@ -666,7 +677,7 @@ def _main(argv: list[str] | None = None) -> int:
                 ):
                     location = ""
                 print(f"giraffe: {location + ': ' if location else ''}{error['message']}", file=sys.stderr)
-        return 4
+        return exit_code
 
     try:
         args = parser().parse_args(arguments)
@@ -1148,6 +1159,8 @@ def _main(argv: list[str] | None = None) -> int:
         else:
             _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False))
         return exit_code
+    except MissingRestartScriptError as error:
+        return failure([{"loc": [], "message": str(error), "type": type(error).__name__}], exit_code=2)
     except ModelSelectionError as error:
         print(f"giraffe: {error}", file=sys.stderr)
         if json_output:
@@ -1254,7 +1267,8 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                     print(f"    {REASONING_OUTPUT_NOTE}")
                 if request.get("reason"):
                     print(f"    {request['reason']}")
-            print(f"  {restart.get('model_load', 'Not reported by this server')}")
+            model_load = restart.get("model_load", "Not reported by this server")
+            print(f"  {'Model load: ' if model_load == 'Not reported by this server' else ''}{model_load}")
             print(f"  Model loaded before first request: {restart.get('model_loaded_before_first_request', 'Unknown')}")
             if restart.get("measurement_api"):
                 print(f"  {restart['measurement_api']}")

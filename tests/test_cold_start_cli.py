@@ -155,14 +155,49 @@ def test_no_script_confirmation_preserves_normal_run(monkeypatch, capsys):
     assert capsys.readouterr() == ("", "")
 
 
-def test_legacy_restart_command_drops_with_visible_note_and_never_restarts(tmp_path, capsys):
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("has_model", [False, True])
+def test_cold_start_without_script_exits_two_before_running(tmp_path, monkeypatch, capsys, legacy, output_format, has_model):
     path = tmp_path / "old.json"
     path.write_text(json.dumps({"config_version": 2, "targets": [{"name": "local",
-        "url": "http://localhost", "model": "tiny", "restart_command": ["false"]}]}))
-    config = configuration(parser().parse_args(["cold-start", "--config", str(path)]))
-    assert config.restart_target is None
-    assert config.targets[0].restart_script is None
-    assert "restart_command" in capsys.readouterr().err
+        "url": "http://localhost", **({"model": "tiny"} if has_model else {}),
+        **({"restart_command": ["false"]} if legacy else {})}]}))
+    monkeypatch.setattr("giraffe.cli._run", lambda *args, **kwargs: pytest.fail("plain run started"))
+    monkeypatch.setattr("giraffe.cli._discover_model", lambda *args, **kwargs: pytest.fail("model discovery started"))
+    assert main(["cold-start", "--config", str(path), "--output-format", output_format,
+                 "--output", str(tmp_path / "run")]) == 2
+    captured = capsys.readouterr()
+    message = "cold-start needs a restart script. Use --restart-script or set restart_script in the config."
+    assert message in captured.out + captured.err
+    if output_format == "json":
+        assert json.loads(captured.out)["exit_code"] == 2
+    if legacy:
+        assert "restart_command" in captured.err
+
+
+def test_url_only_cold_start_without_script_refuses_before_model_discovery(monkeypatch, capsys):
+    monkeypatch.setattr("giraffe.cli._discover_model", lambda *args, **kwargs: pytest.fail("model discovery started"))
+    assert main(["cold-start", "--url", "http://localhost"]) == 2
+    assert "cold-start needs a restart script. Use --restart-script or set restart_script in the config." in capsys.readouterr().err
+
+
+def test_text_missing_model_load_evidence_has_a_label(tmp_path, capsys):
+    report = RunReport(run_id="cold", started_at="now", finished_at="now", overall="pass",
+        manifest={}, observations={"targets": {"local": {"restart": {
+            "model_load": "Not reported by this server"}}}})
+    _print_result(report, tmp_path / "report.json", None, tmp_path, {})
+    assert "Model load: Not reported by this server" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("contents,message", [
+    ("#!/bin/sh\r\ntrue\r\n", "Restart script contains control or invisible characters. Remove them to review it safely."),
+    ("echo not-a-script\n", "Restart script must start with a #! line.")])
+def test_yes_does_not_bypass_script_validation(script, contents, message, monkeypatch, capsys):
+    script.write_bytes(contents.encode())
+    monkeypatch.setattr("giraffe.cli._run", lambda *args, **kwargs: pytest.fail("unsafe script ran"))
+    assert main(arguments(script, "--yes")) == 4
+    assert message in capsys.readouterr().err
 
 
 def test_ui_flag_renamed():
