@@ -33,8 +33,8 @@ assert.deepEqual(tabs.map(tab=>tab.textContent),['Results','Performance']);
 assert.equal($('#tab-results').getAttribute('aria-selected'),'true');
 assert.equal($('#report-performance').hidden,true);assert.equal($('#report-results').hidden,false);
 assert.equal($$('.finding-check').length,2);assert.equal($('[data-finding="local:skipped"]'),null);
-assert.match($('.checks-not-selected').textContent,/Not selected: Endpoint access, Response validity/);
-assert(!$('.checks-not-selected').open);assert.doesNotMatch($('.checks-not-selected').textContent,/Skipped|Answer correctness/);assert.match($('.check-count').textContent,/2 checks/);
+assert.match($('.checks-not-selected').textContent,/Not selected: skipped check/);
+assert(!$('.checks-not-selected').open);assert.match($('.check-count').textContent,/2 checks/);
 chooseReportTab('performance');
 assert.equal($('#report-performance').getAttribute('aria-labelledby'),'tab-performance');
 assert.equal($('#report-results').getAttribute('aria-labelledby'),'tab-results');
@@ -48,7 +48,7 @@ assert.match($('#performance-window').textContent,/Full request window · 0–10
 assert.match($('#performance-window').textContent,/Stage C4 · 2–6 s · 3 requests/);
 assert.equal($('#performance-target').querySelectorAll('option').length,2);
 assert.equal($('#report-sections').hidden,false);assert.equal($('#report-sections').querySelectorAll('a').length,9);
-assert.match($('#report-performance').textContent,/View results/);
+assert.match($('#report-performance').textContent,/View test results/);
 chooseReportTab('results');assert.equal($('#report-sections').hidden,true);
 assert.equal($('#report-performance').hidden,true);assert.equal($('#report-results').hidden,false);
 """, dom=True)
@@ -127,7 +127,7 @@ assert.equal(page.run('reportView.tab'),'results');assert(page.paths.includes('/
 """)
 
 
-def test_results_put_single_check_findings_before_open_conditions_and_collapsed_diagnostics():
+def test_results_put_single_check_findings_before_collapsed_conditions_and_diagnostics():
     run_render_checks(r"""
 const record={id:'request-1',target:'local',scenario:'initial',status:'completed',valid:true,score:true};
 detail(report([check('correctness','fail',{summary:'A required answer was wrong',evidence_ids:['request-1']})],{
@@ -140,8 +140,8 @@ assert(positions.every(value=>value>=0),html);assert.deepEqual([...positions].so
 assert.equal(panel.querySelector('.check-verdict-summary'),null,'finished checks are listed only once');
 assert.equal(panel.querySelectorAll('.finding-check').length,1);
 assert.match(panel.querySelector('.finding-check').textContent,/A required answer was wrong/);
-const conditions=panel.querySelector('details.condition-reference');assert(conditions);assert(conditions.open);
-assert(conditions.querySelector('.condition-strip'));
+const conditions=panel.querySelector('details.condition-reference');assert(conditions);assert(!conditions.open);
+assert(conditions.querySelector('.tests-section'));
 const diagnostics=panel.querySelector('details.run-diagnostics');assert(diagnostics);assert(!diagnostics.open);
 assert(diagnostics.querySelector('.resource-summary'));
 assert.match($('#main').querySelector('h1').textContent,/Answer correctness failed/);
@@ -195,8 +195,8 @@ def test_compact_requests_fetch_escaped_evidence_and_return_to_the_condition_pag
 const compact=Array.from({length:5},(_,index)=>({id:'request-'+index,target:'local',scenario:'initial',status:'completed',output_chars:17,score:false}));
 const source=report([check('correctness','fail')],{requests_compact:true,requests:compact});
 const before=JSON.stringify(source);detail(source);chooseReportTab('results');
-const tests=$('#test-dialog');tests.innerHTML='<table><tbody><tr class="request-evidence-row" tabindex="0" data-request="request-0"><td>#0001</td></tr></tbody></table>';tests.showModal();
-const requestLink=tests.querySelector('.request-evidence-row');requestLink.focus({preventScroll:true});
+const tests=$('#test-dialog');tests.innerHTML='<button data-condition-request="request-0">#0001</button>';tests.showModal();
+const requestLink=tests.querySelector('[data-condition-request]');requestLink.focus({preventScroll:true});
 const calls=[];api=async path=>{
   calls.push(path);const id=decodeURIComponent(path.split('/').at(-1));
   return {id,target:'local',scenario:'initial',status:'completed',valid:true,score:false,
@@ -208,7 +208,7 @@ assert.equal(calls[0],'/api/runs/saved-run/requests/request-0');assert(evidence.
 assert.match(evidence.textContent,/Incorrect answer/);assert.match(evidence.textContent,/Mismatch <expected>/);
 assert.match(evidence.innerHTML,/&lt;actual answer(?:&gt;|>)/);assert.match(evidence.innerHTML,/&lt;input message(?:&gt;|>)/);
 assert.match(evidence.innerHTML,/&lt;expected answer(?:&gt;|>)/);assert.doesNotMatch(evidence.innerHTML,/<actual answer>|<input message>|<expected answer>/);
-assert.match(evidence.textContent,/Back to condition details/);
+assert.match(evidence.textContent,/Back to test details/);
 closeRequestEvidence();assert(!evidence.open);assert(tests.open);assert.equal(document.activeElement,requestLink);
 await openRequest('request-0');assert.equal(calls.length,1,'reopening retained evidence uses the small cache');closeRequestEvidence();
 for(let index=1;index<5;index++){await openRequest('request-'+index);closeRequestEvidence();assert(requestEvidenceCache.size<=3);}
@@ -300,12 +300,12 @@ def test_condition_dialog_closing_after_terminal_switch_reveals_its_focus_target
  const aggregate={target:'local',condition_id:'one',check_id:'correctness',name:'One condition',aggregate_status:'running',planned:2,planned_kind:'exact',started:2,running:1,completed:1,failed:0,not_started:0};
  state.detail={id:'finishing-dialog',state:'running',config:{targets:[]},live_conditions:[aggregate]};renderDetail();
  api=async()=>({aggregate,rows:[],totals:{running:1},page:1,pages:1,total:0});
- const cell=$('.condition-strip-row');openConditionDialog(cell.dataset.conditionKey);await Promise.resolve();await Promise.resolve();
+ const cell=$('.condition-spot');openConditionDialog(cell.dataset.conditionKey);await Promise.resolve();await Promise.resolve();
  aggregate.aggregate_status='passed';aggregate.running=0;aggregate.completed=2;
  state.detail={id:'finishing-dialog',state:'completed',report:report([check('correctness','pass')],{conditions:[aggregate]})};renderDetail();
  assert.equal(reportView.tab,'results');assert($('#test-dialog').open);assert(!$('#report-results').hidden);
  closeConditionDialog();assert.equal(reportView.tab,'results');assert(!$('#report-results').hidden);
- assert.equal(document.activeElement,$('.condition-strip-row'));assert.equal(document.activeElement.dataset.conditionKey,cell.dataset.conditionKey);
+ assert.equal(document.activeElement,$('.condition-spot'));assert.equal(document.activeElement.dataset.conditionKey,cell.dataset.conditionKey);
  assert($('.condition-reference').open,'restored condition focus must be visible');
 })()
 """, dom=True)
@@ -317,11 +317,11 @@ def test_missing_terminal_report_settles_an_open_live_condition_dialog():
  const aggregate={target:'local',condition_id:'one',check_id:'correctness',name:'One condition',aggregate_status:'running',planned:2,planned_kind:'exact',started:2,running:1,completed:1,failed:0,not_started:0};
  state.detail={id:'save-failure',state:'running',config:{targets:[]},live_conditions:[aggregate]};renderDetail();
  api=async()=>({aggregate,rows:[],totals:{running:1},page:1,pages:1,total:0});
- openConditionDialog($('.condition-strip-row').dataset.conditionKey);await Promise.resolve();await Promise.resolve();
+ openConditionDialog($('.condition-spot').dataset.conditionKey);await Promise.resolve();await Promise.resolve();
  state.detail={...state.detail,state:'error',error:'Disk unavailable',report:null,summary:{overall:'inconclusive',request_count:2,checks:[]}};renderDetail();
  assert(!$('#test-dialog').open);assert.equal(conditionDialog,null);assert.equal(reportView.tab,'results');
  assert.equal(document.activeElement,$('#tab-results'));assert.match($('#main').textContent,/Disk unavailable|Only a summary was saved/);
- assert(!$('.condition-strip-row').classList.contains('running'));
+ assert(!$('.condition-spot').classList.contains('running'));
 })()
 """, dom=True)
 
@@ -331,9 +331,9 @@ def test_evidence_close_keeps_focus_in_test_dialog_after_its_filtered_row_disapp
 (async()=>{
  const row={id:'r1',target:'local',scenario:'initial',status:'completed',valid:true,score:true,output:'OK'};
  detail(report([check('access','pass')],{requests:[row]}));chooseReportTab('results',{anchor:false});
- const tests=$('#test-dialog');tests.innerHTML='<label>Status <select data-evidence-filter="status"></select></label><table><tbody><tr class="request-evidence-row" tabindex="0" data-request="r1"><td>#0001</td></tr></tbody></table>';tests.showModal();
- const original=$('.request-evidence-row',tests);original.focus({preventScroll:true});await openRequest('r1');original.parentNode.removeChild(original);
- assert(!original.isConnected);closeRequestEvidence();assert(tests.open);assert.equal(document.activeElement,$('#test-dialog [data-evidence-filter="status"]'));
+ const tests=$('#test-dialog');tests.innerHTML='<label>Status <select id="condition-filter"></select></label><button data-condition-request="r1">#0001</button>';tests.showModal();
+ const original=$('[data-condition-request]',tests);original.focus({preventScroll:true});await openRequest('r1');original.parentNode.removeChild(original);
+ assert(!original.isConnected);closeRequestEvidence();assert(tests.open);assert.equal(document.activeElement,$('#condition-filter'));
 })()
 """, dom=True)
 
@@ -455,7 +455,7 @@ control=controls()[1];control.value='generation';listeners.change({target:contro
 assert.equal(rows().length,0);assert.match(panel().textContent,/No measurements match/);
 assert.equal(controls()[1].value,'generation');assert.equal(document.activeElement,controls()[1]);
 control=controls()[0];control.value='without_warnings';listeners.change({target:control});
-assert.equal(rows().length,1);assert.match(rows()[0].textContent,/no material change/);
+assert.equal(rows().length,1);assert.match(rows()[0].textContent,/No material regression/);
 chooseReportTab(TAB==='results'?'performance':'results');
 const other=$('#report-'+reportView.tab),otherControls=other.querySelectorAll('.comparison-filters select');
 assert.equal(other.querySelectorAll('[data-metric]').length,1);

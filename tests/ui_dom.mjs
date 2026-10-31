@@ -29,7 +29,7 @@ export function browserDOM(listeners) {
     set open(value){if(value)this.setAttribute('open','');else this.removeAttribute('open');}
     get innerHTML(){return this.childNodes.map(node=>node.outerHTML).join('');}
     set innerHTML(html){this.writes++;const root=this.tagName==='TEMPLATE'?this.content:this;for(const child of [...root.childNodes])root.removeChild(child);parse(html,root);}
-    get outerHTML(){return this.nodeType===3?encode(this.nodeValue):`<${this.tagName.toLowerCase()}${this.attributes.map(({name,value})=>` ${name}="${encode(value)}"`).join('')}>${['AREA','BASE','BR','COL','EMBED','HR','IMG','INPUT','LINK','META','PARAM','SOURCE','TRACK','WBR'].includes(this.tagName)?'':`${this.innerHTML}</${this.tagName.toLowerCase()}>`}`;}
+    get outerHTML(){return this.nodeType===3?encode(this.nodeValue):`<${this.tagName.toLowerCase()}${this.attributes.map(({name,value})=>` ${name}="${encode(value)}"`).join('')}>${this.innerHTML}</${this.tagName.toLowerCase()}>`;}
     get textContent(){return this.nodeType===3?this.nodeValue:this.childNodes.map(node=>node.textContent).join('');}
     set textContent(value){for(const child of [...this.childNodes])this.removeChild(child);this.insertBefore(new Node(null,value),null);}
     getAttribute(name){return this.attrs.get(name) ?? null;}
@@ -67,7 +67,7 @@ export function browserDOM(listeners) {
         const element=new Node(tag);
         for(const [,name,a,b,c] of token.slice(tag.length+1,-1).matchAll(/([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g))element.setAttribute(name,decode(a ?? b ?? c ?? ''));
         stack.at(-1).insertBefore(element,null);
-        if(!token.endsWith('/>')&&!['hr','input','br','img','meta','link','col'].includes(tag))stack.push(element);
+        if(!token.endsWith('/>')&&!['hr','input','br','img','meta','link'].includes(tag))stack.push(element);
       }else stack.at(-1).insertBefore(new Node(null,decode(token)),null);
     }
   }

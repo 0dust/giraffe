@@ -122,7 +122,7 @@ const comparisons=Array.from({length:94},(_,index)=>({check:'generation',scenari
 const value=report([check('access','pass')],{baseline:{run_id:'before-upgrade',targets:[{target:'local',comparisons}]}});
 const hero=detail(value);assert.match(hero,/vs baseline before-upgrade: 94 measurements · 30 with warnings/);
 const html=renderComparison(value);assert.equal((html.match(/data-comparison-group=/g)||[]).length,1);assert.equal((html.match(/data-metric=/g)||[]).length,94);
-assert.equal((html.match(/data-label="Verdict">no material change/g)||[]).length,64);assert.equal((html.match(/data-label="Verdict">not comparable/g)||[]).length,30);assert.match(html,/No eligible samples/);
+assert.equal((html.match(/Median · No material regression/g)||[]).length,64);assert.equal((html.match(/Median · Warning/g)||[]).length,30);assert.match(html,/No eligible samples/);
 state.comparisonFilter='with_warnings';const filtered=renderComparison(value);assert.equal((filtered.match(/data-metric=/g)||[]).length,30);
 assert.equal((html.match(/Why this warning\?/g)||[]).length,30);assert.doesNotMatch(html,/No material worsening detected in these samples\.|Entry \d/);
 """)

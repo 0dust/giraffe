@@ -34,7 +34,7 @@ for(const [name,value] of [['concurrency','40'],['max_output_tokens','256'],['re
 assert.equal(nodes['#field-load_patterns_concurrent_levels-hint'].textContent,'Used by maintained-concurrency traffic and the long-input / short-answer test.');
 nodes['#load-ceiling-label']={};syncLoadDisplay(readForm().config);assert.equal(nodes['#load-ceiling-label'].textContent,40);
 assert.match(nodes['#run-ceilings-summary'].textContent,/40 at once/);
-assert.equal(hints[0].textContent,'Custom · run default: 4 at once');
+assert.equal(hints[0].textContent,'Custom · run default: 4 at a time');
 assert.equal(hints[1].textContent,'Custom · run default: 256 tokens');
 assert.equal(hints[2].textContent,'Custom · run default: 60 seconds');
 assert.equal(bootstrap.limits['sessions.concurrency'].maximum,512);assert.equal(elements.profile_sessions_concurrency.max,String(bootstrap.limits['sessions.concurrency'].maximum)); // Preserve the session schema's own maximum.
@@ -94,8 +94,8 @@ const correctness=bootstrap.checks.find(x=>x.id==='correctness'),cancel=bootstra
 config.samples=7;
 assert.equal(checkFieldHint(correctness,config,'samples'),'Run default');
 assert.equal(checkFieldHint(cancel,config,'cancel_after_ms'),'Check default');
-assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/Leave blank to use the run setting/);
-assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/Leave blank to use the run setting/);
+assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/suite value is a default, not a ceiling/);
+assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/suite value is a default, not a ceiling/);
 config.test_options.correctness={samples:7};
 assert.equal(checkFieldHint(correctness,config,'samples'),'Custom · run default: 7 requests');
 const generation=bootstrap.checks.find(x=>x.id==='generation');config.limits.latency_ms=900;
@@ -215,12 +215,12 @@ def test_lower_run_ceiling_preserves_requested_override_and_sets_native_limits()
     browser_logic(r"""
 config.concurrency=8;config.test_options.correctness={concurrency:8};
 const check=bootstrap.checks.find(x=>x.id==='correctness');
-assert.match(effectiveCheckSummary(check,config),/8 at once/);
+assert.match(effectiveCheckSummary(check,config),/8 at a time/);
 config.concurrency=4;config.max_output_tokens=32;config.request_timeout_seconds=5;
 config.test_options.generation={max_output_tokens:64};config.test_options.access={request_timeout_seconds:10};
 const summary=effectiveCheckSummary(check,config);
-assert.match(summary,/8 at once/);assert.doesNotMatch(summary,/exceeds run limit/);
-assert.doesNotMatch(summary,/ · 4 at once/);
+assert.match(summary,/8 at a time/);assert.doesNotMatch(summary,/exceeds run limit/);
+assert.doesNotMatch(summary,/ · 4 at a time/);
 assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config),'');
 assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='access'),config),'');
 const elements={test_correctness_concurrency:{value:'8'},test_generation_max_output_tokens:{value:'64'},

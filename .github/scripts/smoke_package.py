@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 from importlib import metadata, resources
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -14,6 +15,47 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import giraffe
 import httpx
 from giraffe.web import create_app
+
+
+def check_builtin_tokenizer(data):
+    encoding = data.joinpath("o200k_base.tiktoken").read_bytes()
+    expected_hash = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+    if hashlib.sha256(encoding).hexdigest() != expected_hash:
+        raise RuntimeError("Installed built-in tokenizer encoding is missing or corrupted")
+    notices = data.joinpath("THIRD_PARTY_NOTICES.txt").read_text()
+    for required in (expected_hash, "MIT License", "Copyright (c) 2022 OpenAI, Shantanu Jain"):
+        if required not in notices:
+            raise RuntimeError("Installed tokenizer third-party notices are missing or incomplete")
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory) / "home"
+        cache = Path(directory) / "cache"
+        home.mkdir(mode=0o500)
+        cache.mkdir(mode=0o500)
+        environment = dict(os.environ, HOME=str(home), XDG_CACHE_HOME=str(cache),
+                           TIKTOKEN_CACHE_DIR=str(cache))
+        try:
+            subprocess.run([sys.executable, "-c", '''
+import os
+import socket
+def blocked(*args, **kwargs):
+    raise AssertionError("Built-in tokenizer attempted network access")
+class BlockedSocket(socket.socket):
+    def __new__(cls, *args, **kwargs):
+        return blocked()
+socket.socket = BlockedSocket
+socket.create_connection = blocked
+from giraffe.local_tokenizer import _builtin_encoding
+environment = dict(os.environ)
+encoding = _builtin_encoding()
+text = "Giraffe tokenizes offline. 🦒"
+assert encoding.decode(encoding.encode(text)) == text
+assert dict(os.environ) == environment, "Built-in tokenizer changed the environment"
+'''], check=True, timeout=30, env=environment)
+            if any(home.iterdir()) or any(cache.iterdir()):
+                raise RuntimeError("Built-in tokenizer wrote to home or cache")
+        finally:
+            home.chmod(0o700)
+            cache.chmod(0o700)
 
 
 def check_asset_version(url, content):
@@ -74,6 +116,7 @@ async def main():
         raise RuntimeError("The giraffe command is missing or points to the wrong entry point")
     command = Path(sysconfig.get_path("scripts")) / "giraffe"
     subprocess.run([str(command), "--help"], check=True, timeout=30)
+    check_builtin_tokenizer(resources.files("giraffe").joinpath("data"))
     static = resources.files("giraffe").joinpath("static")
     with tempfile.TemporaryDirectory() as directory:
         app = create_app(Path(directory) / "runs", token="package-smoke-token")
@@ -83,7 +126,7 @@ async def main():
             response = await client.get("/?token=package-smoke-token", follow_redirects=True)
             response.raise_for_status()
             await check_ui_assets(client, static)
-    print(f"Installed giraffe-llm {installed.version}: CLI and UI assets passed")
+    print(f"Installed giraffe-llm {installed.version}: CLI, offline tokenizer and UI assets passed")
 
 
 if __name__ == "__main__":

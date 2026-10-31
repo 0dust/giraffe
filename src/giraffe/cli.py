@@ -12,22 +12,39 @@ import logging
 import signal
 import secrets
 import ipaddress
+import importlib.util
 import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-from pydantic import ValidationError
+REQUIRED_MODULES = ("httpx", "pydantic", "yaml", "jsonschema", "fastapi", "uvicorn", "tiktoken")
 
-from giraffe import __version__
-from giraffe.configuration_errors import configuration_errors
-from giraffe.diagnostics import configure_logging, run_logging
-from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
-                           migrate_concurrent_load, migrate_load_test, migrate_run_limits)
-from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
-from giraffe.resources import PhaseSampler, SAMPLING
+
+def _required_modules_available() -> bool:
+    for module in REQUIRED_MODULES:
+        if importlib.util.find_spec(module) is None:
+            print(f"giraffe: missing required module '{module}'; run pip install --upgrade giraffe-llm",
+                  file=sys.stderr)
+            return False
+    return True
+
+
+# Check before imports that themselves require installed dependencies.
+if _required_modules_available():
+    import yaml
+    from pydantic import ValidationError
+
+    from giraffe import __version__
+    from giraffe.configuration_errors import configuration_errors
+    from giraffe.diagnostics import configure_logging, run_logging
+    from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
+                               migrate_concurrent_load, migrate_load_test, migrate_run_limits)
+    from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
+    from giraffe.resources import PhaseSampler, SAMPLING
+else:
+    raise SystemExit(4)
 
 
 class UsageError(SystemExit):
@@ -1211,6 +1228,8 @@ def _progress_print(message):
 
 
 def main(argv: list[str] | None = None) -> int:
+    if not _required_modules_available():
+        return 4
     configure_logging()
     stdout, stderr = sys.stdout, sys.stderr
     out, err = _PipeSafeStream(stdout), _PipeSafeStream(stderr)

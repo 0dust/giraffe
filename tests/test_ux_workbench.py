@@ -4,13 +4,36 @@ from tests.test_ux_catalogue import browser_logic
 from tests.test_ux_setup import run_browser_logic
 
 
-def test_editing_settings_keeps_one_screen_and_opens_advanced():
+def test_editing_from_review_returns_directly_after_validation():
     run_browser_logic(r"""
 state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
-nodes['#new-run-form']={};nodes['#setup-advanced']={open:false};
-syncSetupStep=syncConfigView=()=>{};
-revealSetupStep(2);assert.equal(state.setupStep,3);assert.equal(nodes['#setup-advanced'].open,true);
-revealSetupStep(1);assert.equal(state.setupStep,3);
+tokenizerSetupReady=()=>true;
+nodes['#new-run-form']={};
+const validations=[];
+validateRunForm=(form,step)=>{validations.push(step);return true;};
+validateSetupChecks=()=>validations.push('checks');
+captureFormDraft=updateBounds=()=>{};
+await listeners.click({target:{closest:q=>q==='[data-setup-step]'?{dataset:{setupStep:'1',reviewEdit:'true'}}:null}});
+assert.equal(state.setupStep,1);assert.equal(state.returnToReview,true);
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'setup-next'}}:null}});
+assert.equal(validations.join(','),'1,2,checks');
+assert.equal(state.setupStep,3);assert.equal(state.returnToReview,false);
+state.setupStep=2;state.returnToReview=true;validateRunForm=()=>false;
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'setup-next'}}:null}});
+assert.equal(state.setupStep,2);assert.equal(state.returnToReview,true);
+""")
+
+
+def test_return_from_advanced_editor_at_launch_keeps_step_and_reveals_form():
+    run_browser_logic(r"""
+state.jsonDraft=state.jsonBase='synced';state.setupStep=3;state.configView='json';
+nodes['#config-panel-form']=element();
+syncConfigView=syncSetupStep=()=>{};
+for(const returnToReview of [false,true]){
+ state.returnToReview=returnToReview;state.configView='json';
+ await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'setup-next'}}:null}});
+ assert.equal(state.setupStep,3);assert.equal(state.configView,'form');assert.equal(state.returnToReview,false);
+}
 """)
 
 
@@ -21,11 +44,11 @@ state.jsonDraft=state.jsonBase='synced';
 const original=JSON.stringify(state.config);
 const plan={count_kind:'exact',planned_total:4,request_limit:12,required_request_limit:4,
  rows:[{id:'initial',title:'Connection check',requests_per_target:1,kind:'exact',summary:'Shared connection request.',source:'generated'},
- {id:'access',title:'Endpoint access',requests_per_target:0,kind:'exact',summary:'Reused.',source:'generated'},
+ {id:'access',title:'Endpoint response',requests_per_target:0,kind:'exact',summary:'Reused.',source:'generated'},
  {id:'correctness',title:'Known answers',requests_per_target:3,kind:'exact',summary:'Three questions.',source:'generated'}]};
 api=()=>{throw new Error('Preview rendering must not send traffic');};
 let html=renderRunBlueprint(state.config,plan);
-assert.match(html,/4 requests planned/);assert.match(html,/Max requests/);
+assert.match(html,/4 requests planned/);assert.match(html,/Maximum requests/);
 assert.match(html,/data-plan-row="initial"/);assert.doesNotMatch(html,/data-plan-row="access"/);
 assert.doesNotMatch(html,/data-plan-check=/);assert.match(html,/per endpoint/);
 assert.doesNotMatch(html,/Play example|800 ms|Passed/);
@@ -200,4 +223,23 @@ location.hash='#runs';await route();assert.equal(location.hash,'#runs');assert.e
 location.hash='';state.runs=[{id:'saved'}];await route();assert.equal(location.hash,'#new');assert.equal(rendered,1);
 location.hash='';state.runs=[];state.active='active-run';await route();assert.equal(location.hash,'#runs/active-run');assert.equal(rendered,1);
 assert.equal(requests,0);
+""")
+
+
+def test_clear_api_key_keeps_regenerated_section_open_and_focuses_fresh_input():
+    run_browser_logic(r"""
+const oldInput=element({value:'secret'}),oldSection=element({open:true});
+nodes['#connection-auth']=oldSection;nodes['#new-run-form']={elements:{api_key:oldInput}};
+sessionAPIKey={url:'http://local/v1',key:'secret'};
+let renders=0;
+invalidateModelDiscovery=captureFormDraft=configChanged=()=>{};
+renderNew=()=>{
+ renders++;assert.equal(sessionAPIKey,null);assert.equal(oldInput.value,'');
+ nodes['#connection-auth']=element({open:false});nodes['#new-run-form']={elements:{api_key:element()}};
+};
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'clear-api-key'}}:null}});
+assert.equal(renders,1);assert.notEqual(nodes['#connection-auth'],oldSection);
+assert.equal(nodes['#connection-auth'].open,true);
+assert.equal(nodes['#new-run-form'].elements.api_key.focused,true);
+assert.equal(oldInput.focused,undefined);
 """)

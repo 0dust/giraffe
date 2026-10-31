@@ -6,15 +6,39 @@ from pathlib import Path
 
 import pytest
 
-from giraffe import concurrent_load, workloads, logprobs, logprob_workload
+from giraffe import concurrent_load, workloads, logprobs, logprob_workload, runner
 from giraffe.deployment import fixture_hash
 from giraffe.models import RunConfig
-from giraffe.reporting import _run_limits_workload_identity, _settings_reasons
+from giraffe.reporting import _run_limits_workload_identity, _settings_reasons, compare_baseline
+from tests.test_runner import client as client
 from tests.test_reporting import make_report
 
 
 LEGACY_GENERATOR = "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115eccb0"
 LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("load", [False, True], ids=["quick-check", "load"])
+async def test_browser_safety_limits_preserve_real_baseline_comparability(load):
+    from tests.test_concurrent_load import configuration
+
+    config = (configuration(max_requests=None) if load else RunConfig(
+        targets=[{"name": "local", "url": "http://localhost:8000", "model": "test"}]))
+    assert config.max_requests is config.max_duration_seconds is config.concurrency is None
+    previous = await runner.run_suite(config)
+    limited = config.model_copy(update={
+        "max_requests": 50_000, "max_duration_seconds": 7200, "concurrency": 128})
+    current = await runner.run_suite(limited)
+
+    compared = compare_baseline(current, previous)
+
+    assert not previous.limits_reached and not current.limits_reached
+    assert current.manifest["effective_checks"] == previous.manifest["effective_checks"]
+    assert current.manifest["fixture_pack"] == previous.manifest["fixture_pack"]
+    target = compared.baseline["targets"][0]
+    assert target["reasons"] == []
+    assert target["comparisons"]
 
 
 IDENTITY_TABLE_GUIDANCE = (

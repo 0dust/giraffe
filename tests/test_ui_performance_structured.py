@@ -23,7 +23,7 @@ const markup=performanceMetricTable(rows);
 document.querySelector('#main').innerHTML=markup;
 assert(!markup.includes('Recorded; see evidence'));
 assert.equal($$('.performance-metric-value details').length,3);
-assert.match($('#main').textContent,/First answer limit/);
+assert.match($('#main').textContent,/First useful output limit/);
 assert.match($('#main').textContent,/Local drops 0 · Late 2 · Not offered 5/);
 assert.match($('#main').textContent,/Elapsed time.*12 ms/);
 assert(markup.includes('&lt;unsafe&gt;'));
@@ -37,7 +37,6 @@ def test_html_structured_summary_and_disclosure(row):
     assert '<details' in html and '<summary>Underlying values</summary>' in html
     assert '<pre>' not in html
     if row['id'] == 'latency_attainment':
-        # The report boundary normalizes this legacy helper label for display.
         assert 'First useful output limit' in html
     elif row['id'] == 'drops':
         assert 'Local drops 0 · Late 2 · Not offered 5' in html
@@ -68,7 +67,7 @@ def test_standalone_report_shows_recorded_latency_violation():
 
     saved = report([record(load_point={'response_criteria': ROWS[0]['value'][0]})])
     html = _render(saved)
-    assert 'First answer limit' in html
+    assert 'First useful output limit' in html
     assert '<summary>Underlying values</summary>' in html
     assert 'Recorded; see evidence' not in html
 

@@ -6,7 +6,9 @@ event loop, and can be killed on timeout or Stop. It never contacts the endpoint
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+from importlib import resources
 import json
 import os
 from pathlib import Path
@@ -22,6 +24,14 @@ SETUP_TIMEOUT_SECONDS = 30.0
 AUTOMATIC_SETUP_TIMEOUT_SECONDS = 5.0
 BUILTIN = "builtin"
 BUILTIN_ENCODING = "o200k_base"
+BUILTIN_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+BUILTIN_N_VOCAB = 200019
+BUILTIN_SPECIAL_TOKENS = {"<|endoftext|>": 199999, "<|endofprompt|>": 200018}
+BUILTIN_PATTERN = "|".join([
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"\p{N}{1,3}", r" ?[^\s\p{L}\p{N}]+[\r\n/]*", r"\s*[\r\n]+", r"\s+(?!\S)", r"\s+",
+])
 HF_INSTALL_HINT = "Install giraffe-llm[hf-tokenizer] to use the model's own tokenizer"
 BUILTIN_NOTICE = ("Using built-in tiktoken o200k_base for prompt sizing. These are reference "
                   "token counts, not the served model's counts; chat formatting is excluded. "
@@ -219,21 +229,13 @@ async def ensure_tokenizers(config, *, include_server_metadata=True):
         except (TimeoutError, TokenizerUnavailable) as error:
             if automatic and name != BUILTIN:
                 name, source = BUILTIN, "builtin_fallback"
-                try:
-                    async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
-                        ready = verified.get(name) or await _verify_tokenizer(name)
-                except (TimeoutError, TokenizerUnavailable):
-                    raise TokenizerUnavailable(
-                        "Built-in tokenizer could not be loaded. Its first use needs internet access "
-                        "to download encoding data and a writable local cache. No run was started.",
-                        target_index=index) from None
+                async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
+                    ready = verified.get(name) or await _verify_tokenizer(name)
             else:
                 reason = "setup timed out" if isinstance(error, TimeoutError) else str(error)
                 raise TokenizerUnavailable(
-                    f"Tokenizer setup for {target.name} failed: {reason}. "
-                    + ("Built-in encoding data downloads automatically on first use; check internet access and the local cache. "
-                       if name == BUILTIN else "Select builtin to use the built-in tokenizer. ")
-                    + "No run was started.", target_index=index) from None
+                    f'Could not load tokenizer "{name}": {reason.rstrip(".")}.',
+                    code=getattr(error, "code", "tokenizer_unavailable"), target_index=index) from None
         verified[name] = ready
         target._tokenizer_setup = {"tokenizer": name, "source": source,
             "chat_template": ready.get("chat_template", False), "identity": identity,
@@ -243,27 +245,22 @@ async def ensure_tokenizers(config, *, include_server_metadata=True):
 
 
 async def preview_tokenizer(model, token_id="auto"):
-    """Resolve and load the first-page selection without endpoint credentials/traffic."""
-    from .models import RunConfig
-
+    """Verify only an explicit Token ID; automatic resolution happens at run start."""
     requested = token_id.strip() or "auto"
-    if requested.lower() in {"auto", "automatic", "builtin"}:
-        requested = "auto" if requested.lower() == "automatic" else requested.lower()
-    name = model.strip() if requested == "auto" else requested
-    if not name:
-        raise TokenizerUnavailable("Enter the served model name, or enter a model name in Token ID.")
-    config = RunConfig(targets=[{"name": "tokenizer-preview", "url": "http://tokenizer-preview.invalid/v1",
-        "model": name, "tokenizer": "builtin" if requested == "builtin" else "auto"}], checks=["load"])
-    await ensure_tokenizers(config, include_server_metadata=False)
-    setup = config.targets[0]._tokenizer_setup
-    fallback = setup["source"] == "builtin_fallback"
-    tokenizer = setup["tokenizer"]
-    return {"status": "fallback" if fallback else "ready", "tokenizer": tokenizer,
-        "encoding": BUILTIN_ENCODING if tokenizer == BUILTIN else None,
-        "message": (f'Could not resolve or load a tokenizer for "{name}". Built-in o200k_base will be used. '
-                    'Enter a model name in Token ID to try again, or choose builtin.' if fallback else
-                    'Ready: built-in tiktoken o200k_base will be used. Its counts may differ from your model.'
-                    if tokenizer == BUILTIN else f'Ready: {tokenizer}. Tokenizer files are cached locally.')}
+    if requested.lower() in {"auto", "automatic", BUILTIN}:
+        tokenizer = BUILTIN if requested.lower() == BUILTIN else "auto"
+        return {"status": "ready", "tokenizer": tokenizer, "message": ""}
+    try:
+        async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
+            await _verify_tokenizer(requested)
+    except (TimeoutError, TokenizerUnavailable) as error:
+        reason = "setup timed out" if isinstance(error, TimeoutError) else (
+            "Install giraffe-llm[hf-tokenizer], or pick Automatic"
+            if error.code == "missing_dependency" else str(error))
+        raise TokenizerUnavailable(
+            f'Could not load tokenizer "{requested}": {reason.rstrip(".")}.',
+            code=getattr(error, "code", "tokenizer_unavailable")) from None
+    return {"status": "ready", "tokenizer": requested, "message": ""}
 
 
 def _progress(run, target, scenario, status, **metadata):
@@ -391,14 +388,16 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
 
 
 async def _start_worker(tokenizer, *, allow_download=False):
-    env = {**os.environ, "TOKENIZERS_PARALLELISM": "false"}
-    if not allow_download:
-        env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    env = None
+    if tokenizer != BUILTIN:
+        env = {**os.environ, "TOKENIZERS_PARALLELISM": "false"}
+        if not allow_download:
+            env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     # Endpoint credentials are never forwarded to Hugging Face. Existing HF
     # credentials/offline preferences remain under the user's control.
     return await asyncio.create_subprocess_exec(
         sys.executable, "-m", "giraffe.local_tokenizer", tokenizer,
-        *(["--download"] if allow_download else []),
+        *(["--download"] if tokenizer != BUILTIN and allow_download else []),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL, env=env,
     )
@@ -411,28 +410,32 @@ async def _read_worker(process):
     return json.loads(line)
 
 
-def _builtin_encoding(allow_download):
+def _builtin_encoding():
     import tiktoken
-    from tiktoken import load
 
-    cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(cache_home / "giraffe" / "tiktoken"))
-    offline = any(os.environ.get(key, "").lower() in {"1", "true", "yes", "on"}
-                  for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"))
-    if not allow_download or offline:
-        # tiktoken has no offline flag. In this isolated worker, refuse cache
-        # misses at its I/O boundary; cached data still uses its hash validation.
-        def no_download(_path):
-            raise OSError("Built-in encoding is not cached; connect once to download it")
-        load.read_file = no_download
-    return tiktoken.get_encoding(BUILTIN_ENCODING)
+    try:
+        contents = resources.files("giraffe").joinpath("data/o200k_base.tiktoken").read_bytes()
+    except OSError:
+        raise TokenizerUnavailable("Built-in tokenizer data is missing; the install is corrupt",
+                                   code="corrupt_install") from None
+    if hashlib.sha256(contents).hexdigest() != BUILTIN_SHA256:
+        raise TokenizerUnavailable("Built-in tokenizer data failed its integrity check; the install is corrupt",
+                                   code="corrupt_install")
+    ranks = {base64.b64decode(token, validate=True): int(rank)
+             for line in contents.splitlines() if line for token, rank in [line.split()]}
+    encoding = tiktoken.Encoding(name=BUILTIN_ENCODING, pat_str=BUILTIN_PATTERN,
+        mergeable_ranks=ranks, special_tokens=dict(BUILTIN_SPECIAL_TOKENS))
+    # o200k_base has gaps in its token IDs, so explicit_n_vocab cannot be used.
+    if encoding.n_vocab != BUILTIN_N_VOCAB:
+        raise TokenizerUnavailable("Built-in tokenizer vocabulary is corrupt", code="corrupt_install")
+    return encoding
 
 
 def _worker(tokenizer_name, *, allow_download=False):
     builtin = tokenizer_name == BUILTIN
     try:
         if builtin:
-            tokenizer = _builtin_encoding(allow_download)
+            tokenizer = _builtin_encoding()
             has_template = False
             def count(messages):
                 return sum(len(tokenizer.encode(m["content"], disallowed_special=())) for m in messages)
@@ -455,12 +458,18 @@ def _worker(tokenizer_name, *, allow_download=False):
                            for message in messages)
         count([{"role": "user", "content": "Tokenizer setup."}])
     except ImportError:
-        print(json.dumps({"error": ("Built-in tokenizer dependencies are missing; reinstall giraffe-llm"
+        print(json.dumps({"error": ("Required module tiktoken is missing; the install is broken"
                                    if builtin else HF_INSTALL_HINT),
                           "code": "missing_dependency"}), flush=True)
         return
+    except TokenizerUnavailable as error:
+        print(json.dumps({"error": str(error), "code": error.code}), flush=True)
+        return
     except Exception:
-        print(json.dumps({"error": "Tokenizer files could not be loaded or used. Check network access, local cache permissions and offline settings"}), flush=True)
+        error = ({"error": "Built-in tokenizer could not be loaded or used; the install is corrupt",
+                  "code": "corrupt_install"} if builtin else
+                 {"error": "Tokenizer files could not be loaded or used. Check the Token ID, network access, local cache permissions and offline settings"})
+        print(json.dumps(error), flush=True)
         return
     print(json.dumps({"ready": True, "chat_template": has_template,
                       "token_count_scope": "builtin_reference" if builtin else
