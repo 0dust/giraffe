@@ -81,6 +81,12 @@ async def test_background_http_server_survives_script_exit_stop_and_timeout(tmp_
         info = json.loads(metadata.read_text())
         pid = info["pid"]
         if ending == "stop":
+            # The child publishes metadata before the script resumes and prints.
+            # Stop only after there is flushed script output to retain.
+            log_path = run.config._restart_log_dir / "restart.log"
+            async with asyncio.timeout(3):
+                while not log_path.exists() or "restart issued" not in log_path.read_text():
+                    await asyncio.sleep(.01)
             run.stop.set()
         result = await asyncio.wait_for(task, 1 if ending == "success" else 5)
         assert result is (ending == "success")

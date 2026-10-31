@@ -216,6 +216,40 @@ async def test_script_has_its_own_timeout_and_only_last_4k_output_is_reported(tm
     assert run.observations["local"]["restart"]["output_tail"] == data[-4096:].decode()
 
 
+@pytest.mark.parametrize("ending", ["success", "failure", "timeout", "stop", "cancel"])
+async def test_flushed_script_output_is_retained_and_redacted_on_every_exit(tmp_path, monkeypatch, ending):
+    secret = "exit-path-test-key"
+    monkeypatch.setenv("COLD_EXIT_KEY", secret)
+    ready = tmp_path / "output-flushed"
+    body = f"printf '%s\\n' 'restart issued {secret}'\n: > '{ready}'\n"
+    body += "exit 0\n" if ending == "success" else "exit 7\n" if ending == "failure" else "while :; do sleep .05; done\n"
+    run, target, _ = run_context(tmp_path, script(tmp_path, body),
+                                 restart_script_timeout_seconds=.5 if ending == "timeout" else 5)
+    target.api_key_env = "COLD_EXIT_KEY"
+    task = asyncio.create_task(runner._restart(run, target))
+    try:
+        async with asyncio.timeout(3):
+            while not ready.exists():
+                await asyncio.sleep(.005)
+        if ending == "stop":
+            run.stop.set()
+        if ending == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await asyncio.wait_for(task, 3) is (ending == "success")
+        assert (tmp_path / "restart.log").read_text() == f"restart issued {secret}\n"
+        assert stat.S_IMODE((tmp_path / "restart.log").stat().st_mode) == 0o600
+        observation = run.observations["local"]["restart"]
+        assert observation["output_tail"] == "restart issued [redacted]\n"
+        assert observation["status"] == ("hook_completed" if ending == "success" else "blocked")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_cancelling_restart_task_preserves_started_child(tmp_path):
     child_pid = tmp_path / "child.pid"
     path = script(tmp_path, f"sleep 10 &\necho $! > '{child_pid}'\nwhile :; do sleep .05; done\n")

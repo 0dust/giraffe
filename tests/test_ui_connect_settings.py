@@ -172,7 +172,7 @@ def test_disclosures_use_css_only_edit_close_labels_without_a_caret():
     assert re.search(r'details\[open\]\s*>\s*summary\s+\.when-closed,\s*details:not\(\[open\]\)\s*>\s*summary\s+\.when-open\s*\{\s*display:\s*none;', css)
     assert re.search(r'\.connection-auth\s*\{[^}]*margin:\s*0 0 20px;', css)
     assert re.search(r'\.connection-auth\[open\]\s*\{\s*padding-bottom:\s*16px;', css)
-    assert re.search(r'\.connection-auth > \.api-key-row \{[^}]*grid-template-columns: 140px ', css)
+    assert re.search(r'\.connection-auth > \.api-key-row \{[^}]*grid-template-columns: 176px ', css)
     assert '  .connection-auth > .api-key-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; }' in css
     assert 'shared-settings-caret' not in css
     assert not any('shared-settings-caret' in node.get('class', '') for node in tree.nodes)

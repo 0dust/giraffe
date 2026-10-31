@@ -21,7 +21,8 @@ class Client:
         return RequestRecord(id=uuid.uuid4().hex, target="t", fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids, started_at="now", status="completed",
             valid=True, output=str(spec.expected), elapsed_ms=2, first_output_ms=1,
-            last_output_ms=2, answer_chunks=2, http_status=200)
+            last_output_ms=2, answer_chunks=2, http_status=200,
+            finish_reason="stop", stream_terminated=True)
 
 
 async def test_equal_inflight_entries_never_lose_records_or_leak_overlap():
@@ -154,6 +155,11 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
     assert run.errors == 0 and run.budget_used == 1 and run.reason is None
     assert len(run.observations["t"]["readiness_requests"]) == 3
     assert run.observations["t"]["restart"]["status"] == "ready"
+    measured = [record for record in run.records if record.scenario in {"readiness", "cold_start_warm"}]
+    assert len(measured) == 3
+    assert all(record.status == "completed" and record.finish_reason == "stop"
+               and record.stream_terminated for record in measured)
+    assert len(run.observations["t"]["restart"]["warm_requests"]) == 2
     result = next(c for c in runner._checks(run, cfg.targets[0]) if c.id == "access")
     assert result.status == "pass" and result.metrics["attempted"] == 1
 
