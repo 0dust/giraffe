@@ -72,8 +72,9 @@ async def test_automatic_hf_without_extra_uses_builtin(monkeypatch, local_tokeni
     assert config.targets[0]._tokenizer_setup["source"] == "builtin_fallback"
     assert capsys.readouterr().err == ""
     config.targets[0].tokenizer = "organization/model"
-    with pytest.raises(sizing.TokenizerUnavailable, match=r"Install giraffe-llm\[hf-tokenizer\]"):
+    with pytest.raises(sizing.TokenizerUnavailable, match=r"Install giraffe-llm\[hf-tokenizer\]") as failed:
         await sizing.ensure_tokenizers(config)
+    assert "pick Automatic" not in str(failed.value)
 
 
 def test_cli_validate_imports_without_hf_extra(tmp_path):

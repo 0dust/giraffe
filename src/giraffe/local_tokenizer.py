@@ -32,7 +32,7 @@ BUILTIN_PATTERN = "|".join([
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
     r"\p{N}{1,3}", r" ?[^\s\p{L}\p{N}]+[\r\n/]*", r"\s*[\r\n]+", r"\s+(?!\S)", r"\s+",
 ])
-HF_INSTALL_HINT = "Install giraffe-llm[hf-tokenizer], or pick Automatic"
+HF_INSTALL_HINT = "Install giraffe-llm[hf-tokenizer] to use the model's own tokenizer"
 BUILTIN_NOTICE = ("Using built-in tiktoken o200k_base for prompt sizing. These are reference "
                   "token counts, not the served model's counts; chat formatting is excluded. "
                   "Measured token usage comes from the server.")
@@ -254,7 +254,9 @@ async def preview_tokenizer(model, token_id="auto"):
         async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
             await _verify_tokenizer(requested)
     except (TimeoutError, TokenizerUnavailable) as error:
-        reason = "setup timed out" if isinstance(error, TimeoutError) else str(error)
+        reason = "setup timed out" if isinstance(error, TimeoutError) else (
+            "Install giraffe-llm[hf-tokenizer], or pick Automatic"
+            if error.code == "missing_dependency" else str(error))
         raise TokenizerUnavailable(
             f'Could not load tokenizer "{requested}": {reason.rstrip(".")}.',
             code=getattr(error, "code", "tokenizer_unavailable")) from None

@@ -186,11 +186,11 @@ async def test_preview_api_automatic_and_builtin_cannot_fail_to_load(tmp_path, m
         assert response.json()["message"] == ""
 
 
-@pytest.mark.parametrize("reason,code", [
-    ("Tokenizer files could not be loaded", "tokenizer_unavailable"),
-    (sizing.HF_INSTALL_HINT, "missing_dependency"),
+@pytest.mark.parametrize("reason,code,preview_reason", [
+    ("Tokenizer files could not be loaded", "tokenizer_unavailable", "Tokenizer files could not be loaded"),
+    (sizing.HF_INSTALL_HINT, "missing_dependency", "Install giraffe-llm[hf-tokenizer], or pick Automatic"),
 ])
-async def test_preview_api_returns_clean_typed_name_error(tmp_path, monkeypatch, reason, code):
+async def test_preview_api_returns_clean_typed_name_error(tmp_path, monkeypatch, reason, code, preview_reason):
     from tests.test_web import browser
     async def unavailable(*args, **kw):
         raise sizing.TokenizerUnavailable(reason, code=code)
@@ -198,7 +198,7 @@ async def test_preview_api_returns_clean_typed_name_error(tmp_path, monkeypatch,
     async with browser(tmp_path / "runs") as client:
         response = await client.post("/api/targets/tokenizer", json={"token_id": "organization/model"})
         assert response.status_code == 422
-        assert response.json()["detail"] == f'Could not load tokenizer "organization/model": {reason}.'
+        assert response.json()["detail"] == f'Could not load tokenizer "organization/model": {preview_reason}.'
         assert "tokenizer-preview" not in response.text
         assert "No run was started" not in response.text
         assert "reinstall" not in response.text
@@ -360,7 +360,7 @@ async def test_builtin_worker_inherits_environment_without_download_flags(monkey
     assert kwargs["env"] is None
 
 
-def test_worker_missing_hf_extra_offers_install_or_automatic(monkeypatch, capsys):
+def test_worker_missing_hf_extra_reports_cli_install_hint(monkeypatch, capsys):
     original_import = builtins.__import__
     def without_transformers(name, *args, **kwargs):
         if name == "transformers":
@@ -369,7 +369,7 @@ def test_worker_missing_hf_extra_offers_install_or_automatic(monkeypatch, capsys
     monkeypatch.setattr(builtins, "__import__", without_transformers)
     sizing._worker("organization/model", allow_download=True)
     result = json.loads(capsys.readouterr().out)
-    assert result == {"error": "Install giraffe-llm[hf-tokenizer], or pick Automatic", "code": "missing_dependency"}
+    assert result == {"error": "Install giraffe-llm[hf-tokenizer] to use the model's own tokenizer", "code": "missing_dependency"}
 
 
 async def test_automatic_missing_hf_extra_falls_back_to_packaged_builtin(monkeypatch, local_tokenizer):

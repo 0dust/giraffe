@@ -105,9 +105,14 @@ def test_run_limits_click_targets_and_scrollable_plan_css():
         assert rule in desktop
     assert re.search(r'@media\s*\(max-width:\s*\d+px\)[\s\S]*?\.run-blueprint\s*\{[^}]*position:\s*static;[^}]*max-height:\s*none;[^}]*overflow-y:\s*visible',css)
     browser_logic(r'''
-const html=renderSharedRunSettings(config);assert.equal((html.match(/class="run-limit-selection"/g)||[]).length,4);assert.doesNotMatch(html,/class="test-selection"/);
+const html=renderSharedRunSettings(config);assert.equal((html.match(/class="run-limit-selection"/g)||[]).length,3);assert.doesNotMatch(html,/class="test-selection"/);
+const toggles=[...html.matchAll(/<label class="run-limit-selection"><input type="checkbox" name="([^"]+)" data-limit-toggle="([^"]+)" aria-controls="([^"]+)"/g)];
+assert.deepEqual(toggles.map(match=>match[2]).sort(),['concurrency','max_duration_seconds','max_requests']);
+for(const [,name,field,controls] of toggles){assert.equal(name,field+'_enabled');assert.equal(controls,'field-'+field);assert(html.includes('id="'+controls+'"'));}
+assert.match(html,/<input\b(?=[^>]*type="number")(?=[^>]*name="max_memory_mb")[^>]*>/);
+assert.doesNotMatch(html,/name="max_memory_mb_enabled"/);
 for(const label of html.matchAll(/<label\b[^>]*>[\s\S]*?<\/label>/g))assert.doesNotMatch(label[0],/class="field-info"/);
-for(const field of ['max_duration_seconds','max_requests','concurrency','max_memory_mb'])assert(html.includes('popovertarget="field-'+field+'-help"'));
+for(const field of ['max_duration_seconds','max_requests','concurrency','max_memory_mb','request_timeout_seconds'])assert(html.includes('popovertarget="field-'+field+'-help"'));
 assert.match(renderNew.toString(),/class="run-blueprint" tabindex="0" aria-label="Run plan"/);
 ''')
 

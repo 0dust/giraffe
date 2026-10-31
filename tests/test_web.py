@@ -421,14 +421,20 @@ async def test_bootstrap_exposes_authoritative_configuration_fields(tmp_path):
         assert result["config"]["checks"] == list(DEFAULT_CHECKS)
 
 
-async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provided_config", [False, True], ids=["fresh-browser", "provided-unlimited"])
+async def test_request_plan_is_additive_on_every_setup_endpoint(tmp_path, monkeypatch, provided_config):
     from giraffe.request_pack import pack_preview
 
     monkeypatch.setattr("giraffe.web.run_suite", lambda *a, **k: pytest.fail("Setup sent traffic"))
-    async with browser(tmp_path) as client:
+    defaults = config(checks=list(DEFAULT_CHECKS)) if provided_config else None
+    async with browser(tmp_path, defaults=defaults) as client:
         bootstrap = (await client.get("/api/bootstrap")).json()
         assert bootstrap["request_plan"]["planned_per_target"] == 13
-        values = config(checks=list(DEFAULT_CHECKS))
+        values = bootstrap["config"]
+        assert values["max_requests"] == (None if provided_config else 50000)
+        assert values["max_duration_seconds"] == (None if provided_config else 7200)
+        assert values["concurrency"] == (None if provided_config else 128)
+        values["targets"][0]["model"] = "test-model"
         for endpoint in ("draft", "validate", "preview"):
             response = await client.post(f"/api/config/{endpoint}", json=values)
             assert response.status_code == 200, response.text
