@@ -2257,8 +2257,9 @@ def _cold_start_html(report: RunReport) -> str:
         sections.append(f'<section><h2>Cold start</h2><h3>{_e(name)}</h3><dl>')
         sections.extend(f'<dt>{_e(label)}</dt><dd>{_e(value)}</dd>' for label, value in rows)
         help_text = 'Some servers load weights at startup, in which case it\'s part of "Service answered after".'
-        sections.append(f'</dl><p>{_e(cold.get("model_load", "Not reported by this server"))} '
-                        f'<button type="button" title="{_e(help_text)}" aria-label="Model load information">i</button></p>')
+        model_load = (cold.get("model_load") or "Not reported by this server").removeprefix("Model load: ")
+        sections.append(f'<dt>Model load <button type="button" title="{_e(help_text)}" '
+                        f'aria-label="Model load information">i</button></dt><dd>{_e(model_load)}</dd></dl>')
         if cold.get("measurement_api"):
             sections.append(f'<p>{_e(cold["measurement_api"])}</p>')
         sections.append('<div class="table"><table><tr><th>Request</th><th>First answer</th><th>Latency</th></tr>')

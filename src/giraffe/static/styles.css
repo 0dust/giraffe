@@ -540,7 +540,7 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 /* Review (step 3) */
 #setup-review { padding: 0 32px 8px; border-radius: var(--r-xl); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--highlight); }
 /* Pre-flight sheet: a full-width traffic hero, then "where requests go" beside "what and where". */
-#setup-review > .setup-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "flight" "scope" "criteria" "comparison" "options" "guide"; }
+#setup-review > .setup-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "flight" "scope" "criteria" "guide"; }
 #setup-review .review-main, #setup-review #request-plan { display: contents; }
 .plan-hero { grid-area: hero; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 48px; align-items: end; padding: 26px 0 24px; border-bottom: 1px solid var(--line); }
 .plan-hero > .review-section-heading, .plan-hero > .plan-ceiling, .plan-hero > :is(.review-load, .notice, .actions, .plan-status, .button) { grid-column: 1 / -1; }
@@ -565,13 +565,13 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .plan-flight .review-evaluator { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--line-2); }
 #setup-review #run-bounds { grid-area: scope; align-content: start; }
 #setup-review .review-criteria { grid-area: criteria; padding: 22px 0; border-top: 1px solid var(--line); }
-#setup-review #comparison-settings { grid-area: comparison; padding: 14px 0; border-top: 1px solid var(--line); }
-#setup-review #execution-settings { grid-area: options; padding: 14px 0; border-top: 1px solid var(--line); }
+#launch-settings { margin-bottom: 20px; }
+#launch-settings #comparison-settings, #launch-settings #execution-settings { padding: 14px 0; border-top: 1px solid var(--line); }
 #setup-review #load-guidance { grid-area: guide; }
 #setup-review #load-guidance:not(:empty) { padding: 0 0 18px; }
 @media (min-width: 1024px) {
-  #setup-review > .setup-body { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); column-gap: 56px; align-items: start; grid-template-areas: "hero hero" "flight scope" "criteria scope" "criteria comparison" "criteria options" "guide guide"; grid-template-rows: auto auto auto auto 1fr auto; }
-  #setup-review .review-criteria, #setup-review #execution-settings { align-self: stretch; }
+  #setup-review > .setup-body { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); column-gap: 56px; align-items: start; grid-template-areas: "hero hero" "flight scope" "criteria scope" "guide guide"; grid-template-rows: auto auto 1fr auto; }
+  #setup-review .review-criteria { align-self: stretch; }
 }
 .review-main { display: grid; align-content: start; }
 .review-section { padding: 22px 0; }
@@ -1723,9 +1723,12 @@ main > #report-results { padding-top:20px; }
 .api-key-action { color: var(--accent); }
 .connection-auth > .form-field { margin-top: 12px; }
 #restart-script-setting { position: relative; }
-#restart-script-row .api-key-label { justify-self: start; padding-inline-end: 22px; white-space: nowrap; }
+#restart-script-row .api-key-label { justify-self: start; margin-inline-end: 24px; white-space: nowrap; }
 #restart-script-help { position: absolute; top: 9px; left: 0; min-height: 36px; margin: 0; font-size: 13px; pointer-events: none; }
 #restart-script-help > .field-info, #restart-script-help > .field-help { pointer-events: auto; }
+#restart-script-preview pre, #review-restart pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+#restart-script-preview dd, #review-restart dd { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+#restart-script-preview dt, #review-restart dt { flex-shrink: 0; }
 .setup-advanced > .details-content { padding: 12px 0; gap: 16px; }
 @media (max-width: 599px) {
   .connection-auth > .api-key-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; }

@@ -2443,7 +2443,7 @@ function renderReviewScope(payload) {
   if(!config.checks.length)problems.push({msg:'Select at least one check.',fields:['checks']});
   if(usesPack&&!cases.length)problems.push({msg:'Add a question or choose built-in examples.',fields:['request_pack']});
   if(usesPack&&cases.some(item=>item.scorer==='judge')&&!judgesReady(config))problems.push({msg:'Configure the AI evaluator for questions that need it.',fields:['judging']});
-  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${renderSettingIssues(problems,'warning')}${renderRestartConfirmation(config)}`;
+  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${renderSettingIssues(problems,'warning')}`;
 }
 function browseCheckIntent(category) {
   if(!checkGroups.some(group=>group.id===category))return;
@@ -2663,10 +2663,13 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
   ${renderSharedRunSettings(c)}${renderCheckSelection(c)}</section>
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
-  <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
-  <div class="review-main"><div id="run-bounds"></div>
+  <section class="setup-section" id="launch-settings"><div id="launch-restart">${renderRestartConfirmation(c)}</div>
   <div class="fields" id="comparison-settings">${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div>
   <details class="setup-disclosure" id="execution-settings"><summary>Saved with this run <span class="dim" id="saved-run-summary">${escape(savedRunSummary(target.name,c.retention))}</span></summary><div class="details-content"><div class="fields">${selectField('retention','Save model answers',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${retentionLabels[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Name in reports',target.name,{required:true,placeholder:'local',hint:'',help:'Labels this server in reports and comparisons.'})}</div></div></details>
+  </section>
+  <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
+  <div class="review-main"><div id="run-bounds"></div>
+
   </div><section id="request-plan" class="request-plan review-section"></section><div id="setup-history" hidden></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Apply changes before returning to the form.</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor',hint:'',help:[fieldDescription('config_editor').help,inputRetentionNotice].join(' ')})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" tabindex="0" aria-label="Run plan" hidden></aside>
@@ -2735,6 +2738,7 @@ function updateBounds() {
     const card=$(`[data-test-card="${check.id}"]`);
     updateCheckRow(check,c,card);
   }
+  const restart=$('#launch-restart');if(restart)restart.innerHTML=renderRestartConfirmation(c);
   $('#run-bounds').innerHTML=renderReviewScope(payload);
   const selectionText=`${c.checks.length} ${c.checks.length===1?'check':'checks'} selected`;
   if($('#selection-summary').textContent!==selectionText)$('#selection-summary').textContent=selectionText;
@@ -2776,7 +2780,7 @@ function invalidateRestartPreview() {
   state.restartPreviewSequence++;state.restartPreview=null;invalidateRestartConfirmation();renderRestartPreview();
 }
 function renderScriptContents(preview) {
-  return `<dl class="bound-list"><div><dt>Full path</dt><dd>${escape(preview.path)}</dd></div><div><dt>Machine</dt><dd>${escape(preview.machine)}</dd></div><div><dt>SHA-256</dt><dd class="mono">${escape(preview.sha256)}</dd></div></dl><pre>${escape(preview.contents)}</pre>`;
+  return `<dl class="bound-list"><div><dt>Full path</dt><dd>${escape(preview.path)}</dd></div><div><dt>Machine</dt><dd>${escape(preview.machine)}</dd></div><div><dt>SHA-256</dt><dd class="mono">${escape(preview.sha256)}</dd></div></dl><pre tabindex="0">${escape(preview.contents)}</pre>`;
 }
 function renderRestartScriptRow(target,config) {
   if(!state.bootstrap.restart_allowed)return `<div class="field-label"><span class="hint">Restart scripts unavailable</span>${infoHelp('restart_permission','Restart scripts unavailable','Restart scripts are disabled on this bind. Start giraffe ui with --allow-restart-script to enable them.')}</div>`;
@@ -2788,7 +2792,7 @@ function watchRestartScriptRow() {
   const summary=$('#restart-script-row > summary'),label=$('#restart-script-row .api-key-label'),help=$('#restart-script-help'),row=$('#restart-script-setting');if(!summary||!label||!help||!row)return;
   const resize=()=>{
     const bounds=row.getBoundingClientRect(),heading=summary.getBoundingClientRect(),text=label.getBoundingClientRect();
-    help.style.left=`${text.right-bounds.left-16}px`;help.style.top=`${heading.top-bounds.top}px`;help.style.height=`${heading.height}px`;
+    help.style.left=`${text.right-bounds.left+8}px`;help.style.top=`${heading.top-bounds.top}px`;help.style.height=`${heading.height}px`;
   };
   resize();
   if(typeof ResizeObserver!=='undefined'){state.restartRowObserver=new ResizeObserver(resize);state.restartRowObserver.observe(summary);state.restartRowObserver.observe(label);}
@@ -3415,7 +3419,7 @@ function renderColdStart(report=state.detail?.report) {
   if(!targets.length)return '';
   return `<section id="results-cold-start" class="panel report-result-section"><h2>Cold start</h2>${targets.map(([name,item],index)=>{
     const restart=item.restart,first=restart.first_request || {},warm=restart.warm_requests || [];
-    const rows=[['Script time',ms(restart.script_ms)],['Service answered after',ms(restart.service_answered_ms)],['First answer after',ms(restart.readiness_ms)],['Model load',restart.model_load || 'Not reported by this server'],['Model loaded before first request',restart.model_loaded_before_first_request || 'Unknown']];
+    const rows=[['Script time',ms(restart.script_ms)],['Service answered after',ms(restart.service_answered_ms)],['First answer after',ms(restart.readiness_ms)],['Model load',(restart.model_load || 'Not reported by this server').replace(/^Model load: /,'')],['Model loaded before first request',restart.model_loaded_before_first_request || 'Unknown']];
     return `${targets.length>1?`<h3>${escape(name)}</h3>`:''}<dl class="bound-list">${rows.map(([label,value])=>`<div><dt>${escape(label)}${label==='Model load'?infoHelp(`cold_model_load_${index}`,'Model load','Some servers load weights at startup, in which case it\'s part of "Service answered after".'):''}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>${restart.measurement_api?`<p class="hint">${escape(restart.measurement_api)}</p>`:''}<div class="metric-table"><table><thead><tr><th>Request</th><th>First-answer time</th><th>Latency</th></tr></thead><tbody>${[first,...warm].map((request,index)=>`<tr><th scope="row">${index?`Follow-up ${index}`:'First request'}</th><td>${request.first_output_ms==null?'Not measured':ms(request.first_output_ms)}${request.first_output_kind==='reasoning'?'<p class="hint">First output was reasoning; no answer within the output cap.</p>':''}${request.reason?`<p class="hint">${escape(request.reason)}</p>`:''}</td><td>${request.elapsed_ms==null?'Not measured':ms(request.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>${restart.reason?`<p>${escape(restart.reason)}</p>`:''}${restart.output_tail?`<details class="check-observations"><summary>Restart script output</summary><pre>${escape(restart.output_tail)}</pre></details>`:''}`;
   }).join('')}</section>`;
 }

@@ -51,6 +51,21 @@ def test_cold_start_reasoning_and_unmeasured_warm_output_are_labelled():
     assert "None ms" not in html
 
 
+@pytest.mark.parametrize("value", ["Model load: 1.38 s, reported by Ollama", "Not reported by this server",
+                                 "Model was already loaded"])
+def test_cold_start_model_load_value_has_one_label_and_preserves_json(value):
+    from giraffe.reporting import _cold_start_html
+
+    report = make_report()
+    report.observations["targets"] = {"local": {"restart": {"model_load": value}}}
+    original = report.model_dump_json()
+    html = _cold_start_html(report)
+    assert '<dt>Model load' in html
+    assert f'<dd>{value.removeprefix("Model load: ")}</dd>' in html
+    assert '<dd>Model load: ' not in html
+    assert report.model_dump_json() == original
+
+
 def test_comparison_setting_reasons_include_structured_values_without_changing_text():
     current, previous = make_report(), make_report("baseline")
     current.manifest["config"]["request_timeout_seconds"] = 300

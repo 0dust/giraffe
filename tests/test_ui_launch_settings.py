@@ -1,6 +1,7 @@
 """Launch controls and the closed restart row keep their existing form contract."""
 
 from pathlib import Path
+import re
 
 from tests.test_run_limits_phase6_ui import Markup, rendered_form
 from tests.test_ux_catalogue import browser_logic
@@ -68,6 +69,39 @@ def test_comparison_is_an_always_visible_equal_grid_and_saved_disclosure_has_onl
     help_text, = [node for node in tree.nodes if node.get('id') == 'field-name-help-text']
     assert help_text['text'] == 'Labels this server in reports and comparisons.'
     assert not any(node.get('id') == 'field-name-hint' for node in tree.nodes)
+    review, = [node for node in tree.nodes if node.get('id') == 'setup-review']
+    assert review not in details['parents'] and review not in grid['parents']
+    launch, = [node for node in tree.nodes if node.get('id') == 'launch-settings']
+    assert details['parents'][-1] is grid['parents'][-1] is launch
+    assert launch['parents'][-1] is review['parents'][-1]
+    assert tree.nodes.index(grid) < tree.nodes.index(details) < tree.nodes.index(review)
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    assert re.search(r'\.fields \{[^}]*grid-template-columns: repeat\(2, minmax\(0,1fr\)\)', css)
+    assert '.fields, .fields.three { grid-template-columns: minmax(0,1fr); }' in css
+    assert '#setup-review #comparison-settings' not in css
+    assert '#setup-review #execution-settings' not in css
+    assert '#setup-review > .setup-body { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); column-gap: 56px;' in css
+
+
+def test_launch_settings_span_above_review_grid_with_restart_first_only_when_configured():
+    html = browser_logic(r'''
+nodes['#main']={};nodes['#config-editor']={};
+nodes['#new-run-form']={elements:new Proxy({}, {get(target,name){return target[name] ||= {dataset:{},value:''};}})};
+state.jsonDraft=state.jsonBase='synced';state.bootstrap.restart_allowed=true;
+config.targets[0].restart_script='/tmp/restart.sh';
+syncTestControls=updateBounds=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=()=>{};
+renderNew();console.log(JSON.stringify(nodes['#main'].innerHTML));
+''')
+    tree = Markup(html)
+    review, = [node for node in tree.nodes if node.get('id') == 'setup-review']
+    ordered = [next(node for node in tree.nodes if node.get('id') == name)
+               for name in ('review-restart', 'comparison-settings', 'execution-settings', 'setup-review')]
+    assert [tree.nodes.index(node) for node in ordered] == sorted(tree.nodes.index(node) for node in ordered)
+    for node in ordered[:-1]:
+        assert review not in node['parents']
+        assert any(parent.get('id') == 'setup-panel-3' for parent in node['parents'])
+    assert len(tree.named('confirm_restart_script')) == 1
+    assert not any(node.get('id') == 'review-restart' for node in Markup(rendered_form()).nodes)
 
 
 def test_saved_summary_updates_on_name_input_and_retention_change_without_opening():
@@ -124,8 +158,31 @@ nodes['#restart-script-help']={style:{}};
 const observed=[];ResizeObserver=class{constructor(callback){resize=callback;}observe(node){observed.push(node);}};
 watchRestartScriptRow();assert.equal(disconnected,true);
 assert.equal(nodes['#restart-script-help'].style.height,'76px');
-assert.equal(nodes['#restart-script-help'].style.left,'154px');assert.equal(nodes['#restart-script-help'].style.top,'9px');
+assert.equal(nodes['#restart-script-help'].style.left,'178px');assert.equal(nodes['#restart-script-help'].style.top,'9px');
+assert.equal(Number.parseFloat(nodes['#restart-script-help'].style.left)+20-right,8);
 assert.equal(observed.length,2);
 height=36;right=180;resize();assert.equal(nodes['#restart-script-help'].style.height,'36px');
-assert.equal(nodes['#restart-script-help'].style.left,'144px');
+assert.equal(nodes['#restart-script-help'].style.left,'168px');
+assert.equal(Number.parseFloat(nodes['#restart-script-help'].style.left)+20-right,8);
 ''')
+
+
+def test_script_preview_wraps_and_scrolls_with_keyboard_access_on_connect_and_launch():
+    html = browser_logic(r'''
+state.bootstrap.restart_allowed=true;config.targets[0].restart_script='/tmp/restart.sh';
+state.restartPreview={status:'current',route:state.routeVersion,requestedPath:'/tmp/restart.sh',
+path:'/tmp/'+('long'.repeat(100)),sha256:'a'.repeat(64),machine:'local',contents:'#!/bin/sh\n'+('long'.repeat(1000))};
+console.log(JSON.stringify([renderScriptContents(state.restartPreview),renderRestartConfirmation(config)]));
+''')
+    for markup in html:
+        tree = Markup(markup)
+        pre, = [node for node in tree.nodes if node['tag'] == 'pre']
+        assert pre['tabindex'] == '0'
+        assert pre['text'] == '#!/bin/sh\n' + 'long' * 1000
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    rule = re.search(r'#restart-script-preview pre, #review-restart pre\s*\{([^}]+)\}', css)
+    assert rule
+    for declaration in ('white-space: pre-wrap', 'overflow-wrap: anywhere', 'max-height: 320px', 'overflow-y: auto'):
+        assert declaration in rule[1]
+    assert re.search(r'#restart-script-preview dd, #review-restart dd\s*\{[^}]*overflow-wrap: anywhere', css)
+    assert re.search(r'#restart-script-row \.api-key-label\s*\{[^}]*margin-inline-end: 24px', css)

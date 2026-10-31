@@ -20,6 +20,19 @@ assert.doesNotMatch(html,/<bad>/);
 ''')
 
 
+def test_model_load_values_omit_repeated_label_without_changing_json_evidence():
+    run_browser_logic(r'''
+for(const value of ['Model load: 1.38 s, reported by Ollama','Not reported by this server','Model was already loaded']){
+ const report={observations:{targets:{local:{restart:{model_load:value}}}}},original=JSON.stringify(report);
+ const html=renderColdStart(report);
+ assert.match(html,/<dt>Model load<button/);
+ assert(html.includes('<dd>'+value.replace(/^Model load: /,'')+'</dd>'));
+ assert.doesNotMatch(html,/<dd>Model load: /);
+ assert.equal(JSON.stringify(report),original);
+}
+''')
+
+
 def test_script_row_reuses_connection_pattern_and_hides_when_disallowed():
     run_browser_logic(r"""
 const config={restart_script_timeout_seconds:600},target={restart_script:'/tmp/restart.sh'};
