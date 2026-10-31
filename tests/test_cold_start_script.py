@@ -187,15 +187,23 @@ async def test_no_confirmation_or_changed_hash_never_executes(tmp_path):
 
 
 async def test_script_exits_without_waiting_for_inherited_output_handle(tmp_path):
-    path = script(tmp_path, "sleep 0.6 &\necho complete\n")
+    child_pid = tmp_path / "child.pid"
+    path = script(tmp_path, f"sleep 20 &\necho $! > '{child_pid}'\necho complete\n")
     run, target, events = run_context(tmp_path, path)
     started = time.monotonic()
-    assert await runner._restart(run, target)
-    assert time.monotonic() - started < .5
-    obs = run.observations["local"]["restart"]
-    assert "complete" in obs["output_tail"] and obs["script_ms"] >= 0
-    assert stat.S_IMODE((tmp_path / "restart.log").stat().st_mode) == 0o600
-    assert events[0][0][1:4] == ("restart_script", "Running restart script", "running")
+    try:
+        assert await runner._restart(run, target)
+        assert time.monotonic() - started < 10
+        obs = run.observations["local"]["restart"]
+        assert "complete" in obs["output_tail"] and obs["script_ms"] >= 0
+        assert stat.S_IMODE((tmp_path / "restart.log").stat().st_mode) == 0o600
+        assert events[0][0][1:4] == ("restart_script", "Running restart script", "running")
+    finally:
+        if child_pid.exists():
+            try:
+                os.kill(int(child_pid.read_text()), 15)
+            except ProcessLookupError:
+                pass
 
 
 async def test_nonzero_is_blocked_with_output_and_exit_code(tmp_path):
