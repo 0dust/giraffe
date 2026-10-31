@@ -32,6 +32,9 @@ assert.match(html,/when-closed">Edit/);assert.match(html,/when-open">Close/);
 assert.match(html,/name="restart_script_timeout_seconds"[^>]*value="600"/);
 assert.match(html,/class="field-info"/);
 assert.match(html,/name="restart_script"/);
+assert.match(html,/>Script path<\/label>/);
+assert.match(html,/placeholder="\/path\/to\/restart.sh"/);
+assert.equal(html.split('Restart script (optional)').length-1,1);
 state.bootstrap.restart_allowed=false;
 html=renderRestartScriptRow(target,config);
 assert.doesNotMatch(html,/name="restart_script"/);
@@ -40,6 +43,12 @@ assert.equal(renderRestartConfirmation({targets:[target]}),'');
 state.bootstrap.restart_allowed=true;
 assert.equal(renderRestartConfirmation({targets:[{}]}),'');
 """)
+
+
+def test_connection_rows_share_wider_desktop_label_column_and_original_phone_rule():
+    css = APP.with_name("styles.css").read_text()
+    assert ".connection-auth > .api-key-row { display: grid; grid-template-columns: 176px minmax(0, 1fr) auto;" in css
+    assert "@media (max-width: 599px) {\n  .connection-auth > .api-key-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; }" in css
 
 
 def test_confirmation_is_explicit_ephemeral_and_invalidated_by_config_or_path_changes():

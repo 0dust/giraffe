@@ -47,7 +47,7 @@ def observation(report):
 
 def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_000,
                 first_delay=0, models_status=200, reasoning_only=False,
-                cold_failure=None, warm_failure=False):
+                cold_failure=None, warm_failure=False, native_failure=None, native_failure_on=1):
     calls = []
     native_count = 0
     measurement_count = 0
@@ -85,6 +85,10 @@ def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_00
             return httpx.Response(models_status, json={"data": []})
         if path == "/api/chat":
             native_count += 1
+            if native_failure is not None and native_count == native_failure_on:
+                if isinstance(native_failure, int):
+                    return httpx.Response(native_failure, json={"error": "native unavailable"})
+                return httpx.Response(200, content=native_failure)
             if native_count == 1:
                 await asyncio.sleep(first_delay)
             answer = payload["messages"][-1]["content"].split(":", 1)[0]
@@ -127,6 +131,8 @@ async def test_native_three_measurements_then_unchanged_normal_checks(monkeypatc
     restart = observation(report)
     assert restart["status"] == "ready"
     assert restart["measurement_api"] == cold_start.NATIVE_API_LABEL
+    from giraffe.reporting import _cold_start_html
+    assert "Measured through Ollama&#x27;s native API" in _cold_start_html(report)
     assert restart["model_load_ms"] == 903
     assert restart["model_loaded_before_first_request"] == "No"
     assert restart["script_ms"] <= restart["service_answered_ms"] <= restart["readiness_ms"]
@@ -145,6 +151,52 @@ async def test_native_three_measurements_then_unchanged_normal_checks(monkeypatc
     assert all(body["stream"] is True for body in native)
     assert all(body["stream"] is False for _, body in inference[3:])
     assert next(check for check in report.checks if check.id == "serving").status == "pass"
+
+
+@pytest.mark.parametrize("failure", [400, 401, 404, 405, "not JSON", "{}\n",
+    '{"done":true,"message":[]}\n', '{"done":true,"message":{"content":42}}\n',
+    '{"done":true,"done_reason":[],"message":{"content":"1"}}\n',
+    '{"done":"yes","message":{"content":"1"}}\n',
+    '{"done":false,"message":{"content":"1"}}\n'])
+async def test_unusable_native_cold_request_falls_back_for_cold_and_warm(monkeypatch, tmp_path, failure):
+    calls = mocked_http(monkeypatch, native_failure=failure)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass")))
+    restart = observation(report)
+    assert restart["status"] == "ready"
+    assert restart["model_load"] == "Not reported by this server"
+    assert restart["model_loaded_before_first_request"] == "Unknown"
+    assert "measurement_api" not in restart and "model_load_ms" not in restart
+    assert restart["first_request"]["first_output_ms"] is not None
+    assert all(item["first_output_ms"] is not None for item in restart["warm_requests"])
+    paths = [path for method, path, _ in calls if method == "POST"]
+    assert paths == ["/api/chat"] + ["/v1/chat/completions"] * 6
+    assert next(c for c in report.checks if c.id == "serving").status == "pass"
+    from giraffe.reporting import _cold_start_html
+    assert "Measured through" not in _cold_start_html(report)
+
+
+async def test_unusable_native_warm_request_falls_back_and_removes_native_label(monkeypatch, tmp_path):
+    calls = mocked_http(monkeypatch, native_failure=404, native_failure_on=2)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass")))
+    restart = observation(report)
+    assert restart["status"] == "ready"
+    assert restart["model_load"] == "Not reported by this server"
+    assert "measurement_api" not in restart and "model_load_ms" not in restart
+    assert all(item["first_output_ms"] is not None for item in restart["warm_requests"])
+    paths = [path for method, path, _ in calls if method == "POST"]
+    assert paths == ["/api/chat"] * 2 + ["/v1/chat/completions"] * 5
+
+
+async def test_native_detection_without_native_numbers_never_claims_native_measurement(monkeypatch, tmp_path):
+    mocked_http(monkeypatch, cold_failure=503)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=.1))
+    restart = observation(report)
+    assert restart["status"] == "blocked"
+    assert restart["first_request"]["first_output_ms"] is None
+    assert "measurement_api" not in restart
+    from giraffe.reporting import _cold_start_html
+    assert "Measured through" not in _cold_start_html(report)
 
 
 @pytest.mark.parametrize("native", [True, False])

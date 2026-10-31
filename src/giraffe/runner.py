@@ -1175,7 +1175,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 initial_specs = builtin_fixtures(response_config, check_id="serving")["short"]
                 if restart and restart["status"] == "hook_completed":
                     from .cold_start import (NATIVE_API_LABEL, OllamaColdClient, cold_spec,
-                                             detect_ollama, model_load_evidence, output_measurement,
+                                             detect_ollama, model_load_evidence, native_fallback, output_measurement,
                                              residency, retry_readiness)
                     started = restart["started_monotonic"]
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
@@ -1184,6 +1184,22 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     measured_client = client
                     native = False
                     before = "unknown"
+
+                    async def measure_restart(probe, *, deadline_override=None):
+                        nonlocal measured_client, native
+                        record = await run.request(target, measured_client, probe,
+                                                   deadline_override=deadline_override, budget_exempt=True)
+                        if native and record is not None and native_fallback(record):
+                            native = False
+                            measured_client = client
+                            restart.pop("measurement_api", None)
+                            restart.pop("model_load_ms", None)
+                            restart.update(model_load="Not reported by this server",
+                                           model_loaded_before_first_request="Unknown")
+                            record = await run.request(target, client, probe,
+                                                       deadline_override=deadline_override, budget_exempt=True)
+                        return record
+
                     while time.monotonic() < ready_deadline and not run.stop_reason(target.name):
                         try:
                             async with asyncio.timeout_at(ready_deadline):
@@ -1203,11 +1219,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                 native = await detect_ollama(target, config, deadline=ready_deadline, stop=run.stop)
                                 if native:
                                     measured_client = OllamaColdClient(client)
-                                    restart["measurement_api"] = NATIVE_API_LABEL
                                     before = await residency(target, config, deadline=ready_deadline, stop=run.stop)
                             probe = cold_spec(initial_specs[0])
-                            record = await run.request(target, measured_client, probe, deadline_override=ready_deadline,
-                                                       budget_exempt=True)
+                            record = await measure_restart(probe, deadline_override=ready_deadline)
                             if record is None:
                                 break
                             measurement = output_measurement(record)
@@ -1218,6 +1232,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                     + measurement["first_output_ms"], 3) if measurement["first_output_ms"] is not None else None
                                 restart["first_output_kind"] = measurement["first_output_kind"]
                                 if native:
+                                    restart["measurement_api"] = NATIVE_API_LABEL
                                     after = await residency(target, config, deadline=ready_deadline, stop=run.stop)
                                     restart.update(model_load_evidence(before, after,
                                         record.workload.get("reported_load_duration_ns")))
@@ -1237,7 +1252,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     # cache reuse in the two cold-start follow-up measurements.
                     from .cold_start import warm_specs
                     for probe in warm_specs(initial_specs[0]):
-                        record = await run.request(target, measured_client, probe, budget_exempt=True)
+                        record = await measure_restart(probe)
                         restart["warm_requests"].append(output_measurement(record) if record is not None else {
                             "first_output_ms": None, "elapsed_ms": None,
                             "reason": run.stop_reason(target.name) or "No request completed"})

@@ -49,6 +49,13 @@ def retry_readiness(record):
     }
 
 
+def native_fallback(record):
+    """An incompatible native route must not prevent usual-route measurement."""
+    return not retry_readiness(record) and (
+        not record.workload.get("native_response_complete")
+        or "first_output_kind" not in output_measurement(record))
+
+
 def _measurement_spec(base, number, scenario):
     # These prompts have seven tokens each in the bundled reference encoding.
     # Different leading digits avoid sharing the complete user-prompt prefix;
@@ -108,8 +115,7 @@ async def detect_ollama(target, config, *, deadline=None, stop=None):
             inventory = await deployment._read(client, str(_native_url(target, "/api/ps")))
             version = await deployment._read(client, str(_native_url(target, "/api/version")))
         return (isinstance(inventory, dict) and isinstance(inventory.get("models"), list)
-                and isinstance(version, dict) and isinstance(version.get("version"), str)
-                and bool(version["version"]))
+                and isinstance(version, dict) and isinstance(version.get("version"), str))
 
     return await _observation(probe, deadline=deadline, stop=stop, default=False)
 
@@ -188,16 +194,24 @@ class _NativeStream(httpx.AsyncByteStream):
                 yield b"data: [DONE]\n\n"
 
     def _event(self, data):
+        if not isinstance(data.get("done"), bool):
+            raise _ProtocolError("native response is missing a boolean done field")
         done = data.get("done") is True
-        message = data.get("message", {})
+        message = data.get("message")
         if not isinstance(message, dict):
             raise _ProtocolError("response is missing assistant content")
+        if not any(key in message for key in ("content", "thinking")) or any(
+                not isinstance(message[key], str) for key in ("content", "thinking") if key in message):
+            raise _ProtocolError("native response is missing assistant text")
         delta = {"content": message.get("content", ""),
                  "reasoning_content": message.get("thinking", "")}
         finish = data.get("done_reason", "stop") if done else None
+        if done and not isinstance(finish, str):
+            raise _ProtocolError("invalid native completion finish reason")
         event = {"model": data.get("model"), "choices": [{
             "delta": delta, "finish_reason": finish}]}
         if done:
+            self.evidence["native_response_complete"] = True
             self.evidence["reported_load_duration_ns"] = data.get("load_duration")
             event["usage"] = {"prompt_tokens": data.get("prompt_eval_count"),
                               "completion_tokens": data.get("eval_count")}
@@ -269,5 +283,7 @@ class OllamaColdClient:
         reported = evidence.get("reported_load_duration_ns")
         if _valid_duration(reported):
             record.workload["reported_load_duration_ns"] = reported
-        record.workload["measurement_api"] = NATIVE_API_LABEL
+        record.workload["native_response_complete"] = evidence.get("native_response_complete", False)
+        if "first_output_kind" in output_measurement(record) and not native_fallback(record):
+            record.workload["measurement_api"] = NATIVE_API_LABEL
         return record

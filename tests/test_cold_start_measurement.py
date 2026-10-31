@@ -106,12 +106,40 @@ async def test_detection_is_read_only_authenticated_and_ignores_discovery(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inventory", [{}, [], None, "OK", {"models": None},
+                                       {"models": {}}, {"models": "models"}])
+async def test_detection_rejects_malformed_inventory(monkeypatch, inventory):
+    target, config = settings()
+    install_transport(monkeypatch, lambda request: httpx.Response(200, content=json.dumps(
+        inventory if request.url.path == "/api/ps" else {"version": "0.31"})))
+    assert not await detect_ollama(target, config)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("inventory,version", [({}, {"version": "0.31"}), ({"models": []}, {}),
-                                              ({"models": []}, {"version": 31})])
+    ({"models": []}, {"version": 31}), ({"models": []}, {"version": None}),
+    ({"models": []}, {"version": []}), ({"models": []}, []),
+    ({"models": []}, None), ({"models": []}, "OK")])
 async def test_detection_rejects_non_ollama_shapes(monkeypatch, inventory, version):
     target, config = settings()
     install_transport(monkeypatch, lambda request: httpx.Response(
-        200, json=inventory if request.url.path == "/api/ps" else version))
+        200, content=json.dumps(inventory if request.url.path == "/api/ps" else version)))
+    assert not await detect_ollama(target, config)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [None, "/api/ps", "/api/version"])
+@pytest.mark.parametrize("body", ["OK", "<html>Welcome</html>", "{invalid"])
+async def test_detection_rejects_generic_200_and_non_json_bodies(monkeypatch, path, body):
+    target, config = settings()
+
+    def handler(request):
+        if path is None or request.url.path == path:
+            return httpx.Response(200, text=body)
+        return httpx.Response(200, json={"models": []} if request.url.path == "/api/ps"
+                              else {"version": "0.31"})
+
+    install_transport(monkeypatch, handler)
     assert not await detect_ollama(target, config)
 
 
