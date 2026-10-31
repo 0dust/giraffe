@@ -1421,3 +1421,16 @@ config.tool_calling=true;config.stream=false;
 assert.throws(()=>configureProfiles(config,new Map(),{},{limits:bootstrap.limits}),/Enable streaming/);
 config.tool_calling=false;assert.doesNotThrow(()=>configureProfiles(config,new Map(),{},{limits:bootstrap.limits}));
 """)
+
+
+def test_step_one_metrics_url_placeholders():
+    from tests.test_run_limits_phase6_ui import Markup, rendered_form
+
+    tree = Markup(rendered_form())
+    for name, expected in [
+        ('metrics_url', 'Optional, e.g. http://localhost:8000/metrics'),
+        ('host_metrics_url', 'Optional, e.g. http://localhost:9100/metrics'),
+    ]:
+        control, = tree.named(name)
+        assert control['placeholder'] == expected
+        assert any(parent.get('id') == 'setup-panel-1' for parent in control['parents'])
