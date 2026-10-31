@@ -14,12 +14,14 @@ from tests.test_ux_setup import run_browser_logic
 
 
 def test_shared_timeout_and_load_override_are_visible_and_independent():
-    connection = rendered_form().split('data-setup-panel="2"', 1)[0]
-    assert 'Request timeout (seconds)' in connection
-    assert 'name="request_timeout_seconds" type="number" value="300"' in connection
+    tree = Markup(rendered_form())
+    timeout, = tree.named('request_timeout_seconds')
+    assert timeout['value'] == '300'
+    assert any(parent.get('id') == 'shared-settings' for parent in timeout['parents'])
     browser_logic(FORM + r'''
 const shared=renderSharedRunSettings(config),load=renderLoadEditor(config);
-assert.doesNotMatch(shared,/name="request_timeout_seconds"/);
+assert.match(shared,/name="request_timeout_seconds"/);
+assert.equal(settingDestination('request_timeout_seconds').step,2);
 assert.match(load,/Send new requests for \(seconds\)/);
 assert.doesNotMatch(load,/load_schedule_finish_seconds|Wait for unfinished|Duration per workload/);
 assert.equal(settingDestination('request_timeout_seconds').name,'request_timeout_seconds');
@@ -107,28 +109,25 @@ assert.doesNotMatch(html,/The affected test traffic did not run/);
 ''')
 
 
-@pytest.mark.parametrize("token_id", ["auto", "saved/tokenizer"])
-def test_connection_setup_has_one_editable_token_id_box(token_id):
+@pytest.mark.parametrize("token_id,mode", [(None, "auto"), ("auto", "auto"),
+                                          ("builtin", "builtin"), ("saved/tokenizer", "custom")])
+def test_connection_setup_has_one_native_tokenizer_select(token_id, mode):
     config = RunConfig(targets=[{"name": "saved", "url": "http://localhost/v1", "model": "test", "tokenizer": token_id}])
     connection = rendered_form(config).split('data-setup-panel="2"', 1)[0]
-    assert connection.count('name="tokenizer"') == 1
-    assert 'Token ID / tokenizer</label>' in connection
     tree = Markup(connection)
     tokenizer, = tree.named('tokenizer')
-    assert any(parent.get('class') == 'form-field' for parent in tokenizer['parents'])
-    assert tokenizer['aria-describedby'] == 'tokenizer-status'
-    assert 'Token counting' not in connection
-    assert 'aria-controls="tokenizer-options"' in connection
-    assert 'role="combobox"' in connection
-    assert 'role="listbox"' in connection
-    assert tokenizer["value"] == ("Automatic" if token_id == "auto" else token_id)
-    assert 'data-token-id="builtin"' in connection
-    assert 'tokenizer-help' not in connection
+    assert tokenizer['tag'] == 'select'
+    assert 'Token ID / tokenizer</label>' in connection
+    options = [node for node in tree.nodes if node['tag'] == 'option' and tokenizer in node['parents']]
+    assert [(node['value'], node['text']) for node in options] == [('auto', 'Automatic'), ('builtin', 'builtin'), ('custom', 'Custom')]
+    assert [node['value'] for node in options if 'selected' in node] == [mode]
+    custom, = tree.named('tokenizer_custom')
+    assert custom['value'] == (token_id if mode == 'custom' else '')
+    assert custom['placeholder'] == 'Qwen/Qwen2.5-7B-Instruct'
+    assert 'id="tokenizer-help"' not in connection
     assert 'Tokenizer files download' not in connection
-    assert 'Automatic checks the model name' not in connection
-    assert 'class="tokenizer-options" role="listbox" aria-label="Token ID options"' in connection
-    assert connection.count('role="option" tabindex="-1"') == 2
-    assert 'id="tokenizer-status" class="hint" role="status" aria-live="polite"' in connection
+    assert 'tokenizer-combobox' not in connection
+    assert 'tokenizer-options' not in connection
     assert 'retry-tokenizer' not in connection
     assert 'name="metrics_url"' in connection and 'Server metrics URL</label>' in connection
     assert 'Performance metrics' not in connection
@@ -142,13 +141,13 @@ assert.match(gpu,/Automatic metrics discovery/);assert.doesNotMatch(gpu,/Metrics
 ''')
 
 
-def test_form_preserves_same_box_tokenizer_selection():
+def test_form_preserves_native_tokenizer_selection():
     browser_logic(FORM + r'''
-form.elements.tokenizer={value:'Automatic'};
+form.elements.tokenizer={value:'auto'};form.elements.tokenizer_custom={value:''};
 assert.equal(readForm(false).config.targets[0].tokenizer,'auto');
 form.elements.tokenizer.value='builtin';
 assert.equal(readForm(false).config.targets[0].tokenizer,'builtin');
-form.elements.tokenizer.value='qwen2.5-7b';
+form.elements.tokenizer.value='custom';form.elements.tokenizer_custom.value=' qwen2.5-7b ';
 assert.equal(readForm(false).config.targets[0].tokenizer,'qwen2.5-7b');
 assert.equal(readForm(false).config.targets[0].model,state.config.targets[0].model);
 ''')
@@ -167,14 +166,15 @@ assert.match(html,/Reference counts, not server usage/);
 
 
 TOKENIZER_FORM = FORM + r'''
-form.elements.tokenizer={name:'tokenizer',value:'Automatic'};
+form.elements.tokenizer={name:'tokenizer',value:'auto'};
+form.elements.tokenizer_custom={name:'tokenizer_custom',value:''};
 nodes['#tokenizer-status']={textContent:'',classList:{toggle(){}}};
 syncSetupStep=()=>{};
 configChanged=updateBounds=()=>{throw Error('Preview must not change configuration or invalidate the plan');};
 '''
 
 
-@pytest.mark.parametrize("choice", ["Automatic", "builtin", "auto", ""])
+@pytest.mark.parametrize("choice", ["auto", "builtin"])
 def test_default_tokenizer_never_previews_gates_or_changes_the_plan(choice):
     browser_logic(TOKENIZER_FORM + r'''
 form.elements.tokenizer.value=CHOICE;
@@ -191,7 +191,7 @@ assert.equal(state.requestPreview,savedPlan);assert.equal(state.requestPreview.s
 
 def test_typed_tokenizer_verifies_exact_name_and_does_not_invalidate_plan():
     browser_logic(TOKENIZER_FORM + r'''
-form.elements.tokenizer.value='Qwen/Qwen2.5-7B';
+form.elements.tokenizer.value='custom';form.elements.tokenizer_custom.value='Qwen/Qwen2.5-7B';
 let called=null;
 api=async(path,options)=>{called={path,body:JSON.parse(options.body)};return {status:'ready',tokenizer:'Qwen/Qwen2.5-7B',message:''};};
 scheduleTokenizerSelection({immediate:true});assert.equal(tokenizerSetupReady(),false);
@@ -206,7 +206,7 @@ assert.equal(readForm(false).config.targets[0].tokenizer,'Qwen/Qwen2.5-7B');
 
 def test_typed_tokenizer_failure_and_timeout_show_backend_error_and_clear_on_edit():
     browser_logic(TOKENIZER_FORM + r'''
-form.elements.tokenizer.value='missing/model';
+form.elements.tokenizer.value='custom';form.elements.tokenizer_custom.value='missing/model';
 for(const message of ['Could not load tokenizer "missing/model": Install giraffe-llm[hf-tokenizer] or pick Automatic.',
  'Could not load tokenizer "missing/model": setup timed out.']){
  state.tokenizerSelection=null;
@@ -216,10 +216,10 @@ for(const message of ['Could not load tokenizer "missing/model": Install giraffe
  assert.equal(nodes['#tokenizer-status'].textContent,message);
  assert.equal(nodes['#tokenizer-status'].className,'notice error');
 }
-form.elements.tokenizer.value='different/model';scheduleTokenizerSelection();
+form.elements.tokenizer.value='custom';form.elements.tokenizer_custom.value='different/model';scheduleTokenizerSelection();
 assert.equal(state.tokenizerSelection.status,'pending');assert.match(nodes['#tokenizer-status'].textContent,/Resolving and loading/);
 assert.equal(nodes['#tokenizer-status'].className,'hint');assert.equal(tokenizerSetupReady(),false);
-form.elements.tokenizer.value='Automatic';scheduleTokenizerSelection();
+form.elements.tokenizer.value='auto';scheduleTokenizerSelection();
 assert.equal(tokenizerSetupReady(),true);assert.equal(nodes['#tokenizer-status'].textContent,'');
 ''')
 
@@ -227,10 +227,10 @@ assert.equal(tokenizerSetupReady(),true);assert.equal(nodes['#tokenizer-status']
 @pytest.mark.parametrize("replacement", ["builtin", "other/model"])
 def test_superseded_tokenizer_response_cannot_overwrite_current_selection(replacement):
     browser_logic(TOKENIZER_FORM + r'''
-form.elements.tokenizer.value='first/model';let finish;
+form.elements.tokenizer.value='custom';form.elements.tokenizer_custom.value='first/model';let finish;
 api=()=>new Promise(resolve=>{finish=resolve;});scheduleTokenizerSelection();
 const old=resolveTokenizerSelection(state.tokenizerSelection.key,state.tokenizerSequence,state.routeVersion);
-form.elements.tokenizer.value=REPLACEMENT;scheduleTokenizerSelection();
+form.elements.tokenizer.value=REPLACEMENT==='builtin'?'builtin':'custom';form.elements.tokenizer_custom.value=REPLACEMENT;scheduleTokenizerSelection();
 finish({status:'ready',tokenizer:'first/model',message:'Wrong result'});await old;
 assert.doesNotMatch(nodes['#tokenizer-status'].textContent,/Wrong result/);
 if(REPLACEMENT==='builtin'){
@@ -246,7 +246,7 @@ if(REPLACEMENT==='builtin'){
 
 def test_typed_pending_and_error_gate_next_and_launch_but_defaults_never_do():
     run_browser_logic(r"""
-const form={elements:{model:element({value:'test-model'}),tokenizer:element({value:'typed/model'})}};
+const form={elements:{model:element({value:'test-model'}),tokenizer:element({value:'custom'}),tokenizer_custom:element({value:'typed/model'})}};
 nodes['#new-run-form']=form;
 for(const selector of ['#setup-panel-1','#start-run','#setup-navigation-hint','[data-action="setup-next"]','[data-action="setup-back"]'])nodes[selector]=element();
 state.jsonDraft=state.jsonBase='synced';
@@ -256,7 +256,7 @@ for(const status of ['error','pending','ready',null]){
  state.setupStep=1;syncSetupStep();assert.equal(nodes['[data-action="setup-next"]'].disabled,status!=='ready');
  state.setupStep=3;syncSetupStep();assert.equal(nodes['#start-run'].disabled,status!=='ready');
 }
-for(const choice of ['Automatic','builtin']){
+for(const choice of ['auto','builtin']){
  form.elements.tokenizer.value=choice;
  state.setupStep=1;syncSetupStep();assert.equal(nodes['[data-action="setup-next"]'].disabled,false);
  state.setupStep=3;syncSetupStep();assert.equal(nodes['#start-run'].disabled,false);
@@ -268,7 +268,7 @@ assert.equal(nodes['[data-action="setup-next"]'].disabled,true);assert.equal(nod
 
 def test_typed_error_cannot_bypass_launch_and_default_can_launch():
     browser_logic(r'''
-const form={elements:{model:{value:'test-model'},tokenizer:{value:'bad/model'}}};nodes['#new-run-form']=form;
+const form={elements:{model:{value:'test-model'},tokenizer:{value:'custom'},tokenizer_custom:{value:'bad/model'}}};nodes['#new-run-form']=form;
 nodes['#form-error']={hidden:true,textContent:''};nodes['#start-run']={};
 state.setupStep=3;state.config.targets[0].tokenizer='bad/model';state.config.checks=['access'];
 const message='Could not load tokenizer "bad/model": Invalid tokenizer.';
@@ -279,7 +279,7 @@ refreshRequestPreview=async()=>{};focusFirstSettingError=()=>{};setActive=id=>{s
 const paths=[];api=async(path,options)=>{paths.push(path);return path==='/api/config/validate'?{config:JSON.parse(options.body)}:{id:'started'};};
 await startRun({preventDefault(){},target:form});
 assert(!paths.includes('/api/runs'));assert.equal(nodes['#form-error'].textContent,message);assert.equal(nodes['#start-run'].disabled,true);
-form.elements.tokenizer.value='Automatic';state.config.targets[0].tokenizer='auto';
+form.elements.tokenizer.value='auto';state.config.targets[0].tokenizer='auto';
 await startRun({preventDefault(){},target:form});assert(paths.includes('/api/runs'));assert.equal(state.active,'started');
 ''')
 
@@ -287,7 +287,7 @@ await startRun({preventDefault(){},target:form});assert(paths.includes('/api/run
 
 def test_typed_tokenizer_request_timeout_ends_pending_and_clears_its_timer():
     browser_logic(TOKENIZER_FORM + r'''
-form.elements.tokenizer.value='slow/model';
+form.elements.tokenizer.value='custom';form.elements.tokenizer_custom.value='slow/model';
 const timers=new Map();let sequence=0;
 setTimeout=(callback,delay)=>{timers.set(++sequence,{callback,delay});return sequence;};clearTimeout=id=>timers.delete(id);
 let signal;

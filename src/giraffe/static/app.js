@@ -1126,8 +1126,9 @@ function settingDestination(path) {
   if(['samples','max_output_tokens','context_limit','default_concurrency'].includes(path))return {name:'config_editor',label:human(path).toLowerCase(),step};
   const sections={load_test:'load',concurrent_load:'concurrency',sessions:'sessions',consistency:'consistency',arrivals:'arrivals',prefix:'prefix',traffic:'capacity',tool_checks:'tools'};
   if(parts.length===1&&sections[root]||root==='test_options'&&parts.length===2)return {section:true,check:sections[root]||parts[1],step,label:root==='test_options'?`${human(parts[1]).toLowerCase()} settings`:`${human(sections[root]).toLowerCase()} settings`};
-  if(['stream','retention','request_timeout_seconds','max_memory_mb'].includes(root)){step=1;}
-  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2];step=1;}
+  if(root==='stream'){step=1;}
+  else if(root==='retention'){step=3;}
+  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=1;}
   else if(root==='load_test'){
     check='load';
     if(parts[1]==='migrated_tests')return {name:'config_editor',step,label:'imported load settings'};
@@ -1157,7 +1158,7 @@ function settingDestination(path) {
   else if(['arrivals','prefix','sessions','consistency'].includes(root)){check=root;name=`profile_${root}_${parts[1]}`;}
   else if(root==='traffic'){check='capacity';name=`traffic_${parts[1]}`;}
   else if(root==='tool_checks'){check='tools';name=`profile_tools_${parts[1]}`;}
-  else if(root==='limits'){name=`limit_${parts[1]}`;if(parts[1]==='regression_percent')step=1;}
+  else if(root==='limits'){name=`limit_${parts[1]}`;if(parts[1]==='regression_percent')step=3;}
   else if(root==='judging')name=parts[1]==='judges'?`judge_${parts[2]}_${parts[3]}`:`judging_${parts[1]}`;
   else if(root==='config')name='config_editor';
   const labels={max_memory_mb:'Maximum memory',concurrency:'Simultaneous limit',max_duration_seconds:'Maximum duration',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'Maximum requests',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'send new requests for',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
@@ -1513,7 +1514,7 @@ function renderSharedRunSettings(config) {
     const fullHelp=[help,state.bootstrap?.cap_explanations?.[settingPath(name)]?.help].filter(Boolean).join(' ');
     return `<div class="optional-run-limit" data-run-limit="${name}"><div class="test-selection-line"><label class="run-limit-selection"><input type="checkbox" name="${name}_enabled" data-limit-toggle="${name}" aria-controls="field-${name}" aria-describedby="field-${name}-hint" ${enabled?'checked':''}><span>${label}</span></label>${infoHelp(name,label,fullHelp)}</div>${input}${name==='max_duration_seconds'?selectField('max_duration_unit','Time unit',['s','min','h'].map(value=>`<option value="${value}" ${value===unit?'selected':''}>${value}</option>`).join('')):''}</div>`;
   };
-  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits</h2><span class="run-ceilings-values" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit" aria-hidden="true"><span class="when-closed">Edit limits</span><span class="when-open">Close limits</span></span></summary><div class="setup-body"><div class="fields three run-limit-fields">${rows.map(args=>row(...args)).join('')}</div></div></details><p class="checks-plan-summary sr-only" id="checks-plan-summary">Preparing request estimate…</p></section>`;
+  return `<section class="setup-section shared-run-settings" aria-labelledby="shared-settings-title"><details class="shared-settings-editor" id="shared-settings"><summary class="shared-settings-summary"><h2 id="shared-settings-title">Run limits</h2><span class="run-ceilings-values" id="run-ceilings-summary">${escape(sharedLimitsSummary(config))}</span><span class="shared-settings-edit" aria-hidden="true"><span class="when-closed">Edit limits</span><span class="when-open">Close limits</span></span></summary><div class="setup-body"><div class="fields three run-limit-fields">${rows.map(args=>row(...args)).join('')}</div><div class="fields">${field('request_timeout_seconds','Request timeout (seconds)',config.request_timeout_seconds,{type:'number',step:'any',required:true,hint:''})}${field('max_memory_mb','Max memory growth (MiB)',config.max_memory_mb,{type:'number',required:true,hint:'0 turns off the memory limit.',help:fieldDescription('max_memory_mb').hint})}</div></div></details><p class="checks-plan-summary sr-only" id="checks-plan-summary">Preparing request estimate…</p></section>`;
 }
 function toggleRunLimit(name,enabled) {
   const form=$('#new-run-form'),input=form?.elements[name];if(!input)return;
@@ -2405,7 +2406,7 @@ function navigateSetup(step) {
     if(step>state.setupStep){
       for(let index=state.setupStep;index<step;index++){
         if(!validateRunForm($('#new-run-form'),index))return;
-        if(index===1&&!tokenizerSetupReady()){scheduleTokenizerSelection({immediate:true});$('#field-tokenizer')?.focus();return;}
+        if(index===1&&!tokenizerSetupReady()){scheduleTokenizerSelection({immediate:true});($('#new-run-form')?.elements.tokenizer_custom||$('#field-tokenizer'))?.focus();return;}
         if(index===2){
           revealSetupStep(2);
           if($('#request-plan')&&!currentRequestPlan()&&!currentSettingErrors().length){
@@ -2481,32 +2482,26 @@ function useRuntimeShortcut(runtime) {
     form.elements.url.focus();
   }catch(error){configError(error);}
 }
-function showTokenizerOptions(open) {
-  const options=$('#tokenizer-options');if(!options)return;
-  options.hidden=!open;
-  $('#field-tokenizer')?.setAttribute('aria-expanded',String(open));
-  $('[data-action="tokenizer-options"]')?.setAttribute('aria-expanded',String(open));
-}
 function tokenizerChoice() {
-  const value=$('#new-run-form')?.elements.tokenizer?.value.trim() || 'auto';
-  return ['auto','automatic','builtin'].includes(value.toLowerCase())?(value.toLowerCase()==='automatic'?'auto':value.toLowerCase()):value;
+  const form=$('#new-run-form'),mode=form?.elements.tokenizer?.value || 'auto';
+  return mode==='custom'?(form.elements.tokenizer_custom?.value || '').trim():mode;
 }
 function tokenizerSelectionKey() {
   const form=$('#new-run-form'),token_id=tokenizerChoice();
-  return form?.elements.tokenizer&&!['auto','builtin'].includes(token_id)?JSON.stringify({token_id}):null;
+  return form?.elements.tokenizer?.value==='custom'&&token_id?JSON.stringify({token_id}):null;
 }
 function currentTokenizerSelection() {
   const key=tokenizerSelectionKey(),result=state.tokenizerSelection;
   return key&&result?.key===key&&result.route===state.routeVersion?result:null;
 }
 function tokenizerSetupReady() {
-  return !tokenizerSelectionKey()||currentTokenizerSelection()?.status==='ready';
+  return $('#new-run-form')?.elements.tokenizer?.value!=='custom'||Boolean(tokenizerChoice())&&currentTokenizerSelection()?.status==='ready';
 }
 function renderTokenizerSelection() {
   const node=$('#tokenizer-status');if(!node)return;
-  const result=currentTokenizerSelection();
-  node.textContent=['pending','error'].includes(result?.status)?result.message:'';
-  node.className=result?.status==='error'?'notice error':'hint';
+  const result=currentTokenizerSelection(),empty=$('#new-run-form')?.elements.tokenizer?.value==='custom'&&!tokenizerChoice();
+  node.textContent=empty?'Enter a tokenizer name, or pick Automatic.':['pending','error'].includes(result?.status)?result.message:'';
+  node.className=!empty&&result?.status==='error'?'notice error':'hint';
   node.hidden=!node.textContent;
   syncSetupStep();
 }
@@ -2645,6 +2640,8 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   state.setupPreset=preset;
   if(preset==='custom')state.showAvailableTests=true;
   const c=state.config,target=c.targets?.[0] || {},limits=c.limits || {};
+  const tokenizerMode=target.tokenizer==null||target.tokenizer==='auto'?'auto':target.tokenizer==='builtin'?'builtin':'custom';
+  const tokenizerName=tokenizerMode==='custom'?target.tokenizer:$('#new-run-form')?.elements.tokenizer_custom?.value || '';
   if(sessionAPIKey && !apiKeyFor(target.url))clearAPIKey();
   $('#main').innerHTML=`${renderHeroCoat()}<div class="page-heading setup-page-heading"><div><h1 id="setup-title">Test your endpoint</h1><p class="setup-lede" id="setup-lede"></p></div><button type="button" class="text-button setup-import" data-action="import-config">Load saved setup</button></div>
   <div class="notice" id="new-active-notice" ${state.active||state.diskActive?'':'hidden'}>${newActiveNotice()}</div>
@@ -2659,8 +2656,8 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model || '',{required:true,placeholder:'Found when you connect',hint:''})}</div><p class="hint" id="model-options-label"></p></div></div>
   <div class="setup-advanced"><div class="details-content">
   <details class="connection-auth" id="connection-auth"><summary class="api-key-row"><span class="api-key-label">API key</span><span class="row-value api-key-value">${apiKeyFor(target.url)?'Set for this tab':escape(target.api_key_env)||'Not set'}</span><span class="row-action api-key-action"><span class="when-closed">Edit</span><span class="when-open">Close</span></span></summary>${field('api_key','API key','',{type:'password',placeholder:'Paste your API key',hint:'',help:'Kept in memory for this tab. Never included in saved setups or reports. Paste it again after reloading. Leave blank for an open endpoint.'})}<button type="button" class="text-button" data-action="clear-api-key">Clear key</button>${field('api_key_env','API key environment variable',apiKeyFor(target.url)?'':target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:''})}</details>
-  <div class="form-field"><label for="field-tokenizer">Token ID / tokenizer</label><div class="tokenizer-combobox"><input id="field-tokenizer" name="tokenizer" role="combobox" aria-autocomplete="list" aria-controls="tokenizer-options" aria-expanded="false" value="${escape(target.tokenizer && target.tokenizer!=='auto'?target.tokenizer:'Automatic')}" maxlength="512" autocomplete="off" aria-describedby="tokenizer-status"><button type="button" class="tokenizer-dropdown" data-action="tokenizer-options" aria-label="Show Token ID options" aria-controls="tokenizer-options" aria-expanded="false">▾</button><div id="tokenizer-options" class="tokenizer-options" role="listbox" aria-label="Token ID options" hidden><button type="button" role="option" tabindex="-1" data-action="select-tokenizer" data-token-id="Automatic">Automatic</button><button type="button" role="option" tabindex="-1" data-action="select-tokenizer" data-token-id="builtin">builtin</button></div></div><p id="tokenizer-status" class="hint" role="status" aria-live="polite"></p></div>
-  <div class="fields">${field('metrics_url','Server metrics URL',target.metrics_url,{type:'url',hint:''})}${field('host_metrics_url','Host metrics URL',target.host_metrics_url,{type:'url',hint:''})}${selectField('stream','Streaming',`<option value="true" ${c.stream?'selected':''}>On</option><option value="false" ${c.stream?'':'selected'}>Off</option>`,{hint:''})}${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('request_timeout_seconds','Request timeout (seconds)',c.request_timeout_seconds,{type:'number',step:'any',required:true,hint:''})}${field('max_memory_mb','Max memory growth (MiB)',c.max_memory_mb,{type:'number',required:true,hint:'0 turns off the memory limit.'})}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div>
+  ${renderField('tokenizer','Token ID / tokenizer',`<select id="field-tokenizer" name="tokenizer" aria-describedby="tokenizer-status">${[['auto','Automatic'],['builtin','builtin'],['custom','Custom']].map(([value,label])=>`<option value="${value}" ${tokenizerMode===value?'selected':''}>${label}</option>`).join('')}</select><div id="tokenizer-custom-field" ${tokenizerMode==='custom'?'':'hidden'}>${field('tokenizer_custom','Tokenizer name',tokenizerName,{placeholder:'Qwen/Qwen2.5-7B-Instruct',hint:''}).replace('autocomplete="off"','autocomplete="off" maxlength="512" aria-describedby="tokenizer-status"')}</div><p id="tokenizer-status" class="hint" role="status" aria-live="polite"></p>`,{hint:'',help:"Used to size prompts. Automatic uses the model's own tokenizer when it can be found, otherwise builtin. builtin uses tiktoken o200k_base, included with Giraffe; its counts are approximate. Custom loads a Hugging Face model ID or local path and needs giraffe-llm[hf-tokenizer]."})}
+  <div class="fields">${field('metrics_url','Server metrics URL',target.metrics_url,{type:'url',hint:''})}${field('host_metrics_url','Host metrics URL',target.host_metrics_url,{type:'url',hint:''})}${selectField('stream','Streaming',`<option value="true" ${c.stream?'selected':''}>On</option><option value="false" ${c.stream?'':'selected'}>Off</option>`,{hint:''})}</div>
   </div></div></div>
   ${(c.targets || []).length>1?`<div class="notice multi-target-notice"><strong>${c.targets.length} endpoints configured.</strong> This connection test checks the first endpoint. The run checks all configured endpoints.</div>`:''}
   </div></section></div>
@@ -2669,7 +2666,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}</div></div></details>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div><div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div></div></div></details>
   </div><section id="request-plan" class="request-plan review-section"></section><div id="setup-history" hidden></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Apply changes before returning to the form.</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor',hint:'',help:[fieldDescription('config_editor').help,inputRetentionNotice].join(' ')})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" tabindex="0" aria-label="Run plan" hidden></aside>
@@ -4072,7 +4069,6 @@ document.addEventListener('click',async(event)=>{
   const heroAction=event.target.closest('[data-action]')?.dataset.action,guard=state.heroActionGuard;
   if(heroAction==='reconnect'){if(!state.accessExpired)location.reload();return;}
   if(guard&&guard.id===state.detail?.id&&Date.now()<guard.until&&['rerun','baseline-dialog','compare-run','show-failing','show-inconclusive','show-comparison'].includes(heroAction)){event.preventDefault?.();return;}
-  if(!event.target.closest('.tokenizer-combobox'))showTokenizerOptions(false);
   if(event.target.closest('.skip-link')){event.preventDefault();const main=$('#main');main.setAttribute('tabindex','-1');main.focus({preventScroll:true});main.scrollIntoView({block:'start'});return;}
   if(handleConditionClick(event))return;
   if(handlePerformanceClick(event))return;
@@ -4124,8 +4120,6 @@ document.addEventListener('click',async(event)=>{
   if(action==='catalogue-filter'){state.catalogueFilter=event.target.closest('[data-catalogue-filter]').dataset.catalogueFilter;syncTestControls();return;}
   if(action==='reset-profile'){try{assertAppliedConfig();const key=event.target.closest('[data-profile]').dataset.profile;captureFormDraft();state.config[key]=null;configChanged();renderNew('custom');$(`[data-profile="${key}"]`)?.focus();}catch(error){configError(error);}return;}
   if(action==='quick-checks'){try{assertAppliedConfig();captureFormDraft();state.config.checks=clone(state.bootstrap.config.checks);state.config.structured_json=false;state.config.metrics=false;state.config.tool_calling=false;state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;configChanged();renderNew('custom');$('[data-catalogue-filter="selected"]')?.focus();}catch(error){configError(error);}return;}
-  if(action==='tokenizer-options'){showTokenizerOptions($('#tokenizer-options').hidden);return;}
-  if(action==='select-tokenizer'){const input=$('#field-tokenizer');input.value=event.target.closest('[data-token-id]').dataset.tokenId;showTokenizerOptions(false);input.focus();scheduleTokenizerSelection({immediate:true});configChanged();updateBounds();return;}
   if(action==='setup-next'){navigateSetup(state.configView==='json'?state.setupStep:state.returnToReview?3:state.setupStep+1);return;}
   if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
   if(action==='test-connection'){await testConnection();return;}
@@ -4286,7 +4280,7 @@ document.addEventListener('input',event=>{
   if(['url','api_key_env','api_key'].includes(event.target.name)&&state.autoModel&&$('#new-run-form').elements.model.value===state.autoModel){$('#new-run-form').elements.model.value='';state.autoModel=null;}
   if(event.target.name==='model')state.autoModel=null;
   if(['url','model','api_key_env','api_key'].includes(event.target.name))invalidateModelDiscovery();
-  if(event.target.name==='tokenizer'){showTokenizerOptions(false);scheduleTokenizerSelection();}
+  if(event.target.name==='tokenizer_custom')scheduleTokenizerSelection();
   if(['max_requests','max_duration_seconds','concurrency','max_memory_mb'].includes(event.target.name)){state.limitValues ||= {};state.limitValues[event.target.name]=event.target.value;}
   if(event.target.id==='config-editor')state.jsonDraft=event.target.value;
   if(event.target.name==='load_patterns_concurrent_levels')event.target.dataset.inherited='false';
@@ -4336,7 +4330,7 @@ document.addEventListener('change',event=>{
     renderModelDiscovery();scheduleTokenizerSelection({immediate:true});if(value==='__manual__'){$('#manual-model-field').hidden=false;input.focus();}
     configChanged();updateBounds();return;
   }
-  if(event.target.name==='tokenizer'){scheduleTokenizerSelection({immediate:true});configChanged();updateBounds();return;}
+  if(event.target.name==='tokenizer'){$('#tokenizer-custom-field').hidden=event.target.value!=='custom';if(event.target.value==='custom')$('#new-run-form').elements.tokenizer_custom.focus();scheduleTokenizerSelection({immediate:true});configChanged();updateBounds();return;}
   if(event.target.id==='dataset-bulk-scorer')return;
   if(event.target.matches('[data-load-enable]')){setLoadPanel(event.target.dataset.loadEnable,event.target.checked);configChanged();updateBounds();return;}
   if(event.target.name?.startsWith('load_')){configChanged();updateBounds();return;}
@@ -4345,15 +4339,6 @@ document.addEventListener('change',event=>{
   if(event.target.id==='request-pack-file'){const file=event.target.files[0];event.target.value='';importRequestPack(file);return;}if(event.target.name==='request_source'){changeRequestSource(event.target.value);return;}if(event.target.id==='config-file'){const file=event.target.files[0];event.target.value='';importConfig(file);return;}if(event.target.closest('#new-run-form')){configChanged();scheduleRequestPlan();}if(event.target.closest('[data-test-editor]')&&event.target.tagName==='SELECT'){if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);else editTestField(event.target);updateBounds();}if(event.target.name==='check'){const id=event.target.value;captureFormDraft();renderNew('custom');const control=$(`[name="check"][value="${id}"]`);if(control?.closest('[data-test-card]')?.hidden)$('[data-catalogue-filter="all"]')?.focus();else control?.focus();return;}if(event.target.id==='run-filter'){state.filter=event.target.value;renderRuns();$('#run-filter').focus();}if(['mode','restart_target'].includes(event.target.name)){updateRestart();if(state.configView==='json'&&!hasJsonChanges()){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}}if(event.target.name==='replace')$('#save-baseline').textContent=event.target.checked?'Replace baseline':'Save baseline';});
 let navigationPrefix=0;
 document.addEventListener('keydown',event=>{
-  if(event.target.closest?.('.tokenizer-combobox')){
-    if(event.key==='Escape'){event.preventDefault();showTokenizerOptions(false);$('#field-tokenizer')?.focus();return;}
-    if(['ArrowDown','ArrowUp'].includes(event.key)){
-      event.preventDefault();showTokenizerOptions(true);
-      const options=$$('[data-token-id]'),index=options.indexOf(event.target),direction=event.key==='ArrowDown'?1:-1;
-      options[index<0?(direction>0?0:options.length-1):(index+direction+options.length)%options.length]?.focus();return;
-    }
-  }
-
   if(event.isComposing)return;
   if(handleConditionKeydown(event))return;
   if(handlePerformanceKeydown(event))return;

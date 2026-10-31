@@ -11,14 +11,10 @@ CONNECT_FIELDS = [
     ('metrics_url', 'Server metrics URL'),
     ('host_metrics_url', 'Host metrics URL'),
     ('stream', 'Streaming'),
-    ('retention', 'Keep response text'),
-    ('request_timeout_seconds', 'Request timeout (seconds)'),
-    ('max_memory_mb', 'Max memory growth (MiB)'),
-    ('limit_regression_percent', 'Regression threshold (%)'),
 ]
 
 
-def test_connect_settings_match_reference_order_labels_and_single_controls():
+def test_connect_settings_keep_tokenizer_full_width_and_metrics_stream_in_grid():
     html = rendered_form()
     tree = Markup(html)
     auth = next(node for node in tree.nodes if node.get('id') == 'connection-auth')
@@ -48,7 +44,9 @@ def test_connect_settings_match_reference_order_labels_and_single_controls():
     assert details['parents'][-1]['class'] == 'setup-advanced'
     tokenizer, = tree.named('tokenizer')
     assert grid not in tokenizer['parents']
-    assert tokenizer['parents'][-2]['parents'][-1] is details
+    assert details in tokenizer['parents']
+    assert tokenizer['tag'] == 'select'
+    assert [node['name'] for node in tree.nodes if node.get('name') and grid in node['parents']] == ['metrics_url', 'host_metrics_url', 'stream']
     css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
     assert '#setup-deployment .fields { display: block; }' not in css
     assert '#setup-deployment > .setup-body > .fields { display: block; }' in css
@@ -56,7 +54,7 @@ def test_connect_settings_match_reference_order_labels_and_single_controls():
     assert positions == sorted(positions)
     assert '0 turns off the memory limit.' in html
     connection = html.split('data-setup-panel="2"', 1)[0]
-    for removed in ('Performance metrics', 'Additional exporter addresses', 'How answers arrive', 'tokenizer-help'):
+    for removed in ('Performance metrics', 'Additional exporter addresses', 'How answers arrive', 'id="tokenizer-help"'):
         assert removed not in connection
     assert not tree.named('max_memory_mb_enabled')
     assert 'Choose your checks' in html
@@ -65,7 +63,7 @@ def test_connect_settings_match_reference_order_labels_and_single_controls():
 
 def test_connect_info_icons_are_on_labels_and_use_csp_safe_popovers():
     tree = Markup(rendered_form())
-    for name in ('metrics_url', 'host_metrics_url', 'request_timeout_seconds', 'limit_regression_percent'):
+    for name in ('metrics_url', 'host_metrics_url', 'request_timeout_seconds', 'max_memory_mb', 'limit_regression_percent'):
         control, = tree.named(name)
         info, = [node for node in tree.nodes if node.get('id') == control['id'] + '-info']
         label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == control['id']]
@@ -75,6 +73,9 @@ def test_connect_info_icons_are_on_labels_and_use_csp_safe_popovers():
         help_node, = [node for node in tree.nodes if node.get('id') == info['popovertarget']]
         assert help_node['popover'] == 'auto' and help_node['text'].strip()
         assert not any(key.lower().startswith('on') for key in info)
+    memory_help, = [node for node in tree.nodes if node.get('id') == 'field-max_memory_mb-help']
+    assert 'MiB of RAM growth since the run started; 0 = off.' in memory_help['text']
+    assert 'Exceeding the limit stops unfinished work with partial results;' in memory_help['text']
     assert not any(node.get('id') == 'field-preparation-info' for node in tree.nodes)
 
 
@@ -119,7 +120,11 @@ state.config=structuredClone(bootstrap.config);state.jsonDraft=state.jsonBase='s
 api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 toast=()=>{};
 await importConfig({text:async()=>JSON.stringify(saved)});assertValues();
-for(const name of Object.keys(edits)){const path=['metrics_url','host_metrics_url'].includes(name)?'targets.0.'+name:name==='limit_regression_percent'?'limits.regression_percent':name;assert.equal(settingDestination(path).step,1,name);}
+for(const name of Object.keys(edits)){
+ const path=['metrics_url','host_metrics_url'].includes(name)?'targets.0.'+name:name==='limit_regression_percent'?'limits.regression_percent':name;
+ const step=['retention','limit_regression_percent'].includes(name)?3:['request_timeout_seconds','max_memory_mb'].includes(name)?2:1;
+ assert.equal(settingDestination(path).step,step,name);
+}
 const limitNames=['max_requests','max_duration_seconds','concurrency'];
 for(const name of limitNames)form.elements[name+'_enabled'].checked=false;
 const unset=readForm(false).config;
@@ -169,3 +174,53 @@ def test_disclosures_use_css_only_edit_close_labels_without_a_caret():
     assert re.search(r'\.connection-auth\[open\]\s*\{\s*padding-bottom:\s*16px;', css)
     assert 'shared-settings-caret' not in css
     assert not any('shared-settings-caret' in node.get('class', '') for node in tree.nodes)
+
+
+def test_moved_settings_have_one_editable_control_on_their_own_step():
+    tree = Markup(rendered_form())
+    for name, step, disclosure in [
+        ('request_timeout_seconds', 2, 'shared-settings'),
+        ('max_memory_mb', 2, 'shared-settings'),
+        ('retention', 3, None),
+        ('limit_regression_percent', 3, None),
+    ]:
+        control, = tree.named(name)
+        assert any(parent.get('id') == f'setup-panel-{step}' for parent in control['parents']), name
+        if disclosure:
+            assert any(parent.get('id') == disclosure for parent in control['parents']), name
+        else:
+            assert any(parent['tag'] == 'details' and parent.get('id') == 'execution-settings' for parent in control['parents']), name
+    timeout, = tree.named('request_timeout_seconds')
+    memory, = tree.named('max_memory_mb')
+    grid = next(parent for parent in timeout['parents'] if parent.get('class') == 'fields')
+    assert grid in memory['parents']
+    duration, = tree.named('max_duration_seconds')
+    assert tree.nodes.index(duration) < tree.nodes.index(timeout) < tree.nodes.index(memory)
+    retention, = tree.named('retention')
+    baseline, = tree.named('baseline_id')
+    regression, = tree.named('limit_regression_percent')
+    name, = tree.named('name')
+    assert tree.nodes.index(retention) < tree.nodes.index(name)
+    assert tree.nodes.index(baseline) < tree.nodes.index(regression)
+    assert baseline['parents'][-2] is regression['parents'][-2]
+    execution_grid = next(parent for parent in baseline['parents'] if parent.get('class') == 'fields')
+    execution_controls = [node['name'] for node in tree.nodes if node.get('name') and execution_grid in node['parents']]
+    assert execution_controls[execution_controls.index('baseline_id') + 1] == 'limit_regression_percent'
+
+
+def test_moved_setting_errors_reveal_the_new_step_and_open_their_disclosure():
+    from tests.test_ux_catalogue import browser_logic
+
+    browser_logic(r'''
+state.jsonDraft=state.jsonBase='synced';state.openTest=null;
+assertAppliedConfig=()=>{};revealSetupStep=step=>state.setupStep=step;
+const paths=[['request_timeout_seconds','request_timeout_seconds',2],['max_memory_mb','max_memory_mb',2],['limits.regression_percent','limit_regression_percent',3],['retention','retention',3]];
+for(const [path,name,step] of paths){
+ const disclosure={tagName:'DETAILS',open:false},field={parentElement:disclosure,style:{},scrollIntoView(){this.scrolled=true;}};
+ const input={parentElement:field,setAttribute(name,value){this[name]=value;},focus(){this.focused=true;},closest:selector=>selector==='.form-field'?field:null};
+ nodes['#new-run-form']={elements:{[name]:input}};state.setupStep=1;
+ focusFirstSettingError({errors:[{fields:[path],msg:'Invalid value.'}]});
+ assert.equal(state.setupStep,step,path);assert.equal(disclosure.open,true,path);
+ assert.equal(input.focused,true,path);assert.equal(field.scrolled,true,path);
+}
+''')

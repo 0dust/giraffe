@@ -330,9 +330,10 @@ const expected=['max_requests','max_duration_seconds','concurrency','max_request
 for(const name of expected)assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 let depth=0,maximumDepth=0;
 for(const tag of markup.matchAll(/<(\/?)details\b[^>]*>/g)){depth+=tag[1]?-1:1;maximumDepth=Math.max(maximumDepth,depth);}
-assert.equal(depth,0);assert.equal(maximumDepth,1); // One disclosure; request settings and pass criteria live in check panels.
+assert.equal(depth,0);assert.equal(maximumDepth,1); // One run-limits disclosure; check panels retain their own criteria.
 assert.doesNotMatch(markup,/Set the limits once|run-limit-note/);
-assert.doesNotMatch(markup,/name="max_memory_mb"|name="request_timeout_seconds"|Request default|Resource protection/);
+assert.doesNotMatch(markup,/Request default|Resource protection/);
+for(const name of ['request_timeout_seconds','max_memory_mb'])assert.equal((markup.match(new RegExp('name="'+name+'"','g'))||[]).length,1,name);
 assert.match(markup,/Giraffe stops sending new requests and cancels all requests still in progress/);
 for(const name of ['max_requests','max_duration_seconds','concurrency'])assert.match(markup,new RegExp('id="field-'+name+'-hint"></span>')); // Empty enabled-state hint receives Not set when unchecked.
 assert.match(markup,/AI evaluator calls have separate limits/); // Available through the field help.
@@ -342,7 +343,7 @@ config.max_requests=80;config.max_duration_seconds=12.5;config.concurrency=2;upd
 assert.equal(nodes['#run-ceilings-summary'].textContent,'80 requests · 12.5s · 2 at once');
 state.catalogueFilter='selected';const catalogue=renderCheckSelection(config);
 assert(!catalogue.includes('id="shared-settings"')); // Run limits is a preceding sibling in renderNew.
-assert.doesNotMatch(markup,/name="request_timeout_seconds"/);
+assert.match(markup,/name="request_timeout_seconds"/);
 assert.doesNotMatch(markup,/name="samples"|name="max_output_tokens"|name="context_limit"|name="stream"|name="limit_/);
 assert.match(catalogue,/<div id="catalogue-browse-tools" hidden>/);
 assert(catalogue.indexOf('id="catalogue-browse-tools"')<catalogue.indexOf('data-action="quick-checks"'));

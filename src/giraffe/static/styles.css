@@ -1566,12 +1566,6 @@ main > #report-results { padding-top:20px; }
 .performance-bucket-details { margin:12px 0; color:var(--text-3); font-size:10.5px; }
 .performance-intended-transition { stroke:var(--surface); stroke-width:1.3; vector-effect:non-scaling-stroke; }
 
-.tokenizer-combobox { position:relative; }
-.tokenizer-combobox > input { width:100%; padding-right:42px; }
-.tokenizer-dropdown { position:absolute; right:1px; top:1px; height:calc(100% - 2px); width:40px; border:0; background:transparent; color:var(--text); cursor:pointer; }
-.tokenizer-options { position:absolute; top:100%; left:0; right:0; z-index:20; padding:4px; border:1px solid var(--line-strong); border-radius:var(--r); background:var(--surface-2); box-shadow:var(--shadow-lg); }
-.tokenizer-options > button { display:block; width:100%; padding:10px; text-align:left; border:0; background:transparent; color:var(--text); cursor:pointer; }
-.tokenizer-options > button:hover,.tokenizer-options > button:focus { background:var(--surface); }
 
 /* Comparisons use compact, anchored sections like the performance report. */
 [id^="results-"] { scroll-margin-top: 145px; }
