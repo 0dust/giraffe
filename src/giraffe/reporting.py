@@ -2235,6 +2235,50 @@ def _check_timing_violation_ids(check: CheckResult) -> set[str]:
     return {rid for source in sources if isinstance(source, list) for rid in source if isinstance(rid, str)}
 
 
+def _cold_start_html(report: RunReport) -> str:
+    from .cold_start import REASONING_OUTPUT_NOTE
+
+    sections = []
+    for name, observation in report.observations.get("targets", {}).items():
+        cold = observation.get("restart")
+        if not cold:
+            continue
+
+        def duration(value):
+            return f"{value:g} ms" if isinstance(value, (int, float)) else "Not measured"
+
+        rows = [("Script time", duration(cold.get("script_ms"))),
+                ("Service answered after", duration(cold.get("service_answered_ms"))),
+                ("First answer after", duration(cold.get("readiness_ms"))),
+                ("Model loaded before first request", cold.get("model_loaded_before_first_request", "Unknown"))]
+        comparisons = [("First request", cold.get("first_request") or {})]
+        comparisons.extend((f"Warm request {index}", item)
+                           for index, item in enumerate(cold.get("warm_requests", []), 1))
+        sections.append(f'<section><h2>Cold start</h2><h3>{_e(name)}</h3><dl>')
+        sections.extend(f'<dt>{_e(label)}</dt><dd>{_e(value)}</dd>' for label, value in rows)
+        help_text = 'Some servers load weights at startup, in which case it\'s part of "Service answered after".'
+        model_load = (cold.get("model_load") or "Not reported by this server").removeprefix("Model load: ")
+        sections.append(f'<dt>Model load <button type="button" title="{_e(help_text)}" '
+                        f'aria-label="Model load information">i</button></dt><dd>{_e(model_load)}</dd></dl>')
+        if cold.get("measurement_api"):
+            sections.append(f'<p>{_e(cold["measurement_api"])}</p>')
+        sections.append('<div class="table"><table><tr><th>Request</th><th>First answer</th><th>Latency</th></tr>')
+        for label, item in comparisons:
+            note = REASONING_OUTPUT_NOTE if item.get("first_output_kind") == "reasoning" else ""
+            note_html = f'<p>{_e(note)}</p>' if note else ""
+            reason_html = f'<p>{_e(item["reason"])}</p>' if item.get("reason") else ""
+            sections.append(f'<tr><td>{_e(label)}</td><td>{_e(duration(item.get("first_output_ms")))}'
+                            f'{note_html}{reason_html}</td>'
+                            f'<td>{_e(duration(item.get("elapsed_ms")))}</td></tr>')
+        sections.append('</table></div>')
+        if cold.get("reason"):
+            sections.append(f'<p>{_e(cold["reason"])}</p>')
+        if cold.get("output_tail"):
+            sections.append(f'<details><summary>Script output (last 4 KiB)</summary><pre>{_e(cold["output_tail"])}</pre></details>')
+        sections.append('</section>')
+    return "".join(sections)
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -2263,6 +2307,7 @@ def _render(report: RunReport) -> str:
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     for summary in disconnected.values():
         parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
+    parts.append(_cold_start_html(report))
     if report.abort_reason:
         parts.append(f'<p class="card">Run stopped: {_e(report.abort_reason)}</p>')
     for target in config.get("targets", []):

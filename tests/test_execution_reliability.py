@@ -21,7 +21,8 @@ class Client:
         return RequestRecord(id=uuid.uuid4().hex, target="t", fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids, started_at="now", status="completed",
             valid=True, output=str(spec.expected), elapsed_ms=2, first_output_ms=1,
-            last_output_ms=2, answer_chunks=2, http_status=200)
+            last_output_ms=2, answer_chunks=2, http_status=200,
+            finish_reason="stop", stream_terminated=True)
 
 
 async def test_equal_inflight_entries_never_lose_records_or_leak_overlap():
@@ -140,16 +141,25 @@ async def test_restart_readiness_has_separate_deadline_and_error_accounting(monk
             attempts.append(spec.scenario)
             return await super().execute(spec, **kwargs)
     async def restart(run, target):
-        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic()}
+        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic(),
+                                          "service_answered_ms": None, "warm_requests": []}
         return True
+    async def not_ollama(*args, **kwargs):
+        return False
+    monkeypatch.setattr("giraffe.cold_start.detect_ollama", not_ollama)
     monkeypatch.setattr(runner, "LLMClient", Cold)
     monkeypatch.setattr(runner, "_restart", restart)
     run = runner._Run(cfg, None, None)
     await runner._target(run, cfg.targets[0], builtin_fixtures(cfg))
-    assert attempts == ["GET models"] * 4 + ["readiness"]
-    assert run.errors == run.budget_used == 0 and run.reason is None
-    assert len(run.observations["t"]["readiness_requests"]) == 1
+    assert attempts == ["GET models"] * 4 + ["readiness", "cold_start_warm", "cold_start_warm", "initial"]
+    assert run.errors == 0 and run.budget_used == 1 and run.reason is None
+    assert len(run.observations["t"]["readiness_requests"]) == 3
     assert run.observations["t"]["restart"]["status"] == "ready"
+    measured = [record for record in run.records if record.scenario in {"readiness", "cold_start_warm"}]
+    assert len(measured) == 3
+    assert all(record.status == "completed" and record.finish_reason == "stop"
+               and record.stream_terminated for record in measured)
+    assert len(run.observations["t"]["restart"]["warm_requests"]) == 2
     result = next(c for c in runner._checks(run, cfg.targets[0]) if c.id == "access")
     assert result.status == "pass" and result.metrics["attempted"] == 1
 
@@ -166,7 +176,8 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
         async def ready(self, deadline):
             await asyncio.sleep(1)
     async def restart(run, target):
-        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic()}
+        run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic(),
+                                          "service_answered_ms": None, "warm_requests": []}
         return True
     monkeypatch.setattr(runner, "LLMClient", Cold)
     monkeypatch.setattr(runner, "_restart", restart)

@@ -693,8 +693,7 @@ def safe_config(config):
     for original in config.get("targets", []):
         target = dict(original)
         target["identity"] = sanitize(target.get("identity", {}))
-        if target.get("restart_command"):
-            target["restart_command"] = safe_launch(target["restart_command"])
+        target.pop("restart_command", None)
         deployment = dict(target.get("deployment", {}))
         for category in (*CATEGORIES, "extension"):
             deployment[category] = safe_metadata(deployment).get(category, {})

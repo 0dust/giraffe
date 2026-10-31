@@ -13,15 +13,14 @@ from tests.test_web import browser, finished, report, successful_runner
 
 
 def config(**values):
-    return RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test",
-                               "restart_command": ["true"]}],
+    return RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test"}],
                      checks=["correctness"], default_concurrency=40, **values)
 
 
 async def test_real_validated_snapshot_copy_cli_accepts_resource_block(tmp_path, limits):
     limits["hard"] = 70
     cfg = config()
-    async with browser(tmp_path, allow_restart_command=True) as client:
+    async with browser(tmp_path) as client:
         validated = await client.post("/api/config/validate", json=cfg.model_dump(mode="json"))
         assert validated.status_code == 200, validated.text
         normalized = validated.json()
@@ -101,6 +100,11 @@ def test_other_traffic_cli_commands_guard_before_dispatch(tmp_path, monkeypatch,
     limits["hard"] = hard
     cfg = config(request_source="request_pack", request_pack={"version": 1, "cases": [{
         "fixture_id": "one", "scorer": "none", "messages": [{"role": "user", "content": "Question"}]}]})
+    if command == "cold-start":
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o700)
+        cfg.targets[0].restart_script = str(script)
     path = tmp_path / "config.json"
     path.write_text(cfg.model_dump_json())
     calls = []
@@ -111,7 +115,7 @@ def test_other_traffic_cli_commands_guard_before_dispatch(tmp_path, monkeypatch,
         return report(configuration)
 
     monkeypatch.setattr("giraffe.cli._run", run)
-    flags = ["--restart", "local"] if command == "cold-start" else ["--case", "one", "--target", "local"]
+    flags = ["--restart", "local", "--yes"] if command == "cold-start" else ["--case", "one", "--target", "local"]
     destination = tmp_path / "saved"
     result = main([command, "--config", str(path), "--output", str(destination), *flags])
     assert result == (3 if hard == 70 else 0)
@@ -147,7 +151,7 @@ async def test_web_summary_and_lifecycle_metadata_share_one_lock(tmp_path, monke
     monkeypatch.setattr(web, "write_report", write_report)
     monkeypatch.setattr(storage, "_write_metadata", write_metadata)
     monkeypatch.setattr(web, "run_suite", successful_runner)
-    async with browser(tmp_path, allow_restart_command=True) as client:
+    async with browser(tmp_path) as client:
         response = await client.post("/api/runs", json={"config": config().model_dump(mode="json")})
         assert response.status_code == 202, response.text
         identifier = response.json()["id"]

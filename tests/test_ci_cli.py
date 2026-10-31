@@ -349,7 +349,7 @@ def test_ui_host_token_link_and_restart_opt_in(host, port, tmp_path, monkeypatch
         captured['app'] = server.config.app
         captured['host'] = server.config.host
     monkeypatch.setattr(uvicorn.Server, 'run', run)
-    assert main(['ui', '--host', host, '--port', str(port), '--no-browser', '--allow-restart-command',
+    assert main(['ui', '--host', host, '--port', str(port), '--no-browser', '--allow-restart-script',
                  '--runs-dir', str(tmp_path)]) == 0
     output = capsys.readouterr()
     assert captured['address'] == (host, port) and captured['host'] == host

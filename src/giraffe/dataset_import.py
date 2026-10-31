@@ -147,7 +147,7 @@ def try_example_config(draft: ConfigDraft, fixture_id: str, target_name: str) ->
     effective = draft.effective_check(consumer)
     values = draft.model_dump(mode="json")
     selected_target = target.model_dump(mode="json")
-    selected_target.update(parent=None, restart_command=None, metrics_url=None, host_metrics_url=None)
+    selected_target.update(parent=None, restart_script=None, metrics_url=None, host_metrics_url=None)
     selected_target["deployment"].update(discovery="none", collector_url=None, metadata_file=None)
     values.update(targets=[selected_target], checks=["correctness"], max_requests=1,
                   restart_target=None, custom_fixtures=None, overlap_models=False,

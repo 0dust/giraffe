@@ -34,9 +34,11 @@ def cli_command(
             raise ValueError("Restart requires explicit cold-start mode and target")
         command = "giraffe run"
     else:
+        if restart_target is None and len(config.targets) == 1:
+            restart_target = config.targets[0].name
         target = next((target for target in config.targets if target.name == restart_target), None)
-        if target is None or not target.restart_command:
-            raise ValueError("Cold start requires a named target with a restart command")
+        if target is None or not target.restart_script:
+            raise ValueError("Cold start requires a target with a restart script")
         if "\x00" in target.name:
             raise ValueError("Restart target must not contain a NUL character")
         if config.restart_target not in {None, restart_target}:

@@ -640,6 +640,11 @@ class StartRun(SessionCredentials):
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
     restart_target: str | None = None
+    restart_script_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class RestartScriptPreview(Model):
+    path: str = Field(min_length=1)
 
 
 class CleanupRequest(CleanupCriteria):
@@ -868,7 +873,7 @@ def _bootstrap_config(defaults: dict | None) -> dict:
 def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                migration_notes: list[str] | None = None,
                token: str | None = None,
-               allow_restart_command: bool = False,
+               allow_restart_script: bool = False,
                host: str = "127.0.0.1",
                port: int = 8765,
                max_total_storage: int = DEFAULT_LIMITS["max_total_storage"],
@@ -880,6 +885,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     if not launch_token:
         raise ValueError("UI access token must not be empty")
     local_host = _is_local_authority(f"[{host}]" if ":" in host and not host.startswith("[") else host)
+    restart_allowed = local_host or allow_restart_script
     limits = {"max_total_storage": max_total_storage, "min_free_disk": min_free_disk,
               "max_run_storage": max_run_storage}
     if any(type(value) is not int or value < 0 for value in limits.values()):
@@ -1148,9 +1154,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 or valid_token(request.cookies.get(cookie_name)))
 
     def require_restart_allowed(config, *, mode="normal", restart_target=None):
-        if not allow_restart_command and (mode == "cold-start" or config.restart_target or restart_target):
-            raise HTTPException(403, "Restart commands are disabled. Start giraffe ui with "
-                                "--allow-restart-command to enable cold-start runs.")
+        if not restart_allowed and (mode == "cold-start" or config.restart_target or restart_target):
+            raise HTTPException(403, "Restart scripts are disabled. Start giraffe ui with "
+                                "--allow-restart-script to enable cold-start runs on a non-loopback bind.")
 
     def local_mutation_error(request):
         # Validate before request.url uses Host, for reads as well as mutations.
@@ -1731,14 +1737,26 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         migrated_defaults, limit_notes = migrate_run_limits(defaults)
         migrated_defaults, load_notes = migrate_concurrent_load(migrated_defaults)
         _, combined_notes = migrate_load_test(migrated_defaults)
-        return {**capabilities(resolved, restart_allowed=allow_restart_command), "config": resolved.model_dump(mode="json"),
+        return {**capabilities(resolved, restart_allowed=restart_allowed), "config": resolved.model_dump(mode="json"),
                 "baseline_configs": await run_in_threadpool(setup_baseline_configs),
                 "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
                 "active_run_id": active.get("id"), "disk_active_id": await run_in_threadpool(disk_active_id), "request_plan": await run_in_threadpool(preview_plan, resolved)}
 
     @app.get("/api/capabilities")
     async def describe_capabilities():
-        return capabilities(restart_allowed=allow_restart_command)
+        return capabilities(restart_allowed=restart_allowed)
+
+    @app.post("/api/targets/restart-script/preview")
+    def restart_script_preview(body: RestartScriptPreview):
+        from giraffe.restart_script import preview_script
+
+        if not restart_allowed:
+            raise HTTPException(403, "Restart scripts are disabled. Start giraffe ui with --allow-restart-script to enable cold-start runs on a non-loopback bind.")
+        try:
+            return preview_script(body.path)
+        except ValueError as error:
+            raise HTTPException(422, detail=[{"loc": ["path"], "msg": str(error),
+                                             "type": "restart_script"}]) from None
 
     @app.post("/api/targets/models")
     async def target_models(body: ModelDiscovery):
@@ -1885,11 +1903,23 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 raise HTTPException(422, "Restart target must not contain a NUL character")
             target = next((target for target in config.targets
                            if target.name == body.restart_target), None)
-            if target is None or not target.restart_command:
-                raise HTTPException(422, "Cold start requires a named target with a restart command")
+            if target is None or not target.restart_script:
+                raise HTTPException(422, "Cold start requires a named target with a restart script")
             if config.restart_target and config.restart_target != body.restart_target:
                 raise HTTPException(422, "Restart targets must match")
-            config = config.model_copy(update={"restart_target": body.restart_target})
+            if execute:
+                from giraffe.restart_script import CHANGED_SCRIPT, preview_script
+
+                if not body.restart_script_sha256:
+                    raise HTTPException(422, "Review and confirm the restart script before each run.")
+                try:
+                    preview = preview_script(target.restart_script)
+                except ValueError as error:
+                    raise HTTPException(422, str(error)) from None
+                if not secrets.compare_digest(preview["sha256"], body.restart_script_sha256):
+                    raise HTTPException(409, CHANGED_SCRIPT)
+            config = config.model_copy(update={"restart_target": body.restart_target,
+                                               "restart_script_sha256": body.restart_script_sha256 if execute else None})
         if config.custom_fixtures and "correctness" in config.checks:
             try:
                 load_custom_fixtures(config.custom_fixtures)
@@ -1940,6 +1970,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
             directory = _directory(root, identifier)
             await run_in_threadpool(directory.mkdir, parents=True)
+            config._restart_log_dir = directory
             meta = {"id": identifier, "state": "running", "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                     "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
             await run_in_threadpool(save_metadata, directory, meta)

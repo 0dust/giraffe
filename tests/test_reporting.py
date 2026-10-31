@@ -34,6 +34,38 @@ def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
 
 
+def test_cold_start_reasoning_and_unmeasured_warm_output_are_labelled():
+    from giraffe.reporting import _cold_start_html
+
+    report = make_report()
+    report.observations["targets"] = {"local": {"restart": {
+        "readiness_ms": 25, "first_request": {"first_output_ms": 5,
+            "elapsed_ms": 20, "first_output_kind": "reasoning"},
+        "warm_requests": [{"first_output_ms": 2, "elapsed_ms": 12, "first_output_kind": "reasoning"},
+                          {"first_output_ms": None, "elapsed_ms": None, "reason": "HTTP 503"}],
+    }}}
+    html = _cold_start_html(report)
+    assert html.count("First output was reasoning; no answer within the output cap.") == 2
+    assert "Not measured" in html and "HTTP 503" in html
+    assert "5 ms" in html and "2 ms" in html
+    assert "None ms" not in html
+
+
+@pytest.mark.parametrize("value", ["Model load: 1.38 s, reported by Ollama", "Not reported by this server",
+                                 "Model was already loaded"])
+def test_cold_start_model_load_value_has_one_label_and_preserves_json(value):
+    from giraffe.reporting import _cold_start_html
+
+    report = make_report()
+    report.observations["targets"] = {"local": {"restart": {"model_load": value}}}
+    original = report.model_dump_json()
+    html = _cold_start_html(report)
+    assert '<dt>Model load' in html
+    assert f'<dd>{value.removeprefix("Model load: ")}</dd>' in html
+    assert '<dd>Model load: ' not in html
+    assert report.model_dump_json() == original
+
+
 def test_comparison_setting_reasons_include_structured_values_without_changing_text():
     current, previous = make_report(), make_report("baseline")
     current.manifest["config"]["request_timeout_seconds"] = 300

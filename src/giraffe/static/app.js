@@ -24,7 +24,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, restartPreview:null, restartPreviewSequence:0, restartConfirmedHash:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 const statusLabels = {pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -1023,7 +1023,7 @@ function renderRuns() {
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
 }
-const numericFields=['context_limit','concurrency','max_requests','max_memory_mb','max_duration_seconds','request_timeout_seconds','max_output_tokens'].map(name=>[name]);
+const numericFields=['context_limit','concurrency','max_requests','max_memory_mb','max_duration_seconds','request_timeout_seconds','restart_script_timeout_seconds','max_output_tokens'].map(name=>[name]);
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output (estimate)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
 const fieldDescriptions={
   url:{hint:'Address of your LLM server.',help:'Use the address Giraffe can reach, such as http://localhost:11434/v1 for Ollama or http://localhost:8000/v1 for vLLM. Giraffe connects to an existing server; it does not start or install a model.'},
@@ -1044,8 +1044,8 @@ const fieldDescriptions={
   buckets_output:{help:'The maximum answer tokens requested for this case. The first answer case asks for a box label; the other two ask for the label followed by numbers. The server can finish before reaching the cap. Each case owns its answer cap; the suite value is a default.'},
   host_metrics_url:{hint:'Optional server host exporter address.',help:'An existing node_exporter Prometheus-text URL measures server-wide CPU and host RAM alongside the workload. Giraffe does not install an exporter. Inference and runtime metrics credentials are not forwarded to this URL.'},
   metrics_url:{hint:'Optional server metrics address.',help:'Use an existing Prometheus metrics URL, such as http://localhost:9400/metrics. Giraffe reads measurements from it; it does not install an exporter. Missing metrics remain unknown.'},
-  mode:{help:'Use running server tests the server as it is. Restart one server first runs its configured restart command before testing. Choose this only when you intend to restart that server.'},
-  restart_target:{help:'Only this endpoint’s configured restart command runs. Other endpoints keep running. A restart command must already be configured for the selected endpoint.'},
+  restart_script:{help:'Giraffe runs this script to restart your server before testing, so you can see how it behaves from a cold start: how long it takes to start, how slow the first requests are and, if the server reports it, how long the model takes to load. The script is yours and decides what restarting means, for example systemctl restart ollama. It runs on this machine, and only when you tick the box on the Launch page. Only this file is reviewed; anything it calls is not. Don\'t print secrets: output is saved in the report.'},
+  restart_script_timeout_seconds:{help:'Maximum time to wait for the script to exit, bounded by the run’s remaining time. The server it starts keeps running after Stop or timeout.'},
   baseline_id:{help:'Choose a previously saved run to compare with this one. Giraffe reports changes in errors, answers and timing, while still checking this run against its own acceptance settings. Leave this empty for a first run.'},
   baseline_name:{help:'Give this saved run a name you will recognize later, such as before-model-update. Saving a baseline does not change the run’s outcome.'},
   traffic_rates:{hint:'Requests per second, for example 1, 2, 4.',help:'Each number is a separate load stage, from lowest to highest. Giraffe starts new requests at that rate without waiting for previous answers. Requests it cannot start because its in-flight limit is full are counted as local drops.'},
@@ -1127,8 +1127,8 @@ function settingDestination(path) {
   const sections={load_test:'load',concurrent_load:'concurrency',sessions:'sessions',consistency:'consistency',arrivals:'arrivals',prefix:'prefix',traffic:'capacity',tool_checks:'tools'};
   if(parts.length===1&&sections[root]||root==='test_options'&&parts.length===2)return {section:true,check:sections[root]||parts[1],step,label:root==='test_options'?`${human(parts[1]).toLowerCase()} settings`:`${human(sections[root]).toLowerCase()} settings`};
   if(root==='stream'){step=1;}
-  else if(root==='retention'){step=3;}
-  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=1;}
+  else if(['retention','name','baseline_id'].includes(root)){step=3;}
+  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=name==='name'?3:1;}
   else if(root==='load_test'){
     check='load';
     if(parts[1]==='migrated_tests')return {name:'config_editor',step,label:'imported load settings'};
@@ -2034,6 +2034,7 @@ function refreshInheritedFields(id,onlyInherited=false) {
 }
 const inputRetentionNotice='Questions and expected answers are saved with the run. Retention all / failures / none controls whether response text and evaluator reasons are kept. Request metadata (timings, status, scores) is always saved. Retention does not cap disk usage; storage limits do.';
 function configChanged() {
+  invalidateRestartConfirmation();
   state.jsonValidation=null;state.configRevision++;
   if(state.requestPreview)state.requestPreview.status='stale';
   renderRequestPreview();
@@ -2216,7 +2217,7 @@ async function tryDatasetExample(event) {
     config.retention=$('#dataset-try-form').elements.save_try_output.checked?'all':'none';
     state.submitting=true;
     const result=await api('/api/runs/try-example',{method:'POST',body:JSON.stringify({config,fixture_id:draft.fixture_id,target_name,api_keys:sessionAPIKeys(config)})});
-    setActive(result.id);closeDatasetDialog();if(draft.route===state.routeVersion)location.hash=linkRun(result.id);else toast('Example run started. Open the active run to inspect it.');
+    invalidateRestartConfirmation();setActive(result.id);closeDatasetDialog();if(draft.route===state.routeVersion)location.hash=linkRun(result.id);else toast('Example run started. Open the active run to inspect it.');
   }catch(error){datasetError(error.message);}finally{state.submitting=false;}
 }
 function currentRequestPlan() {
@@ -2437,15 +2438,12 @@ function renderReviewScope(payload) {
   const usesPack=usesQuestions&&config.request_source==='request_pack',cases=config.request_pack?.cases || [];
   const mixedSources=usesPack&&config.checks.some(id=>!['correctness','load','gpu'].includes(id));
   const source=usesQuestions?(usesPack?`Your questions · ${number(cases.length)} saved ${cases.length===1?'question':'questions'}${mixedSources?` for ${questionChecks.map(catalogTitle).join(' and ')}. Other checks use generated requests.`:''}`:'Built-in examples'):'';
-  const baseline=payload.baseline_id?state.baselines.find(item=>item.id===payload.baseline_id):null;
-  const comparison=payload.baseline_id?`Compare with saved run: ${baseline?.name || payload.baseline_id}`:'';
   const problems=[];
   if(targets.some(target=>!target.url?.trim()||!target.model?.trim()))problems.push({msg:'Enter an endpoint URL and model for every target.',fields:['targets.0.url','targets.0.model']});
   if(!config.checks.length)problems.push({msg:'Select at least one check.',fields:['checks']});
   if(usesPack&&!cases.length)problems.push({msg:'Add a question or choose built-in examples.',fields:['request_pack']});
   if(usesPack&&cases.some(item=>item.scorer==='judge')&&!judgesReady(config))problems.push({msg:'Configure the AI evaluator for questions that need it.',fields:['judging']});
-  const restart=payload.mode==='cold-start'?targets.find(target=>target.name===payload.restart_target):null;
-  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section><section class="review-section review-compare" id="review-compare"><div class="review-section-heading"><h3>Compare with</h3>${state.baselines?.length?`<button type="button" class="text-button" data-action="choose-baseline">${payload.baseline_id?'Change':'Choose baseline'}</button>`:''}</div>${comparison?`<p class="hint review-baseline">${escape(comparison)}</p><p class="hint">Results will show what changed since that run.</p>`:state.baselines?.length?`<p class="hint">Not compared. Choose a saved baseline to see what changed since that run.</p>`:'<p class="hint">No baselines yet. After a run, open its results and press <strong>Save as reference baseline</strong>. You can then compare later runs against it here.</p>'}</section>${renderSettingIssues(problems,'warning')}${payload.mode==='cold-start'?notice(restart?.restart_command?.length?`Restart ${restart.name} before testing. This runs its configured restart command.`:'Restart selected, but no restart command is configured for that endpoint. Use the running server or configure a restart command.','warning'):''}`;
+  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${renderSettingIssues(problems,'warning')}`;
 }
 function browseCheckIntent(category) {
   if(!checkGroups.some(group=>group.id===category))return;
@@ -2656,6 +2654,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <div class="connection-row model-options" id="model-options"><label class="row-label" for="field-model">Model</label><div class="row-control"><label for="connection-model-choice" hidden>Available models</label><select id="connection-model-choice" hidden></select><div id="manual-model-field">${field('model','Model',target.model || '',{required:true,placeholder:'Found when you connect',hint:''})}</div><p class="hint" id="model-options-label"></p></div></div>
   <div class="setup-advanced"><div class="details-content">
   <details class="connection-auth" id="connection-auth"><summary class="api-key-row"><span class="api-key-label">API key (optional)</span><span class="row-value api-key-value">${apiKeyFor(target.url)?'Set for this tab':escape(target.api_key_env)||'Not set'}</span><span class="row-action api-key-action"><span class="when-closed">Edit</span><span class="when-open">Close</span></span></summary>${field('api_key','API key (optional)','',{type:'password',placeholder:'Paste your API key',hint:'',help:'Kept in memory for this tab. Never included in saved setups or reports. Paste it again after reloading. Leave blank for an open endpoint.'})}<button type="button" class="text-button" data-action="clear-api-key">Clear key</button>${field('api_key_env','API key environment variable',apiKeyFor(target.url)?'':target.api_key_env,{placeholder:'OPENAI_API_KEY',hint:''})}</details>
+  ${renderRestartScriptRow(target,c)}
   ${renderField('tokenizer','Token ID / tokenizer',`<select id="field-tokenizer" name="tokenizer" aria-describedby="tokenizer-status">${[['auto','Automatic'],['builtin','builtin'],['custom','Custom']].map(([value,label])=>`<option value="${value}" ${tokenizerMode===value?'selected':''}>${label}</option>`).join('')}</select><div id="tokenizer-custom-field" ${tokenizerMode==='custom'?'':'hidden'}>${field('tokenizer_custom','Tokenizer name',tokenizerName,{placeholder:'Qwen/Qwen2.5-7B-Instruct',hint:''}).replace('autocomplete="off"','autocomplete="off" maxlength="512" aria-describedby="tokenizer-status"')}</div><p id="tokenizer-status" class="hint" role="status" aria-live="polite"></p>`,{hint:'',help:"Used to size prompts. Automatic uses the model's own tokenizer when it can be found, otherwise builtin. builtin uses tiktoken o200k_base, included with Giraffe; its counts are approximate. Custom loads a Hugging Face model ID or local path and needs giraffe-llm[hf-tokenizer]."})}
   <div class="fields">${field('metrics_url','Server metrics URL (optional)',target.metrics_url,{type:'url',hint:'',placeholder:'http://localhost:8000/metrics'})}${field('host_metrics_url','Host metrics URL (optional)',target.host_metrics_url,{type:'url',hint:'',placeholder:'http://localhost:9100/metrics'})}${selectField('stream','Streaming',`<option value="true" ${c.stream?'selected':''}>On</option><option value="false" ${c.stream?'':'selected'}>Off</option>`,{hint:''})}</div>
   </div></div></div>
@@ -2664,9 +2663,13 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   </section><section class="setup-step-content" id="setup-panel-2" data-setup-panel="2" aria-label="Choose checks" hidden>
   ${renderSharedRunSettings(c)}${renderCheckSelection(c)}</section>
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
+  <section class="setup-section" id="launch-settings"><div id="launch-restart">${renderRestartConfirmation(c)}</div>
+  <div class="fields" id="comparison-settings">${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved with this run <span class="dim" id="saved-run-summary">${escape(savedRunSummary(target.name,c.retention))}</span></summary><div class="details-content"><div class="fields">${selectField('retention','Save model answers',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${retentionLabels[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Name in reports',target.name,{required:true,placeholder:'local',hint:'',help:'Labels this server in reports and comparisons.'})}</div></div></details>
+  </section>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div><div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div></div></div></details>
+
   </div><section id="request-plan" class="request-plan review-section"></section><div id="setup-history" hidden></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Apply changes before returning to the form.</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor',hint:'',help:[fieldDescription('config_editor').help,inputRetentionNotice].join(' ')})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" tabindex="0" aria-label="Run plan" hidden></aside>
@@ -2680,11 +2683,10 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
     for(const name of check.option_fields){const input=$('#new-run-form').elements[`test_${check.id}_${name}`];if(input)input.dataset.inherited=String(options[name]==null);}
     for(const name of check.limit_fields){const input=$('#new-run-form').elements[`test_${check.id}_limit_${name}`];if(input)input.dataset.inherited=String(!Object.hasOwn(options.limits || {},name));}
   }
-  const form=$('#new-run-form');if(form.elements.load_patterns_concurrent_levels)form.elements.load_patterns_concurrent_levels.dataset.inherited=String(c.load_test?.patterns?.concurrent?.levels===undefined);if(form.elements.traffic_max_in_flight)form.elements.traffic_max_in_flight.dataset.inherited=String(c.traffic?.max_in_flight==null);form.elements.mode.value=state.formMode;
+  const form=$('#new-run-form');if(form.elements.load_patterns_concurrent_levels)form.elements.load_patterns_concurrent_levels.dataset.inherited=String(c.load_test?.patterns?.concurrent?.levels===undefined);if(form.elements.traffic_max_in_flight)form.elements.traffic_max_in_flight.dataset.inherited=String(c.traffic?.max_in_flight==null);
   if(form.elements.api_key)form.elements.api_key.value=apiKeyFor(target.url);
-  if(state.formRestartTarget&&c.targets.some(t=>t.name===state.formRestartTarget))form.elements.restart_target.value=state.formRestartTarget;
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
-  syncTestControls();updateBounds();updateRestart();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();watchPlanViewport();scheduleTokenizerSelection({immediate:true});renderTokenizerSelection();
+  syncTestControls();updateBounds();renderRestartPreview();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();watchPlanViewport();watchRestartScriptRow();scheduleTokenizerSelection({immediate:true});renderTokenizerSelection();
 }
 function readForm(allowEmpty=false) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
@@ -2693,6 +2695,7 @@ function readForm(allowEmpty=false) {
   if(!config.targets?.length)throw new Error('Configuration must contain at least one target.');
   const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
   if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
+  if(form.elements.restart_script)first.restart_script=form.elements.restart_script.value.trim() || null;
   if(form.elements.metrics_url)first.metrics_url=form.elements.metrics_url.value.trim() || null;
   first.tokenizer=tokenizerChoice();
   if(form.elements.host_metrics_url)first.host_metrics_url=form.elements.host_metrics_url.value.trim() || null;
@@ -2711,7 +2714,16 @@ function readForm(allowEmpty=false) {
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config.restart_target=null;
-  return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
+  const confirmed=restartConfirmed(config);
+  return {config,baseline_id:data.get('baseline_id') || null,mode:confirmed?'cold-start':'normal',restart_target:confirmed?first.name:null,...(confirmed?{restart_script_sha256:state.restartConfirmedHash}:{})};
+}
+const retentionLabels={failures:'Failed answers only',all:'All answers',none:'None'};
+function savedRunSummary(name,retention) {
+  return `${name ?? ''} · ${retentionLabels[retention || 'failures']}`;
+}
+function updateSavedRunSummary() {
+  const form=$('#new-run-form'),summary=$('#saved-run-summary');if(!form||!summary)return;
+  summary.textContent=savedRunSummary(form.elements.name?.value.trim(),form.elements.retention?.value);
 }
 function updateBounds() {
   let payload;try{payload=readForm(true);}catch{return;}
@@ -2726,6 +2738,7 @@ function updateBounds() {
     const card=$(`[data-test-card="${check.id}"]`);
     updateCheckRow(check,c,card);
   }
+  const restart=$('#launch-restart');if(restart)restart.innerHTML=renderRestartConfirmation(c);
   $('#run-bounds').innerHTML=renderReviewScope(payload);
   const selectionText=`${c.checks.length} ${c.checks.length===1?'check':'checks'} selected`;
   if($('#selection-summary').textContent!==selectionText)$('#selection-summary').textContent=selectionText;
@@ -2748,7 +2761,72 @@ function configureEvaluator() {
   if(!state.config.judging?.judges?.length)changeJudge('add');
   else $('[name="judge_0_url"]')?.focus();
 }
-function updateRestart(){const form=$('#new-run-form');if(!form)return;const mode=form.elements.mode.value;$('#restart-controls').hidden=mode!=='cold-start';const name=form.elements.restart_target.value;const target=state.config.targets.find(t=>t.name===name);$('#restart-hook').textContent=target?.restart_command?.length?`Configured command: ${target.restart_command.join(' ')}`:'No restart command is configured for this target. Add restart_command in the configuration before using cold start.';updateBounds();}
+function restartScriptPath(config=state.config) {
+  return $('#new-run-form')?.elements.restart_script?.value.trim() ?? config?.targets?.[0]?.restart_script ?? '';
+}
+function currentRestartPreview(config=state.config) {
+  const preview=state.restartPreview;
+  return preview?.status==='current'&&preview.route===state.routeVersion&&preview.requestedPath===restartScriptPath(config)?preview:null;
+}
+function restartConfirmed(config=state.config) {
+  const preview=currentRestartPreview(config);
+  return Boolean(state.bootstrap?.restart_allowed&&preview&&state.restartConfirmedHash===preview.sha256);
+}
+function invalidateRestartConfirmation() {
+  state.restartConfirmedHash=null;
+  const checkbox=$('#confirm-restart-script');if(checkbox)checkbox.checked=false;
+}
+function invalidateRestartPreview() {
+  state.restartPreviewSequence++;state.restartPreview=null;invalidateRestartConfirmation();renderRestartPreview();
+}
+function renderScriptContents(preview) {
+  return `<dl class="bound-list"><div><dt>Full path</dt><dd>${escape(preview.path)}</dd></div><div><dt>Machine</dt><dd>${escape(preview.machine)}</dd></div><div><dt>SHA-256</dt><dd class="mono">${escape(preview.sha256)}</dd></div></dl><pre tabindex="0">${escape(preview.contents)}</pre>`;
+}
+function renderRestartScriptRow(target,config) {
+  if(!state.bootstrap.restart_allowed)return `<div class="field-label"><span class="hint">Restart scripts unavailable</span>${infoHelp('restart_permission','Restart scripts unavailable','Restart scripts are disabled on this bind. Start giraffe ui with --allow-restart-script to enable them.')}</div>`;
+  const label='Restart script (optional)';
+  return `<div id="restart-script-setting"><details class="connection-auth" id="restart-script-row"><summary class="api-key-row"><span class="api-key-label">${label}</span><span class="row-value api-key-value">${escape(target.restart_script)||'Not set'}</span><span class="row-action api-key-action"><span class="when-closed">Edit</span><span class="when-open">Close</span></span></summary>${field('restart_script','Script path',target.restart_script,{hint:'',placeholder:'/path/to/restart.sh',hideInfo:true})}<button type="button" class="text-button" data-action="preview-restart-script">Review script</button><div id="restart-script-preview" role="status"></div>${schemaField('restart_script_timeout_seconds',config.restart_script_timeout_seconds ?? 600,state.bootstrap.config_schema.properties.restart_script_timeout_seconds,{label:'Restart script timeout (seconds)',hint:''})}</details><div class="field-label" id="restart-script-help">${infoHelp('restart_script',label,fieldDescription('restart_script').help)}</div></div>`;
+}
+function watchRestartScriptRow() {
+  state.restartRowObserver?.disconnect();
+  const summary=$('#restart-script-row > summary'),label=$('#restart-script-row .api-key-label'),help=$('#restart-script-help'),row=$('#restart-script-setting');if(!summary||!label||!help||!row)return;
+  const resize=()=>{
+    const bounds=row.getBoundingClientRect(),heading=summary.getBoundingClientRect(),text=label.getBoundingClientRect();
+    help.style.left=`${text.right-bounds.left+8}px`;help.style.top=`${heading.top-bounds.top}px`;help.style.height=`${heading.height}px`;
+  };
+  resize();
+  if(typeof ResizeObserver!=='undefined'){state.restartRowObserver=new ResizeObserver(resize);state.restartRowObserver.observe(summary);state.restartRowObserver.observe(label);}
+}
+function renderRestartPreview() {
+  const element=$('#restart-script-preview');if(!element)return;
+  const preview=currentRestartPreview(),saved=state.restartPreview;
+  element.innerHTML=preview?renderScriptContents(preview):saved?.status==='pending'?'<p class="hint">Reviewing script…</p>':'';
+  const error=$('#field-restart_script-error'),input=$('#field-restart_script');
+  if(error){error.textContent=saved?.status==='error'?saved.error:'';error.hidden=!error.textContent;}
+  if(input){if(saved?.status==='error'){input.setAttribute('aria-invalid','true');input.setAttribute('aria-describedby','field-restart_script-error');}else input.removeAttribute('aria-invalid');}
+  const summary=$('#restart-script-row > summary .row-value');if(summary)summary.textContent=restartScriptPath()||'Not set';
+}
+function renderRestartConfirmation(config) {
+  if(!state.bootstrap.restart_allowed||!config.targets?.[0]?.restart_script)return '';
+  const preview=currentRestartPreview(config);
+  return `<section class="review-section" id="review-restart"><label class="test-selection"><input type="checkbox" id="confirm-restart-script" name="confirm_restart_script" ${restartConfirmed(config)?'checked':''} ${preview?'':'disabled'}><span>Restart the server with this script before testing</span></label>${preview?renderScriptContents(preview):'<button type="button" class="text-button" data-action="preview-restart-script">Review script</button>'}</section>`;
+}
+async function previewRestartScript() {
+  invalidateRestartConfirmation();
+  const path=restartScriptPath(),route=state.routeVersion,sequence=++state.restartPreviewSequence;
+  if(!path){state.restartPreview=null;renderRestartPreview();updateBounds();return;}
+  state.restartPreview={status:'pending',requestedPath:path,route};renderRestartPreview();updateBounds();
+  try{
+    const preview=await api('/api/targets/restart-script/preview',{method:'POST',body:JSON.stringify({path})});
+    if(route!==state.routeVersion||sequence!==state.restartPreviewSequence||path!==restartScriptPath())return;
+    state.restartPreview={...preview,status:'current',requestedPath:path,route};
+  }catch(error){
+    if(route!==state.routeVersion||sequence!==state.restartPreviewSequence||path!==restartScriptPath())return;
+    state.restartPreview={status:'error',requestedPath:path,route,error:error.message};
+    const input=$('#new-run-form')?.elements.restart_script;if(input)input.setAttribute('aria-invalid','true');
+  }
+  renderRestartPreview();updateBounds();
+}
 async function startRun(event) {
   event.preventDefault();if(state.submitting||state.active||state.configBusy)return;
   if($('#setup-panel-1')&&state.setupStep<3){navigateSetup(state.setupStep+1);return;}
@@ -2767,13 +2845,13 @@ async function startRun(event) {
     const payload=await validatedSnapshot();
     await refreshRequestPreview(payload.config);
     if(currentResourceErrors().length)throw new Error(currentResourceErrors()[0].msg);
-    if(payload.mode==='cold-start'&&!payload.config.targets.find(t=>t.name===payload.restart_target)?.restart_command?.length)throw new Error('Cold start requires a configured restart_command for the selected target.');
+    if(payload.mode==='cold-start'&&(!restartConfirmed(payload.config)||payload.restart_script_sha256!==state.restartConfirmedHash))throw new Error('The script changed. Review it again.');
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Checking input preparation…';
     const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','load'].includes(id)))state.config.request_source=draft.request_source;
-    setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
-  }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}focusFirstSettingError(error);const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Launch ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
+    invalidateRestartConfirmation();setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
+  }catch(error){if(error.message==='The script changed. Review it again.'){invalidateRestartPreview();updateBounds();}if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}focusFirstSettingError(error);const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Launch ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
 }
 function summaryReport(detail){return {checks:detail.summary?.checks||[],requests:detail.live_requests||[],abort_reason:detail.abort_reason};}
 function reportConfig(report){return report?.manifest?.config || state.detail?.config || {};}
@@ -2972,7 +3050,8 @@ function renderPreparation(detail=state.detail) {
     const running=item.status==='running'&&activeState(detail),key=JSON.stringify([item.target,item.step,item.started_elapsed_seconds]),sample=Number(item.elapsed_seconds || 0),previous=clocks.get(key);
     if(!previous||sample!==previous.sample)clocks.set(key,{sample,at:Date.now()});
     const clock=clocks.get(key),seconds=sample+(running?(Date.now()-clock.at)/1000:0),status=running?'running':item.status==='running'?'cancelled':item.status;
-    const label={running:'Preparing test traffic',completed:item.builtin?'Preparation complete · built-in tokenizer':item.estimated?'Preparation complete · estimated input size':'Preparation complete',failed:'Preparation failed',unavailable:'Preparation unavailable',cancelled:'Preparation stopped'}[status] || 'Preparation';
+    const restarting=item.scenario==='restart_script'||item.step==='Running restart script';
+    const label=restarting&&running?'Running restart script':{running:'Preparing test traffic',completed:item.builtin?'Preparation complete · built-in tokenizer':item.estimated?'Preparation complete · estimated input size':'Preparation complete',failed:'Preparation failed',unavailable:'Preparation unavailable',cancelled:'Preparation stopped'}[status] || 'Preparation';
     const optionalEvidence=optional(item);
     const scope=item.scenario==='context_preparation'?catalogTitle('context'):item.scenario?.startsWith('load_preparation_')?catalogTitle('load'):'';
     const execution=optionalEvidence?(running?'Checking optional measurement support before continuing test traffic.':status==='completed'?'Supported measurements are available.':'Unsupported measurements stay unknown; this does not establish a workload failure.'):running?'Test traffic for this preparation has not started.':['failed','unavailable','cancelled'].includes(status)?'The affected test traffic did not run.':'';
@@ -3313,7 +3392,7 @@ function renderDetail() {
   if(!report){
     const hadTestDialog=$('#test-dialog')?.open;if(hadTestDialog)closeConditionDialog({reveal:false});
     const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d);
-    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
+    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderColdStart(d.report)}${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
   }
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline');
   const required=checks.filter(c=>c.required);
@@ -3326,7 +3405,7 @@ function renderDetail() {
   const compareButton=d.state==='completed'?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
   patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}${renderBaselineSummary(report)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
   ${d.error?notice(d.error,d.state==='error'?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
-  <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}
+  <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}${renderColdStart(report)}
   <section id="results-checks" class="report-result-section"><section id="result-content">${renderChecks(report)}</section></section>
   <details id="report-baseline-reference" class="report-reference report-result-section comparison-container" ${report.baseline||state.tab==='baseline'?'open':''}><summary><h2>Baseline comparison</h2></summary><div id="baseline-content" data-comparison-scope="results">${renderComparison(report)}</div></details>
   <section id="results-configuration" class="report-result-section"><details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary><h2>Run configuration</h2></summary>${renderConfig(report)}</details></section>
@@ -3334,6 +3413,15 @@ function renderDetail() {
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
   syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
+}
+function renderColdStart(report=state.detail?.report) {
+  const targets=Object.entries(report?.observations?.targets || {}).filter(([,item])=>item.restart);
+  if(!targets.length)return '';
+  return `<section id="results-cold-start" class="panel report-result-section"><h2>Cold start</h2>${targets.map(([name,item],index)=>{
+    const restart=item.restart,first=restart.first_request || {},warm=restart.warm_requests || [];
+    const rows=[['Script time',ms(restart.script_ms)],['Service answered after',ms(restart.service_answered_ms)],['First answer after',ms(restart.readiness_ms)],['Model load',(restart.model_load || 'Not reported by this server').replace(/^Model load: /,'')],['Model loaded before first request',restart.model_loaded_before_first_request || 'Unknown']];
+    return `${targets.length>1?`<h3>${escape(name)}</h3>`:''}<dl class="bound-list">${rows.map(([label,value])=>`<div><dt>${escape(label)}${label==='Model load'?infoHelp(`cold_model_load_${index}`,'Model load','Some servers load weights at startup, in which case it\'s part of "Service answered after".'):''}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>${restart.measurement_api?`<p class="hint">${escape(restart.measurement_api)}</p>`:''}<div class="metric-table"><table><thead><tr><th>Request</th><th>First-answer time</th><th>Latency</th></tr></thead><tbody>${[first,...warm].map((request,index)=>`<tr><th scope="row">${index?`Follow-up ${index}`:'First request'}</th><td>${request.first_output_ms==null?'Not measured':ms(request.first_output_ms)}${request.first_output_kind==='reasoning'?'<p class="hint">First output was reasoning; no answer within the output cap.</p>':''}${request.reason?`<p class="hint">${escape(request.reason)}</p>`:''}</td><td>${request.elapsed_ms==null?'Not measured':ms(request.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>${restart.reason?`<p>${escape(restart.reason)}</p>`:''}${restart.output_tail?`<details class="check-observations"><summary>Restart script output</summary><pre>${escape(restart.output_tail)}</pre></details>`:''}`;
+  }).join('')}</section>`;
 }
 function renderDiagnostics(report,detail) {
   return `<details class="run-diagnostics"><summary>Run diagnostics</summary><p>Internal run ID: <code>${escape(report?.run_id || 'Not recorded')}</code></p>${renderResources(report,detail)}</details>`;
@@ -3728,7 +3816,7 @@ function renderLive() {
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
   patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
-  ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
+  ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderColdStart(d.report)}<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
   ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
 </section>
   <details class="panel live-activity"><summary>Activity · last 5 events</summary><div class="event-list">${[...events].reverse().slice(0,5).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(({request_started:'Request sent',request_completed:'Response received',run_started:'Run started',run_stopping:'Stopping run',run_completed:'Run complete',judging_started:'Answer evaluation started',judging_progress:'Evaluating answers'})[e.event] || human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span></div>`).join('')||'<p class="hint">Preparing the first requests…</p>'}</div></details></div>
@@ -3937,7 +4025,7 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
-  replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;invalidateRestartPreview();state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -3945,10 +4033,10 @@ function assertAppliedConfig() {if(hasJsonChanges())throw new Error('Apply or di
 function captureFormDraft() {
   const form=$('#new-run-form');if(!form)return;
   state.prefillBaseline=form.elements.baseline_id.value;
-  state.formMode=form.elements.mode.value;state.formRestartTarget=form.elements.restart_target.value;
   try{state.config=readForm(true).config;}catch{}
 }
 async function restoreDraft() {
+  invalidateRestartPreview();
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
@@ -4013,8 +4101,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     captureFormDraft();
     replaceMigrationNotes(result.migration_notes);
     state.config=result.config;state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
-    // An explicit restart target in imported/edited JSON remains visible and intentional.
-    state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
+    invalidateRestartPreview();
     state.config.restart_target=null;
     state.jsonDraft=null;state.jsonBase=null;configChanged();
     renderNew();toast(importing?'Configuration imported.':'Configuration applied.');
@@ -4023,6 +4110,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
 }
 async function importConfig(file) {
   if(!file)return;
+  invalidateRestartConfirmation();
   const version=state.routeVersion,revision=state.configRevision;
   try{assertAppliedConfig();const text=await file.text();if(version!==state.routeVersion||revision!==state.configRevision)return;await applyConfig(text,{importing:true});}
   catch(error){if(version===state.routeVersion)configError(error);}
@@ -4123,6 +4211,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='setup-next'){navigateSetup(state.configView==='json'?state.setupStep:state.returnToReview?3:state.setupStep+1);return;}
   if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
   if(action==='test-connection'){await testConnection();return;}
+  if(action==='preview-restart-script'){await previewRestartScript();return;}
   if(action==='clear-api-key'){clearAPIKey();invalidateModelDiscovery();captureFormDraft();configChanged();renderNew();$('#connection-auth').open=true;$('#new-run-form').elements.api_key.focus();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
   if(configure){toggleTestEditor(configure);return;}
@@ -4228,7 +4317,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='reset-traffic'){configChanged();const form=$('#new-run-form');form.elements.traffic_mode.value='default';const defaults=state.bootstrap.config.traffic;for(const [key,value] of Object.entries(defaults)){if(key==='mix'){for(const [kind,weight] of Object.entries(value))form.elements[`traffic_mix_${kind}`].value=weight;}else form.elements[`traffic_${key}`].value=Array.isArray(value)?value.join(', '):value ?? '';}syncTestControls();updateBounds();return;}
   if(action==='compare-saved'){await openComparisonDialog();return;}
   if(action==='compare-run'){const saved=(state.baselines || []).find(item=>item.run_id===state.detail?.id);await rerun();if(saved)state.prefillBaseline=saved.id;return;}
-  if(action==='choose-baseline'){const options=$('#execution-settings');if(options){options.open=true;const select=$('#field-baseline_id');select?.focus();select?.scrollIntoView?.({block:'center'});}return;}
+  if(action==='choose-baseline'){try{focusSetting('baseline_id');}catch(error){configError(error);}return;}
   if(action==='retry')route();if(action==='clear-filter'){state.filter='all';state.historySearch='';renderRuns();}
   if(action==='stop')await confirmStop();if(action==='show-failing')showFailingRequests();if(action==='show-inconclusive'){chooseReportTab('results',{anchor:false});const findings=$('#failing-requests');findings?.scrollIntoView?.({block:'start'});findings?.focus({preventScroll:true});}if(action==='show-comparison'){chooseReportTab('results',{anchor:false});revealReportSection('baseline');location.hash=`${linkRun(state.detail.id)}/results/baseline`;}if(action==='rerun')await rerun();if(action==='baseline-dialog')openBaselineDialog();
   if(action==='close-dialog'){if(event.target.closest('dialog')?.id==='request-dialog')closeRequestEvidence();else event.target.closest('dialog').close();}if(action==='apply-config')await applyConfig();
@@ -4268,6 +4357,9 @@ document.addEventListener('input',event=>{
   if(event.target.id==='run-search'){state.historySearch=event.target.value;renderRuns();return;}
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
+  if(event.target.name==='confirm_restart_script')return;
+  if(['name','retention'].includes(event.target.name))updateSavedRunSummary();
+  if(event.target.name==='restart_script'){invalidateRestartPreview();event.target.removeAttribute?.('aria-invalid');}
   event.target.removeAttribute?.('data-setting-highlight');
   if(['url','model','name'].includes(event.target.name))event.target.setCustomValidity?.('');
   if(['url','api_key_env'].includes(event.target.name))clearAPIKey();
@@ -4293,6 +4385,9 @@ document.addEventListener('input',event=>{
   updateBounds();
 });
 document.addEventListener('change',event=>{
+  if(['name','retention'].includes(event.target.name)&&event.target.closest('#new-run-form'))updateSavedRunSummary();
+  if(event.target.name==='confirm_restart_script'){const preview=currentRestartPreview();state.restartConfirmedHash=event.target.checked&&preview?preview.sha256:null;state.configRevision++;state.requestPreview&&(state.requestPreview.status='stale');updateBounds();return;}
+  if(event.target.name==='restart_script'){configChanged();previewRestartScript();return;}
   const comparisonFilter=event.target.dataset?.comparisonFilter;
   if(['outcome','check'].includes(comparisonFilter)){
     const container=event.target.closest('[data-comparison-scope]'),report=state.detail?.report;if(!container||!report)return;
@@ -4336,7 +4431,7 @@ document.addEventListener('change',event=>{
   if(event.target.name?.startsWith('load_')){configChanged();updateBounds();return;}
   if(event.target.name==='example_scorer'){syncExampleScorer();return;}
   if(event.target.closest('#dataset-import-form')){const draft=state.datasetImport;if(draft){draft.mapping=importMappingValues();draft.sequence++;draft.loading=false;draft.mappingDirty=true;renderDatasetImport();}return;}
-  if(event.target.id==='request-pack-file'){const file=event.target.files[0];event.target.value='';importRequestPack(file);return;}if(event.target.name==='request_source'){changeRequestSource(event.target.value);return;}if(event.target.id==='config-file'){const file=event.target.files[0];event.target.value='';importConfig(file);return;}if(event.target.closest('#new-run-form')){configChanged();scheduleRequestPlan();}if(event.target.closest('[data-test-editor]')&&event.target.tagName==='SELECT'){if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);else editTestField(event.target);updateBounds();}if(event.target.name==='check'){const id=event.target.value;captureFormDraft();renderNew('custom');const control=$(`[name="check"][value="${id}"]`);if(control?.closest('[data-test-card]')?.hidden)$('[data-catalogue-filter="all"]')?.focus();else control?.focus();return;}if(event.target.id==='run-filter'){state.filter=event.target.value;renderRuns();$('#run-filter').focus();}if(['mode','restart_target'].includes(event.target.name)){updateRestart();if(state.configView==='json'&&!hasJsonChanges()){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}}if(event.target.name==='replace')$('#save-baseline').textContent=event.target.checked?'Replace baseline':'Save baseline';});
+  if(event.target.id==='request-pack-file'){const file=event.target.files[0];event.target.value='';importRequestPack(file);return;}if(event.target.name==='request_source'){changeRequestSource(event.target.value);return;}if(event.target.id==='config-file'){const file=event.target.files[0];event.target.value='';importConfig(file);return;}if(event.target.closest('#new-run-form')){configChanged();scheduleRequestPlan();}if(event.target.closest('[data-test-editor]')&&event.target.tagName==='SELECT'){if(event.target.closest('[data-profile-settings]'))editProfileField(event.target);else editTestField(event.target);updateBounds();}if(event.target.name==='check'){const id=event.target.value;captureFormDraft();renderNew('custom');const control=$(`[name="check"][value="${id}"]`);if(control?.closest('[data-test-card]')?.hidden)$('[data-catalogue-filter="all"]')?.focus();else control?.focus();return;}if(event.target.id==='run-filter'){state.filter=event.target.value;renderRuns();$('#run-filter').focus();}if(event.target.name==='replace')$('#save-baseline').textContent=event.target.checked?'Replace baseline':'Save baseline';});
 let navigationPrefix=0;
 document.addEventListener('keydown',event=>{
   if(event.isComposing)return;
