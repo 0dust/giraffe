@@ -308,13 +308,13 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 details > summary { list-style: none; }
 details[open] > summary .when-closed, details:not([open]) > summary .when-open { display: none; }
 details > summary::-webkit-details-marker { display: none; }
-.setup-disclosure > summary, .check-advanced > summary, .configuration-tools > summary, .check-observations > summary, .comparison-support > summary, .request-timing > summary, .request-reasoning > summary, .request-planning > summary, .workload-breakdown > summary, .checks-not-run > summary, .baseline-identifier > summary, .judge-configuration > summary, .judge-limits > summary, .dataset-advanced > summary, .example-advanced > summary, .pack-preview-details > summary, details.judge-disclosure > summary, .checks-disclosure > summary, #dataset-dialog details > summary, .request-comparison details > summary, .shared-run-settings details > summary {
+.setup-disclosure > summary, .check-advanced > summary, .configuration-tools > summary, .all-requests > summary, .run-diagnostics > summary, .check-observations > summary, .comparison-support > summary, .request-timing > summary, .request-reasoning > summary, .request-planning > summary, .workload-breakdown > summary, .checks-not-run > summary, .baseline-identifier > summary, .judge-configuration > summary, .judge-limits > summary, .dataset-advanced > summary, .example-advanced > summary, .pack-preview-details > summary, details.judge-disclosure > summary, .checks-disclosure > summary, #dataset-dialog details > summary, .request-comparison details > summary, .shared-run-settings details > summary {
   display: flex; align-items: center; gap: 8px; min-height: 34px; font-size: 13px; font-weight: 500; color: var(--text-2);
 }
-:is(.setup-disclosure, .check-advanced, .configuration-tools, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure) > summary::before {
+:is(.setup-disclosure, .check-advanced, .configuration-tools, .all-requests, .run-diagnostics, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure) > summary::before {
   content: ''; width: 7px; height: 7px; border-right: 1.6px solid currentColor; border-bottom: 1.6px solid currentColor; transform: rotate(-45deg); transition: transform .2s var(--ease); margin: 0 3px 0 1px; flex-shrink: 0; opacity: .7;
 }
-:is(.setup-disclosure, .check-advanced, .configuration-tools, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure)[open] > summary::before { transform: rotate(45deg) translate(-2px,-1px); }
+:is(.setup-disclosure, .check-advanced, .configuration-tools, .all-requests, .run-diagnostics, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure)[open] > summary::before { transform: rotate(45deg) translate(-2px,-1px); }
 details > summary:hover { color: var(--text); }
 .details-content { padding: 6px 0 4px 20px; display: grid; gap: 12px; }
 
@@ -502,7 +502,7 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .shared-run-settings { margin-top: 26px; border-radius: var(--r-lg); background: var(--surface); border: 1px solid var(--line); }
 .shared-settings-summary { display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; }
 .shared-settings-summary:hover { background: var(--surface-2); }
-.shared-settings-summary:focus-visible, .configuration-tools > summary:focus-visible, #new-run-form details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.shared-settings-summary:focus-visible, .configuration-tools > summary:focus-visible, .all-requests > summary:focus-visible, .run-diagnostics > summary:focus-visible, #new-run-form details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .shared-settings-summary::marker { content: ''; }
 .field-error { color: var(--fail); font-size: 13px; line-height: 1.45; }
 [aria-invalid="true"] { border-color: var(--fail) !important; }
@@ -1262,7 +1262,7 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 .swarm-dot.packed:hover, .swarm-dot.packed:focus-visible { stroke: var(--text); stroke-width: 1.5; }
 
 .all-requests { margin-bottom: 22px; border: 1px solid var(--line); border-radius: var(--r-xl); background: var(--surface); overflow: hidden; }
-.all-requests > summary { padding: 14px 20px; font-size: 13px; }
+.all-requests > summary { padding: 14px 20px; }
 .all-requests > .request-viz, .all-requests > .evidence-band { margin-bottom: 0; border: 0; border-radius: 0; box-shadow: none; }
 
 .request-sent, .request-identity, .request-internal { min-width: 0; overflow-wrap: anywhere; }
@@ -1692,7 +1692,7 @@ main > #report-results { padding-top:20px; }
 .answer-excerpt summary { display:inline-block; max-width:calc(100% - 70px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:top; cursor:pointer; text-decoration:underline dotted; }
 .answer-excerpt pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; }
 .finding-expanded { margin-top:14px; border-top:1px solid var(--line); }
-.passed-checks > summary, .checks-not-selected > summary, .run-diagnostics > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }
+.passed-checks > summary, .checks-not-selected > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }
 .passed-checks .finding-check { margin-top:8px; }
 .preparation-status { margin:4px 0; }
 .run-diagnostics { margin-top:20px; }

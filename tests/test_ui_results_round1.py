@@ -1,4 +1,7 @@
 """Round-one regression coverage for actionable findings and safe navigation."""
+from pathlib import Path
+import re
+
 from tests.test_ux_results import run_render_checks
 
 
@@ -126,3 +129,30 @@ assert.equal((html.match(/Median · No material regression/g)||[]).length,64);as
 state.comparisonFilter='with_warnings';const filtered=renderComparison(value);assert.equal((filtered.match(/data-metric=/g)||[]).length,30);
 assert.equal((html.match(/Why this warning\?/g)||[]).length,30);assert.doesNotMatch(html,/No material worsening detected in these samples\.|Entry \d/);
 """)
+
+
+def test_request_and_diagnostics_summaries_share_the_configuration_disclosure_styles():
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    rules = re.findall(r'([^{}]+)\{([^{}]*)\}', css)
+    shared, = [(selectors, body) for selectors, body in rules
+               if '.setup-disclosure > summary,' in selectors]
+    chevron, = [(selectors, body) for selectors, body in rules
+                if '.configuration-tools,' in selectors and '> summary::before' in selectors and '[open]' not in selectors]
+    opened, = [(selectors, body) for selectors, body in rules
+               if '.configuration-tools,' in selectors and '[open] > summary::before' in selectors]
+    focus, = [(selectors, body) for selectors, body in rules
+              if '.configuration-tools > summary:focus-visible' in selectors]
+    for name in ('all-requests', 'run-diagnostics'):
+        assert f'.{name} > summary' in shared[0]
+        assert f'.{name},' in chevron[0] and f'.{name},' in opened[0]
+        assert f'.{name} > summary:focus-visible' in focus[0]
+        # No later summary rule may override the shared colour or typography.
+        for selectors, body in rules:
+            if f'.{name} > summary' in selectors and selectors != shared[0]:
+                assert not re.search(r'(?:^|;)\s*(?:color|font(?:-size|-weight)?|cursor)\s*:', body)
+    assert 'color: var(--text-2)' in shared[1]
+    assert "content: ''" in chevron[1] and 'rotate(-45deg)' in chevron[1]
+    assert 'rotate(45deg)' in opened[1]
+    assert 'summary { cursor: pointer; }' in css
+    assert 'details > summary:hover { color: var(--text); }' in css
+    assert '.passed-checks > summary, .checks-not-selected > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }' in css
