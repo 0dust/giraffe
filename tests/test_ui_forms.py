@@ -195,7 +195,9 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
   const markup=nodes['#main'].innerHTML;
   assert.doesNotMatch(markup,/setup-side-summary|setup-planned-traffic|review-baseline/);
   const options=markup.slice(markup.indexOf('id="execution-settings"'),markup.indexOf('</details>',markup.indexOf('id="execution-settings"')));
-  assert(options.includes('name="baseline_id"'));assert(options.includes('Compare with baseline'));
+  assert(!options.includes('name="baseline_id"'));assert(!options.includes('Compare with baseline'));
+  assert(markup.includes('id="comparison-settings"'));assert(markup.includes('Compare with baseline'));
+  assert(options.includes('Saved with this run'));assert(options.includes('name="retention"'));assert(options.includes('name="name"'));
   assert(markup.indexOf('id="run-bounds"')<markup.indexOf('id="request-plan"'));
   for(const name of ['baseline_id','name'])assert(controls.some(input=>input.name===name));
   for(const name of ['mode','restart_target'])assert(!controls.some(input=>input.name===name));

@@ -169,15 +169,15 @@ assert.doesNotMatch(markup,/Measurement only/);assert.match(markup,/First output
 """, config)
 
 
-def test_review_surfaces_only_an_active_baseline_and_escapes_its_name():
+def test_baseline_choice_escapes_names_without_duplicate_review_controls():
     browser_logic(r"""
 state.baselines=[{id:'baseline-123',name:'Before <upgrade>'}];
-let markup=renderReviewScope({config,baseline_id:'baseline-123'});
-assert.match(markup,/Compare with saved run: Before &lt;upgrade&gt;/);
-assert.doesNotMatch(markup,/baseline-123/);
-markup=renderReviewScope({config,baseline_id:'missing-<id>'});
-assert.match(markup,/Compare with saved run: missing-&lt;id&gt;/);
-assert.doesNotMatch(renderReviewScope({config,baseline_id:null}),/review-baseline|Compare with saved run/);
+let markup=baselineOptions('baseline-123');
+assert.match(markup,/Before &lt;upgrade&gt;/);assert.match(markup,/value="baseline-123" selected/);
+for(const baseline_id of ['baseline-123','missing-<id>',null]){
+ markup=renderReviewScope({config,baseline_id});
+ assert.doesNotMatch(markup,/review-compare|choose-baseline|review-baseline|Compare with saved run/);
+}
 """)
 
 

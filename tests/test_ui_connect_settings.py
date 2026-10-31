@@ -183,7 +183,8 @@ def test_moved_settings_have_one_editable_control_on_their_own_step():
     for name, step, disclosure in [
         ('request_timeout_seconds', 2, 'shared-settings'),
         ('max_memory_mb', 2, 'shared-settings'),
-        ('retention', 3, None),
+        ('retention', 3, 'execution-settings'),
+        ('name', 3, 'execution-settings'),
         ('limit_regression_percent', 3, None),
     ]:
         control, = tree.named(name)
@@ -191,7 +192,7 @@ def test_moved_settings_have_one_editable_control_on_their_own_step():
         if disclosure:
             assert any(parent.get('id') == disclosure for parent in control['parents']), name
         else:
-            assert any(parent['tag'] == 'details' and parent.get('id') == 'execution-settings' for parent in control['parents']), name
+            assert not any(parent['tag'] == 'details' for parent in control['parents']), name
     timeout, = tree.named('request_timeout_seconds')
     memory, = tree.named('max_memory_mb')
     grid = next(parent for parent in timeout['parents'] if parent.get('class') == 'fields')
@@ -216,7 +217,7 @@ def test_moved_setting_errors_reveal_the_new_step_and_open_their_disclosure():
     browser_logic(r'''
 state.jsonDraft=state.jsonBase='synced';state.openTest=null;
 assertAppliedConfig=()=>{};revealSetupStep=step=>state.setupStep=step;
-const paths=[['request_timeout_seconds','request_timeout_seconds',2],['max_memory_mb','max_memory_mb',2],['limits.regression_percent','limit_regression_percent',3],['retention','retention',3]];
+const paths=[['request_timeout_seconds','request_timeout_seconds',2],['max_memory_mb','max_memory_mb',2],['limits.regression_percent','limit_regression_percent',3],['retention','retention',3],['targets.0.name','name',3]];
 for(const [path,name,step] of paths){
  const disclosure={tagName:'DETAILS',open:false},field={parentElement:disclosure,style:{},scrollIntoView(){this.scrolled=true;}};
  const input={parentElement:field,setAttribute(name,value){this[name]=value;},focus(){this.focused=true;},closest:selector=>selector==='.form-field'?field:null};

@@ -1044,7 +1044,7 @@ const fieldDescriptions={
   buckets_output:{help:'The maximum answer tokens requested for this case. The first answer case asks for a box label; the other two ask for the label followed by numbers. The server can finish before reaching the cap. Each case owns its answer cap; the suite value is a default.'},
   host_metrics_url:{hint:'Optional server host exporter address.',help:'An existing node_exporter Prometheus-text URL measures server-wide CPU and host RAM alongside the workload. Giraffe does not install an exporter. Inference and runtime metrics credentials are not forwarded to this URL.'},
   metrics_url:{hint:'Optional server metrics address.',help:'Use an existing Prometheus metrics URL, such as http://localhost:9400/metrics. Giraffe reads measurements from it; it does not install an exporter. Missing metrics remain unknown.'},
-  restart_script:{help:'Runs this executable UTF-8 script directly on the machine running Giraffe, from the script’s folder, without a shell or arguments. Maximum size: 64 KiB. Review and confirm it for each run. Redirect the server’s own output in the script. Stop and timeout terminate only the script; a server it starts keeps running. Only this file is reviewed; anything it calls is not. Don\'t print secrets: output is saved in the report.'},
+  restart_script:{help:'Giraffe runs this script to restart your server before testing, so you can see how it behaves from a cold start: how long it takes to start, how slow the first requests are and, if the server reports it, how long the model takes to load. The script is yours and decides what restarting means, for example systemctl restart ollama. It runs on this machine, and only when you tick the box on the Launch page. Only this file is reviewed; anything it calls is not. Don\'t print secrets: output is saved in the report.'},
   restart_script_timeout_seconds:{help:'Maximum time to wait for the script to exit, bounded by the run’s remaining time. The server it starts keeps running after Stop or timeout.'},
   baseline_id:{help:'Choose a previously saved run to compare with this one. Giraffe reports changes in errors, answers and timing, while still checking this run against its own acceptance settings. Leave this empty for a first run.'},
   baseline_name:{help:'Give this saved run a name you will recognize later, such as before-model-update. Saving a baseline does not change the run’s outcome.'},
@@ -1127,8 +1127,8 @@ function settingDestination(path) {
   const sections={load_test:'load',concurrent_load:'concurrency',sessions:'sessions',consistency:'consistency',arrivals:'arrivals',prefix:'prefix',traffic:'capacity',tool_checks:'tools'};
   if(parts.length===1&&sections[root]||root==='test_options'&&parts.length===2)return {section:true,check:sections[root]||parts[1],step,label:root==='test_options'?`${human(parts[1]).toLowerCase()} settings`:`${human(sections[root]).toLowerCase()} settings`};
   if(root==='stream'){step=1;}
-  else if(root==='retention'){step=3;}
-  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=1;}
+  else if(['retention','name','baseline_id'].includes(root)){step=3;}
+  else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=name==='name'?3:1;}
   else if(root==='load_test'){
     check='load';
     if(parts[1]==='migrated_tests')return {name:'config_editor',step,label:'imported load settings'};
@@ -2438,14 +2438,12 @@ function renderReviewScope(payload) {
   const usesPack=usesQuestions&&config.request_source==='request_pack',cases=config.request_pack?.cases || [];
   const mixedSources=usesPack&&config.checks.some(id=>!['correctness','load','gpu'].includes(id));
   const source=usesQuestions?(usesPack?`Your questions · ${number(cases.length)} saved ${cases.length===1?'question':'questions'}${mixedSources?` for ${questionChecks.map(catalogTitle).join(' and ')}. Other checks use generated requests.`:''}`:'Built-in examples'):'';
-  const baseline=payload.baseline_id?state.baselines.find(item=>item.id===payload.baseline_id):null;
-  const comparison=payload.baseline_id?`Compare with saved run: ${baseline?.name || payload.baseline_id}`:'';
   const problems=[];
   if(targets.some(target=>!target.url?.trim()||!target.model?.trim()))problems.push({msg:'Enter an endpoint URL and model for every target.',fields:['targets.0.url','targets.0.model']});
   if(!config.checks.length)problems.push({msg:'Select at least one check.',fields:['checks']});
   if(usesPack&&!cases.length)problems.push({msg:'Add a question or choose built-in examples.',fields:['request_pack']});
   if(usesPack&&cases.some(item=>item.scorer==='judge')&&!judgesReady(config))problems.push({msg:'Configure the AI evaluator for questions that need it.',fields:['judging']});
-  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section><section class="review-section review-compare" id="review-compare"><div class="review-section-heading"><h3>Compare with</h3>${state.baselines?.length?`<button type="button" class="text-button" data-action="choose-baseline">${payload.baseline_id?'Change':'Choose baseline'}</button>`:''}</div>${comparison?`<p class="hint review-baseline">${escape(comparison)}</p><p class="hint">Results will show what changed since that run.</p>`:state.baselines?.length?`<p class="hint">Not compared. Choose a saved baseline to see what changed since that run.</p>`:'<p class="hint">No baselines yet. After a run, open its results and press <strong>Save as reference baseline</strong>. You can then compare later runs against it here.</p>'}</section>${renderSettingIssues(problems,'warning')}${renderRestartConfirmation(config)}`;
+  return `<section class="review-section" id="review-endpoints"><div class="review-section-heading"><h3>${targets.length===1?'Endpoint':'Endpoints'}</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="1">Edit connection</button></div><ul class="review-targets">${targets.map(target=>`<li>${targets.length>1?`<strong>${escape(target.name)}</strong>`:''}<dl class="review-identity"><div><dt>Model</dt><dd>${escape(target.model || 'Model needed')}</dd></div><div><dt>URL</dt><dd class="review-endpoint-url">${escape(target.url || 'Endpoint URL needed')}</dd></div></dl></li>`).join('')}</ul></section><section class="review-section" id="review-checks"><div class="review-section-heading"><h3>Checks</h3><button type="button" class="text-button" data-review-edit="true" data-setup-step="2">Edit checks</button></div><ul class="review-check-names">${config.checks.length?config.checks.map(id=>`<li>${escape(catalogTitle(id))}</li>`).join(''):'<li>No checks selected</li>'}</ul>${source?`<p class="hint review-question-source">${escape(source)}</p>`:''}</section>${renderSettingIssues(problems,'warning')}${renderRestartConfirmation(config)}`;
 }
 function browseCheckIntent(category) {
   if(!checkGroups.some(group=>group.id===category))return;
@@ -2667,7 +2665,8 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence & baseline options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}<div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div></div></div></details>
+  <div class="fields" id="comparison-settings">${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved with this run <span class="dim" id="saved-run-summary">${escape(savedRunSummary(target.name,c.retention))}</span></summary><div class="details-content"><div class="fields">${selectField('retention','Save model answers',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${retentionLabels[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Name in reports',target.name,{required:true,placeholder:'local',hint:'',help:'Labels this server in reports and comparisons.'})}</div></div></details>
   </div><section id="request-plan" class="request-plan review-section"></section><div id="setup-history" hidden></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Apply changes before returning to the form.</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor',hint:'',help:[fieldDescription('config_editor').help,inputRetentionNotice].join(' ')})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" tabindex="0" aria-label="Run plan" hidden></aside>
@@ -2684,7 +2683,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   const form=$('#new-run-form');if(form.elements.load_patterns_concurrent_levels)form.elements.load_patterns_concurrent_levels.dataset.inherited=String(c.load_test?.patterns?.concurrent?.levels===undefined);if(form.elements.traffic_max_in_flight)form.elements.traffic_max_in_flight.dataset.inherited=String(c.traffic?.max_in_flight==null);
   if(form.elements.api_key)form.elements.api_key.value=apiKeyFor(target.url);
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
-  syncTestControls();updateBounds();renderRestartPreview();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();watchPlanViewport();scheduleTokenizerSelection({immediate:true});renderTokenizerSelection();
+  syncTestControls();updateBounds();renderRestartPreview();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();watchPlanViewport();watchRestartScriptRow();scheduleTokenizerSelection({immediate:true});renderTokenizerSelection();
 }
 function readForm(allowEmpty=false) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
@@ -2714,6 +2713,14 @@ function readForm(allowEmpty=false) {
   config.restart_target=null;
   const confirmed=restartConfirmed(config);
   return {config,baseline_id:data.get('baseline_id') || null,mode:confirmed?'cold-start':'normal',restart_target:confirmed?first.name:null,...(confirmed?{restart_script_sha256:state.restartConfirmedHash}:{})};
+}
+const retentionLabels={failures:'Failed answers only',all:'All answers',none:'None'};
+function savedRunSummary(name,retention) {
+  return `${name ?? ''} · ${retentionLabels[retention || 'failures']}`;
+}
+function updateSavedRunSummary() {
+  const form=$('#new-run-form'),summary=$('#saved-run-summary');if(!form||!summary)return;
+  summary.textContent=savedRunSummary(form.elements.name?.value.trim(),form.elements.retention?.value);
 }
 function updateBounds() {
   let payload;try{payload=readForm(true);}catch{return;}
@@ -2773,7 +2780,18 @@ function renderScriptContents(preview) {
 }
 function renderRestartScriptRow(target,config) {
   if(!state.bootstrap.restart_allowed)return `<div class="field-label"><span class="hint">Restart scripts unavailable</span>${infoHelp('restart_permission','Restart scripts unavailable','Restart scripts are disabled on this bind. Start giraffe ui with --allow-restart-script to enable them.')}</div>`;
-  return `<details class="connection-auth" id="restart-script-row"><summary class="api-key-row"><span class="api-key-label">Restart script (optional)</span><span class="row-value api-key-value">${escape(target.restart_script)||'Not set'}</span><span class="row-action api-key-action"><span class="when-closed">Edit</span><span class="when-open">Close</span></span></summary>${field('restart_script','Script path',target.restart_script,{hint:'',placeholder:'/path/to/restart.sh'})}<button type="button" class="text-button" data-action="preview-restart-script">Review script</button><div id="restart-script-preview" role="status"></div>${schemaField('restart_script_timeout_seconds',config.restart_script_timeout_seconds ?? 600,state.bootstrap.config_schema.properties.restart_script_timeout_seconds,{label:'Restart script timeout (seconds)',hint:''})}</details>`;
+  const label='Restart script (optional)';
+  return `<div id="restart-script-setting"><details class="connection-auth" id="restart-script-row"><summary class="api-key-row"><span class="api-key-label">${label}</span><span class="row-value api-key-value">${escape(target.restart_script)||'Not set'}</span><span class="row-action api-key-action"><span class="when-closed">Edit</span><span class="when-open">Close</span></span></summary>${field('restart_script','Script path',target.restart_script,{hint:'',placeholder:'/path/to/restart.sh',hideInfo:true})}<button type="button" class="text-button" data-action="preview-restart-script">Review script</button><div id="restart-script-preview" role="status"></div>${schemaField('restart_script_timeout_seconds',config.restart_script_timeout_seconds ?? 600,state.bootstrap.config_schema.properties.restart_script_timeout_seconds,{label:'Restart script timeout (seconds)',hint:''})}</details><div class="field-label" id="restart-script-help">${infoHelp('restart_script',label,fieldDescription('restart_script').help)}</div></div>`;
+}
+function watchRestartScriptRow() {
+  state.restartRowObserver?.disconnect();
+  const summary=$('#restart-script-row > summary'),label=$('#restart-script-row .api-key-label'),help=$('#restart-script-help'),row=$('#restart-script-setting');if(!summary||!label||!help||!row)return;
+  const resize=()=>{
+    const bounds=row.getBoundingClientRect(),heading=summary.getBoundingClientRect(),text=label.getBoundingClientRect();
+    help.style.left=`${text.right-bounds.left-16}px`;help.style.top=`${heading.top-bounds.top}px`;help.style.height=`${heading.height}px`;
+  };
+  resize();
+  if(typeof ResizeObserver!=='undefined'){state.restartRowObserver=new ResizeObserver(resize);state.restartRowObserver.observe(summary);state.restartRowObserver.observe(label);}
 }
 function renderRestartPreview() {
   const element=$('#restart-script-preview');if(!element)return;
@@ -4295,7 +4313,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='reset-traffic'){configChanged();const form=$('#new-run-form');form.elements.traffic_mode.value='default';const defaults=state.bootstrap.config.traffic;for(const [key,value] of Object.entries(defaults)){if(key==='mix'){for(const [kind,weight] of Object.entries(value))form.elements[`traffic_mix_${kind}`].value=weight;}else form.elements[`traffic_${key}`].value=Array.isArray(value)?value.join(', '):value ?? '';}syncTestControls();updateBounds();return;}
   if(action==='compare-saved'){await openComparisonDialog();return;}
   if(action==='compare-run'){const saved=(state.baselines || []).find(item=>item.run_id===state.detail?.id);await rerun();if(saved)state.prefillBaseline=saved.id;return;}
-  if(action==='choose-baseline'){const options=$('#execution-settings');if(options){options.open=true;const select=$('#field-baseline_id');select?.focus();select?.scrollIntoView?.({block:'center'});}return;}
+  if(action==='choose-baseline'){try{focusSetting('baseline_id');}catch(error){configError(error);}return;}
   if(action==='retry')route();if(action==='clear-filter'){state.filter='all';state.historySearch='';renderRuns();}
   if(action==='stop')await confirmStop();if(action==='show-failing')showFailingRequests();if(action==='show-inconclusive'){chooseReportTab('results',{anchor:false});const findings=$('#failing-requests');findings?.scrollIntoView?.({block:'start'});findings?.focus({preventScroll:true});}if(action==='show-comparison'){chooseReportTab('results',{anchor:false});revealReportSection('baseline');location.hash=`${linkRun(state.detail.id)}/results/baseline`;}if(action==='rerun')await rerun();if(action==='baseline-dialog')openBaselineDialog();
   if(action==='close-dialog'){if(event.target.closest('dialog')?.id==='request-dialog')closeRequestEvidence();else event.target.closest('dialog').close();}if(action==='apply-config')await applyConfig();
@@ -4336,6 +4354,7 @@ document.addEventListener('input',event=>{
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
   if(event.target.name==='confirm_restart_script')return;
+  if(['name','retention'].includes(event.target.name))updateSavedRunSummary();
   if(event.target.name==='restart_script'){invalidateRestartPreview();event.target.removeAttribute?.('aria-invalid');}
   event.target.removeAttribute?.('data-setting-highlight');
   if(['url','model','name'].includes(event.target.name))event.target.setCustomValidity?.('');
@@ -4362,6 +4381,7 @@ document.addEventListener('input',event=>{
   updateBounds();
 });
 document.addEventListener('change',event=>{
+  if(['name','retention'].includes(event.target.name)&&event.target.closest('#new-run-form'))updateSavedRunSummary();
   if(event.target.name==='confirm_restart_script'){const preview=currentRestartPreview();state.restartConfirmedHash=event.target.checked&&preview?preview.sha256:null;state.configRevision++;state.requestPreview&&(state.requestPreview.status='stale');updateBounds();return;}
   if(event.target.name==='restart_script'){configChanged();previewRestartScript();return;}
   const comparisonFilter=event.target.dataset?.comparisonFilter;
