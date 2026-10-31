@@ -224,3 +224,22 @@ location.hash='';state.runs=[{id:'saved'}];await route();assert.equal(location.h
 location.hash='';state.runs=[];state.active='active-run';await route();assert.equal(location.hash,'#runs/active-run');assert.equal(rendered,1);
 assert.equal(requests,0);
 """)
+
+
+def test_clear_api_key_keeps_regenerated_section_open_and_focuses_fresh_input():
+    run_browser_logic(r"""
+const oldInput=element({value:'secret'}),oldSection=element({open:true});
+nodes['#connection-auth']=oldSection;nodes['#new-run-form']={elements:{api_key:oldInput}};
+sessionAPIKey={url:'http://local/v1',key:'secret'};
+let renders=0;
+invalidateModelDiscovery=captureFormDraft=configChanged=()=>{};
+renderNew=()=>{
+ renders++;assert.equal(sessionAPIKey,null);assert.equal(oldInput.value,'');
+ nodes['#connection-auth']=element({open:false});nodes['#new-run-form']={elements:{api_key:element()}};
+};
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'clear-api-key'}}:null}});
+assert.equal(renders,1);assert.notEqual(nodes['#connection-auth'],oldSection);
+assert.equal(nodes['#connection-auth'].open,true);
+assert.equal(nodes['#new-run-form'].elements.api_key.focused,true);
+assert.equal(oldInput.focused,undefined);
+""")

@@ -1206,7 +1206,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "actions": [{"label": f"Use {required:,} total requests", "field": "max_requests", "value": required},
                             *edits]})
             warnings.append(message)
-        if unknown or kind != "exact":
+        if (unknown or kind != "exact") and config.max_requests < 20 * estimated_total:
             message = f"{target}: duration-based or adaptive traffic can exhaust the request budget and leave checks unfinished."
             request_warnings.append({"kind": "adaptive_risk", "fields": ["max_requests"], "msg": message})
             warnings.append(message)

@@ -27,7 +27,8 @@ def test_connect_settings_match_reference_order_labels_and_single_controls():
     spans = [node for node in tree.nodes if node['tag'] == 'span' and summary in node['parents']]
     assert [(node['class'], node['text']) for node in spans] == [
         ('api-key-label', 'API key'), ('row-value api-key-value', 'Not set'),
-        ('row-action api-key-action', 'Edit'),
+        ('row-action api-key-action', 'EditClose'),
+        ('when-closed', 'Edit'), ('when-open', 'Close'),
     ]
     positions = [html.index('id="connection-auth"')]
     grid = None
@@ -119,4 +120,52 @@ api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:
 toast=()=>{};
 await importConfig({text:async()=>JSON.stringify(saved)});assertValues();
 for(const name of Object.keys(edits)){const path=['metrics_url','host_metrics_url'].includes(name)?'targets.0.'+name:name==='limit_regression_percent'?'limits.regression_percent':name;assert.equal(settingDestination(path).step,1,name);}
+const limitNames=['max_requests','max_duration_seconds','concurrency'];
+for(const name of limitNames)form.elements[name+'_enabled'].checked=false;
+const unset=readForm(false).config;
+for(const name of limitNames)assert.equal(unset[name],null,name);
+// Fresh-run defaults must not fill in limits deliberately absent from a saved setup.
+bootstrap.config={...bootstrap.config,max_requests:50000,max_duration_seconds:7200,concurrency:128};
+const assertUnset=()=>{
+ const current=readForm(false).config;
+ for(const name of limitNames){assert.equal(current[name],null,name);assert.equal(form.elements[name+'_enabled'].checked,false,name);}
+};
+state.detail={report:{manifest:{config:unset}},baseline_id:null};await rerun();renderNew();assertUnset();
+state.config=structuredClone(bootstrap.config);state.jsonDraft=state.jsonBase='synced';renderNew();
+await importConfig({text:async()=>JSON.stringify(unset)});assertUnset();
 ''')
+
+
+def test_api_key_help_is_once_per_field_without_visible_hints():
+    tree = Markup(rendered_form())
+    for name, placeholder, expected in [
+        ('api_key', 'Paste your API key', 'Kept in memory for this tab. Never included in saved setups or reports. Paste it again after reloading. Leave blank for an open endpoint.'),
+        ('api_key_env', 'OPENAI_API_KEY', 'Name of an environment variable set on the machine running giraffe ui, set before starting Giraffe. Enter its name, not the key. Saved setups and terminal commands need this variable or a freshly pasted key.'),
+    ]:
+        control, = tree.named(name)
+        assert control['placeholder'] == placeholder
+        field = control['parents'][-1]
+        info, = [node for node in tree.nodes if node.get('id') == f'field-{name}-info']
+        assert field in info['parents']
+        assert not any(parent['tag'] in ('label', 'summary') for parent in info['parents'])
+        help_node, = [node for node in tree.nodes if node.get('id') == f'field-{name}-help']
+        assert help_node['popover'] == 'auto'
+        assert help_node['text'].count(expected) == 1
+        assert not any('hint' in node.get('class', '').split() and node['text'].strip() and field in node['parents'] for node in tree.nodes)
+
+
+def test_disclosures_use_css_only_edit_close_labels_without_a_caret():
+    tree = Markup(rendered_form())
+    for selector, closed, opened in [('connection-auth', 'Edit', 'Close'), ('shared-settings', 'Edit limits', 'Close limits')]:
+        disclosure, = [node for node in tree.nodes if node.get('id') == selector]
+        assert 'open' not in disclosure
+        summary, = [node for node in tree.nodes if node['tag'] == 'summary' and node['parents'][-1] is disclosure]
+        for class_name, text in [('when-closed', closed), ('when-open', opened)]:
+            label, = [node for node in tree.nodes if node.get('class') == class_name and summary in node['parents']]
+            assert label['text'] == text
+    css = (Path(__file__).parents[1] / 'src/giraffe/static/styles.css').read_text()
+    assert re.search(r'details\[open\]\s*>\s*summary\s+\.when-closed,\s*details:not\(\[open\]\)\s*>\s*summary\s+\.when-open\s*\{\s*display:\s*none;', css)
+    assert re.search(r'\.connection-auth\s*\{[^}]*margin:\s*0 0 20px;', css)
+    assert re.search(r'\.connection-auth\[open\]\s*\{\s*padding-bottom:\s*16px;', css)
+    assert 'shared-settings-caret' not in css
+    assert not any('shared-settings-caret' in node.get('class', '') for node in tree.nodes)

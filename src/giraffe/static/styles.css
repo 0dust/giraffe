@@ -306,6 +306,7 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 
 /* Disclosure */
 details > summary { list-style: none; }
+details[open] > summary .when-closed, details:not([open]) > summary .when-open { display: none; }
 details > summary::-webkit-details-marker { display: none; }
 .setup-disclosure > summary, .check-advanced > summary, .configuration-tools > summary, .check-observations > summary, .comparison-support > summary, .request-timing > summary, .request-reasoning > summary, .request-planning > summary, .workload-breakdown > summary, .checks-not-run > summary, .baseline-identifier > summary, .judge-configuration > summary, .judge-limits > summary, .dataset-advanced > summary, .example-advanced > summary, .pack-preview-details > summary, details.judge-disclosure > summary, .checks-disclosure > summary, #dataset-dialog details > summary, .request-comparison details > summary, .shared-run-settings details > summary {
   display: flex; align-items: center; gap: 8px; min-height: 34px; font-size: 13px; font-weight: 500; color: var(--text-2);
@@ -1178,8 +1179,6 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 #setup-panel-2 #run-ceilings-summary { grid-column: 3; grid-row: 1; font: 500 13px var(--mono); color: var(--text-2); }
 #setup-panel-2 .shared-settings-edit { grid-column: 4; display: inline-flex; align-items: center; height: 32px; padding: 0 14px; border-radius: var(--r-sm); border: 1px solid var(--accent-line); background: var(--surface-2); color: var(--accent); font-size: 13px; font-weight: 550; }
 #setup-panel-2 .shared-settings-summary:hover .shared-settings-edit { border-color: var(--accent-line); color: var(--accent); }
-.shared-settings-caret { display: inline-block; }
-[open] .shared-settings-caret { transform: rotate(180deg); }
 #setup-panel-2 .shared-settings-editor[open] > .shared-settings-summary { border-bottom: 1px solid var(--line); }
 @media (max-width: 640px) { #setup-panel-2 #run-ceilings-summary { grid-column: 2 / -1; grid-row: 2; } }
 
@@ -1721,7 +1720,8 @@ main > #report-results { padding-top:20px; }
   .result-heading > .actions { flex-wrap:wrap; }
 }
 
-.connection-auth { margin: 0; padding-block: 8px; border-block: 1px solid var(--line); }
+.connection-auth { margin: 0 0 20px; padding-block: 8px; border-block: 1px solid var(--line); }
+.connection-auth[open] { padding-bottom: 16px; }
 .connection-auth > .api-key-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) auto; gap: 16px; align-items: center; min-height: 36px; color: var(--text-2); font-size: 13px; }
 .api-key-label { color: var(--text); font-weight: 500; }
 .api-key-value { min-width: 0; overflow-wrap: anywhere; }

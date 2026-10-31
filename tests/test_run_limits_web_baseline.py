@@ -7,7 +7,7 @@ import pytest
 
 from giraffe.models import RunConfig
 from giraffe.reporting import _settings_reasons
-from giraffe.web import _configuration_errors, _track_live_request
+from giraffe.web import BROWSER_DEFAULT_RUN_LIMITS, _configuration_errors, _track_live_request
 from tests.test_reporting import make_report
 from tests.test_web import browser, config, finished, report, start
 
@@ -41,12 +41,11 @@ async def test_a19_legacy_web_config_migrates_before_validation_and_reports_note
     assert any("default_concurrency" in note for note in result["migration_notes"])
 
 
-async def test_a4_bootstrap_has_null_limits_without_migration_notes(tmp_path):
+async def test_a4_fresh_bootstrap_has_browser_limits_without_migration_notes(tmp_path):
     async with browser(tmp_path) as client:
         result = (await client.get("/api/bootstrap")).json()
     assert result["config"]["config_version"] == 2
-    assert all(result["config"][field] is None for field in
-               ("concurrency", "max_requests", "max_duration_seconds"))
+    assert {field: result["config"][field] for field in BROWSER_DEFAULT_RUN_LIMITS} == BROWSER_DEFAULT_RUN_LIMITS
     assert result["migration_notes"] == []
 
 
