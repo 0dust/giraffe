@@ -172,11 +172,12 @@ def test_ui_flag_renamed():
         parser().parse_args(["ui", "--allow-restart-command"])
 
 
-def test_text_cold_start_uses_reported_evidence_only(tmp_path, capsys):
+@pytest.mark.parametrize("kind", ["answer", "reasoning"])
+def test_text_cold_start_uses_reported_evidence_only(tmp_path, capsys, kind):
     report = RunReport(run_id="cold", started_at="now", finished_at="now", overall="pass",
         manifest={}, observations={"targets": {"local": {"restart": {
             "script_ms": 10, "service_answered_ms": 20, "readiness_ms": 3000,
-            "first_request": {"first_output_ms": 2900, "elapsed_ms": 2980},
+            "first_request": {"first_output_ms": 2900, "elapsed_ms": 2980, "first_output_kind": kind},
             "warm_requests": [{"first_output_ms": 7, "elapsed_ms": 10},
                               {"first_output_ms": 8, "elapsed_ms": 11}],
             "model_load": "Model was already loaded",
@@ -189,3 +190,5 @@ def test_text_cold_start_uses_reported_evidence_only(tmp_path, capsys):
     assert "Warm request 2: first answer 8 ms; latency 11 ms" in output
     assert "Model was already loaded" in output
     assert "Model load:" not in output
+    note = "First output was reasoning; no answer within the output cap."
+    assert (note in output) == (kind == "reasoning")

@@ -8,6 +8,18 @@ from tests.test_ux_setup import run_browser_logic
 APP = Path(__file__).parents[1] / "src/giraffe/static/app.js"
 
 
+def test_reasoning_output_and_failed_warm_measurements_are_labelled():
+    run_browser_logic(r'''
+const html=renderColdStart({observations:{targets:{local:{restart:{readiness_ms:25,
+first_request:{first_output_ms:5,elapsed_ms:20,first_output_kind:'reasoning'},
+warm_requests:[{first_output_ms:2,elapsed_ms:12,first_output_kind:'reasoning'},
+{first_output_ms:null,elapsed_ms:null,reason:'HTTP 503 <bad>'}]}}}}});
+assert.equal(html.split('First output was reasoning; no answer within the output cap.').length-1,2);
+assert.match(html,/Not measured/);assert.match(html,/HTTP 503 &lt;bad&gt;/);
+assert.doesNotMatch(html,/<bad>/);
+''')
+
+
 def test_script_row_reuses_connection_pattern_and_hides_when_disallowed():
     run_browser_logic(r"""
 const config={restart_script_timeout_seconds:600},target={restart_script:'/tmp/restart.sh'};

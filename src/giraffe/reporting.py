@@ -2236,6 +2236,8 @@ def _check_timing_violation_ids(check: CheckResult) -> set[str]:
 
 
 def _cold_start_html(report: RunReport) -> str:
+    from .cold_start import REASONING_OUTPUT_NOTE
+
     sections = []
     for name, observation in report.observations.get("targets", {}).items():
         cold = observation.get("restart")
@@ -2261,7 +2263,11 @@ def _cold_start_html(report: RunReport) -> str:
             sections.append(f'<p>{_e(cold["measurement_api"])}</p>')
         sections.append('<div class="table"><table><tr><th>Request</th><th>First answer</th><th>Latency</th></tr>')
         for label, item in comparisons:
-            sections.append(f'<tr><td>{_e(label)}</td><td>{_e(duration(item.get("first_output_ms")))}</td>'
+            note = REASONING_OUTPUT_NOTE if item.get("first_output_kind") == "reasoning" else ""
+            note_html = f'<p>{_e(note)}</p>' if note else ""
+            reason_html = f'<p>{_e(item["reason"])}</p>' if item.get("reason") else ""
+            sections.append(f'<tr><td>{_e(label)}</td><td>{_e(duration(item.get("first_output_ms")))}'
+                            f'{note_html}{reason_html}</td>'
                             f'<td>{_e(duration(item.get("elapsed_ms")))}</td></tr>')
         sections.append('</table></div>')
         if cold.get("reason"):

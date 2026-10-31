@@ -1175,7 +1175,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 initial_specs = builtin_fixtures(response_config, check_id="serving")["short"]
                 if restart and restart["status"] == "hook_completed":
                     from .cold_start import (NATIVE_API_LABEL, OllamaColdClient, cold_spec,
-                                             detect_ollama, model_load_evidence, residency)
+                                             detect_ollama, model_load_evidence, output_measurement,
+                                             residency, retry_readiness)
                     started = restart["started_monotonic"]
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     initial = []
@@ -1183,7 +1184,6 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     measured_client = client
                     native = False
                     before = "unknown"
-                    first = None
                     while time.monotonic() < ready_deadline and not run.stop_reason(target.name):
                         try:
                             async with asyncio.timeout_at(ready_deadline):
@@ -1208,24 +1208,29 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                             probe = cold_spec(initial_specs[0])
                             record = await run.request(target, measured_client, probe, deadline_override=ready_deadline,
                                                        budget_exempt=True)
-                            inference_finished_ms = round((time.monotonic()-started)*1000, 3)
-                            if first is None and record is not None:
-                                first = record
-                                restart["first_request"] = {"first_output_ms": record.first_output_ms,
-                                                            "elapsed_ms": record.elapsed_ms}
+                            if record is None:
+                                break
+                            measurement = output_measurement(record)
+                            restart["first_request"] = measurement
+                            if "first_output_kind" in measurement:
+                                restart["readiness_ms"] = round(
+                                    (run.start-started)*1000 + record.timing_start_ms
+                                    + measurement["first_output_ms"], 3) if measurement["first_output_ms"] is not None else None
+                                restart["first_output_kind"] = measurement["first_output_kind"]
                                 if native:
                                     after = await residency(target, config, deadline=ready_deadline, stop=run.stop)
                                     restart.update(model_load_evidence(before, after,
                                         record.workload.get("reported_load_duration_ns")))
-                            if record and record.valid:
-                                restart["readiness_ms"] = inference_finished_ms
                                 initial = [record]
+                                break
+                            if not retry_readiness(record):
+                                restart["reason"] = measurement["reason"]
                                 break
                         await asyncio.sleep(min(.25, max(0, ready_deadline-time.monotonic())))
                     restart["status"] = "ready" if initial else "blocked"
                     restart.pop("started_monotonic", None)
                     if restart["status"] == "blocked":
-                        restart["reason"] = "No successful inference within readiness budget"
+                        restart.setdefault("reason", "No successful inference within readiness budget")
                         run.stop_reason(target.name)
                         return
                     # Same prompt token size, different text: do not reward prefix
@@ -1233,9 +1238,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     from .cold_start import warm_specs
                     for probe in warm_specs(initial_specs[0]):
                         record = await run.request(target, measured_client, probe, budget_exempt=True)
-                        if record is not None:
-                            restart["warm_requests"].append({"first_output_ms": record.first_output_ms,
-                                                             "elapsed_ms": record.elapsed_ms})
+                        restart["warm_requests"].append(output_measurement(record) if record is not None else {
+                            "first_output_ms": None, "elapsed_ms": None,
+                            "reason": run.stop_reason(target.name) or "No request completed"})
                     telemetry_task = await start_metrics()
                     if enabled & {"access", "serving", "first_output", "generation"}:
                         await run.group(target, client, initial_specs, "initial", count=1)

@@ -12,7 +12,7 @@ from giraffe.cold_start import (
     NATIVE_API_LABEL, OllamaColdClient, cold_spec, detect_ollama, model_load_evidence,
     residency, warm_specs,
 )
-from giraffe.models import RequestSpec, RunConfig, Target
+from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 
 
 def settings(**changes):
@@ -23,6 +23,34 @@ def settings(**changes):
 def request_spec(**changes):
     return RequestSpec(fixture_id="ready", scenario="connection", check_ids=[],
                        messages=[{"role": "user", "content": "Return 42"}], **changes)
+
+
+@pytest.mark.parametrize("answer_time,reasoning_time,kind,first", [
+    (20, 5, "reasoning", 5), (2, 8, "answer", 2), (0, None, "answer", 0),
+    (None, 3, "reasoning", 3)])
+def test_restart_measurement_uses_first_generated_output_without_reclassifying_record(answer_time, reasoning_time, kind, first):
+    from giraffe.cold_start import output_measurement
+
+    record = RequestRecord(id="first", target="local", fixture_id="cold", scenario="readiness",
+        check_ids=[], started_at="now", status="completed", http_status=200, valid=False,
+        first_output_ms=answer_time, first_reasoning_ms=reasoning_time,
+        elapsed_ms=40, error="reasoning exhausted the output budget before an answer")
+    original = record.model_dump()
+    measurement = output_measurement(record)
+    assert measurement == {"first_output_ms": first, "first_output_kind": kind, "elapsed_ms": 40}
+    assert record.model_dump() == original
+
+
+def test_generated_text_without_timing_still_establishes_restart_readiness():
+    from giraffe.cold_start import output_measurement
+
+    record = RequestRecord(id="first", target="local", fixture_id="cold", scenario="readiness",
+        check_ids=[], started_at="now", status="completed", http_status=200, valid=False,
+        reasoning="Thinking", elapsed_ms=40)
+    assert output_measurement(record) == {
+        "first_output_ms": None, "first_output_kind": "reasoning", "elapsed_ms": 40}
+    record.http_status = 201
+    assert "first_output_kind" not in output_measurement(record)
 
 
 def install_transport(monkeypatch, handler):

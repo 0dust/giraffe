@@ -46,16 +46,34 @@ def observation(report):
 
 
 def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_000,
-                first_delay=0, models_status=200):
+                first_delay=0, models_status=200, reasoning_only=False,
+                cold_failure=None, warm_failure=False):
     calls = []
     native_count = 0
+    measurement_count = 0
     actual_client = httpx.AsyncClient
 
     async def handler(request):
-        nonlocal native_count
+        nonlocal native_count, measurement_count
         path = request.url.path
         payload = json.loads(request.content) if request.content else None
         calls.append((request.method, path, payload))
+        measured = payload and ": Reply with " in payload.get("messages", [{}])[-1].get("content", "")
+        if measured:
+            measurement_count += 1
+            if measurement_count == 1 and cold_failure is not None:
+                if cold_failure == "connect":
+                    raise httpx.ConnectError("not up yet")
+                if cold_failure == "timeout":
+                    raise httpx.ReadTimeout("not up yet")
+                if cold_failure == "missing_model":
+                    return httpx.Response(404, json={"error": {"code": "model_not_found", "message": "model not found"}})
+                if cold_failure == "unavailable_model":
+                    return httpx.Response(404, json={"error": {"code": "model_not_available",
+                        "message": "Requested model is not available yet."}})
+                return httpx.Response(cold_failure, json={"error": "unavailable"})
+            if warm_failure and payload["messages"][-1]["content"][0] in "23":
+                return httpx.Response(503, json={"error": "warm failure"})
         if path == "/api/ps":
             if not native:
                 return httpx.Response(404)
@@ -73,14 +91,22 @@ def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_00
             chunks = [{"message": {"content": answer}, "done": False},
                       {"message": {"content": ""}, "done": True, "done_reason": "stop",
                        "load_duration": duration, "prompt_eval_count": 7, "eval_count": 1}]
+            if reasoning_only:
+                chunks = [{"model": "qwen3:0.6b", "message": {"role": "assistant", "content": "",
+                    "thinking": "Let me think through the requested number."}, "done": True,
+                    "done_reason": "length", "load_duration": duration,
+                    "prompt_eval_count": 7, "eval_count": 128}]
             return httpx.Response(200, content="".join(json.dumps(c)+"\n" for c in chunks),
                                   headers={"content-type": "application/x-ndjson"})
         if path.endswith("/chat/completions"):
             prompt = "\n".join(m.get("content") or "" for m in payload["messages"])
             answer = (prompt.split(":", 1)[0] if ": Reply with " in prompt
                       else FakeEndpoint._answer(prompt))
-            return httpx.Response(200, json={"choices": [{"message": {"content": answer},
-                "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+            return httpx.Response(200, json={"choices": [{"message": {
+                "content": "" if reasoning_only else answer,
+                **({"reasoning_content": "Let me think through the requested number."} if reasoning_only else {})},
+                "finish_reason": "length" if reasoning_only else "stop"}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 128 if reasoning_only else 2}})
         return httpx.Response(404)
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: actual_client(
@@ -119,6 +145,69 @@ async def test_native_three_measurements_then_unchanged_normal_checks(monkeypatc
     assert all(body["stream"] is True for body in native)
     assert all(body["stream"] is False for _, body in inference[3:])
     assert next(check for check in report.checks if check.id == "serving").status == "pass"
+
+
+@pytest.mark.parametrize("native", [True, False])
+async def test_reasoning_only_length_response_is_ready_once_and_preserves_normal_verdicts(monkeypatch, tmp_path, native):
+    calls = mocked_http(monkeypatch, native=native, reasoning_only=True, duration=867_000_000)
+    ordinary = await runner.run_suite(settings(tmp_path))
+    calls.clear()
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=.15))
+    restart = observation(report)
+    assert restart["status"] == "ready"
+    measured = [r for r in report.requests if r.scenario in {"readiness", "cold_start_warm"}]
+    assert len(measured) == 3
+    assert all(r.http_status == 200 and not r.valid and r.finish_reason == "length" for r in measured)
+    assert all(r.error == "reasoning exhausted the output budget before an answer" for r in measured)
+    assert all(r.output == "" and r.reasoning and r.first_output_ms is None for r in measured)
+    for summary, record in zip([restart["first_request"], *restart["warm_requests"]], measured):
+        assert summary["first_output_kind"] == "reasoning"
+        assert summary["first_output_ms"] == record.first_reasoning_ms
+    first = measured[0]
+    assert restart["script_ms"] <= restart["service_answered_ms"] <= restart["readiness_ms"]
+    assert restart["readiness_ms"] <= first.completed_ms
+    assert restart["first_output_kind"] == "reasoning"
+    if native:
+        assert restart["model_load_ms"] == 867
+    assert [(c.id, c.status, c.summary) for c in ordinary.checks] == [
+        (c.id, c.status, c.summary) for c in report.checks]
+
+
+@pytest.mark.parametrize("status", [200, 400, 401, 403, 404, 422])
+async def test_nontransient_response_stops_readiness_after_one_attempt(monkeypatch, tmp_path, status):
+    calls = mocked_http(monkeypatch, native=False, cold_failure=status)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=1))
+    restart = observation(report)
+    assert restart["status"] == "blocked"
+    assert len([method for method, _, _ in calls if method == "POST"]) == 1
+    record = next(r for r in report.requests if r.scenario == "readiness")
+    assert restart["reason"] == record.error
+    assert restart["reason"] != "No successful inference within readiness budget"
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("failure", [429, 500, 503, "missing_model", "unavailable_model", "connect", "timeout"])
+async def test_only_transient_errors_retry_then_measure_output(monkeypatch, tmp_path, native, failure):
+    mocked_http(monkeypatch, native=native, cold_failure=failure)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=2))
+    assert observation(report)["status"] == "ready"
+    assert len([r for r in report.requests if r.scenario == "readiness"]) == 2
+    assert observation(report)["first_request"]["first_output_kind"] == "answer"
+
+
+@pytest.mark.parametrize("native", [True, False])
+async def test_warm_failure_is_not_measured_and_does_not_block_checks(monkeypatch, tmp_path, native):
+    mocked_http(monkeypatch, native=native, warm_failure=True)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass")))
+    restart = observation(report)
+    assert restart["status"] == "ready" and len(restart["warm_requests"]) == 2
+    for item in restart["warm_requests"]:
+        assert item["first_output_ms"] is item["elapsed_ms"] is None
+        assert "503" in item["reason"]
+    assert next(c for c in report.checks if c.id == "serving").status == "pass"
 
 
 def test_cold_followups_are_visible_without_reserving_normal_request_budget(tmp_path):

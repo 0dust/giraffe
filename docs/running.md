@@ -156,8 +156,8 @@ The **Cold start** section appears in UI, text, JSON and HTML results:
 | --- | --- |
 | Script time | Script start to exit. |
 | Service answered after | Script start to the first HTTP response from the models route, polled every 250 ms. |
-| First answer after | Script start to the first successful inference. |
-| Cold vs warm | First-request first-answer time and latency beside two follow-up requests with different text of the same token size. |
+| First answer after | Script start to the first generated output, reasoning or answer, from an HTTP 200 response. |
+| Cold vs warm | First generated output time and latency beside two follow-up requests with different text of the same token size. |
 | Model load | Server evidence only; never inferred from first-answer or startup timing. |
 | Model loaded before first request | Yes, No or Unknown, based on residency evidence. |
 
@@ -166,6 +166,15 @@ timeout to detect Ollama. On detected Ollama only, the first request and two war
 requests use streaming `/api/chat`, with equivalent messages and output cap,
 labelled **Measured through Ollama's native API**. All normal checks afterwards
 use the usual OpenAI-compatible route unchanged.
+
+For restart readiness and these three measurements, HTTP 200 with generated
+reasoning or answer text establishes readiness even when the output cap leaves
+no final answer. `first_output_kind` identifies `answer` or `reasoning`; reasoning
+output is labelled **First output was reasoning; no answer within the output cap.**
+Only connection errors, timeouts, HTTP 429/5xx, and a 404 identifying an unavailable
+model are retried. Other responses stop readiness with their actual reason. A
+failed warm request is not measured and does not block the normal checks. Normal
+checks retain their existing reasoning-versus-answer classification and verdicts.
 
 A load duration is reported only when `/api/ps` showed the model absent before
 the first request and present afterwards, and the server reported the duration:

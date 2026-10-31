@@ -1249,6 +1249,11 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                     value = request.get(field)
                     return f"{value:g} ms" if isinstance(value, (float, int)) else "Not measured"
                 print(f"  {label}: first answer {timing('first_output_ms')}; latency {timing('elapsed_ms')}")
+                if request.get("first_output_kind") == "reasoning":
+                    from giraffe.cold_start import REASONING_OUTPUT_NOTE
+                    print(f"    {REASONING_OUTPUT_NOTE}")
+                if request.get("reason"):
+                    print(f"    {request['reason']}")
             print(f"  {restart.get('model_load', 'Not reported by this server')}")
             print(f"  Model loaded before first request: {restart.get('model_loaded_before_first_request', 'Unknown')}")
             if restart.get("measurement_api"):

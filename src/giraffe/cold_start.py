@@ -15,6 +15,38 @@ from .client import LLMClient, _MAX_RESPONSE_BYTES, _ProtocolError, _headers, _o
 
 
 NATIVE_API_LABEL = "Measured through Ollama's native API"
+REASONING_OUTPUT_NOTE = "First output was reasoning; no answer within the output cap."
+
+
+def output_measurement(record):
+    """Summarize restart output without changing ordinary answer/check evidence."""
+    candidates = [(value, kind) for value, kind in (
+        (record.first_output_ms, "answer"), (record.first_reasoning_ms, "reasoning"))
+        if value is not None]
+    if record.http_status == 200 and (candidates or record.output.strip() or record.reasoning.strip()):
+        first, kind = min(candidates) if candidates else (
+            None, "reasoning" if record.reasoning.strip() or record.reasoning_stripped else "answer")
+        return {"first_output_ms": first, "first_output_kind": kind,
+                "elapsed_ms": record.elapsed_ms}
+    return {"first_output_ms": None, "elapsed_ms": None,
+            "reason": record.error or f"HTTP {record.http_status}: no generated output"}
+
+
+def retry_readiness(record):
+    """Only startup/transport failures warrant another cold request."""
+    if record.status == "timeout" or record.http_status == 429:
+        return True
+    if record.http_status is not None and 500 <= record.http_status <= 599:
+        return True
+    if record.http_status == 404:
+        return bool(record.workload.get("model_not_served"))
+    return record.http_status is None and record.error in {
+        f"{prefix} ({kind})"
+        for prefix in ("request failed", "client failure")
+        for kind in ("ConnectError", "ConnectTimeout", "ReadError", "WriteError", "CloseError",
+                     "NetworkError", "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
+                     "BrokenPipeError", "RemoteProtocolError", "OSError")
+    }
 
 
 def _measurement_spec(base, number, scenario):
