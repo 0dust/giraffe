@@ -236,6 +236,12 @@ async def sessions(run, target, client):
         value = f"Session_{index:04d}_{mode}"
         item["seeded_value"] = value
         previous_completed_ms = None
+
+        def finalize_pause(record):
+            record.workload["actual_pause_seconds"] = (
+                max(0, (record.dispatch_ms - previous_completed_ms) / 1000)
+                if previous_completed_ms is not None and record.dispatch_ms is not None else None)
+
         for turn, prompt in enumerate(turns):
             sampled = plan["turns"][turn] if plan else {
                 "think_time_seconds": settings.delay_seconds if turn else 0,
@@ -296,15 +302,12 @@ async def sessions(run, target, client):
             if not workload:
                 request.scorer, request.expected = "exact", value
                 request.options = deterministic_options(config, request.options)
-            record = await run.request(target, client, request)
+            record = await run.request(target, client, request, finalize_record=finalize_pause)
             if record is None:
                 item["stop_reason"] = run.reason or "request budget reached"
                 run.unfinished[target.name].add("sessions")
                 break
             item["turns"].append(record.id)
-            record.workload["actual_pause_seconds"] = (
-                max(0, (record.dispatch_ms - previous_completed_ms) / 1000)
-                if previous_completed_ms is not None and record.dispatch_ms is not None else None)
             previous_completed_ms = record.completed_ms
             if reasoning_budget(record):
                 item["stop_reason"] = "reasoning exhausted the output budget before an answer; session recall unverified"

@@ -129,7 +129,7 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue95_pauses")
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue95_pause_evidence")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
     }
@@ -156,7 +156,7 @@ def test_presampling_generator_identity_retains_the_original_session_settings():
     assert _settings_reasons(current, old) == []
 
 
-@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses"])
+@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"])
 def test_sampled_sessions_are_never_attested_as_unchanged_historical_traffic(revision):
     current, _, _, _ = reports()
     current.manifest["config"]["sessions"].update(
