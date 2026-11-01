@@ -2281,9 +2281,10 @@ async def test_watchdog_can_be_disabled(monkeypatch, disabled):
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-async def test_target_outage_cancels_only_its_capacity_requests(monkeypatch, overlap):
+def test_target_outage_cancels_only_its_capacity_requests(monkeypatch, overlap):
     import httpx
     from tests.test_client import Chunks
+    from tests.test_review26_phase4_accuracy import run_virtual
 
     silent_calls, healthy_calls, streams = 0, 0, []
 
@@ -2303,19 +2304,23 @@ async def test_target_outage_cancels_only_its_capacity_requests(monkeypatch, ove
 
     mock_inference_transport(monkeypatch, handler)
     targets = [Target(name=name, model="test", url="http://" + name) for name in ("silent", "healthy")]
-    report = await runner.run_suite(load_config(targets=targets, overlap_models=overlap, stream=False,
-        concurrency=4, max_requests=100, stop_after_errors=100, rate=100, duration=.15, finish=1,
-        request_source="request_pack", request_pack={"version": 1, "cases": [{"fixture_id": "one",
-            "messages": [{"role": "user", "content": "42"}], "scorer": "exact", "expected": "42"}]},
-        unresponsive_after_failures=2, unresponsive_for_seconds=.04))
-    assert report.abort_reason is None and list(report.observations["target_abort_reasons"]) == ["silent"]
-    assert streams and all(stream.closed for stream in streams)
-    interrupted = [r for r in report.requests if r.target == "silent" and r.status == "cancelled"]
-    assert interrupted and all(r.score is None and "unresponsive" in r.error for r in interrupted)
-    healthy = [r for r in report.requests if r.target == "healthy"]
-    assert healthy_calls == len(healthy) == 15
-    assert all(r.status == "completed" and r.valid for r in healthy)
-    assert report.observations["targets"]["healthy"]["endpoint_health"]["abort_reason"] is None
+
+    async def scenario():
+        report = await runner.run_suite(load_config(targets=targets, overlap_models=overlap, stream=False,
+            concurrency=4, max_requests=100, stop_after_errors=100, rate=100, duration=.15, finish=1,
+            request_source="request_pack", request_pack={"version": 1, "cases": [{"fixture_id": "one",
+                "messages": [{"role": "user", "content": "42"}], "scorer": "exact", "expected": "42"}]},
+            unresponsive_after_failures=2, unresponsive_for_seconds=.04))
+        assert report.abort_reason is None and list(report.observations["target_abort_reasons"]) == ["silent"]
+        assert streams and all(stream.closed for stream in streams)
+        interrupted = [r for r in report.requests if r.target == "silent" and r.status == "cancelled"]
+        assert interrupted and all(r.score is None and "unresponsive" in r.error for r in interrupted)
+        healthy = [r for r in report.requests if r.target == "healthy"]
+        assert healthy_calls == len(healthy) == 15
+        assert all(r.status == "completed" and r.valid for r in healthy)
+        assert report.observations["targets"]["healthy"]["endpoint_health"]["abort_reason"] is None
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("overlap", [False, True])
