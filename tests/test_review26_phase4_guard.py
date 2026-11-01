@@ -49,7 +49,7 @@ api=async(path,options)=>{
 };
 assert.equal(currentSettingErrors().length,0);
 assert.equal(canStartRun(),false);
-assert.match(renderPlanWarnings(VALIDATED.request_plan),/Restart `giraffe web`/);
+assert.match(renderPlanTime(VALIDATED.request_plan),/Restart `giraffe web`/);
 await copyCli();
 assert.equal(JSON.stringify(paths),JSON.stringify(['/api/config/validate','/api/config/cli']));
 assert.equal(nodes['#config-error'].hidden,true);

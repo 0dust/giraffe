@@ -5,7 +5,7 @@ import json
 import pytest
 
 from giraffe.cli import main
-from giraffe.models import CATALOGUE_NAMES, RunConfig, RunReport
+from giraffe.models import RunConfig, RunReport
 from giraffe.planning import request_plan
 from tests.test_ux_catalogue import browser_logic
 
@@ -14,7 +14,7 @@ TARGET = {"name": "local", "url": "http://localhost/v1", "model": "test"}
 
 def test_limit_names_match_bounds_and_edit_destinations():
     browser_logic(r"""
-const labels={max_requests:'Max requests',max_duration_seconds:'Max duration',concurrency:'Max concurrency'};
+const labels={max_requests:'Maximum requests',max_duration_seconds:'Maximum duration',concurrency:'Simultaneous limit'};
 const markup=renderPlanBounds(config)+renderSharedRunSettings(config);
 for(const [path,label] of Object.entries(labels)){
   assert(markup.includes('<dt>'+label+'</dt>'));
@@ -63,10 +63,20 @@ assert.equal(elements.max_requests.disabled,false);assert.equal(elements.max_req
 """.replace('PLAN', json.dumps(plan)), configured)
 
 
-def test_warning_names_match_every_catalogue_entry():
+def test_restored_catalogue_retains_reference_names():
+    names = {
+        "access": "Endpoint response", "serving": "Invalid responses",
+        "correctness": "Answer correctness", "json": "JSON correctness",
+        "context": "Context recall", "tools": "Tool-call correctness",
+        "first_output": "First answer", "generation": "Generation",
+        "load": "Load test", "recovery": "Recovery after load",
+        "sessions": "Concurrent conversations", "consistency": "Answer consistency",
+        "cancellation": "Cancellation & timeouts", "prefix": "Prompt cache evidence",
+        "gpu": "GPU metrics",
+    }
     browser_logic(r"""
 for(const [check,name] of Object.entries(NAMES))assert.equal(catalogTitle(check),name);
-""".replace('NAMES', json.dumps(CATALOGUE_NAMES)))
+""".replace('NAMES', json.dumps(names)))
 
 
 def test_time_budget_warning_formats_action_without_changing_numeric_value():

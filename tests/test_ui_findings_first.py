@@ -19,8 +19,8 @@ const value=report([check('correctness','fail',{summary:'Wrong city.',evidence_i
 const html=detail(value);
 assert.match(html,/Show failing requests/);assert.match(html,/Expected:.*Paris/);assert.match(html,/Received:.*Lyon/);
 assert.doesNotMatch(html,/verdict-word|Acceptance failed|check-verdicts|data-check="local:json"/);
-assert.match(html,/Not selected:[^<]*JSON correctness/);assert.match(html,/<details class="run-diagnostics"/);
-assert.match(html,/<p class="result-guidance">0 of 1 checks passed<\/p>/);
+assert.match(html,/Not selected: JSON correctness/);assert.match(html,/<details class="run-diagnostics"/);
+assert.match(html,/<p class="result-guidance">Wrong city\.<\/p>/);
 assert.match(html,/<p class="finding-check-reason">Wrong city\.<\/p>/);
 """)
 
@@ -39,7 +39,7 @@ def test_report_rail_retargets_links_after_run_navigation():
 (async()=>{
  for(const id of ['A','B']){
   location.hash='#runs/'+id+'/performance';state.detail={id,state:'completed',report:report([check('access','pass')])};renderDetail();
-  for(const link of $('#report-sections').querySelectorAll('a'))assert(link.getAttribute('href').startsWith('#runs/'+id+'/'));if($('#report-sections a'))assert.equal($('#report-sections a').getAttribute('href'),'#runs/'+id+'/performance/overview');
+  for(const link of $('#report-sections').querySelectorAll('a'))assert(link.getAttribute('href').startsWith('#runs/'+id+'/performance/'));
  }
  location.hash='#runs/B/results';await route();
  assert.equal($('#report-sections').hidden,true);assert.equal($('#report-sections').querySelectorAll('a').length,0);
@@ -70,8 +70,8 @@ const baseline={run_id:'old',status:'fail',targets:[{target:'local',comparisons:
  {metric:'latency_ms',status:'inconclusive',reason:'Too few samples'}]}]};
 state.baselines=[{id:'chosen',run_id:'old',name:'Before deploy'}];let html=detail(report([check('access','pass')],{baseline,overall:'fail'}));
 assert.match(html,/vs baseline Before deploy: 4 measurements · 1 with warnings/);
-html=renderComparison(state.detail.report);assert.equal((html.match(/data-metric=/g)||[]).length,4);for(const heading of ['Metric','Baseline','Current','Δ','Verdict'])assert(new RegExp('<th[^>]*>'+heading+'</th>').test(html));
-assert.match(html,/\+30%/);assert.match(html,/-30%/);assert.match(html,/worse/);assert.match(html,/no material change/);assert.match(html,/Too few samples/);assert.match(html,/Why this warning/);assert.doesNotMatch(html,/Entry \d/);
+html=renderComparison(state.detail.report);assert.equal((html.match(/data-metric=/g)||[]).length,4);for(const heading of ['Baseline','Current','Change'])assert(html.includes('<dt>'+heading+'</dt>'));
+assert.match(html,/\+30%/);assert.match(html,/-30%/);assert.match(html,/Regression detected/);assert.match(html,/No material regression/);assert.match(html,/Too few samples/);assert.match(html,/Why this warning/);assert.doesNotMatch(html,/Entry \d/);
 """)
 
 
@@ -105,7 +105,7 @@ def test_long_answers_expand_and_reason_details_keep_backend_text():
     run_render_checks(r"""
 const value=report([check('correctness','fail',{summary:'First reason. Second reason. Third reason.',evidence_ids:['bad']})],{overall:'fail',observations:{summary:'First sentence. Second sentence. To conclude, Raise the budget. Fourth sentence.'},requests:[{id:'bad',score:false,status:'completed',output:'x'.repeat(300),evaluation:{expected:'y'.repeat(300)}}]});
 const html=detail(value);assert.match(html,/<details class="answer-excerpt">/);assert.match(html,/x{300}/);assert.match(html,/y{300}/);
-const guidance=html.match(/<p class="result-guidance">(.*?)<\/p>/)[1];assert.equal(guidance,'0 of 1 checks passed');assert.match(html,/First reason\. Second reason\./);assert.match(html,/Third reason\./);assert.doesNotMatch(html,/<summary>Details<\/summary>/);assert.doesNotMatch(html,/To conclude,/);
+const guidance=html.match(/<p class="result-guidance">(.*?)<\/p>/)[1];assert.equal(guidance,'First sentence. Second sentence.');assert.match(html,/Raise the budget/);assert.doesNotMatch(html,/To conclude,/);
 assert.equal((html.match(/<div class="finding-request">/g)||[]).length,1);
 """)
 
@@ -129,7 +129,7 @@ def test_routes_rail_clicks_and_palette_follow_current_run_and_focus_heading():
  api=async path=>{const id=path.slice('/api/runs/'.length);return {id,state:'completed',report:reports[id]};};
  const assertCurrent=id=>{
   assert.equal(state.detail.id,id);assert.equal(document.activeElement,$('#main h1'));
-  for(const link of $('#report-sections').querySelectorAll('a'))assert(link.getAttribute('href').startsWith('#runs/'+id+'/'));if($('#report-sections a'))assert.equal($('#report-sections a').getAttribute('href'),'#runs/'+id+'/performance/overview');
+  for(const link of $('#report-sections').querySelectorAll('a'))assert(link.getAttribute('href').startsWith('#runs/'+id+'/performance/'));
  };
  location.hash='#runs/A/results';await route();assertCurrent('A');
  location.hash='#runs/B/results';await route();assertCurrent('B');
@@ -139,18 +139,19 @@ def test_routes_rail_clicks_and_palette_follow_current_run_and_focus_heading():
  const dialog=document.createElement('dialog');dialog.setAttribute('id','command-dialog');document.body.insertBefore(dialog,null);
  dialog.showModal=function(){this.open=true;$('#command-search').focus=()=>{};};
  state.runs=[{id:'A',targets:[{model:'same-model'}]},{id:'B',targets:[{model:'same-model'}]}];openCommands();
- const commandIndex=commandList.findIndex(item=>item.group==='Runs');await listeners.click({target:$('[data-command="'+commandIndex+'"]')});
+ const commandIndex=commandList.findIndex(item=>item.group==='Recent runs');await listeners.click({target:$('[data-command="'+commandIndex+'"]')});
  await route();assertCurrent('A');assert(!dialog.open);
 })()
 """, dom=True)
 
 
-def test_setup_profiles_replace_steps_and_run_headers_use_url_identity():
+def test_setup_step_buttons_have_names_and_run_headers_use_url_identity():
     run_render_checks(r"""
 Object.defineProperty(Object.getPrototypeOf($('#main')),'elements',{get(){return new Proxy({},{get:(_,name)=>this.querySelector('[name="'+String(name)+'"]')||{value:'',dataset:{}}});}});
 state.config={...structuredClone(bootstrap.defaults),targets:[{name:'local',model:'test',url:'http://localhost/v1',tokenizer:{mode:'builtin'}}]};state.bootstrap.checks=[];state.jsonDraft=state.jsonBase='synced';
 renderHeroCoat=()=>'';syncTestControls=updateBounds=updateRestart=syncConfigView=syncPackControls=renderRequestPreview=syncSetupStep=renderModelDiscovery=watchPlanViewport=scheduleTokenizerSelection=renderTokenizerSelection=()=>{};
-renderNew();assert.equal($$('.setup-step').length,0);assert.equal($$('.setup-profile').length,5);assert.equal($('#start-run').getAttribute('type'),'submit');
+renderNew();const steps=$$('.setup-step');assert.equal(steps.length,3);
+for(const [index,label] of ['Connect','Checks','Launch'].entries())assert.equal(steps[index].getAttribute('aria-label'),'Step '+(index+1)+': '+label);
 const html=detail(report([check('access','pass')],{run_id:'abcdef012345'}),{id:'20261027T155344-8acbbc1f'});
 assert.match(html.split('report-toolbar')[0],/20261027T155344-8acbbc1f/);assert.doesNotMatch(html.split('report-toolbar')[0],/abcdef012345/);assert.match($('.run-diagnostics').textContent,/abcdef012345/);
 state.runs=[{id:'one',overall:'pass',state:'completed',started_at:'2026-10-27T15:00:01Z',targets:[{model:'same'}]},{id:'two',overall:'fail',state:'completed',started_at:'2026-10-27T15:00:02Z',targets:[{model:'same'}]}];renderRailRuns();const links=$$('#rail-runs a');assert.match(links[0].textContent,/Passed/);assert.match(links[1].textContent,/Failed/);assert.notEqual(links[0].textContent,links[1].textContent);
@@ -205,7 +206,7 @@ def test_saved_partial_summary_uses_findings_and_user_stop_copy():
     run_render_checks(r"""
 state.detail={id:'partial',state:'interrupted',abort_reason:'cancelled by user',request_plan:{planned_total:8},config:{targets:[],checks:['access']},summary:{overall:'inconclusive',request_count:2,checks:[check('access','inconclusive'),check('json','skipped',{summary:'Not selected for this run.'})]},live_requests:[{id:'a',status:'completed'},{id:'b',status:'cancelled'}]};
 renderDetail();const html=nodes['#main'].innerHTML;assert.match(html,/<h1>Stopped by you<\/h1>/);assert.match(html,/2 of 8 planned requests finished/);
-assert.match(html,/Not selected:[^<]*JSON correctness/);assert.doesNotMatch(html,/data-verdict-check|data-check="local:json"/);assert.match(html,/<details class="run-diagnostics">/);
+assert.match(html,/Not selected: JSON correctness/);assert.doesNotMatch(html,/data-verdict-check|data-check="local:json"/);assert.match(html,/<details class="run-diagnostics">/);
 nodes['#result-content']={innerHTML:''};listeners.click({target:{closest:q=>q==='[data-check]'?{dataset:{check:'local:access'}}:null}});
 assert.match(nodes['#result-content'].innerHTML,/finding-expanded/);
 """)

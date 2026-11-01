@@ -38,6 +38,21 @@ async def test_smoke_accepts_transformed_assets_and_follows_versioned_dependenci
     assert not any(url.endswith("/static/form-config.mjs") for url in requested)
 
 
+def test_smoke_checks_packaged_tokenizer_without_network_or_writable_cache(smoke):
+    smoke.check_builtin_tokenizer(resources.files("giraffe").joinpath("data"))
+
+
+@pytest.mark.parametrize("damage", ["encoding", "notice"])
+def test_smoke_rejects_damaged_tokenizer_resources(tmp_path, smoke, damage):
+    data = resources.files("giraffe").joinpath("data")
+    for name in ("o200k_base.tiktoken", "THIRD_PARTY_NOTICES.txt"):
+        (tmp_path / name).write_bytes(data.joinpath(name).read_bytes())
+    name = "o200k_base.tiktoken" if damage == "encoding" else "THIRD_PARTY_NOTICES.txt"
+    (tmp_path / name).write_bytes(b"corrupted")
+    with pytest.raises(RuntimeError, match="tokenizer"):
+        smoke.check_builtin_tokenizer(tmp_path)
+
+
 @pytest.mark.parametrize("damage", [
     "missing_boot_reference", "missing_boot", "corrupt_boot", "corrupt_styles",
     "corrupt_script", "raw_script", "stale_script_version", "stale_dependency_version",

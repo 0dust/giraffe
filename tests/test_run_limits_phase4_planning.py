@@ -650,3 +650,25 @@ def test_recovery_cleanup_wait_remains_when_sustained_duration_is_zero():
     assert {item["id"] for item in plan["time_components"]} == {"recovery_wait"}
     assert plan["estimated_low_seconds"] == 4
     assert plan["estimated_high_seconds"] == 4
+
+
+@pytest.mark.parametrize("budget, warns", [(89, True), (90, False), (91, False)])
+def test_time_risk_uses_full_timeout_bound_and_suppresses_connection_warning_when_it_fits(budget, warns):
+    configured = config(checks=["access", "correctness"], max_duration_seconds=budget)
+    plan = request_plan(configured)
+    assert sum(item["high_seconds"] for item in plan["time_timeline"]) == 90
+    assert any(item["kind"] == "estimate_risk" for item in plan["time_warnings"]) is warns
+    assert any("shares the time limit" in text for text in plan["warnings"]) is warns
+    if not warns:
+        assert plan["time_warnings"] == plan["errors"] == []
+
+
+def test_time_risk_remains_when_workload_has_no_usable_duration_bound():
+    from giraffe.planning import _time_plan
+
+    configured = config(checks=["generation"], max_duration_seconds=7200)
+    plan = _time_plan(configured, [{"id": "generation", "title": "Generation speed",
+                                   "requests_per_target": None, "kind": "bounded"}], None)
+    notice, = plan["time_warnings"]
+    assert notice["kind"] == "estimate_risk"
+    assert "completion time cannot be bounded" in notice["msg"]

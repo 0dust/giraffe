@@ -87,6 +87,7 @@ _DELTA_WINDOW = 16384
 _REPORT_CACHE_BYTES = 256 * 1024 * 1024
 _ISOLATED_REPORT_BYTES = 256 * 1024
 _IN_REPORT_PROCESS = False
+BROWSER_DEFAULT_RUN_LIMITS = {"max_requests": 50_000, "max_duration_seconds": 7200, "concurrency": 128}
 
 
 @contextmanager
@@ -850,7 +851,9 @@ def _bootstrap_config(defaults: dict | None) -> dict:
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost:11434/v1",
                                  "model": "placeholder"}]).model_dump(mode="json")
     config["targets"][0]["model"] = ""
-    if defaults is not None:
+    if defaults is None:
+        config.update(BROWSER_DEFAULT_RUN_LIMITS)
+    else:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
         defaults, _ = migrate_run_limits(defaults)
         defaults, _ = migrate_concurrent_load(defaults)

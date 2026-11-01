@@ -302,7 +302,7 @@ def test_setup_arrival_history_is_visible_and_tracks_the_current_plan(tmp_path):
     run_render_checks(setup + "\nconst config=" + cfg.model_dump_json()
                       + ";const plan=" + json.dumps(value) + r''';
 state.config=config;state.jsonDraft=state.jsonBase='synced';renderNew();
-$('#setup-advanced').open=false;
+state.setupStep=3;syncSetupStep();
 const original=JSON.stringify(state.config),message=plan.arrival_history[0].message;
 api=()=>{throw new Error('History rendering must not send traffic');};
 function current(){
@@ -314,14 +314,14 @@ function visible(){
   const outlet=$('#setup-history');assert(outlet,'History needs a visible setup outlet');
   const disclosure=outlet.querySelector('.arrival-history');assert(disclosure);
   assert.equal(disclosure.querySelector('summary').textContent,'Previous arrival delivery');
-  assert(!outlet.closest('#setup-advanced'));assert(!outlet.closest('#run-blueprint'));
+  assert(outlet.closest('#setup-panel-3'));assert(!outlet.closest('#run-blueprint'));
   for(let ancestor=disclosure.parentNode;ancestor;ancestor=ancestor.parentNode){
     assert(!ancestor.hidden,'History ancestor must be visible');
     assert(ancestor.tagName!=='DETAILS'||ancestor.open,'History must not be inside a closed disclosure');
   }
   assert.equal(disclosure.querySelector('a').getAttribute('href'),'#runs/source-run');
   assert.equal($('#main').textContent.split(message).length-1,1,'History appears once');
-  assert(!$('#setup-advanced').open,'History does not force Advanced open');
+  assert.equal(state.setupStep,3,'History belongs to the Launch plan');
 }
 function cleared(){assert($('#setup-history').hidden);assert.equal($('#setup-history').textContent,'');}
 current();visible();

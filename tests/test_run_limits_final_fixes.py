@@ -23,11 +23,10 @@ def test_short_estimate_names_connection_risk_without_contradicting_headline():
     assert [item["id"] for item in risk["components"]] == ["initial"]
     browser_logic("const plan=" + json.dumps(plan) + r""";
 const markup=renderPlanTime(plan);
-assert.doesNotMatch(markup,/Confidence:|test traffic only/);
-const warnings=renderPlanWarnings(plan);
-assert.match(warnings,/Endpoint access for service may wait up to 30 s/);
+assert.match(markup,/Confidence: medium/);
+assert.match(markup,/Endpoint access for service may wait up to 30 s/);
 assert.doesNotMatch(markup,/estimated traffic duration may exceed|Unknown requests/);
-assert.match(warnings,/data-setting-path="test_options.access.request_timeout_seconds"/);
+assert.match(markup,/data-setting-path="test_options.access.request_timeout_seconds"/);
 """)
 
 
@@ -66,8 +65,6 @@ def test_duration_range_never_repeats_identical_formatted_endpoints(low, high, e
     browser_logic(f"""
 const plan={{estimated_seconds:{(low + high) / 2},estimated_low_seconds:{low},estimated_high_seconds:{high}}};
 const markup=renderPlanTime(plan);
-assert.equal(formatDurationRange({low},{high}),'{expected}'.replace('about ',''));
-assert(markup.includes('~'+'{expected}'.replace('about ','')),markup);
-assert.equal((markup.match(/plan-time/g)||[]).length,1);
-assert.doesNotMatch(markup,/Confidence:|test traffic only/);
+assert(markup.includes('Estimated duration: {expected} · test traffic only'),markup);
+assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);
 """)

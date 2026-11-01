@@ -54,14 +54,15 @@ function numeric(value, label, allowInvalid=false) {
 export function configureRunLimits(source, values, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   for (const name of ['max_duration_seconds','max_requests','concurrency','max_memory_mb']) {
-    if (!values.has(`${name}_enabled`)) continue;
-    if (values.get(`${name}_enabled`) !== 'on') {
+    const toggled = values.has(`${name}_enabled`);
+    if (!toggled && !(name === 'max_memory_mb' && values.has(name))) continue;
+    if (toggled && values.get(`${name}_enabled`) !== 'on') {
       config[name] = name === 'max_memory_mb' ? 0 : null;
       continue;
     }
     let value = numeric(values.get(name), name, allowInvalid);
     if (value === null) {
-      const msg = 'Enter a value or turn this limit off.';
+      const msg = name === 'max_memory_mb' ? 'Enter a value; use 0 to turn the memory limit off.' : 'Enter a value or turn this limit off.';
       if (!allowInvalid) throw Object.assign(new Error(msg), {errors:[{fields:[name],msg}]});
       value = '';
     }

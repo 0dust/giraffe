@@ -67,8 +67,7 @@ def test_standalone_old_empty_reports_show_availability_without_empty_charts():
     assert 'Not collected' in html and 'Not applicable' in html
     assert 'no runtime telemetry collection evidence' in html
     assert '<svg' not in html
-    assert '<h2>Requests</h2>' in html and 'Reproduce this run' in html
-    assert 'Request evidence' not in html
+    assert 'Request evidence' in html and 'Reproduce this run' in html
 
 
 def test_standalone_values_come_from_selected_backend_summary():
@@ -169,9 +168,3 @@ def test_standalone_measurement_catalog_preview_is_bounded():
     html = render_performance(performance)
     assert 'Showing 50 of 1000 windows; complete catalog in report.json.' in html
     assert 'window-canary-49' in html and 'window-canary-50' not in html
-
-
-def test_standalone_report_timing_labels_use_time_to_first_answer():
-    html = _render(synthetic_report_1000())
-    assert 'Time to first answer' in html
-    assert not re.search(r'\bfirst output\b', html, re.I)

@@ -108,3 +108,23 @@ def test_unbounded_pack_judging_summary_uses_planned_calls_without_quota_clamp()
     assert not any("exceed a target request quota" in warning or "exceeds the run time budget" in warning or "consume additional shared" in warning
                    for warning in preview["warnings"])
     json.dumps(preview, allow_nan=False)
+
+
+@pytest.mark.parametrize("offset, warns", [(-1, True), (0, False), (1, False)])
+def test_adaptive_request_risk_only_below_twenty_times_conservative_plan(offset, warns):
+    configured = config(checks=["load"])
+    estimate = request_plan(configured)["conservative_requests_per_target"]
+    configured.max_requests = 20 * estimate + offset
+    result = request_plan(configured)
+    assert any(item["kind"] == "adaptive_risk" for item in result["request_warnings"]) is warns
+
+
+def test_tight_browser_limits_still_warn_for_load():
+    from giraffe.web import _bootstrap_config
+
+    values = _bootstrap_config(None)
+    values["targets"][0]["model"] = "test"
+    values.update(checks=["load"], max_requests=100, max_duration_seconds=60)
+    result = request_plan(RunConfig.model_validate(values))
+    assert any(item["kind"] == "adaptive_risk" for item in result["request_warnings"])
+    assert any(item["kind"] == "estimate_risk" for item in result["time_warnings"])

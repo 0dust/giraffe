@@ -84,12 +84,23 @@ class VirtualLoop(asyncio.SelectorEventLoop):
     """Run the real scheduling/batching code without spending seconds asleep."""
 
     now = 0
+    _executor_pending = 0
 
     def time(self):
         return self.now
 
+    def run_in_executor(self, executor, func, *args):
+        future = super().run_in_executor(executor, func, *args)
+        self._executor_pending += 1
+
+        def completed(_):
+            self._executor_pending -= 1
+
+        future.add_done_callback(completed)
+        return future
+
     def _run_once(self):
-        if not self._ready and self._scheduled:
+        if not self._ready and self._scheduled and not self._executor_pending:
             self.now = max(self.now, min((handle._when for handle in self._scheduled
                                           if not handle.cancelled()), default=self.now))
         super()._run_once()
@@ -118,6 +129,20 @@ def run_virtual(monkeypatch, coroutine):
             if name.startswith("giraffe.") and getattr(module, "monotonic", None) is time.monotonic:
                 monkeypatch.setattr(module, "monotonic", loop.time)
         return execution.run(coroutine)
+
+
+def test_virtual_clock_waits_for_executor_work(monkeypatch):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        sleeper = asyncio.create_task(asyncio.sleep(100))
+        await asyncio.to_thread(time.sleep, .2)
+        assert loop.time() == started
+        assert not sleeper.done()
+        sleeper.cancel()
+        await asyncio.gather(sleeper, return_exceptions=True)
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("case", CASES)

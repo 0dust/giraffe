@@ -23,7 +23,7 @@ assert.equal((html.match(/placeholder="Measure only"/g)||[]).length,4);
 assert.doesNotMatch(html,/Load types|Load schedule|p95|Context length|Pairs per|pending|in.flight|data-profile-settings/);
 assert.equal((html.match(/aria-live="polite"/g)||[]).length,2);assert.doesNotMatch(html,/<section[^>]*aria-live/);
 assert.equal((renderRunBlueprint(config).match(/aria-live="polite"/g)||[]).length,1);
-assert.match(effectiveCheckSummary(bootstrap.checks.find(c=>c.id==='load'),config),/1 workload · 1, 4 at once/);
+assert.match(effectiveCheckSummary(bootstrap.checks.find(c=>c.id==='load'),config),/1 workload · 1, 4 concurrent/);
 assert.equal(bootstrap.checks.filter(c=>['load','concurrency','capacity','arrivals'].includes(c.id)).length,1);
 ''')
 
@@ -50,7 +50,7 @@ const s=loadSettings(config);s.workloads.mixed.selected=['short_short','long_sho
 s.workloads.mixed.share_mode='custom';s.workloads.mixed.shares={short_short:20,long_short:30,short_long:40};assert.equal(loadDisplay(s).shares,'90% total · must equal 100%.');
 s.profile.long.output_tokens=512;assert.match(loadDisplay(s).coverage,/At least 410 generated tokens/);
 assert.match(loadDisplay(s).slowdown,/1.5× means up to 50% longer.*at most 3 seconds/);
-s.patterns.concurrent.levels=[1,4,8];s.schedule.duration_seconds=10;assert.match(loadDisplay(s).allocation,/With 4 at once: 3 short streams, with room for one added long request/);assert.match(loadDisplay(s).allocation,/Level 1 is not applicable/);
+s.patterns.concurrent.levels=[1,4,8];s.schedule.duration_seconds=10;assert.match(loadDisplay(s).allocation,/At 4 concurrent requests: 3 short streams, with room for one added long request/);assert.match(loadDisplay(s).allocation,/Level 1 is not applicable/);
 const rows=loadShapes.map(shape=>({dataset:{loadShareRow:shape}}));groups['[data-load-share-row]']=rows;nodes['#load-shares']={};nodes['#load-share-note']={};syncLoadDisplay({...config,load_test:s});assert.equal(rows.filter(row=>!row.hidden).length,3);assert.equal(nodes['#load-shares'].hidden,false);
 ''')
 
@@ -86,9 +86,9 @@ def test_plan_breakdown_and_duration_rows_use_server_numbers():
     plan=request_plan(config)
     browser_logic('const plan='+json.dumps(plan)+r''';
 config.checks=['load'];const html=renderRunBlueprint(config,plan);
-assert.match(html,/Load test plan/);assert.match(html,/Scheduled conditions/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);assert.match(html,/Unknown \+ 135/);
+assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);assert.match(html,/Unknown \+ 135/);
 assert.match(html,/Expected scheduled requests/);assert.match(html,/Execution order/);
-assert.match(renderPlanTime(plan),/~3 min \(up to 63 min if responses slow down\)/);assert.equal((renderPlanTime(plan).match(/class="hint plan-time"/g)||[]).length,1);assert.doesNotMatch(html,/Estimated duration:|Confidence:/);
+assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);
 assert.doesNotMatch(renderLoadPlan(config),/12<\/dd>|3m 0s/); // No independent planner fallback.
 ''')
 
@@ -140,10 +140,10 @@ const stress={...point,id:'load_stress_output_c4',type:'stress',workload:'output
 const metrics={configured_load_seconds:80,load_types:{combinations:{title:loadTitles.combinations,status:'fail',points:[point]},mixed:{title:loadTitles.mixed,status:'fail',points:[mixed]},interference:{title:loadTitles.interference,status:'fail',points:[interference]},stress:{title:loadTitles.stress,status:'inconclusive',points:[stress]}}};
 const html=renderConcurrentResults(metrics);
 for(const type of Object.keys(metrics.load_types))assert(html.includes('data-load-result="'+type+'"'));
-for(const label of ['Workload','requested concurrency','delivered / configured','Sent / completed','failed / timeouts','Valid / required','Correct (%)','Client-delivered concurrency','Server-evidenced concurrency','TTFT / first-answer p95','Response p95','Requests/s','Output tokens/s','actual (median, min–max) / target','actual (median, min–max) / cap','Status / reason','How these are measured'])assert(html.includes(label),label);
+for(const label of ['Workload','requested concurrency','delivered / configured','Sent / completed','failed / timeouts','Valid / required','Correct (%)','Client-delivered concurrency','Server-evidenced concurrency','First-output p95','Response p95','Requests/s','Output tokens/s','actual (median, min–max) / target','actual (median, min–max) / cap','Status / reason','How these are measured'])assert(html.includes(label),label);
 assert.match(html,/not reported \/ 2,048/);assert.match(html,/not reported/);assert.doesNotMatch(html,/0 \/ 2,048/);
 assert.match(html,/3.2 \/ 10 s/);assert.match(html,/Drain 0.5 s/);assert.match(html,/error threshold exceeded &lt;endpoint&gt;/);
-assert.match(html,/Observed by sent requests/);assert.match(html,/Observed by concurrent time/);assert.match(html,/66.7%/);
+assert.match(html,/Observed by sent requests/);assert.match(html,/Observed by in-flight time/);assert.match(html,/66.7%/);
 assert.match(html,/Matched interference groups/);assert.match(html,/Short-only control/);assert.match(html,/Slowdown: 1.2×/);
 assert.match(html,/Buffered short streams: 1 \/ 8/);assert.match(html,/Ambiguous A\/B overlaps excluded from both groups: 2/);
 assert.match(html,/Short-stream concurrency mean \/ peak \/ server-evidenced: 2.8 \/ 3 \/ 3/);
@@ -163,18 +163,18 @@ def test_live_conditions_group_by_load_type_and_level_with_point_verdicts():
 const conditions=['load_combo_long_short_c4','load_combo_short_long_c4','load_mixed_c4','load_mixed_c8','load_interference_control_c4','load_interference_probe_c4','load_stress_output_c4'].map(id=>({target:'local',condition:{id,check:'concurrency',label:phaseName(id)},planned:null,sent:0,status:'waiting'}));
 state.detail={id:'live',config:{targets:[{name:'local'}]},live_conditions:conditions};
 let html=renderTests([],{conditions,live:true});
-assert.equal((html.match(/class="condition-strip-row"/g)||[]).length,7);
-assert.equal((html.match(/class="condition-strip"/g)||[]).length,1);
+assert.equal((html.match(/class="condition-spot request-spot /g)||[]).length,7);
+assert.equal((html.match(/class="condition-mosaic"/g)||[]).length,1);
 const views=()=>[...conditionViews.values()];
 for(const name of ['Short-only control','Long input during short streams','Large-output stress'])assert(views().some(view=>view.name===name),name);
 assert.equal(views().filter(view=>view.name==='Mixed load').length,2);
 assert(views().some(view=>view.name==='Mixed load'&&view.description==='8 at once'));
 assert(views().some(view=>/Long input.*Short output/.test(view.name)&&view.description==='4 at once'));
-assert(views().every(view=>view.checkName==='Load test'));
+assert(views().every(view=>view.checkName==='Concurrent load'));
 assert.doesNotMatch(html,/test-condition|Inspect test/);
 conditions[0].status='finished';conditions[0].reason='criteria met';conditions[0].load_point_result={status:'pass',cut_short:false,not_run:false};
-html=renderTests([],{conditions,live:true});let first=html.match(/<button[^>]*class="condition-strip-row"[\s\S]*?<\/button>/)[0];
-assert.match(first,/data-state="pass"/);assert.match(first,/>Passed<\/span>/);assert.doesNotMatch(first,/Finished|Stopped early/);
+html=renderTests([],{conditions,live:true});let first=html.match(/<g class="condition-spot[\s\S]*?<\/g>/)[0];
+assert.match(first,/data-state="pass"/);assert.match(first,/>✓<\/text>/);assert.doesNotMatch(first,/Finished|Stopped early/);
 // Sending-window shortfall remains check evidence; it cannot override an authoritative verdict.
 conditions[0].load_point_result.cut_short=true;renderTests([],{conditions,live:true});
 assert.equal(views()[0].status,'passed');assert.equal(views()[0].summary.load_point_result.cut_short,true);
@@ -185,9 +185,9 @@ const completed=report([check('concurrency','fail',{metrics:{load_types:{combina
 // The saved point verdict is used when no live point verdict is supplied.
 const savedConditions=conditions.map(({load_point_result,...condition})=>({...condition,reason:null}));
 html=renderTests([],{conditions:savedConditions,report:completed});
-assert.match(html.match(/<button[^>]*class="condition-strip-row"[\s\S]*?<\/button>/)[0],/data-state="fail"/);
+assert.match(html.match(/<g class="condition-spot[\s\S]*?<\/g>/)[0],/data-state="fail"/);
 const calibration=[{target:'local',condition:{id:'load_calibration_long_long_output',check:'concurrency',load_type:'calibration',label:phaseName('load_calibration_long_long_output')}}];
-html=renderTests([],{conditions:calibration,live:true});assert.equal(conditionViews.size,1);assert.match(html,/Calibrating Long input tokens/);assert.doesNotMatch(html,/condition-spot/);
+html=renderTests([],{conditions:calibration,live:true});assert.equal(conditionViews.size,0);assert.doesNotMatch(html,/condition-spot|Input token calibration/);
 assert.equal(phaseName(calibration[0].condition.id),'Calibrating Long input tokens (long-output prompt)'); // Inspection labels still exist.
 ''')
 

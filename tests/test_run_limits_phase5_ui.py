@@ -109,7 +109,7 @@ for(const name of ['traffic_rates','traffic_expected_response_seconds','traffic_
 assert.equal(nodes['#field-concurrency'].attributes['aria-invalid'],'true');
 assert.match(nodes['#field-concurrency-error'].textContent,/needs more open files/);
 assert.match(nodes['#field-concurrency-warning'].innerHTML,/Capacity waits/);
-const markup=renderPlanWarnings(plan);
+const markup=renderPlanTime(plan);
 for(const message of ['Capacity waits','Estimate: 500','needs more open files'])assert(markup.includes(message));
 assert.match(markup,/data-setting-path="traffic.expected_response_seconds"/);
 assert.equal((markup.match(/role="alert"/g)||[]).length,1);

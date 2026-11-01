@@ -37,7 +37,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 const nodes={}, listeners={};
-const context={structuredClone,nodes,listeners,assert,
+const context={structuredClone,nodes,listeners,assert,setTimeout,clearTimeout,
   document:{querySelector:q=>nodes[q],addEventListener:(event,fn)=>listeners[event]=fn},
   window:{addEventListener(){}}};
 const source=fs.readFileSync(SCRIPT_PATH,'utf8')

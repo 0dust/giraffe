@@ -168,8 +168,28 @@ def test_defaults_and_planning_numbers():
     assert plan['configured_load_seconds'] == 810
     assert plan['load_test']['workloads']['combinations']['test_points'] == 27
     assert next(r for r in plan['rows'] if r['id'] == 'load_combinations')['requests_per_target'] is None
-    assert plan['request_warnings'][0]['fields'] == ['max_requests']
-    assert plan['request_warnings'][0]['kind'] == 'adaptive_risk'
+    assert plan['conservative_requests_per_target'] == 0
+    assert plan['request_warnings'] == []
+    scheduled = c.model_copy(deep=True)
+    scheduled.load_test.patterns.constant.enabled = True
+    scheduled.load_test.patterns.rates = [1]
+    conservative = request_plan(scheduled)['conservative_requests_per_target']
+    assert conservative > 0
+    scheduled.max_requests = 20 * conservative - 1
+    warning = request_plan(scheduled)['request_warnings']
+    assert len(warning) == 1
+    assert warning[0]['fields'] == ['max_requests']
+    assert warning[0]['kind'] == 'adaptive_risk'
+    scheduled.max_requests = 20 * conservative
+    bounded = request_plan(scheduled)
+    assert bounded['request_warnings'] == []
+    scheduled.max_requests = scheduled.max_duration_seconds = None
+    unlimited = request_plan(scheduled)
+    assert unlimited['request_warnings'] == []
+    assert unlimited['time_warnings'] == []
+    assert unlimited['conservative_requests_per_target'] == conservative
+    assert unlimited['configured_load_seconds'] == bounded['configured_load_seconds']
+    assert unlimited['rows'] == bounded['rows']
     i = configuration(load={'combinations': {'enabled': False}, 'interference': {'enabled': True}, 'schedule': {'levels': [2], 'duration_seconds': 30}})
     assert request_plan(i)['configured_load_seconds'] == 60
     assert minimum_reservation(i.load_test) == 3

@@ -138,10 +138,10 @@ def test_singular_plural_final_drawer_plan_and_results():
     browser_logic('const plan=' + json.dumps(request_plan(configured)) + r''';
 config.checks=['load'];
 let html=renderLoadEditor(config)+renderLoadPlan(config,plan);
-assert.match(html,/Scheduled conditions/);assert.match(html,/Send new requests for/);
+assert.match(html,/Scheduled load tests/);assert.match(html,/Send new requests for/);
 const point={id:'one',source:'primary',type:'combinations',workload:'short_short',shape:'short_short',pattern:'concurrent',level:1,groups:[]};
-html+=renderLoadTestResults({points:[point]});assert.match(html,/1 at once/);assert.doesNotMatch(html,/1 requests at once/);
-point.level=2;assert.match(renderLoadTestResults({points:[point]}),/2 at once/);
+html+=renderLoadTestResults({points:[point]});assert.match(html,/1 concurrent request/);assert.doesNotMatch(html,/1 concurrent requests/);
+point.level=2;assert.match(renderLoadTestResults({points:[point]}),/2 concurrent requests/);
 config.load_test.profile.long.output_tokens=1;config.load_test.workloads.stress.enabled=true;config.load_test.workloads.stress.min_output_percent=100;
 assert.match(renderLoadEditor(config),/At least 1 generated token/);
 ''', config=configured)
