@@ -67,8 +67,7 @@ def test_session_explanations_stay_with_their_fields_and_add_task():
         ('sessions_profile', 'Mixed performance runs use actual replies as conversation history. Concurrent users share Simultaneous limit with other target requests. Answer quality is not scored.'),
         ('sessions_count', 'Weights divide the total conversation budget among selected tasks. Each conversation keeps its task and history. Output caps limit length; actual input/output tokens are reported.'),
         ('profile_sessions_modes', 'Prepared uses saved replies; earlier model replies uses answers from this run.'),
-        ('profile_sessions_modes', 'Uses the saved fixed/live exact-repeat conversations. Their prompts, modes and concurrency can be changed below.'),
-        ('profile_sessions_turns', 'Editing replaces this list. Keep prepared answers aligned with the saved conversation questions.'),
+        ('profile_sessions_turns', 'Editing replaces the recall prompts. Giraffe supplies each conversation’s unique name and checks replies against it.'),
         ('profile_sessions_concurrency', 'An accepted value is not demonstrated delivery capacity.'),
         ('profile_sessions_max_tokens', 'Own answer cap for every turn. The suite default is not a ceiling.'),
     ]:
