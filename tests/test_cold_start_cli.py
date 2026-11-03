@@ -207,12 +207,18 @@ def test_ui_flag_renamed():
         parser().parse_args(["ui", "--allow-restart-command"])
 
 
-@pytest.mark.parametrize("kind", ["answer", "reasoning"])
-def test_text_cold_start_uses_reported_evidence_only(tmp_path, capsys, kind):
+@pytest.mark.parametrize("kind,answer_present,cap_exhausted", [
+    ("answer", True, False), ("reasoning", False, True),
+    ("reasoning", True, False), ("reasoning", True, True),
+    ("reasoning", False, False), ("reasoning", None, None),
+])
+def test_text_cold_start_uses_reported_evidence_only(tmp_path, capsys, kind, answer_present, cap_exhausted):
     report = RunReport(run_id="cold", started_at="now", finished_at="now", overall="pass",
         manifest={}, observations={"targets": {"local": {"restart": {
             "script_ms": 10, "service_answered_ms": 20, "readiness_ms": 3000,
-            "first_request": {"first_output_ms": 2900, "elapsed_ms": 2980, "first_output_kind": kind},
+            "first_request": {"first_output_ms": 2900, "elapsed_ms": 2980, "first_output_kind": kind,
+                              **({"answer_present": answer_present} if answer_present is not None else {}),
+                              **({"output_cap_exhausted": cap_exhausted} if cap_exhausted is not None else {})},
             "warm_requests": [{"first_output_ms": 7, "elapsed_ms": 10},
                               {"first_output_ms": 8, "elapsed_ms": 11}],
             "model_load": "Model was already loaded",
@@ -226,4 +232,10 @@ def test_text_cold_start_uses_reported_evidence_only(tmp_path, capsys, kind):
     assert "Model was already loaded" in output
     assert "Model load:" not in output
     note = "First output was reasoning; no answer within the output cap."
-    assert (note in output) == (kind == "reasoning")
+    missing_answer = kind == "reasoning" and answer_present is False and cap_exhausted is True
+    assert (note in output) == missing_answer
+    assert ("First output was reasoning" in output) == (kind == "reasoning")
+    from giraffe.reporting import _cold_start_html
+    html = _cold_start_html(report)
+    assert (note in html) == missing_answer
+    assert ("First output was reasoning" in html) == (kind == "reasoning")

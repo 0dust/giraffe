@@ -63,6 +63,9 @@ def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_00
         if measured:
             measurement_count += 1
             if measurement_count == 1 and interruption:
+                if path == "/api/chat":
+                    # The failed inference has already loaded the model.
+                    native_count += 1
                 class InterruptedStream(httpx.AsyncByteStream):
                     async def __aiter__(self):
                         if path == "/api/chat":
@@ -235,6 +238,23 @@ async def test_interrupted_cold_output_retries_instead_of_counting_ready(monkeyp
     assert restart["first_request"]["elapsed_ms"] == attempts[1].elapsed_ms
     if native:
         assert restart["measurement_api"] == cold_start.NATIVE_API_LABEL
+
+
+@pytest.mark.parametrize("interruption", ["reset", "timeout", "cancel"])
+async def test_resident_retry_duration_is_not_attributed_to_interrupted_cold_load(monkeypatch, tmp_path, interruption):
+    mocked_http(monkeypatch, interruption=interruption, duration=1000)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=2))
+    restart = observation(report)
+    attempts = [record for record in report.requests if record.scenario == "readiness"]
+    assert len(attempts) == 2
+    assert attempts[0].http_status == 200 and attempts[0].output == "1"
+    assert attempts[1].workload["reported_load_duration_ns"] == 1000
+    assert restart["status"] == "ready"
+    assert restart["model_loaded_before_first_request"] == "No"
+    assert restart["model_load"] == "Model was not loaded before the first request"
+    assert "model_load_ms" not in restart
+    assert restart["first_request"]["elapsed_ms"] == attempts[1].elapsed_ms
 
 
 async def test_stop_during_native_warm_request_retains_cold_evidence_and_reports_not_measured(monkeypatch, tmp_path):

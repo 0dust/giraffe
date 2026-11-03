@@ -20,6 +20,8 @@ REASONING_OUTPUT_NOTE = "First output was reasoning; no answer within the output
 
 def output_measurement(record):
     """Summarize restart output without changing ordinary answer/check evidence."""
+    from .fixtures import final_answer
+
     candidates = [(value, kind) for value, kind in (
         (record.first_output_ms, "answer"), (record.first_reasoning_ms, "reasoning"))
         if value is not None]
@@ -29,9 +31,19 @@ def output_measurement(record):
         first, kind = min(candidates) if candidates else (
             None, "reasoning" if record.reasoning.strip() or record.reasoning_stripped else "answer")
         return {"first_output_ms": first, "first_output_kind": kind,
-                "elapsed_ms": record.elapsed_ms}
+                "elapsed_ms": record.elapsed_ms,
+                "answer_present": record.first_output_ms is not None or bool(final_answer(record.output)[0].strip()),
+                "output_cap_exhausted": record.finish_reason == "length"}
     return {"first_output_ms": None, "elapsed_ms": None,
             "reason": record.error or f"HTTP {record.http_status}: no generated output"}
+
+
+def reasoning_output_note(measurement):
+    if measurement.get("first_output_kind") != "reasoning":
+        return ""
+    if measurement.get("answer_present") is False and measurement.get("output_cap_exhausted") is True:
+        return REASONING_OUTPUT_NOTE
+    return "First output was reasoning."
 
 
 def retry_readiness(record):

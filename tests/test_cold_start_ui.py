@@ -11,12 +11,26 @@ APP = Path(__file__).parents[1] / "src/giraffe/static/app.js"
 def test_reasoning_output_and_failed_warm_measurements_are_labelled():
     run_browser_logic(r'''
 const html=renderColdStart({observations:{targets:{local:{restart:{readiness_ms:25,
-first_request:{first_output_ms:5,elapsed_ms:20,first_output_kind:'reasoning'},
-warm_requests:[{first_output_ms:2,elapsed_ms:12,first_output_kind:'reasoning'},
+first_request:{first_output_ms:5,elapsed_ms:20,first_output_kind:'reasoning',answer_present:false,output_cap_exhausted:true},
+warm_requests:[{first_output_ms:2,elapsed_ms:12,first_output_kind:'reasoning',answer_present:false,output_cap_exhausted:true},
 {first_output_ms:null,elapsed_ms:null,reason:'HTTP 503 <bad>'}]}}}}});
 assert.equal(html.split('First output was reasoning; no answer within the output cap.').length-1,2);
 assert.match(html,/Not measured/);assert.match(html,/HTTP 503 &lt;bad&gt;/);
 assert.doesNotMatch(html,/<bad>/);
+''')
+
+
+def test_reasoning_before_an_answer_or_without_cap_evidence_is_not_labelled_missing():
+    run_browser_logic(r'''
+for(const evidence of [{answer_present:true,output_cap_exhausted:false},
+ {answer_present:true,output_cap_exhausted:true},
+ {answer_present:false,output_cap_exhausted:false},{}]){
+ const item={first_output_ms:5,elapsed_ms:20,first_output_kind:'reasoning',...evidence};
+ const html=renderColdStart({observations:{targets:{local:{restart:{
+  first_request:item,warm_requests:[item]}}}}});
+ assert.doesNotMatch(html,/no answer within the output cap/);
+ assert.equal(html.split('First output was reasoning.').length-1,2);
+}
 ''')
 
 

@@ -1183,6 +1183,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     measured_client = client
                     native = False
                     before = "unknown"
+                    readiness_attempts = 0
 
                     async def measure_restart(probe, *, deadline_override=None):
                         nonlocal measured_client, native
@@ -1220,6 +1221,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                     measured_client = OllamaColdClient(client)
                                     before = await residency(target, config, deadline=ready_deadline, stop=run.stop)
                             probe = cold_spec(initial_specs[0])
+                            readiness_attempts += 1
                             record = await measure_restart(probe, deadline_override=ready_deadline)
                             if record is None:
                                 break
@@ -1233,8 +1235,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                 if native:
                                     restart["measurement_api"] = NATIVE_API_LABEL
                                     after = await residency(target, config, deadline=ready_deadline, stop=run.stop)
+                                    # A prior failed inference may already have loaded
+                                    # the model; its retry's duration cannot time that load.
                                     restart.update(model_load_evidence(before, after,
-                                        record.workload.get("reported_load_duration_ns")))
+                                        record.workload.get("reported_load_duration_ns")
+                                        if readiness_attempts == 1 else None))
                                 initial = [record]
                                 break
                             if not retry_readiness(record):

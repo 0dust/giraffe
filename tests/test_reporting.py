@@ -40,8 +40,10 @@ def test_cold_start_reasoning_and_unmeasured_warm_output_are_labelled():
     report = make_report()
     report.observations["targets"] = {"local": {"restart": {
         "readiness_ms": 25, "first_request": {"first_output_ms": 5,
-            "elapsed_ms": 20, "first_output_kind": "reasoning"},
-        "warm_requests": [{"first_output_ms": 2, "elapsed_ms": 12, "first_output_kind": "reasoning"},
+            "elapsed_ms": 20, "first_output_kind": "reasoning",
+            "answer_present": False, "output_cap_exhausted": True},
+        "warm_requests": [{"first_output_ms": 2, "elapsed_ms": 12, "first_output_kind": "reasoning",
+                           "answer_present": False, "output_cap_exhausted": True},
                           {"first_output_ms": None, "elapsed_ms": None, "reason": "HTTP 503"}],
     }}}
     html = _cold_start_html(report)

@@ -38,7 +38,8 @@ def test_restart_measurement_uses_first_generated_output_without_reclassifying_r
         error="reasoning exhausted the output budget before an answer")
     original = record.model_dump()
     measurement = output_measurement(record)
-    assert measurement == {"first_output_ms": first, "first_output_kind": kind, "elapsed_ms": 40}
+    assert measurement == {"first_output_ms": first, "first_output_kind": kind, "elapsed_ms": 40,
+                           "answer_present": answer_time is not None, "output_cap_exhausted": True}
     assert record.model_dump() == original
 
 
@@ -49,7 +50,8 @@ def test_generated_text_without_timing_still_establishes_restart_readiness():
         check_ids=[], started_at="now", status="completed", http_status=200, valid=False,
         reasoning="Thinking", elapsed_ms=40, stream_terminated=True, finish_reason="length")
     assert output_measurement(record) == {
-        "first_output_ms": None, "first_output_kind": "reasoning", "elapsed_ms": 40}
+        "first_output_ms": None, "first_output_kind": "reasoning", "elapsed_ms": 40,
+        "answer_present": False, "output_cap_exhausted": True}
     record.http_status = 201
     assert "first_output_kind" not in output_measurement(record)
 
@@ -301,6 +303,12 @@ async def test_native_reasoning_precedes_first_answer_and_fragmented_utf8(monkey
     assert result.first_reasoning_ms < result.first_output_ms
     assert result.first_output_ms >= 15
     assert "reported_load_duration_ns" not in result.workload
+    from giraffe.cold_start import output_measurement
+    measured = output_measurement(result)
+    assert measured["first_output_kind"] == "reasoning"
+    assert measured["first_output_ms"] == result.first_reasoning_ms
+    assert measured["answer_present"] is True
+    assert measured["output_cap_exhausted"] is False
 
 
 @pytest.mark.asyncio

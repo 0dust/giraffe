@@ -179,8 +179,10 @@ use the usual OpenAI-compatible route unchanged.
 
 For restart readiness and these three measurements, HTTP 200 with generated
 reasoning or answer text establishes readiness even when the output cap leaves
-no final answer. `first_output_kind` identifies `answer` or `reasoning`; reasoning
-output is labelled **First output was reasoning; no answer within the output cap.**
+no final answer. `first_output_kind` identifies `answer` or `reasoning`. The label
+**First output was reasoning; no answer within the output cap.** requires both an
+absent answer and an exhausted output cap. When an answer follows reasoning,
+the label is **First output was reasoning.**
 Only connection errors, timeouts, HTTP 429/5xx, and a 404 identifying an unavailable
 model are retried. Other responses stop readiness with their actual reason. A
 failed warm request is not measured and does not block the normal checks. Normal
@@ -196,6 +198,9 @@ timing says **Slow first answer; model load not confirmed**. Other servers say
 case it's part of **Service answered after**. No per-engine startup behavior is
 assumed. These measurements do not change check verdicts and are not compared
 against baselines.
+
+If readiness inference is retried, model-load duration remains unconfirmed:
+an earlier failed request may already have loaded the model before the retry.
 
 Legacy `restart_command` values are dropped with a visible migration note and
 never executed. Put the command in an executable script and set `restart_script`.
