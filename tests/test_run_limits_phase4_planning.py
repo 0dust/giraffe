@@ -230,7 +230,7 @@ async def test_no_budget_recovery_prime_count_matches_inprocess_run(monkeypatch)
 
 @pytest.mark.parametrize("confidence", ["high", "medium"])
 def test_fixed_latency_inprocess_traffic_finishes_inside_estimated_range(monkeypatch, confidence):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         from giraffe import runner
@@ -259,7 +259,7 @@ def test_fixed_latency_inprocess_traffic_finishes_inside_estimated_range(monkeyp
 
 @pytest.mark.parametrize("confidence", ["high", "medium"])
 def test_fixed_latency_httpx_endpoint_finishes_inside_estimated_range(monkeypatch, confidence):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
     from giraffe.client import LLMClient
 
     async def enter_mock_client(self):
@@ -497,7 +497,7 @@ def test_overlapping_targets_keep_concurrency_bounds_while_refilling(monkeypatch
     import asyncio
     from giraffe import runner
     from tests.test_runner import FakeClient
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     class PooledClient(FakeClient):
         delay = .01
@@ -564,7 +564,7 @@ def test_canonical_warnings_include_time_coverage_and_estimate_risk_once():
 
 
 def test_more_endpoints_than_slots_accounts_for_serial_finite_traffic(monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         from giraffe import runner

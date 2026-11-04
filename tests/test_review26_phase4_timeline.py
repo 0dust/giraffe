@@ -29,7 +29,7 @@ def observations(report):
 
 def test_full_timeline_remedy_completes_windows_and_later_finite_work(monkeypatch):
     from tests.test_planning import load_config
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
     async def scenario():
         class FixedLatency(FakeClient):
             delay = .005

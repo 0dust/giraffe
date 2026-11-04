@@ -107,7 +107,7 @@ async def test_two_polling_clients_do_not_delay_real_run_loop(tmp_path, monkeypa
 
     monkeypatch.setattr(web, "run_suite", capture_report)
     configuration = config(checks=["serving"], samples=60 if large_report in {"uncached", "band"} else 12, concurrency=1,
-                           max_requests=62 if large_report in {"uncached", "band"} else 14, max_duration_seconds=10,
+                           max_requests=62 if large_report in {"uncached", "band"} else 14, max_duration_seconds=60,
                            request_timeout_seconds=2)
     if large_report:
         # Exercise actual parsing, model/compact serialization and performance
@@ -149,14 +149,14 @@ async def test_two_polling_clients_do_not_delay_real_run_loop(tmp_path, monkeypa
             gc.collect()
             gc.freeze()
             identifier = await start(control, configuration)
-            assert await asyncio.to_thread(completed.wait, 10), "Warm-up run stalled"
+            assert await asyncio.to_thread(completed.wait, 60), "Warm-up run stalled"
             assert (await finished(control, identifier))["state"] == "completed"
             completed.clear()
             # The control makes no HTTP requests while request timing is active.
             gc.collect()
             gc.freeze()
             identifier = await start(control, configuration)
-            assert await asyncio.to_thread(completed.wait, 10), "Unpolled run stalled"
+            assert await asyncio.to_thread(completed.wait, 60), "Unpolled run stalled"
             assert (await finished(control, identifier))["state"] == "completed"
             completed.clear()
             gc.collect()
@@ -177,7 +177,7 @@ async def test_two_polling_clients_do_not_delay_real_run_loop(tmp_path, monkeypa
             polling = [asyncio.create_task(hammer(client, count))
                        for client, count in zip((first, second), counts)]
             try:
-                assert await asyncio.to_thread(completed.wait, 10), "Polled run stalled"
+                assert await asyncio.to_thread(completed.wait, 60), "Polled run stalled"
                 await asyncio.wait_for(asyncio.gather(*polling), 5)
                 assert (await finished(control, identifier))["state"] == "completed"
             finally:

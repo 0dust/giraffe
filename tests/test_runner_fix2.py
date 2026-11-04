@@ -9,7 +9,7 @@ from tests.test_runner_stats_revision import VariableClient, spec
 
 
 def _monitor_stop_report(monkeypatch, client, *, target_start_delay):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     monkeypatch.setattr(client, "delay", 10)
     original_target, original_monitor = runner._target, runner._Run.monitor

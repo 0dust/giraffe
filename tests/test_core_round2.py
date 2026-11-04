@@ -154,27 +154,37 @@ async def test_nonstreaming_cancellation_has_explicit_reason(monkeypatch):
     assert 'client cancellation requires streaming' in result.summary
 
 
-@pytest.mark.asyncio
-async def test_gpu_only_waits_within_run_duration(monkeypatch):
-    import time
-    from giraffe import runner, telemetry
-    from tests.test_gpu_reliability import snapshot
-    from tests.test_runner import config as run_config, check
-    calls = []
-    async def scrape(run, target, phase, **kwargs):
-        calls.append(time.monotonic())
-        return snapshot(timestamp=time.time()*1000, elapsed=calls[-1]-run.start) | {'status': 'available', 'phase': phase}
-    monkeypatch.setattr(telemetry, 'scrape', scrape)
-    configured = run_config(checks=['gpu'], max_duration_seconds=.08)
-    started = time.monotonic()
-    report = await runner.run_suite(configured)
-    elapsed = time.monotonic()-started
-    assert .05 <= calls[1]-calls[0] < .1
-    assert elapsed < .2
-    result = check(report, 'gpu')
-    assert result.status == 'inconclusive'
-    assert 'observation window shorter than exporter refresh' in result.summary
-    assert result.metrics['observation_window']['required_seconds'] >= 30
+def test_gpu_only_waits_within_run_duration(monkeypatch):
+    from giraffe import runner
+    from tests.virtual_clock import run_virtual
+
+    metrics = runner._metrics
+
+    async def scenario():
+        import asyncio
+        import time
+        from giraffe import telemetry
+        from tests.test_gpu_reliability import snapshot
+        from tests.test_runner import config as run_config, check
+        monkeypatch.setattr(runner, "_metrics", metrics)
+        clock = asyncio.get_running_loop().time
+        calls = []
+        async def scrape(run, target, phase, **kwargs):
+            calls.append(clock())
+            return snapshot(timestamp=time.time()*1000, elapsed=calls[-1]-run.start) | {'status': 'available', 'phase': phase}
+        monkeypatch.setattr(telemetry, 'scrape', scrape)
+        configured = run_config(checks=['gpu'], max_duration_seconds=.08)
+        started = clock()
+        report = await runner.run_suite(configured)
+        elapsed = clock()-started
+        assert .05 <= calls[1]-calls[0] < .1
+        assert elapsed < .2
+        result = check(report, 'gpu')
+        assert result.status == 'inconclusive'
+        assert 'observation window shorter than exporter refresh' in result.summary
+        assert result.metrics['observation_window']['required_seconds'] >= 30
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.asyncio
@@ -219,25 +229,35 @@ async def test_gpu_final_scrape_reuses_bounded_metrics_end_phase(monkeypatch, sa
 
 
 @pytest.mark.parametrize('minimum', [0, .025])
-@pytest.mark.asyncio
-async def test_gpu_observation_window_is_configurable(monkeypatch, minimum):
-    import time
-    from giraffe import runner, telemetry
-    from tests.test_gpu_reliability import snapshot
-    from tests.test_runner import config as run_config, check
-    async def scrape(run, target, phase, **kwargs):
-        return snapshot(timestamp=time.time()*1000, elapsed=time.monotonic()-run.start) | {
-            'status': 'available', 'phase': phase}
-    monkeypatch.setattr(telemetry, 'scrape', scrape)
-    configured = run_config(checks=['gpu'], gpu_min_observation_seconds=minimum,
-                            max_duration_seconds=.5, metrics_interval_seconds=1)
-    started = time.monotonic()
-    report = await runner.run_suite(configured)
-    assert time.monotonic()-started < .2
-    result = check(report, 'gpu')
-    assert result.status == 'pass'
-    assert result.metrics['observation_window']['required_seconds'] == minimum
-    assert result.metrics['observation_window']['elapsed_seconds'] >= minimum
+def test_gpu_observation_window_is_configurable(monkeypatch, minimum):
+    from giraffe import runner
+    from tests.virtual_clock import run_virtual
+
+    metrics = runner._metrics
+
+    async def scenario():
+        import asyncio
+        import time
+        from giraffe import telemetry
+        from tests.test_gpu_reliability import snapshot
+        from tests.test_runner import config as run_config, check
+        monkeypatch.setattr(runner, "_metrics", metrics)
+        clock = asyncio.get_running_loop().time
+        async def scrape(run, target, phase, **kwargs):
+            return snapshot(timestamp=time.time()*1000, elapsed=clock()-run.start) | {
+                'status': 'available', 'phase': phase}
+        monkeypatch.setattr(telemetry, 'scrape', scrape)
+        configured = run_config(checks=['gpu'], gpu_min_observation_seconds=minimum,
+                                max_duration_seconds=.5, metrics_interval_seconds=1)
+        started = clock()
+        report = await runner.run_suite(configured)
+        assert clock()-started < .2
+        result = check(report, 'gpu')
+        assert result.status == 'pass'
+        assert result.metrics['observation_window']['required_seconds'] == minimum
+        assert result.metrics['observation_window']['elapsed_seconds'] >= minimum
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.asyncio
