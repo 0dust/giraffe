@@ -493,3 +493,26 @@ def test_saved_scheduling_windows_cannot_be_ignored_when_recomputing_fairness():
     result = summarize(source, records)
     assert fairness(result)['status'] == 'inconclusive'
     assert any('scheduling' in reason for reason in fairness(result)['reasons'])
+
+
+@pytest.mark.parametrize('conversation',[False,True])
+def test_truncated_conversation_is_partial_but_stateless_cap_is_valid(conversation):
+    item = record('user-01',end=50)
+    if conversation:
+        item.workload.update(session_id='chat-1',turn_id=0)
+    result = summarize(observation([item],users=('user-01',),criteria={
+        'min_samples':1,'max_error_percent':0,'max_completion_ms':100,
+        'min_output_tokens_per_second':1}),[item])
+    user = row(result)
+    if conversation:
+        assert user['outcomes']['errors'] == 1
+        assert user['outcomes']['valid_completed'] == 0
+        assert user['partial_output_tokens'] == 100
+        assert user['known_output_tokens'] == 0
+        assert user['status'] == 'fail'
+    else:
+        assert user['outcomes']['errors'] == 0
+        assert user['outcomes']['valid_completed'] == 1
+        assert user['partial_output_tokens'] == 0
+        assert user['known_output_tokens'] == 100
+        assert user['status'] == 'pass'

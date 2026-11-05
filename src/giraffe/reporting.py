@@ -174,8 +174,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             unchanged_checks.add("prefix")
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
-    if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
-        return None  # Sampled traffic has no historical equivalent.
+    sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
+    if sampled_sessions and revision not in {"persistent_users", "shared_conversations"}:
+        return None  # Earlier revisions have no attested sampled-traffic equivalent.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
         if not checks.intersection(resolved.checks):
@@ -204,6 +205,11 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
+    if sampled_sessions:
+        identity["session_sampling_source_sha256"] = {
+            "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+        }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
             "legacy": "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7",
@@ -1525,6 +1531,14 @@ def _retained(report: RunReport) -> RunReport:
             or (record.status == "completed" and not record.valid) or record.score is False
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
+        if (policy != "all" and "multi_user" in record.check_ids
+                and record.workload.get("session_id") and record.workload.get("mode") == "live"
+                and record.evaluation and any(message.get("role") == "assistant"
+                    for message in record.evaluation.messages)):
+            # Prior replies are response bodies even when copied into later inputs.
+            record = record.model_copy(update={"evaluation": record.evaluation.model_copy(update={
+                "messages": [{**message, "content": ""} if message.get("role") == "assistant" else message
+                             for message in record.evaluation.messages]})})
         result.requests.append(record if keep else _without_response(record))
     from .performance import refresh_performance
     return refresh_performance(result)
