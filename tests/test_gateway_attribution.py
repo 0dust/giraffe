@@ -242,3 +242,70 @@ def test_conflicting_repeated_row_and_anonymous_attribution_are_unverified():
     matched, _, _ = _normalize([row], "run", {"local": record})
     record._gateway_key_hash = None
     assert _assess([record], matched, 1, complete=True)["state"] == "unverified"
+
+
+async def test_unconfigured_selection_is_unavailable_without_traffic():
+    from giraffe.runner import run_suite
+    from giraffe.planning import request_plan
+    cfg = RunConfig(targets=[{"name": "proxy", "url": "http://127.0.0.1:1", "model": "test"}],
+                    checks=["gateway_attribution"], max_memory_mb=0)
+    report = await run_suite(cfg)
+    check = next(c for c in report.checks if c.id == "gateway_attribution")
+    assert check.metrics["state"] == "unavailable" and not report.requests
+    row = next(row for row in request_plan(cfg)["rows"] if row["id"] == "gateway_attribution")
+    assert row["requests_per_target"] == 0 and "unavailable" in json.dumps(row)
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_observer_transport_echo_is_suppressed_but_shared_logs_remain(monkeypatch, caplog, malformed):
+    import logging
+    from giraffe.gateway_attribution import execute, result
+    from giraffe.models import RequestRecord
+    secret = "observer-credential-echo"
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, secret)
+    cfg = config()
+    cfg.gateway_attribution.settle_seconds = .2
+    run = _Run(cfg, None, None)
+    reading = asyncio.Event()
+
+    async def serve(reader, writer):
+        request = await reader.readuntil(b"\r\n\r\n")
+        if b"/shared " in request:
+            writer.write(b"HTTP/1.1 200 SharedVisible\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+        else:
+            reading.set()
+            writer.write(f"HTTP/1.1 200 {secret}\r\nX-Echo: {secret}\r\n".encode())
+            if malformed:
+                writer.write(f"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{secret}\r\n".encode())
+            else:
+                body = json.dumps({"data": [], "total_pages": 1, "echo": secret}).encode()
+                writer.write(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async def fake_request(target, client, spec):
+        return RequestRecord(id=spec.identity, target=target.name, identity=spec.identity,
+            fixture_id=spec.fixture_id, scenario=spec.scenario, check_ids=spec.check_ids,
+            started_at="2026-11-06T00:00:00Z", status="completed", valid=True,
+            input_tokens=3, completion_tokens=5)
+
+    monkeypatch.setattr(run, "request", fake_request)
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    cfg.targets[0].gateway.url = url + "/logs"
+    caplog.set_level(logging.DEBUG)
+    async def shared():
+        await reading.wait()
+        async with httpx.AsyncClient() as client:
+            await client.get(url + "/shared")
+    try:
+        await asyncio.gather(execute(run, cfg.targets[0], None), shared())
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert secret not in caplog.text
+    assert "SharedVisible" in caplog.text
+    assert secret not in result(run, cfg.targets[0]).model_dump_json()
+    assert result(run, cfg.targets[0]).metrics["state"] == "unverified"

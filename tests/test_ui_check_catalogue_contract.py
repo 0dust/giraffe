@@ -18,6 +18,7 @@ NAMES = {
     'sessions': 'Multi-turn sessions', 'multi_user': 'Multi-user', 'consistency': 'Answer consistency',
     'tools': 'Tool calling',
     'gateway_policy': 'Gateway quotas & priorities',
+    'gateway_attribution': 'Gateway usage attribution',
 }
 
 

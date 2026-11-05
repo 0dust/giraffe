@@ -2208,8 +2208,6 @@ class RunConfig(Model):
                     self.checks.append(check)
         self.validate_active_judges()
         self.checks = list(dict.fromkeys(self.checks))
-        if "gateway_attribution" in self.checks and self.gateway_attribution is None:
-            raise ValueError("gateway_attribution requires explicit identity selection and settings")
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
         self.tool_calling = "tools" in self.checks
         if (self.tool_calling and self.tool_checks and self.tool_checks.modes

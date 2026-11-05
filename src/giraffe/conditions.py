@@ -13,6 +13,7 @@ from typing import Any
 
 _SCENARIOS = {
     "gateway_policy": ("Gateway policy", "gateway_policy"),
+    "gateway_attribution": ("Gateway usage attribution", "gateway_attribution"),
     "initial": ("First request", "access"),
     "readiness": ("Readiness", "access"),
     "warm": ("Warm-up", "serving"),

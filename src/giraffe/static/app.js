@@ -1387,10 +1387,11 @@ const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load','multi_user']},
   {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency']},
-  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_policy']},
+  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_attribution','gateway_policy']},
 ];
 const checkGuide={
   gateway_policy:{name:'Gateway quotas & priorities',purpose:'Exercise a declared admission policy for separate test identities.',sends:'Bounded identical requests per identity through LiteLLM; no gateway configuration changes.',shows:'Affected-user rejections, continued peer service, actual work and evidence qualifications.'},
+  gateway_attribution:{name:'Gateway usage attribution',purpose:'Compare each test identity’s final usage with gateway request logs.',sends:'Bounded marked requests using selected identities, followed by read-only evidence requests.',shows:'Matched, mismatched or unverified identity and token counts. Missing evidence stays inconclusive.',needs:'LiteLLM spend logs and identity environment-variable references'},
   multi_user:{name:'Multi-user',purpose:'See which users become slow or fail while sharing one endpoint.',sends:'Repeated independent requests from persistent users; pauses release request slots.',shows:'Every user’s delivery, response timing and outcomes over a common window.'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
@@ -1418,6 +1419,10 @@ function profileDefaults(key,config=state.config) {return effectiveProfileDefaul
 function catalogTitle(id) {return checkGuide[id]?.name || human(id);}
 function renderProfileEditor(check,config) {
   const key=check.id;
+  if(key==='gateway_attribution'){
+    const settings=config.gateway_attribution,configured=Boolean(settings?.identities?.length);
+    return `<div data-profile-settings="gateway_attribution"><p>${configured?`${escape(settings.identities.join(', '))} · ${number(settings.samples ?? 2)} samples per identity`:'Not configured'}</p><p class="hint">${config.targets?.[0]?.gateway?'Evidence endpoint configured':'Evidence endpoint not configured'}. Edit gateway_attribution, targets[].test_identities and targets[].gateway in JSON. Credentials use environment-variable references; put no secret values in this configuration.</p><button type="button" class="text-button" data-action="edit-setting" data-setting-path="gateway_attribution">Edit identity and evidence configuration (JSON)</button></div>`;
+  }
   if(key==='load')return renderLoadEditor(config);
   if(key==='multi_user')return renderMultiUserEditor(config);
   if(key==='gateway_policy')return renderGatewayPolicyEditor(config);
@@ -1460,6 +1465,7 @@ function checkCoverageWarning(check,config) {
 function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
   if(check.id==='gateway_policy'){const s=gatewayPolicySettings(config);return `${s.capability} · ${s.users.length} identities · ${s.users.reduce((n,u)=>n+u.requests,0)} request cap · ${s.duration_seconds}s`;}
+  if(check.id==='gateway_attribution'){const s=config.gateway_attribution;return s?.identities?.length?`${s.identities.length} identities · ${s.samples ?? 2} samples each · bounded read-only evidence`:'Not configured · select identities and an evidence endpoint in JSON';}
   if(check.id==='multi_user'){const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);return `${s.levels.join(' → ')} users · ${config.concurrency==null?'No shared request ceiling':`${config.concurrency} shared request slots`} · ${s.duration_seconds}s per level`; }
   const parts=[];
   const timeout=check.id==='load'?loadSettings(config).request_timeout_seconds:check.id==='gpu'?null:optionValue(config,check,'request_timeout_seconds') ?? config.request_timeout_seconds;
@@ -3472,7 +3478,7 @@ function storageOmission(report) {
   const storage=report.manifest?.storage;if(!storage||!storage.response_bodies_omitted&&!storage.limit_exceeded)return '';
   return notice(`Storage limit on disk: ${number(storage.response_bodies_omitted)} response ${storage.response_bodies_omitted===1?'body':'bodies'} omitted. ${storage.reason || 'Request metadata, scores and timing were preserved.'}${storage.limit_exceeded?' Request metadata alone exceeds the configured limit on disk.':''}`,'warning');
 }
-function keyMetric(check,report){if(check.status==='skipped')return report&&unselectedCheck(check,report)?'Not selected':check.summary || 'No result recorded';const m=check.metrics || {};if(check.id==='load')return counted(m.points?.length||0,'load test');if(check.id==='concurrency'&&m.load_types)return `${counted(Object.values(m.load_types).reduce((total,group)=>total+(group.points?.length || 0),0),'test point')} · ${counted(Object.keys(m.load_types).length,'load type')}`;if(check.id==='cancellation'&&m.cancellation_results)return `Server stopped: ${human(m.cancellation_results.server_stopped.status)} · Answer: ${human(m.cancellation_results.answer.status)}`;if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
+function keyMetric(check,report){if(check.status==='skipped')return report&&unselectedCheck(check,report)?'Not selected':check.summary || 'No result recorded';const m=check.metrics || {};if(check.id==='gateway_attribution')return `${human(m.state || 'unverified')} · ${number(m.matched_requests || 0)} / ${number(m.observed_requests || 0)} matched`;if(check.id==='load')return counted(m.points?.length||0,'load test');if(check.id==='concurrency'&&m.load_types)return `${counted(Object.values(m.load_types).reduce((total,group)=>total+(group.points?.length || 0),0),'test point')} · ${counted(Object.keys(m.load_types).length,'load type')}`;if(check.id==='cancellation'&&m.cancellation_results)return `Server stopped: ${human(m.cancellation_results.server_stopped.status)} · Answer: ${human(m.cancellation_results.answer.status)}`;if(['context','correctness','json'].includes(check.id)&&m.scored)return `${m.correct} / ${m.scored} correct`;if(check.id==='capacity'&&Object.hasOwn(m,'highest_acceptable_rate_rps'))return m.highest_acceptable_rate_rps==null?'Arrival capacity unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s ${m.request_pack?.control_status==='fail'?'loaded · quiet failed':'accepted'}`;if(check.id==='capacity'&&m.highest_tested_acceptable_concurrency!=null)return `Concurrency ${m.highest_tested_acceptable_concurrency} accepted`;if(check.id==='first_output')return `${ms(m.first_output_p95_ms)} p95 · ${m.attempted || 0} requests`;if(check.id==='generation')return `${ms(m.p95_ms)} p95 · ${m.attempted || 0} requests`;return m.attempted!=null?`${number(m.attempted)} requests · ${check.target}`:check.target;}
 let findingEvidence={id:null,records:new Map(),pending:new Set(),errors:new Map()};
 function checkViolationIds(check,report) {
   const ids=new Set();
@@ -3623,6 +3629,10 @@ function renderCheck(check,report) {
     const points=Object.values(m.load_types).flatMap(group=>group.points || []),sum=key=>points.reduce((total,point)=>total+(point[key] || 0),0);
     metrics.push(metric('Test points',number(points.length),counted(Object.keys(m.load_types).length,'load type')));
     metrics.push(metric('Requests completed / sent',`${number(sum('completed'))} / ${number(sum('sent'))}`,`${number(sum('failed'))} failed · ${number(sum('timed_out'))} timed out · includes drain`));
+  }else if(check.id==='gateway_attribution'){
+    metrics.push(metric('Attribution evidence',human(m.state || 'unverified'),'Only complete, correlated request evidence can verify attribution'));
+    metrics.push(metric('Matched / observed requests',`${number(m.matched_requests || 0)} / ${number(m.observed_requests || 0)}`));
+    metrics.push(metric('Matched input / output tokens',`${number(m.prompt_tokens || 0)} / ${number(m.completion_tokens || 0)}`,'Final cumulative usage counted once per request'));
   }else if(check.id==='gpu'){
     const snapshots=m.snapshots || [],samples=snapshots.flatMap(s=>s.samples || []);
     metrics.push(metric('Telemetry snapshots',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Snapshots containing reported samples'));
@@ -3652,7 +3662,7 @@ function renderCheck(check,report) {
     if(current)metrics.push(metric('Generation pace · slowest (estimate)',m.generation_tokens_per_second_min==null?'Unmeasured':`${number(m.generation_tokens_per_second_min,1)} tok/s`,limits.min_output_tokens_per_second?`Every measurable request must reach ${limits.min_output_tokens_per_second} tok/s`:'No minimum generation rate set'));
     metrics.push(metric('End-to-end output rate · median',m.output_tokens_per_second_p50==null?'Not reported':`${number(m.output_tokens_per_second_p50,1)} tok/s`,current?'Includes waiting for first output; separate from generation pace':'Older report: the output-rate limit used this end-to-end definition'));
   }
-  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>!['multi_user','gateway_policy'].includes(k)&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
+  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>!['multi_user','gateway_policy'].includes(k)&&!(check.id==='gateway_attribution'&&k==='identities')&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
   return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(checkGuide[check.id]?.name || check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
   ${check.id==='cancellation'&&check.status!=='skipped'?renderCancellationResults(m):''}
   ${check.status==='skipped'?`<div class="empty-state" style="padding:35px 24px"><p>${unselectedCheck(check,report)?'This check was not selected. No result is inferred.':'This check was skipped. The recorded reason is shown above; no passing result is inferred.'}</p></div>`:`<dl class="metrics-grid">${metrics.join('')}</dl>`}
@@ -3660,6 +3670,7 @@ function renderCheck(check,report) {
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.logprobs?renderLogprobResults(m.logprobs):''}
   ${m.gateway_policy?renderGatewayPolicyResults(m.gateway_policy):''}
+  ${check.id==='gateway_attribution'?renderGatewayAttributionResults(m):''}
   ${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
@@ -3667,6 +3678,10 @@ function renderCheck(check,report) {
   ${check.id==='gpu'&&m.snapshots?renderGpuSnapshots(m.snapshots):''}
   ${records.length&&check.id!=='multi_user'?`<div class="evidence-title"><span>Requests</span><span class="hint">${state.failingRequestsOnly?`${sorted.length} failing · `:''}${records.length} recorded · incorrect and failed first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${violations.has(r.id)?`<small${check.status==='pass'?' class="hint"':''}>${escape(timingFailureReason(r,check,report,violations))}</small>`:''}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?`<span class="status fail">Incorrect</span>${renderInlineAnswer(r,report,{loading:false})}`:r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'||check.id==='multi_user'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
   ${Object.keys(extras).length?`<details class="check-observations"><summary>More measurements</summary><pre>${escape(JSON.stringify(extras,null,2))}</pre></details>`:''}`;
+}
+function renderGatewayAttributionResults(metrics){
+  if(!metrics.identities?.length)return '';
+  return `<div class="metric-table"><h3>Per-identity attribution</h3><p class="hint">Missing, delayed or incomplete evidence remains unverified. Token totals include matched requests only.</p><table><thead><tr><th>Identity</th><th>Matched</th><th>Mismatched</th><th>Unverified</th><th>Matched input / output tokens</th></tr></thead><tbody>${metrics.identities.map(row=>`<tr><td>${escape(row.identity)}</td><td>${number(row.matched_requests)}</td><td>${number(row.mismatched_requests)}</td><td>${number(row.unverified_requests)}</td><td>${number(row.prompt_tokens)} / ${number(row.completion_tokens)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function renderGpuSnapshots(snapshots){return snapshots.map(snapshot=>`<div class="metric-table"><h3>${escape(human(snapshot.phase))} <span class="hint">${date(snapshot.collected_at)}</span></h3>${snapshot.reason?`<p class="hint" style="margin:12px 0">${escape(snapshot.reason)}</p>`:''}${snapshot.unavailable?.length?`<p class="hint" style="margin:12px 0">Unavailable: ${snapshot.unavailable.map(human).map(escape).join(', ')}</p>`:''}${snapshot.samples?.length?`<table><thead><tr><th>Metric</th><th>Value</th><th>Freshness</th></tr></thead><tbody>${snapshot.samples.map(s=>`<tr><td>${escape(s.name)}<small>${escape(s.labels)}</small></td><td class="mono">${number(s.value,3)}</td><td>${s.stale?'Stale':s.age_seconds==null?'Scrape only':`${number(s.age_seconds,1)}s old`}</td></tr>`).join('')}</tbody></table>`:''}</div>`).join('');}
 function renderTrafficStages(stages,pack=null){

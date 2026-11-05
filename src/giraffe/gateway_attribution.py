@@ -157,7 +157,7 @@ async def execute(run, target, client):
     settings, gateway = run.config.gateway_attribution, target.gateway
     observation = _state("unavailable", "Gateway evidence endpoint and credentials are not configured.")
     run.observations[target.name][CHECK] = observation
-    if gateway is None:
+    if gateway is None or settings is None:
         return
     if gateway.profile != "litellm":
         observation.update(state="unsupported", reason="No supported attribution adapter selected for this gateway profile.")
