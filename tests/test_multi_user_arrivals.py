@@ -137,6 +137,28 @@ def test_scheduled_users_run_with_omitted_global_concurrency(monkeypatch, scenar
     run_virtual(monkeypatch, run())
 
 
+def test_other_check_transport_pool_does_not_raise_user_admission_limit(monkeypatch):
+    from giraffe.models import RunConfig
+
+    async def run():
+        raw = settings(levels=[1], scenarios=["arrivals"], duration_seconds=.2, profile=PROFILE,
+            arrivals={"requests_per_second": 1, "bursts": [
+                {"user_id": "user-01", "at_seconds": 0, "requests": 8}]}).model_dump()
+        raw.pop("concurrency")
+        raw.update(default_concurrency=4, checks=["multi_user", "sessions"],
+                   sessions={"sessions": 16, "concurrency": 16})
+        cfg = RunConfig.model_validate(raw)
+        state = runner._Run(cfg, None, None)
+        assert state.max_connections == 16
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        window, = state.observations["service"]["multi_user"]["windows"]
+        assert window["peak_in_flight"] == 4
+        assert window["offer_accounting"]["dispatched"] == 4
+        assert window["offer_accounting"]["dropped_local"] == 5
+        assert state.slots.qsize() == 16
+    run_virtual(monkeypatch, run())
+
+
 @pytest.mark.parametrize("budget", [None, 3])
 def test_user_offers_reconcile_busy_slots_and_budget(monkeypatch, budget):
     async def run():
