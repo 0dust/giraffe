@@ -315,8 +315,12 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
     settings.arrivals.bursts=rows?rows.split(',').map(row=>{const [id,seconds,count,spacing]=row.trim().split('@');return {user_id:id.trim(),at_seconds:numeric(seconds,'Burst time',allowInvalid),requests:numeric(count,'Burst requests',allowInvalid),spacing_seconds:numeric(spacing||'0','Burst spacing',allowInvalid)};}):[];
   }
   for(const key of ['control_seconds','sustained_seconds','lighter_seconds','sustained_requests_per_second','lighter_requests_per_second','max_slowdown'])if(values.has('multi_user_recovery_'+key))settings.recovery[key]=number('recovery_'+key,key);
-  if(values.has('multi_user_noisy_neighbors_profiles_rendered'))settings.noisy_neighbors.heavy_profiles=['long_short','short_long','long_long'].filter(name=>values.get('multi_user_noisy_neighbors_profile_'+name)==='on');
-  if(values.has('multi_user_noisy_neighbors_triggers_rendered'))settings.noisy_neighbors.triggers=['before_output','during_stream'].filter(name=>values.get('multi_user_noisy_neighbors_trigger_'+name)==='on');
+  for(const [field,group,options] of [['heavy_profiles','profile',['long_short','short_long','long_long']],['triggers','trigger',['before_output','during_stream']]]){
+    if(!values.has('multi_user_noisy_neighbors_'+group+'s_rendered'))continue;
+    const selected=options.filter(name=>values.get('multi_user_noisy_neighbors_'+group+'_'+name)==='on');
+    const previous=settings.noisy_neighbors[field];
+    settings.noisy_neighbors[field]=[...previous.filter(name=>selected.includes(name)),...selected.filter(name=>!previous.includes(name))];
+  }
   if(values.has('multi_user_noisy_neighbors_heavy_user_ids')){
     const text=String(values.get('multi_user_noisy_neighbors_heavy_user_ids')||'').trim();
     settings.noisy_neighbors.heavy_user_ids=text?text.split(',').map(value=>value.trim()):null;

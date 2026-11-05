@@ -264,6 +264,28 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
                for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
 
 
+def _same_load_workload(current: dict, old: dict) -> bool:
+    """Attest the optional nonce argument only for unchanged ordinary Load runs."""
+    settings = []
+    for manifest in (current, old):
+        raw = manifest.get("config", {})
+        if raw.get("config_version") != 2 or set(raw.get("checks", [])) != {"load"} or "load_test" not in raw:
+            return False
+        try:
+            resolved = RunConfig.model_validate(raw).load_test.model_dump(mode="json")
+        except ValidationError:
+            return False
+        identity = {"generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
+                    "settings": {"load_test": resolved}}
+        if not any(fixture_hash({**identity, "load_test_source_sha256": source}) ==
+                   manifest.get("fixture_pack", {}).get("workload_fixture_sha256") for source in (
+                       "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
+                       "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")):
+            return False
+        settings.append(resolved)
+    return settings[0] == settings[1]
+
+
 def _limits_reached(report: RunReport) -> set[str]:
     reached = set(report.limits_reached)
     if any("Global request budget exhausted" in warning for warning in report.warnings):
@@ -459,7 +481,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         reasons.append("Fixture pack identity is missing or unknown.")
     else:
         inactive = {"custom"}
-        if _same_run_limits_workload(report.manifest, baseline.manifest):
+        if (_same_run_limits_workload(report.manifest, baseline.manifest)
+                or _same_load_workload(report.manifest, baseline.manifest)):
             inactive.add("workload_fixture_sha256")
         if ({key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
@@ -1927,7 +1950,8 @@ def _multi_user_scenario_export(window: dict[str, Any]) -> dict[str, Any]:
         user_fields = ("user_id", "status", "qualified", "reasons", "matched_samples", "control_request_ids",
             "probe_request_ids", "heavy_request_ids", "slowdown", "first_answer_change_ms", "completion_change_ms",
             "stream_gap_change_ms", "output_tokens_change", "control_input_median_tokens", "probe_input_median_tokens",
-            "control_output_median_tokens", "probe_output_median_tokens")
+            "control_output_median_tokens", "probe_output_median_tokens",
+            "heavy_input_median_tokens", "heavy_output_median_tokens")
         result["interference"] = {key: evidence[key] for key in fields if key in evidence}
         result["interference"]["users"] = [{key: user[key] for key in user_fields if key in user}
                                              for user in evidence.get("users", [])]
@@ -2003,7 +2027,9 @@ def _multi_user_scenario_html(window: dict[str, Any], anchors: dict[str, str]) -
                 f'{_number(user.get("slowdown"))}×</td><td>{_number(user.get("first_answer_change_ms"))} / '
                 f'{_number(user.get("completion_change_ms"))} / {_number(user.get("stream_gap_change_ms"))}</td>'
                 f'<td>{_number(user.get("control_input_median_tokens"))} → {_number(user.get("probe_input_median_tokens"))} / '
-                f'{_number(user.get("control_output_median_tokens"))} → {_number(user.get("probe_output_median_tokens"))}</td>'
+                f'{_number(user.get("control_output_median_tokens"))} → {_number(user.get("probe_output_median_tokens"))}'
+                f'<br>Heavy input / output medians: {_number(user.get("heavy_input_median_tokens"))} / '
+                f'{_number(user.get("heavy_output_median_tokens"))} tokens</td>'
                 f'<td>{_number(user.get("output_tokens_change"))} tokens<br>Control: {links(user.get("control_request_ids", []))}'
                 f'<br>Probe: {links(user.get("probe_request_ids", []))}<br>Heavy: {links(user.get("heavy_request_ids", []))}</td></tr>')
         parts.append('</table></div>')
