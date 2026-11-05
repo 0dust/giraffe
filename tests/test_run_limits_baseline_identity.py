@@ -18,6 +18,7 @@ LEGACY_GENERATOR = "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115e
 LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
 PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
 NONCE_ONLY_LOAD = "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
+NONCE_LOAD_GENERATOR = "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
 
 
 def load_reports(*, load_source=None):
@@ -28,7 +29,7 @@ def load_reports(*, load_source=None):
                                    for m in (load_test, concurrent_load, traffic))).hexdigest()
     for report, digest in ((current, load_source or source), (old, "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36")):
         report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
-            "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+            "generator_source_sha256": NONCE_LOAD_GENERATOR,
             "settings": settings, "load_test_source_sha256": digest})
     return current, old, settings
 
@@ -49,7 +50,7 @@ def test_post_build_admission_guard_requires_new_load_baseline():
 @pytest.mark.parametrize("change", ["generator", "source", "settings", "missing_settings", "multi_user", "builtin"])
 def test_load_source_compatibility_does_not_hide_unattested_work(change):
     current, old, settings = load_reports(load_source=NONCE_ONLY_LOAD)
-    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+    identity = {"generator_source_sha256": NONCE_LOAD_GENERATOR,
                 "settings": settings,
                 "load_test_source_sha256": "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"}
     if change == "generator":

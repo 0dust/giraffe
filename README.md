@@ -267,7 +267,8 @@ Missing references never fall back to the shared key. Identity probes retain
 numeric response evidence, not answer text or arbitrary server identifiers.
 Ordinary requests continue to use the target's shared credentials.
 
-The LiteLLM adapter requires generated request metadata, the matching session
+The LiteLLM reader sends a bounded UTC date window covering the probes and
+settle period on every page. The adapter requires generated request metadata, the matching session
 marker, a gateway API-key hash, and complete final prompt/completion token counts.
 The hash is compared in memory and discarded. Repeated log rows and cumulative
 streaming usage count once. Header-only or anonymous identities without a bearer

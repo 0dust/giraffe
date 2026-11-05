@@ -466,7 +466,7 @@ class LLMClient:
 
         def body_received(size):
             record.response_body_bytes += size
-            if self.on_response is not None:
+            if self.on_response is not None and spec.identity is None:
                 self.on_response()
         record.request_hash = hashlib.sha256(json.dumps({
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
