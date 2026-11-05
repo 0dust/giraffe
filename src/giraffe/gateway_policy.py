@@ -9,11 +9,6 @@ from .models import CheckResult, RequestSpec
 
 VERSION = 2
 PROMPT = "Reply with exactly the word OK."
-SUPPORTED = {"key_rpm", "priority_rpm"}
-
-
-def _supported(settings):
-    return settings.gateway == "litellm" and settings.capability in SUPPORTED
 
 
 async def execute(run, target, client):
@@ -27,7 +22,7 @@ async def execute(run, target, client):
         "complete": False, "stop_reason": None, "offered": {user.identity: 0 for user in settings.users}}
     observation["isolated_run"] = set(run.config.checks) == {"gateway_policy"} and len(run.config.targets) == 1
     run.observations[target.name]["gateway_policy"] = observation
-    if not _supported(settings):
+    if not settings.supported:
         observation["stop_reason"] = "Selected gateway capability is unsupported."
         return
     from .identities import identity_headers
@@ -122,7 +117,7 @@ def summarize(settings, observation, records):
 
     if settings is None:
         return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
-    if not _supported(settings):
+    if not settings.supported:
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if not records:
         return outcome("unexercised", "No policy traffic was dispatched.")

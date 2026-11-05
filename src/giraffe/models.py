@@ -874,7 +874,7 @@ def required_concurrency(config) -> dict[str, Any]:
                     if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
                     else max(config.multi_user.levels))
         elif check == "gateway_policy":
-            peak = len(config.gateway_policy.users) if config.gateway_policy else 0
+            peak = len(config.gateway_policy.users) if config.gateway_policy and config.gateway_policy.supported else 0
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1122,6 +1122,10 @@ class GatewayPolicy(Model):
     model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
     saturation_threshold: float | None = Field(default=None, ge=0, le=1)
     saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
+
+    @property
+    def supported(self) -> bool:
+        return self.gateway == "litellm" and self.capability in {"key_rpm", "priority_rpm"}
 
     @model_validator(mode="after")
     def valid_policy(self):

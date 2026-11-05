@@ -1304,7 +1304,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     "current_outcomes": user, "baseline_outcomes": previous,
                     "qualification": current_policy.get("qualification"), "threshold": 0,
                     "worsening": 100 if status == "fail" else 0,
-                    "reason": "Matched declared policies and observed admission; no timing inference." if compatible else
+                    "reason": current_check.summary if compatible and previous else
                               "Policy settings, summary version or qualified passing baseline do not match.",
                     "evidence_ids": user["request_ids"]})
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
