@@ -44,6 +44,10 @@ def identity_headers(target, alias):
     identity = target.test_identities.get(alias)
     if identity is None:
         raise ValueError("Test identity credentials are unavailable.")
+    return credential_headers(identity)
+
+
+def credential_headers(identity):
     headers = {"Accept": "application/json, text/event-stream"}
     refs = dict(identity.headers_env)
     if identity.api_key_env:
