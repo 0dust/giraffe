@@ -628,6 +628,7 @@ class _Run:
                     on_start()
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
+                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
@@ -795,6 +796,7 @@ class _Run:
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
+                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
@@ -2662,6 +2664,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         from giraffe import session_sampling
         workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
             Path(session_sampling.__file__).read_bytes()).hexdigest()
+    if "multi_user" in config.checks:
+        from giraffe import multi_user, load_test, concurrent_load
+        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, load_test, concurrent_load))).hexdigest()
+        workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic
         workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()

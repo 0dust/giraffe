@@ -168,3 +168,6 @@ def cap_explanations(limits):
     if help_text:
         explanations[prefix] = {"label": "Probability evidence", "help": help_text}
     return explanations
+
+# User lifetime is independent of the simultaneous HTTP request limit.
+MAX_SIMULATED_USERS = 32

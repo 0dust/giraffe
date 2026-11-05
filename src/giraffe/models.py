@@ -17,7 +17,7 @@ from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, f
 from . import __version__
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
-                   MAX_STAGE_SECONDS, MAX_SESSIONS,
+                   MAX_STAGE_SECONDS, MAX_SESSIONS, MAX_SIMULATED_USERS,
                    MAX_SESSION_TURNS, MAX_SESSION_TURN_CHARS, MAX_TOOL_CONFIG_BYTES, MAX_TOOL_RESULT_BYTES,
                    MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
                    MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS)
@@ -39,6 +39,7 @@ CHECK_NAMES = {
     "gpu": "GPU metrics",
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
+    "multi_user": "Multi-user",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
@@ -712,7 +713,7 @@ def migrate_run_limits(value):
         checks.extend([*(["json"] if value.get("structured_json") else []),
                        *(["gpu"] if value.get("metrics") else [])])
         checks.extend(check for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                                ("sessions", "sessions"), ("consistency", "consistency"),
+                                                ("sessions", "sessions"), ("multi_user", "multi_user"), ("consistency", "consistency"),
                                                 ("tool_calling", "tools"), ("tool_checks", "tools"))
                       if value.get(field) is not None and (field != "tool_calling" or value[field]))
         value["checks"] = list(dict.fromkeys(checks))
@@ -866,6 +867,8 @@ def required_concurrency(config) -> dict[str, Any]:
         elif check == "arrivals":
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
+        elif check == "multi_user":
+            peak = max(config.multi_user.levels)
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1080,6 +1083,34 @@ class SessionDistribution(Model):
     def valid_weights(self):
         if self.weights is not None and (len(self.weights) != len(self.values) or not any(self.weights)):
             raise ValueError("distribution weights must match the values and include a positive weight")
+        return self
+
+
+class MultiUserCriteria(Model):
+    max_first_answer_ms: float | None = Field(default=None, gt=0)
+    max_completion_ms: float | None = Field(default=None, gt=0)
+    max_error_percent: float | None = Field(default=0, ge=0, le=100)
+    min_output_tokens_per_second: float | None = Field(default=None, gt=0)
+    min_samples: StrictInt = Field(default=1, ge=1)
+
+
+class MultiUser(Model):
+    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
+        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
+    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
+    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
+    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
+    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
+    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
+
+    @model_validator(mode="after")
+    def valid_population(self):
+        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
+            raise ValueError("multi-user levels and shapes must be distinct")
+        if any(value > 60 for value in self.think_time_seconds.values):
+            raise ValueError("multi-user think times must be between 0 and 60 seconds")
         return self
 
 
@@ -1981,6 +2012,7 @@ class RunConfig(Model):
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
+    multi_user: MultiUser | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
@@ -2053,7 +2085,7 @@ class RunConfig(Model):
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                 ("sessions", "sessions"),
+                                 ("sessions", "sessions"), ("multi_user", "multi_user"),
                                  ("consistency", "consistency"), ("tool_calling", "tools"),
                                  ("tool_checks", "tools")):
                 if getattr(self, field):
@@ -2072,6 +2104,8 @@ class RunConfig(Model):
             self.arrivals = Arrival()
         if "prefix" in self.checks and self.prefix is None:
             self.prefix = Prefix()
+        if "multi_user" in self.checks and self.multi_user is None:
+            self.multi_user = MultiUser()
         if "sessions" in self.checks and self.sessions is None:
             self.sessions = Sessions(max_tokens=min(32, self.max_output_tokens))
         if "consistency" in self.checks and self.consistency is None:
