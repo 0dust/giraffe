@@ -33,6 +33,11 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None)
         value = headers.get(name)
         if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value):
             setattr(evidence, field, int(value))
+    if headers.get("x-litellm-rate-limiter-version") == "v3":
+        evidence.limiter_version = "v3"
+        limit = headers.get("x-ratelimit-priority_model-limit-requests")
+        if isinstance(limit, str) and re.fullmatch(r"[0-9]{1,12}", limit):
+            evidence.priority_request_limit = int(limit)
     retry = headers.get("retry-after")
     if isinstance(retry, str) and re.fullmatch(r"[0-9]{1,8}(?:\.[0-9]{1,6})?", retry):
         evidence.retry_after_seconds = float(retry)

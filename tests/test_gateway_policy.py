@@ -35,13 +35,17 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
     async def handle(request):
         if request.method != "POST":
             return httpx.Response(404)
-        who = "limited" if request.headers["authorization"] == "Bearer limited-secret" else "peer"
+        who = {"Bearer limited-secret": "limited", "Bearer peer-secret": "peer"}.get(request.headers.get("authorization"))
+        if who is None:
+            return httpx.Response(401, json={"error": {"type": "authentication_error"}})
         counts[who] += 1
         seen.append(who)
         await asyncio.sleep(.01)
         priority = "low" if who == "limited" else "high"
         headers = {"x-ratelimit-limit-requests": "2" if who == "limited" else "8",
-                   "x-litellm-priority": priority}
+                   "x-litellm-priority": priority, "retry-after": "60",
+                   "x-litellm-rate-limiter-version": "v3",
+                   "x-ratelimit-priority_model-limit-requests": str(next(user.rpm for user in cfg.gateway_policy.users if user.identity == who))}
         threshold = 3 if behavior == "overadmit" else 1 if behavior == "early" else 2
         if who == "limited" and counts[who] > threshold and behavior != "ignore":
             message = ("Priority-based rate limit exceeded. Model: test, Priority: low, Rate limit type: requests, Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: 50%"
@@ -54,6 +58,9 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         usage = {"prompt_tokens": 8, "completion_tokens": 2}
         if behavior == "missing_usage":
             usage = {}
+        if behavior == "reasoning_work" and who == "limited":
+            usage = {"prompt_tokens": 8, "completion_tokens": 128,
+                     "completion_tokens_details": {"reasoning_tokens": 126}}
         return httpx.Response(200, headers=headers, json={"choices": [{"message": {
             "content": "OK"}, "finish_reason": "stop"}], "usage": usage})
 

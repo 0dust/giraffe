@@ -2042,13 +2042,13 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
 
 def _gateway_policy_html(data):
     rows = "".join(f'<tr><td>{_e(user["identity"])}</td><td>{_e(user["priority"] or "—")}</td>'
-        f'<td>{user["declared_rpm"]}</td><td>{user["admitted"]}</td><td>{user["rejected"]}</td>'
-        f'<td>{user["completed"]} / {user["planned"]}</td>'
-        f'<td>{_e(user["input_tokens"])}</td><td>{_e(user["output_tokens"])}</td></tr>' for user in data["users"])
+        f'<td>{_e(user["declared_rpm"])}</td><td>{_e(user["admitted"])}</td><td>{_e(user["rejected"])}</td>'
+        f'<td>{_e(user["completed"])} / {_e(user["planned"])}</td>'
+        f'<td>{_e(user["input_tokens"])}</td><td>{_e(user.get("completion_tokens", user["output_tokens"]))}</td></tr>' for user in data["users"])
     return (f'<h3>Gateway policy · {_e(data["qualification"])}</h3><p>{_e(data["interpretation"])}</p>'
         '<div class="table"><table><tr><th>Identity</th><th>Priority tier</th><th>Declared RPM</th>'
         '<th>Admitted</th><th>Rejected</th><th>Completed / offered cap</th><th>Actual input tokens</th>'
-        f'<th>Actual output tokens</th></tr>{rows}</table></div>'
+        f'<th>Actual output tokens (including reasoning)</th></tr>{rows}</table></div>'
         f'<p>Peer continuation: {_e(data["peer_continuation"])} · Overlap observed: {_e(data["overlap_observed"])} · '
         f'Comparable actual work: {_e(data["comparable_actual_work"])}</p>'
         f'<details><summary>Declared policy and qualification</summary><pre>{_json(data)}</pre></details>')

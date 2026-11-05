@@ -16,6 +16,7 @@ max_duration_seconds: 20
 request_timeout_seconds: 5
 gateway_policy:
   gateway: litellm
+  auth_header: Authorization # Match an existing litellm_key_header_name if customized.
   capability: key_rpm
   gateway_version: null # Set the version actually deployed.
   affected_identity: limited

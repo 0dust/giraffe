@@ -1109,6 +1109,7 @@ class GatewayPolicyUser(Model):
 
 
 class GatewayPolicy(Model):
+    auth_header: str = Field(default="Authorization", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
     gateway: str = Field(default="litellm", min_length=1, max_length=64)
     capability: str = Field(default="key_rpm", min_length=1, max_length=64)
     gateway_version: str | None = Field(default=None, max_length=64)
@@ -2741,6 +2742,8 @@ class GatewayResponseEvidence(PersistedModel):
     retry_after_seconds: float | None = Field(default=None, ge=0)
     rate_limit_unit: Literal["requests", "tokens", "unknown"] | None = None
     priority_matches: bool | None = None
+    limiter_version: Literal["v3"] | None = None
+    priority_request_limit: int | None = Field(default=None, ge=0)
     model_rpm: int | None = Field(default=None, ge=0)
     saturation_percent: float | None = Field(default=None, ge=0, le=100)
 
