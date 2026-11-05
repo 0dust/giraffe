@@ -602,8 +602,11 @@ async def test_missing_optional_telemetry_does_not_block_api():
 
 async def test_normal_run_never_invokes_configured_restart(tmp_path):
     marker = tmp_path / "unexpected"
+    script = tmp_path / "restart.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    script.chmod(0o700)
     target = Target(name="service", model="local", url="http://localhost:1234",
-                    restart_command=["touch", str(marker)])
+                    restart_script=str(script))
     report = await runner.run_suite(config(targets=[target]))
     assert not marker.exists()
     assert report.observations["targets"]["service"]["restart"] is None
@@ -618,14 +621,29 @@ async def test_explicit_restart_missing_hook_blocks_only_named_target():
     assert {r.target for r in report.requests} == {"other"}
 
 
-async def test_explicit_restart_executes_only_named_argv_hook(tmp_path):
-    import sys
+async def test_explicit_restart_executes_only_named_script(tmp_path, monkeypatch):
+    from giraffe.restart_script import preview_script
+
     marker, other_marker = tmp_path / "chosen", tmp_path / "other"
+    script = tmp_path / "restart.sh"
+    script.write_text(f"#!/bin/sh\nprintf yes > '{marker}'\n")
+    script.chmod(0o700)
+    other_script = tmp_path / "other.sh"
+    other_script.write_text(f"#!/bin/sh\ntouch '{other_marker}'\n")
+    other_script.chmod(0o700)
+
+    async def no_native(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr("giraffe.cold_start.detect_ollama", no_native)
     targets = [Target(name="service", model="local", url="http://localhost:1234",
-                      restart_command=[sys.executable, "-c", f"open({str(marker)!r}, 'w').write('yes')"]),
+                      restart_script=str(script)),
                Target(name="other", model="local", url="http://localhost:1235",
-                      restart_command=["touch", str(other_marker)])]
-    report = await runner.run_suite(config(targets=targets, restart_target="service"))
+                      restart_script=str(other_script))]
+    settings = config(targets=targets, restart_target="service",
+                      restart_script_sha256=preview_script(str(script))["sha256"])
+    settings._restart_log_dir = tmp_path / "run"
+    report = await runner.run_suite(settings)
     assert marker.read_text() == "yes" and not other_marker.exists()
     observation = report.observations["targets"]["service"]["restart"]
     assert observation["status"] == "ready" and observation["readiness_ms"] > 0
@@ -1830,7 +1848,8 @@ async def test_disconnected_sustained_endpoint_aborts_and_keeps_partial_evidence
 async def test_run_deadline_during_readiness_is_reported_before_monitor_tick(client, monkeypatch):
     async def restart(run, target):
         run.observations[target.name]["restart"] = {
-            "status": "hook_completed", "started_monotonic": time.monotonic()}
+            "status": "hook_completed", "started_monotonic": time.monotonic(),
+            "service_answered_ms": None, "warm_requests": []}
         return True
 
     async def not_ready(self, deadline):
@@ -2134,7 +2153,8 @@ async def test_slow_cold_start_does_not_consume_watchdog_window(monkeypatch):
 
     async def restart(run, target):
         run.observations[target.name]["restart"] = {
-            "status": "hook_completed", "started_monotonic": time.monotonic()}
+            "status": "hook_completed", "started_monotonic": time.monotonic(),
+            "service_answered_ms": None, "warm_requests": []}
         return True
 
     async def handler(request):
@@ -2146,6 +2166,10 @@ async def test_slow_cold_start_does_not_consume_watchdog_window(monkeypatch):
             return httpx.Response(200)
         return endpoint_answer(request)
 
+    async def no_native(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr("giraffe.cold_start.detect_ollama", no_native)
     monkeypatch.setattr(runner, "_restart", restart)
     mock_inference_transport(monkeypatch, handler)
     events = []
@@ -2160,12 +2184,18 @@ async def test_slow_cold_start_does_not_consume_watchdog_window(monkeypatch):
     assert not any(e["event"] in {"target_stopping", "run_stopping"} for e in events)
 
 
-async def test_run_deadline_terminates_restart_hook():
-    import sys
+async def test_run_deadline_terminates_restart_script(tmp_path):
+    from giraffe.restart_script import preview_script
 
+    script = tmp_path / "restart.sh"
+    script.write_text("#!/bin/sh\nexec sleep 2\n")
+    script.chmod(0o700)
     target = Target(name="service", model="test", url="http://localhost",
-        restart_command=[sys.executable, "-c", "import time; time.sleep(2)"])
-    report = await runner.run_suite(config(targets=[target], restart_target="service", max_duration_seconds=.03))
+                    restart_script=str(script))
+    settings = config(targets=[target], restart_target="service", max_duration_seconds=.03,
+                      restart_script_sha256=preview_script(str(script))["sha256"])
+    settings._restart_log_dir = tmp_path / "run"
+    report = await runner.run_suite(settings)
     assert report.observations["inference_duration_seconds"] < .3
     assert report.abort_reason == "maximum run duration reached"
     assert not report.requests

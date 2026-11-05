@@ -72,7 +72,7 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path, mon
         values = judged_config()
         values["stream"] = False
         values["retention"] = "all"
-        values["targets"][0].update(url=endpoint.url, restart_command=["should-never-run"],
+        values["targets"][0].update(url=endpoint.url, restart_script="/should-never-run/restart.sh",
                                    deployment={"collector_url": endpoint.url + "/collector"})
         values["targets"].append({"name": "unfinished", "url": "http://127.0.0.1:1", "model": ""})
         values["restart_target"] = "local"
@@ -80,7 +80,7 @@ async def test_try_example_is_single_http_request_and_saved_report(tmp_path, mon
         values["request_pack"]["cases"][0].pop("rubric")
         values["request_pack"]["cases"].append({"fixture_id": "other", "messages": [
             {"role": "user", "content": "DO NOT SEND"}], "scorer": "exact", "expected": "ignored"})
-        async with browser(tmp_path, allow_restart_command=True) as client:
+        async with browser(tmp_path) as client:
             response = await client.post("/api/runs/try-example", json={
                 "config": values, "fixture_id": "refund", "target_name": "local"})
             assert response.status_code == 202, response.text

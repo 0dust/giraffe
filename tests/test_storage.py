@@ -72,6 +72,17 @@ def test_cleanup_criteria_combine_and_only_delete_as_needed_for_total(tmp_path):
     assert plan["candidates"][1]["criterion"] == "max_total_bytes"
 
 
+def test_cleanup_recognizes_and_deletes_run_with_restart_log(tmp_path):
+    run = saved(tmp_path, "cold", days=30)
+    (run / "restart.log").write_text("restart issued\n")
+    assert [r["id"] for r in cleanup_plan(tmp_path, keep_latest=0)["candidates"]] == ["cold"]
+    size = run_size(run)
+    result = apply_cleanup(tmp_path, ["cold"], keep_latest=0)
+    assert result["deleted"] == ["cold"]
+    assert result["bytes_freed"] == size
+    assert not run.exists()
+
+
 def test_cleanup_protects_active_kept_baseline_busy_and_unrecognized_runs(tmp_path):
     for identifier in ("active", "kept", "baseline", "foreign", "nested", "symlink", "temporary", "eligible"):
         saved(tmp_path, identifier, days=30)

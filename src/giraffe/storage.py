@@ -25,7 +25,7 @@ from . import models
 DEFAULT_LIMITS = {"max_total_storage": 5 * 1024 ** 3, "min_free_disk": 1024 ** 3,
                   "max_run_storage": 256 * 1024 ** 2}
 # HTML remains recognized for legacy runs and explicit CLI exports.
-_FILES = {"report.json", "report.html", ".web.json", ".keep", "summary.json", "evidence.jsonl", "giraffe.log"}
+_FILES = {"report.json", "report.html", ".web.json", ".keep", "summary.json", "evidence.jsonl", "giraffe.log", "restart.log"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 logger = logging.getLogger(__name__)
 _metadata_lock = threading.RLock()

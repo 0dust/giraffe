@@ -113,7 +113,7 @@ def test_shell_metacharacters_and_restart_target_are_literal(tmp_path, config, b
     attack = f"--$(touch {shlex.quote(str(marker))}); `touch {shlex.quote(str(marker))}`\n' \" $HOME"
     config.targets[0].name = attack
     config.targets[0].model = attack
-    config.targets[0].restart_command = ["restart", attack]
+    config.targets[0].restart_script = attack
     config.restart_target = attack
     config.request_options["user"] = attack
     baseline.observations["user"] = attack
@@ -177,7 +177,7 @@ def test_invalid_mode_or_restart_is_rejected(config, kwargs):
 
 
 def test_implicit_or_mismatched_restart_is_rejected(config):
-    config.targets[0].restart_command = ["restart"]
+    config.targets[0].restart_script = "./restart.sh"
     config.restart_target = "local"
     with pytest.raises(ValueError, match="explicit cold-start"):
         cli_command(config)
@@ -188,6 +188,6 @@ def test_implicit_or_mismatched_restart_is_rejected(config):
 
 def test_restart_target_nul_is_rejected(config):
     config.targets[0].name = "bad\x00name"
-    config.targets[0].restart_command = ["restart"]
+    config.targets[0].restart_script = "./restart.sh"
     with pytest.raises(ValueError, match="NUL"):
         cli_command(config, mode="cold-start", restart_target="bad\x00name")

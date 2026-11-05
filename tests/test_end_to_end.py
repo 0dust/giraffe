@@ -183,9 +183,10 @@ def test_cli_honors_request_budget_and_never_runs_restart_hook_by_default(tmp_pa
     with FakeEndpoint() as endpoint:
         config = run_config(endpoint, max_requests=3)
         config.targets[0].tokenizer = str(tokenizer_path)
-        config.targets[0].restart_command = [
-            sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('run')",
-        ]
+        script = tmp_path / "restart.py"
+        script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).write_text('run')\n")
+        script.chmod(0o700)
+        config.targets[0].restart_script = str(script)
         result, report, _ = cli_run(tmp_path, config, "bounded")
         observed_requests = len(endpoint.requests)
     assert observed_requests == len(report["requests"]) + 1

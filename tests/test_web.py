@@ -470,7 +470,7 @@ async def test_capabilities_share_the_cli_catalog_and_do_not_start_traffic(tmp_p
     async with browser(tmp_path) as client:
         discovery = (await client.get("/api/capabilities")).json()
         bootstrap = (await client.get("/api/bootstrap")).json()
-        assert discovery == capabilities()
+        assert discovery == capabilities(restart_allowed=True)
         assert discovery["version"] == __version__
         assert discovery["checks"] == bootstrap["checks"]
         assert discovery["config_schema"] == bootstrap["config_schema"]
@@ -493,22 +493,22 @@ async def test_copy_cli_preserves_intent_without_starting_a_run(tmp_path, monkey
         assert not any(path.is_dir() and not path.name.startswith(".") for path in tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("mode,restart_target,config_restart,hook", [
-    ("normal", "local", None, ["true"]),
-    ("normal", None, "local", ["true"]),
-    ("cold-start", None, None, ["true"]),
-    ("cold-start", "unknown", None, ["true"]),
-    ("cold-start", "local\x00", None, ["true"]),
+@pytest.mark.parametrize("mode,restart_target,config_restart,script", [
+    ("normal", "local", None, "/not-read/restart.sh"),
+    ("normal", None, "local", "/not-read/restart.sh"),
+    ("cold-start", None, None, "/not-read/restart.sh"),
+    ("cold-start", "unknown", None, "/not-read/restart.sh"),
+    ("cold-start", "local\x00", None, "/not-read/restart.sh"),
     ("cold-start", "local", None, None),
 ])
 async def test_copy_cli_and_start_reject_the_same_invalid_restart_intent(
-    tmp_path, mode, restart_target, config_restart, hook,
+    tmp_path, mode, restart_target, config_restart, script,
 ):
     values = config(checks=["access"])
-    values["targets"][0]["restart_command"] = hook
+    values["targets"][0]["restart_script"] = script
     values["restart_target"] = config_restart
     body = {"config": values, "mode": mode, "restart_target": restart_target}
-    async with browser(tmp_path, allow_restart_command=True) as client:
+    async with browser(tmp_path) as client:
         copy = await client.post("/api/config/cli", json=body)
         start = await client.post("/api/runs", json=body)
         assert copy.status_code == start.status_code == 422
@@ -870,26 +870,32 @@ async def test_disabled_correctness_does_not_load_custom_fixture_file(tmp_path, 
 
 
 async def test_normal_run_never_runs_restart_config(tmp_path, fake_runner):
+    from giraffe.restart_script import preview_script
+
+    script = tmp_path / "restart.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o700)
     values = config(restart_target="local")
-    values["targets"][0]["restart_command"] = ["echo", "restart"]
-    async with browser(tmp_path, defaults=values, allow_restart_command=True) as client:
+    values["targets"][0]["restart_script"] = str(script)
+    async with browser(tmp_path, defaults=values) as client:
         assert (await client.get("/api/bootstrap")).json()["config"]["restart_target"] is None
         response = await client.post("/api/runs", json={"config": values})
         assert response.status_code == 422
         response = await client.post("/api/runs", json={"config": values, "mode": "cold-start"})
         assert response.status_code == 422
-        identifier = await start(client, values, mode="cold-start", restart_target="local")
+        identifier = await start(client, values, mode="cold-start", restart_target="local",
+                                 restart_script_sha256=preview_script(str(script))["sha256"])
         assert (await finished(client, identifier))["config"]["restart_target"] == "local"
 
 
-async def test_cold_start_requires_matching_target_with_hook(tmp_path, fake_runner):
-    async with browser(tmp_path, allow_restart_command=True) as client:
+async def test_cold_start_requires_matching_target_with_script(tmp_path, fake_runner):
+    async with browser(tmp_path) as client:
         response = await client.post("/api/runs", json={"config": config(), "mode": "cold-start",
                                                        "restart_target": "local"})
         assert response.status_code == 422
         values = config(restart_target="local")
         values["targets"].append({"name": "other", "url": "http://localhost:1234/v1",
-                                  "model": "test", "restart_command": ["echo", "restart"]})
+                                  "model": "test", "restart_script": "/not-read/restart.sh"})
         response = await client.post("/api/runs", json={"config": values, "mode": "cold-start",
                                                        "restart_target": "other"})
         assert response.status_code == 422

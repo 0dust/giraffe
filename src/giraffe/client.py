@@ -361,6 +361,19 @@ class LLMClient:
             except (httpx.HTTPError, OSError):
                 pass  # Transport cleanup cannot invalidate a completed response.
 
+    async def service_answered(self, deadline: float) -> bool:
+        """A response from the models route proves HTTP availability, not inference."""
+        remaining = min(1, deadline - time.monotonic())
+        if remaining <= 0:
+            return False
+        url = completion_url(self.target.url).removesuffix("/chat/completions") + "/models"
+        try:
+            async with asyncio.timeout(remaining):
+                async with self._client.stream("GET", url, timeout=remaining):
+                    return True
+        except (httpx.HTTPError, OSError, TimeoutError):
+            return False
+
     async def ready(self, deadline: float) -> bool:
         """Poll the advertised model route without spending an inference request."""
         if self._client is None:
@@ -693,7 +706,7 @@ class LLMClient:
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
-                        if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
+                        if spec.scenario in {"connection", "readiness", "cold_start_warm"} and response.status_code in {400, 404, 422}:
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
                             try:
@@ -709,6 +722,11 @@ class LLMClient:
                             record.workload["model_not_served"] = ((isinstance(code, str) and code in {"model_not_found", "unknown_model"})
                                 or "unknown model" in message or "model does not exist" in message or "model not found" in message
                                 or (self.target.model.lower() in message and missing))
+                            if spec.scenario in {"readiness", "cold_start_warm"} and response.status_code == 404:
+                                record.workload["model_not_served"] |= (
+                                    isinstance(code, str) and code in {"model_not_available", "model_not_ready"}
+                                    or bool(re.search(r"\bmodel\b", message)) and any(
+                                        term in message for term in ("not ready", "not available", "still loading")))
                         if probing and response.status_code in {400, 422}:
                             rejected_field = _rejected_evidence_field(error_body)
                             if rejected_field:
