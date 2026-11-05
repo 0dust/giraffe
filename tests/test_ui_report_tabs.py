@@ -211,6 +211,26 @@ assert.match($('.performance-window-description').textContent,/Selected cancella
 """, dom=True)
 
 
+def test_live_refresh_preserves_target_selection_while_measurements_load():
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+state.detail={id:'saved-run',state:'running',config:{targets:[]},live_requests:[]};renderDetail();
+reportView.performance=performanceFixture();reportView.tab='performance';renderDetail();
+let finish;api=()=>new Promise(resolve=>finish=resolve);
+const select=$('#performance-target');select.value='other';listeners.change({target:select});
+assert(reportView.pending);
+renderDetail();
+assert.equal($('#performance-target').value,'other','a live poll must preserve the requested target');
+assert($('#performance-window').hasAttribute('disabled'),'old measurements cannot be selected while loading');
+finish(performanceFixture('other','full'));await Promise.resolve();await Promise.resolve();
+assert.equal($('#performance-target').value,'other');
+assert.equal($('#performance-window').value,'full');
+assert(!$('#performance-window').hasAttribute('disabled'));
+assert.match($('#report-performance').textContent,/Model B/);
+})()
+""", dom=True)
+
+
 def test_live_partial_measurements_disclose_retention_and_absent_data_is_not_zero():
     run_render_checks(PERFORMANCE + r"""
 const config={targets:[{name:'local',model:'m'}],max_requests:1000,concurrency:32};

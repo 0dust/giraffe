@@ -11,7 +11,7 @@ from copy import deepcopy
 
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
-from giraffe.models import CheckResult, LoadTestSettings, Limits, TrafficConfig
+from giraffe.models import CheckResult, LoadTestSettings, Limits, TrafficConfig, required_concurrency
 from giraffe.traffic import run_stage
 
 
@@ -420,7 +420,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     window.update(start_ms=_relative(run), end_ms=_relative(run)+window["planned_duration_seconds"]*1000,
                   planned_end_ms=_relative(run)+window["planned_duration_seconds"]*1000, reason=None)
     evidence = await run_stage(traffic=TrafficConfig(duration_seconds=window["planned_duration_seconds"],
-        rates=[window["requests_per_second"]], max_in_flight=run.config.concurrency,
+        rates=[window["requests_per_second"]], max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
         scheduler_lag_tolerance_ms=100, drain_timeout_seconds=None), rate_rps=window["requests_per_second"]*window["population"],
         stage_index=0, fixtures={}, execute=send, reserve_offer=reserve, try_acquire=run.try_acquire_slot,
         release=run.release_slot, stop_reason=stop, deadline=run.deadline, limits=Limits(),
@@ -479,8 +479,8 @@ def _planned_observation(settings, *, include_offers=True):
                 window.update(id=f"multi_user_{level}_recovery_{role}", scenario="recovery", role=role,
                     requests_per_second=rate, control_window_id=f"multi_user_{level}_recovery_control",
                     sustained_window_id=f"multi_user_{level}_recovery_sustained",
-                    control_work_count=math.ceil(recovery.control_seconds*recovery.lighter_requests_per_second),
-                    work_sequence_start=math.ceil(recovery.sustained_seconds*recovery.sustained_requests_per_second)
+                    control_work_count=_steady_offer_count(recovery.control_seconds, 0, recovery.lighter_requests_per_second),
+                    work_sequence_start=_steady_offer_count(recovery.sustained_seconds, 0, recovery.sustained_requests_per_second)
                         if role == "lighter" else 0)
                 windows.append(window)
         if "repeated_requests" in settings.scenarios:

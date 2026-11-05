@@ -60,6 +60,53 @@ def test_recovery_missing_phase_end_is_inconclusive(phase):
     assert not evidence["qualified"]
 
 
+@pytest.mark.parametrize("fault", [None, "single_read", "missing_gap"])
+def test_recovery_requires_qualified_peer_streams(fault):
+    source, records = recovery_observation()
+    for request, shift in zip(records[3:6], [0, 120, 60], strict=True):
+        request.dispatch_ms += shift
+        request.timing_start_ms += shift
+        request.completed_ms += shift
+    peer = records[5]
+    if fault == "single_read":
+        peer.answer_reads = peer.answer_chunks = 1
+    elif fault == "missing_gap":
+        peer.max_stream_gap_ms = None
+    evidence = summarize(source, records)["windows"][-1]["recovery"]
+    for user in evidence["users"][:2]:
+        assert user["status"] == ("inconclusive" if fault else "pass")
+        assert any("qualified peer streaming overlap" in reason for reason in user["reasons"]) == bool(fault)
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+def test_fractional_phase_boundaries_replay_only_scheduled_control_work(monkeypatch):
+    from giraffe import runner
+    from giraffe.multi_user import execute
+    from tests.test_runner import FakeClient
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    async def run():
+        cfg = settings(levels=[2], scenarios=["recovery"], profile=PROFILE, recovery={
+            "control_seconds": .14, "sustained_seconds": .14, "lighter_seconds": .14,
+            "sustained_requests_per_second": 100, "lighter_requests_per_second": 50})
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        windows = state.observations["service"]["multi_user"]["windows"]
+        assert [w["offer_accounting"]["dispatched"] for w in windows] == [14, 28, 14]
+        for uid in ("user-01", "user-02"):
+            own = [r for r in state.records if r.workload["user_id"] == uid]
+            control = {r.workload["matched_work_sequence"]: r.workload["matched_work_sha256"]
+                       for r in own if r.workload["role"] == "control"}
+            assert set(control) == set(range(1, 8))
+            later = [r for r in own if r.workload["role"] != "control"]
+            assert all(r.workload["matched_work_sequence"] in control for r in later)
+            assert all(r.workload["matched_work_sha256"] == control[r.workload["matched_work_sequence"]]
+                       for r in later)
+            lighter = [r for r in own if r.workload["role"] == "lighter"]
+            assert [r.workload["work_sequence"] for r in lighter] == list(range(15, 22))
+    run_virtual(monkeypatch, run())
+
+
 @pytest.mark.parametrize("fault", ["missing_control", "drift", "missing_usage", "generator", "gap", "partial"])
 def test_unqualified_recovery_cannot_pass(fault):
     source, records = recovery_observation()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 import json
 import ssl
 import time
@@ -31,8 +32,9 @@ def _number(value):
 
 
 def _normalize(rows, marker, expected):
-    """Drop all raw data before returning; hashes are compared only in memory."""
+    """Normalize transient row evidence; never include it in reports."""
     matched = defaultdict(dict)
+    owners = {}
     unrelated = invalid = 0
     for row in rows:
         if not isinstance(row, dict):
@@ -57,11 +59,13 @@ def _normalize(rows, marker, expected):
             continue
         prompt, completion, total = (row.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens"))
         actual_key = row.get("api_key")
+        key_valid = (isinstance(actual_key, str) and len(actual_key) == 64
+                     and all(char in "0123456789abcdef" for char in actual_key))
         complete = (all(_number(n) for n in (prompt, completion, total))
                     and prompt + completion == total and row.get("status") == "success"
-                    and isinstance(actual_key, str) and len(actual_key) == 64
-                    and all(char in "0123456789abcdef" for char in actual_key))
+                    and key_valid)
         value = {"complete": complete,
+                 "key_hash": actual_key if key_valid else None,
                  "identity_matches": bool(expected[local_id]._gateway_key_hash)
                     and actual_key == expected[local_id]._gateway_key_hash,
                  "prompt_tokens": prompt if _number(prompt) else None,
@@ -71,6 +75,11 @@ def _normalize(rows, marker, expected):
         # that changes its final usage or owner is unstable evidence.
         if previous is not None and previous != value:
             value["complete"] = False
+            invalid += 1
+        owner = owners.setdefault(gateway_id, local_id)
+        if owner != local_id:
+            matched[owner][gateway_id]["complete"] = value["complete"] = False
+            invalid += 1
         matched[local_id][gateway_id] = value
     return matched, unrelated, invalid
 
@@ -117,13 +126,14 @@ def _client(config, headers, timeout):
                              timeout=timeout, follow_redirects=False)
 
 
-async def _pages(client, url, marker, *, max_rows, stop):
+async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
     rows = []
+    pagination = None
     for page in range(1, MAX_PAGES + 1):
         if stop.is_set():
             return rows, False
         async with client.stream("GET", url, params={"session_id": marker, "page": page,
-                                                     "page_size": min(PAGE_SIZE, max_rows)}) as response:
+                "page_size": min(PAGE_SIZE, max_rows), "start_date": start_date, "end_date": end_date}) as response:
             if response.status_code in {404, 405, 501}:
                 return "unsupported", False
             if response.status_code != 200:
@@ -140,15 +150,20 @@ async def _pages(client, url, marker, *, max_rows, stop):
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                 return rows, False
             data = payload["data"]
+            pages, capped = payload.get("total_pages"), payload.get("total_is_capped", False)
+            if type(pages) is not int or pages < 0 or type(capped) is not bool:
+                return rows, False
+            if pagination is not None and pagination != (pages, capped):
+                return rows, False
+            pagination = (pages, capped)
             if len(rows) + len(data) > max_rows:
                 return rows, False
             rows.extend(data)
             if not data:
-                return rows, True
-            pages = payload.get("total_pages")
-            if type(pages) is not int or pages < 0:
+                return rows, page > pages or (page == 1 and pages <= 1)
+            if pages == 0:
                 return rows, False
-            if payload.get("total_is_capped") is not True and page >= pages:
+            if not capped and page >= pages:
                 return rows, True
     return rows, False
 
@@ -172,6 +187,7 @@ async def execute(run, target, client):
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
     marker = "giraffe-" + uuid.uuid4().hex
+    start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     records = []
     planned = settings.samples * len(settings.identities)
     run.plan_condition(target.name, CHECK, planned=planned)
@@ -188,14 +204,27 @@ async def execute(run, target, client):
                 record = await run.request(target, client, spec)
                 if record is not None:
                     records.append(record)
+    except asyncio.CancelledError:
+        records = [record for record in run.records if record.target == target.name
+                   and record.workload.get("gateway_run") == marker]
+        observation = _assess(records, {}, planned, complete=False)
+        observation.update(reason="Gateway identity probes were interrupted before attribution completed.")
+        run.observations[target.name][CHECK] = observation
+        for record in records:
+            record._gateway_key_hash = None
+        raise
     finally:
         run.finish_condition(target.name, CHECK)
     if not records:
         observation.update(state="unverified", reason="No identified requests were admitted within the run budget.", planned_requests=planned)
         return
-    deadline = min(run.deadline, time.monotonic() + settings.settle_seconds)
+    collection_started = time.monotonic()
+    deadline = min(run.deadline, collection_started + settings.settle_seconds)
+    collection_window = max(0, deadline - collection_started)
+    end_date = (datetime.now(timezone.utc) + timedelta(seconds=collection_window + 1)).strftime("%Y-%m-%d %H:%M:%S")
     attempts, previous, unstable = 0, {}, False
     assessment = _assess(records, {}, planned, complete=False)
+    run.observations[target.name][CHECK] = assessment
     expected = {record.id: record for record in records}
     try:
         with identity_scope(True):
@@ -206,31 +235,45 @@ async def execute(run, target, client):
                     attempts += 1
                     async with asyncio.timeout_at(deadline):
                         rows, complete = await _pages(reader, gateway.url, marker,
+                            start_date=start_date, end_date=end_date,
                             max_rows=run.config.metrics_max_series, stop=run.stop)
                     if isinstance(rows, str):
-                        assessment = _state(rows, "Read-only gateway spend logs are unavailable or unsupported.")
+                        assessment = _assess(records, {}, planned, complete=False)
+                        assessment.update(state=rows, reason="Read-only gateway spend logs are unavailable or unsupported.")
                         break
                     matched, unrelated, invalid = _normalize(rows, marker, expected)
                     current = {(local_id, gateway_id): value for local_id, entries in matched.items()
                                for gateway_id, value in entries.items()}
-                    unstable |= any(key not in current or (value["complete"] and current[key] != value)
-                                    for key, value in previous.items())
+                    unstable |= invalid > 0 or any(key not in current or (value["complete"] and current[key] != value)
+                                                   for key, value in previous.items())
                     previous = current
-                    assessment = _assess(records, matched, planned, complete=complete, unstable=unstable)
+                    assessment = _assess(records, matched, planned, complete=complete and invalid == 0, unstable=unstable)
                     assessment.update(unrelated_rows=unrelated, invalid_rows=invalid,
                                       collection_complete=complete, evidence_changed=unstable)
                     if assessment["state"] in {"verified", "mismatch"}:
                         break
-                    await asyncio.sleep(min(settings.settle_seconds / 4, max(0, deadline - time.monotonic())))
+                    if attempts < 3:
+                        next_read = collection_started + collection_window * .85 * attempts / 2
+                        try:
+                            await asyncio.wait_for(run.stop.wait(), timeout=max(0, next_read - time.monotonic()))
+                        except TimeoutError:
+                            pass
+                if run.stop.is_set():
+                    assessment = _assess(records, {}, planned, complete=False)
+                    assessment.update(reason="Gateway evidence collection was interrupted.")
+    except asyncio.CancelledError:
+        assessment = _assess(records, {}, planned, complete=False)
+        assessment.update(reason="Gateway evidence collection was interrupted.")
+        raise
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
         assessment.update(state="unverified", reason="Gateway evidence collection did not complete within its bounded window.")
     finally:
         # Secret-derived fingerprints are transient and never included in reports.
         for record in records:
             record._gateway_key_hash = None
-    assessment.update(collection_attempts=attempts, source="litellm_spend_logs_v2",
-        evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")
-    run.observations[target.name][CHECK] = assessment
+        assessment.update(collection_attempts=attempts, source="litellm_spend_logs_v2",
+            evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")
+        run.observations[target.name][CHECK] = assessment
 
 
 def result(run, target):

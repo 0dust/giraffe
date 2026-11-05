@@ -337,6 +337,12 @@ async def run_stage(
             })
             if run_start is not None:
                 spec.workload = {**spec.workload, "scheduled_ms": (started_at - run_start + offset) * 1000}
+            ready = time.monotonic()
+            lag_ms = max(0.0, (ready - started_at - offset) * 1000)
+            offer_lags_ms[index] = lag_ms
+            if missed_arrival(offset, ready):
+                drop(index, "dropped_late")
+                return
             record = await execute(spec, lambda record: annotate(kind, offset, lag_ms, record))
             if record is None:
                 drop(index, "not_offered")
