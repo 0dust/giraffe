@@ -3628,6 +3628,10 @@ function renderCheck(check,report) {
     const points=Object.values(m.load_types).flatMap(group=>group.points || []),sum=key=>points.reduce((total,point)=>total+(point[key] || 0),0);
     metrics.push(metric('Test points',number(points.length),counted(Object.keys(m.load_types).length,'load type')));
     metrics.push(metric('Requests completed / sent',`${number(sum('completed'))} / ${number(sum('sent'))}`,`${number(sum('failed'))} failed · ${number(sum('timed_out'))} timed out · includes drain`));
+  }else if(check.id==='gateway_access'){
+    const cases=m.gateway_access?.cases || [];
+    metrics.push(metric('Cases matched',`${cases.filter(row=>row.status==='pass').length} / ${cases.length}`,'Only declared allow and deny cases'));
+    metrics.push(metric('Unverified cases',number(cases.filter(row=>row.observed==='unverified').length),'Missing or unsupported evidence cannot confirm a decision'));
   }else if(check.id==='gateway_attribution'){
     metrics.push(metric('Attribution evidence',human(m.state || 'unverified'),'Only complete, correlated request evidence can verify attribution'));
     metrics.push(metric('Matched / observed requests',`${number(m.matched_requests || 0)} / ${number(m.observed_requests || 0)}`));

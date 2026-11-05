@@ -2215,6 +2215,9 @@ def _verdict_summary(check, config, records, budget):
         check.remediation = {"action": "review_check", "check": check.id, "code": reason or check.status}
     if check.status == "blocked" and summary.startswith("Internal error in Giraffe ("):
         return summary
+    if check.id == "gateway_access":
+        # Expected HTTP denials are policy evidence, not serving failures.
+        return summary
     if check.id == "concurrency":
         from .concurrent_load import remedies
         guidance = remedies(check.metrics, config)

@@ -33,3 +33,27 @@ const html=renderGatewayAccessResults({qualification:'Limited declared cases onl
 assert.match(html,/Expected/);assert.match(html,/Observed/);assert.match(html,/unverified/);
 assert.match(html,/Limited declared cases only/);assert.match(html,/503/);
 ''', config())
+
+
+def test_access_report_uses_case_counts_instead_of_completion_metrics():
+    browser_logic(r'''
+const check={id:'gateway_access',target:'proxy',status:'pass',required:true,summary:'Cases matched.',metrics:{gateway_access:{cases:[
+{name:'valid',identity:'allowed',expected:'allow',observed:'allow',status:'pass'},
+{name:'invalid',identity:'denied',expected:'deny',observed:'deny',status:'pass'}]}}};
+const html=renderCheck(check,{requests:[],checks:[check],manifest:{config}});
+assert.match(html,/Cases matched/);assert.match(html,/2 \/ 2/);
+assert.doesNotMatch(html,/Requests completed/);assert.doesNotMatch(html,/>0 \/ 0</);
+''', config())
+
+
+def test_expected_denial_is_not_appended_as_a_policy_failure():
+    from giraffe.models import CheckResult, RequestRecord
+    from giraffe.runner import _verdict_summary
+
+    check = CheckResult(id='gateway_access', title='Gateway access policy', target='proxy',
+        status='fail', summary='Unexpected access in declared cases.')
+    record = RequestRecord(id='denied', target='proxy', fixture_id='expected-denial',
+        scenario='gateway_access', check_ids=['gateway_access'], started_at='2026-11-06T00:00:00Z',
+        status='failed', http_status=401, error='HTTP 401')
+    summary = _verdict_summary(check, config(), [record], '')
+    assert summary == check.summary
