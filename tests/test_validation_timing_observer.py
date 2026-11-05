@@ -74,6 +74,40 @@ class BytesControl(httpx.AsyncByteStream):
             yield chunk
 
 
+@pytest.mark.parametrize("historical_api", [False, True])
+async def test_observer_tracks_request_through_identity_scope_wrapper(monkeypatch, tmp_path, historical_api):
+    from giraffe.models import RunConfig, Target
+    from tests.test_client import spec
+
+    data = (b'data: {"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}\n\n'
+            b'data: [DONE]\n\n')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=BytesControl([data]))), **kwargs))
+    target = Target(name="local", url="http://synthetic/v1", model="test")
+    log = TimingLog(tmp_path / "events.jsonl", tmp_path / "health.json", {})
+    observed_api = (SimpleNamespace(
+        LLMClient=SimpleNamespace(execute=product_client.LLMClient._execute),
+        _sse_events=product_client._sse_events) if historical_api else product_client)
+    observer = Observer(observed_api, log)
+    public_execute = product_client.LLMClient.execute
+    async with product_client.LLMClient(target, RunConfig(targets=[target])) as client:
+        try:
+            observer.install()
+            record = await client.execute(spec())
+        finally:
+            observer.uninstall()
+    health = log.close({})
+    assert record.valid and record.output == "42"
+    assert product_client.LLMClient.execute is public_execute
+    assert health["complete"] and not health["callback_errors"]
+    rows = read_rows(log.events)
+    assert {"client_timer_start", "client_timer_end", "client_body_chunk", "client_semantic_ready"} <= {
+        row["kind"] for row in rows}
+    assert {row["metadata"]["record_id"] for row in rows} == {record.id}
+    assert all(row["lower_ns"] <= row["upper_ns"] for row in rows)
+
+
 @pytest.mark.parametrize("mode", ["bundled", "fragmented_utf8", "reasoning", "error"])
 async def test_body_read_brackets_cover_actual_unchanged_sse_reader(tmp_path, mode):
     data = ('data: {"id":"known","choices":[{"delta":{"reasoning_content":"think"}}]}\r\n\r\n'

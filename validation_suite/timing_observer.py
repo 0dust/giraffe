@@ -220,7 +220,9 @@ class Observer:
         if not hasattr(sys, "monitoring"):
             raise RuntimeError("Python 3.12+ sys.monitoring is required")
         self.log = log
-        self.execute = client.LLMClient.execute.__code__
+        # The identity scope wraps execution without owning its clocks or body
+        # reader. Older clients keep those sites directly in execute.
+        self.execute = getattr(client.LLMClient, "_execute", client.LLMClient.execute).__code__
         self.sse = client._sse_events.__code__
         self.receive = _nested(self.execute, "receive")
         self.recv = asyncio.selector_events._SelectorSocketTransport._read_ready__data_received.__code__
