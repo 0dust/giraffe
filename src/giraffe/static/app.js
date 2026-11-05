@@ -1464,7 +1464,7 @@ function checkCoverageWarning(check,config) {
 }
 function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
-  if(check.id==='gateway_policy'){const s=gatewayPolicySettings(config);return `${s.capability} · ${s.users.length} identities · ${s.users.reduce((n,u)=>n+u.requests,0)} request cap · ${s.duration_seconds}s`;}
+  if(check.id==='gateway_policy'){if(!config.gateway_policy)return 'Not configured · declare identities, policy and offered work';const s=gatewayPolicySettings(config);return `${s.capability} · ${s.users.length} identities · ${s.users.reduce((n,u)=>n+u.requests,0)} request cap · ${s.duration_seconds}s`;}
   if(check.id==='gateway_attribution'){const s=config.gateway_attribution;return s?.identities?.length?`${s.identities.length} identities · ${s.samples ?? 2} samples each · bounded read-only evidence`:'Not configured · select identities and an evidence endpoint in JSON';}
   if(check.id==='multi_user'){const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);return `${s.levels.join(' → ')} users · ${config.concurrency==null?'No shared request ceiling':`${config.concurrency} shared request slots`} · ${s.duration_seconds}s per level`; }
   const parts=[];
