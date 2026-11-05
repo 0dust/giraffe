@@ -235,13 +235,14 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | JSON correctness · `json` | Expected fields, types and values |
 | Cancellation & limits · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
 | Recovery after load · `recovery` | Heavy traffic followed by matched light probes |
+| Scale-down continuity · `scale_down` | Active responses, backend draining and survivor capacity during one external replica removal |
 | GPU metrics · `gpu` | Available GPU telemetry |
 | Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
 | Tool calling · `tools` | Tool-call structure, names and expected arguments |
 
-The catalog has 13 verdict checks and two server observations: **GPU metrics** and
+The catalog has 14 verdict checks and two server observations: **GPU metrics** and
 **Prefix cache**. Both remain in the selected checks and baseline configuration.
 Missing GPU telemetry and missing or inactive prefix caching do not change the
 verdict. GPU hardware faults and an exceeded configured temperature limit can
@@ -272,3 +273,16 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 [Report an issue](https://github.com/0dust/giraffe/issues) with your Giraffe version, engine/model and reproduction steps. Remove API keys and private prompts or answers before sharing reports.
 
 [Contributing](https://github.com/0dust/giraffe/blob/main/CONTRIBUTING.md) · [Apache 2.0 license](https://github.com/0dust/giraffe/blob/main/LICENSE)
+
+### Observe an external scale-down
+
+The opt-in `scale_down` check keeps streamed answers active while you remove one
+replica externally, then reports **client-visible continuity**, **backend drain
+semantics** and **remaining capacity** separately. Start with
+[`examples/scale-down.yaml`](examples/scale-down.yaml) and the
+[operator workflow](docs/running.md#scale-down-continuity).
+A read-only lifecycle exporter and a representative long-answer fixture are
+needed for complete coverage. Missing evidence stays inconclusive; successful
+traffic alone does not establish graceful draining. Giraffe does not provision or
+remove replicas. Controlled HTTP tests are available; qualification on a real
+multi-replica deployment is still pending.

@@ -203,7 +203,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
     if(['check','setup_goal','setup_load','request_source','session_pause_mode'].includes(name))continue;
     assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
   }}
-  assert.equal(controls.filter(input=>input.name==='check').length,15);
+  assert.equal(controls.filter(input=>input.name==='check').length,16);
   for(const name of ['max_requests','max_duration_seconds'])assert(controls.some(input=>input.name===name));
   if(preset==='concurrent'){{
     assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);

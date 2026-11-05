@@ -524,7 +524,7 @@ function renderFlightPlan(plan) {
   const rows=(plan.rows || []).filter(r=>r.requests_per_target!==0),max=Math.max(1,...rows.map(r=>r.requests_per_target || 0));
   return `<div class="flight-plan"><div class="viz-heading"><h3>Flight plan</h3><span class="hint">Per endpoint</span></div>${rows.map(r=>`<div class="flight-row"><div><span>${escape(checkGuide[r.id]?catalogTitle(r.id):r.title)}</span><span class="mono">${r.requests_per_target==null?(r.kind==='duration'?'Duration-based':'Adaptive'):`${r.kind==='estimate'?'~':''}${number(r.requests_per_target)}`}</span></div><div class="flight-track ${r.requests_per_target==null?'adaptive':''}">${r.requests_per_target==null?'':`<span style="width:${r.requests_per_target/max*100}%"></span>`}</div></div>`).join('')}</div>`;
 }
-const phaseNames={"initial":"First request","readiness":"Readiness","warm":"Warm-up","short":"Short requests","long":"Long requests","generation":"Generation speed","context":"Long-context recall","correctness":"Answer correctness","json":"Structured JSON","sustained":"Sustained load","recovery":"Recovery check","recovery_baseline":"Recovery baseline","recovery_prime":"Recovery preparation","limits":"Output limits","stop_control":"Stop-sequence baseline","client_cancel":"Client cancellation","client_deadline":"Client deadline","backend_cancel":"Server cancellation","backend_cancel_control":"Server cancellation baseline","backend_cancel_followup":"Server cancellation follow-up","cancellation_probe":"Cancellation probes","cancellation_baseline":"Cancellation baseline","fairness":"Mixed long/short fairness","fairness_baseline":"Short requests alone","fairness_short":"Short requests with competing load","fairness_long":"Competing long requests","pack_control":"Quiet baseline","pack_loaded":"Your questions under load","request_pack":"Your questions","arrival":"Scheduled arrivals","mixed_control":"Short-request baseline","prefix_shared":"Shared prefix","prefix_independent":"Independent prefixes","prefix_history":"Growing conversation history","consistency":"Repeated-request consistency","judging":"AI evaluation","connection":"Connection","deadline_probe":"Client deadline"};
+const phaseNames={"scale_down_baseline":"Scale-down baseline","scale_down_long":"Active answers during removal","scale_down_followup":"Traffic during and after removal","initial":"First request","readiness":"Readiness","warm":"Warm-up","short":"Short requests","long":"Long requests","generation":"Generation speed","context":"Long-context recall","correctness":"Answer correctness","json":"Structured JSON","sustained":"Sustained load","recovery":"Recovery check","recovery_baseline":"Recovery baseline","recovery_prime":"Recovery preparation","limits":"Output limits","stop_control":"Stop-sequence baseline","client_cancel":"Client cancellation","client_deadline":"Client deadline","backend_cancel":"Server cancellation","backend_cancel_control":"Server cancellation baseline","backend_cancel_followup":"Server cancellation follow-up","cancellation_probe":"Cancellation probes","cancellation_baseline":"Cancellation baseline","fairness":"Mixed long/short fairness","fairness_baseline":"Short requests alone","fairness_short":"Short requests with competing load","fairness_long":"Competing long requests","pack_control":"Quiet baseline","pack_loaded":"Your questions under load","request_pack":"Your questions","arrival":"Scheduled arrivals","mixed_control":"Short-request baseline","prefix_shared":"Shared prefix","prefix_independent":"Independent prefixes","prefix_history":"Growing conversation history","consistency":"Repeated-request consistency","judging":"AI evaluation","connection":"Connection","deadline_probe":"Client deadline"};
 const phasePurposes={"concurrency":"Measures response quality, timing and evidenced concurrency for each duration-based test point.","access":"Checks that the server is reachable and can answer a request.","serving":"Checks that the server returns valid answers reliably.","generation":"Measures how quickly the server generates an answer.","context":"Checks whether the model can recall facts from a long input.","correctness":"Checks answers against the expected answers for different questions.","json":"Checks whether answers follow the required JSON structure.","recovery":"Checks whether normal answers return after sustained heavy traffic.","cancellation":"Checks request limits, cancellation, and the server's ability to keep serving afterwards.","fairness":"Checks whether competing long requests delay short answers.","mixed":"Checks whether a heavy partner delays a short request before or during its answer.","prefix":"Compares serving behavior when requests share an input prefix or use independent prefixes.","arrivals":"Checks whether the server keeps up with requests sent on a fixed schedule.","capacity":"Measures how many requests the server can handle at the configured arrival rate.","buckets":"Checks serving speed and reliability for this input size, output cap, and number of simultaneous requests.","token_stress":"Checks serving behavior with a large input or a long generated answer under load.","consistency":"Checks whether repeated copies of each prompt produce consistent answers under load.","sessions":"Checks whether answers stay correct as conversation history grows across turns.","tools":"Checks whether the model selects tools and uses their results correctly.","judging":"Asks an AI evaluator to check a recorded answer against its expected answer."};
 const phaseChecks={"initial":"access","readiness":"access","warm":"serving","short":"serving","long":"serving","generation":"generation","context":"context","correctness":"correctness","json":"json","sustained":"recovery","recovery":"recovery","recovery_baseline":"recovery","recovery_prime":"recovery","limits":"cancellation","stop_control":"cancellation","client_cancel":"cancellation","client_deadline":"cancellation","backend_cancel":"cancellation","backend_cancel_control":"cancellation","backend_cancel_followup":"cancellation","cancellation_probe":"cancellation","cancellation_baseline":"cancellation","fairness":"fairness","fairness_baseline":"fairness","fairness_short":"fairness","fairness_long":"fairness","pack_control":"correctness","pack_loaded":"correctness","request_pack":"correctness","arrival":"arrivals","mixed_control":"mixed","prefix_shared":"prefix","prefix_independent":"prefix","prefix_history":"prefix","consistency":"consistency","judging":"judging","connection":"access","deadline_probe":"cancellation"};
 const plainName=value=>String(value).replaceAll('_',' ').replaceAll('-',' ').toLowerCase().replace(/^./,c=>c.toUpperCase());
@@ -754,7 +754,7 @@ async function runEvents(id, after=0) {
   finally{if(state.eventAbort===controller)state.eventAbort=null;}
 }
 function mergeRunEvents(detail, delta) {
-  const events=delta.events || [],keys=['state','progress','live_request_count','live_request_summary','live_preparations','phases','error','abort_reason'];
+  const events=delta.events || [],keys=['state','progress','live_request_count','live_request_summary','live_preparations','phases','error','abort_reason','scale_down_control'];
   for(const event of events)for(const key of keys)if(Object.hasOwn(event,key))detail[key]=event[key];
   for(const key of keys)if(Object.hasOwn(delta,key))detail[key]=delta[key];
   detail.seq=delta.seq;
@@ -1124,7 +1124,7 @@ function settingDestination(path) {
   let name=path,check=null,step=2;
   if(['checks','request_pack','judging'].includes(path))return {name:path,label:{checks:'checks',request_pack:'questions',judging:'AI evaluator'}[path],step};
   if(['samples','max_output_tokens','context_limit','default_concurrency'].includes(path))return {name:'config_editor',label:human(path).toLowerCase(),step};
-  const sections={load_test:'load',concurrent_load:'concurrency',sessions:'sessions',consistency:'consistency',arrivals:'arrivals',prefix:'prefix',traffic:'capacity',tool_checks:'tools'};
+  const sections={scale_down:'scale_down',load_test:'load',concurrent_load:'concurrency',sessions:'sessions',consistency:'consistency',arrivals:'arrivals',prefix:'prefix',traffic:'capacity',tool_checks:'tools'};
   if(parts.length===1&&sections[root]||root==='test_options'&&parts.length===2)return {section:true,check:sections[root]||parts[1],step,label:root==='test_options'?`${human(parts[1]).toLowerCase()} settings`:`${human(sections[root]).toLowerCase()} settings`};
   if(root==='stream'){step=1;}
   else if(root==='retention'){step=3;}
@@ -1144,6 +1144,7 @@ function settingDestination(path) {
     name=loadFieldName(parts.join('.'));
     return {name,check,step,label:loadFieldLabel(parts.slice(1).join('.'))};
   }
+  else if(root==='scale_down'){check='scale_down';name=`scale_down_${parts[1]}`;}
   else if(root==='test_options'){check=parts[1];name=check==='correctness'&&state.config?.request_source==='request_pack'&&parts[2]!=='limits'?'request_pack_correctness':`test_${check}_${parts.slice(2).join('_').replace('limits_','limit_')}`;}
   else if(root==='sessions'&&parts[1]==='sampling'){
     check='sessions';name=parts[2]==='seed'?'session_sampling_seed':`session_${parts[3]==='weights'?'weights':'sample'}_${parts[2]||'think_time_seconds'}`;
@@ -1321,6 +1322,7 @@ function loadSettingPath(name) {
   const path=paths.find(path=>loadFieldName(path)===name);return path?'load_test.'+path:name;
 }
 function settingPath(name) {
+  if(name.startsWith('scale_down_'))return 'scale_down.'+name.slice(11);
   const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
   if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
   if(name.startsWith('load_'))return loadSettingPath(name);
@@ -1379,10 +1381,11 @@ function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder
 const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load']},
-  {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency']},
+  {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency','scale_down']},
   {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu']},
 ];
 const checkGuide={
+  scale_down:{name:'Scale-down continuity',purpose:'Observe active answers during an external replica removal.',sends:'A long streaming cohort and bounded follow-up traffic.',shows:'Client-visible continuity, backend drain semantics and remaining capacity separately.',needs:'Streaming, at least two replicas, and read-only lifecycle evidence'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
   serving:{name:'Invalid responses',purpose:'Look for errors, empty answers and incomplete responses.',sends:'Repeated short requests; also inspects responses from the selected checks.',shows:'Invalid responses, timeouts and server errors against your allowed error rate.'},
@@ -1409,6 +1412,7 @@ function profileDefaults(key,config=state.config) {return effectiveProfileDefaul
 function catalogTitle(id) {return checkGuide[id]?.name || human(id);}
 function renderProfileEditor(check,config) {
   const key=check.id;
+  if(key==='scale_down')return renderScaleDownEditor(config);
   if(key==='load')return renderLoadEditor(config);
   if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
@@ -1448,6 +1452,7 @@ function checkCoverageWarning(check,config) {
 }
 function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
+  if(check.id==='scale_down'){const s=scaleDownSettings(config);return `${s.target} · ${s.long_cohort_size} long streams · ${s.requests_per_second} follow-up requests/s · ${s.grace_seconds}s grace from ${human(s.grace_anchor)}`;}
   const parts=[];
   const timeout=check.id==='load'?loadSettings(config).request_timeout_seconds:check.id==='gpu'?null:optionValue(config,check,'request_timeout_seconds') ?? config.request_timeout_seconds;
   if(timeout!=null)parts.push(`Request timeout ${elapsed(timeout)}`);
@@ -1537,6 +1542,7 @@ function renderCheckSelection(config) {
   </div></section>`;
 }
 function testSettingsLabel(check,config) {
+  if(check.id==='scale_down')return config.scale_down?(config.checks.includes('scale_down')?'Configured':'Saved draft'):'';
   const custom=Object.keys(config.test_options?.[check.id] || {}).length>0||
     (check.id==='capacity'&&!sameConfig(config.traffic,state.bootstrap.config.traffic))||
     (check.id==='load'&&!sameConfig(loadSettings(config),loadSettings({...config,load_test:null})));
@@ -1667,6 +1673,58 @@ function renderTestCard(check,config) {
   ${criteria?`${criteriaFields.length>1?'<h4>Pass criteria</h4>':''}<fieldset class="fields check-criteria-fields">${criteria}</fieldset>`:''}
   ${moreCriteria?`<details class="check-advanced"><summary>More pass criteria</summary><fieldset class="fields">${moreCriteria}</fieldset></details>`:''}</div>
   <div class="test-editor-footer"><button type="button" class="button small" data-done-test="${check.id}">Done</button></div></div></section>`;
+}
+
+function scaleDownSettings(config) {
+  const schema=state.bootstrap.config_schema.$defs.ScaleDownConfig;
+  return {...Object.fromEntries(Object.entries(schema.properties).filter(([,v])=>Object.hasOwn(v,'default')).map(([key,v])=>[key,v.default])),target:config.targets?.[0]?.name||'',...config.scale_down};
+}
+function configureScaleDown(config,data) {
+  const defaults=scaleDownSettings({...config,scale_down:null}),settings=scaleDownSettings(config),schema=state.bootstrap.config_schema.$defs.ScaleDownConfig;
+  for(const [key,property] of Object.entries(schema.properties))if(data.has(`scale_down_${key}`)){
+    const value=data.get(`scale_down_${key}`);
+    settings[key]=['integer','number'].includes(property.type)?(value===''?null:Number(value)):String(value).trim();
+  }
+  return config.scale_down||config.checks.includes('scale_down')||!sameConfig(settings,defaults)?{...config,scale_down:settings}:config;
+}
+function renderScaleDownEditor(config) {
+  const settings=scaleDownSettings(config),schema=state.bootstrap.config_schema.$defs.ScaleDownConfig;
+  const labels={target:'Endpoint',long_fixture:'Long-answer fixture ID',followup_fixture:'Follow-up fixture ID',requests_per_second:'Follow-up requests per second',concurrency:'Concurrent requests',long_cohort_size:'Long streams held open',min_baseline_samples:'Minimum baseline answers',min_overlap_samples:'Minimum overlapping answers',min_post_samples:'Minimum post-removal answers',baseline_timeout_seconds:'Baseline / arming timeout (seconds)',event_timeout_seconds:'Wait for removal (seconds)',grace_seconds:'Expected grace (seconds)',grace_anchor:'Grace starts at',post_seconds:'Post-removal traffic (seconds)',completion_seconds:'Final completion allowance (seconds)'};
+  const primary=['target','long_fixture','followup_fixture','requests_per_second','concurrency','long_cohort_size','grace_seconds','grace_anchor'];
+  const render=key=>key==='target'?selectField('scale_down_target',labels.target,(config.targets||[]).map(target=>`<option value="${escape(target.name)}" ${target.name===settings.target?'selected':''}>${escape(target.name)}</option>`).join('')):schemaField(`scale_down_${key}`,settings[key],schema.properties[key],{label:labels[key],hint:''});
+  return `<p>You remove a replica externally. Giraffe only observes traffic and records your marker. Only real answer streams can arm the scenario; a marker is not backend confirmation.</p><fieldset class="fields">${primary.map(render).join('')}</fieldset><details class="check-advanced"><summary>Sample requirements and observation windows</summary><fieldset class="fields">${Object.keys(schema.properties).filter(key=>!primary.includes(key)).map(render).join('')}</fieldset></details><p class="hint">The run's response-time, stream-pause and correctness limits apply. Global request, duration and concurrency limits can leave coverage inconclusive. Fixture IDs must exist in the configured fixture pack.</p>`;
+}
+const scaleDownLabels={continuity:'Client-visible continuity',drain:'Backend drain semantics',capacity:'Remaining capacity'};
+function renderScaleDownResults(check,report) {
+  const evidence=report.observations?.targets?.[check.target]?.scale_down||{},records=new Map((report.requests||[]).map(record=>[record.id,record])),links=ids=>(ids||[]).map(id=>records.has(id)?`<button type="button" class="text-button" data-request="${escape(id)}">${escape(id)}</button>`:`${escape(id)} (no client record)`).join(' ');
+  const rows=Object.entries(scaleDownLabels).map(([key,label])=>{const result=check.metrics?.results?.[key]||{};return `<section class="check-detail-head"><div class="check-detail-heading"><h3>${label}</h3>${badge(result.status||'inconclusive')}</div><p>${escape(result.summary||'No result recorded.')}</p>${result.limitations?.length?`<ul>${result.limitations.map(value=>`<li>${escape(value)}</li>`).join('')}</ul>`:''}<p>${links(result.request_ids)}</p>${result.evidence_ids?.length?`<p class="hint">Evidence IDs: ${escape(result.evidence_ids.join(', '))}</p>`:''}</section>`;}).join('');
+  const marker=evidence.marker,seen=new Set();
+  const snapshots=(evidence.snapshots||[]).map(snapshot=>{const source=snapshot.export||{},events=(source.events||[]).filter(event=>{const key=JSON.stringify([source.source,source.clock_id,event]);if(seen.has(key))return false;seen.add(key);return true;});return `<section><h4>${escape(source.source)} · clock ${escape(source.clock_id)}</h4><p class="hint">Collected at runner offsets ${escape(snapshot.collected_start_ms)}–${escape(snapshot.collected_end_ms)} ms · mapped capture ${escape(snapshot.capture_start_ms??'unknown')}–${escape(snapshot.capture_end_ms??'unknown')} ms · source capture ${escape(source.captured_at??'unknown')} · uncertainty ${escape(source.clock_uncertainty_ms??'unknown')} ms</p><ul>${events.map(event=>`<li>${escape(event.event_id)} · ${escape(human(event.kind))} · sequence ${escape(event.sequence)} · source time ${escape(event.time_ms)} ms · replica ${escape(event.replica_id)}${event.request_id?` · ${links([event.request_id])} · attempt ${escape(event.attempt_id)} · ${escape(event.outcome||'')}`:''}</li>`).join('')}</ul><details><summary>Inventory and coverage</summary><pre>${escape(JSON.stringify({inventories:source.inventories,coverage:source.coverage},null,2))}</pre></details></section>`;}).join('');
+  const timings=(report.requests||[]).filter(record=>record.target===check.target&&record.check_ids?.includes('scale_down')).map(record=>`<tr><td>${links([record.id])}</td><td>${escape(record.status)} · ${escape(record.finish_reason||'no finish reason')}</td><td>${ms(record.dispatch_ms)}</td><td>${ms(evidence.answer_started_ms?.[record.id])}</td><td>${ms(record.completed_ms)}</td></tr>`).join('');
+  return `${rows}<details><summary>Event timeline and request cohorts</summary><p>Operator intent is not backend confirmation. Runner offsets and source clocks are separate; rows do not establish ordering across clocks.</p>${marker?`<p>Marker ${escape(marker.event_id)} · ${escape(marker.source)} · intended replica ${escape(marker.replica_id||'unspecified')} · operator time ${escape(marker.operator_at||'not supplied')} · runner receipt ${escape(evidence.marker_received_ms??'unknown')} ms · accepted ${escape(evidence.marker_accepted_ms??'unknown')} ms</p>`:'<p>No accepted operator marker recorded.</p>'}<p>Runner offsets (ms): armed ${escape(evidence.armed_ms??'unknown')}; post window ${escape(evidence.post_started_ms??'unknown')}–${escape(evidence.post_ended_ms??'unknown')}.</p>${[['baseline_request_ids','Baseline'],['long_request_ids','Active answer cohort'],['followup_request_ids','Follow-up traffic']].map(([key,label])=>`<p>${label}: ${links(evidence[key])}</p>`).join('')}${timings?`<div class="request-table-scroll"><table><thead><tr><th>Request</th><th>Outcome</th><th>Dispatch offset</th><th>First answer offset</th><th>Completion offset</th></tr></thead><tbody>${timings}</tbody></table></div>`:''}${snapshots}<p>${escape((evidence.limitations||[]).join('; '))}</p></details>`;
+}
+function renderScaleDownControl(detail) {
+  const control=detail.scale_down_control;if(!control)return '';
+  const local=state.scaleDownSubmission?.id===detail.id?state.scaleDownSubmission:null,ack=control.acknowledgment?.accepted===true?control.acknowledgment:local?.ack||control.acknowledgment;
+  const standalone=detail.stoppable===false&&activeState(detail);
+  const active=detail.stoppable!==false&&detail.state==='running'&&control.phase==='armed'&&!ack?.accepted;
+  return `<section class="panel" id="scale-down-control" data-live-key="scale-down-control"><h2>Scale-down continuity · ${escape(human(control.phase))}</h2><p>Only real answer streams arm this scenario. Remove the replica externally. A marker is not backend confirmation; final results require lifecycle evidence and sufficient overlap.</p>${standalone?'<p class="hint">This run is owned by a standalone CLI process. Mark the removal with <code>giraffe mark-scale-down &lt;run-directory&gt; --event-id &lt;unique-event-id&gt;</code>, using the active run directory and a unique event ID.</p>':''}${active?`<div class="fields">${field('scale_down_replica_marker','Intended replica incarnation (optional)',local?.marker?.replica_id||'',{})}${field('scale_down_marker_source','Operator source',local?.marker?.source||'browser',{})}</div><button type="button" class="button" data-action="mark-scale-down" ${local?.pending?'disabled':''}>${local?.pending?'Submitting…':'Mark removal'}</button>`:''}<p role="status" aria-live="polite">${ack?`${ack.accepted===true?'Accepted':'Rejected'}: ${escape(ack.reason||(ack.accepted===true?'Removal marker recorded.':'Marker was not accepted.'))}`:local?.error?escape(local.error):'No marker accepted.'}</p></section>`;
+}
+async function markScaleDown() {
+  const detail=state.detail,control=detail?.scale_down_control,version=state.routeVersion;
+  if(detail?.stoppable===false||detail?.state!=='running'||control?.phase!=='armed'||(state.scaleDownSubmission?.id===detail.id&&state.scaleDownSubmission.pending))return;
+  const previous=state.scaleDownSubmission?.id===detail.id?state.scaleDownSubmission:null;
+  const marker=previous?.retrySameMarker&&previous.marker?.nonce===control.nonce?previous.marker:{event_id:globalThis.crypto?.randomUUID?.()||`browser-${Date.now()}-${Math.random().toString(16).slice(2)}`,nonce:control.nonce,target:control.target,replica_id:$('#field-scale_down_replica_marker')?.value?.trim()||null,source:$('#field-scale_down_marker_source')?.value?.trim()||'browser',operator_at:new Date().toISOString()};
+  state.scaleDownSubmission={id:detail.id,pending:true,marker};renderLive();
+  try{
+    const ack=await api(`/api/runs/${encodeURIComponent(detail.id)}/scale-down/event`,{method:'POST',body:JSON.stringify(marker)});
+    if(state.scaleDownSubmission?.id===detail.id)state.scaleDownSubmission={id:detail.id,marker,ack};
+  }catch(error){
+    const retrySameMarker=error.status==null||error.status>=500||error.status===408;
+    const message=retrySameMarker?`Acknowledgment unavailable: ${error.message}. Retry to check the same marker.`:`Marker rejected: ${error.message}${error.status===422?'. Correct the fields and submit again.':''}`;
+    if(state.scaleDownSubmission?.id===detail.id)state.scaleDownSubmission={id:detail.id,marker,retrySameMarker,error:message};
+  }
+  if(state.reportRouteActive&&version===state.routeVersion&&reportRoute()?.id===detail.id&&state.detail?.id===detail.id&&state.detail.state==='running')renderLive();
 }
 
 const loadSizes=['short','medium','long'];
@@ -2764,7 +2822,7 @@ function readForm(allowEmpty=false) {
   // Disabled editors still retain their values when a test is unchecked.
   for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea')){if(input.type==='radio'&&!input.checked)continue;data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);}
   if(!config.targets?.length)throw new Error('Configuration must contain at least one target.');
-  const first=config.targets[0];for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
+  const first=config.targets[0],previousTargetName=first.name;for(const key of ['url','model','name'])first[key]=String(data.get(key) || '').trim();
   if(form.elements.api_key_env)first.api_key_env=form.elements.api_key_env.value.trim() || (apiKeyFor(first.url)?'GIRAFFE_API_KEY':null);
   if(form.elements.metrics_url)first.metrics_url=form.elements.metrics_url.value.trim() || null;
   first.tokenizer=tokenizerChoice();
@@ -2780,6 +2838,8 @@ function readForm(allowEmpty=false) {
   config=configureTests(config,data,state.bootstrap.checks,state.bootstrap.config.traffic,{allowEmpty,allowInvalid:allowEmpty,percentageInputs:true,limits:state.bootstrap.limits});
   if(form.elements.load_patterns_concurrent_levels?.dataset.inherited==='true')data.set('load_patterns_concurrent_levels',loadSettings(config).patterns.concurrent.levels.join(', '));
   config=configureLoadTest(config,data,loadFormDefaults(config),{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
+  if(data.get('scale_down_target')===previousTargetName)data.set('scale_down_target',first.name);
+  config=configureScaleDown(config,data);
   config=configureJudging(config,data,{allowInvalid:allowEmpty});
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
@@ -3547,7 +3607,7 @@ function renderChecks(report) {
   const item=c=>{
     const key=`${c.target}:${c.id}`,excerpts=inlineAnswerRequests(c,report);
     const reason=shortReason(c.summary);
-    return `<article class="panel finding-check ${escape(c.status)}" data-finding="${escape(key)}"><div class="finding-check-heading"><h2><button class="text-button" data-check="${escape(key)}" aria-pressed="${state.selectedCheck===key}">${escape(checkGuide[c.id]?.name || c.title)}${(reportConfig(report).targets||[]).length>1?` · ${escape(c.target)}`:''}</button></h2>${badge(c.status)}</div><p class="finding-check-reason">${escape(reason.summary)}</p>${reason.rest?`<details><summary>Details</summary><p>${escape(reason.rest)}</p></details>`:''}${excerpts.length?`<div class="finding-requests">${excerpts.map(r=>`<div class="finding-request"><div class="finding-question"><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small></div>${renderInlineAnswer(r,report)}</div>`).join('')}</div>`:''}${state.selectedCheck===key?`<div class="finding-expanded check-detail">${renderCheck(c,report)}</div>`:''}</article>`;
+    return `<article class="panel finding-check ${escape(c.status)}" data-finding="${escape(key)}"><div class="finding-check-heading"><h2><button class="text-button" data-check="${escape(key)}" aria-pressed="${state.selectedCheck===key}">${escape(checkGuide[c.id]?.name || c.title)}${(reportConfig(report).targets||[]).length>1?` · ${escape(c.target)}`:''}</button></h2>${badge(c.status)}</div><p class="finding-check-reason">${escape(reason.summary)}</p>${reason.rest?`<details><summary>Details</summary><p>${escape(reason.rest)}</p></details>`:''}${excerpts.length?`<div class="finding-requests">${excerpts.map(r=>`<div class="finding-request"><div class="finding-question"><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small></div>${renderInlineAnswer(r,report)}</div>`).join('')}</div>`:''}${c.id==='scale_down'?renderScaleDownResults(c,report):''}${state.selectedCheck===key&&c.id!=='scale_down'?`<div class="finding-expanded check-detail">${renderCheck(c,report)}</div>`:''}</article>`;
   };
   return `<div class="findings" id="failing-requests" tabindex="-1"><p class="hint check-count">${number(selected.length)} checks · ${number(attention.length)} need attention · ${number(passed.length)} passed</p>${attention.map(item).join('')}${passed.length?`<details class="passed-checks" ${!attention.length||passed.some(c=>`${c.target}:${c.id}`===state.selectedCheck)?'open':''}><summary>Passed checks · ${passed.length}</summary>${passed.map(item).join('')}</details>`:''}${unselected.length?`<details class="checks-not-selected"><summary>Not selected: ${unselected.map(c=>escape(checkGuide[c.id]?.name || c.title)).join(', ')}</summary><p>No traffic was sent for these checks.</p></details>`:''}${!selected.length?'<p>No selected checks produced a result.</p>':''}</div>`;
 }
@@ -3562,6 +3622,7 @@ function renderCancellationResults(metrics){
   }).join('');
 }
 function renderCheck(check,report) {
+  if(check.id==='scale_down')return renderScaleDownResults(check,report);
   const m=check.metrics || {},config=reportConfig(report),recordedLimits=report.manifest?.effective_checks?.[check.id]?.limits;
   const limits=recordedLimits || {...(config.limits || {}),...(config.test_options?.[check.id]?.limits || {})};
   const defaultLimits=report.manifest?.default_check_limits?.[check.id] || [];
@@ -3802,7 +3863,7 @@ function renderLive() {
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
   patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
   ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
-  ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
+  ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderScaleDownControl(d)}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
 </section>
   <details class="panel live-activity"><summary>Activity · last 5 events</summary><div class="event-list">${[...events].reverse().slice(0,5).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(({request_started:'Request sent',request_completed:'Response received',run_started:'Run started',run_stopping:'Stopping run',run_completed:'Run complete',judging_started:'Answer evaluation started',judging_progress:'Evaluating answers'})[e.event] || human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span></div>`).join('')||'<p class="hint">Preparing the first requests…</p>'}</div></details></div>
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderDiagnostics(d.report,d)}</section>`,{landing:true});
@@ -4174,6 +4235,7 @@ document.addEventListener('click',async(event)=>{
     const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});return;}
   const request=event.target.closest('[data-request]');if(request){openRequest(request.dataset.request);return;}
   const action=event.target.closest('[data-action]')?.dataset.action;
+  if(action==='mark-scale-down'){await markScaleDown();return;}
   if(action==='refresh-performance'){loadPerformance({force:true});return;}
   if(action==='back-to-test'){closeRequestEvidence();return;}
   if(action==='storage-dialog'){openStorageDialog();return;}

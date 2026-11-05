@@ -361,3 +361,62 @@ tokenizer. Explicitly configuring an HF tokenizer without the extra fails with
 an install hint; automatic resolution silently falls back to built-in sizing.
 The UI verifies a typed **Token ID / tokenizer** before continuing. **Automatic**
 and **builtin** need no setup check; Automatic resolves when the run starts.
+
+## Scale-down continuity
+
+Use `examples/scale-down.yaml` for an existing endpoint with at least two replica
+incarnations. Set its model, inference URL and read-only `collector_url`, and
+choose traffic and grace settings appropriate to that deployment. The
+[workload guide](workloads.md#scale-down-continuity) specifies the evidence schema
+and fixture requirements.
+
+```sh
+giraffe validate --config examples/scale-down.yaml
+giraffe preview --config examples/scale-down.yaml
+giraffe run --config examples/scale-down.yaml --html
+```
+
+Preview reports the scenario's worst-case request/time allowance and any tighter
+global limits. During the run, wait for **armed**: baseline answers succeeded and
+real long-answer text has arrived. Keep those answers active through the removal.
+The operator performs one removal externally and marks it in the active run;
+Giraffe never chooses, provisions or deletes a replica. The marker is intent, not
+proof that draining or process termination occurred.
+
+For a standalone CLI run, use its live run directory:
+
+```sh
+giraffe mark-scale-down RUN_DIR --event-id removal-1 --replica-id REPLICA_INCARNATION --source operator --wait-seconds 5
+```
+
+The command reads the live nonce and target, submits a bounded atomic marker, and
+waits for the worker acknowledgment. **Accepted**, **rejected** and
+**submitted without acknowledgment** are different outcomes. Repeating an
+accepted event returns its original acknowledgment; a conflicting event cannot
+replace it. An early rejection can be retried with the same event ID after the
+scenario arms, and the retry waits for its own worker acknowledgment. An unarmed,
+finished, wrong-target or old-nonce submission is rejected. One marker is accepted
+per scenario.
+
+In the UI, configure the scale-down check, wait for its armed state and use
+**Mark removal**. The API equivalent is
+`POST /api/runs/{identifier}/scale-down/event`; use the current `nonce` and `target`
+from live run status, with this JSON body:
+
+```json
+{"event_id":"removal-1","nonce":"CURRENT_RUN_NONCE","target":"service","replica_id":"REPLICA_INCARNATION","source":"operator"}
+```
+
+`replica_id` is optional when unknown; complete backend evidence must still
+identify one removed incarnation. Optional `operator_at` records operator time;
+the CLI equivalent is `--operator-at 2026-11-05T12:34:56+00:00`. It defaults to
+null; use the same timestamp when retrying an accepted event. Worker receipt and
+acceptance times remain separate. Existing API authentication
+and origin restrictions apply.
+
+Inspect all three result rows and their request/event evidence in the live view
+and saved report. A failed original response remains a failure even if subsequent
+traffic succeeds. A client budget cancellation is labeled separately. Historical
+reproduction preserves the prior evidence but starts with a fresh nonce and
+requires a new external event. Automatic baseline comparison between different
+external removals is unsupported.

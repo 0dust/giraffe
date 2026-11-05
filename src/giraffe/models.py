@@ -31,6 +31,7 @@ CHECK_NAMES = {
     "first_output": "Time to first answer",
     "generation": "Generation speed",
     "load": "Load test",
+    "scale_down": "Scale-down continuity",
     "context": "Long-context recall",
     "correctness": "Answer correctness",
     "json": "JSON correctness",
@@ -44,7 +45,7 @@ CHECK_NAMES = {
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
-               "correctness", "json", "cancellation", "recovery", "gpu")
+               "correctness", "json", "cancellation", "recovery", "gpu", "scale_down")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
 # Saved pre-v2 files with no selection retain their historical workload.
 _LEGACY_DEFAULT_CHECKS = ("access", "serving", "first_output", "generation", "load",
@@ -870,6 +871,8 @@ def required_concurrency(config) -> dict[str, Any]:
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
             peak = max([1, *config.consistency.levels])
+        elif check == "scale_down" and config.scale_down:
+            peak = config.scale_down.concurrency
         elif check == "load":
             from giraffe.load_test import required_slots
             peak = required_slots(config)
@@ -1939,6 +1942,178 @@ class RequestJudgement(PersistedModel):
     votes: list[JudgeVote] = Field(default_factory=list)
 
 
+class ScaleDownConfig(Model):
+    """One externally controlled replica removal with finite traffic windows."""
+    target: str = Field(min_length=1, max_length=256)
+    long_fixture: str = Field(default="generation.copy.v1", min_length=1, max_length=256)
+    followup_fixture: str = Field(default="short.copy.v2", min_length=1, max_length=256)
+    requests_per_second: float = Field(default=1, gt=0, le=MAX_TRAFFIC_RATE)
+    concurrency: int = Field(default=4, ge=2, le=MAX_SIMULTANEOUS_REQUESTS, strict=True)
+    long_cohort_size: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS - 1, strict=True)
+    min_baseline_samples: int = Field(default=2, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True)
+    min_overlap_samples: int = Field(default=1, ge=1, le=MAX_SIMULTANEOUS_REQUESTS - 1, strict=True)
+    min_post_samples: int = Field(default=5, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True)
+    baseline_timeout_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
+    event_timeout_seconds: float = Field(default=120, gt=0, le=MAX_STAGE_SECONDS)
+    grace_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
+    grace_anchor: Literal["removal_requested", "drain_effective"] = "drain_effective"
+    post_seconds: float = Field(default=10, gt=0, le=MAX_STAGE_SECONDS)
+    completion_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
+
+    @model_validator(mode="after")
+    def bounded_scenario(self):
+        if self.concurrency <= self.long_cohort_size:
+            raise ValueError("scale_down concurrency must leave at least one slot beyond the long cohort")
+        if self.max_sending_seconds > MAX_STAGE_SECONDS:
+            raise ValueError("scale_down sending windows exceed the maximum stage duration")
+        if self.min_overlap_samples > self.long_cohort_size:
+            raise ValueError("scale_down long cohort must cover min_overlap_samples")
+        if self.max_requests > MAX_PLANNED_ARRIVALS:
+            raise ValueError("scale_down exceeds the maximum planned arrivals")
+        return self
+
+    @property
+    def max_requests(self) -> int:
+        return self.min_baseline_samples + self.long_cohort_size + math.ceil(self.requests_per_second * self.max_sending_seconds)
+
+    @property
+    def max_sending_seconds(self) -> float:
+        return self.baseline_timeout_seconds + self.event_timeout_seconds + self.grace_seconds + self.post_seconds
+
+    @property
+    def max_duration_seconds(self) -> float:
+        return self.max_sending_seconds + self.completion_seconds
+
+
+MAX_SCALE_DOWN_SNAPSHOTS = 4096
+ScaleDownIdentifier = Annotated[str, Field(min_length=1, max_length=256)]
+
+
+class ScaleDownMarker(Model):
+    """Operator intent; never a backend lifecycle fact."""
+    event_id: ScaleDownIdentifier
+    nonce: ScaleDownIdentifier
+    target: ScaleDownIdentifier
+    replica_id: ScaleDownIdentifier | None = None
+    source: ScaleDownIdentifier
+    operator_at: str | None = Field(default=None, max_length=128)
+
+
+class ScaleDownLifecycleFact(Model):
+    event_id: ScaleDownIdentifier
+    sequence: int = Field(ge=0, strict=True)
+    time_ms: float = Field(ge=0, description="Time in the export's source clock, not runner monotonic time.")
+    kind: Literal["removal_requested", "drain_effective", "request_admitted", "request_completed", "replica_terminated"]
+    replica_id: ScaleDownIdentifier
+    request_id: ScaleDownIdentifier | None = None
+    attempt_id: ScaleDownIdentifier | None = None
+    outcome: Literal["completed", "failed", "cancelled"] | None = None
+
+    @model_validator(mode="after")
+    def attempt_identity(self):
+        if self.kind in {"request_admitted", "request_completed"} and (self.request_id is None or self.attempt_id is None):
+            raise ValueError("request lifecycle facts require request_id and attempt_id")
+        return self
+
+
+class ScaleDownInventory(Model):
+    event_id: ScaleDownIdentifier
+    sequence: int = Field(ge=0, strict=True)
+    time_ms: float = Field(ge=0)
+    replicas: list[ScaleDownIdentifier] = Field(max_length=MAX_SIMULTANEOUS_REQUESTS)
+
+    @field_validator("replicas")
+    @classmethod
+    def unique_incarnations(cls, values):
+        if len(values) != len(set(values)):
+            raise ValueError("replica inventory requires unique incarnation IDs")
+        return values
+
+
+class ScaleDownCoverage(Model):
+    replica_id: ScaleDownIdentifier
+    start_sequence: int = Field(ge=0, strict=True)
+    end_sequence: int = Field(ge=0, strict=True)
+    complete: StrictBool = False
+    scope: Literal["all", "giraffe"] = "giraffe"
+    gaps: list[Annotated[int, Field(ge=0, strict=True)]] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+    truncated: StrictBool = False
+
+    @model_validator(mode="after")
+    def ordered_interval(self):
+        if self.start_sequence > self.end_sequence:
+            raise ValueError("coverage start_sequence must not exceed end_sequence")
+        return self
+
+
+class ScaleDownLifecycleExport(Model):
+    """Explicit collector claims, separate from ordinary deployment metadata."""
+    schema_version: Literal[1] = 1
+    target: ScaleDownIdentifier
+    source: ScaleDownIdentifier
+    clock_id: ScaleDownIdentifier
+    through_sequence: int = Field(ge=0, strict=True)
+    captured_at: str | None = Field(default=None, max_length=128,
+        description="UTC ISO timestamp when the source sampled this export; absent means unmapped time.")
+    clock_uncertainty_ms: float | None = Field(default=None, ge=0, le=60000,
+        description="Upper bound on source UTC clock error; required for a UTC-to-runner mapping.")
+    inventories: list[ScaleDownInventory] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+    events: list[ScaleDownLifecycleFact] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+    coverage: list[ScaleDownCoverage] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+
+
+class ScaleDownSnapshot(Model):
+    collected_start_ms: float = Field(ge=0)
+    collected_end_ms: float = Field(ge=0)
+    capture_start_ms: float | None = Field(default=None, ge=0,
+        description="Earliest source capture in runner monotonic offsets, mapped by the collector, never accepted from export JSON.")
+    capture_end_ms: float | None = Field(default=None, ge=0,
+        description="Latest source capture in runner monotonic offsets; absent mapping cannot establish request overlap.")
+    export: ScaleDownLifecycleExport
+
+    @model_validator(mode="after")
+    def ordered_capture(self):
+        if self.collected_start_ms > self.collected_end_ms:
+            raise ValueError("collector interval is reversed")
+        if (self.capture_start_ms is None) != (self.capture_end_ms is None):
+            raise ValueError("both capture interval bounds are required")
+        if self.capture_start_ms is not None and self.capture_start_ms > self.capture_end_ms:
+            raise ValueError("capture interval is reversed")
+        return self
+
+
+class ScaleDownEvidence(Model):
+    schema_version: Literal[1] = 1
+    timing_health: dict[str, Any] | None = Field(default=None,
+        description="Existing client timing-health snapshot frozen at the scenario boundary; retained for offline qualification.")
+    timing_threshold_ms: float | None = Field(default=None, ge=0,
+        description="Existing timing qualification threshold frozen with the scenario health snapshot.")
+    armed_ms: float | None = Field(default=None, ge=0)
+    marker: ScaleDownMarker | None = None
+    marker_accepted_ms: float | None = Field(default=None, ge=0)
+    marker_received_ms: float | None = Field(default=None, ge=0)
+    snapshots: list[ScaleDownSnapshot] = Field(default_factory=list, max_length=MAX_SCALE_DOWN_SNAPSHOTS)
+    baseline_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_PLANNED_ARRIVALS)
+    long_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_SIMULTANEOUS_REQUESTS)
+    followup_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_PLANNED_ARRIVALS)
+    answer_started_ms: dict[ScaleDownIdentifier, Annotated[float, Field(ge=0)]] = Field(default_factory=dict,
+        description="First real answer content observed by the client callback, in runner monotonic offsets.")
+    post_started_ms: float | None = Field(default=None, ge=0)
+    post_ended_ms: float | None = Field(default=None, ge=0)
+    dropped_post_requests: int = Field(default=0, ge=0, strict=True)
+    stop_reason: str | None = Field(default=None, max_length=1024)
+    limitations: list[str] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+
+
+class ScaleDownSubresult(Model):
+    status: Literal["pass", "fail", "inconclusive"]
+    summary: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    request_ids: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunConfig(Model):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
     targets: list[Target] = Field(min_length=1)
@@ -1974,6 +2149,7 @@ class RunConfig(Model):
     metrics_max_series: int = Field(default=128, ge=1, le=1024)
     cache_pressure_threshold: float = Field(default=.9, gt=0, le=1)
     arrivals: Arrival | None = None
+    scale_down: ScaleDownConfig | None = None
     prefix: Prefix | None = None
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
     load_test: LoadTest = Field(default_factory=LoadTest)
@@ -2082,6 +2258,15 @@ class RunConfig(Model):
         if set(self.checks) - set(CHECK_NAMES):
             raise ValueError("Unknown check name(s): " + ", ".join(sorted(set(self.checks) - set(CHECK_NAMES)))
                              + ". Valid names: " + ", ".join(CHECK_NAMES))
+        if "scale_down" in self.checks:
+            if self.scale_down is None:
+                raise ValueError("scale_down requires its scenario configuration")
+            if self.scale_down.target not in names:
+                raise ValueError("scale_down target must name a configured target")
+            if not self.stream:
+                raise ValueError("scale_down requires streaming")
+            if self.concurrency is not None and self.concurrency <= self.scale_down.long_cohort_size:
+                raise ValueError("scale_down requires a concurrency slot beyond its long cohort")
         self.resolve_concurrency()
         for check_id, options in self.test_options.items():
             if check_id not in CHECK_OPTION_FIELDS:

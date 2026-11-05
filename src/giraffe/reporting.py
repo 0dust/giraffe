@@ -157,7 +157,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"} and not set(resolved.checks) <= {"sessions", "consistency"}:
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"} and not set(resolved.checks) <= {"sessions", "consistency"}:
         return None  # Load generators changed; this attestation covers unchanged specialists only.
     if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
         return None  # Sampled traffic has no historical equivalent.
@@ -184,6 +184,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95": "ebc8dc0b150701e1a97f571a6ea7a37cdcf62f4d3d9db97244d8c2bd5c17b092",
             "issue95_pauses": "37bf5c074bfdb19f367e5348b678e5a923977fe7bf013b8c781a43bb8efca19e",
             "issue95_pause_evidence": "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83",
+            # Only the scale-down registry entry changed; session and text
+            # consistency request construction remains identical.
+            "scale_down_registration": "7c5a71d2036dc04a2fbbcaacfd8c55b07d1297b35c56ab79a21e04906d7fe8d0",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -207,6 +210,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "issue95_pauses": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "issue95_pause_evidence": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "scale_down_registration": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -225,7 +229,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
@@ -1112,7 +1116,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         rows = []
         # Optional observations and checks without inference/acceptance cohorts
         # do not participate in baseline verdicts or sample-collection guidance.
-        non_request_checks = {"gpu"}
+        non_request_checks = {"gpu", "scale_down"}
         non_verdict_checks = non_request_checks | {
             check.id for run in (report, baseline) for check in run.checks
             if check.target == name and not check.required
@@ -1290,6 +1294,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
         point_count = sum(row["status"] in {"pass", "fail"}
                           for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
+        if any(check.id == "scale_down" and check.target == name and check.status != "skipped"
+               for run in (report, baseline) for check in run.checks):
+            target_reasons.append("Automatic scale-down comparison is unsupported: separate external removals are not interchangeable traffic measurements.")
         if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
@@ -2259,6 +2266,61 @@ def _check_timing_violation_ids(check: CheckResult) -> set[str]:
     return {rid for source in sources if isinstance(source, list) for rid in source if isinstance(rid, str)}
 
 
+_SCALE_DOWN_LABELS = {"continuity": "Client-visible continuity", "drain": "Backend drain semantics", "capacity": "Remaining capacity"}
+
+
+def _scale_down_html(check, report, anchors):
+    evidence = report.observations.get("targets", {}).get(check.target, {}).get("scale_down", {})
+    def links(ids):
+        return " ".join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>' if rid in anchors else _e(rid) for rid in ids)
+    parts = ['<h4>Scale-down results</h4><table><tr><th>Result</th><th>Status</th><th>Evidence</th></tr>']
+    for key, label in _SCALE_DOWN_LABELS.items():
+        result = check.metrics.get("results", {}).get(key, {})
+        parts.append(f'<tr><td>{label}</td><td>{_badge(result.get("status", "inconclusive"))}</td>'
+                     f'<td>{_e(result.get("summary", "No result recorded."))}<p>{links(result.get("request_ids", []))}</p>'
+                     f'<p>{_e("; ".join(result.get("limitations", [])))}</p>'
+                     f'<p>Evidence IDs: {_e(", ".join(result.get("evidence_ids", [])))}</p></td></tr>')
+    parts.append('</table><details><summary>Event timeline</summary><p>Operator intent is not backend confirmation. '
+                 'Runner offsets and source clocks are separate; rows do not establish ordering across clocks.</p>')
+    marker = evidence.get("marker")
+    if marker:
+        parts.append(f'<p>Operator marker {_e(marker.get("event_id"))} · {_e(marker.get("source"))} · '
+                     f'intended replica {_e(marker.get("replica_id"))} · operator time {_e(marker.get("operator_at"))} · '
+                     f'runner receipt {_e(evidence.get("marker_received_ms"))} ms · '
+                     f'accepted {_e(evidence.get("marker_accepted_ms"))} ms</p>')
+    parts.append(f'<p>Runner offsets (ms): armed {_e(evidence.get("armed_ms"))}; '
+                 f'post window {_e(evidence.get("post_started_ms"))}–{_e(evidence.get("post_ended_ms"))}.</p>')
+    for name, label in (("baseline_request_ids", "Baseline"), ("long_request_ids", "Active answer cohort"), ("followup_request_ids", "Follow-up traffic")):
+        parts.append(f'<p>{label}: {links(evidence.get(name, []))}</p>')
+    parts.append('<table><tr><th>Request</th><th>Outcome</th><th>Dispatch offset (ms)</th>'
+                 '<th>First answer offset (ms)</th><th>Completion offset (ms)</th></tr>')
+    for record in report.requests:
+        if record.target == check.target and "scale_down" in record.check_ids:
+            parts.append(f'<tr><td>{links([record.id])}</td><td>{_e(record.status)} · {_e(record.finish_reason)} · '
+                         f'stream terminated: {_e(record.stream_terminated)}</td><td>{_e(record.dispatch_ms)}</td>'
+                         f'<td>{_e(evidence.get("answer_started_ms", {}).get(record.id))}</td><td>{_e(record.completed_ms)}</td></tr>')
+    parts.append('</table>')
+    seen = set()
+    for snapshot in evidence.get("snapshots", []):
+        export = snapshot.get("export", {})
+        parts.append(f'<h5>Source {_e(export.get("source"))} · clock {_e(export.get("clock_id"))}</h5>'
+                     f'<p>Collected in runner interval {_e(snapshot.get("collected_start_ms"))}–{_e(snapshot.get("collected_end_ms"))} ms; '
+                     f'mapped capture {_e(snapshot.get("capture_start_ms"))}–{_e(snapshot.get("capture_end_ms"))} ms; '
+                     f'source capture {_e(export.get("captured_at"))}; uncertainty {_e(export.get("clock_uncertainty_ms"))} ms.</p><ul>')
+        for event in export.get("events", []):
+            identity = (export.get("source"), export.get("clock_id"), json.dumps(event, sort_keys=True))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            parts.append(f'<li>{_e(event.get("event_id"))}: {_e(event.get("kind"))} · sequence {_e(event.get("sequence"))} · '
+                         f'source time {_e(event.get("time_ms"))} ms · replica {_e(event.get("replica_id"))} · '
+                         f'attempt {_e(event.get("attempt_id"))} · outcome {_e(event.get("outcome"))} '
+                         f'{links([event["request_id"]]) if event.get("request_id") else ""}</li>')
+        parts.append(f'</ul><details><summary>Inventory and coverage</summary><pre>{_json({"inventories": export.get("inventories", []), "coverage": export.get("coverage", [])})}</pre></details>')
+    parts.append(f'<p>{_e("; ".join(evidence.get("limitations", [])))}</p></details>')
+    return "".join(parts)
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -2362,6 +2424,8 @@ def _render(report: RunReport) -> str:
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "scale_down":
+            metrics = _scale_down_html(check, report, anchors) + metrics
         if check.id == "load":
             metrics = _load_test_html(check.metrics) + metrics
         if check.id == "concurrency" and "load_types" in check.metrics:
@@ -2716,9 +2780,12 @@ def reproduction_export(report: RunReport) -> dict:
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
             "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},
+            "scale_down_history": {name: obs["scale_down"] for name, obs in retained.observations.get("targets", {}).items() if "scale_down" in obs},
             "deployment_history": {name: obs.get("deployment_history", []) for name, obs in retained.observations.get("targets", {}).items()},
             "instructions": ["Supply secret environment-variable references locally.",
                 "Match suite and fixture hashes; supply any local fixture/metadata files.",
                 "Verify unknown server settings manually. This export cannot recreate inaccessible server state.",
                 "Imported launch arguments describe intent and are never executed by this export.",
-                "A saved failed run is a reference, not an approved deployment."]}
+                "A saved failed run is a reference, not an approved deployment."] +
+                (["Scale-down history is evidence only. A new run creates a fresh nonce and requires a new external removal marker."]
+                 if any("scale_down" in obs for obs in retained.observations.get("targets", {}).values()) else [])}

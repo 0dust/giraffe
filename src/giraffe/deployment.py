@@ -6,8 +6,10 @@ import asyncio
 import logging
 import hashlib
 import json
+import math
 import re
 import shlex
+from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -250,10 +252,11 @@ async def _read(client, url, *, body=None):
     async with client.stream("POST" if body is not None else "GET", url, json=body) as response:
         response.raise_for_status()
         data = bytearray()
-        async for chunk in response.aiter_bytes():
-            if len(data) + len(chunk) > MAX_DEPLOYMENT_BODY_BYTES:
-                raise ValueError("discovery response exceeds 64 KiB")
-            data.extend(chunk)
+        async with aclosing(response.aiter_bytes()) as chunks:
+            async for chunk in chunks:
+                if len(data) + len(chunk) > MAX_DEPLOYMENT_BODY_BYTES:
+                    raise ValueError("discovery response exceeds 64 KiB")
+                data.extend(chunk)
     return json.loads(data)
 
 
@@ -421,11 +424,73 @@ async def preparation_residency(config, *, stop=None):
     return dict(zip((target.name for target in config.targets), observations, strict=True))
 
 
-async def snapshot(target, config, deadline, stop):
+def scale_down_enabled(target, config):
+    return ("scale_down" in config.checks and config.scale_down is not None
+            and config.scale_down.target == target.name)
+
+
+def _lifecycle_snapshot(payload, target, run_start, start, end, wall_start, wall_end):
+    """Validate source claims without turning receipt time into source freshness."""
+    from .models import ScaleDownLifecycleExport, ScaleDownSnapshot
+
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int:
+        raise ValueError("Lifecycle export requires an explicit integer schema version")
+    export = ScaleDownLifecycleExport.model_validate(payload, strict=True)
+    if export.target != target.name:
+        raise ValueError("Lifecycle export target differs")
+    # Redacting identity strings would merge distinct events/attempts. Reject the
+    # export if existing credential sanitization would alter any source string.
+    def safe_strings(value):
+        if isinstance(value, str):
+            return sanitize(value) == value
+        if isinstance(value, list):
+            return all(safe_strings(child) for child in value)
+        if isinstance(value, dict):
+            return all(safe_strings(child) for child in value.values())
+        return True
+
+    if not safe_strings(export.model_dump()):
+        raise ValueError("Lifecycle export contains unsafe text")
+    if run_start is None or not math.isfinite(run_start) or run_start > start:
+        raise ValueError("Lifecycle export requires runner time origin")
+    capture_start = capture_end = None
+    limitations = []
+    try:
+        captured = datetime.fromisoformat(export.captured_at.replace("Z", "+00:00"))
+        if captured.utcoffset() is None or captured.utcoffset().total_seconds() != 0:
+            raise ValueError("Capture timestamp must be UTC")
+        if export.clock_uncertainty_ms is None:
+            raise ValueError("Source clock uncertainty is absent")
+        uncertainty = export.clock_uncertainty_ms / 1000
+        stamp = captured.timestamp()
+        if stamp + uncertainty < wall_start or stamp - uncertainty > wall_end:
+            raise ValueError("Source capture does not overlap this collection")
+        if abs((wall_end - wall_start) - (end - start)) > .005:
+            raise ValueError("Local UTC clock changed during collection")
+        # Two anchors conservatively include local clock sampling error. Never
+        # trim the source's uncertainty to the HTTP interval or the run start.
+        capture_start = min(start - run_start + stamp - uncertainty - wall_start,
+                            end - run_start + stamp - uncertainty - wall_end) * 1000
+        capture_end = max(start - run_start + stamp + uncertainty - wall_start,
+                          end - run_start + stamp + uncertainty - wall_end) * 1000
+        if capture_start < 0:
+            raise ValueError("Source capture uncertainty precedes the run")
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        capture_start = capture_end = None
+        limitations.append("Lifecycle source capture time cannot be mapped to this collection; "
+                            "receipt time does not establish source freshness.")
+    snap = ScaleDownSnapshot(collected_start_ms=(start - run_start) * 1000,
+                             collected_end_ms=(end - run_start) * 1000,
+                             capture_start_ms=capture_start, capture_end_ms=capture_end, export=export)
+    return snap.model_dump(mode="json"), limitations
+
+
+async def snapshot(target, config, deadline, stop, *, run_start=None):
     import time
     from giraffe.client import _headers
 
     deployment = target.deployment
+    lifecycle_enabled = scale_down_enabled(target, config)
     result = {
         "schema_version": "1",
         "target": target.name,
@@ -441,6 +506,8 @@ async def snapshot(target, config, deadline, stop):
             "Chat APIs do not establish host layout, containers, launch settings or kernels.",
         ],
     }
+    if lifecycle_enabled and not deployment.collector_url:
+        result["scale_down_limitations"] = ["Lifecycle collector is not configured."]
     intended = safe_metadata(deployment.model_dump())
     imported_fields = set()
     imported_scope, imported_time = None, None
@@ -497,12 +564,14 @@ async def snapshot(target, config, deadline, stop):
     origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     remaining = min(config.metrics_timeout_seconds, deadline - time.monotonic())
     if stop.is_set() or remaining <= 0:
+        if lifecycle_enabled:
+            result["scale_down_limitations"] = ["Run stopped before lifecycle collection."]
         result["discovery"].append({"status": "run_stopped"})
         return result
-    client = await asyncio.to_thread(_discovery_client, config, remaining)
-    async with client:
-        try:
-            async with asyncio.timeout(remaining):
+    try:
+        async with asyncio.timeout(remaining):
+            client = await asyncio.to_thread(_discovery_client, config, remaining)
+            async with client:
                 reported = {}
                 if deployment.discovery != "none":
                     client.headers.update(_headers(target))
@@ -579,7 +648,22 @@ async def snapshot(target, config, deadline, stop):
                 if deployment.collector_url:
                     # Separate configured collector never inherits inference credentials.
                     client.headers.clear()
+                    client.cookies.clear()
+                    collected_start, wall_start = time.monotonic(), time.time()
                     export = await _read(client, deployment.collector_url)
+                    collected_end, wall_end = time.monotonic(), time.time()
+                    if not isinstance(export, dict):
+                        raise ValueError("Collector export must be an object")
+                    if lifecycle_enabled:
+                        try:
+                            lifecycle, limitations = _lifecycle_snapshot(
+                                export.get("scale_down_lifecycle"),
+                                target, run_start, collected_start, collected_end, wall_start, wall_end)
+                            result["scale_down_lifecycle"] = lifecycle
+                            result["scale_down_limitations"] = limitations
+                        except (ValueError, TypeError):
+                            result["scale_down_limitations"] = [
+                                "Lifecycle collector export is missing, invalid, unsafe, or for another target."]
                     safe = safe_metadata(export)
                     scope = export.get("scope", "configured collector; replica coverage unverified")
                     for category, values in safe.items():
@@ -595,9 +679,12 @@ async def snapshot(target, config, deadline, stop):
                     result["discovery"].append(
                         {"status": "available", "source": "configured-collector"}
                     )
-        except (httpx.HTTPError, ValueError, OSError, TimeoutError) as exc:
-            logger.debug("Deployment evidence collection failed", exc_info=True)
-            result["discovery"].append({"status": "unavailable", "reason": type(exc).__name__})
+    except (httpx.HTTPError, ValueError, OSError, TimeoutError) as exc:
+        logger.debug("Deployment evidence collection failed: %s", type(exc).__name__)
+        result["discovery"].append({"status": "unavailable", "reason": type(exc).__name__})
+        if lifecycle_enabled and "scale_down_lifecycle" not in result:
+            result.setdefault("scale_down_limitations", [
+                "Lifecycle collection unavailable, invalid, oversized, or timed out."])
     for row in result["fields"].values():
         if (
             "configured" in row

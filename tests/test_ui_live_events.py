@@ -275,3 +275,48 @@ await page.run(`
 })()
 `);
 """)
+
+
+def test_scale_down_controls_appear_and_advance_from_live_deltas_without_reload():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+  schedulePoll=()=>{};connectionError=()=>{};
+  renderDetail=()=>{nodes['#main'].innerHTML=renderScaleDownControl(state.detail);};
+  const detail=state.detail={id:'live',state:'running',seq:0,config:state.config};
+  renderDetail();assert.equal(nodes['#main'].innerHTML,'');
+  const control={run_id:'runner-id',target:'local',nonce:'fresh',phase:'baseline',acknowledgment:null};
+  const paths=[];let response={seq:1,state:'running',events:[{event:'scale_down_updated',scale_down_control:control}]};
+  api=async path=>{paths.push(path);return response;};
+  await pollDetail(state.routeVersion);
+  assert.equal(state.detail,detail);assert.match(nodes['#main'].innerHTML,/id="scale-down-control"/);
+  assert.doesNotMatch(nodes['#main'].innerHTML,/data-action="mark-scale-down"/);
+  response={seq:2,state:'running',events:[{event:'scale_down_updated',scale_down_control:{...control,phase:'armed'}}]};
+  await pollDetail(state.routeVersion);assert.match(nodes['#main'].innerHTML,/data-action="mark-scale-down"/);
+  response={seq:3,state:'running',events:[],scale_down_control:{...control,phase:'observing',acknowledgment:{accepted:true}}};
+  await pollDetail(state.routeVersion);assert.equal(detail.scale_down_control.phase,'observing');
+  assert.match(nodes['#main'].innerHTML,/Accepted: Removal marker recorded/);
+  assert.doesNotMatch(nodes['#main'].innerHTML,/data-action="mark-scale-down"/);
+  assert.deepEqual(paths,['/api/runs/live/events?after=0','/api/runs/live/events?after=1','/api/runs/live/events?after=2']);
+})()
+`);
+""")
+
+
+def test_scale_down_delta_for_a_previous_run_cannot_arm_the_current_run():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+(async()=>{
+  schedulePoll=()=>{};connectionError=()=>{};renderDetail=()=>{};
+  state.detail={id:'old',state:'running',seq:1,config:state.config};
+  let finish;api=async()=>new Promise(resolve=>finish=resolve);
+  const pending=pollDetail(state.routeVersion);
+  const current=state.detail={id:'new',state:'running',seq:0,config:state.config};
+  finish({seq:2,state:'running',events:[{event:'scale_down_updated',scale_down_control:{run_id:'old-runner',target:'local',nonce:'old',phase:'armed'}}]});
+  await pending;assert.equal(state.detail,current);assert.equal(current.scale_down_control,undefined);
+  assert.equal(current.seq,0);assert.equal(renderScaleDownControl(current),'');
+})()
+`);
+""")
