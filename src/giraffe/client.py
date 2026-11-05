@@ -388,6 +388,13 @@ class LLMClient:
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
     ) -> RequestRecord:
+        from .identities import identity_scope
+        with identity_scope(spec.identity is not None):
+            return await self._execute(spec, first_output_event=first_output_event)
+
+    async def _execute(
+        self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+    ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
         preparation_start = time.perf_counter()
@@ -703,12 +710,7 @@ class LLMClient:
                     # Rebuild the complete headers from this identity instead.
                     request.headers = httpx.Request("POST", request.url, json=payload,
                                                     headers=selected_headers).headers
-                from .identities import identity_request
-                identity_token = identity_request.set(spec.identity is not None)
-                try:
-                    response = await self._client.send(request, stream=True)
-                finally:
-                    identity_request.reset(identity_token)
+                response = await self._client.send(request, stream=True)
                 events = None
                 try:
                     record.http_status = response.status_code

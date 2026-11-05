@@ -1,6 +1,7 @@
 """Identity selection must be isolated on the actual pooled request boundary."""
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -119,3 +120,37 @@ def test_gateway_error_evidence_is_strict_and_does_not_retain_text(status, error
     evidence = response_evidence(status, json.dumps({"error": {"type": error_type, "message": message}}).encode())
     assert evidence.error_kind == expected
     assert "message" not in evidence.model_dump_json()
+
+
+async def test_finish_reason_cannot_retain_echoed_credential(monkeypatch):
+    monkeypatch.setenv("KEY", "finish-secret")
+    target = Target(name="proxy", url="http://proxy", model="test", test_identities={"alice": {"api_key_env": "KEY"}})
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "finish-secret"}]})), **kw))
+    async with LLMClient(target, RunConfig(targets=[target], stream=False)) as client:
+        result = await client.execute(request("alice"))
+    assert "finish-secret" not in result.model_dump_json()
+
+
+async def test_identity_dependency_logging_is_scoped_through_body_cleanup(monkeypatch, caplog):
+    monkeypatch.setenv("KEY", "transport-secret")
+    target = Target(name="proxy", url="http://proxy", model="test", test_identities={"alice": {"api_key_env": "KEY"}})
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            logging.getLogger("httpcore.http11").debug("body transport-secret")
+            yield b'{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}'
+
+        async def aclose(self):
+            logging.getLogger("httpcore.connection").debug("close transport-secret")
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, stream=Body(), extensions={"reason_phrase": b"transport-secret"})), **kw))
+    with caplog.at_level(logging.DEBUG):
+        async with LLMClient(target, RunConfig(targets=[target], stream=False)) as client:
+            await client.execute(request("alice"))
+            assert "transport-secret" not in caplog.text
+            await client.execute(request())
+    assert "transport-secret" in caplog.text  # Ordinary shared-key logging remains enabled.
